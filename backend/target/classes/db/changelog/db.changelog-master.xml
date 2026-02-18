@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.20.xsd">
+    <include file="changes/V1_init_schema.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V2_test_cases_and_suites.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V3_plans_cycles_executions.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V4_import_export_jobs.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V5_api_tokens_webhooks.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V6_notifications.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V7_testcase_additional_fields.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V8_ai_generation_history.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V9_cycle_status.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V10_cycle_share.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V11_bugs.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V12_jira_integration.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V13_testcase_jira_link.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V14_knowledge_base_items.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V15_audit_logs_project_id.sql" relativeToChangelogFile="true"/>
+</databaseChangeLog>

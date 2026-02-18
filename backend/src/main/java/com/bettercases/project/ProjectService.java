@@ -1,0 +1,170 @@
+package com.bettercases.project;
+
+import com.bettercases.Database;
+import com.bettercases.rbac.Role;
+import com.bettercases.rbac.RbacService;
+import com.bettercases.suite.SuiteService;
+import com.bettercases.workspace.WorkspaceService;
+
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+public final class ProjectService {
+    /** Create a new project in the given organization; caller must be an org member. Adds creator as project_admin. */
+    public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description) {
+        String normalizedKey = key != null ? key.trim().toUpperCase().replaceAll("[^A-Z0-9]", "") : "";
+        if (normalizedKey.isEmpty()) normalizedKey = "PROJ";
+        normalizedKey = normalizedKey.substring(0, Math.min(32, normalizedKey.length()));
+
+        String sql = "INSERT INTO projects (organization_id, key, name, description) VALUES (?, ?, ?, ?) RETURNING id, key, name, created_at";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, orgId);
+            ps.setString(2, normalizedKey);
+            ps.setString(3, name != null ? name.trim() : "");
+            ps.setString(4, description != null ? description : "");
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) throw new RuntimeException("Insert failed");
+            UUID projectId = (UUID) rs.getObject("id");
+            try (PreparedStatement pm = c.prepareStatement("INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'project_admin')")) {
+                pm.setObject(1, projectId);
+                pm.setObject(2, userId);
+                pm.executeUpdate();
+            }
+            SuiteService.ensureDefaultSuiteExists(projectId);
+            return Map.of(
+                    "id", projectId.toString(),
+                    "key", rs.getString("key"),
+                    "name", rs.getString("name"),
+                    "createdAt", rs.getTimestamp("created_at").toInstant().toString()
+            );
+        } catch (SQLException e) {
+            if (e.getSQLState() != null && e.getSQLState().equals("23505")) {
+                throw new io.javalin.http.BadRequestResponse("A project with this key already exists in your workspace.");
+            }
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static List<Map<String, Object>> listProjectsForUser(UUID userId) {
+        String sql = "SELECT p.id, p.key, p.name, p.description, p.settings, p.archived_at, p.created_at, pm.role " +
+                "FROM projects p JOIN project_members pm ON p.id = pm.project_id WHERE pm.user_id = ? AND p.archived_at IS NULL ORDER BY p.updated_at DESC";
+        List<Map<String, Object>> out = new ArrayList<>();
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, userId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                out.add(Map.of(
+                        "id", rs.getObject("id"),
+                        "key", rs.getString("key"),
+                        "name", rs.getString("name"),
+                        "description", rs.getString("description") != null ? rs.getString("description") : "",
+                        "role", rs.getString("role"),
+                        "createdAt", rs.getTimestamp("created_at").toInstant().toString()
+                ));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return out;
+    }
+
+    public static Optional<Map<String, Object>> getProject(UUID projectId, UUID userId) {
+        if (!RbacService.hasProjectAccess(userId, projectId)) return Optional.empty();
+        String sql = "SELECT id, organization_id, key, name, description, settings, archived_at, created_at, updated_at FROM projects WHERE id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return Optional.of(Map.<String, Object>of(
+                        "id", rs.getObject("id").toString(),
+                        "key", rs.getString("key"),
+                        "name", rs.getString("name"),
+                        "description", rs.getString("description") != null ? rs.getString("description") : "",
+                        "settings", rs.getString("settings") != null ? rs.getString("settings") : "{}",
+                        "createdAt", rs.getTimestamp("created_at").toInstant().toString(),
+                        "updatedAt", rs.getTimestamp("updated_at").toInstant().toString()
+                ));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return Optional.empty();
+    }
+
+    public static void updateProject(UUID projectId, UUID userId, String name, String description, String settingsJson) {
+        Role role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canManageProject()) throw new io.javalin.http.ForbiddenResponse("Cannot manage project");
+        String sql = "UPDATE projects SET name = ?, description = ?, settings = COALESCE(?::jsonb, settings), updated_at = now() WHERE id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, name);
+            ps.setString(2, description != null ? description : "");
+            ps.setString(3, settingsJson);
+            ps.setObject(4, projectId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static List<Map<String, Object>> listMembers(UUID projectId, UUID userId) {
+        RbacService.requireProjectRole(userId, projectId);
+        String sql = "SELECT u.id, u.email, u.name, pm.role, pm.created_at FROM project_members pm JOIN users u ON pm.user_id = u.id WHERE pm.project_id = ? ORDER BY pm.created_at";
+        List<Map<String, Object>> out = new ArrayList<>();
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                out.add(Map.of(
+                        "userId", rs.getObject("u.id").toString(),
+                        "email", rs.getString("u.email"),
+                        "name", rs.getString("u.name") != null ? rs.getString("u.name") : "",
+                        "role", rs.getString("pm.role"),
+                        "joinedAt", rs.getTimestamp("pm.created_at").toInstant().toString()
+                ));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return out;
+    }
+
+    public static void addMember(UUID projectId, UUID actorId, UUID targetUserId, String role) {
+        Role r = RbacService.requireProjectRole(actorId, projectId);
+        if (!r.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
+        if (!WorkspaceService.isUserInProjectOrganization(projectId, targetUserId)) {
+            throw new io.javalin.http.BadRequestResponse("User must be a workspace team member before they can be allocated to this project.");
+        }
+        String sql = "INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ps.setObject(2, targetUserId);
+            ps.setString(3, role);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void removeMember(UUID projectId, UUID actorId, UUID targetUserId) {
+        Role r = RbacService.requireProjectRole(actorId, projectId);
+        if (!r.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("DELETE FROM project_members WHERE project_id = ? AND user_id = ?")) {
+            ps.setObject(1, projectId);
+            ps.setObject(2, targetUserId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}

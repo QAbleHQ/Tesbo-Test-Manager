@@ -1,0 +1,908 @@
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
+
+type RequestInitWithBody = RequestInit & { body?: object };
+
+export async function api<T = unknown>(
+  path: string,
+  options: RequestInitWithBody = {}
+): Promise<T> {
+  const { body, ...rest } = options;
+  const headers: HeadersInit = {
+    "Content-Type": "application/json",
+    ...(rest.headers as Record<string, string>),
+  };
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...rest,
+    headers,
+    credentials: "include",
+    ...(body !== undefined && { body: JSON.stringify(body) }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || String(res.status));
+  }
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+export async function authMe(): Promise<{ userId: string } | null> {
+  try {
+    return await api<{ userId: string }>("/api/auth/me");
+  } catch {
+    return null;
+  }
+}
+
+export async function requestOtp(email: string): Promise<void> {
+  await api("/api/auth/otp/request", { method: "POST", body: { email } });
+}
+
+export async function verifyOtp(email: string, code: string): Promise<{ ok: boolean; userId: string }> {
+  return api("/api/auth/otp/verify", { method: "POST", body: { email, code } });
+}
+
+export async function logout(): Promise<void> {
+  await api("/api/auth/logout", { method: "POST" });
+}
+
+export interface OnboardingResponse {
+  organizationId: string;
+  projectId: string;
+  projectKey: string;
+}
+
+export async function createOrgAndProject(data: {
+  orgName: string;
+  projectKey: string;
+  projectName: string;
+  projectDescription?: string;
+}): Promise<OnboardingResponse> {
+  return api<OnboardingResponse>("/api/onboarding/org-and-project", {
+    method: "POST",
+    body: data,
+  });
+}
+
+// Workspace (organization) – team members at workspace level; project access is by allocation
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: string;
+}
+
+export interface WorkspaceMember {
+  userId: string;
+  email: string;
+  name: string;
+  role: string;
+  joinedAt: string;
+}
+
+export async function getWorkspace(): Promise<WorkspaceInfo> {
+  return api<WorkspaceInfo>("/api/workspace");
+}
+
+export async function listWorkspaceMembers(): Promise<WorkspaceMember[]> {
+  return api<WorkspaceMember[]>("/api/workspace/members");
+}
+
+export async function addWorkspaceMember(data: { email?: string; userId?: string; role?: string }): Promise<void> {
+  await api("/api/workspace/members", { method: "POST", body: data });
+}
+
+export async function removeWorkspaceMember(userId: string): Promise<void> {
+  await api(`/api/workspace/members/${userId}`, { method: "DELETE" });
+}
+
+// Projects
+export interface ProjectSummary {
+  id: string;
+  key: string;
+  name: string;
+  description: string;
+  role: string;
+  createdAt: string;
+}
+
+export async function listProjects(): Promise<ProjectSummary[]> {
+  return api<ProjectSummary[]>("/api/projects");
+}
+
+export async function createProject(data: { key?: string; name: string; description?: string }): Promise<{ id: string; key: string; name: string; createdAt: string }> {
+  return api<{ id: string; key: string; name: string; createdAt: string }>("/api/projects", { method: "POST", body: data });
+}
+
+export async function getProject(id: string): Promise<Record<string, unknown>> {
+  return api<Record<string, unknown>>(`/api/projects/${id}`);
+}
+
+export async function updateProject(id: string, data: { name?: string; description?: string; settings?: string }): Promise<void> {
+  await api(`/api/projects/${id}`, { method: "PATCH", body: data });
+}
+
+export interface AiGeneratedDraft {
+  title: string;
+  preconditions: string;
+  stepsJson: string;
+  expectedSummary: string;
+  priority: string;
+  tags: string[];
+}
+
+export interface GenerateAiTestCasesBody {
+  userStory: string;
+  acceptanceCriteria?: string;
+  prompt?: string;
+  style?: string;
+  count?: number;
+  provider?: "openai" | "anthropic";
+  model?: string;
+  includeHappyFlow?: boolean;
+  includeNegativeFlow?: boolean;
+  includeMultiTab?: boolean;
+  includeCrossBrowser?: boolean;
+  includeBoundary?: boolean;
+}
+
+export interface GenerateAiTestCasesResponse {
+  generationRequestId: string;
+  provider: "openai" | "anthropic";
+  drafts: AiGeneratedDraft[];
+  generatedCount: number;
+}
+
+export async function generateAiTestCases(
+  projectId: string,
+  data: GenerateAiTestCasesBody
+): Promise<GenerateAiTestCasesResponse> {
+  return api<GenerateAiTestCasesResponse>(`/api/projects/${projectId}/ai/generate-testcases`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export interface AiGenerationHistoryItem {
+  id: string;
+  requestedBy: string;
+  provider: string;
+  model: string | null;
+  userStory: string;
+  acceptanceCriteria: string;
+  customPrompt: string;
+  style: string;
+  requestedCount: number;
+  includeHappyFlow: boolean;
+  includeNegativeFlow: boolean;
+  includeMultiTab: boolean;
+  includeCrossBrowser: boolean;
+  includeBoundary: boolean;
+  generatedCount: number;
+  generatedPayload: string;
+  savedCount: number;
+  saveEvents: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listAiGenerationHistory(
+  projectId: string,
+  params?: { limit?: number; offset?: number }
+): Promise<{ list: AiGenerationHistoryItem[] }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  const query = sp.toString();
+  return api<{ list: AiGenerationHistoryItem[] }>(
+    `/api/projects/${projectId}/ai/generation-history${query ? `?${query}` : ""}`
+  );
+}
+
+export async function trackAiGenerationSaved(
+  projectId: string,
+  requestId: string,
+  data: { suiteId?: string; testcaseIds: string[] }
+): Promise<void> {
+  await api(`/api/projects/${projectId}/ai/generation-history/${requestId}/save`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function listProjectMembers(projectId: string): Promise<{ userId: string; email: string; name: string; role: string; joinedAt: string }[]> {
+  return api(`/api/projects/${projectId}/members`);
+}
+
+export async function addProjectMember(projectId: string, data: { userId: string; role: string }): Promise<void> {
+  await api(`/api/projects/${projectId}/members`, { method: "POST", body: data });
+}
+
+export async function removeProjectMember(projectId: string, userId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/members/${userId}`, { method: "DELETE" });
+}
+
+// Suites
+export interface SuiteNode {
+  id: string;
+  parentId: string | null;
+  name: string;
+  position: number;
+  createdAt: string;
+}
+
+export async function listSuites(projectId: string): Promise<SuiteNode[]> {
+  return api<SuiteNode[]>(`/api/projects/${projectId}/suites`);
+}
+
+export async function createSuite(projectId: string, data: { name: string; parentId?: string; position?: number }): Promise<SuiteNode> {
+  return api<SuiteNode>(`/api/projects/${projectId}/suites`, { method: "POST", body: data });
+}
+
+export async function updateSuite(suiteId: string, data: { name?: string; parentId?: string; position?: number }): Promise<void> {
+  await api(`/api/suites/${suiteId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteSuite(suiteId: string, mode: "deleteTestcases" | "moveToDefault" = "moveToDefault"): Promise<void> {
+  await api(`/api/suites/${suiteId}?mode=${mode}`, { method: "DELETE" });
+}
+
+// Test cases
+export interface TestCaseListItem {
+  id: string;
+  externalId: string;
+  title: string;
+  priority: string;
+  type: string;
+  automationStatus: string;
+  automationTags?: string;
+  status: string;
+  suiteId: string | null;
+  ownerId: string | null;
+  updatedAt: string;
+  jiraIssueKey?: string | null;
+  jiraUrl?: string | null;
+}
+
+export async function listTestCases(
+  projectId: string,
+  params?: {
+    limit?: number;
+    offset?: number;
+    suiteId?: string;
+    status?: string;
+    priority?: string;
+    type?: string;
+    automationStatus?: string;
+    search?: string;
+  }
+): Promise<{ list: TestCaseListItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.suiteId) sp.set("suiteId", params.suiteId);
+  if (params?.status) sp.set("status", params.status);
+  if (params?.priority) sp.set("priority", params.priority);
+  if (params?.type) sp.set("type", params.type);
+  if (params?.automationStatus) sp.set("automationStatus", params.automationStatus);
+  if (params?.search) sp.set("search", params.search);
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/testcases?${sp}`, { credentials: "include" });
+  const list = await res.json();
+  if (!res.ok) {
+    const err = (list as { error?: string }).error || res.statusText;
+    throw new Error(err || String(res.status));
+  }
+  const normalizedList = Array.isArray(list) ? list : [];
+  const totalHeader = res.headers.get("X-Total-Count");
+  let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
+  if (Number.isNaN(total)) {
+    total = normalizedList.length;
+  }
+  return { list: normalizedList, total };
+}
+
+export async function getTestCase(projectId: string, testcaseId: string): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}`);
+}
+
+export async function createTestCase(projectId: string, data: Record<string, unknown>): Promise<{ id: string; externalId: string; title: string; createdAt: string }> {
+  return api(`/api/projects/${projectId}/testcases`, { method: "POST", body: data });
+}
+
+export async function updateTestCase(projectId: string, testcaseId: string, data: Record<string, unknown>): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/${testcaseId}`, { method: "PUT", body: data });
+}
+
+export async function deleteTestCase(projectId: string, testcaseId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/${testcaseId}`, { method: "DELETE" });
+}
+
+export async function bulkUpdateTestCases(projectId: string, data: { testcaseIds: string[]; priority?: string; suiteId?: string; status?: string; ownerId?: string }): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/bulk-update`, { method: "POST", body: data });
+}
+
+export async function bulkDeleteTestCases(projectId: string, data: { testcaseIds: string[] }): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/bulk-delete`, { method: "POST", body: data });
+}
+
+export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
+  return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+}
+
+// Plans
+export async function listPlans(projectId: string): Promise<Record<string, unknown>[]> {
+  return api(`/api/projects/${projectId}/plans`);
+}
+
+export async function getPlan(planId: string): Promise<Record<string, unknown>> {
+  return api(`/api/plans/${planId}`);
+}
+
+export async function createPlan(projectId: string, data: { name: string; description?: string; targetRelease?: string }): Promise<{ id: string }> {
+  return api(`/api/projects/${projectId}/plans`, { method: "POST", body: data });
+}
+
+export async function updatePlan(planId: string, data: { name?: string; description?: string; targetRelease?: string }): Promise<void> {
+  await api(`/api/plans/${planId}`, { method: "PATCH", body: data });
+}
+
+export async function deletePlan(planId: string): Promise<void> {
+  await api(`/api/plans/${planId}`, { method: "DELETE" });
+}
+
+export async function listPlanItems(planId: string): Promise<{ id: string; suiteId: string | null; testcaseId: string | null; position: number }[]> {
+  return api(`/api/plans/${planId}/items`);
+}
+
+export async function addPlanItem(planId: string, data: { suiteId?: string; testcaseId?: string; position?: number }): Promise<void> {
+  await api(`/api/plans/${planId}/items`, { method: "POST", body: data });
+}
+
+// Plan Runs & Progress
+export interface PlanRunItem {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  createdAt: string;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  untested: number;
+}
+
+export interface PlanProgress {
+  runCount: number;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  untested: number;
+  executed: number;
+  completionPercent: number;
+}
+
+export interface PlanListItem {
+  id: string;
+  name: string;
+  description: string;
+  targetRelease: string;
+  ownerId: string | null;
+  createdAt: string;
+  runCount: number;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  untested: number;
+  completionPercent: number;
+}
+
+export async function listPlanRuns(planId: string): Promise<PlanRunItem[]> {
+  return api(`/api/plans/${planId}/runs`);
+}
+
+export async function getPlanProgress(planId: string): Promise<PlanProgress> {
+  return api(`/api/plans/${planId}/progress`);
+}
+
+export async function associateRunWithPlan(cycleId: string, planId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: { planId } });
+}
+
+export async function dissociateRunFromPlan(cycleId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: { clearPlan: true } });
+}
+
+// Test Runs (Cycles)
+export interface TestRunListItem {
+  id: string;
+  planId: string | null;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  createdAt: string;
+  totalCases: number;
+  passed: number;
+  failed: number;
+}
+
+export interface TestRunDetail {
+  id: string;
+  projectId: string;
+  planId: string | null;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  shareToken: string | null;
+  shareEnabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExecutionItem {
+  id: string;
+  cycleItemId: string;
+  testcaseId: string;
+  title: string;
+  externalId: string;
+  priority: string;
+  type: string;
+  status: string;
+  assigneeId: string | null;
+  actualResult: string;
+  executedAt: string | null;
+  defectKey: string;
+  defectUrl: string;
+}
+
+export async function listTestRuns(projectId: string): Promise<TestRunListItem[]> {
+  return api(`/api/projects/${projectId}/cycles`);
+}
+
+export async function getTestRun(cycleId: string): Promise<TestRunDetail> {
+  return api(`/api/cycles/${cycleId}`);
+}
+
+export async function createTestRun(projectId: string, data: { name: string; description?: string; environment?: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
+  return api(`/api/projects/${projectId}/cycles`, { method: "POST", body: data });
+}
+
+export async function updateTestRun(cycleId: string, data: { name?: string; description?: string; environment?: string; buildVersion?: string; status?: string }): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteTestRun(cycleId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "DELETE" });
+}
+
+export async function addTestCasesToRun(cycleId: string, testcaseIds: string[]): Promise<void> {
+  await api(`/api/cycles/${cycleId}/testcases`, { method: "POST", body: { testcaseIds } });
+}
+
+export async function removeTestCaseFromRun(cycleId: string, testcaseId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}/testcases/${testcaseId}`, { method: "DELETE" });
+}
+
+export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment?: string; buildVersion?: string }): Promise<{ id: string }> {
+  return api(`/api/projects/${projectId}/cycles/from-plan`, { method: "POST", body: data });
+}
+
+export async function listCycleExecutions(cycleId: string): Promise<ExecutionItem[]> {
+  return api(`/api/cycles/${cycleId}/executions`);
+}
+
+export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
+  await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
+}
+
+// Sharing
+export interface ShareState {
+  shareToken: string;
+  shareEnabled: boolean;
+}
+
+export async function toggleTestRunShare(cycleId: string, enabled: boolean): Promise<ShareState> {
+  return api<ShareState>(`/api/cycles/${cycleId}/share`, { method: "POST", body: { enabled } });
+}
+
+export async function getPublicSharedRun(token: string): Promise<TestRunDetail & { shareEnabled: boolean }> {
+  return api(`/api/public/shared-runs/${token}`);
+}
+
+export async function getPublicSharedExecutions(token: string): Promise<ExecutionItem[]> {
+  return api(`/api/public/shared-runs/${token}/executions`);
+}
+
+// Keep old names as aliases for backward compat
+export const listCycles = listTestRuns;
+export const getCycle = getTestRun;
+
+// Bugs
+export interface BugItem {
+  id: string;
+  title: string;
+  description: string;
+  externalUrl: string;
+  status: string;
+  executionId: string | null;
+  testcaseId: string | null;
+  cycleId: string | null;
+  reportedBy: string | null;
+  reporterName: string;
+  reporterEmail: string;
+  tcExternalId: string;
+  tcTitle: string;
+  cycleName: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listBugs(projectId: string, params?: { status?: string; cycleId?: string }): Promise<BugItem[]> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  const query = sp.toString();
+  return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
+}
+
+export async function getBug(bugId: string): Promise<BugItem> {
+  return api(`/api/bugs/${bugId}`);
+}
+
+export async function createBug(projectId: string, data: {
+  title: string;
+  description?: string;
+  externalUrl?: string;
+  executionId?: string;
+  testcaseId?: string;
+  cycleId?: string;
+}): Promise<{ id: string; title: string; status: string; createdAt: string }> {
+  return api(`/api/projects/${projectId}/bugs`, { method: "POST", body: data });
+}
+
+export async function updateBug(bugId: string, data: {
+  title?: string;
+  description?: string;
+  externalUrl?: string;
+  status?: string;
+}): Promise<void> {
+  await api(`/api/bugs/${bugId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteBug(bugId: string): Promise<void> {
+  await api(`/api/bugs/${bugId}`, { method: "DELETE" });
+}
+
+// Workspace analytics (dashboard – all projects in workspace)
+export interface WorkspaceAnalytics {
+  projectCount: number;
+  testCaseCount: number;
+  suiteCount: number;
+  planCount: number;
+  cycleCount: number;
+  executionStatus: Record<string, number>;
+  executionTotal: number;
+}
+
+export async function getWorkspaceAnalytics(): Promise<WorkspaceAnalytics> {
+  return api<WorkspaceAnalytics>("/api/workspace/analytics");
+}
+
+// Project analytics (optional project-level view)
+export interface ProjectAnalytics {
+  testCaseCount: number;
+  suiteCount: number;
+  planCount: number;
+  cycleCount: number;
+  executionStatus: Record<string, number>;
+  executionTotal: number;
+}
+
+export async function getProjectAnalytics(projectId: string): Promise<ProjectAnalytics> {
+  return api<ProjectAnalytics>(`/api/projects/${projectId}/analytics`);
+}
+
+// ── Report: Execution Report ──
+export interface ExecutionReportRow {
+  groupId: string;
+  groupName: string;
+  Passed: number;
+  Failed: number;
+  Blocked: number;
+  Skipped: number;
+  Untested: number;
+  Retest: number;
+  total: number;
+}
+
+export interface ExecutionReportResponse {
+  filterBy: string;
+  filterValue: string | null;
+  rows: ExecutionReportRow[];
+}
+
+export async function getExecutionReport(
+  projectId: string,
+  params?: { filterBy?: string; filterValue?: string }
+): Promise<ExecutionReportResponse> {
+  const sp = new URLSearchParams();
+  if (params?.filterBy) sp.set("filterBy", params.filterBy);
+  if (params?.filterValue) sp.set("filterValue", params.filterValue);
+  const query = sp.toString();
+  return api<ExecutionReportResponse>(
+    `/api/projects/${projectId}/reports/execution${query ? `?${query}` : ""}`
+  );
+}
+
+// ── Report: Requirement Traceability Matrix ──
+export interface RequirementMatrixRow {
+  testcaseId: string;
+  externalId: string;
+  testcaseTitle: string;
+  priority: string;
+  testcaseStatus: string;
+  suiteName: string | null;
+  runId: string | null;
+  runName: string | null;
+  runStatus: string | null;
+  executionId: string | null;
+  executionStatus: string | null;
+  executedAt: string | null;
+  bugId: string | null;
+  bugTitle: string | null;
+  bugStatus: string | null;
+  bugUrl: string | null;
+}
+
+export async function getRequirementMatrix(projectId: string): Promise<{ rows: RequirementMatrixRow[] }> {
+  return api<{ rows: RequirementMatrixRow[] }>(`/api/projects/${projectId}/reports/requirement-matrix`);
+}
+
+// ── Report: Repository Summary ──
+export interface RepositorySummary {
+  totalTestCases: number;
+  bySuite: { name: string; count: number }[];
+  byStatus: { name: string; count: number }[];
+  addedByDate: { date: string; count: number }[];
+  updatedToday: number;
+  updatedThisWeek: number;
+  updatedThisMonth: number;
+  byPriority: { name: string; count: number }[];
+}
+
+export async function getRepositorySummary(projectId: string): Promise<RepositorySummary> {
+  return api<RepositorySummary>(`/api/projects/${projectId}/reports/repository-summary`);
+}
+
+// ── Jira Integration ──
+
+export interface JiraConnection {
+  connected: boolean;
+  id?: string;
+  cloudId?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: JiraConnectedProject[];
+}
+
+export interface JiraConnectedProject {
+  id: string;
+  jiraProjectId: string;
+  jiraProjectKey: string;
+  jiraProjectName: string;
+  createdAt: string;
+}
+
+export interface JiraProject {
+  id: string;
+  key: string;
+  name: string;
+  style: string;
+  connected: boolean;
+}
+
+export interface JiraTicket {
+  id: string;
+  jiraIssueId: string;
+  jiraIssueKey: string;
+  summary: string;
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  jiraUrl: string;
+  jiraCreatedAt: string | null;
+  jiraUpdatedAt: string | null;
+  syncedAt: string | null;
+}
+
+export async function getJiraAuthUrl(projectId: string): Promise<{ url: string }> {
+  return api<{ url: string }>(`/api/projects/${projectId}/jira/auth-url`);
+}
+
+export async function jiraCallback(projectId: string, code: string): Promise<{ connectionId: string; cloudId: string; siteUrl: string }> {
+  return api(`/api/projects/${projectId}/jira/callback`, { method: "POST", body: { code } });
+}
+
+export async function getJiraStatus(projectId: string): Promise<JiraConnection> {
+  return api<JiraConnection>(`/api/projects/${projectId}/jira/status`);
+}
+
+export async function disconnectJira(projectId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/jira/disconnect`, { method: "DELETE" });
+}
+
+export async function listJiraProjects(projectId: string): Promise<JiraProject[]> {
+  return api<JiraProject[]>(`/api/projects/${projectId}/jira/projects`);
+}
+
+export async function connectJiraProjects(
+  projectId: string,
+  projects: { id: string; key: string; name: string }[]
+): Promise<void> {
+  await api(`/api/projects/${projectId}/jira/projects`, { method: "POST", body: { projects } });
+}
+
+export async function syncJiraTickets(projectId: string): Promise<{ synced: number }> {
+  return api<{ synced: number }>(`/api/projects/${projectId}/jira/sync`, { method: "POST" });
+}
+
+export async function addJiraComment(
+  projectId: string,
+  issueKey: string,
+  comment: string,
+  testCases?: { id: string; title: string }[]
+): Promise<void> {
+  await api(`/api/projects/${projectId}/jira/comment`, {
+    method: "POST",
+    body: { issueKey, comment, testCases },
+  });
+}
+
+export async function listJiraTickets(
+  projectId: string,
+  params?: { limit?: number; offset?: number; search?: string }
+): Promise<{ list: JiraTicket[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.search) sp.set("search", params.search);
+  const query = sp.toString();
+  return api<{ list: JiraTicket[]; total: number }>(
+    `/api/projects/${projectId}/jira/tickets${query ? `?${query}` : ""}`
+  );
+}
+
+// ── Knowledge Base ──
+
+export interface KnowledgeBaseItem {
+  id: string;
+  itemType: "note" | "file";
+  title: string;
+  content: string;
+  fileName: string | null;
+  fileContentType: string | null;
+  fileSize: number | null;
+  createdBy: string | null;
+  creatorName: string;
+  creatorEmail: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listKnowledgeBaseItems(
+  projectId: string,
+  params?: { search?: string; type?: string }
+): Promise<{ list: KnowledgeBaseItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.search) sp.set("search", params.search);
+  if (params?.type) sp.set("type", params.type);
+  const query = sp.toString();
+  return api<{ list: KnowledgeBaseItem[]; total: number }>(
+    `/api/projects/${projectId}/knowledge-base${query ? `?${query}` : ""}`
+  );
+}
+
+export async function createKnowledgeBaseNote(
+  projectId: string,
+  title: string,
+  content: string
+): Promise<KnowledgeBaseItem> {
+  return api<KnowledgeBaseItem>(`/api/projects/${projectId}/knowledge-base`, {
+    method: "POST",
+    body: { title, content },
+  });
+}
+
+export async function uploadKnowledgeBaseFile(
+  projectId: string,
+  file: File
+): Promise<KnowledgeBaseItem> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/knowledge-base/upload`,
+    { method: "POST", credentials: "include", body: formData }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || String(res.status));
+  }
+  return res.json() as Promise<KnowledgeBaseItem>;
+}
+
+export async function updateKnowledgeBaseItem(
+  projectId: string,
+  itemId: string,
+  data: { title?: string; content?: string }
+): Promise<void> {
+  await api(`/api/projects/${projectId}/knowledge-base/${itemId}`, {
+    method: "PATCH",
+    body: data,
+  });
+}
+
+export async function deleteKnowledgeBaseItem(
+  projectId: string,
+  itemId: string
+): Promise<void> {
+  await api(`/api/projects/${projectId}/knowledge-base/${itemId}`, { method: "DELETE" });
+}
+
+export function getKnowledgeBaseFileUrl(projectId: string, itemId: string): string {
+  return `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/knowledge-base/${itemId}/file`;
+}
+
+// ── Activity Feed ──
+
+export interface ActivityLogItem {
+  id: string;
+  actorId: string | null;
+  actorEmail: string | null;
+  actorName: string | null;
+  action: string;
+  entityType: string;
+  entityId: string | null;
+  entityName: string | null;
+  diff: string | null;
+  createdAt: string;
+}
+
+export async function listActivity(
+  projectId: string,
+  params?: { limit?: number; offset?: number; entityType?: string }
+): Promise<{ list: ActivityLogItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.entityType) sp.set("entityType", params.entityType);
+  const query = sp.toString();
+  return api<{ list: ActivityLogItem[]; total: number }>(
+    `/api/projects/${projectId}/activity${query ? `?${query}` : ""}`
+  );
+}

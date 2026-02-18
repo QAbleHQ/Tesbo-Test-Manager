@@ -1,0 +1,16 @@
+# PostgreSQL for BetterCases. Use this if your local Postgres has no "postgres" role.
+# Start: docker compose up -d
+# Stop:  docker compose down
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bettercases
+    ports:
+      - "5432:5432"
+    volumes:
+      - bettercases_pgdata:/var/lib/postgresql/data
+volumes:
+  bettercases_pgdata:
