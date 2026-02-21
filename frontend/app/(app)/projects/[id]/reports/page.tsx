@@ -376,8 +376,8 @@ export default function ReportsPage() {
       listSuites(projectId),
       listProjectMembers(projectId),
     ]).then(([pl, rn, su, mb]) => {
-      setPlans(Array.isArray(pl) ? pl.map((p: Record<string, unknown>) => ({ id: p.id as string, name: p.name as string })) : []);
-      setRuns(Array.isArray(rn) ? rn.map((r: Record<string, unknown>) => ({ id: r.id as string, name: r.name as string })) : []);
+      setPlans(Array.isArray(pl) ? pl.map((p: Record<string, unknown>) => ({ id: String(p.id ?? ""), name: String(p.name ?? "") })) : []);
+      setRuns(Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : []);
       setSuites(su);
       setMembers(mb);
     }).catch(() => {});

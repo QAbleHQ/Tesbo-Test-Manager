@@ -140,7 +140,7 @@ export default function PlanDetailPage() {
 
   async function handleCreateCycle(e: React.FormEvent) {
     e.preventDefault();
-    const name = newCycleName.trim() || (plan?.name as string) || "Test Run";
+    const name = newCycleName.trim() || planName || "Test Run";
     setCreatingCycle(true);
     try {
       const c = await createCycleFromPlan(projectId, { planId, name });
@@ -210,6 +210,9 @@ export default function PlanDetailPage() {
   }
 
   const total = progress?.totalCases || 0;
+  const planName = typeof plan.name === "string" ? plan.name : "";
+  const planDescription = typeof plan.description === "string" ? plan.description : "";
+  const planTargetRelease = typeof plan.targetRelease === "string" ? plan.targetRelease : "";
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -222,7 +225,7 @@ export default function PlanDetailPage() {
               Test Plans
             </Link>
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-            <span className="text-zinc-700 dark:text-zinc-300 font-medium">{plan.name as string}</span>
+            <span className="text-zinc-700 dark:text-zinc-300 font-medium">{planName}</span>
           </nav>
 
           <div className="flex items-start justify-between">
@@ -240,21 +243,21 @@ export default function PlanDetailPage() {
               ) : (
                 <>
                   <div className="flex items-center gap-3">
-                    <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">{plan.name as string}</h1>
-                    {plan.targetRelease && (
+                    <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">{planName}</h1>
+                    {planTargetRelease && (
                       <span className="inline-flex items-center rounded-full bg-violet-100 dark:bg-violet-900/30 text-violet-700 dark:text-violet-300 px-3 py-0.5 text-xs font-medium">
-                        {plan.targetRelease as string}
+                        {planTargetRelease}
                       </span>
                     )}
                   </div>
-                  {plan.description && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{plan.description as string}</p>}
+                  {planDescription && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{planDescription}</p>}
                 </>
               )}
             </div>
             {!editing && (
               <div className="flex items-center gap-2 ml-4">
                 <button
-                  onClick={() => { setEditName(plan.name as string); setEditDesc((plan.description as string) || ""); setEditRelease((plan.targetRelease as string) || ""); setEditing(true); }}
+                  onClick={() => { setEditName(planName); setEditDesc(planDescription); setEditRelease(planTargetRelease); setEditing(true); }}
                   className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 py-2 px-3 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
                 >
                   Edit
@@ -388,7 +391,7 @@ export default function PlanDetailPage() {
                   <input
                     value={newCycleName}
                     onChange={(e) => setNewCycleName(e.target.value)}
-                    placeholder={(plan.name as string) || "Test Run"}
+                    placeholder={planName || "Test Run"}
                     className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
                     autoFocus
                   />
