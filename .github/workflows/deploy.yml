@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
 env:
-  FRONTEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_FRONTEND }}
-  BACKEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_BACKEND }}
+  DOCR_REGISTRY: ${{ secrets.DOCR_REGISTRY }}
+  DOCR_REPO_FRONTEND: ${{ secrets.DOCR_REPO_FRONTEND }}
+  DOCR_REPO_BACKEND: ${{ secrets.DOCR_REPO_BACKEND }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
@@ -26,19 +27,83 @@ jobs:
 
       - name: Build and push frontend image
         run: |
-          docker build -f frontend/Dockerfile -t "$FRONTEND_IMAGE:$IMAGE_TAG" \
+          set -euo pipefail
+
+          DOCR_REGISTRY_CLEAN="$(echo "${DOCR_REGISTRY}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          DOCR_REPO_FRONTEND_CLEAN="$(echo "${DOCR_REPO_FRONTEND}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^/+##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          FRONTEND_IMAGE_CLEAN="${DOCR_REGISTRY_CLEAN}/${DOCR_REPO_FRONTEND_CLEAN}"
+          IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
+
+          if [[ -z "${DOCR_REGISTRY_CLEAN}" || -z "${DOCR_REPO_FRONTEND_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "DOCR_REGISTRY, DOCR_REPO_FRONTEND, or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REGISTRY_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REGISTRY after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REPO_FRONTEND_CLEAN}" =~ ^[a-z0-9._-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REPO_FRONTEND after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${FRONTEND_IMAGE_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+$ ]]; then
+            echo "Invalid FRONTEND_IMAGE after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${IMAGE_TAG_CLEAN}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid IMAGE_TAG after normalization: ${IMAGE_TAG_CLEAN}"
+            exit 1
+          fi
+
+          docker build -f frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
             --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
             frontend
-          docker push "$FRONTEND_IMAGE:$IMAGE_TAG"
-          docker tag "$FRONTEND_IMAGE:$IMAGE_TAG" "$FRONTEND_IMAGE:latest"
-          docker push "$FRONTEND_IMAGE:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${FRONTEND_IMAGE_CLEAN}:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:latest"
 
       - name: Build and push backend image
         run: |
-          docker build -f backend/Dockerfile -t "$BACKEND_IMAGE:$IMAGE_TAG" backend
-          docker push "$BACKEND_IMAGE:$IMAGE_TAG"
-          docker tag "$BACKEND_IMAGE:$IMAGE_TAG" "$BACKEND_IMAGE:latest"
-          docker push "$BACKEND_IMAGE:latest"
+          set -euo pipefail
+
+          DOCR_REGISTRY_CLEAN="$(echo "${DOCR_REGISTRY}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          DOCR_REPO_BACKEND_CLEAN="$(echo "${DOCR_REPO_BACKEND}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^/+##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          BACKEND_IMAGE_CLEAN="${DOCR_REGISTRY_CLEAN}/${DOCR_REPO_BACKEND_CLEAN}"
+          IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
+
+          if [[ -z "${DOCR_REGISTRY_CLEAN}" || -z "${DOCR_REPO_BACKEND_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "DOCR_REGISTRY, DOCR_REPO_BACKEND, or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REGISTRY_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REGISTRY after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REPO_BACKEND_CLEAN}" =~ ^[a-z0-9._-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REPO_BACKEND after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${BACKEND_IMAGE_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+$ ]]; then
+            echo "Invalid BACKEND_IMAGE after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${IMAGE_TAG_CLEAN}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid IMAGE_TAG after normalization: ${IMAGE_TAG_CLEAN}"
+            exit 1
+          fi
+
+          docker build -f backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" backend
+          docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
+          docker push "${BACKEND_IMAGE_CLEAN}:latest"
 
   deploy-frontend:
     needs: build-and-push
