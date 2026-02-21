@@ -1,0 +1,18 @@
+# Root-level dependencies
+/node_modules/
+
+# Backend build output
+/backend/target/
+
+# Runtime logs and lock files
+/backend/logs/*.log
+/backend/logs/*.lck
+
+# Local uploaded/generated artifacts
+/backend/uploads/tesbo-artifacts/
+
+# Local validation screenshots
+/localhost-screenshot.png
+/localhost-run-detail-screenshot.png
+/localhost-test-detail-screenshot.png
+/portal-tesbo-screenshot.png

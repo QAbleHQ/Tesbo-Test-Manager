@@ -30,6 +30,16 @@ const projectNavSections = [
       { href: "activity", label: "Activity" },
     ],
   },
+  {
+    section: "Tesbo Reports",
+    items: [
+      { href: "tesbo-reports", label: "Overview" },
+      { href: "tesbo-reports/runs", label: "Runs" },
+      { href: "tesbo-reports/specs", label: "Specs" },
+      { href: "tesbo-reports/tests", label: "Tests" },
+      { href: "tesbo-reports/analytics", label: "Analytics" },
+    ],
+  },
 ] as const;
 
 const workspaceSettingsNavItems = [
@@ -52,8 +62,8 @@ function NavLink({
       href={href}
       className={`block rounded-lg px-3 py-2 text-sm transition-colors ${
         active
-          ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 font-medium"
-          : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100"
+          ? "bg-[#e8f5eb] dark:bg-zinc-700 text-[var(--primary)] dark:text-zinc-100 font-medium"
+          : "text-[var(--muted)] dark:text-zinc-400 hover:bg-[#eef7f0] dark:hover:bg-zinc-800 hover:text-[var(--primary)] dark:hover:text-zinc-100"
       }`}
     >
       {children}
@@ -105,11 +115,11 @@ export default function Sidebar() {
   const isInWorkspaceSettings = pathname?.startsWith("/settings");
 
   return (
-    <aside className="w-56 shrink-0 border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 flex flex-col min-h-screen">
-      <div className="p-4 border-b border-zinc-200 dark:border-zinc-800">
+    <aside className="w-56 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] dark:bg-zinc-900 flex flex-col min-h-screen">
+      <div className="p-4 border-b border-[var(--border)]">
         <Link
           href="/projects"
-          className="font-semibold text-zinc-900 dark:text-zinc-100 hover:text-zinc-700 dark:hover:text-zinc-300"
+          className="font-semibold text-[var(--primary)] dark:text-zinc-100 hover:opacity-80"
         >
           BetterCases
         </Link>
@@ -134,8 +144,8 @@ export default function Sidebar() {
                   href={`/projects/${projectId}`}
                   className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors truncate ${
                     isOnProjectRoot
-                      ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 font-medium"
-                      : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      ? "bg-[#e8f5eb] dark:bg-zinc-700 text-[var(--primary)] dark:text-zinc-100 font-medium"
+                      : "text-[var(--muted)] dark:text-zinc-400 hover:bg-[#eef7f0] dark:hover:bg-zinc-800 hover:text-[var(--primary)] dark:hover:text-zinc-100"
                   }`}
                   title={projectName ?? undefined}
                 >
@@ -143,13 +153,13 @@ export default function Sidebar() {
                 </Link>
                 <Chevron open />
               </div>
-              <div className="mt-1 ml-3 border-l border-zinc-200 dark:border-zinc-700 pl-2">
+              <div className="mt-1 ml-3 max-h-[calc(100vh-18rem)] overflow-y-auto border-l border-[var(--border)] pl-2 pr-1">
                 {projectNavSections.map(({ section, items }) => (
                   <div key={section} className="mb-3 last:mb-2">
-                    <p className="px-3 py-1 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                    <p className="px-3 py-1 text-xs font-semibold uppercase tracking-wide text-[var(--muted)] dark:text-zinc-300">
                       {section}
                     </p>
-                    <div className="mx-3 mb-1 border-t border-zinc-200 dark:border-zinc-700" />
+                    <div className="mx-3 mb-1 border-t border-[var(--border)]" />
                     <ul className="space-y-0.5">
                       {items.map(({ href, label }) => {
                         const fullHref = `${projectPathPrefix}/${href}`;
@@ -166,7 +176,7 @@ export default function Sidebar() {
                     </ul>
                   </div>
                 ))}
-                <ul className="space-y-0.5 pt-1 border-t border-zinc-200 dark:border-zinc-700">
+                <ul className="space-y-0.5 pt-1 border-t border-[var(--border)]">
                   <li>
                     <NavLink
                       href={`${projectPathPrefix}/settings`}
@@ -189,14 +199,14 @@ export default function Sidebar() {
         </div>
 
         {/* Workspace settings */}
-        <div className="pt-4 mt-4 border-t border-zinc-200 dark:border-zinc-800">
+        <div className="pt-4 mt-4 border-t border-[var(--border)]">
           <div className="flex items-center gap-1">
             <Link
               href="/settings"
               className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${
                 isWorkspaceSettingsActive
-                  ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 font-medium"
-                  : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100"
+                  ? "bg-[#e8f5eb] dark:bg-zinc-700 text-[var(--primary)] dark:text-zinc-100 font-medium"
+                  : "text-[var(--muted)] dark:text-zinc-400 hover:bg-[#eef7f0] dark:hover:bg-zinc-800 hover:text-[var(--primary)] dark:hover:text-zinc-100"
               }`}
             >
               Workspace settings
@@ -204,7 +214,7 @@ export default function Sidebar() {
             <Chevron open={isInWorkspaceSettings} />
           </div>
           {isInWorkspaceSettings && (
-            <ul className="mt-1 ml-3 space-y-0.5 border-l border-zinc-200 dark:border-zinc-700 pl-2">
+            <ul className="mt-1 ml-3 space-y-0.5 border-l border-[var(--border)] pl-2">
               {workspaceSettingsNavItems.map(({ href, label }) => {
                 const active = pathname === href;
                 return (

@@ -40,4 +40,43 @@ public final class EmailService {
             throw new RuntimeException("Failed to send OTP email", e);
         }
     }
+
+    public void sendEmail(String toEmail, String subject, String textBody) {
+        if (toEmail == null || toEmail.isBlank()) return;
+        if (Config.POSTMARK_API_TOKEN == null || Config.POSTMARK_API_TOKEN.isEmpty()) {
+            System.err.println("[EmailService] POSTMARK_API_TOKEN not set; would send mail to " + toEmail + " subject=" + subject);
+            return;
+        }
+        String body = """
+            {"From":"%s","To":"%s","Subject":"%s","TextBody":"%s"}
+            """.formatted(
+                escapeJson(Config.POSTMARK_FROM_EMAIL),
+                escapeJson(toEmail),
+                escapeJson(subject == null ? "" : subject),
+                escapeJson(textBody == null ? "" : textBody)
+            );
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(POSTMARK_API))
+                    .header("Content-Type", "application/json")
+                    .header("X-Postmark-Server-Token", Config.POSTMARK_API_TOKEN)
+                    .timeout(Duration.ofSeconds(15))
+                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() >= 400) {
+                throw new RuntimeException("Postmark returned " + response.statusCode() + ": " + response.body());
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to send email", e);
+        }
+    }
+
+    private static String escapeJson(String value) {
+        return value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r");
+    }
 }

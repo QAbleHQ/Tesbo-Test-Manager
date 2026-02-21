@@ -5,6 +5,7 @@ import com.bettercases.auth.SessionFilter;
 import com.bettercases.onboarding.OnboardingHandler;
 import com.bettercases.project.ProjectHandler;
 import com.bettercases.suite.SuiteHandler;
+import com.bettercases.tesbo.TesboReportsHandler;
 import com.bettercases.testcase.TestCaseHandler;
 import com.bettercases.plan.PlanHandler;
 import com.bettercases.cycle.CycleHandler;
@@ -155,6 +156,36 @@ public final class Main {
 
         app.get("/api/notifications", com.bettercases.notifications.NotificationHandler::list);
         app.post("/api/notifications/{id}/read", com.bettercases.notifications.NotificationHandler::markRead);
+
+        // Tesbo Reports (embedded module)
+        app.get("/api/projects/{projectId}/tesbo-reports/runs", TesboReportsHandler::listRuns);
+        app.get("/api/projects/{projectId}/tesbo-reports/runs/{runId}", TesboReportsHandler::getRun);
+        app.get("/api/projects/{projectId}/tesbo-reports/specs", TesboReportsHandler::listSpecs);
+        app.get("/api/projects/{projectId}/tesbo-reports/specs/{specName}", TesboReportsHandler::getSpec);
+        app.get("/api/projects/{projectId}/tesbo-reports/specs/{specName}/tests/{testName}", TesboReportsHandler::getTestHistory);
+        app.get("/api/projects/{projectId}/tesbo-reports/tests", TesboReportsHandler::listTests);
+        app.get("/api/projects/{projectId}/tesbo-reports/analytics", TesboReportsHandler::analytics);
+        app.get("/api/projects/{projectId}/tesbo-reports/alerts", TesboReportsHandler::listAlerts);
+        app.post("/api/projects/{projectId}/tesbo-reports/alerts", TesboReportsHandler::createAlert);
+        app.put("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}", TesboReportsHandler::updateAlert);
+        app.delete("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}", TesboReportsHandler::deleteAlert);
+        app.post("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}/toggle", TesboReportsHandler::toggleAlert);
+        app.post("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}/send-test", TesboReportsHandler::sendTestAlert);
+        app.get("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::getShare);
+        app.post("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::createShare);
+        app.delete("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::disableShare);
+        app.get("/api/projects/{projectId}/tesbo-reports/settings", TesboReportsHandler::getSettings);
+        app.put("/api/projects/{projectId}/tesbo-reports/settings", TesboReportsHandler::updateSettings);
+        app.post("/api/projects/{projectId}/tesbo-reports/settings/rotate-key", TesboReportsHandler::rotateIngestionKey);
+        app.post("/api/projects/{projectId}/tesbo-reports/ingest/playwright", TesboReportsHandler::ingestPlaywright);
+        app.post("/api/projects/{projectId}/tesbo-reports/ingest/playwright/upload", TesboReportsHandler::ingestPlaywrightFile);
+        app.post("/api/projects/{projectId}/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifact);
+        app.get("/api/projects/{projectId}/tesbo-reports/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getCaseArtifact);
+        app.post("/api/tesbo-reports/ingest/playwright", TesboReportsHandler::ingestPlaywrightByKey);
+        app.post("/api/tesbo-reports/ingest/playwright/upload", TesboReportsHandler::ingestPlaywrightFileByKey);
+        app.post("/api/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifactByKey);
+        app.get("/api/public/tesbo-reports/{token}", TesboReportsHandler::getPublicSharedRun);
+        app.get("/api/public/tesbo-reports/{token}/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getPublicSharedArtifact);
 
         // Log unhandled exceptions and return 500 with JSON (avoids empty 500 in browser)
         app.exception(Exception.class, (e, ctx) -> {

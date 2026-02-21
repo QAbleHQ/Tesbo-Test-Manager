@@ -1,8 +1,14 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --primary: #00ae42;
+  --background: #f6f8f5;
+  --foreground: #0f172a;
+  --surface: #ffffff;
+  --muted: #475569;
+  --border: #e2e8f0;
 }
 
 @theme inline {
@@ -12,15 +18,121 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+.dark {
+  --primary: #00ae42;
+  --background: #0b1220;
+  --foreground: #e2e8f0;
+  --surface: #111827;
+  --muted: #94a3b8;
+  --border: #334155;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+a {
+  color: var(--primary);
+}
+
+.text-zinc-900 {
+  color: var(--foreground);
+}
+
+.text-zinc-800,
+.text-zinc-700,
+.text-zinc-600,
+.text-zinc-500 {
+  color: var(--muted);
+}
+
+.text-zinc-400 {
+  color: #64748b;
+}
+
+.border-zinc-200,
+.border-zinc-300 {
+  border-color: var(--border);
+}
+
+.border-zinc-100 {
+  border-color: #f1f5f9;
+}
+
+.bg-zinc-50,
+.bg-zinc-100 {
+  background-color: var(--background);
+}
+
+.bg-white {
+  background-color: var(--surface);
+}
+
+.bg-zinc-200 {
+  background-color: #e8f5eb;
+}
+
+.bg-zinc-300 {
+  background-color: #d8efe0;
+}
+
+.hover\:bg-zinc-100:hover {
+  background-color: #eef7f0;
+}
+
+.hover\:bg-zinc-200:hover {
+  background-color: #e8f5eb;
+}
+
+.hover\:text-zinc-900:hover {
+  color: var(--foreground);
+}
+
+.text-blue-600,
+.text-blue-700,
+.text-blue-500,
+.hover\:text-blue-700:hover,
+.hover\:text-blue-800:hover {
+  color: var(--primary);
+}
+
+.border-blue-200,
+.border-blue-300,
+.border-blue-600 {
+  border-color: var(--primary);
+}
+
+.bg-blue-50,
+.bg-blue-100 {
+  background-color: #eef7f0;
+}
+
+.bg-blue-600,
+.bg-blue-700 {
+  background-color: var(--primary);
+}
+
+.hover\:bg-blue-700:hover,
+.hover\:bg-blue-800:hover,
+.hover\:bg-blue-600:hover {
+  background-color: #00943a;
+}
+
+.focus\:ring-blue-500:focus,
+.focus\:ring-blue-600:focus,
+.ring-blue-500,
+.ring-blue-600 {
+  --tw-ring-color: var(--primary);
+}
+
+.bg-emerald-50,
+.bg-emerald-100 {
+  background-color: #eef7f0;
+}
+
+.text-emerald-600,
+.text-emerald-700 {
+  color: var(--primary);
 }

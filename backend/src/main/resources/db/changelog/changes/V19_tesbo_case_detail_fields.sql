@@ -1,0 +1,16 @@
+--liquibase formatted sql
+--changeset bettercases:V19-tesbo-case-detail-fields
+
+ALTER TABLE tesbo_report_cases
+    ADD COLUMN IF NOT EXISTS full_title VARCHAR(1024),
+    ADD COLUMN IF NOT EXISTS error_message TEXT,
+    ADD COLUMN IF NOT EXISTS error_stack TEXT,
+    ADD COLUMN IF NOT EXISTS attempt INTEGER,
+    ADD COLUMN IF NOT EXISTS project_name VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS browser_name VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS browser_version VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS os_name VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS os_platform VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS os_arch VARCHAR(128),
+    ADD COLUMN IF NOT EXISTS tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS steps_json JSONB NOT NULL DEFAULT '[]'::jsonb;

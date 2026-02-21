@@ -63,22 +63,22 @@ export default function OnboardingPage() {
 
   if (checking) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950">
+      <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950">
         <p className="text-zinc-500">Loading…</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950 px-4">
       <div className="w-full max-w-md space-y-8">
         <div className="text-center">
-          <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Create your workspace</h1>
-          <p className="mt-1 text-sm text-zinc-500">Your workspace will contain your team and projects. We’ll create your first project inside it.</p>
+          <h1 className="text-2xl font-semibold text-[var(--foreground)] dark:text-zinc-100">Create your workspace</h1>
+          <p className="mt-1 text-sm text-[var(--muted)]">Your workspace will contain your team and projects. We’ll create your first project inside it.</p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label htmlFor="orgName" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label htmlFor="orgName" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
               Workspace name
             </label>
             <input
@@ -87,12 +87,12 @@ export default function OnboardingPage() {
               value={orgName}
               onChange={(e) => setOrgName(e.target.value)}
               placeholder="My Team"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
+              className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
               disabled={loading}
             />
           </div>
           <div>
-            <label htmlFor="projectKey" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label htmlFor="projectKey" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
               Project key
             </label>
             <input
@@ -101,13 +101,13 @@ export default function OnboardingPage() {
               value={projectKey}
               onChange={(e) => setProjectKey(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
               placeholder="PROJ"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100 font-mono"
+              className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100 font-mono"
               disabled={loading}
             />
-            <p className="mt-1 text-xs text-zinc-500">Short code for this project (e.g. PROJ, QA)</p>
+            <p className="mt-1 text-xs text-[var(--muted)]">Short code for this project (e.g. PROJ, QA)</p>
           </div>
           <div>
-            <label htmlFor="projectName" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label htmlFor="projectName" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
               Project name
             </label>
             <input
@@ -116,12 +116,12 @@ export default function OnboardingPage() {
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
               placeholder="My Test Project"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
+              className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
               disabled={loading}
             />
           </div>
           <div>
-            <label htmlFor="projectDescription" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label htmlFor="projectDescription" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
               Description (optional)
             </label>
             <textarea
@@ -129,7 +129,7 @@ export default function OnboardingPage() {
               value={projectDescription}
               onChange={(e) => setProjectDescription(e.target.value)}
               rows={2}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
+              className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
               disabled={loading}
             />
           </div>
@@ -139,7 +139,7 @@ export default function OnboardingPage() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
+            className="w-full rounded-lg bg-[var(--primary)] text-white py-2 px-4 font-medium hover:opacity-90 disabled:opacity-50"
           >
             {loading ? "Creating…" : "Create workspace"}
           </button>
