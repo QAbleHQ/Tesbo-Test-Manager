@@ -26,19 +26,59 @@ jobs:
 
       - name: Build and push frontend image
         run: |
-          docker build -f frontend/Dockerfile -t "$FRONTEND_IMAGE:$IMAGE_TAG" \
+          set -euo pipefail
+
+          FRONTEND_IMAGE_CLEAN="$(echo "${FRONTEND_IMAGE}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/*$##; s/[[:space:]]+$//')"
+          IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
+
+          if [[ -z "${FRONTEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "FRONTEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${FRONTEND_IMAGE_CLEAN}" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
+            echo "Invalid FRONTEND_IMAGE after normalization: ${FRONTEND_IMAGE_CLEAN}"
+            exit 1
+          fi
+
+          if ! [[ "${IMAGE_TAG_CLEAN}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid IMAGE_TAG after normalization: ${IMAGE_TAG_CLEAN}"
+            exit 1
+          fi
+
+          docker build -f frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
             --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
             frontend
-          docker push "$FRONTEND_IMAGE:$IMAGE_TAG"
-          docker tag "$FRONTEND_IMAGE:$IMAGE_TAG" "$FRONTEND_IMAGE:latest"
-          docker push "$FRONTEND_IMAGE:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${FRONTEND_IMAGE_CLEAN}:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:latest"
 
       - name: Build and push backend image
         run: |
-          docker build -f backend/Dockerfile -t "$BACKEND_IMAGE:$IMAGE_TAG" backend
-          docker push "$BACKEND_IMAGE:$IMAGE_TAG"
-          docker tag "$BACKEND_IMAGE:$IMAGE_TAG" "$BACKEND_IMAGE:latest"
-          docker push "$BACKEND_IMAGE:latest"
+          set -euo pipefail
+
+          BACKEND_IMAGE_CLEAN="$(echo "${BACKEND_IMAGE}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/*$##; s/[[:space:]]+$//')"
+          IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
+
+          if [[ -z "${BACKEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "BACKEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${BACKEND_IMAGE_CLEAN}" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
+            echo "Invalid BACKEND_IMAGE after normalization: ${BACKEND_IMAGE_CLEAN}"
+            exit 1
+          fi
+
+          if ! [[ "${IMAGE_TAG_CLEAN}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid IMAGE_TAG after normalization: ${IMAGE_TAG_CLEAN}"
+            exit 1
+          fi
+
+          docker build -f backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" backend
+          docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
+          docker push "${BACKEND_IMAGE_CLEAN}:latest"
 
   deploy-frontend:
     needs: build-and-push
