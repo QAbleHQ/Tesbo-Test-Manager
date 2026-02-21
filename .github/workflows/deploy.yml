@@ -1,0 +1,127 @@
+name: Deploy BetterCases to DigitalOcean
+
+on:
+  workflow_dispatch:
+
+env:
+  FRONTEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_FRONTEND }}
+  BACKEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_BACKEND }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Login to DOCR
+        run: doctl registry login --expiry-seconds 1200
+
+      - name: Build and push frontend image
+        run: |
+          docker build -f frontend/Dockerfile -t "$FRONTEND_IMAGE:$IMAGE_TAG" \
+            --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
+            frontend
+          docker push "$FRONTEND_IMAGE:$IMAGE_TAG"
+          docker tag "$FRONTEND_IMAGE:$IMAGE_TAG" "$FRONTEND_IMAGE:latest"
+          docker push "$FRONTEND_IMAGE:latest"
+
+      - name: Build and push backend image
+        run: |
+          docker build -f backend/Dockerfile -t "$BACKEND_IMAGE:$IMAGE_TAG" backend
+          docker push "$BACKEND_IMAGE:$IMAGE_TAG"
+          docker tag "$BACKEND_IMAGE:$IMAGE_TAG" "$BACKEND_IMAGE:latest"
+          docker push "$BACKEND_IMAGE:latest"
+
+  deploy-frontend:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy frontend
+        env:
+          DROPLET_IP: ${{ secrets.DROPLET_FRONTEND_IP }}
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          set -e
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/frontend"
+          scp -o StrictHostKeyChecking=no deploy/frontend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/frontend/docker-compose.yml
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/frontend/.env <<'EOF'
+          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
+          DOCR_REPO_FRONTEND=${{ secrets.DOCR_REPO_FRONTEND }}
+          IMAGE_TAG=${{ github.sha }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/frontend/app.env <<'EOF'
+          NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/frontend && docker compose pull && docker compose up -d --remove-orphans"
+
+  deploy-backend:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy backend
+        env:
+          DROPLET_IP: ${{ secrets.DROPLET_BACKEND_IP }}
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          set -e
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/backend"
+          scp -o StrictHostKeyChecking=no deploy/backend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/backend/docker-compose.yml
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/backend/.env <<'EOF'
+          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
+          DOCR_REPO_BACKEND=${{ secrets.DOCR_REPO_BACKEND }}
+          IMAGE_TAG=${{ github.sha }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/backend/app.env <<'EOF'
+          PORT=7000
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          DATABASE_USER=${{ secrets.DATABASE_USER }}
+          DATABASE_PASSWORD=${{ secrets.DATABASE_PASSWORD }}
+          CORS_ALLOWED_ORIGINS=${{ secrets.CORS_ALLOWED_ORIGINS }}
+          FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+          SESSION_DAYS=${{ secrets.SESSION_DAYS }}
+          STATIC_OTP=${{ secrets.STATIC_OTP }}
+          POSTMARK_API_TOKEN=${{ secrets.POSTMARK_API_TOKEN }}
+          POSTMARK_FROM_EMAIL=${{ secrets.POSTMARK_FROM_EMAIL }}
+          JIRA_CLIENT_ID=${{ secrets.JIRA_CLIENT_ID }}
+          JIRA_CLIENT_SECRET=${{ secrets.JIRA_CLIENT_SECRET }}
+          JIRA_REDIRECT_URI=${{ secrets.JIRA_REDIRECT_URI }}
+          TESBO_ARTIFACT_STORAGE_PROVIDER=${{ secrets.TESBO_ARTIFACT_STORAGE_PROVIDER }}
+          TESBO_SPACES_ENDPOINT=${{ secrets.TESBO_SPACES_ENDPOINT }}
+          TESBO_SPACES_REGION=${{ secrets.TESBO_SPACES_REGION }}
+          TESBO_SPACES_BUCKET=${{ secrets.TESBO_SPACES_BUCKET }}
+          TESBO_SPACES_ACCESS_KEY=${{ secrets.TESBO_SPACES_ACCESS_KEY }}
+          TESBO_SPACES_SECRET_KEY=${{ secrets.TESBO_SPACES_SECRET_KEY }}
+          TESBO_SIGNED_URL_TTL_SECONDS=${{ secrets.TESBO_SIGNED_URL_TTL_SECONDS }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
