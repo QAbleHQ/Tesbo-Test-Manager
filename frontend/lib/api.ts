@@ -906,3 +906,311 @@ export async function listActivity(
     `/api/projects/${projectId}/activity${query ? `?${query}` : ""}`
   );
 }
+
+// ── Tesbo Reports module ──────────────────────────────────────────────────────
+
+export interface TesboRunSummary {
+  id: string;
+  projectId: string;
+  name: string;
+  status: string;
+  branchName?: string | null;
+  pullRequest?: string | null;
+  commitAuthor?: string | null;
+  runNumber?: string | null;
+  sourceType?: string | null;
+  githubRunId?: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+}
+
+export interface TesboRunCase {
+  caseId: string;
+  specName?: string | null;
+  title: string;
+  fullTitle?: string | null;
+  status: string;
+  durationMs: number | null;
+  traceUrl: string | null;
+  screenshotUrl: string | null;
+  videoUrl: string | null;
+  errorMessage?: string | null;
+  errorStack?: string | null;
+  attempt?: number | null;
+  projectName?: string | null;
+  browserName?: string | null;
+  browserVersion?: string | null;
+  osName?: string | null;
+  osPlatform?: string | null;
+  osArch?: string | null;
+  tags?: string[];
+  steps?: Array<{
+    description?: string;
+    status?: string;
+    durationMs?: number;
+  }>;
+}
+
+export interface TesboRunDetail extends TesboRunSummary {
+  specCount: number;
+  cases: TesboRunCase[];
+}
+
+export interface TesboPublicRunDetail extends TesboRunDetail {
+  shareEnabled: boolean;
+}
+
+export interface TesboSpecSummary {
+  specName: string;
+  totalRuns: number;
+  latestRunAt: string | null;
+  passed: number;
+  failed: number;
+  skipped: number;
+}
+
+export interface TesboSpecDetail {
+  specName: string;
+  tests: {
+    testName: string;
+    latestStatus: string | null;
+    totalRuns: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+  }[];
+}
+
+export interface TesboProjectTest {
+  specName: string;
+  testName: string;
+  latestStatus: string | null;
+  latestRunAt: string | null;
+  totalRuns: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+}
+
+export interface TesboAnalytics {
+  totalRuns: number;
+  totalTests: number;
+  passRate: number;
+  byStatus: Record<string, number>;
+  runsByDay: { day: string; count: number }[];
+}
+
+export interface TesboAlertRule {
+  id: string;
+  name: string;
+  conditionType: "FAILURE_RATIO" | "PASS_RATIO" | "BUILD_UPDATE";
+  comparator: "GREATER_THAN" | "GREATER_OR_EQUAL";
+  threshold: number | null;
+  recipients: string[];
+  frequency: "IMMEDIATE" | "DAILY";
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TesboShareState {
+  enabled: boolean;
+  token: string | null;
+  publicUrl: string | null;
+}
+
+export interface TesboSettings {
+  keepTrace: boolean;
+  traceRetentionDays: number;
+  ingestionApiKey: string;
+  alertsEnabled: boolean;
+  shareByDefault: boolean;
+}
+
+export async function listTesboRuns(projectId: string): Promise<TesboRunSummary[]> {
+  return api<TesboRunSummary[]>(`/api/projects/${projectId}/tesbo-reports/runs`);
+}
+
+export async function getTesboRun(projectId: string, runId: string): Promise<TesboRunDetail> {
+  return api<TesboRunDetail>(`/api/projects/${projectId}/tesbo-reports/runs/${runId}`);
+}
+
+export async function listTesboSpecs(projectId: string): Promise<TesboSpecSummary[]> {
+  return api<TesboSpecSummary[]>(`/api/projects/${projectId}/tesbo-reports/specs`);
+}
+
+export async function getTesboSpec(projectId: string, specName: string): Promise<TesboSpecDetail> {
+  return api<TesboSpecDetail>(
+    `/api/projects/${projectId}/tesbo-reports/specs/${encodeURIComponent(specName)}`
+  );
+}
+
+export async function getTesboTestHistory(
+  projectId: string,
+  specName: string,
+  testName: string
+): Promise<{
+  specName: string;
+  testName: string;
+  runs: { runId: string; runName: string; status: string; executedAt: string | null }[];
+}> {
+  return api(
+    `/api/projects/${projectId}/tesbo-reports/specs/${encodeURIComponent(specName)}/tests/${encodeURIComponent(testName)}`
+  );
+}
+
+export async function listTesboTests(projectId: string): Promise<TesboProjectTest[]> {
+  return api<TesboProjectTest[]>(`/api/projects/${projectId}/tesbo-reports/tests`);
+}
+
+export async function getTesboAnalytics(projectId: string): Promise<TesboAnalytics> {
+  return api<TesboAnalytics>(`/api/projects/${projectId}/tesbo-reports/analytics`);
+}
+
+export async function listTesboAlertRules(projectId: string): Promise<TesboAlertRule[]> {
+  return api<TesboAlertRule[]>(`/api/projects/${projectId}/tesbo-reports/alerts`);
+}
+
+export async function createTesboAlertRule(
+  projectId: string,
+  body: Omit<TesboAlertRule, "id" | "createdAt" | "updatedAt">
+): Promise<TesboAlertRule> {
+  return api<TesboAlertRule>(`/api/projects/${projectId}/tesbo-reports/alerts`, {
+    method: "POST",
+    body,
+  });
+}
+
+export async function updateTesboAlertRule(
+  projectId: string,
+  alertId: string,
+  body: Omit<TesboAlertRule, "id" | "createdAt" | "updatedAt">
+): Promise<TesboAlertRule> {
+  return api<TesboAlertRule>(`/api/projects/${projectId}/tesbo-reports/alerts/${alertId}`, {
+    method: "PUT",
+    body,
+  });
+}
+
+export async function deleteTesboAlertRule(projectId: string, alertId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/tesbo-reports/alerts/${alertId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function toggleTesboAlertRule(
+  projectId: string,
+  alertId: string,
+  enabled: boolean
+): Promise<TesboAlertRule> {
+  return api<TesboAlertRule>(`/api/projects/${projectId}/tesbo-reports/alerts/${alertId}/toggle`, {
+    method: "POST",
+    body: { enabled },
+  });
+}
+
+export async function sendTesboAlertTest(projectId: string, alertId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/tesbo-reports/alerts/${alertId}/send-test`, {
+    method: "POST",
+  });
+}
+
+export async function getTesboRunShare(projectId: string, runId: string): Promise<TesboShareState> {
+  return api<TesboShareState>(`/api/projects/${projectId}/tesbo-reports/runs/${runId}/share`);
+}
+
+export async function createTesboRunShare(
+  projectId: string,
+  runId: string,
+  expiresInHours = 168
+): Promise<TesboShareState> {
+  return api<TesboShareState>(`/api/projects/${projectId}/tesbo-reports/runs/${runId}/share`, {
+    method: "POST",
+    body: { expiresInHours },
+  });
+}
+
+export async function disableTesboRunShare(projectId: string, runId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/tesbo-reports/runs/${runId}/share`, {
+    method: "DELETE",
+  });
+}
+
+export async function getPublicTesboRun(token: string): Promise<TesboPublicRunDetail> {
+  return api<TesboPublicRunDetail>(`/api/public/tesbo-reports/${token}`);
+}
+
+export async function getTesboSettings(projectId: string): Promise<TesboSettings> {
+  return api<TesboSettings>(`/api/projects/${projectId}/tesbo-reports/settings`);
+}
+
+export async function updateTesboSettings(
+  projectId: string,
+  body: Partial<TesboSettings>
+): Promise<TesboSettings> {
+  return api<TesboSettings>(`/api/projects/${projectId}/tesbo-reports/settings`, {
+    method: "PUT",
+    body,
+  });
+}
+
+export async function rotateTesboIngestionKey(projectId: string): Promise<{ ingestionApiKey: string }> {
+  return api<{ ingestionApiKey: string }>(`/api/projects/${projectId}/tesbo-reports/settings/rotate-key`, {
+    method: "POST",
+  });
+}
+
+export async function ingestTesboPlaywright(projectId: string, payload: unknown): Promise<{ runId: string }> {
+  return api<{ runId: string }>(`/api/projects/${projectId}/tesbo-reports/ingest/playwright`, {
+    method: "POST",
+    body: { payload },
+  });
+}
+
+export async function ingestTesboPlaywrightUpload(projectId: string, file: File): Promise<{ runId: string }> {
+  const form = new FormData();
+  form.append("result", file);
+  const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+  const res = await fetch(`${BASE_URL}/api/projects/${projectId}/tesbo-reports/ingest/playwright/upload`, {
+    method: "POST",
+    credentials: "include",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to upload Tesbo result file");
+  }
+  return res.json() as Promise<{ runId: string }>;
+}
+
+export async function uploadTesboCaseArtifact(
+  projectId: string,
+  runId: string,
+  caseId: string,
+  kind: "trace" | "screenshot" | "video",
+  file: File
+): Promise<{ caseId: string; kind: string; url: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+  const res = await fetch(
+    `${BASE_URL}/api/projects/${projectId}/tesbo-reports/runs/${runId}/cases/${caseId}/artifacts/${kind}/upload`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: form,
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to upload Tesbo artifact");
+  }
+  return res.json() as Promise<{ caseId: string; kind: string; url: string }>;
+}

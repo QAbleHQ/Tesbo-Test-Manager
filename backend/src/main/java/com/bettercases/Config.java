@@ -40,6 +40,15 @@ public final class Config {
     public static final String UPLOAD_DIR = getEnv("UPLOAD_DIR", "./uploads");
     public static final long MAX_UPLOAD_SIZE = Long.parseLong(getEnv("MAX_UPLOAD_SIZE", "10485760")); // 10MB
 
+    // Tesbo artifact storage configuration
+    public static final String TESBO_ARTIFACT_STORAGE_PROVIDER = getEnv("TESBO_ARTIFACT_STORAGE_PROVIDER", "local").trim().toLowerCase();
+    public static final String TESBO_SPACES_ENDPOINT = getEnv("TESBO_SPACES_ENDPOINT", "").trim();
+    public static final String TESBO_SPACES_REGION = getEnv("TESBO_SPACES_REGION", "us-east-1").trim();
+    public static final String TESBO_SPACES_BUCKET = getEnv("TESBO_SPACES_BUCKET", "").trim();
+    public static final String TESBO_SPACES_ACCESS_KEY = getEnv("TESBO_SPACES_ACCESS_KEY", "").trim();
+    public static final String TESBO_SPACES_SECRET_KEY = getEnv("TESBO_SPACES_SECRET_KEY", "").trim();
+    public static final int TESBO_SIGNED_URL_TTL_SECONDS = Integer.parseInt(getEnv("TESBO_SIGNED_URL_TTL_SECONDS", "600"));
+
     private static Map<String, String> loadDotEnv() {
         Map<String, String> map = new HashMap<>();
         for (Path dir : new Path[]{
