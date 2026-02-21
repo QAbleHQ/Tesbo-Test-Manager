@@ -19,4 +19,8 @@
     <include file="changes/V13_testcase_jira_link.sql" relativeToChangelogFile="true"/>
     <include file="changes/V14_knowledge_base_items.sql" relativeToChangelogFile="true"/>
     <include file="changes/V15_audit_logs_project_id.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V16_tesbo_reports.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V17_tesbo_run_metadata.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V18_tesbo_artifact_storage_keys.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V19_tesbo_case_detail_fields.sql" relativeToChangelogFile="true"/>
 </databaseChangeLog>

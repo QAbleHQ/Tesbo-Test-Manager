@@ -48,7 +48,7 @@ export default function PlansPage() {
         return;
       }
       listPlans(projectId)
-        .then((data) => setPlans(data as PlanListItem[]))
+        .then((data) => setPlans(data as unknown as PlanListItem[]))
         .catch(() => router.replace("/projects"))
         .finally(() => setLoading(false));
     });

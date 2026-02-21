@@ -34,6 +34,9 @@
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/reporting/ReportingHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/suite/SuiteHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/suite/SuiteService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/tesbo/TesboArtifactStorageService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/tesbo/TesboReportsHandler.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/tesbo/TesboReportsService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/testcase/BulkUpdateHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/testcase/TestCaseHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/testcase/TestCaseService.java
