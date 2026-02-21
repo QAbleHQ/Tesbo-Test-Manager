@@ -3,6 +3,7 @@
 
 # Backend build output
 /backend/target/
+*.class
 
 # Runtime logs and lock files
 /backend/logs/*.log
