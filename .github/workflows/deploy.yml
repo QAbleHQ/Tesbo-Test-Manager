@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
 env:
-  FRONTEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_FRONTEND }}
-  BACKEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_BACKEND }}
+  DOCR_REGISTRY: ${{ secrets.DOCR_REGISTRY }}
+  DOCR_REPO_FRONTEND: ${{ secrets.DOCR_REPO_FRONTEND }}
+  DOCR_REPO_BACKEND: ${{ secrets.DOCR_REPO_BACKEND }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
@@ -28,16 +29,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          FRONTEND_IMAGE_CLEAN="$(echo "${FRONTEND_IMAGE}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/*$##; s/[[:space:]]+$//')"
+          DOCR_REGISTRY_CLEAN="$(echo "${DOCR_REGISTRY}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          DOCR_REPO_FRONTEND_CLEAN="$(echo "${DOCR_REPO_FRONTEND}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^/+##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          FRONTEND_IMAGE_CLEAN="${DOCR_REGISTRY_CLEAN}/${DOCR_REPO_FRONTEND_CLEAN}"
           IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
 
-          if [[ -z "${FRONTEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
-            echo "FRONTEND_IMAGE or IMAGE_TAG is empty after normalization."
+          if [[ -z "${DOCR_REGISTRY_CLEAN}" || -z "${DOCR_REPO_FRONTEND_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "DOCR_REGISTRY, DOCR_REPO_FRONTEND, or IMAGE_TAG is empty after normalization."
             exit 1
           fi
 
-          if ! [[ "${FRONTEND_IMAGE_CLEAN}" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
-            echo "Invalid FRONTEND_IMAGE after normalization: ${FRONTEND_IMAGE_CLEAN}"
+          if ! [[ "${DOCR_REGISTRY_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REGISTRY after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REPO_FRONTEND_CLEAN}" =~ ^[a-z0-9._-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REPO_FRONTEND after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${FRONTEND_IMAGE_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+$ ]]; then
+            echo "Invalid FRONTEND_IMAGE after normalization."
             exit 1
           fi
 
@@ -57,16 +70,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          BACKEND_IMAGE_CLEAN="$(echo "${BACKEND_IMAGE}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/*$##; s/[[:space:]]+$//')"
+          DOCR_REGISTRY_CLEAN="$(echo "${DOCR_REGISTRY}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          DOCR_REPO_BACKEND_CLEAN="$(echo "${DOCR_REPO_BACKEND}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^/+##; s#^[[:space:]]+##; s#[[:space:]]+$##; s#/*$##')"
+          BACKEND_IMAGE_CLEAN="${DOCR_REGISTRY_CLEAN}/${DOCR_REPO_BACKEND_CLEAN}"
           IMAGE_TAG_CLEAN="$(echo "${IMAGE_TAG}" | tr -d '[:space:]')"
 
-          if [[ -z "${BACKEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
-            echo "BACKEND_IMAGE or IMAGE_TAG is empty after normalization."
+          if [[ -z "${DOCR_REGISTRY_CLEAN}" || -z "${DOCR_REPO_BACKEND_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "DOCR_REGISTRY, DOCR_REPO_BACKEND, or IMAGE_TAG is empty after normalization."
             exit 1
           fi
 
-          if ! [[ "${BACKEND_IMAGE_CLEAN}" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
-            echo "Invalid BACKEND_IMAGE after normalization: ${BACKEND_IMAGE_CLEAN}"
+          if ! [[ "${DOCR_REGISTRY_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REGISTRY after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${DOCR_REPO_BACKEND_CLEAN}" =~ ^[a-z0-9._-]+(/[a-z0-9._-]+)*$ ]]; then
+            echo "Invalid DOCR_REPO_BACKEND after normalization."
+            exit 1
+          fi
+
+          if ! [[ "${BACKEND_IMAGE_CLEAN}" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+$ ]]; then
+            echo "Invalid BACKEND_IMAGE after normalization."
             exit 1
           fi
 
