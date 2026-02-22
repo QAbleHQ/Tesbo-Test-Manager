@@ -1,6 +1,6 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
-type RequestInitWithBody = RequestInit & { body?: object };
+type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
 export async function api<T = unknown>(
   path: string,
@@ -1176,7 +1176,7 @@ export async function ingestTesboPlaywrightUpload(projectId: string, file: File)
   const form = new FormData();
   form.append("result", file);
   const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
-  const res = await fetch(`${BASE_URL}/api/projects/${projectId}/tesbo-reports/ingest/playwright/upload`, {
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}/tesbo-reports/ingest/playwright/upload`, {
     method: "POST",
     credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
@@ -1200,7 +1200,7 @@ export async function uploadTesboCaseArtifact(
   form.append("file", file);
   const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
   const res = await fetch(
-    `${BASE_URL}/api/projects/${projectId}/tesbo-reports/runs/${runId}/cases/${caseId}/artifacts/${kind}/upload`,
+    `${API_BASE}/api/projects/${projectId}/tesbo-reports/runs/${runId}/cases/${caseId}/artifacts/${kind}/upload`,
     {
       method: "POST",
       credentials: "include",

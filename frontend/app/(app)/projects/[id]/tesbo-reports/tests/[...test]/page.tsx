@@ -112,6 +112,9 @@ export default function TesboTestDetailPage() {
     setShowTraceViewer(false);
   }, [selectedRunId]);
 
+  const selectedRun = selectedRunId ? runsById[selectedRunId] || null : null;
+  const selectedCase = selectedRunId ? casesByRunId[selectedRunId] || null : null;
+
   useEffect(() => {
     if (!isDetailPopupOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -192,8 +195,6 @@ export default function TesboTestDetailPage() {
     };
   }, [isDetailPopupOpen, selectedCase]);
 
-  const selectedRun = selectedRunId ? runsById[selectedRunId] || null : null;
-  const selectedCase = selectedRunId ? casesByRunId[selectedRunId] || null : null;
   const screenshotUrl = selectedCase?.screenshotUrl ? toAbsoluteArtifactUrl(selectedCase.screenshotUrl) : null;
   const videoUrl = selectedCase?.videoUrl ? toAbsoluteArtifactUrl(selectedCase.videoUrl) : null;
   const traceUrl = selectedCase?.traceUrl ? toAbsoluteArtifactUrl(selectedCase.traceUrl) : null;

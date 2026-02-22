@@ -106,10 +106,12 @@ export default function ProjectSettingsPage() {
         const ai = parsedSettings.ai;
         const aiProvider = ai?.provider === "anthropic" ? "anthropic" : "openai";
         const options = modelOptionsFor(aiProvider);
+        const optionList: readonly string[] = options;
+        const aiModel = typeof ai?.model === "string" ? ai.model : "";
         const resolvedModel =
-          ai?.model && options.includes(ai.model as (typeof options)[number])
-            ? ai.model
-            : options[0];
+          aiModel && optionList.includes(aiModel)
+            ? aiModel
+            : optionList[0] ?? "";
         setProvider(aiProvider);
         setModel(resolvedModel);
         setOpenAiApiKey(ai?.openAiApiKey ?? "");
