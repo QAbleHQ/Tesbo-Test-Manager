@@ -28,20 +28,36 @@ jobs:
       - name: Build and push frontend image
         run: |
           set -euo pipefail
-          docker build -f frontend/Dockerfile -t "${FRONTEND_IMAGE}:${IMAGE_TAG}" \
+          FRONTEND_IMAGE_CLEAN="$(printf '%s' "${FRONTEND_IMAGE}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+
+          if [[ -z "${FRONTEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "FRONTEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
             --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
             frontend
-          docker push "${FRONTEND_IMAGE}:${IMAGE_TAG}"
-          docker tag "${FRONTEND_IMAGE}:${IMAGE_TAG}" "${FRONTEND_IMAGE}:latest"
-          docker push "${FRONTEND_IMAGE}:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${FRONTEND_IMAGE_CLEAN}:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:latest"
 
       - name: Build and push backend image
         run: |
           set -euo pipefail
-          docker build -f backend/Dockerfile -t "${BACKEND_IMAGE}:${IMAGE_TAG}" backend
-          docker push "${BACKEND_IMAGE}:${IMAGE_TAG}"
-          docker tag "${BACKEND_IMAGE}:${IMAGE_TAG}" "${BACKEND_IMAGE}:latest"
-          docker push "${BACKEND_IMAGE}:latest"
+          BACKEND_IMAGE_CLEAN="$(printf '%s' "${BACKEND_IMAGE}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+
+          if [[ -z "${BACKEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "BACKEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" backend
+          docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
+          docker push "${BACKEND_IMAGE_CLEAN}:latest"
 
   deploy-frontend:
     needs: build-and-push
