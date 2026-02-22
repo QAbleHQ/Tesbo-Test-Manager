@@ -20,6 +20,8 @@ type ProjectSettingsPayload = {
   ai?: {
     provider?: "openai" | "anthropic";
     model?: string;
+    openAiApiKey?: string;
+    anthropicApiKey?: string;
   };
   jiraAutoComment?: boolean;
   jiraTicketSelector?: boolean;
@@ -47,6 +49,7 @@ export default function AiTestScriptGenerationPage() {
   const [generating, setGenerating] = useState(false);
   const [projectProvider, setProjectProvider] = useState<"openai" | "anthropic">("openai");
   const [projectModel, setProjectModel] = useState("");
+  const [hasLlmKey, setHasLlmKey] = useState(true);
   const [suiteId, setSuiteId] = useState("");
   const [suites, setSuites] = useState<SuiteNode[]>([]);
 
@@ -110,6 +113,11 @@ export default function AiTestScriptGenerationPage() {
           const provider = settings.ai?.provider === "anthropic" ? "anthropic" : "openai";
           setProjectProvider(provider);
           setProjectModel(settings.ai?.model ?? "");
+          const hasConfiguredKey =
+            provider === "openai"
+              ? Boolean(settings.ai?.openAiApiKey?.trim())
+              : Boolean(settings.ai?.anthropicApiKey?.trim());
+          setHasLlmKey(hasConfiguredKey);
           setSuites(suiteList);
 
           const autoComment = settings.jiraAutoComment === true;
@@ -148,6 +156,10 @@ export default function AiTestScriptGenerationPage() {
   }
 
   async function handleGenerate() {
+    if (!hasLlmKey) {
+      setError("Add your LLM API key in Project Settings before using AI generation.");
+      return;
+    }
     if (!storyDetails.trim()) {
       setError("Story or feature details are required.");
       return;
@@ -267,6 +279,11 @@ export default function AiTestScriptGenerationPage() {
       {error && (
         <p className="mb-4 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/40 dark:text-zinc-200">
           {error}
+        </p>
+      )}
+      {!hasLlmKey && (
+        <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-200">
+          Add your LLM API key in Project Settings {"->"} AI first to use AI generation.
         </p>
       )}
 
@@ -408,7 +425,7 @@ export default function AiTestScriptGenerationPage() {
                 <button
                   type="button"
                   onClick={() => void handleGenerate()}
-                  disabled={generating}
+                  disabled={generating || !hasLlmKey}
                   className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
                 >
                   {generating ? "Generating..." : "Generate test cases"}

@@ -17,13 +17,12 @@ public final class OtpService {
     private static final int OTP_LENGTH = 6;
     private final EmailService emailService = new EmailService();
 
-    /** Returns true if OTP was created and sent (or logged in dev). When STATIC_OTP is set, no email is sent. */
+    /** Returns true if OTP was created and email delivery was attempted. */
     public boolean requestOtp(String email, String ipAddress, String userAgent) {
         if (email == null || (email = email.trim().toLowerCase()).isEmpty()) return false;
         if (isRateLimited(email)) return false;
 
-        boolean useStaticOtp = !Config.STATIC_OTP.isEmpty();
-        String plainCode = useStaticOtp ? Config.STATIC_OTP : generateOtp();
+        String plainCode = generateOtp();
         String codeHash = hash(plainCode);
         Instant expiresAt = Instant.now().plusSeconds(Config.OTP_EXPIRY_MINUTES * 60L);
 
@@ -39,27 +38,17 @@ public final class OtpService {
         }
 
         recordOtpAttempt(email, false);
-        if (!useStaticOtp) {
-            emailService.sendOtp(email, plainCode);
-        }
+        emailService.sendOtp(email, plainCode);
         return true;
     }
 
-    /** Verifies OTP; returns session token if valid. OTP is single-use. When STATIC_OTP is set, that code is accepted for any email without DB lookup. */
+    /** Verifies OTP; returns session token if valid. OTP is single-use. */
     public Optional<String> verifyOtp(String email, String code, String ipAddress, String userAgent) {
         if (email == null || code == null) return Optional.empty();
         email = email.trim().toLowerCase();
         if (isRateLimited(email)) return Optional.empty();
 
         String trimmedCode = code.trim();
-        if (!Config.STATIC_OTP.isEmpty() && Config.STATIC_OTP.equals(trimmedCode)) {
-            Optional<UUID> userId = findOrCreateUser(email);
-            if (userId.isEmpty()) return Optional.empty();
-            String sessionToken = createSession(userId.get(), ipAddress, userAgent);
-            clearRateLimit(email);
-            return Optional.of(sessionToken);
-        }
-
         String codeHash = hash(trimmedCode);
         String selectSql = "SELECT id FROM otp_codes WHERE email = ? AND code_hash = ? AND expires_at > ? AND used_at IS NULL ORDER BY created_at DESC LIMIT 1";
         UUID otpId = null;

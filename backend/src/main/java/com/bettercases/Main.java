@@ -52,6 +52,7 @@ public final class Main {
         app.post("/api/auth/logout", AuthHandler::logout);
         app.get("/api/auth/me", AuthHandler::me);
 
+        app.post("/api/onboarding/workspace", OnboardingHandler::createWorkspace);
         app.post("/api/onboarding/org-and-project", OnboardingHandler::createOrgAndProject);
 
         app.get("/api/workspace", WorkspaceHandler::get);

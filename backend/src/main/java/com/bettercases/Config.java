@@ -22,8 +22,6 @@ public final class Config {
     public static final int OTP_EXPIRY_MINUTES = Integer.parseInt(getEnv("OTP_EXPIRY_MINUTES", "10"));
     public static final int OTP_MAX_ATTEMPTS = Integer.parseInt(getEnv("OTP_MAX_ATTEMPTS", "5"));
     public static final int OTP_RATE_LIMIT_WINDOW_MINUTES = Integer.parseInt(getEnv("OTP_RATE_LIMIT_WINDOW_MINUTES", "15"));
-    /** When set (e.g. "123456"), this OTP is accepted for any email without sending mail. For testing only. */
-    public static final String STATIC_OTP = getEnv("STATIC_OTP", "").trim();
     public static final int SESSION_DAYS = Integer.parseInt(getEnv("SESSION_DAYS", "30"));
     public static final String SESSION_COOKIE_NAME = "bettercases_session";
     public static final Set<String> CORS_ALLOWED_ORIGINS = parseCsv(

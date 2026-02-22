@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { authMe, listProjects, listTestCases, listSuites, createProject } from "@/lib/api";
 import type { ProjectSummary } from "@/lib/api";
@@ -14,6 +14,7 @@ type ProjectWithStats = ProjectSummary & {
 
 export default function ProjectsPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [projects, setProjects] = useState<ProjectWithStats[]>([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
@@ -22,6 +23,12 @@ export default function ProjectsPage() {
   const [createDescription, setCreateDescription] = useState("");
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
+
+  useEffect(() => {
+    if (searchParams.get("create") === "1") {
+      setCreateOpen(true);
+    }
+  }, [searchParams]);
 
   function loadProjects() {
     listProjects()
@@ -95,27 +102,26 @@ export default function ProjectsPage() {
         <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
           Projects
         </h1>
-        {projects.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setCreateOpen(true)}
-            className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
-          >
-            Create project
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => setCreateOpen(true)}
+          className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
+        >
+          {projects.length === 0 ? "Create your first project" : "Create project"}
+        </button>
       </div>
       {projects.length === 0 ? (
         <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/30 p-8 text-center">
           <p className="text-zinc-500">
-            No projects yet. Complete onboarding to create your first project.
+            No projects yet. Create your first project to complete onboarding.
           </p>
-          <Link
-            href="/onboarding"
-            className="mt-4 inline-block text-blue-600 dark:text-blue-400 hover:underline"
+          <button
+            type="button"
+            onClick={() => setCreateOpen(true)}
+            className="mt-4 inline-block rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
           >
-            Set up workspace
-          </Link>
+            Create first project
+          </button>
         </div>
       ) : null}
 

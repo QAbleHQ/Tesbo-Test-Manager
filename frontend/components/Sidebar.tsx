@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getProject } from "@/lib/api";
+import { getProject, logout } from "@/lib/api";
 
 const projectNavSections = [
   {
@@ -86,12 +86,15 @@ function Chevron({ open }: { open: boolean }) {
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const projectMatch = pathname?.match(/^\/projects\/([^/]+)/);
   const projectId = projectMatch?.[1] ?? null;
   const isInProject = Boolean(projectId);
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
   const [projectName, setProjectName] = useState<string | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   useEffect(() => {
     if (!projectId) return;
     let active = true;
@@ -113,6 +116,22 @@ export default function Sidebar() {
   const isProjectsListActive = pathname === "/projects";
   const isWorkspaceSettingsActive = pathname?.startsWith("/settings");
   const isInWorkspaceSettings = pathname?.startsWith("/settings");
+  const onLogout = async () => {
+    if (isLoggingOut) return;
+    setLogoutError(null);
+    setIsLoggingOut(true);
+    try {
+      await logout();
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("token");
+      }
+      router.replace("/login");
+      router.refresh();
+    } catch {
+      setLogoutError("Could not log out. Please try again.");
+      setIsLoggingOut(false);
+    }
+  };
 
   return (
     <aside className="w-56 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] dark:bg-zinc-900 flex flex-col min-h-screen">
@@ -229,6 +248,17 @@ export default function Sidebar() {
           )}
         </div>
       </nav>
+      <div className="p-3 border-t border-[var(--border)]">
+        <button
+          type="button"
+          onClick={onLogout}
+          disabled={isLoggingOut}
+          className="w-full rounded-lg px-3 py-2 text-sm text-left text-[var(--muted)] dark:text-zinc-300 hover:bg-[#eef7f0] dark:hover:bg-zinc-800 hover:text-[var(--primary)] dark:hover:text-zinc-100 disabled:opacity-60"
+        >
+          {isLoggingOut ? "Logging out..." : "Log out"}
+        </button>
+        {logoutError && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{logoutError}</p>}
+      </div>
     </aside>
   );
 }

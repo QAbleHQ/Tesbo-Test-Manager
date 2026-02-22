@@ -51,6 +51,19 @@ export interface OnboardingResponse {
   projectKey: string;
 }
 
+export interface CreateWorkspaceResponse {
+  organizationId: string;
+}
+
+export async function createWorkspace(data: {
+  orgName: string;
+}): Promise<CreateWorkspaceResponse> {
+  return api<CreateWorkspaceResponse>("/api/onboarding/workspace", {
+    method: "POST",
+    body: data,
+  });
+}
+
 export async function createOrgAndProject(data: {
   orgName: string;
   projectKey: string;

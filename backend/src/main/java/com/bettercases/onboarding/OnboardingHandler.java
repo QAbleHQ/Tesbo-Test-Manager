@@ -10,6 +10,43 @@ import java.util.Map;
 import java.util.UUID;
 
 public final class OnboardingHandler {
+    public static void createWorkspace(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        CreateWorkspaceRequest req = ctx.bodyAsClass(CreateWorkspaceRequest.class);
+        if (req == null || req.orgName == null || req.orgName.isBlank()) {
+            ctx.status(400).json(Map.of("error", "orgName required"));
+            return;
+        }
+        String orgName = req.orgName.trim();
+        String orgSlug = slugify(orgName);
+
+        try (Connection c = Database.getDataSource().getConnection()) {
+            c.setAutoCommit(false);
+            try {
+                UUID orgId = insertOrg(c, orgName, orgSlug);
+                insertOrgMember(c, orgId, userId, "owner");
+                c.commit();
+                try {
+                    AuditService.log(userId, "workspace_created", "organization", orgId.toString(), "{}", ctx.ip(), ctx.userAgent());
+                } catch (Exception auditEx) {
+                    System.err.println("Audit log failed (workspace creation still succeeded): " + auditEx.getMessage());
+                }
+                ctx.status(201).json(Map.of(
+                        "organizationId", orgId.toString()
+                ));
+            } catch (SQLException e) {
+                c.rollback();
+                if ("23505".equals(e.getSQLState())) {
+                    ctx.status(409).json(Map.of("error", "You already have a workspace. Go to Projects."));
+                    return;
+                }
+                throw new RuntimeException(e);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public static void createOrgAndProject(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         CreateRequest req = ctx.bodyAsClass(CreateRequest.class);
@@ -123,5 +160,9 @@ public final class OnboardingHandler {
         public String projectKey;
         public String projectName;
         public String projectDescription;
+    }
+
+    public static class CreateWorkspaceRequest {
+        public String orgName;
     }
 }

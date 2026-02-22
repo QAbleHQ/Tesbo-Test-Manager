@@ -126,7 +126,6 @@ jobs:
           CORS_ALLOWED_ORIGINS=${{ secrets.CORS_ALLOWED_ORIGINS }}
           FRONTEND_URL=${{ secrets.FRONTEND_URL }}
           SESSION_DAYS=${{ secrets.SESSION_DAYS }}
-          STATIC_OTP=${{ secrets.STATIC_OTP }}
           POSTMARK_API_TOKEN=${{ secrets.POSTMARK_API_TOKEN }}
           POSTMARK_FROM_EMAIL=${{ secrets.POSTMARK_FROM_EMAIL }}
           JIRA_CLIENT_ID=${{ secrets.JIRA_CLIENT_ID }}

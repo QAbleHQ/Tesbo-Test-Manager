@@ -19,7 +19,13 @@ public final class AuthHandler {
         }
         String ip = ctx.ip();
         String ua = ctx.userAgent();
-        boolean sent = otpService.requestOtp(email, ip, ua);
+        boolean sent;
+        try {
+            sent = otpService.requestOtp(email, ip, ua);
+        } catch (RuntimeException e) {
+            ctx.status(502).json(Map.of("error", "otp_delivery_failed"));
+            return;
+        }
         if (!sent) {
             ctx.status(429).json(Map.of("error", "rate_limited_or_invalid"));
             return;
