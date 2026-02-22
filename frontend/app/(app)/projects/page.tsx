@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { authMe, listProjects, listTestCases, listSuites, createProject } from "@/lib/api";
@@ -12,7 +12,7 @@ type ProjectWithStats = ProjectSummary & {
   suites: SuiteNode[];
 };
 
-export default function ProjectsPage() {
+function ProjectsPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [projects, setProjects] = useState<ProjectWithStats[]>([]);
@@ -247,5 +247,19 @@ export default function ProjectsPage() {
         </div>
       ) : null}
     </main>
+  );
+}
+
+export default function ProjectsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen flex items-center justify-center">
+          <p className="text-zinc-500">Loading…</p>
+        </div>
+      }
+    >
+      <ProjectsPageContent />
+    </Suspense>
   );
 }
