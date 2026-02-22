@@ -23,7 +23,7 @@ jobs:
           token: ${{ secrets.DO_API_TOKEN }}
 
       - name: Login to DOCR
-        run: doctl registry login --expiry-seconds 1200 --read-write
+        run: doctl registry login --expiry-seconds 1200
 
       - name: Build and push frontend image
         run: |
