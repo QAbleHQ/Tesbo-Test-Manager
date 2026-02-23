@@ -1,29 +1,37 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { requestOtp } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [email, setEmail] = useState("");
+  const searchParams = useSearchParams();
+  const redirect = searchParams.get("redirect");
+  const inviteEmail = searchParams.get("inviteEmail")?.trim().toLowerCase() || "";
+  const isInviteEmailLocked = Boolean(inviteEmail);
+  const [email, setEmail] = useState(inviteEmail);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [sent, setSent] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (!email.trim()) {
+    const emailToUse = (isInviteEmailLocked ? inviteEmail : email).trim().toLowerCase();
+    if (!emailToUse) {
       setError("Email is required");
       return;
     }
     setLoading(true);
     try {
-      await requestOtp(email.trim());
-      setSent(true);
-      router.push(`/verify-otp?email=${encodeURIComponent(email.trim())}`);
+      await requestOtp(emailToUse);
+      const qp = new URLSearchParams({ email: emailToUse });
+      if (redirect) qp.set("redirect", redirect);
+      if (isInviteEmailLocked) {
+        qp.set("inviteEmail", inviteEmail);
+        qp.set("lockEmail", "1");
+      }
+      router.push(`/verify-otp?${qp.toString()}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Request failed. You may be rate limited.");
     } finally {
@@ -51,8 +59,13 @@ export default function LoginPage() {
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
               className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
-              disabled={loading}
+              disabled={loading || isInviteEmailLocked}
             />
+            {isInviteEmailLocked && (
+              <p className="mt-1 text-xs text-zinc-500">
+                This invitation can only be accepted with this email address.
+              </p>
+            )}
           </div>
           {error && (
             <p className="text-sm text-red-600 dark:text-red-400">{error}</p>

@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { authMe, listProjects, listTestCases, listSuites, createProject } from "@/lib/api";
+import { authMe, listProjects, listTestCases, listSuites, createProject, getWorkspace } from "@/lib/api";
 import type { ProjectSummary } from "@/lib/api";
 import type { SuiteNode } from "@/lib/api";
 
@@ -23,33 +23,14 @@ function ProjectsPageContent() {
   const [createDescription, setCreateDescription] = useState("");
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
+  const [workspaceRole, setWorkspaceRole] = useState<string>("");
+  const canCreateProject = workspaceRole === "owner" || workspaceRole === "manager";
 
   useEffect(() => {
-    if (searchParams.get("create") === "1") {
+    if (canCreateProject && searchParams.get("create") === "1") {
       setCreateOpen(true);
     }
-  }, [searchParams]);
-
-  function loadProjects() {
-    listProjects()
-      .then(async (list) => {
-        const withStats = await Promise.all(
-          list.map(async (p) => {
-            const [tcRes, suites] = await Promise.all([
-              listTestCases(p.id, { limit: 1 }),
-              listSuites(p.id),
-            ]);
-            return {
-              ...p,
-              testCaseCount: tcRes.total,
-              suites,
-            };
-          })
-        );
-        setProjects(withStats);
-      })
-      .finally(() => setLoading(false));
-  }
+  }, [canCreateProject, searchParams]);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -57,13 +38,35 @@ function ProjectsPageContent() {
         router.replace("/login");
         return;
       }
-      loadProjects();
+      Promise.all([getWorkspace(), listProjects()])
+        .then(async ([workspace, list]) => {
+          setWorkspaceRole((workspace.role || "").toLowerCase());
+          const withStats = await Promise.all(
+            list.map(async (p) => {
+              const [tcRes, suites] = await Promise.all([
+                listTestCases(p.id, { limit: 1 }),
+                listSuites(p.id),
+              ]);
+              return {
+                ...p,
+                testCaseCount: tcRes.total,
+                suites,
+              };
+            })
+          );
+          setProjects(withStats);
+        })
+        .finally(() => setLoading(false));
     });
   }, [router]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setCreateError("");
+    if (!canCreateProject) {
+      setCreateError("Only workspace owner or manager can create projects.");
+      return;
+    }
     if (!createName.trim()) {
       setCreateError("Project name is required");
       return;
@@ -102,26 +105,32 @@ function ProjectsPageContent() {
         <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
           Projects
         </h1>
-        <button
-          type="button"
-          onClick={() => setCreateOpen(true)}
-          className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
-        >
-          {projects.length === 0 ? "Create your first project" : "Create project"}
-        </button>
+        {canCreateProject ? (
+          <button
+            type="button"
+            onClick={() => setCreateOpen(true)}
+            className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
+          >
+            {projects.length === 0 ? "Create your first project" : "Create project"}
+          </button>
+        ) : null}
       </div>
       {projects.length === 0 ? (
         <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/30 p-8 text-center">
           <p className="text-zinc-500">
-            No projects yet. Create your first project to complete onboarding.
+            {canCreateProject
+              ? "No projects yet. Create your first project to complete onboarding."
+              : "You do not have any project access yet. Your project manager will assign a project to you."}
           </p>
-          <button
-            type="button"
-            onClick={() => setCreateOpen(true)}
-            className="mt-4 inline-block rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
-          >
-            Create first project
-          </button>
+          {canCreateProject ? (
+            <button
+              type="button"
+              onClick={() => setCreateOpen(true)}
+              className="mt-4 inline-block rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
+            >
+              Create first project
+            </button>
+          ) : null}
         </div>
       ) : null}
 

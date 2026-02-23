@@ -438,6 +438,15 @@ export default function TesboTestDetailPage() {
                   <Stat label="Browser" value={selectedCase.browserName || "-"} />
                 </div>
 
+                {(selectedCase.errorMessage || selectedCase.errorStack) && (
+                  <div className="rounded-lg border border-rose-300 bg-rose-50 p-2 dark:bg-rose-900/20">
+                    {selectedCase.errorMessage && <p className="text-rose-700">{selectedCase.errorMessage}</p>}
+                    {selectedCase.errorStack && (
+                      <pre className="mt-2 whitespace-pre-wrap text-xs max-h-48 overflow-y-auto">{selectedCase.errorStack}</pre>
+                    )}
+                  </div>
+                )}
+
                 <div className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
                   <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Artifacts</p>
                   <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
@@ -523,15 +532,6 @@ export default function TesboTestDetailPage() {
                         <p className="text-xs text-zinc-500">Video preview unavailable.</p>
                       )}
                     </div>
-                  </div>
-                )}
-
-                {(selectedCase.errorMessage || selectedCase.errorStack) && (
-                  <div className="rounded-lg border border-rose-300 bg-rose-50 p-2 dark:bg-rose-900/20">
-                    {selectedCase.errorMessage && <p className="text-rose-700">{selectedCase.errorMessage}</p>}
-                    {selectedCase.errorStack && (
-                      <pre className="mt-2 whitespace-pre-wrap text-xs max-h-48 overflow-y-auto">{selectedCase.errorStack}</pre>
-                    )}
                   </div>
                 )}
 

@@ -9,7 +9,10 @@ function VerifyOtpForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const emailParam = searchParams.get("email") ?? "";
-  const [email, setEmail] = useState(emailParam);
+  const inviteEmail = searchParams.get("inviteEmail")?.trim().toLowerCase() || "";
+  const isInviteEmailLocked = searchParams.get("lockEmail") === "1" && Boolean(inviteEmail);
+  const redirectParam = searchParams.get("redirect");
+  const [email, setEmail] = useState(inviteEmail || emailParam);
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -17,14 +20,15 @@ function VerifyOtpForm() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (!email.trim() || !code.trim()) {
+    const emailToUse = (isInviteEmailLocked ? inviteEmail : email).trim().toLowerCase();
+    if (!emailToUse || !code.trim()) {
       setError("Email and code are required");
       return;
     }
     setLoading(true);
     try {
-      await verifyOtp(email.trim(), code.trim());
-      router.push("/onboarding");
+      await verifyOtp(emailToUse, code.trim());
+      router.push(redirectParam || "/onboarding");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Invalid or expired code");
@@ -51,8 +55,13 @@ function VerifyOtpForm() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
-              disabled={loading}
+              disabled={loading || isInviteEmailLocked}
             />
+            {isInviteEmailLocked && (
+              <p className="mt-1 text-xs text-zinc-500">
+                This invitation can only be accepted with this email address.
+              </p>
+            )}
           </div>
           <div>
             <label htmlFor="code" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">

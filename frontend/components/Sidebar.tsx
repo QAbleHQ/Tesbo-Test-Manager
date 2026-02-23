@@ -45,6 +45,7 @@ const projectNavSections = [
 const workspaceSettingsNavItems = [
   { href: "/settings", label: "General" },
   { href: "/settings/members", label: "Members" },
+  { href: "/settings/project-access", label: "Project access" },
   { href: "/settings/integrations", label: "Integrations" },
 ] as const;
 

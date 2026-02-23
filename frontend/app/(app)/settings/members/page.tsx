@@ -1,15 +1,17 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   authMe,
   getWorkspace,
   listWorkspaceMembers,
+  listWorkspaceInvitations,
   addWorkspaceMember,
   removeWorkspaceMember,
+  revokeWorkspaceInvitation,
 } from "@/lib/api";
-import type { WorkspaceMember as WorkspaceMemberType } from "@/lib/api";
+import type { WorkspaceInvitation, WorkspaceMember as WorkspaceMemberType } from "@/lib/api";
 
 export default function WorkspaceMembersPage() {
   const router = useRouter();
@@ -19,19 +21,24 @@ export default function WorkspaceMembersPage() {
   const [adding, setAdding] = useState(false);
   const [newEmail, setNewEmail] = useState("");
   const [newRole, setNewRole] = useState("member");
+  const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
+  const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const [revokingInviteId, setRevokingInviteId] = useState<string | null>(null);
 
-  function load() {
+  const load = useCallback(() => {
     authMe().then((me) => {
       if (!me) {
         router.replace("/login");
         return;
       }
       Promise.all([getWorkspace(), listWorkspaceMembers()])
-        .then(([ws, list]) => {
+        .then(async ([ws, list]) => {
           setWorkspace(ws);
           setMembers(list);
+          const pendingInvites = await listWorkspaceInvitations().catch(() => []);
+          setInvitations(pendingInvites);
         })
         .catch((e) => {
           const msg = e.message || "";
@@ -40,14 +47,15 @@ export default function WorkspaceMembersPage() {
         })
         .finally(() => setLoading(false));
     });
-  }
+  }, [router]);
 
   useEffect(() => {
     load();
-  }, [router]);
+  }, [load]);
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
+    setMessage("");
     setError("");
     if (!newEmail.trim()) {
       setError("Enter an email address");
@@ -57,6 +65,7 @@ export default function WorkspaceMembersPage() {
     try {
       await addWorkspaceMember({ email: newEmail.trim(), role: newRole });
       setNewEmail("");
+      setMessage("Member added or invitation sent.");
       load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add member");
@@ -66,6 +75,7 @@ export default function WorkspaceMembersPage() {
   }
 
   async function handleRemove(userId: string) {
+    setMessage("");
     setRemovingId(userId);
     try {
       await removeWorkspaceMember(userId);
@@ -74,6 +84,20 @@ export default function WorkspaceMembersPage() {
       setError(err instanceof Error ? err.message : "Failed to remove");
     } finally {
       setRemovingId(null);
+    }
+  }
+
+  async function handleRevokeInvitation(invitationId: string) {
+    setMessage("");
+    setRevokingInviteId(invitationId);
+    try {
+      await revokeWorkspaceInvitation(invitationId);
+      setInvitations((prev) => prev.filter((inv) => inv.id !== invitationId));
+      setMessage("Invitation revoked.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to revoke invitation");
+    } finally {
+      setRevokingInviteId(null);
     }
   }
 
@@ -123,6 +147,7 @@ export default function WorkspaceMembersPage() {
             disabled={adding}
           >
             <option value="member">Member</option>
+            <option value="manager">Manager</option>
             <option value="admin">Admin</option>
             <option value="owner">Owner</option>
           </select>
@@ -132,16 +157,48 @@ export default function WorkspaceMembersPage() {
           disabled={adding}
           className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
         >
-          {adding ? "Adding…" : "Add member"}
+          {adding ? "Sending…" : "Add member / Send invite"}
         </button>
       </form>
       <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-        They must have signed in at least once. Allocate them to specific projects from each project’s Members page.
+        Existing users are added immediately. New emails receive an invite link to join this workspace.
       </p>
 
+      {message && (
+        <p className="mt-3 text-sm text-emerald-600 dark:text-emerald-400">{message}</p>
+      )}
       {error && (
         <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>
       )}
+
+      <section className="mt-8">
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Pending invitations</h2>
+        {invitations.length === 0 ? (
+          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">No pending invitations.</p>
+        ) : (
+          <ul className="mt-3 divide-y divide-zinc-200 dark:divide-zinc-700">
+            {invitations.map((inv) => (
+              <li key={inv.id} className="py-3 flex items-center justify-between gap-4">
+                <div>
+                  <span className="font-medium text-zinc-900 dark:text-zinc-100">{inv.email}</span>
+                  <span className="ml-2 text-sm text-zinc-500 dark:text-zinc-400 capitalize">{inv.role}</span>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Expires {new Date(inv.expiresAt).toLocaleDateString()}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleRevokeInvitation(inv.id)}
+                  disabled={revokingInviteId === inv.id}
+                  className="text-sm text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                >
+                  {revokingInviteId === inv.id ? "Revoking…" : "Revoke"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <ul className="mt-6 divide-y divide-zinc-200 dark:divide-zinc-700">
         {members.map((m) => (

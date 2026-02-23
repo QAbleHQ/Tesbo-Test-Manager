@@ -81,6 +81,7 @@ export interface WorkspaceInfo {
   id: string;
   name: string;
   slug: string;
+  role?: string;
   createdAt: string;
 }
 
@@ -106,6 +107,81 @@ export async function addWorkspaceMember(data: { email?: string; userId?: string
 
 export async function removeWorkspaceMember(userId: string): Promise<void> {
   await api(`/api/workspace/members/${userId}`, { method: "DELETE" });
+}
+
+export interface WorkspaceInvitation {
+  id: string;
+  email: string;
+  role: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export async function listWorkspaceInvitations(): Promise<WorkspaceInvitation[]> {
+  return api<WorkspaceInvitation[]>("/api/workspace/invitations");
+}
+
+export async function createWorkspaceInvitation(data: { email: string; role?: string }): Promise<WorkspaceInvitation> {
+  return api<WorkspaceInvitation>("/api/workspace/invitations", { method: "POST", body: data });
+}
+
+export async function revokeWorkspaceInvitation(invitationId: string): Promise<void> {
+  await api(`/api/workspace/invitations/${invitationId}`, { method: "DELETE" });
+}
+
+export interface InviteDetails {
+  id: string;
+  organizationId: string | null;
+  projectId: string | null;
+  organizationName: string | null;
+  projectName: string | null;
+  email: string;
+  role: string;
+  expiresAt: string;
+  acceptedAt: string | null;
+  createdAt: string;
+  status: "pending" | "accepted" | "expired";
+}
+
+export async function getInvitationByToken(token: string): Promise<InviteDetails> {
+  return api<InviteDetails>(`/api/invitations/${token}`);
+}
+
+export async function acceptInvitation(token: string): Promise<{ accepted: boolean; organizationId: string | null; projectId: string | null }> {
+  return api<{ accepted: boolean; organizationId: string | null; projectId: string | null }>(`/api/invitations/${token}/accept`, {
+    method: "POST",
+  });
+}
+
+export interface WorkspaceProjectAccessMember {
+  userId: string;
+  email: string;
+  name: string;
+  workspaceRole: string;
+  projectRoles: Record<string, string>;
+}
+
+export interface WorkspaceProjectInfo {
+  id: string;
+  key: string;
+  name: string;
+}
+
+export interface WorkspaceProjectAccessMatrix {
+  projects: WorkspaceProjectInfo[];
+  members: WorkspaceProjectAccessMember[];
+}
+
+export async function getWorkspaceProjectAccess(): Promise<WorkspaceProjectAccessMatrix> {
+  return api<WorkspaceProjectAccessMatrix>("/api/workspace/project-access");
+}
+
+export async function setWorkspaceProjectAccess(data: { projectId: string; userId: string; role: string }): Promise<void> {
+  await api("/api/workspace/project-access", { method: "PUT", body: data });
+}
+
+export async function removeWorkspaceProjectAccess(data: { projectId: string; userId: string }): Promise<void> {
+  await api("/api/workspace/project-access", { method: "DELETE", body: data });
 }
 
 // Projects
