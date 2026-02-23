@@ -18,6 +18,8 @@
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/export/ExportHandler.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/invitation/InvitationHandler.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/invitation/InvitationService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/jira/JiraHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/jira/JiraService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/knowledgebase/KnowledgeBaseHandler.java

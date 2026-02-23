@@ -116,7 +116,8 @@ public final class ProjectService {
 
     public static List<Map<String, Object>> listMembers(UUID projectId, UUID userId) {
         RbacService.requireProjectRole(userId, projectId);
-        String sql = "SELECT u.id, u.email, u.name, pm.role, pm.created_at FROM project_members pm JOIN users u ON pm.user_id = u.id WHERE pm.project_id = ? ORDER BY pm.created_at";
+        String sql = "SELECT u.id AS user_id, u.email AS user_email, u.name AS user_name, pm.role AS member_role, pm.created_at AS joined_at " +
+                "FROM project_members pm JOIN users u ON pm.user_id = u.id WHERE pm.project_id = ? ORDER BY pm.created_at";
         List<Map<String, Object>> out = new ArrayList<>();
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -124,11 +125,11 @@ public final class ProjectService {
             ResultSet rs = ps.executeQuery();
             while (rs.next()) {
                 out.add(Map.of(
-                        "userId", rs.getObject("u.id").toString(),
-                        "email", rs.getString("u.email"),
-                        "name", rs.getString("u.name") != null ? rs.getString("u.name") : "",
-                        "role", rs.getString("pm.role"),
-                        "joinedAt", rs.getTimestamp("pm.created_at").toInstant().toString()
+                        "userId", rs.getObject("user_id").toString(),
+                        "email", rs.getString("user_email"),
+                        "name", rs.getString("user_name") != null ? rs.getString("user_name") : "",
+                        "role", rs.getString("member_role"),
+                        "joinedAt", rs.getTimestamp("joined_at").toInstant().toString()
                 ));
             }
         } catch (SQLException e) {

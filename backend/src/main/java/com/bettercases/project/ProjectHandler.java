@@ -17,6 +17,7 @@ public final class ProjectHandler {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID orgId = WorkspaceService.getCurrentUserOrganizationId(userId)
                 .orElseThrow(() -> new io.javalin.http.BadRequestResponse("No workspace found. Complete onboarding first."));
+        WorkspaceService.requireCanCreateProject(orgId, userId);
         CreateBody body = ctx.bodyAsClass(CreateBody.class);
         if (body == null || body.name == null || body.name.isBlank()) {
             ctx.status(400).json(Map.of("error", "name is required"));

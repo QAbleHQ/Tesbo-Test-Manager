@@ -2,6 +2,7 @@ package com.bettercases;
 
 import com.bettercases.auth.AuthHandler;
 import com.bettercases.auth.SessionFilter;
+import com.bettercases.invitation.InvitationHandler;
 import com.bettercases.onboarding.OnboardingHandler;
 import com.bettercases.project.ProjectHandler;
 import com.bettercases.suite.SuiteHandler;
@@ -46,11 +47,14 @@ public final class Main {
         app.options("/*", ctx -> ctx.status(204).result(""));
 
         app.get("/health", ctx -> ctx.json(java.util.Map.of("status", "ok")));
+        app.get("/api/health", ctx -> ctx.json(java.util.Map.of("status", "ok")));
 
         app.post("/api/auth/otp/request", AuthHandler::requestOtp);
         app.post("/api/auth/otp/verify", AuthHandler::verifyOtp);
         app.post("/api/auth/logout", AuthHandler::logout);
         app.get("/api/auth/me", AuthHandler::me);
+        app.get("/api/invitations/{token}", InvitationHandler::getByToken);
+        app.post("/api/invitations/{token}/accept", InvitationHandler::acceptByToken);
 
         app.post("/api/onboarding/workspace", OnboardingHandler::createWorkspace);
         app.post("/api/onboarding/org-and-project", OnboardingHandler::createOrgAndProject);
@@ -60,6 +64,12 @@ public final class Main {
         app.get("/api/workspace/members", WorkspaceHandler::listMembers);
         app.post("/api/workspace/members", WorkspaceHandler::addMember);
         app.delete("/api/workspace/members/{userId}", WorkspaceHandler::removeMember);
+        app.get("/api/workspace/project-access", WorkspaceHandler::getProjectAccess);
+        app.put("/api/workspace/project-access", WorkspaceHandler::upsertProjectAccess);
+        app.delete("/api/workspace/project-access", WorkspaceHandler::removeProjectAccess);
+        app.get("/api/workspace/invitations", InvitationHandler::listWorkspaceInvitations);
+        app.post("/api/workspace/invitations", InvitationHandler::createWorkspaceInvitation);
+        app.delete("/api/workspace/invitations/{id}", InvitationHandler::revokeWorkspaceInvitation);
 
         app.get("/api/projects", ProjectHandler::list);
         app.post("/api/projects", ProjectHandler::create);
