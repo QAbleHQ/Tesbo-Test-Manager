@@ -12,7 +12,8 @@ import java.util.*;
  * Project access is by allocation: only workspace members can be added to projects (project_members).
  */
 public final class WorkspaceService {
-    private static final Set<String> PROJECT_MEMBER_ROLES = Set.of("viewer", "qa_member", "test_manager", "project_admin");
+    private static final Set<String> WORKSPACE_MEMBER_ROLES = Set.of("owner", "admin", "manager", "member");
+    private static final Set<String> PROJECT_MEMBER_ROLES = Set.of("owner", "admin", "manager", "member", "viewer");
 
     /** Returns the first organization the user belongs to (their workspace). */
     public static Optional<Map<String, Object>> getCurrentUserWorkspace(UUID userId) {
@@ -73,16 +74,33 @@ public final class WorkspaceService {
 
     /** Add a user to the workspace. If email is provided, look up user by email (or create invitation later). For now we support userId. */
     public static void addWorkspaceMember(UUID orgId, UUID actorId, UUID targetUserId, String role) {
-        requireOrgRole(orgId, actorId, "owner", "admin", "manager");
-        if (targetUserId.equals(actorId) && !"owner".equals(getOrgRole(orgId, actorId))) {
+        String actorRole = getOrgRole(orgId, actorId);
+        if (!Set.of("owner", "admin", "manager").contains(actorRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Insufficient permission in workspace");
+        }
+        if (targetUserId.equals(actorId) && !"owner".equals(actorRole)) {
             throw new io.javalin.http.ForbiddenResponse("Cannot change own role");
+        }
+        String normalizedRole = normalizeWorkspaceRole(role);
+        String targetCurrentRole = getOrgRole(orgId, targetUserId);
+        if ("manager".equals(actorRole) && !"member".equals(normalizedRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Managers can only invite members.");
+        }
+        if ("manager".equals(actorRole) && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Managers cannot edit owner or admin users.");
+        }
+        if ("admin".equals(actorRole) && ("owner".equals(normalizedRole) || "admin".equals(normalizedRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot add or promote owner/admin users.");
+        }
+        if ("admin".equals(actorRole) && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot edit owner/admin users.");
         }
         String sql = "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, orgId);
             ps.setObject(2, targetUserId);
-            ps.setString(3, role != null && !role.isBlank() ? role : "member");
+            ps.setString(3, normalizedRole);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -100,13 +118,19 @@ public final class WorkspaceService {
     }
 
     public static void removeWorkspaceMember(UUID orgId, UUID actorId, UUID targetUserId) {
-        requireOrgRole(orgId, actorId, "owner", "admin");
+        String actorRole = getOrgRole(orgId, actorId);
+        if (!Set.of("owner", "admin").contains(actorRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Insufficient permission in workspace");
+        }
         if (targetUserId.equals(actorId)) {
             throw new io.javalin.http.ForbiddenResponse("Cannot remove yourself from workspace");
         }
         String targetRole = getOrgRole(orgId, targetUserId);
-        if ("admin".equals(targetRole)) {
-            throw new io.javalin.http.ForbiddenResponse("Admin users cannot be deleted from workspace");
+        if ("owner".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Owner users cannot be deleted from workspace");
+        }
+        if ("admin".equals(actorRole) && "admin".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot delete admin users from workspace");
         }
         String sql = "DELETE FROM organization_members WHERE organization_id = ? AND user_id = ?";
         try (Connection c = Database.getDataSource().getConnection();
@@ -184,7 +208,7 @@ public final class WorkspaceService {
                 if (projectId != null) {
                     @SuppressWarnings("unchecked")
                     Map<String, String> projectRoles = (Map<String, String>) row.get("projectRoles");
-                    projectRoles.put(projectId.toString(), rs.getString("project_role"));
+                    projectRoles.put(projectId.toString(), canonicalProjectRole(rs.getString("project_role")));
                 }
             }
         } catch (SQLException e) {
@@ -199,7 +223,21 @@ public final class WorkspaceService {
 
     public static void setWorkspaceProjectAccess(UUID orgId, UUID actorId, UUID projectId, UUID targetUserId, String role) {
         requireOrgRole(orgId, actorId, "owner", "admin", "manager");
+        String actorRole = getOrgRole(orgId, actorId);
         String normalizedRole = normalizeProjectRole(role);
+        String targetCurrentRole = getProjectMemberRole(projectId, targetUserId).orElse(null);
+        if ("manager".equals(actorRole) && !"member".equals(normalizedRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Managers can only invite members.");
+        }
+        if ("manager".equals(actorRole) && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Managers cannot edit owner/admin members.");
+        }
+        if ("admin".equals(actorRole) && ("owner".equals(normalizedRole) || "admin".equals(normalizedRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot add or promote owner/admin members.");
+        }
+        if ("admin".equals(actorRole) && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot edit owner/admin members.");
+        }
         requireProjectInOrganization(projectId, orgId);
         requireWorkspaceMember(orgId, targetUserId);
         String sql = "INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?) " +
@@ -217,7 +255,18 @@ public final class WorkspaceService {
 
     public static void removeWorkspaceProjectAccess(UUID orgId, UUID actorId, UUID projectId, UUID targetUserId) {
         requireOrgRole(orgId, actorId, "owner", "admin", "manager");
+        String actorRole = getOrgRole(orgId, actorId);
         requireProjectInOrganization(projectId, orgId);
+        String targetRole = getProjectMemberRole(projectId, targetUserId).orElse(null);
+        if ("owner".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Owner members cannot be removed from project");
+        }
+        if ("admin".equals(actorRole) && "admin".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot remove admin members.");
+        }
+        if ("manager".equals(actorRole) && ("admin".equals(targetRole) || "owner".equals(targetRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Managers cannot remove owner/admin members.");
+        }
         String sql = "DELETE FROM project_members WHERE project_id = ? AND user_id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -277,15 +326,54 @@ public final class WorkspaceService {
         if (role == null || role.isBlank()) {
             throw new io.javalin.http.BadRequestResponse("Project role is required");
         }
-        String normalized = role.trim().toLowerCase();
+        String normalized = role.trim().toLowerCase().replace("-", "_").replace(" ", "_");
+        if ("project_admin".equals(normalized)) normalized = "admin";
+        if ("test_manager".equals(normalized)) normalized = "manager";
+        if ("qa_member".equals(normalized)) normalized = "member";
+        if ("viewer".equals(normalized)) normalized = "member";
         if (!PROJECT_MEMBER_ROLES.contains(normalized)) {
             throw new io.javalin.http.BadRequestResponse("Invalid project role");
         }
         return normalized;
     }
 
+    private static String normalizeWorkspaceRole(String role) {
+        String normalized = role == null ? "member" : role.trim().toLowerCase();
+        if (normalized.isBlank()) normalized = "member";
+        if (!WORKSPACE_MEMBER_ROLES.contains(normalized)) {
+            throw new io.javalin.http.BadRequestResponse("Invalid workspace role");
+        }
+        return normalized;
+    }
+
+    private static String canonicalProjectRole(String role) {
+        if (role == null) return "member";
+        String normalized = role.trim().toLowerCase().replace("-", "_").replace(" ", "_");
+        if ("project_admin".equals(normalized)) return "admin";
+        if ("test_manager".equals(normalized)) return "manager";
+        if ("qa_member".equals(normalized)) return "member";
+        if ("viewer".equals(normalized)) return "member";
+        return normalized;
+    }
+
+    private static Optional<String> getProjectMemberRole(UUID projectId, UUID userId) {
+        String sql = "SELECT role FROM project_members WHERE project_id = ? AND user_id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ps.setObject(2, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return Optional.ofNullable(canonicalProjectRole(rs.getString("role")));
+            }
+            return Optional.empty();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public static void requireCanCreateProject(UUID orgId, UUID actorId) {
-        requireOrgRole(orgId, actorId, "owner", "manager");
+        requireOrgRole(orgId, actorId, "owner", "admin", "manager");
     }
 
     private static void requireOrgMember(UUID orgId, UUID userId) {

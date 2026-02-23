@@ -2,6 +2,7 @@
 
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import { requestOtp } from "@/lib/api";
 
 function LoginForm() {
@@ -80,6 +81,15 @@ function LoginForm() {
         </form>
         <p className="text-center text-sm text-[var(--muted)]">
           We’ll send a one-time code to your email. No password needed.
+        </p>
+        <p className="text-center text-xs text-[var(--muted)] dark:text-zinc-400">
+          <Link href="/privacy-policy" className="hover:underline">
+            Privacy Policy
+          </Link>{" "}
+          ·{" "}
+          <Link href="/terms-and-conditions" className="hover:underline">
+            Terms and Conditions
+          </Link>
         </p>
       </div>
     </div>

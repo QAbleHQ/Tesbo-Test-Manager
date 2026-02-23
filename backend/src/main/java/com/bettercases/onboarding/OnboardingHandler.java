@@ -65,7 +65,7 @@ public final class OnboardingHandler {
                 UUID orgId = insertOrg(c, req.orgName, orgSlug);
                 insertOrgMember(c, orgId, userId, "owner");
                 UUID projectId = insertProject(c, orgId, projectKey, req.projectName, req.projectDescription);
-                insertProjectMember(c, projectId, userId, "project_admin");
+                insertProjectMember(c, projectId, userId, "owner");
                 updateUserDefaultProject(c, userId, projectId);
                 c.commit();
                 try {

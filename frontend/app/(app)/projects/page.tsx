@@ -24,7 +24,7 @@ function ProjectsPageContent() {
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
   const [workspaceRole, setWorkspaceRole] = useState<string>("");
-  const canCreateProject = workspaceRole === "owner" || workspaceRole === "manager";
+  const canCreateProject = workspaceRole === "owner" || workspaceRole === "admin" || workspaceRole === "manager";
 
   useEffect(() => {
     if (canCreateProject && searchParams.get("create") === "1") {
@@ -64,7 +64,7 @@ function ProjectsPageContent() {
     e.preventDefault();
     setCreateError("");
     if (!canCreateProject) {
-      setCreateError("Only workspace owner or manager can create projects.");
+      setCreateError("Only workspace owner, admin, or manager can create projects.");
       return;
     }
     if (!createName.trim()) {

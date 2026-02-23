@@ -210,6 +210,10 @@ export async function updateProject(id: string, data: { name?: string; descripti
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
 }
 
+export async function deleteProject(id: string): Promise<void> {
+  await api(`/api/projects/${id}`, { method: "DELETE" });
+}
+
 export interface AiGeneratedDraft {
   title: string;
   preconditions: string;

@@ -11,10 +11,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public final class ProjectService {
-    /** Create a new project in the given organization; caller must be an org member. Adds creator as project_admin. */
+    /** Create a new project in the given organization; caller must be an org member. Adds creator as owner. */
     public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description) {
         String normalizedKey = key != null ? key.trim().toUpperCase().replaceAll("[^A-Z0-9]", "") : "";
         if (normalizedKey.isEmpty()) normalizedKey = "PROJ";
@@ -30,7 +31,7 @@ public final class ProjectService {
             ResultSet rs = ps.executeQuery();
             if (!rs.next()) throw new RuntimeException("Insert failed");
             UUID projectId = (UUID) rs.getObject("id");
-            try (PreparedStatement pm = c.prepareStatement("INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'project_admin')")) {
+            try (PreparedStatement pm = c.prepareStatement("INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'owner')")) {
                 pm.setObject(1, projectId);
                 pm.setObject(2, userId);
                 pm.executeUpdate();
@@ -64,7 +65,7 @@ public final class ProjectService {
                         "key", rs.getString("key"),
                         "name", rs.getString("name"),
                         "description", rs.getString("description") != null ? rs.getString("description") : "",
-                        "role", rs.getString("role"),
+                        "role", canonicalProjectRole(rs.getString("role")),
                         "createdAt", rs.getTimestamp("created_at").toInstant().toString()
                 ));
             }
@@ -114,6 +115,22 @@ public final class ProjectService {
         }
     }
 
+    public static void deleteProject(UUID projectId, UUID userId) {
+        Role role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canManageProject()) throw new io.javalin.http.ForbiddenResponse("Cannot manage project");
+        String sql = "DELETE FROM projects WHERE id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            int deleted = ps.executeUpdate();
+            if (deleted == 0) {
+                throw new io.javalin.http.NotFoundResponse("Project not found");
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public static List<Map<String, Object>> listMembers(UUID projectId, UUID userId) {
         RbacService.requireProjectRole(userId, projectId);
         String sql = "SELECT u.id AS user_id, u.email AS user_email, u.name AS user_name, pm.role AS member_role, pm.created_at AS joined_at " +
@@ -128,7 +145,7 @@ public final class ProjectService {
                         "userId", rs.getObject("user_id").toString(),
                         "email", rs.getString("user_email"),
                         "name", rs.getString("user_name") != null ? rs.getString("user_name") : "",
-                        "role", rs.getString("member_role"),
+                        "role", canonicalProjectRole(rs.getString("member_role")),
                         "joinedAt", rs.getTimestamp("joined_at").toInstant().toString()
                 ));
             }
@@ -139,17 +156,31 @@ public final class ProjectService {
     }
 
     public static void addMember(UUID projectId, UUID actorId, UUID targetUserId, String role) {
-        Role r = RbacService.requireProjectRole(actorId, projectId);
-        if (!r.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
+        Role actorRole = RbacService.requireProjectRole(actorId, projectId);
+        if (!actorRole.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
         if (!WorkspaceService.isUserInProjectOrganization(projectId, targetUserId)) {
             throw new io.javalin.http.BadRequestResponse("User must be a workspace team member before they can be allocated to this project.");
+        }
+        String normalizedRole = normalizeProjectRole(role);
+        String targetCurrentRole = getProjectMemberRole(projectId, targetUserId).orElse(null);
+        if (actorRole == Role.MANAGER && !"member".equals(normalizedRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Managers can only invite members.");
+        }
+        if (actorRole == Role.MANAGER && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Managers cannot edit owner/admin members.");
+        }
+        if (actorRole == Role.ADMIN && ("owner".equals(normalizedRole) || "admin".equals(normalizedRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot add or promote owner/admin members.");
+        }
+        if (actorRole == Role.ADMIN && ("owner".equals(targetCurrentRole) || "admin".equals(targetCurrentRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot edit owner/admin members.");
         }
         String sql = "INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
             ps.setObject(2, targetUserId);
-            ps.setString(3, role);
+            ps.setString(3, normalizedRole);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -157,8 +188,15 @@ public final class ProjectService {
     }
 
     public static void removeMember(UUID projectId, UUID actorId, UUID targetUserId) {
-        Role r = RbacService.requireProjectRole(actorId, projectId);
-        if (!r.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
+        Role actorRole = RbacService.requireProjectRole(actorId, projectId);
+        if (!actorRole.canManageMembers()) throw new io.javalin.http.ForbiddenResponse("Cannot manage members");
+        String targetRole = getProjectMemberRole(projectId, targetUserId).orElse(null);
+        if ("owner".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Owner members cannot be removed from project");
+        }
+        if (actorRole == Role.ADMIN && "admin".equals(targetRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot remove admin members.");
+        }
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement("DELETE FROM project_members WHERE project_id = ? AND user_id = ?")) {
             ps.setObject(1, projectId);
@@ -167,5 +205,42 @@ public final class ProjectService {
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private static Optional<String> getProjectMemberRole(UUID projectId, UUID userId) {
+        String sql = "SELECT role FROM project_members WHERE project_id = ? AND user_id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ps.setObject(2, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return Optional.ofNullable(canonicalProjectRole(rs.getString("role")));
+            }
+            return Optional.empty();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String canonicalProjectRole(String role) {
+        if (role == null) return "member";
+        String normalized = role.trim().toLowerCase().replace("-", "_").replace(" ", "_");
+        if ("project_admin".equals(normalized)) return "admin";
+        if ("test_manager".equals(normalized)) return "manager";
+        if ("qa_member".equals(normalized)) return "member";
+        if ("viewer".equals(normalized)) return "member";
+        return normalized;
+    }
+
+    private static String normalizeProjectRole(String role) {
+        if (role == null || role.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("Project role is required");
+        }
+        String normalized = canonicalProjectRole(role);
+        if (!Set.of("owner", "admin", "manager", "member").contains(normalized)) {
+            throw new io.javalin.http.BadRequestResponse("Invalid project role");
+        }
+        return normalized;
     }
 }

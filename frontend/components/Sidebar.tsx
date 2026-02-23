@@ -31,9 +31,8 @@ const projectNavSections = [
     ],
   },
   {
-    section: "Tesbo Reports",
+    section: "Automation Reports",
     items: [
-      { href: "tesbo-reports", label: "Overview" },
       { href: "tesbo-reports/runs", label: "Runs" },
       { href: "tesbo-reports/specs", label: "Specs" },
       { href: "tesbo-reports/tests", label: "Tests" },
@@ -43,9 +42,7 @@ const projectNavSections = [
 ] as const;
 
 const workspaceSettingsNavItems = [
-  { href: "/settings", label: "General" },
   { href: "/settings/members", label: "Members" },
-  { href: "/settings/project-access", label: "Project access" },
   { href: "/settings/integrations", label: "Integrations" },
 ] as const;
 
@@ -222,7 +219,7 @@ export default function Sidebar() {
         <div className="pt-4 mt-4 border-t border-[var(--border)]">
           <div className="flex items-center gap-1">
             <Link
-              href="/settings"
+              href="/settings/members"
               className={`flex-1 rounded-lg px-3 py-2 text-sm transition-colors ${
                 isWorkspaceSettingsActive
                   ? "bg-[#e8f5eb] dark:bg-zinc-700 text-[var(--primary)] dark:text-zinc-100 font-medium"

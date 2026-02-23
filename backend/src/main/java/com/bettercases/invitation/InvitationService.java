@@ -24,7 +24,7 @@ public final class InvitationService {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final EmailService EMAIL_SERVICE = new EmailService();
     private static final Set<String> WORKSPACE_ROLES = Set.of("member", "manager", "admin", "owner");
-    private static final Set<String> PROJECT_ROLES = Set.of("viewer", "qa_member", "test_manager", "project_admin");
+    private static final Set<String> PROJECT_ROLES = Set.of("member", "manager", "admin", "owner", "viewer");
 
     private InvitationService() {}
 
@@ -32,6 +32,13 @@ public final class InvitationService {
         requireOrgRole(orgId, actorId, "owner", "admin", "manager");
         String normalizedEmail = normalizeEmail(email);
         String normalizedRole = normalizeWorkspaceRole(role);
+        String actorRole = getOrgRole(orgId, actorId);
+        if ("manager".equals(actorRole) && !"member".equals(normalizedRole)) {
+            throw new io.javalin.http.ForbiddenResponse("Managers can only invite members.");
+        }
+        if ("admin".equals(actorRole) && ("owner".equals(normalizedRole) || "admin".equals(normalizedRole))) {
+            throw new io.javalin.http.ForbiddenResponse("Admins cannot invite owner/admin users.");
+        }
 
         PendingInvitation existing = findPendingWorkspaceInvitation(orgId, normalizedEmail);
         PendingInvitation invitation = existing != null ? existing : insertWorkspaceInvitation(orgId, normalizedEmail, normalizedRole);
@@ -133,7 +140,7 @@ public final class InvitationService {
                     upsertOrganizationMember(c, invitation.organizationId, userId, workspaceRole);
                 }
                 if (invitation.projectId != null) {
-                    String projectRole = PROJECT_ROLES.contains(invitation.role) ? invitation.role : "viewer";
+                    String projectRole = normalizeProjectRole(invitation.role);
                     upsertProjectMember(c, invitation.projectId, userId, projectRole);
                 }
 
@@ -317,6 +324,18 @@ public final class InvitationService {
         if (normalized.isEmpty()) normalized = "member";
         if (!WORKSPACE_ROLES.contains(normalized)) {
             throw new io.javalin.http.BadRequestResponse("Invalid workspace role");
+        }
+        return normalized;
+    }
+
+    private static String normalizeProjectRole(String role) {
+        String normalized = role == null ? "member" : role.trim().toLowerCase().replace("-", "_").replace(" ", "_");
+        if ("project_admin".equals(normalized)) normalized = "admin";
+        if ("test_manager".equals(normalized)) normalized = "manager";
+        if ("qa_member".equals(normalized)) normalized = "member";
+        if ("viewer".equals(normalized)) normalized = "member";
+        if (!PROJECT_ROLES.contains(normalized)) {
+            return "member";
         }
         return normalized;
     }

@@ -1,16 +1,21 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   authMe,
   getProject,
   updateProject,
+  deleteProject as deleteProjectRequest,
   getJiraStatus,
   getJiraAuthUrl,
   disconnectJira,
   rotateTesboIngestionKey,
+  listProjectMembers,
+  listWorkspaceMembers,
+  addProjectMember,
+  removeProjectMember,
   type JiraConnection,
 } from "@/lib/api";
 import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
@@ -51,11 +56,38 @@ type ProjectSettingsPayload = {
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "ai" | "jira" | "tesbo" | "alerts" | "integrations";
+type SettingsTab = "general" | "members" | "ai" | "jira" | "tesbo" | "alerts" | "integrations";
+type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
+type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
+
+const PLATFORM_ROLES = [
+  { value: "owner", label: "Owner" },
+  { value: "admin", label: "Admin" },
+  { value: "manager", label: "Manager" },
+  { value: "member", label: "Member" },
+] as const;
+
+function normalizeRole(role: string): (typeof PLATFORM_ROLES)[number]["value"] {
+  const normalized = role.trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (normalized === "project_admin") return "admin";
+  if (normalized === "test_manager") return "manager";
+  if (normalized === "qa_member" || normalized === "viewer") return "member";
+  if (normalized === "owner" || normalized === "admin" || normalized === "manager" || normalized === "member") {
+    return normalized;
+  }
+  return "member";
+}
+
+function roleLabel(role: string): string {
+  const normalized = normalizeRole(role);
+  const match = PLATFORM_ROLES.find((item) => item.value === normalized);
+  return match?.label ?? "Member";
+}
 
 export default function ProjectSettingsPage() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const projectId = params.id as string;
   const [project, setProject] = useState<Record<string, unknown> | null>(null);
   const [name, setName] = useState("");
@@ -77,6 +109,40 @@ export default function ProjectSettingsPage() {
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [jiraLoading, setJiraLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
+  const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMember[]>([]);
+  const [membersLoading, setMembersLoading] = useState(true);
+  const [memberError, setMemberError] = useState<string | null>(null);
+  const [addUserId, setAddUserId] = useState("");
+  const [addingMember, setAddingMember] = useState(false);
+  const [removingMemberId, setRemovingMemberId] = useState<string | null>(null);
+  const [deletingProject, setDeletingProject] = useState(false);
+  const jiraTabEnabled = jiraStatus?.connected === true;
+
+  const visibleTabs: Array<{ key: SettingsTab; label: string }> = [
+    { key: "general", label: "General" },
+    { key: "members", label: "Members" },
+    { key: "ai", label: "AI" },
+    ...(jiraTabEnabled ? [{ key: "jira" as const, label: "Jira" }] : []),
+    { key: "tesbo", label: "Automation Reports" },
+    { key: "alerts", label: "Alerts" },
+    { key: "integrations", label: "Integrations" },
+  ];
+
+  useEffect(() => {
+    const tab = searchParams.get("tab");
+    if (!tab) return;
+    const allowed: SettingsTab[] = visibleTabs.map((item) => item.key);
+    if (allowed.includes(tab as SettingsTab)) {
+      setActiveTab(tab as SettingsTab);
+    }
+  }, [searchParams, visibleTabs]);
+
+  useEffect(() => {
+    if (activeTab === "jira" && !jiraTabEnabled) {
+      setActiveTab("integrations");
+    }
+  }, [activeTab, jiraTabEnabled]);
 
   function modelOptionsFor(activeProvider: "openai" | "anthropic") {
     return activeProvider === "openai" ? OPENAI_MODELS : ANTHROPIC_MODELS;
@@ -91,6 +157,22 @@ export default function ProjectSettingsPage() {
       return {};
     }
   }
+
+  const loadMembers = useCallback(async () => {
+    try {
+      const [projectList, workspaceList] = await Promise.all([
+        listProjectMembers(projectId),
+        listWorkspaceMembers().catch(() => []),
+      ]);
+      setProjectMembers(projectList as ProjectMember[]);
+      setWorkspaceMembers(workspaceList as WorkspaceMember[]);
+      setMemberError(null);
+    } catch {
+      setMemberError("Failed to load project members.");
+    } finally {
+      setMembersLoading(false);
+    }
+  }, [projectId]);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -130,16 +212,18 @@ export default function ProjectSettingsPage() {
         setTesboShareByDefault(tesbo?.shareByDefault === true);
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
+      loadMembers().catch(() => {});
     });
-  }, [projectId, router]);
+  }, [loadMembers, projectId, router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (provider === "openai" && !openAiApiKey.trim()) {
+    const shouldValidateAiCredentials = activeTab === "ai";
+    if (shouldValidateAiCredentials && provider === "openai" && !openAiApiKey.trim()) {
       setMessage("OpenAI API key is required for OpenAI provider.");
       return;
     }
-    if (provider === "anthropic" && !anthropicApiKey.trim()) {
+    if (shouldValidateAiCredentials && provider === "anthropic" && !anthropicApiKey.trim()) {
       setMessage("Anthropic API key is required for Anthropic provider.");
       return;
     }
@@ -206,11 +290,73 @@ export default function ProjectSettingsPage() {
     try {
       const result = await rotateTesboIngestionKey(projectId);
       setTesboIngestionApiKey(result.ingestionApiKey ?? "");
-      setMessage("Tesbo ingestion key rotated. Save project settings to persist other changes.");
+      setMessage("Automation Reports ingestion key rotated. Save project settings to persist other changes.");
     } catch {
-      setMessage("Failed to rotate Tesbo ingestion key.");
+      setMessage("Failed to rotate Automation Reports ingestion key.");
     } finally {
       setRotatingTesboKey(false);
+    }
+  }
+
+  async function handleDeleteProject() {
+    const projectName = String(project?.name ?? "").trim();
+    if (!projectName) {
+      setMessage("Project name is unavailable. Refresh and try again.");
+      return;
+    }
+    const typedName = window.prompt(`Type "${projectName}" to confirm project deletion.`);
+    if (typedName === null) return;
+    if (typedName.trim() !== projectName) {
+      setMessage("Project deletion cancelled. Entered name does not match.");
+      return;
+    }
+    if (!window.confirm("Delete this project permanently? This action cannot be undone.")) return;
+
+    setDeletingProject(true);
+    setMessage(null);
+    try {
+      await deleteProjectRequest(projectId);
+      router.replace("/projects");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "Failed to delete project.";
+      setMessage(text);
+    } finally {
+      setDeletingProject(false);
+    }
+  }
+
+  const memberIds = new Set(projectMembers.map((member) => member.userId));
+  const availableToAdd = workspaceMembers.filter((member) => !memberIds.has(member.userId));
+
+  async function handleAddMember(e: React.FormEvent) {
+    e.preventDefault();
+    if (!addUserId) {
+      setMemberError("Select a workspace member");
+      return;
+    }
+    setAddingMember(true);
+    setMemberError(null);
+    try {
+      await addProjectMember(projectId, { userId: addUserId, role: "member" });
+      setAddUserId("");
+      await loadMembers();
+    } catch {
+      setMemberError("Failed to add project member.");
+    } finally {
+      setAddingMember(false);
+    }
+  }
+
+  async function handleRemoveMember(userId: string) {
+    setRemovingMemberId(userId);
+    setMemberError(null);
+    try {
+      await removeProjectMember(projectId, userId);
+      setProjectMembers((prev) => prev.filter((member) => member.userId !== userId));
+    } catch {
+      setMemberError("Failed to remove project member.");
+    } finally {
+      setRemovingMemberId(null);
     }
   }
 
@@ -223,7 +369,7 @@ export default function ProjectSettingsPage() {
   }
 
   return (
-    <main className="max-w-xl mx-auto px-4 py-8">
+    <main className="w-full max-w-none px-4 py-8">
       <div className="flex items-start justify-between gap-3">
         <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Project settings</h1>
         <ThemeToggle />
@@ -234,14 +380,7 @@ export default function ProjectSettingsPage() {
 
       <div className="mt-6 border-b border-zinc-200 dark:border-zinc-700">
         <div className="flex flex-wrap gap-0">
-          {[
-            { key: "general", label: "General" },
-            { key: "ai", label: "AI" },
-            { key: "jira", label: "Jira" },
-            { key: "tesbo", label: "Tesbo" },
-            { key: "alerts", label: "Alerts" },
-            { key: "integrations", label: "Integrations" },
-          ].map((tab) => (
+          {visibleTabs.map((tab) => (
             <button
               key={tab.key}
               type="button"
@@ -261,32 +400,55 @@ export default function ProjectSettingsPage() {
       {(activeTab === "general" || activeTab === "ai" || activeTab === "jira" || activeTab === "tesbo") && (
         <form onSubmit={handleSubmit} className="mt-6 space-y-5">
           {activeTab === "general" && (
-            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
-              <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">General</h2>
-                <p className="mt-1 text-sm text-zinc-500">
-                  Basic project details shown across the workspace.
+            <>
+              <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+                <div>
+                  <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">General</h2>
+                  <p className="mt-1 text-sm text-zinc-500">
+                    Basic project details shown across the workspace.
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Name</label>
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Description</label>
+                  <textarea
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    rows={3}
+                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {saving ? "Saving…" : "Save"}
+                </button>
+              </div>
+              <div className="rounded-xl border border-red-200 dark:border-red-800/70 bg-red-50/70 dark:bg-red-900/20 p-4 space-y-2">
+                <h3 className="text-sm font-semibold text-red-700 dark:text-red-300">Danger zone</h3>
+                <p className="text-sm text-red-700/90 dark:text-red-200/90">
+                  Deleting a project permanently removes its test cases, runs, reports, and integrations.
                 </p>
+                <button
+                  type="button"
+                  onClick={() => handleDeleteProject().catch(() => {})}
+                  disabled={deletingProject}
+                  className="rounded-lg bg-red-600 text-white py-2 px-4 text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+                >
+                  {deletingProject ? "Deleting project…" : "Delete project"}
+                </button>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Name</label>
-                <input
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Description</label>
-                <textarea
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  rows={3}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
-                />
-              </div>
-            </div>
+            </>
           )}
 
           {activeTab === "ai" && (
@@ -328,22 +490,20 @@ export default function ProjectSettingsPage() {
                 </select>
               </div>
               <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">OpenAI API Key</label>
+                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                  {provider === "openai" ? "OpenAI API Key" : "Anthropic API Key"}
+                </label>
                 <input
                   type="password"
-                  value={openAiApiKey}
-                  onChange={(e) => setOpenAiApiKey(e.target.value)}
-                  placeholder="sk-..."
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Anthropic API Key</label>
-                <input
-                  type="password"
-                  value={anthropicApiKey}
-                  onChange={(e) => setAnthropicApiKey(e.target.value)}
-                  placeholder="sk-ant-..."
+                  value={provider === "openai" ? openAiApiKey : anthropicApiKey}
+                  onChange={(e) => {
+                    if (provider === "openai") {
+                      setOpenAiApiKey(e.target.value);
+                      return;
+                    }
+                    setAnthropicApiKey(e.target.value);
+                  }}
+                  placeholder={provider === "openai" ? "sk-..." : "sk-ant-..."}
                   className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                 />
               </div>
@@ -392,9 +552,9 @@ export default function ProjectSettingsPage() {
           {activeTab === "tesbo" && (
             <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Tesbo Reports</h2>
+                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Automation Reports</h2>
                 <p className="mt-1 text-sm text-zinc-500">
-                  Controls for embedded Tesbo reporting features in this project.
+                  Controls for embedded Automation Reports features in this project.
                 </p>
               </div>
               <label className="flex items-center gap-3 cursor-pointer">
@@ -449,7 +609,7 @@ export default function ProjectSettingsPage() {
                   checked={tesboAlertsEnabled}
                   onChange={(e) => setTesboAlertsEnabled(e.target.checked)}
                 />
-                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Enable Tesbo alerts</span>
+                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Enable Automation Reports alerts</span>
               </label>
               <label className="flex items-center gap-3 cursor-pointer">
                 <input
@@ -460,7 +620,7 @@ export default function ProjectSettingsPage() {
                 <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Share runs by default</span>
               </label>
               <p className="text-xs text-zinc-500">
-                Tesbo alert rules are managed in the Alerts tab.
+                Automation Reports alert rules are managed in the Alerts tab.
               </p>
             </div>
           )}
@@ -470,14 +630,119 @@ export default function ProjectSettingsPage() {
               {message}
             </p>
           )}
-          <button
-            type="submit"
-            disabled={saving}
-            className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
-          >
-            {saving ? "Saving…" : "Save"}
-          </button>
+          {activeTab !== "general" && (
+            <button
+              type="submit"
+              disabled={saving}
+              className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+          )}
         </form>
+      )}
+
+      {activeTab === "members" && (
+        <section className="mt-6 space-y-5">
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
+            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Project members</h2>
+            <p className="mt-1 text-sm text-zinc-500">
+              Members added here can perform actions inside this project based on their project role.
+            </p>
+            <div className="mt-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3 text-xs text-zinc-600 dark:text-zinc-300 space-y-1">
+              <p><strong>Owner:</strong> Full access to all features and can add admins.</p>
+              <p><strong>Admin:</strong> Similar to owner, but cannot add or remove owners/admins.</p>
+              <p><strong>Manager:</strong> Can invite members and manage project operations.</p>
+              <p><strong>Member:</strong> Can work inside assigned projects, but cannot invite or create projects.</p>
+            </div>
+          </div>
+
+          {availableToAdd.length > 0 && (
+            <form onSubmit={handleAddMember} className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
+              <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Add workspace member
+                  </label>
+                  <select
+                    value={addUserId}
+                    onChange={(e) => setAddUserId(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
+                    disabled={addingMember || membersLoading}
+                  >
+                    <option value="">Select member…</option>
+                    {availableToAdd.map((member) => (
+                      <option key={member.userId} value={member.userId}>
+                        {member.name || member.email} ({member.email})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="submit"
+                  disabled={addingMember || !addUserId || membersLoading}
+                  className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {addingMember ? "Adding…" : "Add member"}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {memberError && (
+            <p className="text-sm text-red-600 dark:text-red-400">{memberError}</p>
+          )}
+
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead className="bg-zinc-50 dark:bg-zinc-800/60">
+                  <tr className="text-left text-zinc-600 dark:text-zinc-300">
+                    <th className="px-4 py-3 font-medium">Name</th>
+                    <th className="px-4 py-3 font-medium">Email</th>
+                    <th className="px-4 py-3 font-medium">Role</th>
+                    <th className="px-4 py-3 font-medium text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {projectMembers.map((member) => (
+                    <tr key={member.userId} className="border-t border-zinc-200 dark:border-zinc-700">
+                      <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">{member.name || "—"}</td>
+                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">{member.email}</td>
+                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">
+                        {roleLabel(member.role)}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveMember(member.userId)}
+                          disabled={removingMemberId === member.userId}
+                          className="text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                        >
+                          {removingMemberId === member.userId ? "Removing…" : "Remove"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {!membersLoading && projectMembers.length === 0 && (
+                    <tr className="border-t border-zinc-200 dark:border-zinc-700">
+                      <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                        No members are assigned to this project yet.
+                      </td>
+                    </tr>
+                  )}
+                  {membersLoading && (
+                    <tr className="border-t border-zinc-200 dark:border-zinc-700">
+                      <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                        Loading members…
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
       )}
 
       {activeTab === "alerts" && (

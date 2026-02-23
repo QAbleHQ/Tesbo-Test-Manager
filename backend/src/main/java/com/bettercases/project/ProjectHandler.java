@@ -43,6 +43,13 @@ public final class ProjectHandler {
         ctx.status(204);
     }
 
+    public static void delete(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("id"));
+        ProjectService.deleteProject(projectId, userId);
+        ctx.status(204);
+    }
+
     public static void listMembers(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("id"));

@@ -75,6 +75,7 @@ public final class Main {
         app.post("/api/projects", ProjectHandler::create);
         app.get("/api/projects/{id}", ProjectHandler::get);
         app.patch("/api/projects/{id}", ProjectHandler::update);
+        app.delete("/api/projects/{id}", ProjectHandler::delete);
         app.get("/api/projects/{id}/members", ProjectHandler::listMembers);
         app.post("/api/projects/{id}/members", ProjectHandler::addMember);
         app.delete("/api/projects/{id}/members/{userId}", ProjectHandler::removeMember);

@@ -13,6 +13,22 @@ import {
 } from "@/lib/api";
 import type { WorkspaceInvitation, WorkspaceMember as WorkspaceMemberType } from "@/lib/api";
 
+const PLATFORM_ROLES = [
+  { value: "owner", label: "Owner" },
+  { value: "admin", label: "Admin" },
+  { value: "manager", label: "Manager" },
+  { value: "member", label: "Member" },
+] as const;
+
+function roleLabel(role: string): string {
+  const normalized = role.trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (normalized === "project_admin") return "Admin";
+  if (normalized === "test_manager") return "Manager";
+  if (normalized === "qa_member" || normalized === "viewer") return "Member";
+  const match = PLATFORM_ROLES.find((item) => item.value === normalized);
+  return match?.label ?? "Member";
+}
+
 export default function WorkspaceMembersPage() {
   const router = useRouter();
   const [workspace, setWorkspace] = useState<{ name: string } | null>(null);
@@ -119,6 +135,12 @@ export default function WorkspaceMembersPage() {
           ? `Team members in ${workspace.name}. Only workspace members can be allocated to projects.`
           : "Manage who has access to your workspace."}
       </p>
+      <div className="mt-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3 text-xs text-zinc-600 dark:text-zinc-300 space-y-1">
+        <p><strong>Owner:</strong> Full workspace access and can add admins.</p>
+        <p><strong>Admin:</strong> Similar to owner, but cannot add/remove owners or admins.</p>
+        <p><strong>Manager:</strong> Can create projects and invite members.</p>
+        <p><strong>Member:</strong> Cannot invite or create projects, but can work inside assigned projects.</p>
+      </div>
 
       <form onSubmit={handleAdd} className="mt-6 flex flex-wrap items-end gap-3">
         <div className="flex-1 min-w-[200px]">
@@ -181,7 +203,7 @@ export default function WorkspaceMembersPage() {
               <li key={inv.id} className="py-3 flex items-center justify-between gap-4">
                 <div>
                   <span className="font-medium text-zinc-900 dark:text-zinc-100">{inv.email}</span>
-                  <span className="ml-2 text-sm text-zinc-500 dark:text-zinc-400 capitalize">{inv.role}</span>
+                  <span className="ml-2 text-sm text-zinc-500 dark:text-zinc-400">{roleLabel(inv.role)}</span>
                   <p className="text-xs text-zinc-500 dark:text-zinc-400">
                     Expires {new Date(inv.expiresAt).toLocaleDateString()}
                   </p>
@@ -215,8 +237,8 @@ export default function WorkspaceMembersPage() {
               </span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-sm text-zinc-500 dark:text-zinc-400 capitalize">
-                {m.role}
+              <span className="text-sm text-zinc-500 dark:text-zinc-400">
+                {roleLabel(m.role)}
               </span>
               <button
                 type="button"
