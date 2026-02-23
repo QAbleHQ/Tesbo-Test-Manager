@@ -5,6 +5,7 @@ import com.bettercases.auth.SessionFilter;
 import com.bettercases.invitation.InvitationHandler;
 import com.bettercases.onboarding.OnboardingHandler;
 import com.bettercases.project.ProjectHandler;
+import com.bettercases.automation.AutomationSessionHandler;
 import com.bettercases.suite.SuiteHandler;
 import com.bettercases.tesbo.TesboReportsHandler;
 import com.bettercases.testcase.TestCaseHandler;
@@ -93,6 +94,12 @@ public final class Main {
         app.post("/api/projects/{projectId}/testcases/bulk-update", com.bettercases.testcase.BulkUpdateHandler::bulkUpdate);
         app.post("/api/projects/{projectId}/testcases/bulk-delete", com.bettercases.testcase.BulkUpdateHandler::bulkDelete);
         app.get("/api/projects/{projectId}/testcases/linked-jira-keys", TestCaseHandler::linkedJiraKeys);
+        app.post("/api/projects/{projectId}/testcases/{testcaseId}/automation/sessions", AutomationSessionHandler::start);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands", AutomationSessionHandler::runCommand);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);
 
         app.get("/api/projects/{projectId}/plans", PlanHandler::list);
         app.post("/api/projects/{projectId}/plans", PlanHandler::create);

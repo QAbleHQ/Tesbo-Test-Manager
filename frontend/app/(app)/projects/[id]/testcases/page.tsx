@@ -771,6 +771,7 @@ export default function TestCasesPage() {
                           <th className="px-4 py-2">Priority</th>
                           <th className="px-4 py-2">Status</th>
                           <th className="px-4 py-2">Updated</th>
+                          <th className="px-4 py-2">Automation</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -829,6 +830,15 @@ export default function TestCasesPage() {
                             <td className="px-4 py-2">{tc.priority}</td>
                             <td className="px-4 py-2">{tc.status}</td>
                             <td className="px-4 py-2 text-zinc-500">{new Date(tc.updatedAt).toLocaleDateString()}</td>
+                            <td className="px-4 py-2">
+                              <button
+                                type="button"
+                                onClick={() => router.push(`/projects/${projectId}/testcases/${tc.id}/automate`)}
+                                className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                              >
+                                Automate
+                              </button>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -879,6 +889,15 @@ export default function TestCasesPage() {
                       {panelMode === "create" ? "Create Test Case" : panelMode === "edit" ? "Edit Test Case" : "Test Case Details"}
                     </h3>
                     <div className="flex items-center gap-2">
+                      {panelMode === "view" && (
+                        <button
+                          type="button"
+                          onClick={() => panelTestcaseId && router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)}
+                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                        >
+                          Automate
+                        </button>
+                      )}
                       {panelMode === "view" && (
                         <button
                           type="button"

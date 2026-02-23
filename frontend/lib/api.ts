@@ -421,6 +421,80 @@ export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: str
   return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
 }
 
+export interface AutomationSession {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  userId: string;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  currentUrl: string | null;
+  browserContextMeta: string | null;
+  lastScreenshotPath: string | null;
+  updatedAt: string;
+  events: Array<{
+    id: string;
+    commandId: string | null;
+    eventType: string;
+    rawCommand: string | null;
+    parsedAction?: Record<string, unknown> | null;
+    executionResult?: Record<string, unknown> | null;
+    screenshotPath: string | null;
+    createdAt: string;
+  }>;
+}
+
+export async function startAutomationSession(
+  projectId: string,
+  testcaseId: string,
+  data?: { startUrl?: string }
+): Promise<{ id: string; startedAt: string }> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/sessions`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function sendAutomationCommand(
+  projectId: string,
+  sessionId: string,
+  command: string
+): Promise<{
+  commandId: string;
+  requiresClarification: boolean;
+  clarificationQuestion?: string;
+  result?: Record<string, unknown>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands`, {
+    method: "POST",
+    body: { command },
+  });
+}
+
+export async function getAutomationSession(projectId: string, sessionId: string): Promise<AutomationSession> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}`);
+}
+
+export async function getAutomationStreamState(projectId: string, sessionId: string): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/stream`);
+}
+
+export async function finalizeAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: { testName?: string; framework?: string; repo?: string; path?: string }
+): Promise<{ status: string; script: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/finalize`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function cancelAutomationSession(projectId: string, sessionId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/automation/sessions/${sessionId}/cancel`, { method: "POST" });
+}
+
 // Plans
 export async function listPlans(projectId: string): Promise<Record<string, unknown>[]> {
   return api(`/api/projects/${projectId}/plans`);

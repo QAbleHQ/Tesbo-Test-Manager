@@ -408,6 +408,14 @@ export default function TestCaseDetailPage() {
             />
           </div>
           <div className="flex gap-2">
+            {!isNew && (
+              <Link
+                href={`/projects/${projectId}/testcases/${testcaseId}/automate`}
+                className="rounded-lg border border-blue-300 bg-blue-50 text-blue-700 py-2 px-4 font-medium hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
+              >
+                Automate
+              </Link>
+            )}
             <button
               type="submit"
               value="create"

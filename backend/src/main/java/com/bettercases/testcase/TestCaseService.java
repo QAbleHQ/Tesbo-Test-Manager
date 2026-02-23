@@ -109,6 +109,7 @@ public final class TestCaseService {
         RbacService.requireProjectRole(userId, projectId);
         String sql = "SELECT id, project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, " +
                 "priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name, automation_framework, automation_tags, " +
+                "automation_script, automation_script_language, automation_script_version, automated_at, automated_by, " +
                 "owner_id, component, status, created_at, updated_at, jira_issue_key, jira_url FROM testcases WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -139,6 +140,12 @@ public final class TestCaseService {
                 m.put("automationTestName", rs.getString("automation_test_name") != null ? rs.getString("automation_test_name") : "");
                 m.put("automationFramework", rs.getString("automation_framework") != null ? rs.getString("automation_framework") : "");
                 m.put("automationTags", rs.getString("automation_tags") != null ? rs.getString("automation_tags") : "");
+                m.put("automationScript", rs.getString("automation_script") != null ? rs.getString("automation_script") : "");
+                m.put("automationScriptLanguage", rs.getString("automation_script_language") != null ? rs.getString("automation_script_language") : "");
+                m.put("automationScriptVersion", rs.getInt("automation_script_version"));
+                m.put("automatedAt", rs.getTimestamp("automated_at") != null ? rs.getTimestamp("automated_at").toInstant().toString() : null);
+                Object automatedBy = rs.getObject("automated_by");
+                m.put("automatedBy", automatedBy != null ? automatedBy.toString() : null);
                 m.put("ownerId", ownerId != null ? ownerId.toString() : null);
                 m.put("component", rs.getString("component") != null ? rs.getString("component") : "");
                 m.put("status", rs.getString("status"));
@@ -267,8 +274,8 @@ public final class TestCaseService {
                 rs.next();
                 nextVersion = rs.getInt(1);
             }
-            try (PreparedStatement sel = c.prepareStatement("SELECT title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, priority, severity, type, automation_status, automation_tags, status FROM testcases WHERE id = ?");
-                 PreparedStatement ins = c.prepareStatement("INSERT INTO testcase_versions (testcase_id, version, snapshot) SELECT id, ?, jsonb_build_object('title', title, 'description', description, 'preconditions', preconditions, 'postconditions', postconditions, 'steps', steps, 'test_data', test_data, 'estimated_duration', estimated_duration, 'attachments', attachments, 'priority', priority, 'severity', severity, 'type', type, 'automation_status', automation_status, 'automation_tags', automation_tags, 'status', status) FROM testcases WHERE id = ?")) {
+            try (PreparedStatement sel = c.prepareStatement("SELECT title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name, automation_framework, automation_tags, automation_script, automation_script_language, automation_script_version, status FROM testcases WHERE id = ?");
+                 PreparedStatement ins = c.prepareStatement("INSERT INTO testcase_versions (testcase_id, version, snapshot) SELECT id, ?, jsonb_build_object('title', title, 'description', description, 'preconditions', preconditions, 'postconditions', postconditions, 'steps', steps, 'test_data', test_data, 'estimated_duration', estimated_duration, 'attachments', attachments, 'priority', priority, 'severity', severity, 'type', type, 'automation_status', automation_status, 'automation_repo', automation_repo, 'automation_path', automation_path, 'automation_test_name', automation_test_name, 'automation_framework', automation_framework, 'automation_tags', automation_tags, 'automation_script', automation_script, 'automation_script_language', automation_script_language, 'automation_script_version', automation_script_version, 'status', status) FROM testcases WHERE id = ?")) {
                 sel.setObject(1, testcaseId);
                 ResultSet rs = sel.executeQuery();
                 if (rs.next()) {

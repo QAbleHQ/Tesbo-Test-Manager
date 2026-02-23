@@ -225,7 +225,7 @@ public final class AiHandler {
         return new RemoteAiService(RemoteAiService.Provider.OPENAI, apiKey, model);
     }
 
-    private static Map<String, String> readAiConfig(UUID projectId) {
+    public static Map<String, String> readAiConfig(UUID projectId) {
         String sql = "SELECT settings FROM projects WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {

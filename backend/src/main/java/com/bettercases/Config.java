@@ -46,6 +46,9 @@ public final class Config {
     public static final String TESBO_SPACES_ACCESS_KEY = getEnv("TESBO_SPACES_ACCESS_KEY", "").trim();
     public static final String TESBO_SPACES_SECRET_KEY = getEnv("TESBO_SPACES_SECRET_KEY", "").trim();
     public static final int TESBO_SIGNED_URL_TTL_SECONDS = Integer.parseInt(getEnv("TESBO_SIGNED_URL_TTL_SECONDS", "600"));
+    public static final String AUTOMATION_AGENT_BASE_URL = getEnv("AUTOMATION_AGENT_BASE_URL", "http://localhost:7400");
+    public static final String AUTOMATION_AGENT_SHARED_TOKEN = getEnv("AUTOMATION_AGENT_SHARED_TOKEN", "");
+    public static final int AUTOMATION_STEP_TIMEOUT_MS = Integer.parseInt(getEnv("AUTOMATION_STEP_TIMEOUT_MS", "10000"));
 
     private static Map<String, String> loadDotEnv() {
         Map<String, String> map = new HashMap<>();
