@@ -83,7 +83,6 @@ function ProjectsPageContent() {
       setCreateKey("");
       setCreateDescription("");
       router.push(`/projects/${created.id}/dashboard`);
-      loadProjects();
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create project");
     } finally {
