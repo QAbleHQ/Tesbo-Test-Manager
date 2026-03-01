@@ -25,9 +25,18 @@ import {
 } from "@/lib/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
+const MANUAL_REQUIRED_NOTE = "Manual execution required (no linked automation script).";
 
 /* ───── Constants ───── */
 const EXEC_STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"] as const;
+const LIVE_STATUS_TO_EXEC_STATUS: Record<string, string> = {
+  queued: "Untested",
+  running: "Retest",
+  passed: "Passed",
+  failed: "Failed",
+  manual: "Untested",
+  cancelled: "Skipped",
+};
 
 /* ───── Donut chart (pure SVG) ───── */
 function DonutChart({
@@ -250,10 +259,11 @@ export default function TestRunDetailPage() {
         if (cancelled) return;
         setAutomatedLiveStatus(status);
         if (status.status === "completed" || status.status === "failed") {
+          const manualCount = status.items.filter((item) => item.status === "manual").length;
           setAutomatedRunId(null);
           setAutomatedSummary(
             status.status === "completed"
-              ? `Automated run completed: ${status.passed} passed, ${status.failed} failed (${status.completed}/${status.totalCases}).`
+              ? `Automated run completed: ${status.passed} passed, ${status.failed} failed, ${manualCount} manual (${status.completed}/${status.totalCases}).`
               : `Automated run failed: ${status.error || "Unknown error"}`
           );
           load();
@@ -516,6 +526,18 @@ export default function TestRunDetailPage() {
     return map;
   }, [automatedLiveStatus]);
 
+  const runningLiveItem = useMemo(
+    () => automatedLiveStatus?.items.find((item) => item.status === "running") ?? null,
+    [automatedLiveStatus]
+  );
+  const queuedLiveItems = useMemo(
+    () =>
+      (automatedLiveStatus?.items ?? [])
+        .filter((item) => item.status === "queued")
+        .sort((a, b) => a.index - b.index),
+    [automatedLiveStatus]
+  );
+
   if (loading || !run) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -626,6 +648,27 @@ export default function TestRunDetailPage() {
         {automatedLiveStatus && automatedRunId && (
           <div className="mb-4 rounded-lg border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 px-4 py-2 text-sm text-violet-800 dark:text-violet-300">
             Live automation: {automatedLiveStatus.completed}/{automatedLiveStatus.totalCases} completed • Passed {automatedLiveStatus.passed}, Failed {automatedLiveStatus.failed}
+            {runningLiveItem && (
+              <div className="mt-1 text-xs">
+                Running now: <span className="font-semibold">{runningLiveItem.externalId || runningLiveItem.title}</span>
+              </div>
+            )}
+            {queuedLiveItems.length > 0 && (
+              <div className="mt-1 text-xs">
+                In queue: <span className="font-semibold">{queuedLiveItems.length}</span>{" "}
+                {queuedLiveItems.length === 1 ? "test" : "tests"}
+                {queuedLiveItems.length <= 3 && (
+                  <span>
+                    {" "}
+                    (
+                    {queuedLiveItems
+                      .map((item) => item.externalId || item.title)
+                      .join(", ")}
+                    )
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         )}
         {automatedSummary && (
@@ -750,6 +793,24 @@ export default function TestRunDetailPage() {
                               Running
                             </span>
                           )}
+                          {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "queued" && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                              In Queue
+                            </span>
+                          )}
+                          {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "manual" && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-500" />
+                              Manual
+                            </span>
+                          )}
+                          {e.status === "Untested" && e.actualResult === MANUAL_REQUIRED_NOTE && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-500" />
+                              Manual
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-5 py-3">
@@ -761,9 +822,15 @@ export default function TestRunDetailPage() {
                       <td className="px-5 py-3">
                         {automatedRunId && liveStatusByExecutionId.has(e.id) ? (
                           <div className="flex items-center gap-2">
-                            <StatusBadge status={liveStatusByExecutionId.get(e.id)?.status === "queued" ? "Untested" : (liveStatusByExecutionId.get(e.id)?.status === "running" ? "Retest" : (liveStatusByExecutionId.get(e.id)?.status === "passed" ? "Passed" : "Failed"))} />
+                            <StatusBadge status={LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested"} />
                             {liveStatusByExecutionId.get(e.id)?.status === "running" && (
                               <span className="text-xs text-blue-600 dark:text-blue-400">Running...</span>
+                            )}
+                            {liveStatusByExecutionId.get(e.id)?.status === "queued" && (
+                              <span className="text-xs text-amber-600 dark:text-amber-400">Queued</span>
+                            )}
+                            {liveStatusByExecutionId.get(e.id)?.status === "manual" && (
+                              <span className="text-xs text-zinc-600 dark:text-zinc-400">Manual run required</span>
                             )}
                           </div>
                         ) : isInProgress ? (

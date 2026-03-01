@@ -149,7 +149,8 @@ public final class AutomationSessionService {
     }
 
     public static void finalizeIntoTestcase(UUID projectId, UUID testcaseId, UUID userId,
-                                            String framework, String repo, String path, String testName, String script) {
+                                            String framework, String repo, String path, String testName, String script,
+                                            List<Map<String, Object>> generatedSteps) {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canEditCases()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot finalize automation");
@@ -180,19 +181,26 @@ public final class AutomationSessionService {
             try (PreparedStatement up = c.prepareStatement(
                     "UPDATE testcases SET automation_status = 'Automated', automation_framework = ?, automation_repo = ?, automation_path = ?, " +
                             "automation_test_name = ?, automation_script = ?, automation_script_language = 'playwright-ts', " +
-                            "automation_script_version = COALESCE(automation_script_version, 0) + 1, automated_at = now(), automated_by = ?, updated_at = now() " +
+                            "automation_script_version = COALESCE(automation_script_version, 0) + 1, steps = COALESCE(?::jsonb, steps), automated_at = now(), automated_by = ?, updated_at = now() " +
                             "WHERE id = ? AND project_id = ?")) {
+                String generatedStepsJson = null;
+                if (generatedSteps != null && !generatedSteps.isEmpty()) {
+                    generatedStepsJson = mapper.writeValueAsString(generatedSteps);
+                }
                 up.setString(1, framework);
                 up.setString(2, repo);
                 up.setString(3, path);
                 up.setString(4, testName);
                 up.setString(5, script);
-                up.setObject(6, userId);
-                up.setObject(7, testcaseId);
-                up.setObject(8, projectId);
+                up.setString(6, generatedStepsJson);
+                up.setObject(7, userId);
+                up.setObject(8, testcaseId);
+                up.setObject(9, projectId);
                 up.executeUpdate();
             }
         } catch (SQLException e) {
+            throw new RuntimeException(e);
+        } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }

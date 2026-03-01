@@ -56,6 +56,8 @@ public final class CycleAutomationRunService {
             throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
         }
         if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
+            assertQueueExecutionAvailable();
+            markManualRequiredNotes(rows);
             UUID runId = AutomationExecutionQueueService.createRunWithJobs(cycleId, rows, Config.AUTOMATION_QUEUE_MAX_RETRIES);
             List<Map<String, Object>> jobs = AutomationExecutionQueueService.listQueueableJobs(runId);
             for (Map<String, Object> job : jobs) {
@@ -146,26 +148,25 @@ public final class CycleAutomationRunService {
         int automated = 0;
         int passed = 0;
         int failed = 0;
+        int manual = 0;
         for (ExecutionScriptRow row : rows) {
-            String startedAt = Instant.now().toString();
-            if (runId != null) {
-                CycleAutomationRunTracker.markCurrent(runId, row.executionId(), "running", "Executing script...");
-            }
             if (row.script() == null || row.script().isBlank()) {
-                failed++;
-                if (!strictAutomatedOnly) {
-                    markExecution(row.executionId(), "Failed", "No automation script is linked to this test case.");
-                }
+                manual++;
+                markManualRequiredNote(row.executionId());
                 if (runId != null) {
-                    CycleAutomationRunTracker.markResult(runId, row.executionId(), "failed", "No automation script is linked to this test case.");
+                    CycleAutomationRunTracker.markResult(runId, row.executionId(), "manual", "Manual execution required (no linked automation script).");
                 }
                 ExecutionAutomationReportService.upsert(
-                        cycleId, row.executionId(), "failed", startedAt, Instant.now().toString(),
-                        List.of(), null, null, "No automation script is linked to this test case."
+                        cycleId, row.executionId(), "manual", Instant.now().toString(), Instant.now().toString(),
+                        List.of(), null, null, "Manual execution required (no linked automation script)."
                 );
                 continue;
             }
             automated++;
+            String startedAt = Instant.now().toString();
+            if (runId != null) {
+                CycleAutomationRunTracker.markCurrent(runId, row.executionId(), "running", "Executing script...");
+            }
             List<Map<String, Object>> reportLogs = List.of();
             String reportStatus = "failed";
             String reportError = null;
@@ -228,10 +229,21 @@ public final class CycleAutomationRunService {
                 "cycleId", cycleId.toString(),
                 "totalCases", total,
                 "automatedCases", automated,
+                "manualCases", manual,
                 "passed", passed,
                 "failed", failed,
                 "completedAt", Instant.now().toString()
         );
+    }
+
+    private static void assertQueueExecutionAvailable() {
+        try {
+            AutomationAgentClient.queueStats();
+        } catch (Exception e) {
+            throw new io.javalin.http.ServiceUnavailableResponse(
+                    "Automation queue worker is unavailable. Start automation-agent with queue enabled."
+            );
+        }
     }
 
     private static String resolveCycleStartUrl(UUID cycleId) {
@@ -363,6 +375,30 @@ public final class CycleAutomationRunService {
             ps.setString(1, status);
             ps.setString(2, resultText);
             ps.setObject(3, executionId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void markManualRequiredNotes(List<ExecutionScriptRow> rows) {
+        for (ExecutionScriptRow row : rows) {
+            if (row.script() == null || row.script().isBlank()) {
+                markManualRequiredNote(row.executionId());
+            }
+        }
+    }
+
+    private static void markManualRequiredNote(UUID executionId) {
+        String sql = """
+                UPDATE executions
+                SET actual_result = ?, updated_at = now()
+                WHERE id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, "Manual execution required (no linked automation script).");
+            ps.setObject(2, executionId);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);

@@ -472,6 +472,7 @@ public final class AutomationSessionHandler {
                 body != null ? body.testName : null,
                 events
         );
+        List<Map<String, Object>> generatedSteps = AutomationScriptBuilderService.buildTestSteps(events);
         AutomationSessionService.finalizeIntoTestcase(
                 projectId,
                 testcaseId,
@@ -480,7 +481,8 @@ public final class AutomationSessionHandler {
                 body != null ? body.repo : null,
                 body != null ? body.path : null,
                 body != null && body.testName != null ? body.testName : "Generated Test",
-                script
+                script,
+                generatedSteps
         );
         AutomationSessionService.markSessionEnded(sessionId, "completed");
         AutomationAgentClient.closeSession(sessionId);

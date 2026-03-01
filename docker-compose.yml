@@ -24,6 +24,7 @@ services:
       PORT: 7400
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
+      AUTOMATION_QUEUE_ENABLED: "true"
       AUTOMATION_QUEUE_SHARED_TOKEN: changeme
       AGENT_SHARED_TOKEN: changeme
       AUTOMATION_QUEUE_CONCURRENCY: 2
@@ -39,6 +40,7 @@ services:
       PORT: 7401
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
+      AUTOMATION_QUEUE_ENABLED: "true"
       AUTOMATION_QUEUE_SHARED_TOKEN: changeme
       AGENT_SHARED_TOKEN: changeme
       AUTOMATION_QUEUE_CONCURRENCY: 4

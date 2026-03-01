@@ -64,7 +64,8 @@ public final class CycleAutomationRunTracker {
         state.currentExecutionId = executionId.toString();
         if ("passed".equalsIgnoreCase(status)) state.passed++;
         if ("failed".equalsIgnoreCase(status)) state.failed++;
-        state.completed = Math.max(0, state.passed + state.failed);
+        if ("manual".equalsIgnoreCase(status)) state.manual++;
+        state.completed = Math.max(0, state.passed + state.failed + state.manual);
     }
 
     public static void complete(UUID runId) {
@@ -96,6 +97,7 @@ public final class CycleAutomationRunTracker {
         out.put("completed", state.completed);
         out.put("passed", state.passed);
         out.put("failed", state.failed);
+        out.put("manual", state.manual);
         out.put("error", state.error);
         out.put("items", new ArrayList<>(state.items));
         return out;
@@ -118,6 +120,7 @@ public final class CycleAutomationRunTracker {
         int completed;
         int passed;
         int failed;
+        int manual;
         String error;
         final List<Map<String, Object>> items = new ArrayList<>();
         final Map<UUID, Integer> indexByExecutionId = new LinkedHashMap<>();

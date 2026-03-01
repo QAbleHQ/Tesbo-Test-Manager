@@ -679,7 +679,7 @@ export interface AutomatedRunLiveStatusItem {
   executionId: string;
   title: string;
   externalId: string;
-  status: "queued" | "running" | "passed" | "failed";
+  status: "queued" | "running" | "passed" | "failed" | "manual" | "cancelled";
   index: number;
   message?: string;
 }

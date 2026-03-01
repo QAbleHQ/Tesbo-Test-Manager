@@ -41,13 +41,13 @@ public final class AutomationExecutionQueueService {
                     ps.setString(4, row.title());
                     ps.setString(5, row.externalId());
                     ps.setString(6, row.script());
-                    ps.setString(7, (row.script() == null || row.script().isBlank()) ? "failed" : "queued");
+                    ps.setString(7, (row.script() == null || row.script().isBlank()) ? "manual" : "queued");
                     ps.setInt(8, Math.max(0, maxRetries));
                     ps.addBatch();
                 }
                 ps.executeBatch();
             }
-            // Immediately count non-runnable jobs as failures.
+            // Immediately count non-runnable jobs as manual-required.
             try (PreparedStatement ps = c.prepareStatement("""
                     UPDATE automation_runs
                     SET failed_jobs = (
@@ -65,6 +65,7 @@ public final class AutomationExecutionQueueService {
                 ps.executeUpdate();
             }
             c.commit();
+            recomputeRun(runId);
             return runId;
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -372,6 +373,7 @@ public final class AutomationExecutionQueueService {
             case "failed" -> "failed";
             case "running" -> "running";
             case "cancelled" -> "cancelled";
+            case "manual" -> "manual";
             default -> "queued";
         };
     }
@@ -425,7 +427,7 @@ public final class AutomationExecutionQueueService {
                 FROM (
                     SELECT run_id,
                            COUNT(*) FILTER (WHERE status = 'queued') AS queued_jobs,
-                           COUNT(*) FILTER (WHERE status IN ('passed', 'failed', 'cancelled')) AS completed_jobs,
+                           COUNT(*) FILTER (WHERE status IN ('passed', 'failed', 'cancelled', 'manual')) AS completed_jobs,
                            COUNT(*) FILTER (WHERE status = 'passed') AS passed_jobs,
                            COUNT(*) FILTER (WHERE status = 'failed') AS failed_jobs,
                            COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_jobs

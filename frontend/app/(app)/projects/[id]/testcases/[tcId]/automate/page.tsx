@@ -1039,8 +1039,9 @@ export default function AutomateTestCasePage() {
               Complete Browser Session and Save Script?
             </h3>
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              This will end the current browser session, convert recorded actions into a Playwright script, and store it
-              in the test case <span className="font-medium">Playwright Script</span> section.
+              This will end the current browser session, convert recorded actions into a Playwright script, and store
+              generated plain-English step definitions in the test case <span className="font-medium">Test Steps</span>{" "}
+              section (with expected results where possible).
             </p>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
