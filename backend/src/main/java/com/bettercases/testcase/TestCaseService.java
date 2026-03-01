@@ -191,9 +191,12 @@ public final class TestCaseService {
         if (!RbacService.getProjectRole(userId, projectId).get().canEditCases())
             throw new io.javalin.http.ForbiddenResponse("Cannot create test cases");
         String externalId = dto.externalId != null && !dto.externalId.isBlank() ? dto.externalId : nextExternalId(projectId);
+        String resolvedAutomationStatus = (dto.automationScript != null && !dto.automationScript.isBlank())
+                ? "Automated"
+                : (dto.automationStatus != null ? dto.automationStatus : "No");
         String sql = "INSERT INTO testcases (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, " +
-                "priority, severity, type, automation_status, automation_tags, owner_id, component, status, jira_issue_key, jira_url) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, external_id, title, created_at";
+                "priority, severity, type, automation_status, automation_tags, automation_script, automation_script_language, automation_script_version, owner_id, component, status, jira_issue_key, jira_url) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, external_id, title, created_at";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
@@ -225,28 +228,41 @@ public final class TestCaseService {
                 ps.setNull(13, java.sql.Types.VARCHAR);
             }
             ps.setString(14, dto.type != null ? dto.type : "Functional");
-            ps.setString(15, dto.automationStatus != null ? dto.automationStatus : "No");
+            ps.setString(15, resolvedAutomationStatus);
             if (dto.automationTags != null && !dto.automationTags.isBlank()) {
                 ps.setString(16, dto.automationTags);
             } else {
                 ps.setNull(16, java.sql.Types.VARCHAR);
             }
-            ps.setObject(17, dto.ownerId != null && !dto.ownerId.isBlank() ? UUID.fromString(dto.ownerId) : userId);
-            if (dto.component != null && !dto.component.isBlank()) {
-                ps.setString(18, dto.component);
+            if (dto.automationScript != null) {
+                ps.setString(17, dto.automationScript);
+            } else {
+                ps.setNull(17, java.sql.Types.VARCHAR);
+            }
+            if (dto.automationScriptLanguage != null && !dto.automationScriptLanguage.isBlank()) {
+                ps.setString(18, dto.automationScriptLanguage);
+            } else if (dto.automationScript != null && !dto.automationScript.isBlank()) {
+                ps.setString(18, "playwright-ts");
             } else {
                 ps.setNull(18, java.sql.Types.VARCHAR);
             }
-            ps.setString(19, dto.status != null ? dto.status : "Draft");
-            if (dto.jiraIssueKey != null && !dto.jiraIssueKey.isBlank()) {
-                ps.setString(20, dto.jiraIssueKey);
-            } else {
-                ps.setNull(20, java.sql.Types.VARCHAR);
-            }
-            if (dto.jiraUrl != null && !dto.jiraUrl.isBlank()) {
-                ps.setString(21, dto.jiraUrl);
+            ps.setInt(19, dto.automationScript != null && !dto.automationScript.isBlank() ? 1 : 0);
+            ps.setObject(20, dto.ownerId != null && !dto.ownerId.isBlank() ? UUID.fromString(dto.ownerId) : userId);
+            if (dto.component != null && !dto.component.isBlank()) {
+                ps.setString(21, dto.component);
             } else {
                 ps.setNull(21, java.sql.Types.VARCHAR);
+            }
+            ps.setString(22, dto.status != null ? dto.status : "Draft");
+            if (dto.jiraIssueKey != null && !dto.jiraIssueKey.isBlank()) {
+                ps.setString(23, dto.jiraIssueKey);
+            } else {
+                ps.setNull(23, java.sql.Types.VARCHAR);
+            }
+            if (dto.jiraUrl != null && !dto.jiraUrl.isBlank()) {
+                ps.setString(24, dto.jiraUrl);
+            } else {
+                ps.setNull(24, java.sql.Types.VARCHAR);
             }
             ResultSet rs = ps.executeQuery();
             rs.next();
@@ -287,10 +303,15 @@ public final class TestCaseService {
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+        String resolvedAutomationStatus = (dto.automationScript != null && !dto.automationScript.isBlank())
+                ? "Automated"
+                : dto.automationStatus;
         String sql = "UPDATE testcases SET title = COALESCE(?, title), description = COALESCE(?, description), preconditions = COALESCE(?, preconditions), " +
                 "postconditions = COALESCE(?, postconditions), steps = COALESCE(?::jsonb, steps), test_data = COALESCE(?, test_data), estimated_duration = ?, attachments = ?, " +
                 "priority = COALESCE(?, priority), severity = ?, type = COALESCE(?, type), automation_status = COALESCE(?, automation_status), " +
                 "automation_repo = ?, automation_path = ?, automation_test_name = ?, automation_framework = ?, automation_tags = ?, " +
+                "automation_script = COALESCE(?, automation_script), automation_script_language = COALESCE(?, automation_script_language), " +
+                "automation_script_version = CASE WHEN ? IS NOT NULL THEN COALESCE(automation_script_version, 0) + 1 ELSE automation_script_version END, " +
                 "owner_id = CASE WHEN ?::uuid IS NOT NULL THEN ?::uuid ELSE owner_id END, component = COALESCE(?, component), status = COALESCE(?, status), " +
                 "suite_id = CASE WHEN ?::uuid IS NOT NULL THEN ?::uuid ELSE suite_id END, updated_at = now() WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
@@ -307,19 +328,22 @@ public final class TestCaseService {
             ps.setString(9, dto.priority);
             ps.setString(10, dto.severity);
             ps.setString(11, dto.type);
-            ps.setString(12, dto.automationStatus);
+            ps.setString(12, resolvedAutomationStatus);
             ps.setString(13, dto.automationRepo);
             ps.setString(14, dto.automationPath);
             ps.setString(15, dto.automationTestName);
             ps.setString(16, dto.automationFramework);
             ps.setString(17, dto.automationTags);
-            ps.setString(18, dto.ownerId);
-            ps.setString(19, dto.ownerId);
-            ps.setString(20, dto.component);
-            ps.setString(21, dto.status);
-            ps.setString(22, suiteId);
-            ps.setString(23, suiteId);
-            ps.setObject(24, testcaseId);
+            ps.setString(18, dto.automationScript);
+            ps.setString(19, dto.automationScriptLanguage);
+            ps.setString(20, dto.automationScript);
+            ps.setString(21, dto.ownerId);
+            ps.setString(22, dto.ownerId);
+            ps.setString(23, dto.component);
+            ps.setString(24, dto.status);
+            ps.setString(25, suiteId);
+            ps.setString(26, suiteId);
+            ps.setObject(27, testcaseId);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -442,6 +466,8 @@ public final class TestCaseService {
         public String type;
         public String automationStatus;
         public String automationTags;
+        public String automationScript;
+        public String automationScriptLanguage;
         public String ownerId;
         public String component;
         public String status;
@@ -467,6 +493,8 @@ public final class TestCaseService {
         public String automationTestName;
         public String automationFramework;
         public String automationTags;
+        public String automationScript;
+        public String automationScriptLanguage;
         public String ownerId;
         public String component;
         public String status;

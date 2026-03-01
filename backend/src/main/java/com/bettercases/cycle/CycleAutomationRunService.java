@@ -1,0 +1,376 @@
+package com.bettercases.cycle;
+
+import com.bettercases.Database;
+import com.bettercases.Config;
+import com.bettercases.automation.AutomationAgentClient;
+import com.bettercases.rbac.RbacService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public final class CycleAutomationRunService {
+    private static final ExecutorService RUNNER_EXECUTOR = Executors.newCachedThreadPool();
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    public static Map<String, Object> executeAutomated(UUID cycleId, UUID userId, boolean strictAutomatedOnly) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
+            throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
+        }
+        return executeAutomatedInternal(cycleId, strictAutomatedOnly);
+    }
+
+    public static Map<String, Object> executeAutomatedAsync(UUID cycleId, UUID userId, boolean strictAutomatedOnly) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
+            throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
+        }
+        return executeAutomatedAsyncInternal(cycleId, strictAutomatedOnly);
+    }
+
+    static Map<String, Object> executeAutomatedAsyncInternal(UUID cycleId, boolean strictAutomatedOnly) {
+        if (strictAutomatedOnly) {
+            List<String> violations = validateAutomatedOnly(cycleId);
+            if (!violations.isEmpty()) {
+                throw new io.javalin.http.BadRequestResponse(
+                        "Scheduled run requires automated-only test cases. Missing scripts: " + String.join(", ", violations)
+                );
+            }
+        }
+        List<ExecutionScriptRow> rows = loadExecutionRows(cycleId);
+        String startUrl = resolveCycleStartUrl(cycleId);
+        if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
+            throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
+        }
+        if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
+            UUID runId = AutomationExecutionQueueService.createRunWithJobs(cycleId, rows, Config.AUTOMATION_QUEUE_MAX_RETRIES);
+            List<Map<String, Object>> jobs = AutomationExecutionQueueService.listQueueableJobs(runId);
+            for (Map<String, Object> job : jobs) {
+                UUID jobId = UUID.fromString(String.valueOf(job.get("jobId")));
+                try {
+                    Map<String, Object> queued = AutomationAgentClient.enqueueAutomationJob(Map.of(
+                            "jobId", String.valueOf(job.get("jobId")),
+                            "runId", String.valueOf(job.get("runId")),
+                            "cycleId", String.valueOf(job.get("cycleId")),
+                            "executionId", String.valueOf(job.get("executionId")),
+                            "script", String.valueOf(job.get("script")),
+                            "startUrl", startUrl,
+                            "maxRetries", job.get("maxRetries")
+                    ));
+                    String queueJobId = queued.get("queueJobId") instanceof String s ? s : String.valueOf(job.get("jobId"));
+                    AutomationExecutionQueueService.markJobEnqueued(jobId, queueJobId);
+                } catch (Exception e) {
+                    AutomationExecutionQueueService.markJobFailed(jobId, "Queue enqueue failed: " + e.getMessage(), false, 0);
+                }
+            }
+            return Map.of(
+                    "runId", runId.toString(),
+                    "cycleId", cycleId.toString(),
+                    "status", "running",
+                    "totalCases", rows.size()
+            );
+        }
+        UUID runId = CycleAutomationRunTracker.start(cycleId, rows);
+        RUNNER_EXECUTOR.submit(() -> {
+            try {
+                runRows(cycleId, strictAutomatedOnly, rows, runId, startUrl);
+                CycleAutomationRunTracker.complete(runId);
+            } catch (Exception e) {
+                CycleAutomationRunTracker.fail(runId, e.getMessage());
+            }
+        });
+        return Map.of(
+                "runId", runId.toString(),
+                "cycleId", cycleId.toString(),
+                "status", "running",
+                "totalCases", rows.size()
+        );
+    }
+
+    public static Map<String, Object> getRunStatus(UUID cycleId, UUID runId, UUID userId) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        if (AutomationExecutionQueueService.exists(cycleId, runId)) {
+            return AutomationExecutionQueueService.snapshot(cycleId, runId);
+        }
+        return CycleAutomationRunTracker.snapshot(cycleId, runId);
+    }
+
+    public static void cancelRun(UUID cycleId, UUID runId, UUID userId) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE) && AutomationExecutionQueueService.exists(cycleId, runId)) {
+            AutomationExecutionQueueService.cancelRun(cycleId, runId, "Cancelled by user");
+            try {
+                AutomationAgentClient.cancelRunQueue(runId);
+            } catch (Exception ignored) {
+                // Cancellation in queue backend is best-effort.
+            }
+            return;
+        }
+        throw new io.javalin.http.BadRequestResponse("Run cancellation is not available for legacy mode.");
+    }
+
+    static Map<String, Object> executeAutomatedInternal(UUID cycleId, boolean strictAutomatedOnly) {
+        if (strictAutomatedOnly) {
+            List<String> violations = validateAutomatedOnly(cycleId);
+            if (!violations.isEmpty()) {
+                throw new io.javalin.http.BadRequestResponse(
+                        "Scheduled run requires automated-only test cases. Missing scripts: " + String.join(", ", violations)
+                );
+            }
+        }
+        List<ExecutionScriptRow> rows = loadExecutionRows(cycleId);
+        String startUrl = resolveCycleStartUrl(cycleId);
+        if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
+            throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
+        }
+        return runRows(cycleId, strictAutomatedOnly, rows, null, startUrl);
+    }
+
+    private static Map<String, Object> runRows(UUID cycleId, boolean strictAutomatedOnly, List<ExecutionScriptRow> rows, UUID runId, String startUrl) {
+        int total = rows.size();
+        int automated = 0;
+        int passed = 0;
+        int failed = 0;
+        for (ExecutionScriptRow row : rows) {
+            String startedAt = Instant.now().toString();
+            if (runId != null) {
+                CycleAutomationRunTracker.markCurrent(runId, row.executionId(), "running", "Executing script...");
+            }
+            if (row.script() == null || row.script().isBlank()) {
+                failed++;
+                if (!strictAutomatedOnly) {
+                    markExecution(row.executionId(), "Failed", "No automation script is linked to this test case.");
+                }
+                if (runId != null) {
+                    CycleAutomationRunTracker.markResult(runId, row.executionId(), "failed", "No automation script is linked to this test case.");
+                }
+                ExecutionAutomationReportService.upsert(
+                        cycleId, row.executionId(), "failed", startedAt, Instant.now().toString(),
+                        List.of(), null, null, "No automation script is linked to this test case."
+                );
+                continue;
+            }
+            automated++;
+            List<Map<String, Object>> reportLogs = List.of();
+            String reportStatus = "failed";
+            String reportError = null;
+            String reportScreenshot = null;
+            String reportVideo = null;
+            try {
+                Map<String, Object> response = AutomationAgentClient.runPlaywrightScript(row.executionId(), row.script(), startUrl);
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> logs = response.get("logs") instanceof List<?> l ? (List<Map<String, Object>>) l : List.of();
+                reportLogs = logs;
+                String status = response.get("status") instanceof String s ? s : "failed";
+                boolean ok = "passed".equalsIgnoreCase(status);
+                reportScreenshot = response.get("screenshotPath") instanceof String s ? s : null;
+                reportVideo = response.get("videoPath") instanceof String s ? s : null;
+                String errorMessage = response.get("errorMessage") instanceof String s ? s : null;
+                if (ok) {
+                    passed++;
+                    reportStatus = "passed";
+                    String message = "Automated run passed.";
+                    if (reportScreenshot != null && !reportScreenshot.isBlank()) {
+                        message += " Screenshot: " + reportScreenshot;
+                    }
+                    markExecution(row.executionId(), "Passed", message);
+                    if (runId != null) {
+                        CycleAutomationRunTracker.markResult(runId, row.executionId(), "passed", message);
+                    }
+                } else {
+                    failed++;
+                    String failureMessage = (errorMessage != null && !errorMessage.isBlank())
+                            ? "Automated run failed: " + errorMessage
+                            : "Automated run failed.";
+                    reportError = failureMessage;
+                    markExecution(row.executionId(), "Failed", failureMessage);
+                    if (runId != null) {
+                        CycleAutomationRunTracker.markResult(runId, row.executionId(), "failed", failureMessage);
+                    }
+                }
+            } catch (Exception e) {
+                failed++;
+                reportError = "Automated run failed: " + e.getMessage();
+                markExecution(row.executionId(), "Failed", reportError);
+                if (runId != null) {
+                    CycleAutomationRunTracker.markResult(runId, row.executionId(), "failed", reportError);
+                }
+            } finally {
+                ExecutionAutomationReportService.upsert(
+                        cycleId,
+                        row.executionId(),
+                        reportStatus,
+                        startedAt,
+                        Instant.now().toString(),
+                        reportLogs,
+                        reportVideo,
+                        reportScreenshot,
+                        reportError
+                );
+            }
+        }
+        return Map.of(
+                "cycleId", cycleId.toString(),
+                "totalCases", total,
+                "automatedCases", automated,
+                "passed", passed,
+                "failed", failed,
+                "completedAt", Instant.now().toString()
+        );
+    }
+
+    private static String resolveCycleStartUrl(UUID cycleId) {
+        String sql = """
+                SELECT c.environment, p.settings
+                FROM cycles c
+                JOIN projects p ON p.id = c.project_id
+                WHERE c.id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) {
+                throw new io.javalin.http.NotFoundResponse();
+            }
+            String environment = rs.getString("environment");
+            if (environment == null || environment.isBlank()) {
+                throw new io.javalin.http.BadRequestResponse("Test run environment is not set.");
+            }
+            String environmentValue = environment.trim();
+            if (looksLikeUrl(environmentValue)) {
+                return environmentValue;
+            }
+            String settingsRaw = rs.getString("settings");
+            String resolved = resolveEnvironmentUrlFromSettings(settingsRaw, environmentValue);
+            if (resolved == null || resolved.isBlank()) {
+                throw new io.javalin.http.BadRequestResponse(
+                        "Selected environment \"" + environmentValue + "\" does not have a configured URL."
+                );
+            }
+            return resolved;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String resolveEnvironmentUrlFromSettings(String settingsRaw, String environmentName) {
+        if (settingsRaw == null || settingsRaw.isBlank()) return null;
+        try {
+            Map<String, Object> settings = mapper.readValue(settingsRaw, new TypeReference<>() {});
+            Object rawEnvironments = settings.get("testRunEnvironments");
+            if (!(rawEnvironments instanceof List<?> list)) return null;
+            for (Object item : list) {
+                if (!(item instanceof Map<?, ?> envMap)) continue;
+                Object name = envMap.get("name");
+                Object url = envMap.get("url");
+                if (!(name instanceof String nameStr) || !(url instanceof String urlStr)) continue;
+                if (environmentName.equalsIgnoreCase(nameStr.trim())) {
+                    String trimmedUrl = urlStr.trim();
+                    if (!trimmedUrl.isBlank()) {
+                        return trimmedUrl;
+                    }
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read project test environment settings", e);
+        }
+    }
+
+    private static boolean looksLikeUrl(String value) {
+        String lower = value.toLowerCase();
+        return lower.startsWith("http://") || lower.startsWith("https://");
+    }
+
+    public static List<String> validateAutomatedOnly(UUID cycleId) {
+        String sql = """
+                SELECT tc.external_id, tc.title
+                FROM cycle_items ci
+                JOIN testcases tc ON tc.id = ci.testcase_id
+                WHERE ci.cycle_id = ?
+                  AND (tc.automation_script IS NULL OR btrim(tc.automation_script) = '')
+                ORDER BY ci.position
+                """;
+        List<String> out = new ArrayList<>();
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                String externalId = rs.getString("external_id");
+                String title = rs.getString("title");
+                if (externalId == null || externalId.isBlank()) out.add(title);
+                else out.add(externalId + " - " + title);
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static List<ExecutionScriptRow> loadExecutionRows(UUID cycleId) {
+        String sql = """
+                SELECT e.id AS execution_id, tc.automation_script, ci.snapshot_title AS title, tc.external_id
+                FROM cycle_items ci
+                JOIN executions e ON e.cycle_item_id = ci.id
+                JOIN testcases tc ON tc.id = ci.testcase_id
+                WHERE ci.cycle_id = ?
+                ORDER BY ci.position
+                """;
+        List<ExecutionScriptRow> out = new ArrayList<>();
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                out.add(new ExecutionScriptRow(
+                        (UUID) rs.getObject("execution_id"),
+                        rs.getString("automation_script"),
+                        rs.getString("title"),
+                        rs.getString("external_id")
+                ));
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void markExecution(UUID executionId, String status, String resultText) {
+        String sql = """
+                UPDATE executions
+                SET status = ?, actual_result = ?, executed_at = now(), updated_at = now()
+                WHERE id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, status);
+            ps.setString(2, resultText);
+            ps.setObject(3, executionId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public record ExecutionScriptRow(UUID executionId, String script, String title, String externalId) {}
+
+    private CycleAutomationRunService() {
+    }
+}

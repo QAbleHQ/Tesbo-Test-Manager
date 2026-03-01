@@ -9,7 +9,9 @@ import {
   createTestRun,
   updateTestRun,
   deleteTestRun,
+  getProject,
   type TestRunListItem,
+  type TestEnvironmentSetting,
 } from "@/lib/api";
 
 /* ───── Status badge colors ───── */
@@ -25,6 +27,10 @@ function statusColor(status: string) {
       return "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300";
   }
 }
+
+type ProjectSettingsPayload = {
+  testRunEnvironments?: Array<{ name?: string; url?: string }>;
+};
 
 /* ───── Modal wrapper ───── */
 function Modal({
@@ -71,10 +77,38 @@ export default function TestRunsPage() {
   const [environment, setEnvironment] = useState("");
   const [buildVersion, setBuildVersion] = useState("");
   const [saving, setSaving] = useState(false);
+  const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
+
+  function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
+    if (typeof raw !== "string" || !raw.trim()) return {};
+    try {
+      const parsed = JSON.parse(raw) as ProjectSettingsPayload;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item) => {
+        const candidate = item as { name?: unknown; url?: unknown };
+        const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+        const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+        if (!name || !url) return null;
+        return { name, url };
+      })
+      .filter((item): item is TestEnvironmentSetting => item !== null);
+  }
 
   const load = useCallback(() => {
-    listTestRuns(projectId)
-      .then(setRuns)
+    Promise.all([listTestRuns(projectId), getProject(projectId)])
+      .then(([runsData, project]) => {
+        setRuns(runsData);
+        const parsedSettings = parseProjectSettings(project.settings);
+        setEnvironmentOptions(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [projectId]);
@@ -92,7 +126,7 @@ export default function TestRunsPage() {
   /* create */
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim() || !environment.trim()) return;
     setSaving(true);
     try {
       await createTestRun(projectId, { name, description, environment, buildVersion });
@@ -115,7 +149,7 @@ export default function TestRunsPage() {
 
   async function handleEdit(e: React.FormEvent) {
     e.preventDefault();
-    if (!editRun) return;
+    if (!editRun || !environment.trim()) return;
     setSaving(true);
     try {
       await updateTestRun(editRun.id, { name, description, environment, buildVersion });
@@ -167,15 +201,23 @@ export default function TestRunsPage() {
             Create and manage test runs to track execution progress.
           </p>
         </div>
-        <button
-          onClick={() => {
-            resetForm();
-            setShowCreate(true);
-          }}
-          className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium transition-colors"
-        >
-          + New Test Run
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              resetForm();
+              setShowCreate(true);
+            }}
+            className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium transition-colors"
+          >
+            + New Test Run
+          </button>
+          <Link
+            href={`/projects/${projectId}/cycles/schedule`}
+            className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
+          >
+            Schedule Run
+          </Link>
+        </div>
       </div>
 
       {/* Empty state */}
@@ -311,15 +353,35 @@ export default function TestRunsPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Environment
+                Environment <span className="text-red-500">*</span>
               </label>
-              <input
-                type="text"
+              <select
                 value={environment}
                 onChange={(e) => setEnvironment(e.target.value)}
-                placeholder="e.g. Staging"
                 className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
-              />
+                required
+              >
+                <option value="">Select environment</option>
+                {environmentOptions.map((env) => (
+                  <option key={env.name} value={env.name}>
+                    {env.name}
+                  </option>
+                ))}
+              </select>
+              {environment && (
+                <p className="mt-1 text-xs text-zinc-500">
+                  URL: {environmentOptions.find((item) => item.name === environment)?.url ?? "Not available"}
+                </p>
+              )}
+              {environmentOptions.length === 0 && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  No environments configured. Add one in{" "}
+                  <Link href={`/projects/${projectId}/settings?tab=general`} className="underline">
+                    Project settings
+                  </Link>
+                  .
+                </p>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
@@ -344,7 +406,7 @@ export default function TestRunsPage() {
             </button>
             <button
               type="submit"
-              disabled={saving || !name.trim()}
+              disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0}
               className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               {saving ? "Creating…" : "Create"}
@@ -390,14 +452,25 @@ export default function TestRunsPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Environment
+                Environment <span className="text-red-500">*</span>
               </label>
-              <input
-                type="text"
+              <select
                 value={environment}
                 onChange={(e) => setEnvironment(e.target.value)}
                 className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
-              />
+                required
+              >
+                <option value="">Select environment</option>
+                {environment &&
+                  !environmentOptions.some((item) => item.name === environment) && (
+                    <option value={environment}>{environment} (legacy)</option>
+                  )}
+                {environmentOptions.map((env) => (
+                  <option key={env.name} value={env.name}>
+                    {env.name}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
@@ -424,7 +497,7 @@ export default function TestRunsPage() {
             </button>
             <button
               type="submit"
-              disabled={saving}
+              disabled={saving || !environment.trim()}
               className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               {saving ? "Saving…" : "Save Changes"}

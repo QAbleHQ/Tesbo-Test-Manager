@@ -3,7 +3,15 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { authMe, listCycleExecutions, updateExecution, type ExecutionItem } from "@/lib/api";
+import {
+  authMe,
+  listCycleExecutions,
+  updateExecution,
+  getExecutionAutomationReport,
+  getExecutionAutomationVideoUrl,
+  type ExecutionAutomationReport,
+  type ExecutionItem,
+} from "@/lib/api";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
@@ -35,6 +43,8 @@ export default function ExecutionDetailPage() {
   const [defectKey, setDefectKey] = useState("");
   const [defectUrl, setDefectUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  const [automationReport, setAutomationReport] = useState<ExecutionAutomationReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -51,6 +61,11 @@ export default function ExecutionDetailPage() {
             setActualResult(e.actualResult || "");
             setDefectKey(e.defectKey || "");
             setDefectUrl(e.defectUrl || "");
+            setReportLoading(true);
+            getExecutionAutomationReport(cycleId, e.id)
+              .then(setAutomationReport)
+              .catch(() => setAutomationReport(null))
+              .finally(() => setReportLoading(false));
           }
         })
         .catch(() => router.replace("/projects"));
@@ -81,6 +96,9 @@ export default function ExecutionDetailPage() {
       </div>
     );
   }
+
+  const executedSteps =
+    automationReport?.logs?.filter((log) => log.kind === "step" || !!log.stepId || !!log.action) ?? [];
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -152,6 +170,96 @@ export default function ExecutionDetailPage() {
               placeholder="Describe what actually happened…"
               className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
+          </div>
+
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-zinc-50 dark:bg-zinc-900/40">
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
+              Automated Run Artifacts
+            </h3>
+            {reportLoading ? (
+              <p className="text-sm text-zinc-500">Loading run logs...</p>
+            ) : !automationReport || automationReport.status === "not_available" ? (
+              <p className="text-sm text-zinc-500">
+                No automated run artifacts found for this execution yet.
+              </p>
+            ) : (
+              <div className="space-y-4">
+                <div className="text-xs text-zinc-500">
+                  <p>Status: <span className="font-medium">{automationReport.status}</span></p>
+                  {automationReport.startedAt && (
+                    <p>Started: {new Date(automationReport.startedAt).toLocaleString()}</p>
+                  )}
+                  {automationReport.endedAt && (
+                    <p>Ended: {new Date(automationReport.endedAt).toLocaleString()}</p>
+                  )}
+                  {automationReport.errorMessage && (
+                    <p className="text-red-600 dark:text-red-400">Error: {automationReport.errorMessage}</p>
+                  )}
+                </div>
+
+                {automationReport.videoAvailable ? (
+                  <div>
+                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Run Video</p>
+                    {automationReport.videoUrl || automationReport.videoAvailable ? (
+                      <video
+                        controls
+                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-black"
+                        src={automationReport.videoUrl || getExecutionAutomationVideoUrl(cycleId, executionId)}
+                      />
+                    ) : (
+                      <p className="text-xs text-zinc-500">Generating secure video URL...</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-zinc-500">Video is not available for this run.</p>
+                )}
+
+                <div>
+                  <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Step Logs</p>
+                  {executedSteps.length === 0 ? (
+                    <p className="text-xs text-zinc-500">No step logs recorded.</p>
+                  ) : (
+                    <div className="max-h-64 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900">
+                      <table className="w-full text-xs">
+                        <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+                          <tr>
+                            <th className="text-left px-2 py-1">Step</th>
+                            <th className="text-left px-2 py-1">Action</th>
+                            <th className="text-left px-2 py-1">Status</th>
+                            <th className="text-left px-2 py-1">Message</th>
+                            <th className="text-left px-2 py-1">Screenshot</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {executedSteps.map((log, idx) => (
+                            <tr key={`${log.stepId ?? "step"}-${idx}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                              <td className="px-2 py-1 font-mono">{log.stepId ?? idx + 1}</td>
+                              <td className="px-2 py-1">{log.action ?? "-"}</td>
+                              <td className="px-2 py-1">{log.status ?? "-"}</td>
+                              <td className="px-2 py-1">{log.message ?? "-"}</td>
+                              <td className="px-2 py-1">
+                                {log.screenshotUrl ? (
+                                  <a
+                                    href={log.screenshotUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-blue-600 hover:underline"
+                                  >
+                                    View
+                                  </a>
+                                ) : (
+                                  "-"
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">

@@ -2,12 +2,21 @@ import express from "express";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
 import {
+  getSession,
   createSession,
   executeSteps,
+  manualAction,
+  runPlaywrightScript,
   sessionState,
   closeSession,
   startCleanupWatchdog,
 } from "./sessionStore.js";
+import {
+  enqueueExecutionJob,
+  startQueueWorker,
+  queueStats,
+  cancelRun,
+} from "./queueRuntime.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -60,8 +69,71 @@ app.post("/internal/sessions/:sessionId/execute", async (req, res) => {
   }
 });
 
-app.get("/internal/sessions/:sessionId/state", (req, res) => {
-  const state = sessionState(req.params.sessionId);
+app.post("/internal/playwright/run", async (req, res) => {
+  const { executionId, script, startUrl } = req.body || {};
+  if (!executionId || !script) {
+    res.status(400).json({ error: "executionId and script are required" });
+    return;
+  }
+  try {
+    const result = await runPlaywrightScript(String(executionId), String(script), typeof startUrl === "string" ? startUrl : null);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Playwright run failed" });
+  }
+});
+
+app.post("/internal/queue/jobs", async (req, res) => {
+  const { jobId, runId, cycleId, executionId, script, startUrl, maxRetries } = req.body || {};
+  if (!jobId || !runId || !cycleId || !executionId || !script) {
+    res.status(400).json({ error: "jobId, runId, cycleId, executionId, and script are required" });
+    return;
+  }
+  try {
+    const queued = await enqueueExecutionJob({
+      jobId: String(jobId),
+      runId: String(runId),
+      cycleId: String(cycleId),
+      executionId: String(executionId),
+      script: String(script),
+      startUrl: typeof startUrl === "string" ? startUrl : null,
+      maxRetries,
+    });
+    res.status(202).json(queued);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Queue enqueue failed" });
+  }
+});
+
+app.post("/internal/queue/runs/:runId/cancel", async (req, res) => {
+  try {
+    await cancelRun(req.params.runId);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Cancel failed" });
+  }
+});
+
+app.get("/internal/queue/stats", async (_req, res) => {
+  try {
+    res.json(await queueStats());
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Queue stats failed" });
+  }
+});
+
+app.post("/internal/sessions/:sessionId/manual-action", async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const result = await manualAction(sessionId, req.body || {});
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : "Manual action failed" });
+  }
+});
+
+app.get("/internal/sessions/:sessionId/state", async (req, res) => {
+  const state = await sessionState(req.params.sessionId);
   if (!state) {
     res.status(404).json({ error: "Session not found" });
     return;
@@ -69,9 +141,80 @@ app.get("/internal/sessions/:sessionId/state", (req, res) => {
   res.json(state);
 });
 
+app.get("/internal/sessions/:sessionId/live", async (req, res) => {
+  const session = getSession(req.params.sessionId);
+  if (!session) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  res.writeHead(200, {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+    Connection: "keep-alive",
+    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+  });
+
+  let cancelled = false;
+  let busy = false;
+  let streamClosed = false;
+  let timer = null;
+  req.on("close", () => {
+    cancelled = true;
+  });
+
+  const closeStream = () => {
+    if (streamClosed) return;
+    streamClosed = true;
+    cancelled = true;
+    if (timer) clearInterval(timer);
+    try {
+      res.end();
+    } catch {
+      // no-op
+    }
+  };
+
+  const writeFrame = async () => {
+    if (cancelled || busy || streamClosed) return;
+    busy = true;
+    try {
+      const buffer = await session.page.screenshot({ type: "jpeg", quality: 55 });
+      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buffer.length}\r\n\r\n`);
+      res.write(buffer);
+      res.write("\r\n");
+      session.currentUrl = session.page.url();
+      session.updatedAt = new Date().toISOString();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const closedContext =
+        message.includes("Target page, context or browser has been closed") ||
+        message.includes("Target closed");
+      if (!closedContext) {
+        logError("live_frame_failed", { error: message });
+      }
+      if (closedContext) {
+        closeStream();
+      }
+    } finally {
+      busy = false;
+    }
+  };
+
+  const intervalMs = 180;
+  timer = setInterval(() => {
+    void writeFrame();
+  }, intervalMs);
+  void writeFrame();
+
+  req.on("close", () => {
+    closeStream();
+  });
+});
+
 app.post("/internal/sessions/:sessionId/close", async (req, res) => {
-  await closeSession(req.params.sessionId);
-  res.status(204).send();
+  const result = await closeSession(req.params.sessionId);
+  res.json(result || { videoPath: null });
 });
 
 app.use((err, _req, res, _next) => {
@@ -81,5 +224,6 @@ app.use((err, _req, res, _next) => {
 
 app.listen(config.port, () => {
   startCleanupWatchdog();
+  startQueueWorker();
   logInfo("automation_agent_started", { port: config.port, headless: config.headless });
 });

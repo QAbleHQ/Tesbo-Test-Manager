@@ -21,8 +21,16 @@
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationSessionService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/bug/BugHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/bug/BugService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationExecutionQueueService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationQueueCallbackHandler.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationQueueMetricsService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleAutomationRunService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleAutomationRunTracker.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleHandler.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleRunScheduleService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleScheduleWorker.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/ExecutionAutomationReportService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/export/ExportHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/invitation/InvitationHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/invitation/InvitationService.java

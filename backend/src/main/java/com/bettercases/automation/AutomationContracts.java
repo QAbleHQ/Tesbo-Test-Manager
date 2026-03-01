@@ -18,11 +18,25 @@ public final class AutomationContracts {
         public String path;
     }
 
+    public static class ManualActionBody {
+        public String actionType;
+        public Double xRatio;
+        public Double yRatio;
+        public Double toXRatio;
+        public Double toYRatio;
+        public Double deltaX;
+        public Double deltaY;
+        public String text;
+        public String key;
+    }
+
     public static class ActionPlan {
         public String commandId;
         public List<ActionStep> steps;
         public String clarificationQuestion;
         public boolean requiresClarification;
+        public boolean goalAchieved;
+        public String completionReason;
     }
 
     public static class ActionStep {
@@ -30,7 +44,9 @@ public final class AutomationContracts {
         public String action;
         public String url;
         public String selector;
+        public String targetDescription;
         public String value;
+        public String expectedText;
         public Integer timeoutMs;
     }
 

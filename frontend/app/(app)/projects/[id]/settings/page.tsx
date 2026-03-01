@@ -17,6 +17,7 @@ import {
   addProjectMember,
   removeProjectMember,
   type JiraConnection,
+  type TestEnvironmentSetting,
 } from "@/lib/api";
 import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
 import ThemeToggle from "@/components/ThemeToggle";
@@ -53,10 +54,14 @@ type ProjectSettingsPayload = {
     alertsEnabled?: boolean;
     shareByDefault?: boolean;
   };
+  testRunEnvironments?: Array<{
+    name?: string;
+    url?: string;
+  }>;
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "members" | "ai" | "jira" | "tesbo" | "alerts" | "integrations";
+type SettingsTab = "general" | "testRuns" | "members" | "ai" | "jira" | "tesbo" | "alerts" | "integrations";
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
@@ -103,6 +108,9 @@ export default function ProjectSettingsPage() {
   const [tesboIngestionApiKey, setTesboIngestionApiKey] = useState("");
   const [tesboAlertsEnabled, setTesboAlertsEnabled] = useState(true);
   const [tesboShareByDefault, setTesboShareByDefault] = useState(false);
+  const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
+  const [newEnvironmentName, setNewEnvironmentName] = useState("");
+  const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
   const [rotatingTesboKey, setRotatingTesboKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -121,6 +129,7 @@ export default function ProjectSettingsPage() {
 
   const visibleTabs: Array<{ key: SettingsTab; label: string }> = [
     { key: "general", label: "General" },
+    { key: "testRuns", label: "Test Environments" },
     { key: "members", label: "Members" },
     { key: "ai", label: "AI" },
     ...(jiraTabEnabled ? [{ key: "jira" as const, label: "Jira" }] : []),
@@ -156,6 +165,19 @@ export default function ProjectSettingsPage() {
     } catch {
       return {};
     }
+  }
+
+  function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item) => {
+        const candidate = item as { name?: unknown; url?: unknown };
+        const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+        const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+        if (!name || !url) return null;
+        return { name, url };
+      })
+      .filter((item): item is TestEnvironmentSetting => item !== null);
   }
 
   const loadMembers = useCallback(async () => {
@@ -210,6 +232,7 @@ export default function ProjectSettingsPage() {
         setTesboIngestionApiKey(tesbo?.ingestionApiKey ?? "");
         setTesboAlertsEnabled(tesbo?.alertsEnabled !== false);
         setTesboShareByDefault(tesbo?.shareByDefault === true);
+        setTestRunEnvironments(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       loadMembers().catch(() => {});
@@ -230,6 +253,23 @@ export default function ProjectSettingsPage() {
     setSaving(true);
     setMessage(null);
     try {
+      const draftName = newEnvironmentName.trim();
+      const draftUrl = newEnvironmentUrl.trim();
+      if (activeTab === "testRuns" && (draftName || draftUrl)) {
+        if (!draftName || !draftUrl) {
+          setMessage("Environment name and URL are required.");
+          return;
+        }
+      }
+      const environmentsToSave = [...testRunEnvironments];
+      if (
+        activeTab === "testRuns" &&
+        draftName &&
+        draftUrl &&
+        !environmentsToSave.some((item) => item.name.toLowerCase() === draftName.toLowerCase())
+      ) {
+        environmentsToSave.push({ name: draftName, url: draftUrl });
+      }
       const currentSettings = parseProjectSettings(project?.settings);
       const nextSettings: ProjectSettingsPayload = {
         ...currentSettings,
@@ -248,13 +288,26 @@ export default function ProjectSettingsPage() {
           alertsEnabled: tesboAlertsEnabled,
           shareByDefault: tesboShareByDefault,
         },
+        testRunEnvironments: environmentsToSave.map((item) => ({
+          name: item.name.trim(),
+          url: item.url.trim(),
+        })),
       };
       await updateProject(projectId, {
         name,
         description,
         settings: JSON.stringify(nextSettings),
       });
+      const refreshed = await getProject(projectId);
+      setProject(refreshed);
+      const refreshedSettings = parseProjectSettings(refreshed.settings);
+      setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
+      setNewEnvironmentName("");
+      setNewEnvironmentUrl("");
       setMessage("Project settings saved.");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "Failed to save project settings.";
+      setMessage(text);
     } finally {
       setSaving(false);
     }
@@ -323,6 +376,27 @@ export default function ProjectSettingsPage() {
     } finally {
       setDeletingProject(false);
     }
+  }
+
+  function handleAddEnvironment() {
+    const name = newEnvironmentName.trim();
+    const url = newEnvironmentUrl.trim();
+    if (!name || !url) {
+      setMessage("Environment name and URL are required.");
+      return;
+    }
+    if (testRunEnvironments.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+      setMessage("Environment name already exists.");
+      return;
+    }
+    setTestRunEnvironments((prev) => [...prev, { name, url }]);
+    setNewEnvironmentName("");
+    setNewEnvironmentUrl("");
+    setMessage(null);
+  }
+
+  function handleRemoveEnvironment(index: number) {
+    setTestRunEnvironments((prev) => prev.filter((_, i) => i !== index));
   }
 
   const memberIds = new Set(projectMembers.map((member) => member.userId));
@@ -397,7 +471,7 @@ export default function ProjectSettingsPage() {
         </div>
       </div>
 
-      {(activeTab === "general" || activeTab === "ai" || activeTab === "jira" || activeTab === "tesbo") && (
+      {(activeTab === "general" || activeTab === "testRuns" || activeTab === "ai" || activeTab === "jira" || activeTab === "tesbo") && (
         <form onSubmit={handleSubmit} className="mt-6 space-y-5">
           {activeTab === "general" && (
             <>
@@ -449,6 +523,77 @@ export default function ProjectSettingsPage() {
                 </button>
               </div>
             </>
+          )}
+
+          {activeTab === "testRuns" && (
+            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Test Run Environments</h2>
+                <p className="mt-1 text-sm text-zinc-500">
+                  Add environment name and URL. Test run creation will require selecting one.
+                </p>
+              </div>
+              <div className="space-y-2">
+                {testRunEnvironments.length === 0 ? (
+                  <p className="text-sm text-zinc-500">No environments added yet.</p>
+                ) : (
+                  <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-zinc-50 dark:bg-zinc-800/60">
+                        <tr className="text-left text-zinc-600 dark:text-zinc-300">
+                          <th className="px-3 py-2.5 font-medium">Environment</th>
+                          <th className="px-3 py-2.5 font-medium">URL</th>
+                          <th className="px-3 py-2.5 font-medium text-right">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {testRunEnvironments.map((env, index) => (
+                          <tr
+                            key={`${env.name}-${index}`}
+                            className="border-t border-zinc-200 dark:border-zinc-700"
+                          >
+                            <td className="px-3 py-2.5 text-zinc-900 dark:text-zinc-100">{env.name}</td>
+                            <td className="px-3 py-2.5 text-zinc-600 dark:text-zinc-300 break-all">{env.url}</td>
+                            <td className="px-3 py-2.5 text-right">
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveEnvironment(index)}
+                                className="rounded-md border border-red-200 dark:border-red-800 px-2 py-1 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
+                              >
+                                Remove
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+              <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+                <input
+                  type="text"
+                  value={newEnvironmentName}
+                  onChange={(e) => setNewEnvironmentName(e.target.value)}
+                  placeholder="Environment name"
+                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                />
+                <input
+                  type="url"
+                  value={newEnvironmentUrl}
+                  onChange={(e) => setNewEnvironmentUrl(e.target.value)}
+                  placeholder="https://staging.example.com"
+                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddEnvironment}
+                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
           )}
 
           {activeTab === "ai" && (

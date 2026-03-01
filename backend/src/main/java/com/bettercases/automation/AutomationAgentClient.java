@@ -29,7 +29,7 @@ public final class AutomationAgentClient {
         String body = send("/internal/sessions/" + sessionId + "/execute", "POST", Map.of(
                 "commandId", commandId,
                 "steps", steps
-        ));
+        ), Duration.ofSeconds(180));
         try {
             return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
         } catch (Exception e) {
@@ -46,15 +46,68 @@ public final class AutomationAgentClient {
         }
     }
 
-    public static void closeSession(UUID sessionId) {
-        send("/internal/sessions/" + sessionId + "/close", "POST", Map.of());
+    public static Map<String, Object> closeSession(UUID sessionId) {
+        String body = send("/internal/sessions/" + sessionId + "/close", "POST", Map.of());
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            return Map.of("videoPath", null);
+        }
+    }
+
+    public static Map<String, Object> manualAction(UUID sessionId, Map<String, Object> action) {
+        String body = send("/internal/sessions/" + sessionId + "/manual-action", "POST", action == null ? Map.of() : action);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent manual action response", e);
+        }
+    }
+
+    public static Map<String, Object> runPlaywrightScript(UUID executionId, String script, String startUrl) {
+        String body = send("/internal/playwright/run", "POST", Map.of(
+                "executionId", executionId.toString(),
+                "script", script == null ? "" : script,
+                "startUrl", startUrl == null ? "" : startUrl
+        ), Duration.ofSeconds(180));
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent playwright run response", e);
+        }
+    }
+
+    public static Map<String, Object> enqueueAutomationJob(Map<String, Object> payload) {
+        String body = send("/internal/queue/jobs", "POST", payload);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation queue enqueue response", e);
+        }
+    }
+
+    public static void cancelRunQueue(UUID runId) {
+        send("/internal/queue/runs/" + runId + "/cancel", "POST", Map.of());
+    }
+
+    public static Map<String, Object> queueStats() {
+        String body = send("/internal/queue/stats", "GET", null);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation queue stats", e);
+        }
     }
 
     private static String send(String path, String method, Object payload) {
+        return send(path, method, payload, Duration.ofSeconds(40));
+    }
+
+    private static String send(String path, String method, Object payload, Duration timeout) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(Config.AUTOMATION_AGENT_BASE_URL + path))
-                    .timeout(Duration.ofSeconds(40))
+                    .timeout(timeout == null ? Duration.ofSeconds(40) : timeout)
                     .header("Content-Type", "application/json");
             if (!Config.AUTOMATION_AGENT_SHARED_TOKEN.isBlank()) {
                 builder.header("x-agent-token", Config.AUTOMATION_AGENT_SHARED_TOKEN);

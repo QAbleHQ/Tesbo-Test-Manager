@@ -45,6 +45,7 @@ export default function TestCaseDetailPage() {
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
+  const [automationScript, setAutomationScript] = useState("");
   const [existingTagSuggestions, setExistingTagSuggestions] = useState<string[]>([]);
   const [type, setType] = useState("Functional");
   const [priority, setPriority] = useState("P2");
@@ -99,6 +100,7 @@ export default function TestCaseDetailPage() {
         setEstimatedDuration("");
         setAttachments("");
         setAutomationTags([]);
+        setAutomationScript("");
         setType("Functional");
         setPriority("P2");
         setStatus("Draft");
@@ -116,6 +118,7 @@ export default function TestCaseDetailPage() {
         setEstimatedDuration((p.estimatedDuration as string) ?? "");
         setAttachments((p.attachments as string) ?? "");
         setAutomationTags(parseTagString((p.automationTags as string) ?? ""));
+        setAutomationScript((p.automationScript as string) ?? "");
         setType((p.type as string) ?? "Functional");
         setSuiteId((p.suiteId as string) ?? "");
         const s = (p.steps as string) ?? "[]";
@@ -141,6 +144,7 @@ export default function TestCaseDetailPage() {
     setSaving(true);
     try {
       if (isNew) {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
@@ -148,10 +152,12 @@ export default function TestCaseDetailPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -166,6 +172,7 @@ export default function TestCaseDetailPage() {
           setEstimatedDuration("");
           setAttachments("");
           setAutomationTags([]);
+          setAutomationScript("");
           setType("Functional");
           setPriority("P2");
           setStatus("Draft");
@@ -183,6 +190,7 @@ export default function TestCaseDetailPage() {
         }
         router.refresh();
       } else {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await updateTestCase(projectId, testcaseId, {
           suiteId: suiteId || undefined,
           title,
@@ -190,10 +198,12 @@ export default function TestCaseDetailPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -214,6 +224,11 @@ export default function TestCaseDetailPage() {
 
   function updateStep(i: number, field: keyof Step, value: string | number) {
     setSteps((s) => s.map((st, idx) => (idx === i ? { ...st, [field]: value } : st)));
+  }
+
+  async function onStartAutomation() {
+    if (isNew) return;
+    router.push(`/projects/${projectId}/testcases/${testcaseId}/automate`);
   }
 
   if (tc === null && !isNew) {
@@ -346,6 +361,7 @@ export default function TestCaseDetailPage() {
                 onChange={(e) => setAutomationStatus(e.target.value)}
                 className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
+                <option value="Automated">Automated</option>
                 <option value="Yes">Yes</option>
                 <option value="No">No</option>
               </select>
@@ -398,6 +414,30 @@ export default function TestCaseDetailPage() {
             />
           </div>
           <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+              {!isNew && (
+                <button
+                  type="button"
+                  onClick={() => void onStartAutomation()}
+                  className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
+                >
+                  Open Automate
+                </button>
+              )}
+            </div>
+            <p className="mb-2 text-xs text-zinc-500">
+              You can edit script manually here, or use Automate to generate and update it.
+            </p>
+            <textarea
+              value={automationScript}
+              onChange={(e) => setAutomationScript(e.target.value)}
+              rows={14}
+              placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
+              className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-900"
+            />
+          </div>
+          <div>
             <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Attachments</label>
             <textarea
               value={attachments}
@@ -409,12 +449,9 @@ export default function TestCaseDetailPage() {
           </div>
           <div className="flex gap-2">
             {!isNew && (
-              <Link
-                href={`/projects/${projectId}/testcases/${testcaseId}/automate`}
-                className="rounded-lg border border-blue-300 bg-blue-50 text-blue-700 py-2 px-4 font-medium hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
-              >
-                Automate
-              </Link>
+              <span className="rounded-lg border border-blue-200 bg-blue-50 py-2 px-4 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-300">
+                You can edit script manually above or use Automate from the script section.
+              </span>
             )}
             <button
               type="submit"

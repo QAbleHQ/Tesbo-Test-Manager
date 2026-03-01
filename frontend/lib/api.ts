@@ -214,6 +214,11 @@ export async function deleteProject(id: string): Promise<void> {
   await api(`/api/projects/${id}`, { method: "DELETE" });
 }
 
+export interface TestEnvironmentSetting {
+  name: string;
+  url: string;
+}
+
 export interface AiGeneratedDraft {
   title: string;
   preconditions: string;
@@ -495,6 +500,27 @@ export async function cancelAutomationSession(projectId: string, sessionId: stri
   await api(`/api/projects/${projectId}/automation/sessions/${sessionId}/cancel`, { method: "POST" });
 }
 
+export async function sendAutomationManualAction(
+  projectId: string,
+  sessionId: string,
+  data: {
+    actionType: "click" | "type" | "press" | "drag" | "scroll";
+    xRatio?: number;
+    yRatio?: number;
+    toXRatio?: number;
+    toYRatio?: number;
+    deltaX?: number;
+    deltaY?: number;
+    text?: string;
+    key?: string;
+  }
+): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/manual-actions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
 // Plans
 export async function listPlans(projectId: string): Promise<Record<string, unknown>[]> {
   return api(`/api/projects/${projectId}/plans`);
@@ -642,6 +668,88 @@ export interface ExecutionItem {
   defectUrl: string;
 }
 
+export interface AutomatedRunResult {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  totalCases: number;
+}
+
+export interface AutomatedRunLiveStatusItem {
+  executionId: string;
+  title: string;
+  externalId: string;
+  status: "queued" | "running" | "passed" | "failed";
+  index: number;
+  message?: string;
+}
+
+export interface AutomatedRunLiveStatus {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  endedAt?: string;
+  currentExecutionId?: string;
+  totalCases: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  error?: string;
+  items: AutomatedRunLiveStatusItem[];
+}
+
+export interface ExecutionAutomationLogItem {
+  kind?: string;
+  stepId?: string;
+  action?: string;
+  status?: string;
+  message?: string;
+  selectorUsed?: string;
+  currentUrl?: string;
+  durationMs?: number;
+  screenshotPath?: string;
+  screenshotUrl?: string;
+  detail?: Record<string, unknown>;
+  ts?: string;
+}
+
+export interface ExecutionAutomationReport {
+  id?: string;
+  cycleId?: string;
+  executionId: string;
+  status: string;
+  startedAt?: string;
+  endedAt?: string;
+  logs: ExecutionAutomationLogItem[];
+  videoAvailable: boolean;
+  videoUrl?: string | null;
+  screenshotPath?: string | null;
+  screenshotUrl?: string | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TestRunSchedule {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  name: string;
+  enabled: boolean;
+  scheduleType: "one_time" | "recurring";
+  runAt: string | null;
+  intervalMinutes: number | null;
+  timezone: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export async function listTestRuns(projectId: string): Promise<TestRunListItem[]> {
   return api(`/api/projects/${projectId}/cycles`);
 }
@@ -650,7 +758,7 @@ export async function getTestRun(cycleId: string): Promise<TestRunDetail> {
   return api(`/api/cycles/${cycleId}`);
 }
 
-export async function createTestRun(projectId: string, data: { name: string; description?: string; environment?: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
+export async function createTestRun(projectId: string, data: { name: string; description?: string; environment: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
   return api(`/api/projects/${projectId}/cycles`, { method: "POST", body: data });
 }
 
@@ -670,7 +778,7 @@ export async function removeTestCaseFromRun(cycleId: string, testcaseId: string)
   await api(`/api/cycles/${cycleId}/testcases/${testcaseId}`, { method: "DELETE" });
 }
 
-export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment?: string; buildVersion?: string }): Promise<{ id: string }> {
+export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment: string; buildVersion?: string }): Promise<{ id: string }> {
   return api(`/api/projects/${projectId}/cycles/from-plan`, { method: "POST", body: data });
 }
 
@@ -680,6 +788,63 @@ export async function listCycleExecutions(cycleId: string): Promise<ExecutionIte
 
 export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
+}
+
+export async function getExecutionAutomationReport(cycleId: string, executionId: string): Promise<ExecutionAutomationReport> {
+  return api<ExecutionAutomationReport>(`/api/cycles/${cycleId}/executions/${executionId}/automation-report`);
+}
+
+export function getExecutionAutomationVideoUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-video`;
+}
+
+export async function executeAutomatedTestRun(cycleId: string): Promise<AutomatedRunResult> {
+  return api<AutomatedRunResult>(`/api/cycles/${cycleId}/execute-automated`, { method: "POST" });
+}
+
+export async function getAutomatedRunStatus(cycleId: string, runId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/${runId}/status`);
+}
+
+export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {
+  return api<TestRunSchedule[]>(`/api/projects/${projectId}/cycles/schedules`);
+}
+
+export async function createTestRunSchedule(
+  projectId: string,
+  data: {
+    cycleId: string;
+    name: string;
+    scheduleType: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<TestRunSchedule> {
+  return api<TestRunSchedule>(`/api/projects/${projectId}/cycles/schedules`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function updateTestRunSchedule(
+  scheduleId: string,
+  data: {
+    cycleId?: string;
+    name?: string;
+    scheduleType?: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteTestRunSchedule(scheduleId: string): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "DELETE" });
 }
 
 // Sharing

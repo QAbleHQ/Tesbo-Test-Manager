@@ -8,7 +8,9 @@
     "start": "node src/index.js"
   },
   "dependencies": {
+    "bullmq": "^5.58.5",
     "express": "^4.21.2",
+    "ioredis": "^5.8.1",
     "playwright": "^1.58.2"
   }
 }

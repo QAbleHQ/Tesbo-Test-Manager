@@ -24,4 +24,7 @@
     <include file="changes/V18_tesbo_artifact_storage_keys.sql" relativeToChangelogFile="true"/>
     <include file="changes/V19_tesbo_case_detail_fields.sql" relativeToChangelogFile="true"/>
     <include file="changes/V20_automation_sessions_and_scripts.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V21_cycle_run_schedules.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V22_execution_automation_reports.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V23_automation_execution_queue.sql" relativeToChangelogFile="true"/>
 </databaseChangeLog>

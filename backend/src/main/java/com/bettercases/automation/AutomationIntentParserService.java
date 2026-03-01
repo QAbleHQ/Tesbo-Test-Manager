@@ -14,6 +14,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -30,8 +31,14 @@ public final class AutomationIntentParserService {
 
     private static final String OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
     private static final String ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages";
-    private static final Set<String> OPENAI_MODELS = Set.of("gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini");
-    private static final Set<String> ANTHROPIC_MODELS = Set.of("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", "claude-3-7-sonnet-latest");
+    private static final Set<String> OPENAI_MODELS = Set.of("gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano");
+    private static final Set<String> ANTHROPIC_MODELS = Set.of(
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-0",
+            "claude-opus-4-6",
+            "claude-3-7-sonnet-latest"
+    );
 
     private static final Pattern ABS_URL_PATTERN = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
     private static final Pattern DOMAIN_PATTERN = Pattern.compile("\\b([a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}(/\\S*)?\\b");
@@ -41,11 +48,11 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Automation Generation.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
         }
     }
 
-    public static AutomationContracts.ActionPlan plan(UUID projectId, String command, String currentUrl) {
+    public static AutomationContracts.ActionPlan plan(UUID projectId, String command, String currentUrl, String pageText) {
         String raw = command == null ? "" : command.trim();
         if (raw.isBlank()) {
             throw new io.javalin.http.BadRequestResponse("command is required");
@@ -54,12 +61,12 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Automation Generation.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
 
         try {
-            AutomationContracts.ActionPlan aiPlan = interpretWithAi(provider, apiKey, model, raw, currentUrl);
+            AutomationContracts.ActionPlan aiPlan = interpretWithAi(provider, apiKey, model, raw, currentUrl, pageText);
             normalizePlan(aiPlan);
             if (aiPlan.requiresClarification || (aiPlan.steps != null && !aiPlan.steps.isEmpty())) {
                 return aiPlan;
@@ -70,11 +77,98 @@ public final class AutomationIntentParserService {
         return heuristicFallback(raw);
     }
 
-    private static AutomationContracts.ActionPlan interpretWithAi(String provider, String apiKey, String model, String command, String currentUrl) throws Exception {
+    public static AutomationContracts.ActionPlan planAutonomousTurn(
+            UUID projectId,
+            String objective,
+            String currentUrl,
+            String pageText,
+            List<String> executionHistory,
+            int remainingStepBudget
+    ) {
+        String goal = objective == null ? "" : objective.trim();
+        if (goal.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("command is required");
+        }
+        Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
+        String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
+        String apiKey = resolveApiKey(provider, aiConfig);
+        if (apiKey.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+        }
+        String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
+        List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;
+        int safeBudget = Math.max(0, remainingStepBudget);
+
+        try {
+            AutomationContracts.ActionPlan aiPlan = interpretAutonomousTurnWithAi(
+                    provider,
+                    apiKey,
+                    model,
+                    goal,
+                    currentUrl,
+                    pageText,
+                    history,
+                    safeBudget
+            );
+            normalizePlan(aiPlan);
+            if (aiPlan.requiresClarification || aiPlan.goalAchieved || (aiPlan.steps != null && !aiPlan.steps.isEmpty())) {
+                return aiPlan;
+            }
+        } catch (Exception ignored) {
+            // fallback if provider is unavailable or parsing failed
+        }
+        return heuristicFallback(goal);
+    }
+
+    public static AutomationContracts.ActionPlan planAutonomousBootstrapTurn(
+            UUID projectId,
+            String objective,
+            String currentUrl,
+            String pageText,
+            List<String> executionHistory,
+            int remainingStepBudget
+    ) {
+        String goal = objective == null ? "" : objective.trim();
+        if (goal.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("command is required");
+        }
+        Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
+        String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
+        String apiKey = resolveApiKey(provider, aiConfig);
+        if (apiKey.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+        }
+        String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
+        List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;
+        int safeBudget = Math.max(0, remainingStepBudget);
+
+        try {
+            AutomationContracts.ActionPlan aiPlan = interpretAutonomousBootstrapWithAi(
+                    provider,
+                    apiKey,
+                    model,
+                    goal,
+                    currentUrl,
+                    pageText,
+                    history,
+                    safeBudget
+            );
+            normalizePlan(aiPlan);
+            return aiPlan;
+        } catch (Exception ignored) {
+            // fallback if provider is unavailable or parsing failed
+        }
+        return heuristicBootstrap(goal, pageText);
+    }
+
+    private static AutomationContracts.ActionPlan interpretWithAi(String provider, String apiKey, String model, String command, String currentUrl, String pageText) throws Exception {
         String prompt = """
-                You are an automation planner for browser actions.
+                You are an AI-driven autonomous browser planner.
+                Understand the current page context first, then infer user intent, then decide the minimum reliable number of steps.
                 Convert the user command into JSON only.
-                Supported actions: navigate, click, type.
+                Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
+                Add verification/assertion steps whenever a user intent implies an expected result.
+                Prefer plans that verify action impact (URL, text, visibility, clickability) after critical actions.
                 If needed info is missing, set requiresClarification=true and ask one clear question.
                 If user says open/go to a domain like google.com, infer navigate URL with https://.
                 Keep selectors practical (prefer role/text/testid style where possible).
@@ -88,14 +182,161 @@ public final class AutomationIntentParserService {
                       "action": "navigate|click|type",
                       "url": "string|null",
                       "selector": "string|null",
+                      "targetDescription": "string|null",
                       "value": "string|null",
+                      "expectedText": "string|null",
                       "timeoutMs": 10000
                     }
                   ]
                 }
                 Current URL: %s
+                Visible page text snippet: %s
                 User command: %s
-                """.formatted(currentUrl == null ? "" : currentUrl, command);
+                """.formatted(
+                currentUrl == null ? "" : currentUrl,
+                pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2000)),
+                command
+        );
+
+        String raw;
+        if ("anthropic".equals(provider)) {
+            raw = callAnthropic(apiKey, model, prompt);
+        } else {
+            raw = callOpenAi(apiKey, model, prompt);
+        }
+        return parsePlanFromJson(raw);
+    }
+
+    private static AutomationContracts.ActionPlan interpretAutonomousTurnWithAi(
+            String provider,
+            String apiKey,
+            String model,
+            String objective,
+            String currentUrl,
+            String pageText,
+            List<String> executionHistory,
+            int remainingStepBudget
+    ) throws Exception {
+        String historySnippet = buildHistorySnippet(executionHistory);
+        String prompt = """
+                You are an autonomous browser agent running in a think-act-observe loop.
+                Decide ONLY the next best actions for this turn.
+
+                Rules:
+                1) First infer whether the objective is already achieved from current page context.
+                2) If achieved, return goalAchieved=true with no steps.
+                3) If not achieved, return a short actionable step list for this turn only.
+                4) Prefer robust selectors and include verification assertions when appropriate.
+                5) Keep this turn within the remaining step budget.
+                6) If previous turn failed, try an alternative strategy in this turn.
+                7) Do not return assertion-only steps when no meaningful user action has been executed yet.
+                8) Return valid JSON only.
+
+                Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
+                If exact CSS selector is uncertain, prefer selector=null and provide targetDescription
+                (for example button/link/field label text) so runtime can resolve robustly.
+
+                Output JSON schema exactly:
+                {
+                  "requiresClarification": boolean,
+                  "clarificationQuestion": "string",
+                  "goalAchieved": boolean,
+                  "completionReason": "string",
+                  "steps": [
+                    {
+                      "id": "step-1",
+                      "action": "navigate|click|type|assert_visible|assert_text|assert_clickable",
+                      "url": "string|null",
+                      "selector": "string|null",
+                      "targetDescription": "string|null",
+                      "value": "string|null",
+                      "expectedText": "string|null",
+                      "timeoutMs": 10000
+                    }
+                  ]
+                }
+
+                Objective: %s
+                Remaining step budget: %s
+                Current URL: %s
+                Visible page text snippet: %s
+                Execution history (oldest to newest):
+                %s
+                """.formatted(
+                objective,
+                remainingStepBudget,
+                currentUrl == null ? "" : currentUrl,
+                pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2200)),
+                historySnippet
+        );
+
+        String raw;
+        if ("anthropic".equals(provider)) {
+            raw = callAnthropic(apiKey, model, prompt);
+        } else {
+            raw = callOpenAi(apiKey, model, prompt);
+        }
+        return parsePlanFromJson(raw);
+    }
+
+    private static AutomationContracts.ActionPlan interpretAutonomousBootstrapWithAi(
+            String provider,
+            String apiKey,
+            String model,
+            String objective,
+            String currentUrl,
+            String pageText,
+            List<String> executionHistory,
+            int remainingStepBudget
+    ) throws Exception {
+        String historySnippet = buildHistorySnippet(executionHistory);
+        String prompt = """
+                You are an autonomous browser agent bootstrap planner.
+                Previous turns were non-actionable. You MUST return an actionable starter turn.
+
+                Hard requirements:
+                1) Return 1-4 steps only.
+                2) Include at least one non-assert action: navigate, click, or type.
+                3) Do NOT return assertion-only steps.
+                4) Prefer targetDescription when selector is uncertain.
+                5) Keep to the remaining step budget.
+                6) Return valid JSON only.
+
+                Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
+
+                Output JSON schema exactly:
+                {
+                  "requiresClarification": boolean,
+                  "clarificationQuestion": "string",
+                  "goalAchieved": boolean,
+                  "completionReason": "string",
+                  "steps": [
+                    {
+                      "id": "step-1",
+                      "action": "navigate|click|type|assert_visible|assert_text|assert_clickable",
+                      "url": "string|null",
+                      "selector": "string|null",
+                      "targetDescription": "string|null",
+                      "value": "string|null",
+                      "expectedText": "string|null",
+                      "timeoutMs": 10000
+                    }
+                  ]
+                }
+
+                Objective: %s
+                Remaining step budget: %s
+                Current URL: %s
+                Visible page text snippet: %s
+                Execution history (oldest to newest):
+                %s
+                """.formatted(
+                objective,
+                remainingStepBudget,
+                currentUrl == null ? "" : currentUrl,
+                pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2200)),
+                historySnippet
+        );
 
         String raw;
         if ("anthropic".equals(provider)) {
@@ -173,6 +414,8 @@ public final class AutomationIntentParserService {
         plan.commandId = UUID.randomUUID().toString();
         plan.requiresClarification = node.path("requiresClarification").asBoolean(false);
         plan.clarificationQuestion = node.path("clarificationQuestion").asText("");
+        plan.goalAchieved = node.path("goalAchieved").asBoolean(false);
+        plan.completionReason = node.path("completionReason").asText("");
         plan.steps = new ArrayList<>();
         JsonNode steps = node.path("steps");
         if (steps.isArray()) {
@@ -183,7 +426,9 @@ public final class AutomationIntentParserService {
                 step.action = st.path("action").asText("");
                 step.url = nullable(st.path("url").asText(""));
                 step.selector = nullable(st.path("selector").asText(""));
+                step.targetDescription = nullable(st.path("targetDescription").asText(""));
                 step.value = nullable(st.path("value").asText(""));
+                step.expectedText = nullable(st.path("expectedText").asText(""));
                 step.timeoutMs = st.path("timeoutMs").asInt(Config.AUTOMATION_STEP_TIMEOUT_MS);
                 plan.steps.add(step);
             }
@@ -205,6 +450,12 @@ public final class AutomationIntentParserService {
             if ("navigate".equals(step.action) && step.url != null && !step.url.startsWith("http://") && !step.url.startsWith("https://")) {
                 step.url = "https://" + step.url;
             }
+            if ((step.selector == null || step.selector.isBlank()) &&
+                    step.targetDescription != null &&
+                    !step.targetDescription.isBlank() &&
+                    ("assert_visible".equals(step.action) || "assert_clickable".equals(step.action))) {
+                step.expectedText = step.targetDescription;
+            }
         }
     }
 
@@ -212,6 +463,8 @@ public final class AutomationIntentParserService {
         AutomationContracts.ActionPlan plan = new AutomationContracts.ActionPlan();
         plan.commandId = UUID.randomUUID().toString();
         plan.steps = new ArrayList<>();
+        plan.goalAchieved = false;
+        plan.completionReason = "";
         String lower = raw.toLowerCase(Locale.ROOT);
 
         Matcher abs = ABS_URL_PATTERN.matcher(raw);
@@ -235,9 +488,100 @@ public final class AutomationIntentParserService {
             return plan;
         }
 
+        if (lower.contains("verify") || lower.contains("assert") || lower.contains("displayed") || lower.contains("visible")) {
+            String target = extractAfterKeywords(raw, List.of("verify that", "verify", "assert that", "assert", "displayed", "visible"));
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "assert_visible";
+            step.selector = target != null ? "text=" + target : null;
+            step.expectedText = target;
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if (lower.contains("compare text") || lower.contains("text should be") || lower.contains("equals text")) {
+            String target = extractAfterKeywords(raw, List.of("compare text", "text should be", "equals text"));
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "assert_text";
+            step.expectedText = target;
+            step.selector = null;
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if (lower.contains("clickable") || lower.contains("can click") || lower.contains("enabled")) {
+            String target = extractAfterKeywords(raw, List.of("clickable", "can click", "enabled"));
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "assert_clickable";
+            step.selector = target != null ? "text=" + target : "button";
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if (lower.contains("click")) {
+            String target = extractAfterKeywords(raw, List.of("click on", "click"));
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "click";
+            step.selector = target != null ? "text=" + target : "button";
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
         plan.requiresClarification = true;
         plan.clarificationQuestion = "Please clarify the action you want to perform in the browser.";
         return plan;
+    }
+
+    private static AutomationContracts.ActionPlan heuristicBootstrap(String objective, String pageText) {
+        AutomationContracts.ActionPlan plan = new AutomationContracts.ActionPlan();
+        plan.commandId = UUID.randomUUID().toString();
+        plan.goalAchieved = false;
+        plan.completionReason = "";
+        plan.requiresClarification = false;
+        plan.steps = new ArrayList<>();
+
+        String text = (pageText == null ? "" : pageText).toLowerCase(Locale.ROOT);
+        String goal = (objective == null ? "" : objective).toLowerCase(Locale.ROOT);
+
+        if (goal.contains("form") && (text.contains("name") || text.contains("email"))) {
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "type";
+            step.targetDescription = text.contains("name") ? "Name" : "Email";
+            step.value = "Test User";
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+        step.id = "step-1";
+        step.action = "click";
+        step.targetDescription = "Submit";
+        step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+        plan.steps.add(step);
+        return plan;
+    }
+
+    private static String buildHistorySnippet(List<String> executionHistory) {
+        if (executionHistory == null || executionHistory.isEmpty()) return "(none)";
+        int start = Math.max(0, executionHistory.size() - 20);
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < executionHistory.size(); i++) {
+            String row = executionHistory.get(i);
+            if (row == null || row.isBlank()) continue;
+            sb.append("- ").append(row).append("\n");
+        }
+        String out = sb.toString().trim();
+        if (out.isBlank()) return "(none)";
+        return out.length() > 3000 ? out.substring(out.length() - 3000) : out;
     }
 
     private static String resolveApiKey(String provider, Map<String, String> aiConfig) {
@@ -311,6 +655,20 @@ public final class AutomationIntentParserService {
         if (value == null) return null;
         String trimmed = value.trim();
         return trimmed.isEmpty() || "null".equalsIgnoreCase(trimmed) ? null : trimmed;
+    }
+
+    private static String extractAfterKeywords(String raw, List<String> keywords) {
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String key : keywords) {
+            int idx = lower.indexOf(key);
+            if (idx >= 0) {
+                String out = raw.substring(idx + key.length()).trim();
+                out = out.replaceAll("^[:\\-\\s]+", "").trim();
+                out = out.replaceAll("^[\"']|[\"']$", "").trim();
+                if (!out.isBlank()) return out;
+            }
+        }
+        return null;
     }
 
     private AutomationIntentParserService() {}

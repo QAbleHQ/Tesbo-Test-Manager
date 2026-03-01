@@ -35,7 +35,7 @@ const TESTCASE_TYPES = [
   "Performance",
   "Security",
 ];
-const AUTOMATION_FEASIBILITY_OPTIONS = ["Yes", "No", "Not Automated"];
+const AUTOMATION_FEASIBILITY_OPTIONS = ["Yes", "No", "Not Automated", "Automated"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "view" | "edit" | "create";
@@ -80,6 +80,7 @@ export default function TestCasesPage() {
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
   const [automationStatus, setAutomationStatus] = useState("Not Automated");
+  const [automationScript, setAutomationScript] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
@@ -242,6 +243,7 @@ export default function TestCasesPage() {
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
     setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setAutomationScript((data.automationScript as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
     setAttachments((data.attachments as string) ?? "");
     setAutomationTags(parseTagString((data.automationTags as string) ?? ""));
@@ -260,6 +262,7 @@ export default function TestCasesPage() {
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
     setAutomationStatus("Not Automated");
+    setAutomationScript("");
     setEstimatedDuration("");
     setAttachments("");
     setAutomationTags([]);
@@ -481,6 +484,7 @@ export default function TestCasesPage() {
     setPanelError(null);
     try {
       if (panelMode === "create") {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         const created = await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
@@ -488,10 +492,12 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -510,6 +516,7 @@ export default function TestCasesPage() {
           await openViewPanel(created.id);
         }
       } else if (panelMode === "edit" && panelTestcaseId) {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await updateTestCase(projectId, panelTestcaseId, {
           suiteId: suiteId || undefined,
           title,
@@ -517,10 +524,12 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -1003,6 +1012,12 @@ export default function TestCasesPage() {
                         <p className="whitespace-pre-wrap leading-7 text-zinc-700 dark:text-zinc-300">{attachments || "-"}</p>
                       </div>
                       <div>
+                        <p className="mb-1 text-sm font-medium text-zinc-500">Playwright Script</p>
+                        <pre className="max-h-72 overflow-auto rounded border border-zinc-200 bg-zinc-50 p-3 text-xs leading-6 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200">
+                          {automationScript?.trim() ? automationScript : "No script added yet."}
+                        </pre>
+                      </div>
+                      <div>
                         <div className="mb-2 flex items-center justify-between">
                           <p className="text-sm font-semibold uppercase tracking-wide text-zinc-500">Test Steps</p>
                           <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
@@ -1268,6 +1283,19 @@ export default function TestCasesPage() {
                           placeholder="Links/paths to screenshots, logs, or reference docs"
                           className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
                         />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+                        <textarea
+                          value={automationScript}
+                          onChange={(e) => setAutomationScript(e.target.value)}
+                          rows={12}
+                          placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
+                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-900"
+                        />
+                        <p className="mt-1 text-xs text-zinc-500">
+                          Saving with script content will mark automation status as Automated.
+                        </p>
                       </div>
                       <div className="flex gap-2">
                         <button
