@@ -2,9 +2,9 @@ import { Queue, Worker } from "bullmq";
 import IORedis from "ioredis";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
-import { runPlaywrightScript } from "./sessionStore.js";
+import { runExecutionWithProvider } from "./providers/index.js";
 
-const cancelledRuns = new Set();
+const cancelledRuns = new Map();
 let connectionRef = null;
 let queueRef = null;
 
@@ -41,6 +41,46 @@ function ensureQueue() {
   return queueRef;
 }
 
+function rememberCancelledRun(runId) {
+  cancelledRuns.set(String(runId), Date.now());
+}
+
+function isCancelledRun(runId) {
+  const key = String(runId);
+  const at = cancelledRuns.get(key);
+  if (!at) return false;
+  const ttlMs = 60 * 60 * 1000;
+  if (Date.now() - at > ttlMs) {
+    cancelledRuns.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function pruneCancelledRuns() {
+  const ttlMs = 60 * 60 * 1000;
+  const now = Date.now();
+  for (const [runId, at] of cancelledRuns.entries()) {
+    if (now - at > ttlMs) cancelledRuns.delete(runId);
+  }
+}
+
+function startHeartbeatLoop(jobId) {
+  const intervalMs = Math.max(1000, Number(config.queueHeartbeatMs || 5000));
+  const timer = setInterval(() => {
+    void notifyBackend(`/api/internal/automation/jobs/${jobId}/heartbeat`, {
+      workerId: config.workerId,
+    }).catch((error) => {
+      logError("queue_job_heartbeat_failed", {
+        jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
 export async function enqueueExecutionJob(payload) {
   const queue = ensureQueue();
   const maxRetries = Number.isFinite(Number(payload.maxRetries))
@@ -58,7 +98,8 @@ export async function enqueueExecutionJob(payload) {
 
 export async function cancelRun(runId) {
   const queue = ensureQueue();
-  cancelledRuns.add(runId);
+  rememberCancelledRun(runId);
+  pruneCancelledRuns();
   const jobs = await queue.getJobs(["waiting", "delayed", "active"], 0, 1000);
   for (const job of jobs) {
     if (String(job.data?.runId) !== String(runId)) continue;
@@ -101,7 +142,7 @@ export function startQueueWorker() {
       const runId = String(data.runId || "");
       const jobId = String(data.jobId || "");
       if (!jobId) throw new Error("jobId missing in queue payload");
-      if (cancelledRuns.has(runId)) {
+      if (isCancelledRun(runId)) {
         await notifyBackend(`/api/internal/automation/jobs/${jobId}/fail`, {
           errorMessage: "Run cancelled",
           willRetry: false,
@@ -113,16 +154,11 @@ export function startQueueWorker() {
         workerId: config.workerId,
         attempt,
       });
+      const stopHeartbeat = startHeartbeatLoop(jobId);
       try {
         const startedAt = new Date().toISOString();
-        await notifyBackend(`/api/internal/automation/jobs/${jobId}/heartbeat`, {
-          workerId: config.workerId,
-        });
-        const result = await runPlaywrightScript(
-          String(data.executionId || ""),
-          String(data.script || ""),
-          typeof data.startUrl === "string" ? data.startUrl : null
-        );
+        await notifyBackend(`/api/internal/automation/jobs/${jobId}/heartbeat`, { workerId: config.workerId });
+        const result = await runExecutionWithProvider(data);
         await notifyBackend(`/api/internal/automation/jobs/${jobId}/complete`, {
           status: result?.status || "failed",
           startedAt,
@@ -130,6 +166,7 @@ export function startQueueWorker() {
           logs: Array.isArray(result?.logs) ? result.logs : [],
           videoPath: result?.videoPath || null,
           screenshotPath: result?.screenshotPath || null,
+          tracePath: result?.tracePath || null,
           attempt,
         });
         return { status: result?.status || "failed" };
@@ -142,6 +179,8 @@ export function startQueueWorker() {
           attempt,
         });
         throw error;
+      } finally {
+        stopHeartbeat();
       }
     },
     {

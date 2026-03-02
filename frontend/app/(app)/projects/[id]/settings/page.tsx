@@ -39,6 +39,22 @@ const ANTHROPIC_MODELS = [
 ] as const;
 
 type ProjectSettingsPayload = {
+  automation?: {
+    executionProvider?: "default" | "lambdatest" | "browserstack";
+    maxParallel?: number;
+    providers?: {
+      lambdatest?: {
+        endpoint?: string;
+        username?: string;
+        accessKey?: string;
+      };
+      browserstack?: {
+        endpoint?: string;
+        username?: string;
+        accessKey?: string;
+      };
+    };
+  };
   ai?: {
     provider?: "openai" | "anthropic";
     model?: string;
@@ -111,6 +127,14 @@ export default function ProjectSettingsPage() {
   const [tesboAlertsEnabled, setTesboAlertsEnabled] = useState(true);
   const [tesboShareByDefault, setTesboShareByDefault] = useState(false);
   const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
+  const [executionProvider, setExecutionProvider] = useState<"default" | "lambdatest" | "browserstack">("default");
+  const [maxParallel, setMaxParallel] = useState(1);
+  const [lambdaTestEndpoint, setLambdaTestEndpoint] = useState("");
+  const [lambdaTestUsername, setLambdaTestUsername] = useState("");
+  const [lambdaTestAccessKey, setLambdaTestAccessKey] = useState("");
+  const [browserStackEndpoint, setBrowserStackEndpoint] = useState("");
+  const [browserStackUsername, setBrowserStackUsername] = useState("");
+  const [browserStackAccessKey, setBrowserStackAccessKey] = useState("");
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
   const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
   const [rotatingTesboKey, setRotatingTesboKey] = useState(false);
@@ -236,6 +260,23 @@ export default function ProjectSettingsPage() {
         setTesboAlertsEnabled(tesbo?.alertsEnabled !== false);
         setTesboShareByDefault(tesbo?.shareByDefault === true);
         setTestRunEnvironments(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
+        const automation = parsedSettings.automation;
+        const resolvedProvider =
+          automation?.executionProvider === "lambdatest" || automation?.executionProvider === "browserstack"
+            ? automation.executionProvider
+            : "default";
+        setExecutionProvider(resolvedProvider);
+        setMaxParallel(
+          typeof automation?.maxParallel === "number" && automation.maxParallel > 0
+            ? Math.min(50, Math.floor(automation.maxParallel))
+            : 1
+        );
+        setLambdaTestEndpoint(automation?.providers?.lambdatest?.endpoint ?? "");
+        setLambdaTestUsername(automation?.providers?.lambdatest?.username ?? "");
+        setLambdaTestAccessKey(automation?.providers?.lambdatest?.accessKey ?? "");
+        setBrowserStackEndpoint(automation?.providers?.browserstack?.endpoint ?? "");
+        setBrowserStackUsername(automation?.providers?.browserstack?.username ?? "");
+        setBrowserStackAccessKey(automation?.providers?.browserstack?.accessKey ?? "");
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       loadMembers().catch(() => {});
@@ -291,6 +332,22 @@ export default function ProjectSettingsPage() {
           ingestionApiKey: tesboIngestionApiKey.trim(),
           alertsEnabled: tesboAlertsEnabled,
           shareByDefault: tesboShareByDefault,
+        },
+        automation: {
+          executionProvider,
+          maxParallel: Math.max(1, Math.min(50, Math.floor(maxParallel || 1))),
+          providers: {
+            lambdatest: {
+              endpoint: lambdaTestEndpoint.trim(),
+              username: lambdaTestUsername.trim(),
+              accessKey: lambdaTestAccessKey.trim(),
+            },
+            browserstack: {
+              endpoint: browserStackEndpoint.trim(),
+              username: browserStackUsername.trim(),
+              accessKey: browserStackAccessKey.trim(),
+            },
+          },
         },
         testRunEnvironments: environmentsToSave.map((item) => ({
           name: item.name.trim(),
@@ -596,6 +653,89 @@ export default function ProjectSettingsPage() {
                 >
                   Add
                 </button>
+              </div>
+              <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Execution</h3>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    Configure how automated test cases execute in parallel and which provider is used.
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="text-sm text-zinc-700 dark:text-zinc-300">
+                    Execution provider
+                    <select
+                      value={executionProvider}
+                      onChange={(e) => setExecutionProvider(e.target.value as "default" | "lambdatest" | "browserstack")}
+                      className="mt-1 w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
+                    >
+                      <option value="default">Default</option>
+                      <option value="lambdatest">LambdaTest</option>
+                      <option value="browserstack">BrowserStack</option>
+                    </select>
+                  </label>
+                  <label className="text-sm text-zinc-700 dark:text-zinc-300">
+                    Max parallel jobs
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={maxParallel}
+                      onChange={(e) => setMaxParallel(Number(e.target.value || 1))}
+                      className="mt-1 w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
+                    />
+                  </label>
+                </div>
+                {executionProvider === "lambdatest" && (
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <input
+                      type="url"
+                      value={lambdaTestEndpoint}
+                      onChange={(e) => setLambdaTestEndpoint(e.target.value)}
+                      placeholder="LambdaTest endpoint"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                    <input
+                      type="text"
+                      value={lambdaTestUsername}
+                      onChange={(e) => setLambdaTestUsername(e.target.value)}
+                      placeholder="LambdaTest username"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                    <input
+                      type="password"
+                      value={lambdaTestAccessKey}
+                      onChange={(e) => setLambdaTestAccessKey(e.target.value)}
+                      placeholder="LambdaTest access key"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+                {executionProvider === "browserstack" && (
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <input
+                      type="url"
+                      value={browserStackEndpoint}
+                      onChange={(e) => setBrowserStackEndpoint(e.target.value)}
+                      placeholder="BrowserStack endpoint"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                    <input
+                      type="text"
+                      value={browserStackUsername}
+                      onChange={(e) => setBrowserStackUsername(e.target.value)}
+                      placeholder="BrowserStack username"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                    <input
+                      type="password"
+                      value={browserStackAccessKey}
+                      onChange={(e) => setBrowserStackAccessKey(e.target.value)}
+                      placeholder="BrowserStack access key"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
               </div>
             </div>
           )}

@@ -23,11 +23,11 @@ public final class ExecutionAutomationReportService {
     private static final ObjectMapper mapper = new ObjectMapper();
 
     public static void upsert(UUID cycleId, UUID executionId, String status, String startedAtIso, String endedAtIso,
-                              List<Map<String, Object>> logs, String videoPath, String screenshotPath, String errorMessage) {
+                              List<Map<String, Object>> logs, String videoPath, String screenshotPath, String tracePath, String errorMessage) {
         String sql = """
                 INSERT INTO execution_automation_reports (
-                  cycle_id, execution_id, status, started_at, ended_at, logs_json, video_path, screenshot_path, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?)
+                  cycle_id, execution_id, status, started_at, ended_at, logs_json, video_path, screenshot_path, trace_path, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
                 ON CONFLICT (execution_id) DO UPDATE SET
                   status = EXCLUDED.status,
                   started_at = EXCLUDED.started_at,
@@ -35,6 +35,7 @@ public final class ExecutionAutomationReportService {
                   logs_json = EXCLUDED.logs_json,
                   video_path = EXCLUDED.video_path,
                   screenshot_path = EXCLUDED.screenshot_path,
+                  trace_path = EXCLUDED.trace_path,
                   error_message = EXCLUDED.error_message,
                   updated_at = now()
                 """;
@@ -54,6 +55,13 @@ public final class ExecutionAutomationReportService {
                     "screenshot",
                     detectContentType(screenshotPath, "image/png")
             );
+            String traceRef = persistArtifactIfNeeded(
+                    cycleId,
+                    executionId,
+                    tracePath,
+                    "trace",
+                    detectContentType(tracePath, "application/zip")
+            );
             List<Map<String, Object>> normalizedLogs = normalizeLogsWithArtifacts(cycleId, executionId, logs);
             ps.setObject(1, cycleId);
             ps.setObject(2, executionId);
@@ -63,7 +71,8 @@ public final class ExecutionAutomationReportService {
             ps.setString(6, mapper.writeValueAsString(normalizedLogs));
             ps.setString(7, videoRef);
             ps.setString(8, screenshotRef);
-            ps.setString(9, errorMessage);
+            ps.setString(9, traceRef);
+            ps.setString(10, errorMessage);
             ps.executeUpdate();
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -74,7 +83,7 @@ public final class ExecutionAutomationReportService {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
-                SELECT id, cycle_id, execution_id, status, started_at, ended_at, logs_json, video_path, screenshot_path, error_message,
+                SELECT id, cycle_id, execution_id, status, started_at, ended_at, logs_json, video_path, screenshot_path, trace_path, error_message,
                        created_at, updated_at
                 FROM execution_automation_reports
                 WHERE cycle_id = ? AND execution_id = ?
@@ -110,6 +119,10 @@ public final class ExecutionAutomationReportService {
             String screenshotRef = rs.getString("screenshot_path");
             out.put("screenshotPath", screenshotRef);
             out.put("screenshotUrl", resolveArtifactUrl(screenshotRef));
+            String traceRef = rs.getString("trace_path");
+            out.put("tracePath", traceRef);
+            out.put("traceAvailable", traceRef != null && !traceRef.isBlank());
+            out.put("traceUrl", resolveArtifactUrl(traceRef));
             out.put("errorMessage", rs.getString("error_message"));
             out.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
             out.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());
@@ -138,6 +151,33 @@ public final class ExecutionAutomationReportService {
             TesboArtifactStorageService.ArtifactReadResult result =
                     TesboArtifactStorageService.read(ref, null, detectContentType(ref, "video/webm"));
             if (result == null) throw new io.javalin.http.NotFoundResponse("Automation video not found");
+            return result;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static TesboArtifactStorageService.ArtifactReadResult getTraceArtifact(UUID cycleId, UUID executionId, UUID userId) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT trace_path FROM execution_automation_reports WHERE cycle_id = ? AND execution_id = ?")) {
+            ps.setObject(1, cycleId);
+            ps.setObject(2, executionId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) throw new io.javalin.http.NotFoundResponse("Automation trace not found");
+            String ref = rs.getString("trace_path");
+            if (ref == null || ref.isBlank()) throw new io.javalin.http.NotFoundResponse("Automation trace not found");
+            Path maybeLocal = Path.of(ref);
+            if (Files.exists(maybeLocal)) {
+                return new TesboArtifactStorageService.ArtifactReadResult(false, null, Files.newInputStream(maybeLocal), detectContentType(ref, "application/zip"));
+            }
+            TesboArtifactStorageService.ArtifactReadResult result =
+                    TesboArtifactStorageService.read(ref, null, detectContentType(ref, "application/zip"));
+            if (result == null) throw new io.javalin.http.NotFoundResponse("Automation trace not found");
             return result;
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -178,6 +218,7 @@ public final class ExecutionAutomationReportService {
         if (lower.endsWith(".webm")) return "video/webm";
         if (lower.endsWith(".png")) return "image/png";
         if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+        if (lower.endsWith(".zip")) return "application/zip";
         return fallback;
     }
 

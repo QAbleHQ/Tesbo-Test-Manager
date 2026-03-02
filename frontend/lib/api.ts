@@ -706,6 +706,8 @@ export interface AutomatedRunResult {
   cycleId: string;
   status: "running" | "completed" | "failed";
   totalCases: number;
+  executionProvider?: string;
+  maxParallel?: number;
 }
 
 export interface AutomatedRunLiveStatusItem {
@@ -728,6 +730,8 @@ export interface AutomatedRunLiveStatus {
   completed: number;
   passed: number;
   failed: number;
+  executionProvider?: string;
+  maxParallel?: number;
   error?: string;
   items: AutomatedRunLiveStatusItem[];
 }
@@ -757,6 +761,9 @@ export interface ExecutionAutomationReport {
   logs: ExecutionAutomationLogItem[];
   videoAvailable: boolean;
   videoUrl?: string | null;
+  traceAvailable?: boolean;
+  traceUrl?: string | null;
+  tracePath?: string | null;
   screenshotPath?: string | null;
   screenshotUrl?: string | null;
   errorMessage?: string | null;
@@ -831,12 +838,20 @@ export function getExecutionAutomationVideoUrl(cycleId: string, executionId: str
   return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-video`;
 }
 
+export function getExecutionAutomationTraceUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-trace`;
+}
+
 export async function executeAutomatedTestRun(cycleId: string): Promise<AutomatedRunResult> {
   return api<AutomatedRunResult>(`/api/cycles/${cycleId}/execute-automated`, { method: "POST" });
 }
 
 export async function getAutomatedRunStatus(cycleId: string, runId: string): Promise<AutomatedRunLiveStatus> {
   return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/${runId}/status`);
+}
+
+export async function getLatestAutomatedRunStatus(cycleId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/latest/status`);
 }
 
 export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {

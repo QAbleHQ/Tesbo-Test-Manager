@@ -200,6 +200,26 @@ public final class CycleHandler {
         }
     }
 
+    public static void streamExecutionAutomationTrace(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID executionId = UUID.fromString(ctx.pathParam("executionId"));
+        try {
+            TesboArtifactStorageService.ArtifactReadResult result =
+                    ExecutionAutomationReportService.getTraceArtifact(cycleId, executionId, userId);
+            if (result.redirect()) {
+                ctx.redirect(result.redirectUrl());
+                return;
+            }
+            if (result.contentType() != null) ctx.contentType(result.contentType());
+            ctx.result(result.stream());
+        } catch (io.javalin.http.HttpResponseException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new io.javalin.http.NotFoundResponse("Automation trace not found");
+        }
+    }
+
     /* ───── RUN automated test cases (manual trigger) ───── */
     public static void executeAutomated(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
@@ -222,6 +242,12 @@ public final class CycleHandler {
         UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
         UUID runId = UUID.fromString(ctx.pathParam("runId"));
         ctx.json(CycleAutomationRunService.getRunStatus(cycleId, runId, userId));
+    }
+
+    public static void getLatestAutomatedRunStatus(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        ctx.json(CycleAutomationRunService.getLatestRunStatus(cycleId, userId));
     }
 
     public static void queueMetrics(Context ctx) {

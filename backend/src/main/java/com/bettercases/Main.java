@@ -131,9 +131,11 @@ public final class Main {
         app.patch("/api/cycles/{cycleId}/executions/{executionId}", CycleHandler::updateExecution);
         app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-report", CycleHandler::getExecutionAutomationReport);
         app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-video", CycleHandler::streamExecutionAutomationVideo);
+        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-trace", CycleHandler::streamExecutionAutomationTrace);
         app.post("/api/cycles/{cycleId}/executions/bulk-assign", CycleHandler::bulkAssign);
         app.post("/api/cycles/{cycleId}/executions/bulk-status", CycleHandler::bulkUpdateStatus);
         app.post("/api/cycles/{cycleId}/execute-automated", CycleHandler::executeAutomated);
+        app.get("/api/cycles/{cycleId}/execute-automated/latest/status", CycleHandler::getLatestAutomatedRunStatus);
         app.get("/api/cycles/{cycleId}/execute-automated/{runId}/status", CycleHandler::getAutomatedRunStatus);
         app.post("/api/cycles/{cycleId}/execute-automated/{runId}/cancel", CycleHandler::cancelAutomatedRun);
         app.get("/api/internal/automation/queue-metrics", CycleHandler::queueMetrics);

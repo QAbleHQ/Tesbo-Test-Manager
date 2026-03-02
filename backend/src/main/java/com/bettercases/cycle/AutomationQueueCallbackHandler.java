@@ -64,6 +64,7 @@ public final class AutomationQueueCallbackHandler {
                 logs,
                 body.videoPath,
                 body.screenshotPath,
+                body.tracePath,
                 ok ? null : body.errorMessage
         );
         if (ok) {
@@ -124,6 +125,7 @@ public final class AutomationQueueCallbackHandler {
         public String errorMessage;
         public String videoPath;
         public String screenshotPath;
+        public String tracePath;
         public List<Map<String, Object>> logs;
         public int attempt;
     }

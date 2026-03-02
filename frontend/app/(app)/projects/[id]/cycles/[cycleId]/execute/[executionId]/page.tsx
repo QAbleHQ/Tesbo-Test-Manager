@@ -1,14 +1,16 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   authMe,
   listCycleExecutions,
   updateExecution,
   getExecutionAutomationReport,
+  getLatestAutomatedRunStatus,
   getExecutionAutomationVideoUrl,
+  getExecutionAutomationTraceUrl,
   type ExecutionAutomationReport,
   type ExecutionItem,
 } from "@/lib/api";
@@ -45,6 +47,7 @@ export default function ExecutionDetailPage() {
   const [saving, setSaving] = useState(false);
   const [automationReport, setAutomationReport] = useState<ExecutionAutomationReport | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const [liveRunState, setLiveRunState] = useState<"running" | "queued" | null>(null);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -71,6 +74,44 @@ export default function ExecutionDetailPage() {
         .catch(() => router.replace("/projects"));
     });
   }, [cycleId, executionId, router]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const poll = async () => {
+      try {
+        const run = await getLatestAutomatedRunStatus(cycleId);
+        if (cancelled) return;
+        const item = run.items.find((entry) => entry.executionId === executionId);
+        const nextLiveState = item?.status === "running" ? "running" : item?.status === "queued" ? "queued" : null;
+        setLiveRunState(nextLiveState);
+
+        if (nextLiveState || run.status === "running") {
+          try {
+            const latestReport = await getExecutionAutomationReport(cycleId, executionId);
+            if (!cancelled) {
+              setAutomationReport(latestReport);
+            }
+          } catch {
+            // Ignore transient report read errors while live polling.
+          }
+          timer = setTimeout(poll, 2000);
+          return;
+        }
+      } catch {
+        // No active run or status endpoint temporarily unavailable.
+      }
+
+      timer = setTimeout(poll, 5000);
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [cycleId, executionId]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -99,6 +140,13 @@ export default function ExecutionDetailPage() {
 
   const executedSteps =
     automationReport?.logs?.filter((log) => log.kind === "step" || !!log.stepId || !!log.action) ?? [];
+  const latestScreenshotUrl = useMemo(() => {
+    for (let i = executedSteps.length - 1; i >= 0; i -= 1) {
+      const candidate = executedSteps[i]?.screenshotUrl;
+      if (candidate) return candidate;
+    }
+    return automationReport?.screenshotUrl || null;
+  }, [automationReport?.screenshotUrl, executedSteps]);
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -176,6 +224,13 @@ export default function ExecutionDetailPage() {
             <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
               Automated Run Artifacts
             </h3>
+            {liveRunState && (
+              <div className="mb-3 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-3 py-2 text-xs text-blue-800 dark:text-blue-300">
+                {liveRunState === "running"
+                  ? "Live preview is active. This page refreshes automation artifacts every few seconds."
+                  : "This testcase is queued for automation. Live preview will start when execution begins."}
+              </div>
+            )}
             {reportLoading ? (
               <p className="text-sm text-zinc-500">Loading run logs...</p>
             ) : !automationReport || automationReport.status === "not_available" ? (
@@ -184,6 +239,18 @@ export default function ExecutionDetailPage() {
               </p>
             ) : (
               <div className="space-y-4">
+                {latestScreenshotUrl && (
+                  <div>
+                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Live Preview</p>
+                    <a href={latestScreenshotUrl} target="_blank" rel="noreferrer" className="block">
+                      <img
+                        src={latestScreenshotUrl}
+                        alt="Latest automation screenshot"
+                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 object-contain max-h-96"
+                      />
+                    </a>
+                  </div>
+                )}
                 <div className="text-xs text-zinc-500">
                   <p>Status: <span className="font-medium">{automationReport.status}</span></p>
                   {automationReport.startedAt && (
@@ -212,6 +279,39 @@ export default function ExecutionDetailPage() {
                   </div>
                 ) : (
                   <p className="text-xs text-zinc-500">Video is not available for this run.</p>
+                )}
+
+                {(automationReport.traceAvailable || automationReport.tracePath) ? (
+                  <div>
+                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Trace Artifact</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <a
+                        href={automationReport.traceUrl || getExecutionAutomationTraceUrl(cycleId, executionId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center rounded-md border border-zinc-300 dark:border-zinc-700 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                      >
+                        Download Trace (.zip)
+                      </a>
+                      {automationReport.traceUrl && (
+                        <a
+                          href={`https://trace.playwright.dev/?trace=${encodeURIComponent(automationReport.traceUrl)}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center rounded-md bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
+                        >
+                          Open in Trace Viewer
+                        </a>
+                      )}
+                    </div>
+                    {!automationReport.traceUrl && (
+                      <p className="mt-1 text-[11px] text-zinc-500">
+                        Trace Viewer needs a direct trace URL. Download the trace zip if direct URL is unavailable.
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-zinc-500">Trace is not available for this run.</p>
                 )}
 
                 <div>

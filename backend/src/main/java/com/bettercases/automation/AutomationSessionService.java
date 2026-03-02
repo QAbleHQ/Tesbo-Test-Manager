@@ -148,6 +148,25 @@ public final class AutomationSessionService {
         }
     }
 
+    public static void markSessionStartFailed(UUID sessionId, String message) {
+        String sql = """
+                UPDATE automation_sessions
+                SET status = 'failed',
+                    current_url = ?,
+                    ended_at = now(),
+                    updated_at = now()
+                WHERE id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, message == null ? "" : message);
+            ps.setObject(2, sessionId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public static void finalizeIntoTestcase(UUID projectId, UUID testcaseId, UUID userId,
                                             String framework, String repo, String path, String testName, String script,
                                             List<Map<String, Object>> generatedSteps) {

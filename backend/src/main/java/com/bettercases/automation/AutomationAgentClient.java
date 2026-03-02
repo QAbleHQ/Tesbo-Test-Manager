@@ -115,7 +115,7 @@ public final class AutomationAgentClient {
     }
 
     public static Map<String, Object> queueStats() {
-        String body = send("/internal/queue/stats", "GET", null);
+        String body = send("/internal/queue/stats", "GET", null, Duration.ofSeconds(5));
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {

@@ -51,38 +51,22 @@ public final class CycleAutomationRunService {
             }
         }
         List<ExecutionScriptRow> rows = loadExecutionRows(cycleId);
-        String startUrl = resolveCycleStartUrl(cycleId);
+        CycleAutomationConfig automationConfig = resolveCycleAutomationConfig(cycleId);
+        String startUrl = automationConfig.startUrl();
         if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
             throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
         }
         if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
             assertQueueExecutionAvailable();
             markManualRequiredNotes(rows);
-            UUID runId = AutomationExecutionQueueService.createRunWithJobs(cycleId, rows, Config.AUTOMATION_QUEUE_MAX_RETRIES);
-            List<Map<String, Object>> jobs = AutomationExecutionQueueService.listQueueableJobs(runId);
-            for (Map<String, Object> job : jobs) {
-                UUID jobId = UUID.fromString(String.valueOf(job.get("jobId")));
-                try {
-                    Map<String, Object> queued = AutomationAgentClient.enqueueAutomationJob(Map.of(
-                            "jobId", String.valueOf(job.get("jobId")),
-                            "runId", String.valueOf(job.get("runId")),
-                            "cycleId", String.valueOf(job.get("cycleId")),
-                            "executionId", String.valueOf(job.get("executionId")),
-                            "script", String.valueOf(job.get("script")),
-                            "startUrl", startUrl,
-                            "maxRetries", job.get("maxRetries")
-                    ));
-                    String queueJobId = queued.get("queueJobId") instanceof String s ? s : String.valueOf(job.get("jobId"));
-                    AutomationExecutionQueueService.markJobEnqueued(jobId, queueJobId);
-                } catch (Exception e) {
-                    AutomationExecutionQueueService.markJobFailed(jobId, "Queue enqueue failed: " + e.getMessage(), false, 0);
-                }
-            }
-            return Map.of(
-                    "runId", runId.toString(),
-                    "cycleId", cycleId.toString(),
-                    "status", "running",
-                    "totalCases", rows.size()
+            return AutomationExecutionOrchestratorService.enqueueRun(
+                    cycleId,
+                    rows,
+                    startUrl,
+                    automationConfig.executionProvider(),
+                    automationConfig.maxParallel(),
+                    automationConfig.providerConfig(),
+                    Config.AUTOMATION_QUEUE_MAX_RETRIES
             );
         }
         UUID runId = CycleAutomationRunTracker.start(cycleId, rows);
@@ -111,6 +95,16 @@ public final class CycleAutomationRunService {
         return CycleAutomationRunTracker.snapshot(cycleId, runId);
     }
 
+    public static Map<String, Object> getLatestRunStatus(UUID cycleId, UUID userId) {
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        RbacService.requireProjectRole(userId, projectId);
+        UUID runId = AutomationExecutionQueueService.findLatestRunId(cycleId);
+        if (runId == null) {
+            throw new io.javalin.http.NotFoundResponse("No automated run found.");
+        }
+        return AutomationExecutionQueueService.snapshot(cycleId, runId);
+    }
+
     public static void cancelRun(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
@@ -136,7 +130,7 @@ public final class CycleAutomationRunService {
             }
         }
         List<ExecutionScriptRow> rows = loadExecutionRows(cycleId);
-        String startUrl = resolveCycleStartUrl(cycleId);
+        String startUrl = resolveCycleAutomationConfig(cycleId).startUrl();
         if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
             throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
         }
@@ -158,7 +152,7 @@ public final class CycleAutomationRunService {
                 }
                 ExecutionAutomationReportService.upsert(
                         cycleId, row.executionId(), "manual", Instant.now().toString(), Instant.now().toString(),
-                        List.of(), null, null, "Manual execution required (no linked automation script)."
+                        List.of(), null, null, null, "Manual execution required (no linked automation script)."
                 );
                 continue;
             }
@@ -172,6 +166,7 @@ public final class CycleAutomationRunService {
             String reportError = null;
             String reportScreenshot = null;
             String reportVideo = null;
+            String reportTrace = null;
             try {
                 Map<String, Object> response = AutomationAgentClient.runPlaywrightScript(row.executionId(), row.script(), startUrl);
                 @SuppressWarnings("unchecked")
@@ -181,6 +176,7 @@ public final class CycleAutomationRunService {
                 boolean ok = "passed".equalsIgnoreCase(status);
                 reportScreenshot = response.get("screenshotPath") instanceof String s ? s : null;
                 reportVideo = response.get("videoPath") instanceof String s ? s : null;
+                reportTrace = response.get("tracePath") instanceof String s ? s : null;
                 String errorMessage = response.get("errorMessage") instanceof String s ? s : null;
                 if (ok) {
                     passed++;
@@ -221,6 +217,7 @@ public final class CycleAutomationRunService {
                         reportLogs,
                         reportVideo,
                         reportScreenshot,
+                        reportTrace,
                         reportError
                 );
             }
@@ -246,7 +243,7 @@ public final class CycleAutomationRunService {
         }
     }
 
-    private static String resolveCycleStartUrl(UUID cycleId) {
+    private static CycleAutomationConfig resolveCycleAutomationConfig(UUID cycleId) {
         String sql = """
                 SELECT c.environment, p.settings
                 FROM cycles c
@@ -265,44 +262,101 @@ public final class CycleAutomationRunService {
                 throw new io.javalin.http.BadRequestResponse("Test run environment is not set.");
             }
             String environmentValue = environment.trim();
-            if (looksLikeUrl(environmentValue)) {
-                return environmentValue;
-            }
             String settingsRaw = rs.getString("settings");
-            String resolved = resolveEnvironmentUrlFromSettings(settingsRaw, environmentValue);
-            if (resolved == null || resolved.isBlank()) {
-                throw new io.javalin.http.BadRequestResponse(
-                        "Selected environment \"" + environmentValue + "\" does not have a configured URL."
-                );
+            Map<String, Object> settings = parseSettings(settingsRaw);
+            String startUrl;
+            if (looksLikeUrl(environmentValue)) {
+                startUrl = environmentValue;
+            } else {
+                String resolved = resolveEnvironmentUrlFromSettings(settings, environmentValue);
+                if (resolved == null || resolved.isBlank()) {
+                    throw new io.javalin.http.BadRequestResponse(
+                            "Selected environment \"" + environmentValue + "\" does not have a configured URL."
+                    );
+                }
+                startUrl = resolved;
             }
-            return resolved;
+            String executionProvider = resolveExecutionProvider(settings);
+            int maxParallel = resolveMaxParallel(settings);
+            Map<String, Object> providerConfig = resolveProviderConfig(settings, executionProvider);
+            return new CycleAutomationConfig(startUrl, executionProvider, maxParallel, providerConfig);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private static String resolveEnvironmentUrlFromSettings(String settingsRaw, String environmentName) {
-        if (settingsRaw == null || settingsRaw.isBlank()) return null;
+    private static Map<String, Object> parseSettings(String settingsRaw) {
+        if (settingsRaw == null || settingsRaw.isBlank()) return Map.of();
         try {
-            Map<String, Object> settings = mapper.readValue(settingsRaw, new TypeReference<>() {});
-            Object rawEnvironments = settings.get("testRunEnvironments");
-            if (!(rawEnvironments instanceof List<?> list)) return null;
-            for (Object item : list) {
-                if (!(item instanceof Map<?, ?> envMap)) continue;
-                Object name = envMap.get("name");
-                Object url = envMap.get("url");
-                if (!(name instanceof String nameStr) || !(url instanceof String urlStr)) continue;
-                if (environmentName.equalsIgnoreCase(nameStr.trim())) {
-                    String trimmedUrl = urlStr.trim();
-                    if (!trimmedUrl.isBlank()) {
-                        return trimmedUrl;
-                    }
-                }
-            }
-            return null;
+            return mapper.readValue(settingsRaw, new TypeReference<>() {});
         } catch (Exception e) {
             throw new RuntimeException("Failed to read project test environment settings", e);
         }
+    }
+
+    private static String resolveEnvironmentUrlFromSettings(Map<String, Object> settings, String environmentName) {
+        Object rawEnvironments = settings.get("testRunEnvironments");
+        if (!(rawEnvironments instanceof List<?> list)) return null;
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> envMap)) continue;
+            Object name = envMap.get("name");
+            Object url = envMap.get("url");
+            if (!(name instanceof String nameStr) || !(url instanceof String urlStr)) continue;
+            if (environmentName.equalsIgnoreCase(nameStr.trim())) {
+                String trimmedUrl = urlStr.trim();
+                if (!trimmedUrl.isBlank()) {
+                    return trimmedUrl;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String resolveExecutionProvider(Map<String, Object> settings) {
+        Object automationObject = settings.get("automation");
+        if (automationObject instanceof Map<?, ?> automationMap) {
+            Object provider = automationMap.get("executionProvider");
+            if (provider instanceof String s && !s.isBlank()) {
+                String normalized = s.trim().toLowerCase();
+                if ("lambdatest".equals(normalized) || "browserstack".equals(normalized)) {
+                    return normalized;
+                }
+            }
+        }
+        return "default";
+    }
+
+    private static int resolveMaxParallel(Map<String, Object> settings) {
+        Object automationObject = settings.get("automation");
+        if (automationObject instanceof Map<?, ?> automationMap) {
+            Object maxParallel = automationMap.get("maxParallel");
+            if (maxParallel instanceof Number n) {
+                return Math.max(1, Math.min(50, n.intValue()));
+            }
+            if (maxParallel instanceof String s && !s.isBlank()) {
+                try {
+                    return Math.max(1, Math.min(50, Integer.parseInt(s.trim())));
+                } catch (NumberFormatException ignored) {
+                    // ignore malformed values
+                }
+            }
+        }
+        return 1;
+    }
+
+    private static Map<String, Object> resolveProviderConfig(Map<String, Object> settings, String executionProvider) {
+        Object automationObject = settings.get("automation");
+        if (!(automationObject instanceof Map<?, ?> automationMap)) return Map.of();
+        Object providersObject = automationMap.get("providers");
+        if (!(providersObject instanceof Map<?, ?> providersMap)) return Map.of();
+        Object selected = providersMap.get(executionProvider);
+        if (!(selected instanceof Map<?, ?> selectedMap)) return Map.of();
+        return selectedMap.entrySet().stream()
+                .filter(e -> e.getKey() instanceof String)
+                .collect(java.util.stream.Collectors.toMap(
+                        e -> (String) e.getKey(),
+                        Map.Entry::getValue
+                ));
     }
 
     private static boolean looksLikeUrl(String value) {
@@ -406,6 +460,13 @@ public final class CycleAutomationRunService {
     }
 
     public record ExecutionScriptRow(UUID executionId, String script, String title, String externalId) {}
+
+    private record CycleAutomationConfig(
+            String startUrl,
+            String executionProvider,
+            int maxParallel,
+            Map<String, Object> providerConfig
+    ) {}
 
     private CycleAutomationRunService() {
     }

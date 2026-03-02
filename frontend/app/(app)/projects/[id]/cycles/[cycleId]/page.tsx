@@ -17,6 +17,7 @@ import {
   createBug,
   executeAutomatedTestRun,
   getAutomatedRunStatus,
+  getLatestAutomatedRunStatus,
   type AutomatedRunLiveStatus,
   type TestRunDetail,
   type ExecutionItem,
@@ -227,6 +228,7 @@ export default function TestRunDetailPage() {
   const [automatedRunId, setAutomatedRunId] = useState<string | null>(null);
   const [automatedLiveStatus, setAutomatedLiveStatus] = useState<AutomatedRunLiveStatus | null>(null);
   const [automatedSummary, setAutomatedSummary] = useState<string | null>(null);
+  const [automatedStarting, setAutomatedStarting] = useState(false);
 
   const load = useCallback(() => {
     Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId)])
@@ -240,6 +242,29 @@ export default function TestRunDetailPage() {
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
 
+  const restoreLatestAutomationRun = useCallback(async () => {
+    try {
+      const latest = await getLatestAutomatedRunStatus(cycleId);
+      setAutomatedLiveStatus(latest);
+      if (latest.status === "running") {
+        setAutomatedRunId(latest.runId);
+        setAutomatedSummary(
+          `Resumed live run: ${latest.completed}/${latest.totalCases} completed • Passed ${latest.passed}, Failed ${latest.failed}.`
+        );
+      } else {
+        const manualCount = latest.items.filter((item) => item.status === "manual").length;
+        setAutomatedRunId(null);
+        setAutomatedSummary(
+          latest.status === "completed"
+            ? `Last automated run completed: ${latest.passed} passed, ${latest.failed} failed, ${manualCount} manual (${latest.completed}/${latest.totalCases}).`
+            : `Last automated run failed: ${latest.error || "Unknown error"}`
+        );
+      }
+    } catch {
+      // No previous automation run for this cycle.
+    }
+  }, [cycleId]);
+
   useEffect(() => {
     authMe().then((me) => {
       if (!me) {
@@ -247,8 +272,9 @@ export default function TestRunDetailPage() {
         return;
       }
       load();
+      restoreLatestAutomationRun().catch(() => {});
     });
-  }, [router, load]);
+  }, [router, load, restoreLatestAutomationRun]);
 
   useEffect(() => {
     if (!automatedRunId) return;
@@ -434,6 +460,7 @@ export default function TestRunDetailPage() {
   async function handleRunAutomated() {
     setAutomatedSummary(null);
     setAutomatedLiveStatus(null);
+    setAutomatedStarting(true);
     try {
       const result = await executeAutomatedTestRun(cycleId);
       if (result?.runId) {
@@ -452,6 +479,8 @@ export default function TestRunDetailPage() {
       }
     } catch (e) {
       setAutomatedSummary(e instanceof Error ? e.message : "Automated run failed");
+    } finally {
+      setAutomatedStarting(false);
     }
   }
 
@@ -526,8 +555,11 @@ export default function TestRunDetailPage() {
     return map;
   }, [automatedLiveStatus]);
 
-  const runningLiveItem = useMemo(
-    () => automatedLiveStatus?.items.find((item) => item.status === "running") ?? null,
+  const runningLiveItems = useMemo(
+    () =>
+      (automatedLiveStatus?.items ?? [])
+        .filter((item) => item.status === "running")
+        .sort((a, b) => a.index - b.index),
     [automatedLiveStatus]
   );
   const queuedLiveItems = useMemo(
@@ -619,10 +651,10 @@ export default function TestRunDetailPage() {
             )}
             <button
               onClick={handleRunAutomated}
-              disabled={automatedRunId !== null || executions.length === 0}
+              disabled={automatedRunId !== null || executions.length === 0 || automatedStarting}
               className="rounded-lg bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
-              {automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
+              {automatedStarting ? "Starting..." : automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
             </button>
             <button
               onClick={() => setShowShare(true)}
@@ -648,9 +680,14 @@ export default function TestRunDetailPage() {
         {automatedLiveStatus && automatedRunId && (
           <div className="mb-4 rounded-lg border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 px-4 py-2 text-sm text-violet-800 dark:text-violet-300">
             Live automation: {automatedLiveStatus.completed}/{automatedLiveStatus.totalCases} completed • Passed {automatedLiveStatus.passed}, Failed {automatedLiveStatus.failed}
-            {runningLiveItem && (
+            {runningLiveItems.length > 0 && (
               <div className="mt-1 text-xs">
-                Running now: <span className="font-semibold">{runningLiveItem.externalId || runningLiveItem.title}</span>
+                Running now:{" "}
+                <span className="font-semibold">
+                  {runningLiveItems
+                    .map((item) => item.externalId || item.title)
+                    .join(", ")}
+                </span>
               </div>
             )}
             {queuedLiveItems.length > 0 && (

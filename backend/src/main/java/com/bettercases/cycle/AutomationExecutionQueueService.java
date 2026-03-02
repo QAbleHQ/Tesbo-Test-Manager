@@ -1,6 +1,8 @@
 package com.bettercases.cycle;
 
 import com.bettercases.Database;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -14,35 +16,60 @@ import java.util.Map;
 import java.util.UUID;
 
 public final class AutomationExecutionQueueService {
-    public static UUID createRunWithJobs(UUID cycleId, List<CycleAutomationRunService.ExecutionScriptRow> rows, int maxRetries) {
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    public static UUID createRunWithJobs(
+            UUID cycleId,
+            List<CycleAutomationRunService.ExecutionScriptRow> rows,
+            int maxRetries,
+            String startUrl,
+            String executionProvider,
+            int maxParallel,
+            Map<String, Object> providerConfigSnapshot
+    ) {
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
             UUID runId;
             try (PreparedStatement ps = c.prepareStatement(
-                    "INSERT INTO automation_runs (cycle_id, status, total_jobs, queued_jobs, started_at) VALUES (?, 'running', ?, ?, now()) RETURNING id")) {
+                    "INSERT INTO automation_runs (cycle_id, status, total_jobs, queued_jobs, started_at, execution_provider, max_parallel, provider_config_json) VALUES (?, 'running', ?, ?, now(), ?, ?, ?::jsonb) RETURNING id")) {
                 ps.setObject(1, cycleId);
                 ps.setInt(2, rows.size());
                 ps.setInt(3, rows.size());
+                ps.setString(4, executionProvider == null || executionProvider.isBlank() ? "default" : executionProvider);
+                ps.setInt(5, Math.max(1, maxParallel));
+                ps.setString(6, mapper.writeValueAsString(providerConfigSnapshot == null ? Map.of() : providerConfigSnapshot));
                 ResultSet rs = ps.executeQuery();
                 rs.next();
                 runId = (UUID) rs.getObject("id");
             }
+            int shardTotal = Math.max(1, Math.min(Math.max(1, maxParallel), countQueueable(rows)));
+            int queueableIndex = 0;
             String insertJobSql = """
                     INSERT INTO automation_jobs (
                       run_id, cycle_id, execution_id, testcase_title, testcase_external_id, script,
-                      status, max_retries
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      status, max_retries, start_url, execution_provider, provider_payload_json, shard_index, shard_total
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)
                     """;
             try (PreparedStatement ps = c.prepareStatement(insertJobSql)) {
                 for (CycleAutomationRunService.ExecutionScriptRow row : rows) {
+                    boolean queueable = row.script() != null && !row.script().isBlank();
+                    int shardIndex = queueable && shardTotal > 1 ? (queueableIndex % shardTotal) + 1 : 1;
+                    if (queueable) {
+                        queueableIndex++;
+                    }
                     ps.setObject(1, runId);
                     ps.setObject(2, cycleId);
                     ps.setObject(3, row.executionId());
                     ps.setString(4, row.title());
                     ps.setString(5, row.externalId());
                     ps.setString(6, row.script());
-                    ps.setString(7, (row.script() == null || row.script().isBlank()) ? "manual" : "queued");
+                    ps.setString(7, queueable ? "queued" : "manual");
                     ps.setInt(8, Math.max(0, maxRetries));
+                    ps.setString(9, startUrl);
+                    ps.setString(10, executionProvider == null || executionProvider.isBlank() ? "default" : executionProvider);
+                    ps.setString(11, mapper.writeValueAsString(providerConfigSnapshot == null ? Map.of() : providerConfigSnapshot));
+                    ps.setInt(12, shardIndex);
+                    ps.setInt(13, shardTotal);
                     ps.addBatch();
                 }
                 ps.executeBatch();
@@ -69,12 +96,14 @@ public final class AutomationExecutionQueueService {
             return runId;
         } catch (SQLException e) {
             throw new RuntimeException(e);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
     public static List<Map<String, Object>> listQueueableJobs(UUID runId) {
         String sql = """
-                SELECT id, run_id, cycle_id, execution_id, script, max_retries
+                SELECT id, run_id, cycle_id, execution_id, script, max_retries, start_url, execution_provider, provider_payload_json, shard_index, shard_total
                 FROM automation_jobs
                 WHERE run_id = ? AND status = 'queued' AND script IS NOT NULL AND btrim(script) <> ''
                 ORDER BY created_at ASC
@@ -92,6 +121,11 @@ public final class AutomationExecutionQueueService {
                 row.put("executionId", rs.getObject("execution_id").toString());
                 row.put("script", rs.getString("script"));
                 row.put("maxRetries", rs.getInt("max_retries"));
+                row.put("startUrl", rs.getString("start_url"));
+                row.put("executionProvider", rs.getString("execution_provider"));
+                row.put("providerPayload", parseJsonObject(rs.getString("provider_payload_json")));
+                row.put("shardIndex", rs.getInt("shard_index"));
+                row.put("shardTotal", rs.getInt("shard_total"));
                 out.add(row);
             }
             return out;
@@ -114,7 +148,7 @@ public final class AutomationExecutionQueueService {
 
     public static Map<String, Object> getJob(UUID jobId) {
         String sql = """
-                SELECT id, run_id, cycle_id, execution_id, status, script, max_retries
+                SELECT id, run_id, cycle_id, execution_id, status, script, max_retries, execution_provider, shard_index, shard_total
                 FROM automation_jobs
                 WHERE id = ?
                 """;
@@ -131,6 +165,9 @@ public final class AutomationExecutionQueueService {
             out.put("status", rs.getString("status"));
             out.put("script", rs.getString("script"));
             out.put("maxRetries", rs.getInt("max_retries"));
+            out.put("executionProvider", rs.getString("execution_provider"));
+            out.put("shardIndex", rs.getInt("shard_index"));
+            out.put("shardTotal", rs.getInt("shard_total"));
             return out;
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -233,6 +270,8 @@ public final class AutomationExecutionQueueService {
         out.put("completed", run.get("completedJobs"));
         out.put("passed", run.get("passedJobs"));
         out.put("failed", run.get("failedJobs"));
+        out.put("executionProvider", run.get("executionProvider"));
+        out.put("maxParallel", run.get("maxParallel"));
         out.put("error", run.get("errorMessage"));
         out.put("items", items);
         return out;
@@ -255,6 +294,48 @@ public final class AutomationExecutionQueueService {
             ps.setObject(2, cycleId);
             ResultSet rs = ps.executeQuery();
             return rs.next();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static UUID findActiveRunId(UUID cycleId) {
+        String sql = """
+                SELECT id
+                FROM automation_runs
+                WHERE cycle_id = ? AND status = 'running'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return (UUID) rs.getObject("id");
+            }
+            return null;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static UUID findLatestRunId(UUID cycleId) {
+        String sql = """
+                SELECT id
+                FROM automation_runs
+                WHERE cycle_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return (UUID) rs.getObject("id");
+            }
+            return null;
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -305,7 +386,7 @@ public final class AutomationExecutionQueueService {
 
     private static Map<String, Object> fetchRun(UUID cycleId, UUID runId) {
         String sql = """
-                SELECT id, cycle_id, status, total_jobs, completed_jobs, passed_jobs, failed_jobs, error_message, started_at, ended_at
+                SELECT id, cycle_id, status, total_jobs, completed_jobs, passed_jobs, failed_jobs, error_message, started_at, ended_at, execution_provider, max_parallel
                 FROM automation_runs
                 WHERE id = ? AND cycle_id = ?
                 """;
@@ -324,6 +405,8 @@ public final class AutomationExecutionQueueService {
             out.put("passedJobs", rs.getInt("passed_jobs"));
             out.put("failedJobs", rs.getInt("failed_jobs"));
             out.put("errorMessage", rs.getString("error_message"));
+            out.put("executionProvider", rs.getString("execution_provider"));
+            out.put("maxParallel", rs.getInt("max_parallel"));
             Timestamp startedAt = rs.getTimestamp("started_at");
             Timestamp endedAt = rs.getTimestamp("ended_at");
             out.put("startedAt", startedAt != null ? startedAt.toInstant().toString() : null);
@@ -336,7 +419,7 @@ public final class AutomationExecutionQueueService {
 
     private static List<Map<String, Object>> fetchRunItems(UUID runId) {
         String sql = """
-                SELECT id, execution_id, testcase_title, testcase_external_id, status, worker_id, error_message
+                SELECT id, execution_id, testcase_title, testcase_external_id, status, worker_id, error_message, shard_index, shard_total, execution_provider
                 FROM automation_jobs
                 WHERE run_id = ?
                 ORDER BY created_at ASC
@@ -358,6 +441,9 @@ public final class AutomationExecutionQueueService {
                 item.put("index", index);
                 item.put("workerId", rs.getString("worker_id"));
                 item.put("message", rs.getString("error_message"));
+                item.put("shardIndex", rs.getInt("shard_index"));
+                item.put("shardTotal", rs.getInt("shard_total"));
+                item.put("executionProvider", rs.getString("execution_provider"));
                 out.add(item);
             }
             return out;
@@ -443,6 +529,25 @@ public final class AutomationExecutionQueueService {
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static int countQueueable(List<CycleAutomationRunService.ExecutionScriptRow> rows) {
+        int count = 0;
+        for (CycleAutomationRunService.ExecutionScriptRow row : rows) {
+            if (row.script() != null && !row.script().isBlank()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static Map<String, Object> parseJsonObject(String raw) {
+        if (raw == null || raw.isBlank()) return Map.of();
+        try {
+            return mapper.readValue(raw, new TypeReference<>() {});
+        } catch (Exception ignored) {
+            return Map.of();
         }
     }
 

@@ -33,7 +33,12 @@ public final class AutomationSessionHandler {
 
         Map<String, Object> session = AutomationSessionService.startSession(projectId, testcaseId, userId, startUrl);
         UUID sessionId = UUID.fromString(String.valueOf(session.get("id")));
-        AutomationAgentClient.createSession(sessionId, startUrl);
+        try {
+            AutomationAgentClient.createSession(sessionId, startUrl);
+        } catch (Exception e) {
+            AutomationSessionService.markSessionStartFailed(sessionId, "Session start failed: " + e.getMessage());
+            throw new io.javalin.http.ServiceUnavailableResponse("Failed to create automation session: " + e.getMessage());
+        }
         try {
             AuditService.logActivity(userId, projectId, "automation_session_started", "testcase", testcaseId.toString(), null);
         } catch (Exception ignored) {}

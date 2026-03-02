@@ -12,6 +12,7 @@ import {
   sessionState,
   closeSession,
   startCleanupWatchdog,
+  SessionCreationError,
 } from "./sessionStore.js";
 import {
   enqueueExecutionJob,
@@ -51,8 +52,14 @@ app.post("/internal/sessions", async (req, res) => {
     await createSession(sessionId, typeof startUrl === "string" ? startUrl : null);
     res.status(201).json({ sessionId });
   } catch (err) {
-    logError("create_session_failed", { error: err instanceof Error ? err.message : String(err) });
-    res.status(500).json({ error: "Failed to create session" });
+    const message = err instanceof Error ? err.message : String(err);
+    const code = err instanceof SessionCreationError ? err.code : "SESSION_CREATION_FAILED";
+    logError("create_session_failed", { error: message, code });
+    if (code === "SESSION_CREATION_CAPACITY_REACHED") {
+      res.status(429).json({ error: message, code });
+      return;
+    }
+    res.status(500).json({ error: "Failed to create session", code, message });
   }
 });
 
@@ -117,7 +124,19 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
 });
 
 app.post("/internal/queue/jobs", async (req, res) => {
-  const { jobId, runId, cycleId, executionId, script, startUrl, maxRetries } = req.body || {};
+  const {
+    jobId,
+    runId,
+    cycleId,
+    executionId,
+    script,
+    startUrl,
+    maxRetries,
+    executionProvider,
+    providerPayload,
+    shardIndex,
+    shardTotal,
+  } = req.body || {};
   if (!jobId || !runId || !cycleId || !executionId || !script) {
     res.status(400).json({ error: "jobId, runId, cycleId, executionId, and script are required" });
     return;
@@ -131,6 +150,10 @@ app.post("/internal/queue/jobs", async (req, res) => {
       script: String(script),
       startUrl: typeof startUrl === "string" ? startUrl : null,
       maxRetries,
+      executionProvider: typeof executionProvider === "string" ? executionProvider : "default",
+      providerPayload: providerPayload && typeof providerPayload === "object" ? providerPayload : {},
+      shardIndex: Number.isFinite(Number(shardIndex)) ? Number(shardIndex) : 1,
+      shardTotal: Number.isFinite(Number(shardTotal)) ? Number(shardTotal) : 1,
     });
     res.status(202).json(queued);
   } catch (err) {

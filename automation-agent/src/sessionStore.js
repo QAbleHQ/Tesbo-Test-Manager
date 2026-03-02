@@ -5,6 +5,16 @@ import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
 
 const sessions = new Map();
+let sessionCreateInFlight = 0;
+
+class SessionCreationError extends Error {
+  constructor(code, message, cause = null) {
+    super(message);
+    this.name = "SessionCreationError";
+    this.code = code;
+    this.cause = cause;
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -19,30 +29,68 @@ async function ensureVideoDir() {
   await fs.mkdir(config.videoDir, { recursive: true });
 }
 
-function getSession(sessionId) {
-  return sessions.get(sessionId) || null;
+async function ensureTraceDir() {
+  await fs.mkdir(config.traceDir, { recursive: true });
 }
 
-async function createSession(sessionId, startUrl) {
-  if (sessions.has(sessionId)) return sessions.get(sessionId);
-  await ensureScreenshotDir();
-  await ensureVideoDir();
-  const browser = await chromium.launch({ headless: config.headless });
-  const contextOptions = {
-    viewport: { width: 1366, height: 768 },
-  };
-  if (config.recordVideo) {
-    contextOptions.recordVideo = {
-      dir: config.videoDir,
-      size: { width: 1366, height: 768 },
-    };
+function throwSessionCreationError(code, message, cause) {
+  throw new SessionCreationError(code, message, cause);
+}
+
+async function navigateToStartUrl(page, startUrl) {
+  const timeoutMs = Math.max(5000, Number(config.startUrlTimeoutMs || 60000));
+  try {
+    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    return;
+  } catch {
+    // Retry once with a broader load event for sites where DOMContentLoaded is delayed.
+    await page.goto(startUrl, { waitUntil: "load", timeout: timeoutMs });
   }
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
-  if (startUrl) {
-    await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+}
+
+async function launchBrowserContext(startUrl) {
+  let browser = null;
+  let context = null;
+  let page = null;
+  try {
+    try {
+      browser = await chromium.launch({ headless: config.headless });
+    } catch (error) {
+      throwSessionCreationError("BROWSER_LAUNCH_FAILED", "Unable to launch browser process", error);
+    }
+    try {
+      const contextOptions = {
+        viewport: { width: 1366, height: 768 },
+      };
+      if (config.recordVideo) {
+        contextOptions.recordVideo = {
+          dir: config.videoDir,
+          size: { width: 1366, height: 768 },
+        };
+      }
+      context = await browser.newContext(contextOptions);
+      page = await context.newPage();
+    } catch (error) {
+      throwSessionCreationError("CONTEXT_INIT_FAILED", "Unable to initialize browser context", error);
+    }
+    if (startUrl) {
+      try {
+        await navigateToStartUrl(page, startUrl);
+      } catch (error) {
+        throwSessionCreationError("START_URL_NAVIGATION_FAILED", `Unable to open start URL: ${startUrl}`, error);
+      }
+    }
+    return { browser, context, page };
+  } catch (error) {
+    await page?.close().catch(() => {});
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+    throw error;
   }
-  const state = {
+}
+
+function buildSessionState(sessionId, browser, context, page) {
+  return {
     id: sessionId,
     browser,
     context,
@@ -54,12 +102,42 @@ async function createSession(sessionId, startUrl) {
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
-  sessions.set(sessionId, state);
-  // Capture initial view so UI can render immediately after startup.
-  await takeScreenshot(state).catch(() => {});
-  state.currentUrl = page.url();
-  logInfo("session_created", { sessionId });
-  return state;
+}
+
+function getSession(sessionId) {
+  return sessions.get(sessionId) || null;
+}
+
+async function createSession(sessionId, startUrl) {
+  if (sessions.has(sessionId)) return sessions.get(sessionId);
+  if (sessionCreateInFlight >= Math.max(1, config.sessionCreateConcurrency)) {
+    throw new SessionCreationError(
+      "SESSION_CREATION_CAPACITY_REACHED",
+      "Automation session capacity reached, retry in a few seconds."
+    );
+  }
+  sessionCreateInFlight += 1;
+  try {
+    try {
+      await ensureScreenshotDir();
+      await ensureVideoDir();
+    } catch (error) {
+      throwSessionCreationError("ARTIFACT_DIR_INIT_FAILED", "Unable to prepare artifacts directories", error);
+    }
+    const { browser, context, page } = await launchBrowserContext(startUrl);
+    const state = buildSessionState(sessionId, browser, context, page);
+    sessions.set(sessionId, state);
+    // Capture initial view so UI can render immediately after startup.
+    await takeScreenshot(state).catch(() => {});
+    state.currentUrl = page.url();
+    logInfo("session_created", { sessionId });
+    return state;
+  } catch (error) {
+    if (error instanceof SessionCreationError) throw error;
+    throw new SessionCreationError("SESSION_CREATION_FAILED", "Unable to create automation session", error);
+  } finally {
+    sessionCreateInFlight -= 1;
+  }
 }
 
 async function resetSession(sessionId, startUrl) {
@@ -73,21 +151,7 @@ async function resetSession(sessionId, startUrl) {
   } catch {
     // best-effort cleanup of previous browser context
   }
-  const browser = await chromium.launch({ headless: config.headless });
-  const contextOptions = {
-    viewport: { width: 1366, height: 768 },
-  };
-  if (config.recordVideo) {
-    contextOptions.recordVideo = {
-      dir: config.videoDir,
-      size: { width: 1366, height: 768 },
-    };
-  }
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
-  if (startUrl) {
-    await page.goto(startUrl, { waitUntil: "domcontentloaded" });
-  }
+  const { browser, context, page } = await launchBrowserContext(startUrl);
   currentSession.browser = browser;
   currentSession.context = context;
   currentSession.page = page;
@@ -288,6 +352,7 @@ function extractPlaywrightTestBody(script) {
 async function runPlaywrightScript(executionId, script, startUrl = null) {
   await ensureScreenshotDir();
   await ensureVideoDir();
+  await ensureTraceDir();
   const startedAt = Date.now();
   const logs = [];
   const browser = await chromium.launch({ headless: config.headless });
@@ -301,6 +366,7 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
     };
   }
   const context = await browser.newContext(contextOptions);
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
   const page = await context.newPage();
   page.on("console", (msg) => {
     logs.push({
@@ -329,6 +395,7 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
   let errorMessage = null;
   let screenshotPath = null;
   let videoPath = null;
+  let tracePath = null;
   let currentUrl = "";
   let stepCounter = 0;
   const recordStep = async (action, detail, fn) => {
@@ -367,7 +434,7 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
   };
   try {
     if (startUrl) {
-      await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await navigateToStartUrl(page, startUrl);
     }
     const body = extractPlaywrightTestBody(script);
     const AsyncFunction = Object.getPrototypeOf(async function noop() {}).constructor;
@@ -392,6 +459,10 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
     if (video) {
       videoPath = await video.path().catch(() => null);
     }
+    tracePath = path.join(config.traceDir, `${executionId}-${Date.now()}.zip`);
+    await context.tracing.stop({ path: tracePath }).catch(() => {
+      tracePath = null;
+    });
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
@@ -402,6 +473,7 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
     logs,
     screenshotPath,
     videoPath,
+    tracePath,
     errorMessage,
     durationMs: Date.now() - startedAt,
   };
@@ -457,7 +529,7 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
 
   try {
     if (startUrl) {
-      await session.page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await navigateToStartUrl(session.page, startUrl);
     }
     const body = extractPlaywrightTestBody(script);
     const AsyncFunction = Object.getPrototypeOf(async function noop() {}).constructor;
@@ -1214,6 +1286,7 @@ function startCleanupWatchdog() {
 export {
   getSession,
   createSession,
+  SessionCreationError,
   resetSession,
   executeSteps,
   manualAction,
