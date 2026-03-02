@@ -46,6 +46,17 @@ public final class AutomationAgentClient {
         }
     }
 
+    public static Map<String, Object> resetSession(UUID sessionId, String startUrl) {
+        String body = send("/internal/sessions/" + sessionId + "/reset", "POST", Map.of(
+                "startUrl", startUrl == null ? "" : startUrl
+        ), Duration.ofSeconds(120));
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent reset response", e);
+        }
+    }
+
     public static Map<String, Object> closeSession(UUID sessionId) {
         String body = send("/internal/sessions/" + sessionId + "/close", "POST", Map.of());
         try {
@@ -74,6 +85,19 @@ public final class AutomationAgentClient {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse automation agent playwright run response", e);
+        }
+    }
+
+    public static Map<String, Object> runPlaywrightScriptInSession(UUID sessionId, UUID executionId, String script, String startUrl) {
+        String body = send("/internal/sessions/" + sessionId + "/run-script", "POST", Map.of(
+                "executionId", executionId.toString(),
+                "script", script == null ? "" : script,
+                "startUrl", startUrl == null ? "" : startUrl
+        ), Duration.ofSeconds(300));
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent in-session script run response", e);
         }
     }
 

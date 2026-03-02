@@ -2,6 +2,9 @@ package com.bettercases.automation;
 
 import com.bettercases.audit.AuditService;
 import com.bettercases.auth.SessionFilter;
+import com.bettercases.project.ProjectService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.http.Context;
 
 import java.io.InputStream;
@@ -15,10 +18,12 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 public final class AutomationSessionHandler {
     private static final HttpClient streamClient = HttpClient.newBuilder().build();
+    private static final ObjectMapper mapper = new ObjectMapper();
     public static void start(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -271,77 +276,141 @@ public final class AutomationSessionHandler {
                     null
             );
 
-            AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeSteps(
-                    sessionId,
-                    commandId.toString(),
-                    boundedSteps
-            );
+            List<AutomationContracts.StepResult> turnResults = new java.util.ArrayList<>();
             String turnScreenshotPath = null;
             int turnPassed = 0;
             int turnFailed = 0;
+            boolean hasFailure = false;
+            String turnCurrentUrl = latestUrl;
 
-            if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
-                allResults.addAll(executeResponse.results);
-                executedSteps += executeResponse.results.size();
-                lastScreenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
-                turnScreenshotPath = lastScreenshotPath;
-                boolean hasFailure = executeResponse.results.stream().anyMatch(r -> !"passed".equalsIgnoreCase(r.status));
-                for (AutomationContracts.StepResult stepResult : executeResponse.results) {
-                    if ("passed".equalsIgnoreCase(stepResult.status)) turnPassed++;
-                    else turnFailed++;
-                    history.add("turn " + turn + " - " + stepResult.action + " => " + stepResult.status +
-                            (stepResult.message == null ? "" : " (" + stepResult.message + ")"));
-                }
-                latestUrl = executeResponse.currentUrl;
-                Map<String, Object> turnExecutionPayload = new HashMap<>();
-                turnExecutionPayload.put("mode", "autonomous");
-                turnExecutionPayload.put("turn", turn);
-                turnExecutionPayload.put("intentLabel", turnIntentLabel);
-                turnExecutionPayload.put("stepCount", executeResponse.results.size());
-                turnExecutionPayload.put("passedCount", turnPassed);
-                turnExecutionPayload.put("failedCount", turnFailed);
-                turnExecutionPayload.put("status", hasFailure ? "partial_failed" : "passed");
-                turnExecutionPayload.put("steps", boundedSteps);
-                turnExecutionPayload.put("results", executeResponse.results);
-                turnExecutionPayload.put("currentUrl", executeResponse.currentUrl);
+            for (int stepIndex = 0; stepIndex < boundedSteps.size(); stepIndex++) {
+                AutomationContracts.ActionStep step = boundedSteps.get(stepIndex);
+                String evaluateText = describeEvaluation(step);
+                String actionText = describeAction(step);
+                Map<String, Object> evaluatingPayload = new HashMap<>();
+                evaluatingPayload.put("mode", "autonomous");
+                evaluatingPayload.put("turn", turn);
+                evaluatingPayload.put("stepIndex", stepIndex + 1);
+                evaluatingPayload.put("stepCount", boundedSteps.size());
+                evaluatingPayload.put("intentLabel", turnIntentLabel);
+                evaluatingPayload.put("step", step);
+                evaluatingPayload.put("evaluateText", evaluateText);
+                evaluatingPayload.put("actionText", actionText);
                 AutomationSessionService.addEvent(
-                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_executed",
+                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_step_evaluating",
                         command,
-                        turnExecutionPayload,
-                        turnExecutionPayload,
-                        turnScreenshotPath
+                        evaluatingPayload,
+                        null,
+                        null
                 );
 
-                Map<String, Object> plannedTurnEntry = new HashMap<>();
-                plannedTurnEntry.put("turn", turn);
-                plannedTurnEntry.put("remainingBudget", remaining);
-                plannedTurnEntry.put("intentLabel", turnIntentLabel);
-                plannedTurnEntry.put("steps", boundedSteps);
-                plannedTurnEntry.put("status", hasFailure ? "partial_failed" : "passed");
-                plannedTurnEntry.put("stepCount", executeResponse.results.size());
-                plannedTurnEntry.put("failedCount", turnFailed);
-                plannedTurnEntry.put("screenshotPath", turnScreenshotPath);
-                plannedTurns.add(plannedTurnEntry);
+                AutomationContracts.AgentExecuteResponse stepResponse = AutomationAgentClient.executeSteps(
+                        sessionId,
+                        commandId.toString(),
+                        List.of(step)
+                );
+                if (stepResponse.results == null || stepResponse.results.isEmpty()) {
+                    completionReason = "Autonomous run stopped because no step result was produced.";
+                    hasFailure = true;
+                    break;
+                }
+                AutomationContracts.StepResult stepResult = stepResponse.results.get(0);
+                turnResults.add(stepResult);
+                allResults.add(stepResult);
+                executedSteps++;
+                if ("passed".equalsIgnoreCase(stepResult.status)) turnPassed++;
+                else {
+                    turnFailed++;
+                    hasFailure = true;
+                }
+                turnCurrentUrl = stepResult.currentUrl == null || stepResult.currentUrl.isBlank()
+                        ? stepResponse.currentUrl
+                        : stepResult.currentUrl;
+                if (stepResult.screenshotPath != null && !stepResult.screenshotPath.isBlank()) {
+                    turnScreenshotPath = stepResult.screenshotPath;
+                    lastScreenshotPath = stepResult.screenshotPath;
+                }
+                history.add("turn " + turn + " step " + (stepIndex + 1) + " - " + stepResult.action + " => " + stepResult.status +
+                        (stepResult.message == null ? "" : " (" + stepResult.message + ")"));
+
+                Map<String, Object> stepExecutionPayload = new HashMap<>();
+                stepExecutionPayload.put("mode", "autonomous");
+                stepExecutionPayload.put("turn", turn);
+                stepExecutionPayload.put("stepIndex", stepIndex + 1);
+                stepExecutionPayload.put("stepCount", boundedSteps.size());
+                stepExecutionPayload.put("intentLabel", turnIntentLabel);
+                stepExecutionPayload.put("step", step);
+                stepExecutionPayload.put("evaluateText", evaluateText);
+                stepExecutionPayload.put("actionText", actionText);
+                stepExecutionPayload.put("result", stepResult);
+                stepExecutionPayload.put("currentUrl", turnCurrentUrl);
+                stepExecutionPayload.put("status", stepResult.status);
+                AutomationSessionService.addEvent(
+                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_step_executed",
+                        command,
+                        stepExecutionPayload,
+                        stepExecutionPayload,
+                        stepResult.screenshotPath
+                );
 
                 if (hasFailure) {
-                    history.add("turn " + turn + " produced failures; re-planning with alternative strategy.");
-                    AutomationSessionService.addEvent(
-                            sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_replanned",
-                            command,
-                            Map.of(
-                                    "mode", "autonomous",
-                                    "turn", turn,
-                                    "intentLabel", turnIntentLabel,
-                                    "reason", "Previous turn had failed step(s); trying alternative strategy."
-                            ),
-                            null,
-                            turnScreenshotPath
-                    );
-                    continue;
+                    break;
                 }
-            } else {
-                completionReason = "Autonomous run stopped because no step result was produced.";
+            }
+
+            if (turnResults.isEmpty()) {
+                if (completionReason == null || completionReason.isBlank()) {
+                    completionReason = "Autonomous run stopped because no step result was produced.";
+                }
                 break;
+            }
+
+            latestUrl = turnCurrentUrl;
+            Map<String, Object> turnExecutionPayload = new HashMap<>();
+            turnExecutionPayload.put("mode", "autonomous");
+            turnExecutionPayload.put("turn", turn);
+            turnExecutionPayload.put("intentLabel", turnIntentLabel);
+            turnExecutionPayload.put("stepCount", turnResults.size());
+            turnExecutionPayload.put("passedCount", turnPassed);
+            turnExecutionPayload.put("failedCount", turnFailed);
+            turnExecutionPayload.put("status", hasFailure ? "partial_failed" : "passed");
+            turnExecutionPayload.put("steps", boundedSteps);
+            turnExecutionPayload.put("results", turnResults);
+            turnExecutionPayload.put("currentUrl", turnCurrentUrl);
+            AutomationSessionService.addEvent(
+                    sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_executed",
+                    command,
+                    turnExecutionPayload,
+                    turnExecutionPayload,
+                    turnScreenshotPath
+            );
+
+            Map<String, Object> plannedTurnEntry = new HashMap<>();
+            plannedTurnEntry.put("turn", turn);
+            plannedTurnEntry.put("remainingBudget", remaining);
+            plannedTurnEntry.put("intentLabel", turnIntentLabel);
+            plannedTurnEntry.put("steps", boundedSteps);
+            plannedTurnEntry.put("status", hasFailure ? "partial_failed" : "passed");
+            plannedTurnEntry.put("stepCount", turnResults.size());
+            plannedTurnEntry.put("failedCount", turnFailed);
+            plannedTurnEntry.put("screenshotPath", turnScreenshotPath);
+            plannedTurns.add(plannedTurnEntry);
+
+            if (hasFailure) {
+                history.add("turn " + turn + " produced failures; re-planning with alternative strategy.");
+                AutomationSessionService.addEvent(
+                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_replanned",
+                        command,
+                        Map.of(
+                                "mode", "autonomous",
+                                "turn", turn,
+                                "intentLabel", turnIntentLabel,
+                                "reason", "Previous step failed; trying alternative strategy."
+                        ),
+                        null,
+                        turnScreenshotPath
+                );
+                continue;
             }
         }
 
@@ -472,7 +541,10 @@ public final class AutomationSessionHandler {
                 body != null ? body.testName : null,
                 events
         );
-        List<Map<String, Object>> generatedSteps = AutomationScriptBuilderService.buildTestSteps(events);
+        boolean shouldGenerateSteps = shouldAutoGenerateSteps(projectId, userId);
+        List<Map<String, Object>> generatedSteps = shouldGenerateSteps
+                ? AutomationScriptBuilderService.buildTestSteps(events)
+                : null;
         AutomationSessionService.finalizeIntoTestcase(
                 projectId,
                 testcaseId,
@@ -598,6 +670,98 @@ public final class AutomationSessionHandler {
         ctx.json(result);
     }
 
+    public static void runPlaywrightScript(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        UUID testcaseId = UUID.fromString(String.valueOf(session.get("testcaseId")));
+        AutomationContracts.RunScriptBody body = ctx.bodyAsClass(AutomationContracts.RunScriptBody.class);
+        String script = body != null && body.script != null ? body.script.trim() : "";
+        if (script.isBlank()) {
+            ctx.status(400).json(Map.of("error", "script is required"));
+            return;
+        }
+        String startUrl = body != null && body.startUrl != null && !body.startUrl.isBlank() ? body.startUrl : null;
+        UUID executionId = UUID.randomUUID();
+        Map<String, Object> result = AutomationAgentClient.runPlaywrightScriptInSession(sessionId, executionId, script, startUrl);
+        String currentUrl = result.get("currentUrl") instanceof String s ? s : null;
+        String screenshotPath = result.get("screenshotPath") instanceof String s ? s : null;
+        String runStatus = result.get("status") instanceof String s ? s : "failed";
+        String errorMessage = result.get("errorMessage") instanceof String s ? s : null;
+
+        AutomationSessionService.touchState(
+                sessionId,
+                currentUrl,
+                screenshotPath,
+                Map.of(
+                        "scriptRun", true,
+                        "scriptVersion", body != null && body.scriptVersion != null ? body.scriptVersion : 0,
+                        "status", runStatus
+                )
+        );
+
+        Map<String, Object> parsedAction = new HashMap<>();
+        parsedAction.put("action", "run_playwright_script");
+        parsedAction.put("scriptVersion", body != null ? body.scriptVersion : null);
+        parsedAction.put("startUrl", startUrl == null ? "" : startUrl);
+
+        Map<String, Object> executionResult = new HashMap<>();
+        executionResult.put("status", runStatus);
+        executionResult.put("currentUrl", currentUrl == null ? "" : currentUrl);
+        executionResult.put("screenshotPath", screenshotPath == null ? "" : screenshotPath);
+        executionResult.put("errorMessage", errorMessage == null ? "" : errorMessage);
+        executionResult.put("durationMs", result.get("durationMs"));
+        executionResult.put("logs", result.get("logs"));
+
+        AutomationSessionService.addEvent(
+                sessionId,
+                projectId,
+                testcaseId,
+                userId,
+                executionId,
+                "playwright_script_executed",
+                "playwright_script_run",
+                parsedAction,
+                executionResult,
+                screenshotPath
+        );
+        ctx.json(result);
+    }
+
+    public static void reset(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        UUID testcaseId = UUID.fromString(String.valueOf(session.get("testcaseId")));
+        AutomationContracts.StartSessionBody body = ctx.bodyAsClass(AutomationContracts.StartSessionBody.class);
+        String startUrl = body != null && body.startUrl != null && !body.startUrl.isBlank() ? body.startUrl : null;
+        Map<String, Object> resetResult = AutomationAgentClient.resetSession(sessionId, startUrl);
+        String currentUrl = resetResult.get("currentUrl") instanceof String s ? s : null;
+        AutomationSessionService.touchState(
+                sessionId,
+                currentUrl,
+                null,
+                Map.of("sessionReset", true)
+        );
+        AutomationSessionService.addEvent(
+                sessionId,
+                projectId,
+                testcaseId,
+                userId,
+                UUID.randomUUID(),
+                "session_reset",
+                "session_reset",
+                Map.of("startUrl", startUrl == null ? "" : startUrl),
+                resetResult,
+                null
+        );
+        ctx.json(resetResult);
+    }
+
     public static void cancel(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -611,6 +775,69 @@ public final class AutomationSessionHandler {
             AuditService.logActivity(userId, projectId, "automation_session_cancelled", "testcase", testcaseId.toString(), null);
         } catch (Exception ignored) {}
         ctx.status(204);
+    }
+
+    private static String describeEvaluation(AutomationContracts.ActionStep step) {
+        String target = friendlyStepTarget(step);
+        if (step == null || step.action == null) {
+            return "I will evaluate the current page state before taking the next action.";
+        }
+        return switch (step.action) {
+            case "navigate" -> "I will evaluate whether navigating to the target page is the next best move.";
+            case "click" -> "I will first confirm " + target + " is visible and clickable before interacting.";
+            case "type" -> {
+                if (looksLikeDropdown(step)) {
+                    yield "I will first confirm " + target + " is a dropdown/selection control before choosing the option.";
+                }
+                yield "I will first confirm " + target + " is ready for input before typing.";
+            }
+            case "assert_visible" -> "I will verify " + target + " is visible on the page.";
+            case "assert_text" -> "I will verify the expected text is present" +
+                    (step.expectedText != null && !step.expectedText.isBlank() ? " (" + step.expectedText + ")." : ".");
+            case "assert_clickable" -> "I will verify " + target + " is enabled and clickable.";
+            default -> "I will evaluate the page state before executing this action.";
+        };
+    }
+
+    private static String describeAction(AutomationContracts.ActionStep step) {
+        String target = friendlyStepTarget(step);
+        if (step == null || step.action == null) {
+            return "Now I will perform the next action.";
+        }
+        return switch (step.action) {
+            case "navigate" -> "Now I will open " + (step.url == null || step.url.isBlank() ? "the required URL." : step.url + ".");
+            case "click" -> "Now I will click " + target + ".";
+            case "type" -> {
+                if (looksLikeDropdown(step)) {
+                    String option = step.value == null || step.value.isBlank() ? "the required option" : "\"" + step.value + "\"";
+                    yield "Now I will select " + option + " from " + target + ".";
+                }
+                String value = step.value == null || step.value.isBlank() ? "the required value" : "\"" + step.value + "\"";
+                yield "Now I will type " + value + " into " + target + ".";
+            }
+            case "assert_visible" -> "Now I will validate that " + target + " is visible.";
+            case "assert_text" -> "Now I will validate that the expected text appears on the page.";
+            case "assert_clickable" -> "Now I will validate that " + target + " is clickable.";
+            default -> "Now I will execute the planned action.";
+        };
+    }
+
+    private static String friendlyStepTarget(AutomationContracts.ActionStep step) {
+        if (step == null) return "the target element";
+        if (step.targetDescription != null && !step.targetDescription.isBlank()) return "\"" + step.targetDescription + "\"";
+        if (step.expectedText != null && !step.expectedText.isBlank()) return "\"" + step.expectedText + "\"";
+        if (step.selector != null && !step.selector.isBlank()) return "\"" + step.selector + "\"";
+        return "the target element";
+    }
+
+    private static boolean looksLikeDropdown(AutomationContracts.ActionStep step) {
+        if (step == null) return false;
+        String selector = step.selector == null ? "" : step.selector.toLowerCase();
+        String target = step.targetDescription == null ? "" : step.targetDescription.toLowerCase();
+        return selector.contains("select")
+                || selector.contains("combobox")
+                || target.contains("dropdown")
+                || target.contains("select");
     }
 
     private static String inferIntentLabel(String objective, List<AutomationContracts.ActionStep> steps) {
@@ -627,6 +854,23 @@ public final class AutomationSessionHandler {
         if (hasClick) return "UI interaction";
         if (hasAssert) return "Verification";
         return "Autonomous action";
+    }
+
+    private static boolean shouldAutoGenerateSteps(UUID projectId, UUID userId) {
+        try {
+            Optional<Map<String, Object>> project = ProjectService.getProject(projectId, userId);
+            if (project.isEmpty()) return true;
+            Object rawSettings = project.get().get("settings");
+            if (!(rawSettings instanceof String settingsJson) || settingsJson.isBlank()) return true;
+            Map<String, Object> settings = mapper.readValue(settingsJson, new TypeReference<>() {});
+            Object aiObject = settings.get("ai");
+            if (!(aiObject instanceof Map<?, ?> aiMap)) return true;
+            Object flag = aiMap.get("autoGenerateTestSteps");
+            if (flag instanceof Boolean enabled) return enabled;
+            return true;
+        } catch (Exception ignored) {
+            return true;
+        }
     }
 
     private AutomationSessionHandler() {}

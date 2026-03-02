@@ -143,6 +143,17 @@ public final class TestCaseService {
                 m.put("automationScript", rs.getString("automation_script") != null ? rs.getString("automation_script") : "");
                 m.put("automationScriptLanguage", rs.getString("automation_script_language") != null ? rs.getString("automation_script_language") : "");
                 m.put("automationScriptVersion", rs.getInt("automation_script_version"));
+                String currentScript = rs.getString("automation_script") != null ? rs.getString("automation_script") : "";
+                String currentScriptLanguage = rs.getString("automation_script_language") != null ? rs.getString("automation_script_language") : "";
+                int currentScriptVersion = rs.getInt("automation_script_version");
+                String testcaseUpdatedAt = rs.getTimestamp("updated_at").toInstant().toString();
+                m.put("automationScriptHistory", listAutomationScriptHistory(
+                        testcaseId,
+                        currentScript,
+                        currentScriptLanguage,
+                        currentScriptVersion,
+                        testcaseUpdatedAt
+                ));
                 m.put("automatedAt", rs.getTimestamp("automated_at") != null ? rs.getTimestamp("automated_at").toInstant().toString() : null);
                 Object automatedBy = rs.getObject("automated_by");
                 m.put("automatedBy", automatedBy != null ? automatedBy.toString() : null);
@@ -448,6 +459,69 @@ public final class TestCaseService {
             throw new RuntimeException(e);
         }
         return counts;
+    }
+
+    private static List<Map<String, Object>> listAutomationScriptHistory(
+            UUID testcaseId,
+            String currentScript,
+            String currentScriptLanguage,
+            int currentScriptVersion,
+            String testcaseUpdatedAt
+    ) {
+        List<Map<String, Object>> history = new ArrayList<>();
+
+        if (currentScript != null && !currentScript.isBlank()) {
+            Map<String, Object> current = new HashMap<>();
+            current.put("scriptVersion", Math.max(1, currentScriptVersion));
+            current.put("testcaseVersion", null);
+            current.put("script", currentScript);
+            current.put("language", currentScriptLanguage == null ? "" : currentScriptLanguage);
+            current.put("capturedAt", testcaseUpdatedAt);
+            current.put("isCurrent", true);
+            history.add(current);
+        }
+
+        String sql = "SELECT version, created_at, " +
+                "COALESCE(snapshot->>'automation_script', '') AS script, " +
+                "COALESCE(snapshot->>'automation_script_language', '') AS script_language, " +
+                "COALESCE(NULLIF(snapshot->>'automation_script_version', '')::int, 0) AS script_version " +
+                "FROM testcase_versions WHERE testcase_id = ? ORDER BY created_at DESC";
+
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, testcaseId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                String script = rs.getString("script");
+                if (script == null || script.isBlank()) continue;
+                int scriptVersion = rs.getInt("script_version");
+                boolean duplicate = false;
+                for (Map<String, Object> entry : history) {
+                    Object existingScriptVersion = entry.get("scriptVersion");
+                    Object existingScript = entry.get("script");
+                    if (existingScriptVersion instanceof Number n &&
+                            n.intValue() == scriptVersion &&
+                            script.equals(existingScript)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                Map<String, Object> row = new HashMap<>();
+                row.put("scriptVersion", scriptVersion);
+                row.put("testcaseVersion", rs.getInt("version"));
+                row.put("script", script);
+                row.put("language", rs.getString("script_language"));
+                row.put("capturedAt", rs.getTimestamp("created_at").toInstant().toString());
+                row.put("isCurrent", false);
+                history.add(row);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+
+        return history;
     }
 
     public static class CreateDto {

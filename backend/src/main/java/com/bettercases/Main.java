@@ -101,9 +101,11 @@ public final class Main {
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/reset", AutomationSessionHandler::reset);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/manual-actions", AutomationSessionHandler::manualAction);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/run-script", AutomationSessionHandler::runPlaywrightScript);
 
         app.get("/api/projects/{projectId}/plans", PlanHandler::list);
         app.post("/api/projects/{projectId}/plans", PlanHandler::create);

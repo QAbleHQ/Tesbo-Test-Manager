@@ -44,6 +44,7 @@ type ProjectSettingsPayload = {
     model?: string;
     openAiApiKey?: string;
     anthropicApiKey?: string;
+    autoGenerateTestSteps?: boolean;
   };
   jiraAutoComment?: boolean;
   jiraTicketSelector?: boolean;
@@ -101,6 +102,7 @@ export default function ProjectSettingsPage() {
   const [model, setModel] = useState("");
   const [openAiApiKey, setOpenAiApiKey] = useState("");
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [autoGenerateTestSteps, setAutoGenerateTestSteps] = useState(true);
   const [jiraAutoComment, setJiraAutoComment] = useState(false);
   const [jiraTicketSelector, setJiraTicketSelector] = useState(false);
   const [tesboKeepTrace, setTesboKeepTrace] = useState(true);
@@ -220,6 +222,7 @@ export default function ProjectSettingsPage() {
         setModel(resolvedModel);
         setOpenAiApiKey(ai?.openAiApiKey ?? "");
         setAnthropicApiKey(ai?.anthropicApiKey ?? "");
+        setAutoGenerateTestSteps(ai?.autoGenerateTestSteps !== false);
         setJiraAutoComment(parsedSettings.jiraAutoComment === true);
         setJiraTicketSelector(parsedSettings.jiraTicketSelector === true);
         const tesbo = parsedSettings.tesboReports;
@@ -278,6 +281,7 @@ export default function ProjectSettingsPage() {
           model: model.trim() || undefined,
           openAiApiKey: openAiApiKey.trim(),
           anthropicApiKey: anthropicApiKey.trim(),
+          autoGenerateTestSteps,
         },
         jiraAutoComment,
         jiraTicketSelector,
@@ -652,6 +656,23 @@ export default function ProjectSettingsPage() {
                   className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                 />
               </div>
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoGenerateTestSteps}
+                  onChange={(e) => setAutoGenerateTestSteps(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <div>
+                  <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                    Auto-generate Test Steps from Automate
+                  </span>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    When enabled, saving an Automate session updates both Playwright script and Test Steps. When
+                    disabled, only the Playwright script is updated.
+                  </p>
+                </div>
+              </label>
             </div>
           )}
 

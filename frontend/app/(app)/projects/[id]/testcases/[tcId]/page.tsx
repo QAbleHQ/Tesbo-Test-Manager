@@ -16,6 +16,14 @@ import {
 } from "@/lib/api";
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
+type ScriptHistoryEntry = {
+  scriptVersion: number;
+  testcaseVersion: number | null;
+  script: string;
+  language: string;
+  capturedAt: string;
+  isCurrent: boolean;
+};
 
 const FETCH_LIMIT = 100;
 
@@ -46,6 +54,10 @@ export default function TestCaseDetailPage() {
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
   const [automationScript, setAutomationScript] = useState("");
+  const [automationScriptVersion, setAutomationScriptVersion] = useState(0);
+  const [scriptVersionHistory, setScriptVersionHistory] = useState<ScriptHistoryEntry[]>([]);
+  const [selectedScriptHistoryKey, setSelectedScriptHistoryKey] = useState("current");
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
   const [existingTagSuggestions, setExistingTagSuggestions] = useState<string[]>([]);
   const [type, setType] = useState("Functional");
   const [priority, setPriority] = useState("P2");
@@ -101,6 +113,9 @@ export default function TestCaseDetailPage() {
         setAttachments("");
         setAutomationTags([]);
         setAutomationScript("");
+        setAutomationScriptVersion(0);
+        setScriptVersionHistory([]);
+        setSelectedScriptHistoryKey("current");
         setType("Functional");
         setPriority("P2");
         setStatus("Draft");
@@ -119,6 +134,32 @@ export default function TestCaseDetailPage() {
         setAttachments((p.attachments as string) ?? "");
         setAutomationTags(parseTagString((p.automationTags as string) ?? ""));
         setAutomationScript((p.automationScript as string) ?? "");
+        const loadedScriptVersion = Number(p.automationScriptVersion ?? 0);
+        setAutomationScriptVersion(Number.isFinite(loadedScriptVersion) ? loadedScriptVersion : 0);
+        const historyRaw = Array.isArray(p.automationScriptHistory)
+          ? (p.automationScriptHistory as Array<Record<string, unknown>>)
+              .map((entry): ScriptHistoryEntry | null => {
+                const script = typeof entry.script === "string" ? entry.script : "";
+                if (!script.trim()) return null;
+                const scriptVersion = Number(entry.scriptVersion ?? 0);
+                const testcaseVersionRaw =
+                  entry.testcaseVersion == null ? null : Number(entry.testcaseVersion);
+                return {
+                  scriptVersion: Number.isFinite(scriptVersion) ? scriptVersion : 0,
+                  testcaseVersion:
+                    testcaseVersionRaw != null && Number.isFinite(testcaseVersionRaw)
+                      ? testcaseVersionRaw
+                      : null,
+                  script,
+                  language: typeof entry.language === "string" ? entry.language : "",
+                  capturedAt: typeof entry.capturedAt === "string" ? entry.capturedAt : "",
+                  isCurrent: entry.isCurrent === true,
+                };
+              })
+              .filter((entry): entry is ScriptHistoryEntry => entry !== null)
+          : [];
+        setScriptVersionHistory(historyRaw);
+        setSelectedScriptHistoryKey("current");
         setType((p.type as string) ?? "Functional");
         setSuiteId((p.suiteId as string) ?? "");
         const s = (p.steps as string) ?? "[]";
@@ -238,6 +279,16 @@ export default function TestCaseDetailPage() {
       </div>
     );
   }
+
+  const previousScriptHistory = scriptVersionHistory.filter((entry) => !entry.isCurrent);
+  const selectedHistoryEntry =
+    selectedScriptHistoryKey === "current"
+      ? null
+      : previousScriptHistory[Number(selectedScriptHistoryKey.replace("history-", ""))] || null;
+  const displayedScript = selectedHistoryEntry ? selectedHistoryEntry.script : automationScript;
+  const currentScriptVersionLabel = automationScript.trim()
+    ? `v${Math.max(1, automationScriptVersion)}`
+    : "Not versioned yet";
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -429,6 +480,20 @@ export default function TestCaseDetailPage() {
             <p className="mb-2 text-xs text-zinc-500">
               You can edit script manually here, or use Automate to generate and update it.
             </p>
+            <p className="mb-2 text-xs text-zinc-500">
+              Current script version: <span className="font-medium">{currentScriptVersionLabel}</span>
+              {previousScriptHistory.length > 0
+                ? ` • ${previousScriptHistory.length} previous version${previousScriptHistory.length === 1 ? "" : "s"}`
+                : ""}
+            </p>
+            <button
+              type="button"
+              onClick={() => setVersionHistoryOpen(true)}
+              disabled={scriptVersionHistory.length === 0}
+              className="mb-2 text-xs text-blue-600 hover:underline disabled:text-zinc-400 disabled:no-underline"
+            >
+              View Version History
+            </button>
             <textarea
               value={automationScript}
               onChange={(e) => setAutomationScript(e.target.value)}
@@ -482,6 +547,69 @@ export default function TestCaseDetailPage() {
           </div>
         </form>
       </main>
+      {versionHistoryOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-5xl rounded-xl border border-zinc-200 bg-white p-4 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Script Version History</h3>
+              <button
+                type="button"
+                onClick={() => setVersionHistoryOpen(false)}
+                className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700"
+              >
+                Close
+              </button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-[220px_1fr]">
+              <div className="max-h-[60vh] overflow-auto rounded border border-zinc-200 p-2 dark:border-zinc-700">
+                <div className="space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedScriptHistoryKey("current")}
+                    className={`w-full rounded px-2 py-1 text-left text-xs ${
+                      selectedScriptHistoryKey === "current"
+                        ? "bg-blue-600 text-white"
+                        : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                    }`}
+                  >
+                    {`v${Math.max(1, automationScriptVersion)} (Latest)`}
+                  </button>
+                  {previousScriptHistory.map((entry, idx) => {
+                    const itemKey = `history-${idx}`;
+                    return (
+                      <button
+                        key={`${entry.scriptVersion}-${idx}`}
+                        type="button"
+                        onClick={() => setSelectedScriptHistoryKey(itemKey)}
+                        className={`w-full rounded px-2 py-1 text-left text-xs ${
+                          selectedScriptHistoryKey === itemKey
+                            ? "bg-blue-600 text-white"
+                            : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                        }`}
+                      >
+                        {`v${entry.scriptVersion}`}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="rounded border border-zinc-200 p-2 dark:border-zinc-700">
+                <textarea
+                  value={displayedScript}
+                  readOnly
+                  rows={24}
+                  className="h-[60vh] w-full rounded border border-zinc-300 bg-zinc-50 px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-950"
+                />
+                {selectedHistoryEntry?.testcaseVersion != null && (
+                  <p className="mt-2 text-[11px] text-zinc-500">
+                    Snapshot from testcase version {selectedHistoryEntry.testcaseVersion}.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

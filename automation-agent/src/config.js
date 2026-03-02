@@ -19,7 +19,7 @@ export const config = {
   backendSharedToken: env("AUTOMATION_QUEUE_SHARED_TOKEN", ""),
   redisUrl: env("REDIS_URL", "redis://localhost:6379"),
   queueName: env("AUTOMATION_QUEUE_NAME", "automation-execution-jobs"),
-  queueEnabled: env("AUTOMATION_QUEUE_ENABLED", "false") !== "false",
+  queueEnabled: env("AUTOMATION_QUEUE_ENABLED", "true") !== "false",
   queueDefaultRetries: Number(env("AUTOMATION_QUEUE_MAX_RETRIES", "2")),
   queueConcurrency: Number(env("AUTOMATION_QUEUE_CONCURRENCY", "2")),
 };

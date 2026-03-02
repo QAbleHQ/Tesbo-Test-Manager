@@ -62,6 +62,51 @@ async function createSession(sessionId, startUrl) {
   return state;
 }
 
+async function resetSession(sessionId, startUrl) {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error("Session not found");
+  const currentSession = session;
+  try {
+    await currentSession.page.close().catch(() => {});
+    await currentSession.context.close().catch(() => {});
+    await currentSession.browser.close().catch(() => {});
+  } catch {
+    // best-effort cleanup of previous browser context
+  }
+  const browser = await chromium.launch({ headless: config.headless });
+  const contextOptions = {
+    viewport: { width: 1366, height: 768 },
+  };
+  if (config.recordVideo) {
+    contextOptions.recordVideo = {
+      dir: config.videoDir,
+      size: { width: 1366, height: 768 },
+    };
+  }
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+  if (startUrl) {
+    await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+  }
+  currentSession.browser = browser;
+  currentSession.context = context;
+  currentSession.page = page;
+  currentSession.currentUrl = page.url();
+  currentSession.lastScreenshotPath = null;
+  currentSession.lastVideoPath = null;
+  currentSession.updatedAt = nowIso();
+  await takeScreenshot(currentSession).catch(() => {});
+  pushEvent(currentSession, {
+    type: "session_reset",
+    startUrl: startUrl || "",
+  });
+  logInfo("session_reset", { sessionId, startUrl: startUrl || "" });
+  return {
+    sessionId,
+    currentUrl: currentSession.currentUrl,
+  };
+}
+
 async function takeScreenshot(session) {
   const fileName = `${session.id}-${Date.now()}.png`;
   const outputPath = path.join(config.screenshotDir, fileName);
@@ -362,6 +407,99 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
   };
 }
 
+async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null) {
+  await ensureScreenshotDir();
+  const session = getSession(sessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+  const startedAt = Date.now();
+  const logs = [];
+  let status = "passed";
+  let errorMessage = null;
+  let screenshotPath = null;
+  let currentUrl = session.currentUrl || "";
+  let stepCounter = 0;
+  const recordStep = async (action, detail, fn) => {
+    const stepStartedAt = Date.now();
+    const stepId = `step-${++stepCounter}`;
+    try {
+      const result = await fn();
+      const stepScreenshotPath = await takeScreenshot(session).catch(() => null);
+      logs.push({
+        kind: "step",
+        stepId,
+        action,
+        status: "passed",
+        detail: detail || {},
+        screenshotPath: stepScreenshotPath,
+        durationMs: Date.now() - stepStartedAt,
+        ts: new Date().toISOString(),
+      });
+      return result;
+    } catch (err) {
+      const stepScreenshotPath = await takeScreenshot(session).catch(() => null);
+      const message = err instanceof Error ? err.message : String(err);
+      logs.push({
+        kind: "step",
+        stepId,
+        action,
+        status: "failed",
+        detail: detail || {},
+        message,
+        screenshotPath: stepScreenshotPath,
+        durationMs: Date.now() - stepStartedAt,
+        ts: new Date().toISOString(),
+      });
+      throw err;
+    }
+  };
+
+  try {
+    if (startUrl) {
+      await session.page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+    }
+    const body = extractPlaywrightTestBody(script);
+    const AsyncFunction = Object.getPrototypeOf(async function noop() {}).constructor;
+    const fn = new AsyncFunction("page", "expect", body);
+    const instrumentedPage = createInstrumentedPage(session.page, recordStep);
+    const expect = createExpect(session.page, recordStep);
+    await fn(instrumentedPage, expect);
+    currentUrl = session.page.url();
+    session.currentUrl = currentUrl;
+    screenshotPath = await takeScreenshot(session);
+  } catch (err) {
+    status = "failed";
+    errorMessage = err instanceof Error ? err.message : String(err);
+    currentUrl = session.page.url();
+    session.currentUrl = currentUrl;
+    screenshotPath = await takeScreenshot(session).catch(() => null);
+    logs.push({
+      level: "error",
+      message: errorMessage,
+      ts: new Date().toISOString(),
+    });
+  }
+
+  pushEvent(session, {
+    type: "playwright_script_finished",
+    executionId,
+    status,
+    currentUrl,
+    screenshotPath,
+    durationMs: Date.now() - startedAt,
+  });
+
+  return {
+    status,
+    currentUrl,
+    logs,
+    screenshotPath,
+    errorMessage,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function pushEvent(session, event) {
   session.events.push({
     ...event,
@@ -569,11 +707,31 @@ async function readTargetValue(page, targetSelector) {
     .catch(() => null);
 }
 
+async function locatorHighlightBox(locator, page, label = null) {
+  try {
+    const box = await locator.boundingBox();
+    if (!box) return null;
+    const viewport = page.viewportSize() || { width: 1366, height: 768 };
+    if (!viewport.width || !viewport.height) return null;
+    const clamp = (value) => Math.max(0, Math.min(1, value));
+    return {
+      xRatio: clamp(box.x / viewport.width),
+      yRatio: clamp(box.y / viewport.height),
+      widthRatio: clamp(box.width / viewport.width),
+      heightRatio: clamp(box.height / viewport.height),
+      label: label || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function executeStep(session, commandId, step) {
   const startedAt = Date.now();
   const stepId = step.id || `step-${startedAt}`;
   let selectorUsed = step.selector || step.targetDescription || null;
   let successMessage = "Step executed successfully";
+  let highlight = null;
   pushEvent(session, {
     type: "step_started",
     commandId,
@@ -623,6 +781,7 @@ async function executeStep(session, commandId, step) {
         throw new Error(`Unable to locate clickable target: ${target}`);
       }
       selectorUsed = resolved.label;
+      highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
       const before = await snapshotState().catch(() => null);
       await resolved.locator.click({ timeout }).catch(async () => {
         await resolved.locator.scrollIntoViewIfNeeded().catch(() => {});
@@ -657,6 +816,7 @@ async function executeStep(session, commandId, step) {
         throw new Error(`Unable to locate input target: ${target}`);
       }
       selectorUsed = resolved.label;
+      highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
       const beforeValue = await readTargetValue(session.page, step.selector);
       let typed = false;
       let afterValue = null;
@@ -719,12 +879,16 @@ async function executeStep(session, commandId, step) {
     } else if (step.action === "assert_visible") {
       const selector = step.selector || (step.targetDescription ? `text=${step.targetDescription}` : null) || (step.expectedText ? `text=${step.expectedText}` : null);
       if (!selector) throw new Error("assert_visible requires selector or expectedText");
-      await session.page.locator(selector).first().waitFor({ state: "visible", timeout });
+      const locator = session.page.locator(selector).first();
+      await locator.waitFor({ state: "visible", timeout });
+      highlight = await locatorHighlightBox(locator, session.page, step.targetDescription || step.expectedText || selector);
     } else if (step.action === "assert_text") {
       const expected = (step.expectedText || "").trim();
       if (!expected) throw new Error("assert_text requires expectedText");
       if (step.selector) {
-        const text = await session.page.locator(step.selector).first().innerText({ timeout });
+        const locator = session.page.locator(step.selector).first();
+        highlight = await locatorHighlightBox(locator, session.page, step.selector);
+        const text = await locator.innerText({ timeout });
         if (!text.toLowerCase().includes(expected.toLowerCase())) {
           throw new Error(`Text mismatch. Expected contains "${expected}", got "${text}"`);
         }
@@ -742,6 +906,7 @@ async function executeStep(session, commandId, step) {
       const locator = resolved.locator;
       await locator.waitFor({ state: "visible", timeout });
       const enabled = await locator.isEnabled({ timeout });
+      highlight = await locatorHighlightBox(locator, session.page, target || resolved.label);
       if (!enabled) throw new Error(`Element is not clickable: ${target}`);
     } else {
       throw new Error(`Unsupported action: ${step.action}`);
@@ -755,6 +920,7 @@ async function executeStep(session, commandId, step) {
       status: "passed",
       currentUrl: session.currentUrl,
       selectorUsed,
+      highlight,
       message: successMessage,
       screenshotPath,
       durationMs: Date.now() - startedAt,
@@ -771,6 +937,7 @@ async function executeStep(session, commandId, step) {
       status: "failed",
       currentUrl: session.currentUrl,
       selectorUsed,
+      highlight,
       message: error instanceof Error ? error.message : "Step failed",
       screenshotPath,
       durationMs: Date.now() - startedAt,
@@ -1047,9 +1214,11 @@ function startCleanupWatchdog() {
 export {
   getSession,
   createSession,
+  resetSession,
   executeSteps,
   manualAction,
   runPlaywrightScript,
+  runPlaywrightScriptInSession,
   sessionState,
   closeSession,
   startCleanupWatchdog,

@@ -485,6 +485,17 @@ export async function getAutomationStreamState(projectId: string, sessionId: str
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/stream`);
 }
 
+export async function resetAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: { startUrl?: string }
+): Promise<{ sessionId: string; currentUrl?: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/reset`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
 export async function finalizeAutomationSession(
   projectId: string,
   sessionId: string,
@@ -516,6 +527,28 @@ export async function sendAutomationManualAction(
   }
 ): Promise<Record<string, unknown>> {
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/manual-actions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function runAutomationPlaywrightScript(
+  projectId: string,
+  sessionId: string,
+  data: {
+    script: string;
+    scriptVersion?: number | null;
+    startUrl?: string;
+  }
+): Promise<{
+  status: "passed" | "failed" | string;
+  currentUrl?: string;
+  errorMessage?: string | null;
+  screenshotPath?: string | null;
+  durationMs?: number;
+  logs?: Array<Record<string, unknown>>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/run-script`, {
     method: "POST",
     body: data,
   });

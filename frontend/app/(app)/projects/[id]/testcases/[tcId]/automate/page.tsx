@@ -11,9 +11,11 @@ import {
   sendAutomationCommand,
   getAutomationSession,
   getAutomationStreamState,
+  resetAutomationSession,
   finalizeAutomationSession,
   cancelAutomationSession,
   sendAutomationManualAction,
+  runAutomationPlaywrightScript,
   type AutomationSession,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -34,6 +36,19 @@ type TimelineItem = {
 };
 
 type SessionStartupState = "select-environment" | "starting" | "waiting-stream" | "ready";
+type BotHighlight = {
+  xRatio: number;
+  yRatio: number;
+  widthRatio?: number;
+  heightRatio?: number;
+  label?: string;
+};
+type ScriptVersionOption = {
+  key: string;
+  label: string;
+  script: string;
+  scriptVersion: number | null;
+};
 
 export default function AutomateTestCasePage() {
   const params = useParams();
@@ -58,15 +73,21 @@ export default function AutomateTestCasePage() {
   const [sessionStartupError, setSessionStartupError] = useState<string | null>(null);
   const [liveStreamFailed, setLiveStreamFailed] = useState(false);
   const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
+  const [sessionStartUrl, setSessionStartUrl] = useState("");
   const [selectedEnvironmentUrl, setSelectedEnvironmentUrl] = useState("");
   const [customEnvironmentUrl, setCustomEnvironmentUrl] = useState("");
   const [manualText, setManualText] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
+  const [quickActionBusy, setQuickActionBusy] = useState<"run" | "rerun" | null>(null);
+  const [scriptVersionOptions, setScriptVersionOptions] = useState<ScriptVersionOption[]>([]);
+  const [versionPickerOpen, setVersionPickerOpen] = useState(false);
+  const [selectedVersionKey, setSelectedVersionKey] = useState<string>("");
   const [aiConfigured, setAiConfigured] = useState(true);
   const [aiProvider, setAiProvider] = useState<"openai" | "anthropic">("openai");
   const [lastClickTarget, setLastClickTarget] = useState<{ xRatio: number; yRatio: number } | null>(null);
   const [cursorPulse, setCursorPulse] = useState(false);
   const [keyboardCapture, setKeyboardCapture] = useState(true);
+  const [botHighlight, setBotHighlight] = useState<BotHighlight | null>(null);
   const dragStartRef = useRef<{ xRatio: number; yRatio: number } | null>(null);
   const suppressClickRef = useRef(false);
   const lastScrollAtRef = useRef(0);
@@ -80,6 +101,58 @@ export default function AutomateTestCasePage() {
   const isChatMode = mode === "chat";
   const startupReady = sessionStartupState === "ready";
   const selectedStartUrl = (selectedEnvironmentUrl || customEnvironmentUrl).trim();
+
+  function asText(value: unknown): string {
+    return typeof value === "string" ? value : "";
+  }
+
+  function isDropdownStep(step: Record<string, unknown>): boolean {
+    const selector = asText(step.selector).toLowerCase();
+    const target = asText(step.targetDescription).toLowerCase();
+    return (
+      selector.includes("select") ||
+      selector.includes("combobox") ||
+      target.includes("dropdown") ||
+      target.includes("select")
+    );
+  }
+
+  function stepTarget(step: Record<string, unknown>): string {
+    const targetDescription = asText(step.targetDescription).trim();
+    const expectedText = asText(step.expectedText).trim();
+    const selector = asText(step.selector).trim();
+    if (targetDescription) return `"${targetDescription}"`;
+    if (expectedText) return `"${expectedText}"`;
+    if (selector) return `"${selector}"`;
+    return "the target element";
+  }
+
+  function describeStepLine(step: Record<string, unknown>, index: number): string {
+    const action = asText(step.action).trim().toLowerCase();
+    const target = stepTarget(step);
+    const value = asText(step.value).trim();
+    const expectedText = asText(step.expectedText).trim();
+    const url = asText(step.url).trim();
+    switch (action) {
+      case "navigate":
+        return `${index}. Open ${url || "the target URL"}.`;
+      case "click":
+        return `${index}. Click ${target}.`;
+      case "type":
+        if (isDropdownStep(step)) {
+          return `${index}. This is a dropdown, so select ${value ? `"${value}"` : "the right option"} from ${target}.`;
+        }
+        return `${index}. Enter ${value ? `"${value}"` : "the required value"} into ${target}.`;
+      case "assert_visible":
+        return `${index}. Verify ${target} is visible.`;
+      case "assert_text":
+        return `${index}. Verify text ${expectedText ? `"${expectedText}"` : "matches expected output"}.`;
+      case "assert_clickable":
+        return `${index}. Verify ${target} is clickable.`;
+      default:
+        return `${index}. Perform ${action || "the planned"} action.`;
+    }
+  }
 
   function parseProjectSettings(raw: unknown): Record<string, unknown> {
     if (typeof raw !== "string" || !raw.trim()) return {};
@@ -123,7 +196,52 @@ export default function AutomateTestCasePage() {
         return;
       }
       getTestCase(projectId, testcaseId)
-        .then((tc) => setTestcaseTitle((tc.title as string) || "Generated Test"))
+        .then((tc) => {
+          setTestcaseTitle((tc.title as string) || "Generated Test");
+          const currentScript = typeof tc.automationScript === "string" ? tc.automationScript : "";
+          const currentVersionRaw = Number(tc.automationScriptVersion ?? 0);
+          const currentScriptVersion = Number.isFinite(currentVersionRaw) && currentVersionRaw > 0 ? currentVersionRaw : 1;
+          const historyRaw = Array.isArray(tc.automationScriptHistory)
+            ? (tc.automationScriptHistory as Array<Record<string, unknown>>)
+            : [];
+          const historyOptions: ScriptVersionOption[] = historyRaw
+            .map((entry, idx) => {
+              const script = typeof entry.script === "string" ? entry.script : "";
+              if (!script.trim()) return null;
+              const scriptVersionRaw = Number(entry.scriptVersion ?? 0);
+              const scriptVersion = Number.isFinite(scriptVersionRaw) && scriptVersionRaw > 0 ? scriptVersionRaw : null;
+              const isCurrent = entry.isCurrent === true;
+              return {
+                key: `history-${idx}`,
+                label: isCurrent ? `v${scriptVersion ?? currentScriptVersion} (Latest)` : `v${scriptVersion ?? "previous"}`,
+                script,
+                scriptVersion,
+              };
+            })
+            .filter((entry): entry is ScriptVersionOption => entry !== null);
+          const currentOption =
+            currentScript.trim().length > 0
+              ? [
+                  {
+                    key: "current",
+                    label: `v${currentScriptVersion} (Latest)`,
+                    script: currentScript,
+                    scriptVersion: currentScriptVersion,
+                  } satisfies ScriptVersionOption,
+                ]
+              : [];
+          const merged = [...currentOption, ...historyOptions.filter((entry) => entry.key !== "current")];
+          const deduped: ScriptVersionOption[] = [];
+          const seen = new Set<string>();
+          for (const option of merged) {
+            const token = `${option.scriptVersion ?? "none"}::${option.script.slice(0, 80)}`;
+            if (seen.has(token)) continue;
+            seen.add(token);
+            deduped.push(option);
+          }
+          setScriptVersionOptions(deduped);
+          setSelectedVersionKey(deduped[0]?.key ?? "");
+        })
         .catch(() => {});
       if (bootstrapSessionId) {
         setSessionId(bootstrapSessionId);
@@ -166,6 +284,7 @@ export default function AutomateTestCasePage() {
     try {
       const created = await startAutomationSession(projectId, testcaseId, selectedStartUrl ? { startUrl: selectedStartUrl } : undefined);
       setSessionId(created.id);
+      setSessionStartUrl(selectedStartUrl);
       setStreamState("Connecting");
       setSessionStartupState("waiting-stream");
       setMessages([
@@ -347,6 +466,39 @@ export default function AutomateTestCasePage() {
         continue;
       }
 
+      if (event.eventType === "autonomous_step_evaluating") {
+        const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+        const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
+        const stepCount = typeof parsed.stepCount === "number" ? parsed.stepCount : null;
+        const evaluateText = toText(parsed.evaluateText);
+        const actionText = toText(parsed.actionText);
+        rawItems.push({
+          at,
+          actionLabel: "Evaluate",
+          primary: `${turn ? `Turn ${turn}` : "Turn"}${stepIndex ? ` - Step ${stepIndex}${stepCount ? `/${stepCount}` : ""}` : ""}`,
+          secondary: evaluateText || undefined,
+          tertiary: actionText ? `Next: ${actionText}` : undefined,
+        });
+        continue;
+      }
+
+      if (event.eventType === "autonomous_step_executed") {
+        const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+        const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
+        const stepCount = typeof parsed.stepCount === "number" ? parsed.stepCount : null;
+        const actionText = toText(parsed.actionText);
+        const result = (execution.result || {}) as Record<string, unknown>;
+        const status = toText(result.status) || toText(parsed.status) || "completed";
+        rawItems.push({
+          at,
+          actionLabel: "Perform",
+          primary: `${turn ? `Turn ${turn}` : "Turn"}${stepIndex ? ` - Step ${stepIndex}${stepCount ? `/${stepCount}` : ""}` : ""}`,
+          secondary: actionText || undefined,
+          tertiary: status ? `status: ${status}` : undefined,
+        });
+        continue;
+      }
+
       if (event.eventType === "autonomous_turn_executed") {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const intentLabel = toText(parsed.intentLabel) || "Autonomous execution";
@@ -420,6 +572,7 @@ export default function AutomateTestCasePage() {
 
   useEffect(() => {
     streamedAutonomousEventIdsRef.current = new Set();
+    setBotHighlight(null);
   }, [sessionId]);
 
   useEffect(() => {
@@ -433,14 +586,54 @@ export default function AutomateTestCasePage() {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const intent = typeof parsed.intentLabel === "string" ? parsed.intentLabel : "Autonomous plan";
         const steps = Array.isArray(parsed.steps) ? (parsed.steps as Array<Record<string, unknown>>) : [];
-        const chain = steps
-          .map((step) => (typeof step.action === "string" ? step.action : "step"))
-          .filter(Boolean)
-          .join(" -> ");
         const stepCount = steps.length;
+        const planIntro = `${turn ? `Turn ${turn}` : "Next turn"} plan: ${intent}. I will run ${stepCount} step${
+          stepCount === 1 ? "" : "s"
+        } now.`;
+        const planLines = steps.map((step, idx) => describeStepLine(step, idx + 1));
+        newChatLines.push([planIntro, ...planLines].join("\n"));
+      } else if (event.eventType === "autonomous_step_evaluating") {
+        const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+        const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
+        const stepCount = typeof parsed.stepCount === "number" ? parsed.stepCount : null;
+        const evaluateText = asText(parsed.evaluateText);
+        const actionText = asText(parsed.actionText);
+        const prefix = `${turn ? `Turn ${turn}` : "Turn"}${stepIndex ? ` · Step ${stepIndex}${stepCount ? `/${stepCount}` : ""}` : ""}`;
         newChatLines.push(
-          `${turn ? `Turn ${turn}` : "Next turn"} planning: I understand the goal as "${intent}". I will run ${stepCount} step${stepCount === 1 ? "" : "s"} now${chain ? ` using this sequence: ${chain}.` : "."}`
+          `${prefix}\nEvaluate: ${evaluateText || "I am checking the page state first."}\nAction: ${
+            actionText || "I will perform the planned interaction next."
+          }`
         );
+      } else if (event.eventType === "autonomous_step_executed") {
+        const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+        const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
+        const execution = (event.executionResult || {}) as Record<string, unknown>;
+        const result = (execution.result || {}) as Record<string, unknown>;
+        const status = asText(result.status) || asText(execution.status) || "completed";
+        const message = asText(result.message);
+        const normalizedStatus = status.toLowerCase() === "passed" ? "completed successfully" : `finished with status "${status}"`;
+        newChatLines.push(
+          `${turn ? `Turn ${turn}` : "Turn"}${stepIndex ? ` · Step ${stepIndex}` : ""} ${normalizedStatus}.${message ? ` ${message}` : ""}`
+        );
+        const highlight = result.highlight as Record<string, unknown> | undefined;
+        const xRatio = typeof highlight?.xRatio === "number" ? highlight.xRatio : null;
+        const yRatio = typeof highlight?.yRatio === "number" ? highlight.yRatio : null;
+        if (xRatio != null && yRatio != null) {
+          setBotHighlight({
+            xRatio,
+            yRatio,
+            widthRatio: typeof highlight?.widthRatio === "number" ? highlight.widthRatio : undefined,
+            heightRatio: typeof highlight?.heightRatio === "number" ? highlight.heightRatio : undefined,
+            label: typeof highlight?.label === "string" ? highlight.label : undefined,
+          });
+          setTimeout(() => {
+            setBotHighlight((prev) => {
+              if (!prev) return prev;
+              if (prev.xRatio !== xRatio || prev.yRatio !== yRatio) return prev;
+              return null;
+            });
+          }, 2200);
+        }
       } else if (event.eventType === "autonomous_turn_replanned") {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const reason = typeof parsed.reason === "string" ? parsed.reason : "Trying an alternative strategy.";
@@ -473,9 +666,14 @@ export default function AutomateTestCasePage() {
     }
   }, [isAutonomousMode, session?.events]);
 
-  async function onSendCommand() {
-    if (!sessionId || !startupReady || !command.trim() || sending) return;
-    if ((isAutonomousMode || isChatMode) && !aiConfigured) {
+  async function executeCommand(
+    input: string,
+    options?: { forceAutonomous?: boolean }
+  ) {
+    if (!sessionId || !startupReady || !input.trim() || sending) return;
+    const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
+    const shouldRequireAi = shouldUseAutonomousMode || isChatMode;
+    if (shouldRequireAi && !aiConfigured) {
       setMessages((prev) => [
         ...prev,
         {
@@ -486,11 +684,10 @@ export default function AutomateTestCasePage() {
       ]);
       return;
     }
-    const value = command.trim();
-    const outboundCommand = isAutonomousMode
+    const value = input.trim();
+    const outboundCommand = shouldUseAutonomousMode
       ? `Autonomous mode objective: ${value}. Think step-by-step based on current DOM/page content, execute the full flow, and include meaningful validation assertions in the plan.`
       : value;
-    setCommand("");
     setSending(true);
     setMessages((prev) => [...prev, { role: "user", content: value }]);
     try {
@@ -517,7 +714,7 @@ export default function AutomateTestCasePage() {
             : "";
         const plannedTurnsRaw = (response.result as Record<string, unknown> | undefined)?.plannedTurns;
         const plannedTurns = Array.isArray(plannedTurnsRaw) ? plannedTurnsRaw : [];
-        const summary = isAutonomousMode
+        const summary = shouldUseAutonomousMode
           ? `Autonomous run finished. Executed ${steps.length} step(s)${iterations ? ` across ${iterations} planning turn(s)` : ""}, including ${assertionCount} assertion step(s). ${goalAchieved ? "Objective achieved." : "Objective not fully confirmed."}`
           : `Command executed with ${steps.length} step(s) and ${assertionCount} assertion step(s).`;
         const suffix = completionReason ? ` ${completionReason}` : "";
@@ -530,15 +727,11 @@ export default function AutomateTestCasePage() {
               typeof turnObj.intentLabel === "string" && turnObj.intentLabel.trim()
                 ? turnObj.intentLabel.trim()
                 : "Autonomous action";
-            const actions = stepList
-              .map((s) => {
-                const step = s as Record<string, unknown>;
-                return typeof step.action === "string" ? step.action : "step";
-              })
-              .filter(Boolean)
-              .join(" -> ");
             const turnNo = typeof turnObj.turn === "number" ? turnObj.turn : idx + 1;
-            return `Turn ${turnNo} [${intentLabel}]: ${actions || "(no steps)"}`;
+            const lines = (stepList as Array<Record<string, unknown>>).map((step, stepIdx) =>
+              describeStepLine(step, stepIdx + 1)
+            );
+            return `Turn ${turnNo} [${intentLabel}]\n${lines.length > 0 ? lines.join("\n") : "(no steps)"}`;
           });
         const thinkingLog = thinkingLines.length > 0 ? `Autonomous thinking log:\n${thinkingLines.join("\n")}` : "";
         setMessages((prev) => [
@@ -556,6 +749,91 @@ export default function AutomateTestCasePage() {
       setStreamState("Lagging");
     } finally {
       setSending(false);
+    }
+  }
+
+  async function resetSessionForFreshRun() {
+    if (!sessionId) return;
+    const startUrl = sessionStartUrl || selectedStartUrl || undefined;
+    setStreamState("Connecting");
+    setLiveStreamFailed(false);
+    await resetAutomationSession(projectId, sessionId, startUrl ? { startUrl } : undefined);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content: "Browser session restarted from scratch for a clean run.",
+      },
+    ]);
+  }
+
+  async function onSendCommand() {
+    if (!command.trim()) return;
+    const value = command.trim();
+    setCommand("");
+    await executeCommand(value);
+  }
+
+  async function onRunIndividualTest() {
+    if (!sessionId || !startupReady || sending || quickActionBusy) return;
+    const individualRunPrompt = `Run this test case individually now: "${testcaseTitle}". 
+Execute the full flow end-to-end and validate with strong assertions for expected outcomes. 
+Stop when pass/fail outcome is clear and summarize results.`;
+    setQuickActionBusy("run");
+    try {
+      await resetSessionForFreshRun();
+      await executeCommand(individualRunPrompt, { forceAutonomous: true });
+    } finally {
+      setQuickActionBusy(null);
+    }
+  }
+
+  async function onRerunIndividualTest() {
+    if (!sessionId || !startupReady || sending || quickActionBusy) return;
+    if (scriptVersionOptions.length === 0) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "No Playwright script version is available to rerun yet. Save or generate a script first.",
+        },
+      ]);
+      return;
+    }
+    setVersionPickerOpen(true);
+  }
+
+  async function onRunSelectedVersion() {
+    if (!sessionId || !startupReady || sending || quickActionBusy) return;
+    const selected = scriptVersionOptions.find((item) => item.key === selectedVersionKey);
+    if (!selected) return;
+    setQuickActionBusy("rerun");
+    setVersionPickerOpen(false);
+    try {
+      await resetSessionForFreshRun();
+      const result = await runAutomationPlaywrightScript(projectId, sessionId, {
+        script: selected.script,
+        scriptVersion: selected.scriptVersion,
+        startUrl: sessionStartUrl || selectedStartUrl || undefined,
+      });
+      const runStatus = typeof result.status === "string" ? result.status.toLowerCase() : "failed";
+      const passed = runStatus === "passed";
+      const durationMs = typeof result.durationMs === "number" ? result.durationMs : null;
+      const durationText = durationMs != null ? ` in ${(durationMs / 1000).toFixed(1)}s` : "";
+      const errorText =
+        !passed && typeof result.errorMessage === "string" && result.errorMessage.trim()
+          ? ` Error: ${result.errorMessage.trim()}`
+          : "";
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `${selected.label} run ${passed ? "PASSED" : "FAILED"}${durationText}.${errorText}`,
+        },
+      ]);
+      setStreamState("Live");
+    } finally {
+      setQuickActionBusy(null);
     }
   }
 
@@ -862,7 +1140,7 @@ export default function AutomateTestCasePage() {
           <h2 className="mb-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Chat</h2>
           <p className="mb-3 text-xs text-zinc-500">
             {isAutonomousMode
-              ? "Autonomous mode: provide a goal, the bot plans full steps with assertions, then executes."
+              ? "Autonomous mode: provide a goal, the bot explains each step, evaluates first, performs action, and verifies outcomes."
               : isLiveMode
                 ? "Live mode: you interact with browser directly, and the bot suggests assertions."
                 : "Chat mode: share intent, and the bot decides and executes steps."}
@@ -917,6 +1195,27 @@ export default function AutomateTestCasePage() {
               {sending ? "Running..." : isAutonomousMode ? "Start Autonomous Run" : "Run"}
             </button>
           </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void onRunIndividualTest()}
+              disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured}
+              className="rounded border border-blue-300 bg-blue-50 px-2 py-1.5 text-xs text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 disabled:opacity-50"
+            >
+              {quickActionBusy === "run" ? "Running test..." : "Run Current Test"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void onRerunIndividualTest()}
+              disabled={!startupReady || sending || Boolean(quickActionBusy)}
+              className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 disabled:opacity-50"
+            >
+              {quickActionBusy === "rerun" ? "Re-running..." : "Re Run Last Test (Live Preview)"}
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] text-zinc-500">
+            Quick actions run inside the current automation session, so you can watch each run directly in Live Browser preview.
+          </p>
         </section>
 
         <section className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-1" : ""}`}>
@@ -964,6 +1263,18 @@ export default function AutomateTestCasePage() {
                   left: `${Math.max(0, Math.min(100, lastClickTarget.xRatio * 100))}%`,
                   top: `${Math.max(0, Math.min(100, lastClickTarget.yRatio * 100))}%`,
                 }}
+              />
+            )}
+            {botHighlight && (
+              <div
+                className="pointer-events-none absolute z-30 rounded border-2 border-emerald-400 bg-emerald-300/20 shadow-[0_0_0_2px_rgba(16,185,129,0.35)]"
+                style={{
+                  left: `${Math.max(0, Math.min(100, botHighlight.xRatio * 100))}%`,
+                  top: `${Math.max(0, Math.min(100, botHighlight.yRatio * 100))}%`,
+                  width: `${Math.max(1.2, Math.min(100, (botHighlight.widthRatio ?? 0.04) * 100))}%`,
+                  height: `${Math.max(1.2, Math.min(100, (botHighlight.heightRatio ?? 0.05) * 100))}%`,
+                }}
+                title={botHighlight.label || "Bot interaction target"}
               />
             )}
           </div>
@@ -1127,6 +1438,47 @@ export default function AutomateTestCasePage() {
               Browser is spinning up and opening environment URL. Please wait for live stream before interaction.
             </p>
           )}
+        </div>
+      )}
+      {versionPickerOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Choose Script Version to Re-run</h3>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              Select which Playwright script version should run in live preview for pass/fail verification.
+            </p>
+            <div className="mt-3">
+              <label className="mb-1 block text-xs font-medium text-zinc-600 dark:text-zinc-300">Script Version</label>
+              <select
+                value={selectedVersionKey}
+                onChange={(event) => setSelectedVersionKey(event.target.value)}
+                className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+              >
+                {scriptVersionOptions.map((option) => (
+                  <option key={option.key} value={option.key}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setVersionPickerOpen(false)}
+                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void onRunSelectedVersion()}
+                disabled={!selectedVersionKey}
+                className="rounded bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
+              >
+                Run Selected Version
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -4,9 +4,11 @@ import { logError, logInfo } from "./logger.js";
 import {
   getSession,
   createSession,
+  resetSession,
   executeSteps,
   manualAction,
   runPlaywrightScript,
+  runPlaywrightScriptInSession,
   sessionState,
   closeSession,
   startCleanupWatchdog,
@@ -54,6 +56,17 @@ app.post("/internal/sessions", async (req, res) => {
   }
 });
 
+app.post("/internal/sessions/:sessionId/reset", async (req, res) => {
+  const { sessionId } = req.params;
+  const { startUrl } = req.body || {};
+  try {
+    const result = await resetSession(sessionId, typeof startUrl === "string" ? startUrl : null);
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : "Session reset failed" });
+  }
+});
+
 app.post("/internal/sessions/:sessionId/execute", async (req, res) => {
   const { sessionId } = req.params;
   const { commandId, steps } = req.body || {};
@@ -80,6 +93,26 @@ app.post("/internal/playwright/run", async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Playwright run failed" });
+  }
+});
+
+app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
+  const { sessionId } = req.params;
+  const { executionId, script, startUrl } = req.body || {};
+  if (!executionId || !script) {
+    res.status(400).json({ error: "executionId and script are required" });
+    return;
+  }
+  try {
+    const result = await runPlaywrightScriptInSession(
+      sessionId,
+      String(executionId),
+      String(script),
+      typeof startUrl === "string" ? startUrl : null
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : "Session script run failed" });
   }
 });
 

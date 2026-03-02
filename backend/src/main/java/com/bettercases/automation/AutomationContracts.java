@@ -30,6 +30,12 @@ public final class AutomationContracts {
         public String key;
     }
 
+    public static class RunScriptBody {
+        public String script;
+        public Integer scriptVersion;
+        public String startUrl;
+    }
+
     public static class ActionPlan {
         public String commandId;
         public List<ActionStep> steps;
@@ -64,6 +70,7 @@ public final class AutomationContracts {
         public String status;
         public String currentUrl;
         public String selectorUsed;
+        public java.util.Map<String, Object> highlight;
         public String message;
         public String screenshotPath;
         public Long durationMs;
