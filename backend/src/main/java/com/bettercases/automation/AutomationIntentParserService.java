@@ -48,7 +48,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
         }
     }
 
@@ -61,7 +61,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
 
@@ -93,7 +93,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
         List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;
@@ -136,7 +136,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous and Chat modes.");
+            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
         List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;
@@ -164,14 +164,19 @@ public final class AutomationIntentParserService {
     private static AutomationContracts.ActionPlan interpretWithAi(String provider, String apiKey, String model, String command, String currentUrl, String pageText) throws Exception {
         String prompt = """
                 You are an AI-driven autonomous browser planner.
-                Understand the current page context first, then infer user intent, then decide the minimum reliable number of steps.
+                Understand current page context first, then infer user intent, then decide the minimum reliable number of steps.
                 Convert the user command into JSON only.
                 Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
-                Add verification/assertion steps whenever a user intent implies an expected result.
-                Prefer plans that verify action impact (URL, text, visibility, clickability) after critical actions.
+                Prioritize user-requested actions over generic safety checks.
+                Do NOT add extra verification/assertion steps unless:
+                - the user explicitly asks to verify/assert/check, OR
+                - one focused assertion is required to confirm objective completion.
+                Avoid pre-checking every step; keep plans lean and action-first.
                 If needed info is missing, set requiresClarification=true and ask one clear question.
                 If user says open/go to a domain like google.com, infer navigate URL with https://.
                 Keep selectors practical (prefer role/text/testid style where possible).
+                When similar elements may exist, make targetDescription uniquely identifying
+                (include nearby heading/section/dialog/form context and control type).
                 Output JSON schema exactly:
                 {
                   "requiresClarification": boolean,
@@ -226,11 +231,15 @@ public final class AutomationIntentParserService {
                 1) First infer whether the objective is already achieved from current page context.
                 2) If achieved, return goalAchieved=true with no steps.
                 3) If not achieved, return a short actionable step list for this turn only.
-                4) Prefer robust selectors and include verification assertions when appropriate.
+                4) Prefer robust selectors and disambiguated targetDescription.
                 5) Keep this turn within the remaining step budget.
                 6) If previous turn failed, try an alternative strategy in this turn.
                 7) Do not return assertion-only steps when no meaningful user action has been executed yet.
-                8) Return valid JSON only.
+                8) Do not add generic validation that user did not request. Assertions are allowed only when
+                   explicitly requested or when needed to confirm final objective completion.
+                9) If target text is likely ambiguous, include context in targetDescription
+                   (for example: "Save button in Profile section", "Email field in Login form").
+                10) Return valid JSON only.
 
                 Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
                 If exact CSS selector is uncertain, prefer selector=null and provide targetDescription
@@ -300,7 +309,9 @@ public final class AutomationIntentParserService {
                 3) Do NOT return assertion-only steps.
                 4) Prefer targetDescription when selector is uncertain.
                 5) Keep to the remaining step budget.
-                6) Return valid JSON only.
+                6) Keep steps action-first and avoid unrequested generic checks.
+                7) If UI likely has similar elements, make targetDescription uniquely identifying with context.
+                8) Return valid JSON only.
 
                 Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
 

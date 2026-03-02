@@ -20,10 +20,47 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AutomationSessionHandler {
     private static final HttpClient streamClient = HttpClient.newBuilder().build();
     private static final ObjectMapper mapper = new ObjectMapper();
+    private static final ExecutorService commandWorkerPool = Executors.newCachedThreadPool();
+    private static final ConcurrentHashMap<UUID, SessionCommandState> commandStates = new ConcurrentHashMap<>();
+
+    private static final class CommandEnvelope {
+        private final UUID sessionId;
+        private final UUID projectId;
+        private final UUID testcaseId;
+        private final UUID userId;
+        private final UUID commandId;
+        private final String rawCommand;
+        private final String objective;
+        private final boolean autonomousMode;
+
+        private CommandEnvelope(UUID sessionId, UUID projectId, UUID testcaseId, UUID userId, UUID commandId,
+                                String rawCommand, String objective, boolean autonomousMode) {
+            this.sessionId = sessionId;
+            this.projectId = projectId;
+            this.testcaseId = testcaseId;
+            this.userId = userId;
+            this.commandId = commandId;
+            this.rawCommand = rawCommand;
+            this.objective = objective;
+            this.autonomousMode = autonomousMode;
+        }
+    }
+
+    private static final class SessionCommandState {
+        private final ConcurrentLinkedQueue<CommandEnvelope> queue = new ConcurrentLinkedQueue<>();
+        private final AtomicBoolean workerRunning = new AtomicBoolean(false);
+        private volatile UUID activeCommandId = null;
+        private volatile AtomicBoolean activeCancelSignal = null;
+    }
     public static void start(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -52,10 +89,109 @@ public final class AutomationSessionHandler {
         Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
                 .orElseThrow(io.javalin.http.NotFoundResponse::new);
         UUID testcaseId = UUID.fromString(String.valueOf(session.get("testcaseId")));
-        String currentUrl = (String) session.get("currentUrl");
+        AutomationContracts.CommandBody body = ctx.bodyAsClass(AutomationContracts.CommandBody.class);
+        String command = body == null ? null : body.command;
+        String rawCommand = command == null ? "" : command.trim();
+        if (rawCommand.isBlank()) {
+            ctx.status(400).json(Map.of("error", "command is required"));
+            return;
+        }
+        boolean autonomousMode = rawCommand.toLowerCase().startsWith("autonomous mode objective:");
+        String objective = autonomousMode
+                ? rawCommand.substring("Autonomous mode objective:".length()).trim()
+                : rawCommand;
+        if (objective.isBlank()) {
+            ctx.status(400).json(Map.of("error", "command is required"));
+            return;
+        }
+
+        UUID commandId = UUID.randomUUID();
+        SessionCommandState state = commandStates.computeIfAbsent(sessionId, ignored -> new SessionCommandState());
+        CommandEnvelope envelope = new CommandEnvelope(
+                sessionId,
+                projectId,
+                testcaseId,
+                userId,
+                commandId,
+                rawCommand,
+                objective,
+                autonomousMode
+        );
+        state.queue.add(envelope);
+
+        Map<String, Object> queuedPayload = new HashMap<>();
+        queuedPayload.put("mode", autonomousMode ? "autonomous" : "chat");
+        queuedPayload.put("objective", objective);
+        queuedPayload.put("queued", true);
+        queuedPayload.put("queueDepth", state.queue.size());
+        AutomationSessionService.addEvent(
+                sessionId, projectId, testcaseId, userId, commandId, "command_queued",
+                rawCommand,
+                queuedPayload,
+                null,
+                null
+        );
+
+        triggerQueueWorker(sessionId);
+
+        ctx.status(202).json(Map.of(
+                "commandId", commandId.toString(),
+                "requiresClarification", false,
+                "queued", true,
+                "queueDepth", state.queue.size()
+        ));
+    }
+
+    private static void triggerQueueWorker(UUID sessionId) {
+        SessionCommandState state = commandStates.computeIfAbsent(sessionId, ignored -> new SessionCommandState());
+        if (!state.workerRunning.compareAndSet(false, true)) return;
+        commandWorkerPool.submit(() -> {
+            try {
+                while (true) {
+                    CommandEnvelope envelope = state.queue.poll();
+                    if (envelope == null) break;
+                    AtomicBoolean cancelSignal = new AtomicBoolean(false);
+                    state.activeCommandId = envelope.commandId;
+                    state.activeCancelSignal = cancelSignal;
+                    try {
+                        executeQueuedCommand(envelope, cancelSignal);
+                    } catch (Exception error) {
+                        AutomationSessionService.addEvent(
+                                envelope.sessionId,
+                                envelope.projectId,
+                                envelope.testcaseId,
+                                envelope.userId,
+                                envelope.commandId,
+                                "command_failed",
+                                envelope.rawCommand,
+                                Map.of("mode", envelope.autonomousMode ? "autonomous" : "chat"),
+                                Map.of("error", error.getMessage() == null ? "Command failed." : error.getMessage()),
+                                null
+                        );
+                    } finally {
+                        state.activeCommandId = null;
+                        state.activeCancelSignal = null;
+                    }
+                }
+            } finally {
+                state.workerRunning.set(false);
+                if (!state.queue.isEmpty()) {
+                    triggerQueueWorker(sessionId);
+                }
+            }
+        });
+    }
+
+    private static void executeQueuedCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal) {
+        String currentUrl = "";
         String pageText = "";
         try {
-            Map<String, Object> liveState = AutomationAgentClient.getSessionState(sessionId);
+            Map<String, Object> persistedSession = AutomationSessionService.getSession(envelope.sessionId, envelope.projectId, envelope.userId)
+                    .orElseThrow(io.javalin.http.NotFoundResponse::new);
+            currentUrl = (String) persistedSession.get("currentUrl");
+        } catch (Exception ignored) {}
+        try {
+            Map<String, Object> liveState = AutomationAgentClient.getSessionState(envelope.sessionId);
             Object liveUrl = liveState.get("currentUrl");
             if (liveUrl instanceof String s && !s.isBlank()) {
                 currentUrl = s;
@@ -66,75 +202,75 @@ public final class AutomationSessionHandler {
             }
         } catch (Exception ignored) {}
 
-        AutomationContracts.CommandBody body = ctx.bodyAsClass(AutomationContracts.CommandBody.class);
-        String command = body == null ? null : body.command;
-        String rawCommand = command == null ? "" : command.trim();
-        boolean autonomousMode = rawCommand.toLowerCase().startsWith("autonomous mode objective:");
-        String objective = autonomousMode
-                ? rawCommand.substring("Autonomous mode objective:".length()).trim()
-                : rawCommand;
+        if (!envelope.autonomousMode) {
+            executeChatCommand(envelope, cancelSignal, currentUrl, pageText);
+            return;
+        }
+        executeAutonomousCommand(envelope, cancelSignal, currentUrl, pageText);
+    }
 
-        UUID commandId = UUID.randomUUID();
-
-        if (!autonomousMode) {
-            AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(projectId, objective, currentUrl, pageText);
-            AutomationSessionService.addEvent(
-                    sessionId, projectId, testcaseId, userId, commandId,
-                    plan.requiresClarification ? "clarification_required" : "command_received",
-                    command,
-                    Map.of(
-                            "requiresClarification", plan.requiresClarification,
-                            "clarificationQuestion", plan.clarificationQuestion == null ? "" : plan.clarificationQuestion,
-                            "steps", plan.steps == null ? List.of() : plan.steps
-                    ),
-                    null,
-                    null
-            );
-
-            if (plan.requiresClarification) {
-                ctx.status(202).json(Map.of(
-                        "commandId", commandId.toString(),
-                        "requiresClarification", true,
-                        "clarificationQuestion", plan.clarificationQuestion
-                ));
-                return;
-            }
-
-            AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeSteps(sessionId, commandId.toString(), plan.steps);
-            String screenshotPath = null;
-            if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
-                screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
-            }
-            AutomationSessionService.touchState(
-                    sessionId,
-                    executeResponse.currentUrl,
-                    screenshotPath,
-                    Map.of("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size())
-            );
-            Map<String, Object> executionPayload = new HashMap<>();
-            executionPayload.put("currentUrl", executeResponse.currentUrl);
-            executionPayload.put("results", executeResponse.results);
-            AutomationSessionService.addEvent(
-                    sessionId, projectId, testcaseId, userId, commandId, "command_executed",
-                    command,
-                    Map.of("steps", plan.steps),
-                    executionPayload,
-                    screenshotPath
-            );
-            ctx.json(Map.of(
-                    "commandId", commandId.toString(),
-                    "requiresClarification", false,
-                    "result", executionPayload
-            ));
+    private static void executeChatCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal, String currentUrl, String pageText) {
+        if (cancelSignal.get()) {
+            appendCancelledEvent(envelope, "Command was stopped before execution started.");
+            return;
+        }
+        AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(envelope.projectId, envelope.objective, currentUrl, pageText);
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId,
+                plan.requiresClarification ? "clarification_required" : "command_received",
+                envelope.rawCommand,
+                Map.of(
+                        "requiresClarification", plan.requiresClarification,
+                        "clarificationQuestion", plan.clarificationQuestion == null ? "" : plan.clarificationQuestion,
+                        "steps", plan.steps == null ? List.of() : plan.steps
+                ),
+                null,
+                null
+        );
+        if (plan.requiresClarification) {
+            return;
+        }
+        if (cancelSignal.get()) {
+            appendCancelledEvent(envelope, "Command was stopped before step execution.");
             return;
         }
 
+        AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeSteps(
+                envelope.sessionId,
+                envelope.commandId.toString(),
+                plan.steps
+        );
+        String screenshotPath = null;
+        if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
+            screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
+        }
+        AutomationSessionService.touchState(
+                envelope.sessionId,
+                executeResponse.currentUrl,
+                screenshotPath,
+                Map.of("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size())
+        );
+        Map<String, Object> executionPayload = new HashMap<>();
+        executionPayload.put("currentUrl", executeResponse.currentUrl);
+        executionPayload.put("results", executeResponse.results);
+        executionPayload.put("cancelled", false);
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
+                envelope.rawCommand,
+                Map.of("steps", plan.steps),
+                executionPayload,
+                screenshotPath
+        );
+    }
+
+    private static void executeAutonomousCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal, String currentUrl, String pageText) {
         final int MAX_AUTONOMOUS_TURNS = 8;
         final int MAX_AUTONOMOUS_STEPS = 32;
         int executedSteps = 0;
         int turnCount = 0;
         int noActionTurns = 0;
         boolean goalAchieved = false;
+        boolean cancelled = false;
         String completionReason = "";
         String lastScreenshotPath = null;
         String latestUrl = currentUrl;
@@ -143,14 +279,19 @@ public final class AutomationSessionHandler {
         List<Map<String, Object>> plannedTurns = new java.util.ArrayList<>();
 
         AutomationSessionService.addEvent(
-                sessionId, projectId, testcaseId, userId, commandId, "command_received",
-                command,
-                Map.of("mode", "autonomous", "objective", objective),
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_received",
+                envelope.rawCommand,
+                Map.of("mode", "autonomous", "objective", envelope.objective),
                 null,
                 null
         );
 
         for (int turn = 1; turn <= MAX_AUTONOMOUS_TURNS; turn++) {
+            if (cancelSignal.get()) {
+                cancelled = true;
+                completionReason = "Autonomous run stopped by user.";
+                break;
+            }
             turnCount = turn;
             if (executedSteps >= MAX_AUTONOMOUS_STEPS) {
                 completionReason = "Autonomous run stopped after reaching step budget.";
@@ -160,7 +301,7 @@ public final class AutomationSessionHandler {
             String loopUrl = latestUrl;
             String loopText = pageText;
             try {
-                Map<String, Object> liveState = AutomationAgentClient.getSessionState(sessionId);
+                Map<String, Object> liveState = AutomationAgentClient.getSessionState(envelope.sessionId);
                 Object liveUrl = liveState.get("currentUrl");
                 if (liveUrl instanceof String s && !s.isBlank()) loopUrl = s;
                 Object liveText = liveState.get("pageText");
@@ -169,8 +310,8 @@ public final class AutomationSessionHandler {
 
             int remaining = Math.max(0, MAX_AUTONOMOUS_STEPS - executedSteps);
             AutomationContracts.ActionPlan turnPlan = AutomationIntentParserService.planAutonomousTurn(
-                    projectId,
-                    objective,
+                    envelope.projectId,
+                    envelope.objective,
                     loopUrl,
                     loopText,
                     history,
@@ -179,8 +320,8 @@ public final class AutomationSessionHandler {
 
             if (turnPlan.requiresClarification) {
                 AutomationSessionService.addEvent(
-                        sessionId, projectId, testcaseId, userId, commandId, "clarification_required",
-                        command,
+                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "clarification_required",
+                        envelope.rawCommand,
                         Map.of(
                                 "mode", "autonomous",
                                 "turn", turn,
@@ -189,11 +330,6 @@ public final class AutomationSessionHandler {
                         null,
                         null
                 );
-                ctx.status(202).json(Map.of(
-                        "commandId", commandId.toString(),
-                        "requiresClarification", true,
-                        "clarificationQuestion", turnPlan.clarificationQuestion
-                ));
                 return;
             }
 
@@ -213,8 +349,8 @@ public final class AutomationSessionHandler {
             if (executedSteps == 0 && (candidateSteps.isEmpty() || candidateAssertionOnly)) {
                 history.add("planner returned non-actionable bootstrap turn; requesting action-only bootstrap plan.");
                 AutomationContracts.ActionPlan bootstrapPlan = AutomationIntentParserService.planAutonomousBootstrapTurn(
-                        projectId,
-                        objective,
+                        envelope.projectId,
+                        envelope.objective,
                         loopUrl,
                         loopText,
                         history,
@@ -266,7 +402,7 @@ public final class AutomationSessionHandler {
             if (boundedSteps.size() > remaining) {
                 boundedSteps = boundedSteps.subList(0, remaining);
             }
-            String turnIntentLabel = inferIntentLabel(objective, boundedSteps);
+            String turnIntentLabel = inferIntentLabel(envelope.objective, boundedSteps);
             Map<String, Object> turnPlanPayload = new HashMap<>();
             turnPlanPayload.put("mode", "autonomous");
             turnPlanPayload.put("turn", turn);
@@ -274,8 +410,8 @@ public final class AutomationSessionHandler {
             turnPlanPayload.put("remainingBudget", remaining);
             turnPlanPayload.put("steps", boundedSteps);
             AutomationSessionService.addEvent(
-                    sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_planned",
-                    command,
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_turn_planned",
+                    envelope.rawCommand,
                     turnPlanPayload,
                     null,
                     null
@@ -287,8 +423,16 @@ public final class AutomationSessionHandler {
             int turnFailed = 0;
             boolean hasFailure = false;
             String turnCurrentUrl = latestUrl;
+            String failedAction = "";
+            String expectedOutcome = "";
+            String observedOutcome = "";
 
             for (int stepIndex = 0; stepIndex < boundedSteps.size(); stepIndex++) {
+                if (cancelSignal.get()) {
+                    cancelled = true;
+                    completionReason = "Autonomous run stopped by user.";
+                    break;
+                }
                 AutomationContracts.ActionStep step = boundedSteps.get(stepIndex);
                 String evaluateText = describeEvaluation(step);
                 String actionText = describeAction(step);
@@ -302,16 +446,16 @@ public final class AutomationSessionHandler {
                 evaluatingPayload.put("evaluateText", evaluateText);
                 evaluatingPayload.put("actionText", actionText);
                 AutomationSessionService.addEvent(
-                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_step_evaluating",
-                        command,
+                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_step_evaluating",
+                        envelope.rawCommand,
                         evaluatingPayload,
                         null,
                         null
                 );
 
                 AutomationContracts.AgentExecuteResponse stepResponse = AutomationAgentClient.executeSteps(
-                        sessionId,
-                        commandId.toString(),
+                        envelope.sessionId,
+                        envelope.commandId.toString(),
                         List.of(step)
                 );
                 if (stepResponse.results == null || stepResponse.results.isEmpty()) {
@@ -327,6 +471,11 @@ public final class AutomationSessionHandler {
                 else {
                     turnFailed++;
                     hasFailure = true;
+                    failedAction = step.action == null ? "" : step.action;
+                    expectedOutcome = actionText;
+                    observedOutcome = stepResult.message == null || stepResult.message.isBlank()
+                            ? "Step failed without a detailed error message."
+                            : stepResult.message;
                 }
                 turnCurrentUrl = stepResult.currentUrl == null || stepResult.currentUrl.isBlank()
                         ? stepResponse.currentUrl
@@ -351,8 +500,8 @@ public final class AutomationSessionHandler {
                 stepExecutionPayload.put("currentUrl", turnCurrentUrl);
                 stepExecutionPayload.put("status", stepResult.status);
                 AutomationSessionService.addEvent(
-                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_step_executed",
-                        command,
+                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_step_executed",
+                        envelope.rawCommand,
                         stepExecutionPayload,
                         stepExecutionPayload,
                         stepResult.screenshotPath
@@ -363,6 +512,7 @@ public final class AutomationSessionHandler {
                 }
             }
 
+            if (cancelled) break;
             if (turnResults.isEmpty()) {
                 if (completionReason == null || completionReason.isBlank()) {
                     completionReason = "Autonomous run stopped because no step result was produced.";
@@ -383,8 +533,8 @@ public final class AutomationSessionHandler {
             turnExecutionPayload.put("results", turnResults);
             turnExecutionPayload.put("currentUrl", turnCurrentUrl);
             AutomationSessionService.addEvent(
-                    sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_executed",
-                    command,
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_turn_executed",
+                    envelope.rawCommand,
                     turnExecutionPayload,
                     turnExecutionPayload,
                     turnScreenshotPath
@@ -403,15 +553,18 @@ public final class AutomationSessionHandler {
 
             if (hasFailure) {
                 history.add("turn " + turn + " produced failures; re-planning with alternative strategy.");
+                Map<String, Object> replanPayload = new HashMap<>();
+                replanPayload.put("mode", "autonomous");
+                replanPayload.put("turn", turn);
+                replanPayload.put("intentLabel", turnIntentLabel);
+                replanPayload.put("reason", "Previous step failed; trying alternative strategy.");
+                replanPayload.put("failedAction", failedAction);
+                replanPayload.put("expectedOutcome", expectedOutcome);
+                replanPayload.put("observedOutcome", observedOutcome);
                 AutomationSessionService.addEvent(
-                        sessionId, projectId, testcaseId, userId, commandId, "autonomous_turn_replanned",
-                        command,
-                        Map.of(
-                                "mode", "autonomous",
-                                "turn", turn,
-                                "intentLabel", turnIntentLabel,
-                                "reason", "Previous step failed; trying alternative strategy."
-                        ),
+                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_turn_replanned",
+                        envelope.rawCommand,
+                        replanPayload,
                         null,
                         turnScreenshotPath
                 );
@@ -422,44 +575,57 @@ public final class AutomationSessionHandler {
         if (goalAchieved && (completionReason == null || completionReason.isBlank())) {
             completionReason = "Objective reached.";
         } else if (!goalAchieved && (completionReason == null || completionReason.isBlank())) {
-            completionReason = "Autonomous run ended before objective could be confirmed.";
+            completionReason = cancelled
+                    ? "Autonomous run stopped by user."
+                    : "Autonomous run ended before objective could be confirmed.";
         }
 
         AutomationSessionService.touchState(
-                sessionId,
+                envelope.sessionId,
                 latestUrl,
                 lastScreenshotPath,
                 Map.of(
                         "mode", "autonomous",
                         "turns", turnCount,
                         "stepCount", executedSteps,
-                        "goalAchieved", goalAchieved
+                        "goalAchieved", goalAchieved,
+                        "cancelled", cancelled
                 )
         );
 
         Map<String, Object> executionPayload = new HashMap<>();
         executionPayload.put("mode", "autonomous");
-        executionPayload.put("objective", objective);
+        executionPayload.put("objective", envelope.objective);
         executionPayload.put("goalAchieved", goalAchieved);
         executionPayload.put("completionReason", completionReason);
         executionPayload.put("iterations", turnCount);
         executionPayload.put("plannedTurns", plannedTurns);
         executionPayload.put("currentUrl", latestUrl);
         executionPayload.put("results", allResults);
+        executionPayload.put("cancelled", cancelled);
 
         AutomationSessionService.addEvent(
-                sessionId, projectId, testcaseId, userId, commandId, "command_executed",
-                command,
-                Map.of("mode", "autonomous", "objective", objective),
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
+                envelope.rawCommand,
+                Map.of("mode", "autonomous", "objective", envelope.objective),
                 executionPayload,
                 lastScreenshotPath
         );
+    }
 
-        ctx.json(Map.of(
-                "commandId", commandId.toString(),
-                "requiresClarification", false,
-                "result", executionPayload
-        ));
+    private static void appendCancelledEvent(CommandEnvelope envelope, String reason) {
+        AutomationSessionService.addEvent(
+                envelope.sessionId,
+                envelope.projectId,
+                envelope.testcaseId,
+                envelope.userId,
+                envelope.commandId,
+                "command_cancelled",
+                envelope.rawCommand,
+                Map.of("mode", envelope.autonomousMode ? "autonomous" : "chat"),
+                Map.of("cancelled", true, "reason", reason),
+                null
+        );
     }
 
     public static void getSession(Context ctx) {
@@ -468,7 +634,47 @@ public final class AutomationSessionHandler {
         UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
         Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
                 .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        SessionCommandState state = commandStates.get(sessionId);
+        Map<String, Object> runtime = new HashMap<>();
+        runtime.put("activeCommandId", state == null || state.activeCommandId == null ? null : state.activeCommandId.toString());
+        runtime.put("queuedCount", state == null ? 0 : state.queue.size());
+        runtime.put("isRunning", state != null && state.activeCommandId != null);
+        session.put("runtime", runtime);
         ctx.json(session);
+    }
+
+    public static void stopActiveCommand(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        UUID testcaseId = UUID.fromString(String.valueOf(session.get("testcaseId")));
+        SessionCommandState state = commandStates.get(sessionId);
+        boolean stopRequested = false;
+        String activeCommandId = null;
+        if (state != null && state.activeCommandId != null && state.activeCancelSignal != null) {
+            state.activeCancelSignal.set(true);
+            stopRequested = true;
+            activeCommandId = state.activeCommandId.toString();
+            AutomationSessionService.addEvent(
+                    sessionId,
+                    projectId,
+                    testcaseId,
+                    userId,
+                    state.activeCommandId,
+                    "command_stop_requested",
+                    "stop_current_command",
+                    Map.of("requested", true),
+                    null,
+                    null
+            );
+        }
+        ctx.status(202).json(Map.of(
+                "stopRequested", stopRequested,
+                "activeCommandId", activeCommandId,
+                "queuedCount", state == null ? 0 : state.queue.size()
+        ));
     }
 
     public static void stream(Context ctx) {
@@ -542,7 +748,7 @@ public final class AutomationSessionHandler {
         AutomationContracts.FinalizeBody body = ctx.bodyAsClass(AutomationContracts.FinalizeBody.class);
 
         List<Map<String, Object>> events = AutomationSessionService.listEvents(sessionId, 5000);
-        String script = AutomationScriptBuilderService.buildPlaywrightScript(
+        String generatedScript = AutomationScriptBuilderService.buildPlaywrightScript(
                 body != null ? body.testName : null,
                 events
         );
@@ -550,6 +756,28 @@ public final class AutomationSessionHandler {
         List<Map<String, Object>> generatedSteps = shouldGenerateSteps
                 ? AutomationScriptBuilderService.buildTestSteps(events)
                 : null;
+        String scriptToSave = generatedScript;
+        if (body != null && body.script != null && !body.script.trim().isBlank()) {
+            scriptToSave = body.script.trim();
+        }
+        List<Map<String, Object>> stepsToSave = generatedSteps;
+        if (shouldGenerateSteps && body != null && body.steps != null) {
+            List<Map<String, Object>> sanitized = new java.util.ArrayList<>();
+            for (Map<String, Object> candidate : body.steps) {
+                if (candidate == null) continue;
+                String action = candidate.get("action") == null ? "" : String.valueOf(candidate.get("action")).trim();
+                String expectedResult = candidate.get("expectedResult") == null ? "" : String.valueOf(candidate.get("expectedResult")).trim();
+                if (action.isBlank() && expectedResult.isBlank()) continue;
+                Map<String, Object> item = new java.util.HashMap<>();
+                item.put("action", action);
+                item.put("expectedResult", expectedResult);
+                sanitized.add(item);
+            }
+            for (int i = 0; i < sanitized.size(); i++) {
+                sanitized.get(i).put("stepNumber", i + 1);
+            }
+            stepsToSave = sanitized;
+        }
         AutomationSessionService.finalizeIntoTestcase(
                 projectId,
                 testcaseId,
@@ -558,15 +786,20 @@ public final class AutomationSessionHandler {
                 body != null ? body.repo : null,
                 body != null ? body.path : null,
                 body != null && body.testName != null ? body.testName : "Generated Test",
-                script,
-                generatedSteps
+                scriptToSave,
+                stepsToSave
         );
         AutomationSessionService.markSessionEnded(sessionId, "completed");
+        SessionCommandState state = commandStates.remove(sessionId);
+        if (state != null && state.activeCancelSignal != null) {
+            state.activeCancelSignal.set(true);
+            state.queue.clear();
+        }
         AutomationAgentClient.closeSession(sessionId);
         try {
             AuditService.logActivity(userId, projectId, "automation_session_finalized", "testcase", testcaseId.toString(), null);
         } catch (Exception ignored) {}
-        ctx.json(Map.of("status", "ok", "script", script));
+        ctx.json(Map.of("status", "ok", "script", scriptToSave));
     }
 
     public static void manualAction(Context ctx) {
@@ -774,6 +1007,11 @@ public final class AutomationSessionHandler {
         Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
                 .orElseThrow(io.javalin.http.NotFoundResponse::new);
         UUID testcaseId = UUID.fromString(String.valueOf(session.get("testcaseId")));
+        SessionCommandState state = commandStates.remove(sessionId);
+        if (state != null && state.activeCancelSignal != null) {
+            state.activeCancelSignal.set(true);
+            state.queue.clear();
+        }
         AutomationSessionService.markSessionEnded(sessionId, "cancelled");
         AutomationAgentClient.closeSession(sessionId);
         try {

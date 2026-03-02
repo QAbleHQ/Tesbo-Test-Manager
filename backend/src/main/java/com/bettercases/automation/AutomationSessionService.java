@@ -203,7 +203,7 @@ public final class AutomationSessionService {
                             "automation_script_version = COALESCE(automation_script_version, 0) + 1, steps = COALESCE(?::jsonb, steps), automated_at = now(), automated_by = ?, updated_at = now() " +
                             "WHERE id = ? AND project_id = ?")) {
                 String generatedStepsJson = null;
-                if (generatedSteps != null && !generatedSteps.isEmpty()) {
+                if (generatedSteps != null) {
                     generatedStepsJson = mapper.writeValueAsString(generatedSteps);
                 }
                 up.setString(1, framework);

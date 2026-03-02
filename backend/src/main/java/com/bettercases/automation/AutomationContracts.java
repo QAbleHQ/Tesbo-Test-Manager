@@ -1,6 +1,7 @@
 package com.bettercases.automation;
 
 import java.util.List;
+import java.util.Map;
 
 public final class AutomationContracts {
     public static class StartSessionBody {
@@ -16,6 +17,8 @@ public final class AutomationContracts {
         public String framework;
         public String repo;
         public String path;
+        public String script;
+        public List<Map<String, Object>> steps;
     }
 
     public static class ManualActionBody {

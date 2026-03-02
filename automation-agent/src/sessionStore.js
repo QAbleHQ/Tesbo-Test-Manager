@@ -703,6 +703,18 @@ function normalizeTargetText(value) {
   return String(value || "").replace(/^text=/i, "").trim();
 }
 
+function stripSurroundingQuotes(value) {
+  const text = String(value || "").trim();
+  if (text.length >= 2) {
+    const startsWithSingle = text.startsWith("'") && text.endsWith("'");
+    const startsWithDouble = text.startsWith('"') && text.endsWith('"');
+    if (startsWithSingle || startsWithDouble) {
+      return text.slice(1, -1).trim();
+    }
+  }
+  return text;
+}
+
 function looksLikeSelector(value) {
   const v = String(value || "").trim();
   if (!v) return false;
@@ -719,47 +731,85 @@ function looksLikeSelector(value) {
 function buildLocatorCandidates(page, rawTarget, actionType = "click") {
   const raw = String(rawTarget || "").trim();
   if (!raw) return [];
-  const textTarget = normalizeTargetText(raw);
+  const textTarget = stripSurroundingQuotes(normalizeTargetText(raw));
   const regex = new RegExp(escapeForRegex(textTarget), "i");
+  const exactRegex = new RegExp(`^\\s*${escapeForRegex(textTarget)}\\s*$`, "i");
   const candidates = [];
 
   if (raw.startsWith("//")) {
-    candidates.push({ label: `xpath:${raw}`, locator: page.locator(`xpath=${raw}`).first() });
+    candidates.push({ label: `xpath:${raw}`, locator: page.locator(`xpath=${raw}`), strict: true });
   }
   if (raw.toLowerCase().startsWith("text=")) {
-    candidates.push({ label: `text:${textTarget}`, locator: page.getByText(textTarget, { exact: false }).first() });
+    candidates.push({ label: `text-exact:${textTarget}`, locator: page.getByText(textTarget, { exact: true }), strict: true });
+    candidates.push({ label: `text:${textTarget}`, locator: page.getByText(textTarget, { exact: false }), strict: false });
   }
   if (looksLikeSelector(raw)) {
-    candidates.push({ label: `selector:${raw}`, locator: page.locator(raw).first() });
+    candidates.push({ label: `selector:${raw}`, locator: page.locator(raw), strict: true });
   }
 
   // Natural-language candidates for unknown layouts/frameworks.
-  candidates.push({ label: `label:${textTarget}`, locator: page.getByLabel(regex).first() });
-  candidates.push({ label: `placeholder:${textTarget}`, locator: page.getByPlaceholder(regex).first() });
-  candidates.push({ label: `testid:${textTarget}`, locator: page.getByTestId(regex).first() });
+  candidates.push({ label: `label-exact:${textTarget}`, locator: page.getByLabel(exactRegex), strict: true });
+  candidates.push({ label: `label:${textTarget}`, locator: page.getByLabel(regex), strict: false });
+  candidates.push({ label: `placeholder-exact:${textTarget}`, locator: page.getByPlaceholder(exactRegex), strict: true });
+  candidates.push({ label: `placeholder:${textTarget}`, locator: page.getByPlaceholder(regex), strict: false });
+  candidates.push({ label: `testid:${textTarget}`, locator: page.getByTestId(regex), strict: true });
   if (actionType === "type") {
-    candidates.push({ label: `role:textbox:${textTarget}`, locator: page.getByRole("textbox", { name: regex }).first() });
-    candidates.push({ label: `role:combobox:${textTarget}`, locator: page.getByRole("combobox", { name: regex }).first() });
-    candidates.push({ label: `name:${textTarget}`, locator: page.locator(`input[name*="${textTarget}" i], textarea[name*="${textTarget}" i], select[name*="${textTarget}" i]`).first() });
+    candidates.push({ label: `role:textbox-exact:${textTarget}`, locator: page.getByRole("textbox", { name: exactRegex }), strict: true });
+    candidates.push({ label: `role:textbox:${textTarget}`, locator: page.getByRole("textbox", { name: regex }), strict: false });
+    candidates.push({ label: `role:combobox-exact:${textTarget}`, locator: page.getByRole("combobox", { name: exactRegex }), strict: true });
+    candidates.push({ label: `role:combobox:${textTarget}`, locator: page.getByRole("combobox", { name: regex }), strict: false });
+    candidates.push({
+      label: `name:${textTarget}`,
+      locator: page.locator(`input[name*="${textTarget}" i], textarea[name*="${textTarget}" i], select[name*="${textTarget}" i]`),
+      strict: false,
+    });
   } else {
-    candidates.push({ label: `role:button:${textTarget}`, locator: page.getByRole("button", { name: regex }).first() });
-    candidates.push({ label: `role:link:${textTarget}`, locator: page.getByRole("link", { name: regex }).first() });
+    candidates.push({ label: `role:button-exact:${textTarget}`, locator: page.getByRole("button", { name: exactRegex }), strict: true });
+    candidates.push({ label: `role:button:${textTarget}`, locator: page.getByRole("button", { name: regex }), strict: false });
+    candidates.push({ label: `role:link-exact:${textTarget}`, locator: page.getByRole("link", { name: exactRegex }), strict: true });
+    candidates.push({ label: `role:link:${textTarget}`, locator: page.getByRole("link", { name: regex }), strict: false });
   }
-  candidates.push({ label: `text:${textTarget}`, locator: page.getByText(regex).first() });
+  candidates.push({ label: `text-exact:${textTarget}`, locator: page.getByText(exactRegex), strict: true });
+  candidates.push({ label: `text:${textTarget}`, locator: page.getByText(regex), strict: false });
 
   return candidates;
 }
 
 async function resolveUsableLocator(page, candidates, timeout = 3000) {
+  let bestAmbiguous = null;
   for (const candidate of candidates) {
     try {
       const count = await candidate.locator.count();
       if (!count || count < 1) continue;
-      await candidate.locator.first().waitFor({ state: "attached", timeout });
-      return { label: candidate.label, locator: candidate.locator.first() };
+      if (count === 1) {
+        const only = candidate.locator.first();
+        await only.waitFor({ state: "attached", timeout });
+        return { label: candidate.label, locator: only, candidateCount: count };
+      }
+
+      const visibleMatches = [];
+      const probeCount = Math.min(count, 8);
+      for (let i = 0; i < probeCount; i += 1) {
+        const item = candidate.locator.nth(i);
+        const visible = await item.isVisible().catch(() => false);
+        if (visible) visibleMatches.push(i);
+      }
+      if (visibleMatches.length === 1) {
+        const picked = candidate.locator.nth(visibleMatches[0]);
+        await picked.waitFor({ state: "attached", timeout });
+        return { label: candidate.label, locator: picked, candidateCount: count };
+      }
+      if (!bestAmbiguous || candidate.strict) {
+        bestAmbiguous = { label: candidate.label, count, strict: !!candidate.strict };
+      }
     } catch {
       // try next candidate
     }
+  }
+  if (bestAmbiguous) {
+    return {
+      ambiguityError: `Ambiguous target matched ${bestAmbiguous.count} elements via ${bestAmbiguous.label}. Provide a more specific target description.`,
+    };
   }
   return null;
 }
@@ -852,6 +902,9 @@ async function executeStep(session, commandId, step) {
       if (!resolved) {
         throw new Error(`Unable to locate clickable target: ${target}`);
       }
+      if (resolved.ambiguityError) {
+        throw new Error(resolved.ambiguityError);
+      }
       selectorUsed = resolved.label;
       highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
       const before = await snapshotState().catch(() => null);
@@ -886,6 +939,9 @@ async function executeStep(session, commandId, step) {
       const resolved = await resolveUsableLocator(session.page, buildLocatorCandidates(session.page, target, "type"), timeout);
       if (!resolved) {
         throw new Error(`Unable to locate input target: ${target}`);
+      }
+      if (resolved.ambiguityError) {
+        throw new Error(resolved.ambiguityError);
       }
       selectorUsed = resolved.label;
       highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
@@ -974,6 +1030,7 @@ async function executeStep(session, commandId, step) {
       const target = step.selector || step.targetDescription || step.expectedText || "";
       const resolved = await resolveUsableLocator(session.page, buildLocatorCandidates(session.page, target, "click"), timeout);
       if (!resolved) throw new Error("assert_clickable requires selector, targetDescription, or expectedText");
+      if (resolved.ambiguityError) throw new Error(resolved.ambiguityError);
       selectorUsed = resolved.label;
       const locator = resolved.locator;
       await locator.waitFor({ state: "visible", timeout });

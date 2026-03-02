@@ -438,6 +438,11 @@ export interface AutomationSession {
   browserContextMeta: string | null;
   lastScreenshotPath: string | null;
   updatedAt: string;
+  runtime?: {
+    activeCommandId: string | null;
+    queuedCount: number;
+    isRunning: boolean;
+  };
   events: Array<{
     id: string;
     commandId: string | null;
@@ -469,11 +474,26 @@ export async function sendAutomationCommand(
   commandId: string;
   requiresClarification: boolean;
   clarificationQuestion?: string;
+  queued?: boolean;
+  queueDepth?: number;
   result?: Record<string, unknown>;
 }> {
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands`, {
     method: "POST",
     body: { command },
+  });
+}
+
+export async function stopAutomationCommand(
+  projectId: string,
+  sessionId: string
+): Promise<{
+  stopRequested: boolean;
+  activeCommandId: string | null;
+  queuedCount: number;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands/stop`, {
+    method: "POST",
   });
 }
 
@@ -499,7 +519,14 @@ export async function resetAutomationSession(
 export async function finalizeAutomationSession(
   projectId: string,
   sessionId: string,
-  data?: { testName?: string; framework?: string; repo?: string; path?: string }
+  data?: {
+    testName?: string;
+    framework?: string;
+    repo?: string;
+    path?: string;
+    script?: string;
+    steps?: Array<{ stepNumber?: number; action?: string; expectedResult?: string }>;
+  }
 ): Promise<{ status: string; script: string }> {
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/finalize`, {
     method: "POST",

@@ -14,6 +14,7 @@ import {
   resetAutomationSession,
   finalizeAutomationSession,
   cancelAutomationSession,
+  stopAutomationCommand,
   sendAutomationManualAction,
   runAutomationPlaywrightScript,
   type AutomationSession,
@@ -25,7 +26,7 @@ type ChatMessage = {
   content: string;
 };
 
-type AutomationMode = "autonomous" | "chat" | "live";
+type AutomationMode = "autonomous" | "live";
 
 type TimelineItem = {
   timeLabel: string;
@@ -33,6 +34,13 @@ type TimelineItem = {
   primary?: string;
   secondary?: string;
   tertiary?: string;
+};
+
+type ReviewStep = {
+  id: string;
+  action: string;
+  expectedResult: string;
+  playwright: string;
 };
 
 type SessionStartupState = "select-environment" | "starting" | "waiting-stream" | "ready";
@@ -64,11 +72,16 @@ export default function AutomateTestCasePage() {
   const [command, setCommand] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
+  const [stoppingCommand, setStoppingCommand] = useState(false);
+  const [chatPaneRatio, setChatPaneRatio] = useState(44);
+  const [resizingPanes, setResizingPanes] = useState(false);
+  const [desktopSplitEnabled, setDesktopSplitEnabled] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [confirmFinalizeOpen, setConfirmFinalizeOpen] = useState(false);
+  const [reviewSteps, setReviewSteps] = useState<ReviewStep[]>([]);
   const [streamState, setStreamState] = useState<"Connecting" | "Live" | "Lagging" | "Disconnected">("Connecting");
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
-  const [mode, setMode] = useState<AutomationMode>("chat");
+  const [mode, setMode] = useState<AutomationMode>("autonomous");
   const [sessionStartupState, setSessionStartupState] = useState<SessionStartupState>("select-environment");
   const [sessionStartupError, setSessionStartupError] = useState<string | null>(null);
   const [liveStreamFailed, setLiveStreamFailed] = useState(false);
@@ -91,16 +104,21 @@ export default function AutomateTestCasePage() {
   const dragStartRef = useRef<{ xRatio: number; yRatio: number } | null>(null);
   const suppressClickRef = useRef(false);
   const lastScrollAtRef = useRef(0);
+  const splitPaneRef = useRef<HTMLDivElement | null>(null);
   const liveViewportRef = useRef<HTMLDivElement | null>(null);
+  const chatLogRef = useRef<HTMLDivElement | null>(null);
+  const timelineLogRef = useRef<HTMLDivElement | null>(null);
   const keyQueueRef = useRef<Array<{ actionType: "press" | "type"; key?: string; text?: string }>>([]);
   const processingKeyQueueRef = useRef(false);
   const streamedAutonomousEventIdsRef = useRef<Set<string>>(new Set());
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
   const isLiveMode = mode === "live";
   const isAutonomousMode = mode === "autonomous";
-  const isChatMode = mode === "chat";
   const startupReady = sessionStartupState === "ready";
   const selectedStartUrl = (selectedEnvironmentUrl || customEnvironmentUrl).trim();
+  const runtimeInfo = session?.runtime;
+  const commandInProgress = Boolean(runtimeInfo?.isRunning);
+  const queuedCommandCount = Number(runtimeInfo?.queuedCount || 0);
 
   function asText(value: unknown): string {
     return typeof value === "string" ? value : "";
@@ -189,6 +207,279 @@ export default function AutomateTestCasePage() {
     return { configured, provider };
   }
 
+  function buildPlaywrightScriptFromReviewSteps(testName: string, steps: ReviewStep[]): string {
+    const lines: string[] = [
+      "import { test, expect } from '@playwright/test';",
+      "",
+      `test('${testName.replace(/\\/g, "\\\\").replace(/'/g, "\\'") || "generated automation test"}', async ({ page }) => {`,
+    ];
+    if (steps.length === 0) {
+      lines.push("  // No recorded actions were available. Add steps manually.");
+    } else {
+      for (const step of steps) {
+        const parts = step.playwright.split("\n");
+        for (const part of parts) {
+          lines.push(`  ${part}`);
+        }
+      }
+    }
+    lines.push("  await expect(page).toHaveURL(/.*/);");
+    lines.push("});");
+    return lines.join("\n");
+  }
+
+  function asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  }
+
+  function isPassedStatus(value: unknown): boolean {
+    const normalized = asText(value).toLowerCase();
+    return normalized === "passed" || normalized === "success";
+  }
+
+  function isTextInputLike(step: Record<string, unknown>): boolean {
+    const selector = asText(step.selector).toLowerCase();
+    const targetHtml = asText(step.targetHtml).toLowerCase();
+    return (
+      selector.startsWith("input") ||
+      selector.startsWith("textarea") ||
+      selector.includes("input[") ||
+      selector.includes("textarea") ||
+      targetHtml.includes("<input") ||
+      targetHtml.includes("<textarea")
+    );
+  }
+
+  function humanizeToken(raw: string): string {
+    const normalized = raw
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!normalized) return "";
+    return normalized
+      .split(" ")
+      .map((part) => (part ? `${part[0].toUpperCase()}${part.slice(1).toLowerCase()}` : ""))
+      .join(" ");
+  }
+
+  function extractFriendlyName(selectorRaw: string): string {
+    const selector = selectorRaw.trim();
+    if (!selector) return "";
+    const attrs = ["name", "aria-label", "placeholder"];
+    for (const attr of attrs) {
+      const quoted = new RegExp(`${attr}=['"]([^'"]+)['"]`, "i").exec(selector);
+      if (quoted?.[1]) return humanizeToken(quoted[1]);
+      const bare = new RegExp(`${attr}=([^\\],\\s]+)`, "i").exec(selector);
+      if (bare?.[1]) return humanizeToken(bare[1]);
+    }
+    if (selector.startsWith("#")) return humanizeToken(selector.slice(1));
+    if (selector.startsWith(".")) return humanizeToken(selector.slice(1));
+    return "";
+  }
+
+  function friendlyClickTarget(parsed: Record<string, unknown>): string {
+    const targetText = humanizeToken(asText(parsed.targetText));
+    if (targetText) return targetText;
+    const selector = asText(parsed.selector);
+    const fromSelector = extractFriendlyName(selector);
+    if (!fromSelector) return "";
+    return isTextInputLike(parsed) ? `${fromSelector} text box` : fromSelector;
+  }
+
+  function friendlyInputTarget(parsed: Record<string, unknown>): string {
+    const targetText = humanizeToken(asText(parsed.targetText));
+    if (targetText) return `${targetText} text box`;
+    const selector = asText(parsed.selector);
+    const fromSelector = extractFriendlyName(selector);
+    return fromSelector ? `${fromSelector} text box` : "";
+  }
+
+  function playwrightLineForAction(parsed: Record<string, unknown>): string {
+    const action = asText(parsed.action);
+    if (action === "navigate") {
+      const url = asText(parsed.url);
+      return url ? `await page.goto('${url.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` : "// navigate step unavailable";
+    }
+    if (action === "click") {
+      const selector = asText(parsed.selector);
+      if (selector) {
+        return `await page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first().click();`;
+      }
+      return "// click target unavailable";
+    }
+    if (action === "type") {
+      const selector = asText(parsed.selector);
+      const value = asText(parsed.value);
+      const escapedValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      if (selector && selector !== "activeElement") {
+        return `await page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first().fill('${escapedValue}');`;
+      }
+      return value ? `await page.keyboard.type('${escapedValue}');` : "// type value unavailable";
+    }
+    if (action === "press") {
+      const key = asText(parsed.key) || "Enter";
+      return `await page.keyboard.press('${key.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');`;
+    }
+    if (action === "assert_visible") {
+      const selector = asText(parsed.selector);
+      const expectedText = asText(parsed.expectedText);
+      if (selector) return `await expect(page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first()).toBeVisible();`;
+      if (expectedText) {
+        return `await expect(page.getByText('${expectedText.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}', { exact: false })).toBeVisible();`;
+      }
+      return "// visible assertion target unavailable";
+    }
+    if (action === "assert_text") {
+      const selector = asText(parsed.selector);
+      const expectedText = asText(parsed.expectedText);
+      if (selector && expectedText) {
+        return `await expect(page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first()).toContainText('${expectedText.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');`;
+      }
+      if (expectedText) {
+        return `await expect(page.getByText('${expectedText.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}', { exact: false })).toBeVisible();`;
+      }
+      return "// text assertion unavailable";
+    }
+    if (action === "assert_clickable") {
+      const selector = asText(parsed.selector);
+      return selector
+        ? `await expect(page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first()).toBeEnabled();`
+        : "// clickable assertion target unavailable";
+    }
+    return `// unsupported action: ${action || "unknown"}`;
+  }
+
+  function reviewStepFromAction(parsed: Record<string, unknown>, index: number): ReviewStep | null {
+    const action = asText(parsed.action).toLowerCase();
+    if (!action || action === "scroll") return null;
+    let actionText = "";
+    let expectedResult = "";
+    if (action === "navigate") {
+      const url = asText(parsed.url);
+      if (!url) return null;
+      actionText = `Open ${url}.`;
+      expectedResult = `The page loads successfully at ${url}.`;
+    } else if (action === "click") {
+      const target = friendlyClickTarget(parsed);
+      actionText = target ? `Click on ${target}.` : "Click on the target element.";
+      expectedResult = "The click action is performed and the UI responds correctly.";
+    } else if (action === "type") {
+      const target = friendlyInputTarget(parsed);
+      const value = asText(parsed.value);
+      actionText = target ? (value ? `Enter "${value}" into ${target}.` : `Type into ${target}.`) : value ? `Type "${value}".` : "Type the required input.";
+      expectedResult = value ? `The field displays "${value}".` : "The input is accepted by the active field.";
+    } else if (action === "press") {
+      const key = asText(parsed.key) || "Enter";
+      actionText = `Press ${key}.`;
+      expectedResult = `The application handles the ${key} key action successfully.`;
+    } else if (action === "drag") {
+      const start = asText(parsed.startSelector);
+      const end = asText(parsed.endSelector);
+      actionText = start && end ? `Drag ${start} to ${end}.` : "Drag and drop the target element.";
+      expectedResult = "The element is moved to the intended location.";
+    } else if (action === "assert_visible") {
+      const target = asText(parsed.expectedText) || friendlyClickTarget(parsed);
+      actionText = target ? `Verify ${target} is visible.` : "Verify the required element is visible.";
+      expectedResult = target ? `${target} is visible on the page.` : "The required UI element is visible to the user.";
+    } else if (action === "assert_text") {
+      const expectedText = asText(parsed.expectedText);
+      const target = friendlyClickTarget(parsed);
+      if (target && expectedText) {
+        actionText = `Verify ${target} contains "${expectedText}".`;
+        expectedResult = `${target} contains "${expectedText}".`;
+      } else if (expectedText) {
+        actionText = `Verify the page contains "${expectedText}".`;
+        expectedResult = `The text "${expectedText}" is visible on the page.`;
+      } else {
+        actionText = "Verify the expected text is shown.";
+        expectedResult = "The required text is visible on the page.";
+      }
+    } else if (action === "assert_clickable") {
+      const target = friendlyClickTarget(parsed);
+      actionText = target ? `Verify ${target} is clickable.` : "Verify the target control is clickable.";
+      expectedResult = target ? `${target} is enabled for interaction.` : "The target control is enabled for interaction.";
+    } else {
+      actionText = `Perform action: ${action}.`;
+      expectedResult = "The action completes successfully.";
+    }
+    return {
+      id: `review-step-${index + 1}-${action}`,
+      action: actionText,
+      expectedResult,
+      playwright: playwrightLineForAction(parsed),
+    };
+  }
+
+  function collectStepsForFinalize(events: AutomationSession["events"]): ReviewStep[] {
+    if (!events || events.length === 0) return [];
+    const actions: Record<string, unknown>[] = [];
+    const hasAutonomousStepEvents = events.some((event) => event.eventType === "autonomous_step_executed");
+    const successfulAutonomousTurns = new Set<number>();
+    for (const event of events) {
+      if (event.eventType !== "autonomous_turn_executed") continue;
+      const parsed = asRecord(event.parsedAction);
+      if (!isPassedStatus(parsed.status)) continue;
+      const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+      if (turn != null) successfulAutonomousTurns.add(turn);
+    }
+    for (const event of events) {
+      const parsed = asRecord(event.parsedAction);
+      const execution = asRecord(event.executionResult);
+      if (event.eventType === "autonomous_step_executed") {
+        if (!isPassedStatus(parsed.status)) continue;
+        const turn = typeof parsed.turn === "number" ? parsed.turn : null;
+        if (turn != null && successfulAutonomousTurns.size > 0 && !successfulAutonomousTurns.has(turn)) continue;
+        const step = asRecord(parsed.step);
+        if (Object.keys(step).length > 0) actions.push(step);
+        continue;
+      }
+      if (event.eventType === "autonomous_turn_executed" && !hasAutonomousStepEvents) {
+        if (!isPassedStatus(parsed.status)) continue;
+        const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+        const results = Array.isArray(parsed.results) ? parsed.results : [];
+        if (results.length === 0) {
+          for (const step of steps) actions.push(asRecord(step));
+        } else {
+          const bound = Math.min(steps.length, results.length);
+          for (let i = 0; i < bound; i += 1) {
+            const result = asRecord(results[i]);
+            if (isPassedStatus(result.status)) actions.push(asRecord(steps[i]));
+          }
+        }
+        continue;
+      }
+      if (event.eventType === "command_executed") {
+        const parsedMode = asText(parsed.mode).toLowerCase();
+        const executionMode = asText(execution.mode).toLowerCase();
+        if (parsedMode === "autonomous" || executionMode === "autonomous") continue;
+        const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+        const results = Array.isArray(execution.results) ? execution.results : [];
+        if (results.length === 0) {
+          for (const step of steps) actions.push(asRecord(step));
+        } else {
+          const bound = Math.min(steps.length, results.length);
+          for (let i = 0; i < bound; i += 1) {
+            const result = asRecord(results[i]);
+            if (isPassedStatus(result.status)) actions.push(asRecord(steps[i]));
+          }
+        }
+        continue;
+      }
+      if (event.eventType === "manual_action_executed" || event.eventType === "step_finished") {
+        const status = asText(execution.status);
+        if (status && !isPassedStatus(status)) continue;
+        if (Object.keys(parsed).length > 0) actions.push(parsed);
+      }
+    }
+    const steps: ReviewStep[] = [];
+    for (let i = 0; i < actions.length; i += 1) {
+      const step = reviewStepFromAction(actions[i], i);
+      if (step) steps.push(step);
+    }
+    return steps;
+  }
+
   useEffect(() => {
     authMe().then((me) => {
       if (!me) {
@@ -250,7 +541,7 @@ export default function AutomateTestCasePage() {
           {
             role: "assistant",
             content:
-              "Automation session started. Choose a mode: Autonomous (agent plans and executes), Chat (intent-driven execution), or Live (you interact while I suggest assertions).",
+              "Automation session started. Choose a mode: Autonomous (agent plans and executes) or Live (you interact while I suggest assertions).",
           },
         ]);
         return;
@@ -291,7 +582,7 @@ export default function AutomateTestCasePage() {
         {
           role: "assistant",
           content:
-            "Automation session started. Waiting for browser stream to become ready. Choose a mode after live stream is available.",
+            "Automation session started. Waiting for browser stream to become ready. Choose Autonomous or Live mode after stream is available.",
         },
       ]);
     } catch (error: unknown) {
@@ -334,7 +625,7 @@ export default function AutomateTestCasePage() {
       }
     };
     void tick();
-    const intervalMs = isLiveMode ? 400 : isAutonomousMode ? 800 : 1500;
+    const intervalMs = isLiveMode ? 400 : 800;
     const id = setInterval(() => void tick(), intervalMs);
     return () => {
       cancelled = true;
@@ -522,11 +813,17 @@ export default function AutomateTestCasePage() {
       if (event.eventType === "autonomous_turn_replanned") {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const reason = toText(parsed.reason) || "Replanning with alternative strategy";
+        const expectedOutcome = toText(parsed.expectedOutcome);
+        const observedOutcome = toText(parsed.observedOutcome);
         rawItems.push({
           at,
           actionLabel: "Autonomous Replan",
           primary: turn ? `After turn ${turn}` : "After previous turn",
           secondary: reason,
+          tertiary:
+            expectedOutcome || observedOutcome
+              ? `Expected: ${expectedOutcome || "-"} | Observed: ${observedOutcome || "-"}`
+              : undefined,
         });
         continue;
       }
@@ -574,6 +871,53 @@ export default function AutomateTestCasePage() {
     streamedAutonomousEventIdsRef.current = new Set();
     setBotHighlight(null);
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!chatLogRef.current) return;
+    chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
+  }, [messages]);
+
+  useEffect(() => {
+    if (!timelineLogRef.current) return;
+    timelineLogRef.current.scrollTop = timelineLogRef.current.scrollHeight;
+  }, [timeline]);
+
+  useEffect(() => {
+    if (!resizingPanes) return;
+    const handleMove = (event: MouseEvent) => {
+      const container = splitPaneRef.current;
+      if (!container) return;
+      const bounds = container.getBoundingClientRect();
+      if (!bounds.width) return;
+      const rawRatio = ((event.clientX - bounds.left) / bounds.width) * 100;
+      const boundedRatio = Math.max(25, Math.min(75, rawRatio));
+      setChatPaneRatio(boundedRatio);
+    };
+    const handleUp = () => {
+      setResizingPanes(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [resizingPanes]);
+
+  useEffect(() => {
+    const updateLayoutMode = () => {
+      setDesktopSplitEnabled(window.innerWidth >= 1024);
+    };
+    updateLayoutMode();
+    window.addEventListener("resize", updateLayoutMode);
+    return () => window.removeEventListener("resize", updateLayoutMode);
+  }, []);
 
   useEffect(() => {
     if (!isAutonomousMode || !session?.events || session.events.length === 0) return;
@@ -637,8 +981,18 @@ export default function AutomateTestCasePage() {
       } else if (event.eventType === "autonomous_turn_replanned") {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const reason = typeof parsed.reason === "string" ? parsed.reason : "Trying an alternative strategy.";
+        const failedAction = asText(parsed.failedAction);
+        const expectedOutcome = asText(parsed.expectedOutcome);
+        const observedOutcome = asText(parsed.observedOutcome);
+        const detailParts = [
+          failedAction ? `Failed action: ${failedAction}.` : "",
+          expectedOutcome ? `Expected: ${expectedOutcome}` : "",
+          observedOutcome ? `Observed: ${observedOutcome}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         newChatLines.push(
-          `${turn ? `After turn ${turn}` : "After the previous turn"}, I did not get the expected outcome. I am replanning with an alternative approach. ${reason}`
+          `${turn ? `After turn ${turn}` : "After the previous turn"}, I did not get the expected outcome. I am replanning with an alternative approach. ${reason}${detailParts ? ` ${detailParts}` : ""}`
         );
       } else if (event.eventType === "autonomous_turn_executed") {
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
@@ -671,15 +1025,14 @@ export default function AutomateTestCasePage() {
     options?: { forceAutonomous?: boolean }
   ) {
     if (!sessionId || !startupReady || !input.trim() || sending) return;
-    const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
-    const shouldRequireAi = shouldUseAutonomousMode || isChatMode;
-    if (shouldRequireAi && !aiConfigured) {
+    const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode || isLiveMode;
+    if (shouldUseAutonomousMode && !aiConfigured) {
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
           content:
-            "Add your AI API key in Project Settings to use Autonomous and Chat modes. Live mode works without AI for recording.",
+            "Add your AI API key in Project Settings to use Autonomous mode commands. Live mode works without AI for recording.",
         },
       ]);
       return;
@@ -698,47 +1051,16 @@ export default function AutomateTestCasePage() {
           { role: "assistant", content: response.clarificationQuestion || "Please clarify your command." },
         ]);
       } else {
-        const result = (response.result || {}) as { results?: Array<Record<string, unknown>> };
-        const steps = Array.isArray(result.results) ? result.results : [];
-        const assertionCount = steps.filter((step) => {
-          const action = typeof step.action === "string" ? step.action : "";
-          return action.startsWith("assert");
-        }).length;
-        const iterations = typeof (response.result as Record<string, unknown> | undefined)?.iterations === "number"
-          ? Number((response.result as Record<string, unknown>).iterations)
-          : null;
-        const goalAchieved = (response.result as Record<string, unknown> | undefined)?.goalAchieved === true;
-        const completionReason =
-          typeof (response.result as Record<string, unknown> | undefined)?.completionReason === "string"
-            ? String((response.result as Record<string, unknown>).completionReason)
-            : "";
-        const plannedTurnsRaw = (response.result as Record<string, unknown> | undefined)?.plannedTurns;
-        const plannedTurns = Array.isArray(plannedTurnsRaw) ? plannedTurnsRaw : [];
-        const summary = shouldUseAutonomousMode
-          ? `Autonomous run finished. Executed ${steps.length} step(s)${iterations ? ` across ${iterations} planning turn(s)` : ""}, including ${assertionCount} assertion step(s). ${goalAchieved ? "Objective achieved." : "Objective not fully confirmed."}`
-          : `Command executed with ${steps.length} step(s) and ${assertionCount} assertion step(s).`;
-        const suffix = completionReason ? ` ${completionReason}` : "";
-        const thinkingLines = plannedTurns
-          .slice(0, 8)
-          .map((turn, idx) => {
-            const turnObj = turn as Record<string, unknown>;
-            const stepList = Array.isArray(turnObj.steps) ? turnObj.steps : [];
-            const intentLabel =
-              typeof turnObj.intentLabel === "string" && turnObj.intentLabel.trim()
-                ? turnObj.intentLabel.trim()
-                : "Autonomous action";
-            const turnNo = typeof turnObj.turn === "number" ? turnObj.turn : idx + 1;
-            const lines = (stepList as Array<Record<string, unknown>>).map((step, stepIdx) =>
-              describeStepLine(step, stepIdx + 1)
-            );
-            return `Turn ${turnNo} [${intentLabel}]\n${lines.length > 0 ? lines.join("\n") : "(no steps)"}`;
-          });
-        const thinkingLog = thinkingLines.length > 0 ? `Autonomous thinking log:\n${thinkingLines.join("\n")}` : "";
-        setMessages((prev) => [
-          ...prev,
-          ...(thinkingLog ? [{ role: "assistant" as const, content: thinkingLog }] : []),
-          { role: "assistant", content: `${summary}${suffix} Review timeline and browser output.` },
-        ]);
+        const depth = Number(response.queueDepth ?? 0);
+        if (response.queued && depth > 1) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `Command queued. Queue depth is ${depth}. I will run it automatically after current command completes.`,
+            },
+          ]);
+        }
       }
       setStreamState("Live");
     } catch (error) {
@@ -837,13 +1159,30 @@ Stop when pass/fail outcome is clear and summarize results.`;
     }
   }
 
+  function onOpenFinalizeReview() {
+    const nextReviewSteps = collectStepsForFinalize(session?.events || []);
+    setReviewSteps(nextReviewSteps);
+    setConfirmFinalizeOpen(true);
+  }
+
+  function onDeleteReviewStep(stepId: string) {
+    setReviewSteps((prev) => prev.filter((step) => step.id !== stepId));
+  }
+
   async function onFinalize() {
     if (!sessionId || finalizing) return;
     setFinalizing(true);
     try {
+      const scriptForSave = buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps);
       await finalizeAutomationSession(projectId, sessionId, {
         framework: "Playwright",
         testName: testcaseTitle,
+        script: scriptForSave,
+        steps: reviewSteps.map((step, index) => ({
+          stepNumber: index + 1,
+          action: step.action,
+          expectedResult: step.expectedResult,
+        })),
       });
       router.push(`/projects/${projectId}/testcases/${testcaseId}`);
       router.refresh();
@@ -1088,6 +1427,30 @@ Stop when pass/fail outcome is clear and summarize results.`;
     router.push(`/projects/${projectId}/testcases/${testcaseId}`);
   }
 
+  async function onStopCurrentCommand() {
+    if (!sessionId || !startupReady || stoppingCommand) return;
+    setStoppingCommand(true);
+    try {
+      const result = await stopAutomationCommand(projectId, sessionId);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: result.stopRequested
+            ? `Stop requested for command ${result.activeCommandId || ""}. Remaining queued commands: ${result.queuedCount}.`
+            : "No active command is running right now.",
+        },
+      ]);
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: error instanceof Error ? error.message : "Failed to stop current command." },
+      ]);
+    } finally {
+      setStoppingCommand(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
       <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center justify-between">
@@ -1101,12 +1464,12 @@ Stop when pass/fail outcome is clear and summarize results.`;
         <div className="flex items-center gap-2">
           <span className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700">{streamState}</span>
           <div className="flex items-center rounded border border-zinc-300 p-0.5 text-xs dark:border-zinc-700">
-            {(["autonomous", "chat", "live"] as AutomationMode[]).map((item) => (
+            {(["autonomous", "live"] as AutomationMode[]).map((item) => (
               <button
                 key={item}
                 type="button"
                 onClick={() => setMode(item)}
-                disabled={!startupReady || ((item === "autonomous" || item === "chat") && !aiConfigured)}
+                disabled={!startupReady || (item === "autonomous" && !aiConfigured)}
                 className={`rounded px-2 py-1 capitalize ${
                   mode === item
                     ? "bg-emerald-600 text-white"
@@ -1119,7 +1482,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           </div>
           <button
             type="button"
-            onClick={() => setConfirmFinalizeOpen(true)}
+            onClick={onOpenFinalizeReview}
             disabled={!sessionId || finalizing || streamState === "Disconnected"}
             className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
           >
@@ -1135,22 +1498,27 @@ Stop when pass/fail outcome is clear and summarize results.`;
         </div>
       </header>
 
-      <main className={`grid gap-4 p-4 ${isLiveMode ? "grid-cols-1" : "lg:grid-cols-2"}`}>
-        <section className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-2" : ""}`}>
-          <h2 className="mb-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Chat</h2>
+      <main className="p-4">
+        <div ref={splitPaneRef} className="flex flex-col gap-4 lg:h-[calc(100vh-96px)] lg:flex-row lg:gap-0">
+        <section
+          className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-2 lg:order-1" : ""} flex min-h-[320px] flex-col lg:rounded-r-none`}
+          style={desktopSplitEnabled ? { width: `${chatPaneRatio}%` } : undefined}
+        >
+          <h2 className="mb-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Assistant</h2>
           <p className="mb-3 text-xs text-zinc-500">
             {isAutonomousMode
               ? "Autonomous mode: provide a goal, the bot explains each step, evaluates first, performs action, and verifies outcomes."
-              : isLiveMode
-                ? "Live mode: you interact with browser directly, and the bot suggests assertions."
-                : "Chat mode: share intent, and the bot decides and executes steps."}
+              : "Live mode: you interact with browser directly, and the bot suggests assertions."}
           </p>
           {!aiConfigured && (
             <p className="mb-3 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
-              {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable Chat and Autonomous modes. Live mode is available for recording.`}
+              {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable Autonomous mode commands. Live mode is available for recording.`}
             </p>
           )}
-          <div className="mb-3 h-[420px] overflow-auto rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950">
+          <div
+            ref={chatLogRef}
+            className="mb-3 h-[420px] min-h-[220px] overflow-auto rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950 lg:h-auto lg:flex-1"
+          >
             <div className="space-y-3">
               {messages.map((message, idx) => (
                 <div
@@ -1166,34 +1534,55 @@ Stop when pass/fail outcome is clear and summarize results.`;
               ))}
             </div>
           </div>
-          <div className="flex gap-2">
-            <input
-              value={command}
-              disabled={!startupReady || ((isAutonomousMode || isChatMode) && !aiConfigured)}
-              onChange={(e) => setCommand(e.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void onSendCommand();
+          <div className="flex items-end gap-2">
+            <div className="relative w-full">
+              <textarea
+                value={command}
+                disabled={!startupReady || !aiConfigured}
+                rows={3}
+                onChange={(e) => setCommand(e.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void onSendCommand();
+                  }
+                }}
+                placeholder={
+                  !aiConfigured
+                    ? "Add AI API key in Project Settings to use this mode"
+                    : isAutonomousMode
+                    ? "Describe the end goal. Example: complete signup flow and verify success page"
+                    : "Live mode tip: interact manually, or run an autonomous goal from here"
                 }
-              }}
-              placeholder={
-                (isAutonomousMode || isChatMode) && !aiConfigured
-                  ? "Add AI API key in Project Settings to use this mode"
-                  : isAutonomousMode
-                  ? "Describe the end goal. Example: complete signup flow and verify success page"
-                  : "Try: open qable.io, click on Connect us now, verify What we do is visible"
-              }
-              className="w-full rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-            />
-            <button
-              type="button"
-              onClick={() => void onSendCommand()}
-              disabled={sending || !sessionId || !startupReady || ((isAutonomousMode || isChatMode) && !aiConfigured)}
-              className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-            >
-              {sending ? "Running..." : isAutonomousMode ? "Start Autonomous Run" : "Run"}
-            </button>
+                className="w-full resize-none rounded border border-zinc-300 px-3 py-2 pr-12 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+              />
+              <button
+                type="button"
+                onClick={() => void (commandInProgress ? onStopCurrentCommand() : onSendCommand())}
+                disabled={commandInProgress ? stoppingCommand || !sessionId || !startupReady : sending || !sessionId || !startupReady || !aiConfigured}
+                title={
+                  commandInProgress
+                    ? (stoppingCommand ? "Stopping command" : "Stop current command")
+                    : sending
+                      ? "Queueing command"
+                      : "Start autonomous run (Enter)"
+                }
+                aria-label={
+                  commandInProgress
+                    ? (stoppingCommand ? "Stopping command" : "Stop current command")
+                    : sending
+                      ? "Queueing command"
+                      : "Start autonomous run"
+                }
+                className={`absolute right-2 bottom-3 flex h-8 w-8 items-center justify-center rounded-md text-sm font-semibold text-white disabled:opacity-50 ${
+                  commandInProgress
+                    ? "bg-red-600 hover:bg-red-700"
+                    : "bg-blue-600 hover:bg-blue-700"
+                }`}
+              >
+                {commandInProgress ? (stoppingCommand ? "…" : "■") : sending ? "…" : "↵"}
+              </button>
+            </div>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <button
@@ -1217,21 +1606,30 @@ Stop when pass/fail outcome is clear and summarize results.`;
             Quick actions run inside the current automation session, so you can watch each run directly in Live Browser preview.
           </p>
         </section>
-
-        <section className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-1" : ""}`}>
+        <div
+          className="hidden lg:flex lg:w-3 lg:cursor-col-resize lg:items-center lg:justify-center"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize chat and browser panels"
+          onMouseDown={() => setResizingPanes(true)}
+        >
+          <div className={`h-16 w-1 rounded ${resizingPanes ? "bg-blue-500" : "bg-zinc-300 dark:bg-zinc-700"}`} />
+        </div>
+        <section
+          className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-1 lg:order-2" : ""} flex min-h-[320px] flex-col lg:rounded-l-none`}
+          style={desktopSplitEnabled ? { width: `${100 - chatPaneRatio}%` } : undefined}
+        >
           <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Live Browser</h2>
           <p className="mb-2 text-xs text-zinc-500">
             {isLiveMode
               ? "Live mode increases stream refresh for near real-time browser playback and manual action recording."
-              : isAutonomousMode
-                ? "Autonomous mode uses medium refresh while the agent plans and executes in the browser."
-                : "Chat mode executes intent from messages and records steps in timeline."}
+              : "Autonomous mode uses medium refresh while the agent plans and executes in the browser."}
           </p>
           <div
             ref={liveViewportRef}
             tabIndex={0}
             onKeyDown={onLiveViewportKeyDown}
-            className={`mb-3 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[78vh]" : "h-[320px]"}`}
+            className={`mb-3 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[78vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
           >
             {shouldShowLiveStream && !liveStreamFailed ? (
               <img
@@ -1324,7 +1722,10 @@ Stop when pass/fail outcome is clear and summarize results.`;
           <p className="mb-3 text-xs text-zinc-500">
             Current URL: {session?.currentUrl || "-"}
           </p>
-          <div className="h-[160px] overflow-auto rounded border border-zinc-200 p-2 text-xs dark:border-zinc-700">
+          <p className="mb-3 text-xs text-zinc-500">
+            Runtime: {commandInProgress ? "Running" : "Idle"} | Queue: {queuedCommandCount}
+          </p>
+          <div ref={timelineLogRef} className="h-[160px] overflow-auto rounded border border-zinc-200 p-2 text-xs dark:border-zinc-700">
             <p className="mb-2 font-medium">Recent Step Events</p>
             <div className="space-y-1">
               {timeline.map((event, idx) => (
@@ -1342,18 +1743,51 @@ Stop when pass/fail outcome is clear and summarize results.`;
             </div>
           </div>
         </section>
+        </div>
       </main>
       {confirmFinalizeOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+          <div className="w-full max-w-6xl rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-              Complete Browser Session and Save Script?
+              Review Steps and Script Before Saving
             </h3>
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              This will end the current browser session, convert recorded actions into a Playwright script, and store
-              generated plain-English step definitions in the test case <span className="font-medium">Test Steps</span>{" "}
-              section (with expected results where possible).
+              Validate plain-English steps and Playwright script side by side. Delete any step you do not want to save;
+              the related Playwright action is removed automatically.
             </p>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <div className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
+                <h4 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Script Steps (Simple English)</h4>
+                <div className="max-h-[360px] space-y-2 overflow-auto pr-1">
+                  {reviewSteps.length === 0 ? (
+                    <p className="text-xs text-zinc-500">No generated steps available for this session yet.</p>
+                  ) : (
+                    reviewSteps.map((step, index) => (
+                      <div key={step.id} className="rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-800/40">
+                        <div className="mb-1 flex items-start justify-between gap-2">
+                          <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">Step {index + 1}</p>
+                          <button
+                            type="button"
+                            onClick={() => onDeleteReviewStep(step.id)}
+                            className="rounded border border-red-300 px-2 py-0.5 text-[11px] text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-900/20"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                        <p className="text-sm text-zinc-800 dark:text-zinc-100">{step.action}</p>
+                        <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{step.expectedResult}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+              <div className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
+                <h4 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Playwright Script</h4>
+                <pre className="max-h-[360px] overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-100">
+                  {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
+                </pre>
+              </div>
+            </div>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
@@ -1369,7 +1803,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 disabled={finalizing}
                 className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                {finalizing ? "Saving..." : "Complete and Save"}
+                {finalizing ? "Saving..." : "Confirm and Save"}
               </button>
             </div>
           </div>
@@ -1380,7 +1814,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           <div className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Choose Environment</h3>
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Select a test environment URL to start browser automation. Live mode works without AI keys; Chat and Autonomous require provider API key in project settings.
+              Select a test environment URL to start browser automation. Live mode works without AI keys; Autonomous commands require provider API key in project settings.
             </p>
             {testRunEnvironments.length > 0 ? (
               <div className="mt-4">

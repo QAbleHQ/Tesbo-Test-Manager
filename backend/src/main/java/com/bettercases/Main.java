@@ -98,6 +98,7 @@ public final class Main {
         app.get("/api/projects/{projectId}/testcases/linked-jira-keys", TestCaseHandler::linkedJiraKeys);
         app.post("/api/projects/{projectId}/testcases/{testcaseId}/automation/sessions", AutomationSessionHandler::start);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands", AutomationSessionHandler::runCommand);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands/stop", AutomationSessionHandler::stopActiveCommand);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);

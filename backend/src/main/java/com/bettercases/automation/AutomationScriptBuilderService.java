@@ -1,9 +1,11 @@
 package com.bettercases.automation;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class AutomationScriptBuilderService {
     public static String buildPlaywrightScript(String testName, List<Map<String, Object>> events) {
@@ -12,27 +14,9 @@ public final class AutomationScriptBuilderService {
         sb.append("import { test, expect } from '@playwright/test';\n\n");
         sb.append("test('").append(escape(sanitizedName)).append("', async ({ page }) => {\n");
         boolean wroteAction = false;
-        for (Map<String, Object> event : events) {
-            String type = String.valueOf(event.getOrDefault("eventType", ""));
-            if ("command_executed".equals(type) || "autonomous_turn_executed".equals(type)) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> parsed = (Map<String, Object>) event.get("parsedAction");
-                if (parsed != null) {
-                    @SuppressWarnings("unchecked")
-                    List<Map<String, Object>> plannedSteps = (List<Map<String, Object>>) parsed.get("steps");
-                    if (plannedSteps != null) {
-                        for (Map<String, Object> step : plannedSteps) {
-                            wroteAction |= appendStepAction(sb, step);
-                        }
-                    }
-                }
-                continue;
-            }
-            if (!"step_finished".equals(type) && !"manual_action_executed".equals(type)) continue;
-            @SuppressWarnings("unchecked")
-            Map<String, Object> parsed = (Map<String, Object>) event.get("parsedAction");
-            if (parsed == null) continue;
-            wroteAction |= appendStepAction(sb, parsed);
+        List<Map<String, Object>> finalizedActions = collectFinalizedActions(events);
+        for (Map<String, Object> action : finalizedActions) {
+            wroteAction |= appendStepAction(sb, action);
         }
         if (!wroteAction) {
             sb.append("  // No recorded actions were available. Add steps manually.\n");
@@ -44,29 +28,7 @@ public final class AutomationScriptBuilderService {
 
     public static List<Map<String, Object>> buildTestSteps(List<Map<String, Object>> events) {
         List<Map<String, Object>> out = new ArrayList<>();
-        List<Map<String, Object>> rawActions = new ArrayList<>();
-        for (Map<String, Object> event : events) {
-            String type = String.valueOf(event.getOrDefault("eventType", ""));
-            if ("command_executed".equals(type) || "autonomous_turn_executed".equals(type)) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> parsed = (Map<String, Object>) event.get("parsedAction");
-                if (parsed != null) {
-                    @SuppressWarnings("unchecked")
-                    List<Map<String, Object>> plannedSteps = (List<Map<String, Object>>) parsed.get("steps");
-                    if (plannedSteps != null) {
-                        for (Map<String, Object> step : plannedSteps) {
-                            rawActions.add(copyAction(step));
-                        }
-                    }
-                }
-                continue;
-            }
-            if (!"step_finished".equals(type) && !"manual_action_executed".equals(type)) continue;
-            @SuppressWarnings("unchecked")
-            Map<String, Object> parsed = (Map<String, Object>) event.get("parsedAction");
-            if (parsed == null) continue;
-            rawActions.add(copyAction(parsed));
-        }
+        List<Map<String, Object>> rawActions = collectFinalizedActions(events);
 
         List<Map<String, Object>> compactedActions = compactTypingActions(rawActions);
         for (Map<String, Object> action : compactedActions) {
@@ -77,6 +39,144 @@ public final class AutomationScriptBuilderService {
             out.get(i).put("stepNumber", i + 1);
         }
         return out;
+    }
+
+    private static List<Map<String, Object>> collectFinalizedActions(List<Map<String, Object>> events) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (events == null || events.isEmpty()) return out;
+
+        boolean hasAutonomousStepEvents = hasEventType(events, "autonomous_step_executed");
+        Set<Integer> successfulAutonomousTurns = successfulAutonomousTurns(events);
+
+        for (Map<String, Object> event : events) {
+            if (event == null) continue;
+            String type = String.valueOf(event.getOrDefault("eventType", ""));
+            if ("autonomous_step_executed".equals(type)) {
+                Map<String, Object> parsed = asMap(event.get("parsedAction"));
+                if (parsed == null) continue;
+                if (!isPassedStatus(asText(parsed.get("status")))) continue;
+                Integer turn = asInteger(parsed.get("turn"));
+                if (turn != null && !successfulAutonomousTurns.isEmpty() && !successfulAutonomousTurns.contains(turn)) continue;
+                Map<String, Object> step = asMap(parsed.get("step"));
+                if (step != null) out.add(copyAction(step));
+                continue;
+            }
+            if ("autonomous_turn_executed".equals(type) && !hasAutonomousStepEvents) {
+                Map<String, Object> parsed = asMap(event.get("parsedAction"));
+                if (parsed == null || !isPassedStatus(asText(parsed.get("status")))) continue;
+                collectStepsFromBundle(out, parsed.get("steps"), parsed.get("results"));
+                continue;
+            }
+            if ("command_executed".equals(type)) {
+                Map<String, Object> parsed = asMap(event.get("parsedAction"));
+                Map<String, Object> execution = asMap(event.get("executionResult"));
+                if (isAutonomousEvent(parsed, execution)) continue;
+                if (parsed == null) continue;
+                collectStepsFromBundle(out, parsed.get("steps"), execution == null ? null : execution.get("results"));
+                continue;
+            }
+            if ("step_finished".equals(type) || "manual_action_executed".equals(type)) {
+                if (!eventPassedOrUnknown(event)) continue;
+                Map<String, Object> parsed = asMap(event.get("parsedAction"));
+                if (parsed == null) continue;
+                out.add(copyAction(parsed));
+            }
+        }
+        return out;
+    }
+
+    private static void collectStepsFromBundle(List<Map<String, Object>> out, Object stepsObj, Object resultsObj) {
+        List<Map<String, Object>> steps = asListOfMaps(stepsObj);
+        if (steps.isEmpty()) return;
+
+        List<Map<String, Object>> results = asListOfMaps(resultsObj);
+        if (results.isEmpty()) {
+            for (Map<String, Object> step : steps) {
+                out.add(copyAction(step));
+            }
+            return;
+        }
+
+        int bound = Math.min(steps.size(), results.size());
+        for (int i = 0; i < bound; i++) {
+            if (isPassedStatus(asText(results.get(i).get("status")))) {
+                out.add(copyAction(steps.get(i)));
+            }
+        }
+    }
+
+    private static boolean eventPassedOrUnknown(Map<String, Object> event) {
+        Map<String, Object> execution = asMap(event.get("executionResult"));
+        if (execution == null) return true;
+        String status = asText(execution.get("status"));
+        if (status.isBlank()) return true;
+        return isPassedStatus(status);
+    }
+
+    private static boolean hasEventType(List<Map<String, Object>> events, String type) {
+        for (Map<String, Object> event : events) {
+            if (event == null) continue;
+            String currentType = String.valueOf(event.getOrDefault("eventType", ""));
+            if (type.equals(currentType)) return true;
+        }
+        return false;
+    }
+
+    private static Set<Integer> successfulAutonomousTurns(List<Map<String, Object>> events) {
+        Set<Integer> turns = new HashSet<>();
+        for (Map<String, Object> event : events) {
+            if (event == null) continue;
+            String type = String.valueOf(event.getOrDefault("eventType", ""));
+            if (!"autonomous_turn_executed".equals(type)) continue;
+            Map<String, Object> parsed = asMap(event.get("parsedAction"));
+            if (parsed == null) continue;
+            if (!isPassedStatus(asText(parsed.get("status")))) continue;
+            Integer turn = asInteger(parsed.get("turn"));
+            if (turn != null) turns.add(turn);
+        }
+        return turns;
+    }
+
+    private static boolean isAutonomousEvent(Map<String, Object> parsed, Map<String, Object> execution) {
+        if ("autonomous".equalsIgnoreCase(asText(parsed == null ? null : parsed.get("mode")))) return true;
+        return "autonomous".equalsIgnoreCase(asText(execution == null ? null : execution.get("mode")));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asMap(Object value) {
+        if (value instanceof Map<?, ?> mapValue) {
+            return (Map<String, Object>) mapValue;
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> asListOfMaps(Object value) {
+        if (!(value instanceof List<?> rawList)) return List.of();
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object item : rawList) {
+            if (item instanceof Map<?, ?> mapItem) {
+                out.add((Map<String, Object>) mapItem);
+            }
+        }
+        return out;
+    }
+
+    private static boolean isPassedStatus(String status) {
+        if (status == null) return false;
+        String normalized = status.trim().toLowerCase();
+        return "passed".equals(normalized) || "success".equals(normalized);
+    }
+
+    private static Integer asInteger(Object value) {
+        if (value instanceof Number number) return number.intValue();
+        String text = asText(value);
+        if (text.isBlank()) return null;
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     private static boolean appendStepAction(StringBuilder sb, Map<String, Object> parsed) {
