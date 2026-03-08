@@ -454,7 +454,7 @@ public final class TesboReportsService {
             }
             String subject = "[Tesbo Alert Test] " + rs.getString("name");
             String body = """
-                This is a test alert from BetterCases Tesbo Reports.
+                This is a test alert from TesboX Tesbo Reports.
 
                 Project: %s
                 Rule: %s

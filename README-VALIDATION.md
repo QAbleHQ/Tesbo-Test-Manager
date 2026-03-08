@@ -1,6 +1,6 @@
 # 🔍 Tesbo UI/UX Validation Toolkit
 
-> **Goal**: Compare portal.tesbo.io run-report pages with localhost BetterCasesv3 implementation
+> **Goal**: Compare portal.tesbo.io run-report pages with localhost TesboXv3 implementation
 
 ---
 

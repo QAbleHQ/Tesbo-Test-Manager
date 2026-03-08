@@ -42,6 +42,14 @@ public final class AutomationIntentParserService {
 
     private static final Pattern ABS_URL_PATTERN = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
     private static final Pattern DOMAIN_PATTERN = Pattern.compile("\\b([a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}(/\\S*)?\\b");
+    private static final Set<String> SUPPORTED_ACTIONS = Set.of(
+            "navigate",
+            "click",
+            "type",
+            "assert_visible",
+            "assert_text",
+            "assert_clickable"
+    );
 
     public static void ensureAiConfigured(UUID projectId) {
         Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
@@ -52,7 +60,13 @@ public final class AutomationIntentParserService {
         }
     }
 
-    public static AutomationContracts.ActionPlan plan(UUID projectId, String command, String currentUrl, String pageText) {
+    public static AutomationContracts.ActionPlan plan(
+            UUID projectId,
+            String command,
+            String currentUrl,
+            String pageText,
+            String domPlanningContext
+    ) {
         String raw = command == null ? "" : command.trim();
         if (raw.isBlank()) {
             throw new io.javalin.http.BadRequestResponse("command is required");
@@ -66,15 +80,25 @@ public final class AutomationIntentParserService {
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
 
         try {
-            AutomationContracts.ActionPlan aiPlan = interpretWithAi(provider, apiKey, model, raw, currentUrl, pageText);
+            AutomationContracts.ActionPlan aiPlan = interpretWithAi(provider, apiKey, model, raw, currentUrl, pageText, domPlanningContext);
             normalizePlan(aiPlan);
+            ensurePlanQuality(aiPlan, false, 0);
             if (aiPlan.requiresClarification || (aiPlan.steps != null && !aiPlan.steps.isEmpty())) {
                 return aiPlan;
             }
         } catch (Exception ignored) {
             // fallback if provider is unavailable or parsing failed
         }
-        return heuristicFallback(raw);
+        AutomationContracts.ActionPlan fallback = heuristicFallback(raw);
+        normalizePlan(fallback);
+        try {
+            ensurePlanQuality(fallback, false, 0);
+            return fallback;
+        } catch (Exception ignored) {
+            return clarificationPlan(
+                    "I could not build a reliable plan from this command. Please mention the exact button/field text visible on the page."
+            );
+        }
     }
 
     public static AutomationContracts.ActionPlan planAutonomousTurn(
@@ -82,6 +106,7 @@ public final class AutomationIntentParserService {
             String objective,
             String currentUrl,
             String pageText,
+            String domPlanningContext,
             List<String> executionHistory,
             int remainingStepBudget
     ) {
@@ -107,17 +132,21 @@ public final class AutomationIntentParserService {
                     goal,
                     currentUrl,
                     pageText,
+                    domPlanningContext,
                     history,
                     safeBudget
             );
             normalizePlan(aiPlan);
+            ensurePlanQuality(aiPlan, true, safeBudget);
             if (aiPlan.requiresClarification || aiPlan.goalAchieved || (aiPlan.steps != null && !aiPlan.steps.isEmpty())) {
                 return aiPlan;
             }
         } catch (Exception ignored) {
             // fallback if provider is unavailable or parsing failed
         }
-        return heuristicFallback(goal);
+        return clarificationPlan(
+                "I could not derive a reliable next action from the current page. Please provide the exact visible label to click or type into."
+        );
     }
 
     public static AutomationContracts.ActionPlan planAutonomousBootstrapTurn(
@@ -125,6 +154,7 @@ public final class AutomationIntentParserService {
             String objective,
             String currentUrl,
             String pageText,
+            String domPlanningContext,
             List<String> executionHistory,
             int remainingStepBudget
     ) {
@@ -150,33 +180,65 @@ public final class AutomationIntentParserService {
                     goal,
                     currentUrl,
                     pageText,
+                    domPlanningContext,
                     history,
                     safeBudget
             );
             normalizePlan(aiPlan);
+            ensurePlanQuality(aiPlan, true, safeBudget);
             return aiPlan;
         } catch (Exception ignored) {
             // fallback if provider is unavailable or parsing failed
         }
-        return heuristicBootstrap(goal, pageText);
+        AutomationContracts.ActionPlan fallback = heuristicBootstrap(goal, pageText);
+        normalizePlan(fallback);
+        try {
+            ensurePlanQuality(fallback, true, safeBudget);
+            return fallback;
+        } catch (Exception ignored) {
+            return clarificationPlan(
+                    "I could not bootstrap a reliable autonomous turn. Please provide one exact starter action with visible UI text."
+            );
+        }
     }
 
-    private static AutomationContracts.ActionPlan interpretWithAi(String provider, String apiKey, String model, String command, String currentUrl, String pageText) throws Exception {
+    private static AutomationContracts.ActionPlan interpretWithAi(
+            String provider,
+            String apiKey,
+            String model,
+            String command,
+            String currentUrl,
+            String pageText,
+            String domPlanningContext
+    ) throws Exception {
         String prompt = """
-                You are an AI-driven autonomous browser planner.
-                Understand current page context first, then infer user intent, then decide the minimum reliable number of steps.
-                Convert the user command into JSON only.
-                Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
-                Prioritize user-requested actions over generic safety checks.
-                Do NOT add extra verification/assertion steps unless:
-                - the user explicitly asks to verify/assert/check, OR
-                - one focused assertion is required to confirm objective completion.
-                Avoid pre-checking every step; keep plans lean and action-first.
-                If needed info is missing, set requiresClarification=true and ask one clear question.
-                If user says open/go to a domain like google.com, infer navigate URL with https://.
-                Keep selectors practical (prefer role/text/testid style where possible).
-                When similar elements may exist, make targetDescription uniquely identifying
-                (include nearby heading/section/dialog/form context and control type).
+                You are a senior test automation engineer operating an autonomous browser agent.
+                Your approach mirrors how a skilled human QA engineer would interact with a web application.
+
+                ## Your Approach
+                1) **Understand context first**: Read the current page carefully — headings, navigation, forms,
+                   buttons, links — to build a mental model of where you are in the application.
+                2) **Infer user intent**: Go beyond literal commands. Understand what the user is really trying to test.
+                   If they say "login", that implies navigating to login, filling credentials, submitting, and verifying success.
+                3) **Navigate naturally**: A real human reads labels, finds navigation menus, clicks through logical paths.
+                   Do the same — don't guess at URLs or selectors; use what's visible on the page.
+                4) **Plan the minimum reliable steps** to accomplish the goal.
+
+                ## Rules
+                - Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
+                - Prioritize user-requested actions over generic safety checks.
+                - Only add assertions when the user explicitly requests them OR one focused assertion confirms objective completion.
+                - Keep plans lean and action-first.
+                - If needed info is missing, set requiresClarification=true and ask one clear question.
+                - If user says open/go to a domain like google.com, infer navigate URL with https://.
+                - Keep selectors practical (prefer role/text/testid style where possible).
+                - When similar elements exist, make targetDescription uniquely identifying
+                  (include nearby heading/section/dialog/form context and control type).
+                - For assertions, use concrete DOM-grounded labels/text only (e.g. "Agencies", "New Agency", "Profile").
+                - Never output abstract placeholders like "Dashboard or user profile element indicating successful login".
+                - When entering data into forms, use the test data values provided in the command if available.
+                  If no specific test data is provided, use realistic values that match the field context.
+
                 Output JSON schema exactly:
                 {
                   "requiresClarification": boolean,
@@ -196,10 +258,12 @@ public final class AutomationIntentParserService {
                 }
                 Current URL: %s
                 Visible page text snippet: %s
+                Structured DOM context: %s
                 User command: %s
                 """.formatted(
                 currentUrl == null ? "" : currentUrl,
                 pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2000)),
+                domPlanningContext == null ? "" : domPlanningContext.substring(0, Math.min(domPlanningContext.length(), 2200)),
                 command
         );
 
@@ -219,27 +283,74 @@ public final class AutomationIntentParserService {
             String objective,
             String currentUrl,
             String pageText,
+            String domPlanningContext,
             List<String> executionHistory,
             int remainingStepBudget
     ) throws Exception {
         String historySnippet = buildHistorySnippet(executionHistory);
         String prompt = """
-                You are an autonomous browser agent running in a think-act-observe loop.
-                Decide ONLY the next best actions for this turn.
+                You are a senior test automation engineer operating an autonomous browser agent in a think-act-observe loop.
+                You explore and interact with the application the way a real human tester would.
 
-                Rules:
-                1) First infer whether the objective is already achieved from current page context.
-                2) If achieved, return goalAchieved=true with no steps.
-                3) If not achieved, return a short actionable step list for this turn only.
-                4) Prefer robust selectors and disambiguated targetDescription.
-                5) Keep this turn within the remaining step budget.
-                6) If previous turn failed, try an alternative strategy in this turn.
-                7) Do not return assertion-only steps when no meaningful user action has been executed yet.
-                8) Do not add generic validation that user did not request. Assertions are allowed only when
-                   explicitly requested or when needed to confirm final objective completion.
-                9) If target text is likely ambiguous, include context in targetDescription
-                   (for example: "Save button in Profile section", "Email field in Login form").
-                10) Return valid JSON only.
+                ## Your Approach (Think Like a Human Tester)
+                Before deciding actions, mentally walk through this:
+                a) **Where am I?** — Read the page: title, breadcrumbs, navigation, headings, forms, and visible content.
+                b) **What am I trying to do?** — Relate the current page state to the overall objective.
+                   The objective contains numbered steps — identify which steps are DONE vs REMAINING.
+                c) **What should I do next?** — Choose the next INCOMPLETE step from the objective.
+                d) **What do I expect to happen?** — Anticipate the result to validate progress.
+
+                ## CRITICAL: Goal Completion Rules
+                - The objective contains a list of test case steps. You MUST complete ALL of them.
+                - Review the execution history and cross-reference it against the objective steps.
+                - Login/authentication is NEVER the final goal — it is only a prerequisite.
+                - Do NOT set goalAchieved=true after only completing login or the first step.
+                - Only set goalAchieved=true when you have executed actions for EVERY step in the objective.
+                - If the objective has a "Completion Checklist", ALL items must be addressed.
+                - Count the steps in the objective and count how many you've completed in the history.
+                  If completed < total, goalAchieved MUST be false.
+
+                ## Test Data Usage
+                - The objective may contain a "Test Data" section with specific values the user provided.
+                - You MUST use these exact values when filling forms or providing input.
+                - Do NOT substitute test data with made-up values when the objective provides specific data.
+
+                ## Rules
+                1) First, analyze execution history to determine which objective steps are DONE vs REMAINING.
+                2) If ALL objective steps are completed AND verified, return goalAchieved=true.
+                3) If steps remain, do DOM-first planning for the NEXT incomplete step:
+                   - Read the page like a human: scan headings, navigation, forms, buttons, and links.
+                   - Identify exact visible labels/text from current page context.
+                   - Prefer controls by role/name/label/testid first, then css/xpath only if needed.
+                   - Build short, concrete targetDescription using only on-screen words.
+                4) Return a short actionable step list for this turn only.
+                5) For click/type/assert steps, targetDescription must be concise and locator-friendly:
+                   - 2-8 words max
+                   - no narrative phrases like "on login page", "at bottom", "for password recovery"
+                   - examples: "Forgot Password?", "Email", "Reset Password", "Back to Login"
+                6) If page has multiple similar elements, disambiguate with compact context in the same phrase
+                   using visible section text (example: "Email in Reset Password form").
+                7) Keep this turn within the remaining step budget.
+                8) If previous turn failed, try an alternative strategy — a real human would try a different
+                   approach: look for alternative navigation paths, try different labels, scroll to find elements,
+                   or explore menus they haven't checked yet.
+                9) Do not return assertion-only steps when no meaningful user action has been executed yet.
+                10) Do not add generic validation that user did not request. Assertions are allowed only when
+                    explicitly requested or when needed to confirm final objective completion.
+                11) If target text is likely ambiguous, include context in targetDescription
+                    (for example: "Save button in Profile section", "Email field in Login form").
+                12) Navigate the application naturally:
+                    - Use navigation menus, breadcrumbs, and links to find features instead of guessing URLs.
+                    - Read form labels to understand what data to enter.
+                    - When a form requires data, use the values from the Test Data section of the objective.
+                      If no test data is provided, use realistic values matching the field context.
+                    - After submitting forms or clicking actions, observe what changed on the page.
+                    - If a page has tabs or sections, check which tab/section is relevant to the objective.
+                13) Return valid JSON only.
+                14) For verification steps, only use concrete UI text/labels present in the visible snippet.
+                    Do not use abstract wording like "successful login indicator" as targetDescription/expectedText.
+                15) When unsure of exact selector, set selector=null and rely on a precise targetDescription
+                    grounded in currently visible DOM text.
 
                 Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
                 If exact CSS selector is uncertain, prefer selector=null and provide targetDescription
@@ -269,13 +380,15 @@ public final class AutomationIntentParserService {
                 Remaining step budget: %s
                 Current URL: %s
                 Visible page text snippet: %s
+                Structured DOM context: %s
                 Execution history (oldest to newest):
                 %s
                 """.formatted(
                 objective,
                 remainingStepBudget,
                 currentUrl == null ? "" : currentUrl,
-                pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2200)),
+                pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 3000)),
+                domPlanningContext == null ? "" : domPlanningContext.substring(0, Math.min(domPlanningContext.length(), 3000)),
                 historySnippet
         );
 
@@ -295,23 +408,44 @@ public final class AutomationIntentParserService {
             String objective,
             String currentUrl,
             String pageText,
+            String domPlanningContext,
             List<String> executionHistory,
             int remainingStepBudget
     ) throws Exception {
         String historySnippet = buildHistorySnippet(executionHistory);
         String prompt = """
-                You are an autonomous browser agent bootstrap planner.
-                Previous turns were non-actionable. You MUST return an actionable starter turn.
+                You are a senior test automation engineer in recovery mode. Previous turns were non-actionable.
+                You MUST return an actionable starter turn to get the test back on track.
+
+                ## Recovery Strategy (Think Like a Human)
+                When a human tester gets stuck, they:
+                - Look around the page for any interactive elements they haven't tried.
+                - Try clicking navigation menus, tabs, or sidebar links to explore.
+                - Look for search functionality to find what they need.
+                - Try scrolling down to find elements below the fold.
+                - Check if there's a different path to reach the same feature.
+
+                Apply this same exploratory mindset.
 
                 Hard requirements:
                 1) Return 1-4 steps only.
                 2) Include at least one non-assert action: navigate, click, or type.
                 3) Do NOT return assertion-only steps.
-                4) Prefer targetDescription when selector is uncertain.
-                5) Keep to the remaining step budget.
-                6) Keep steps action-first and avoid unrequested generic checks.
-                7) If UI likely has similar elements, make targetDescription uniquely identifying with context.
-                8) Return valid JSON only.
+                4) Do DOM-first planning before choosing steps:
+                   - Read the page carefully — headings, navigation, menus, forms, buttons, links.
+                   - Infer exact visible labels from current page context.
+                   - Prefer role/name/label/testid semantics over brittle selectors.
+                5) Prefer targetDescription when selector is uncertain.
+                6) targetDescription must be concise (2-8 words), concrete, and based on visible UI text.
+                7) Keep to the remaining step budget.
+                8) Keep steps action-first and avoid unrequested generic checks.
+                9) If UI likely has similar elements, make targetDescription uniquely identifying with compact context.
+                10) Navigate naturally like a human recovering from a dead end:
+                    - If expected control is missing, explore plausible alternatives (menus, sidebars, search).
+                    - Try different navigation paths to reach the same goal.
+                    - Pick the next safest actionable step instead of repeating the same brittle target.
+                    - Use visible text and layout cues to decide what to try next.
+                11) Return valid JSON only.
 
                 Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
 
@@ -339,6 +473,7 @@ public final class AutomationIntentParserService {
                 Remaining step budget: %s
                 Current URL: %s
                 Visible page text snippet: %s
+                Structured DOM context: %s
                 Execution history (oldest to newest):
                 %s
                 """.formatted(
@@ -346,6 +481,7 @@ public final class AutomationIntentParserService {
                 remainingStepBudget,
                 currentUrl == null ? "" : currentUrl,
                 pageText == null ? "" : pageText.substring(0, Math.min(pageText.length(), 2200)),
+                domPlanningContext == null ? "" : domPlanningContext.substring(0, Math.min(domPlanningContext.length(), 2200)),
                 historySnippet
         );
 
@@ -384,7 +520,7 @@ public final class AutomationIntentParserService {
     private static String callAnthropic(String apiKey, String model, String prompt) throws Exception {
         ObjectNode body = mapper.createObjectNode();
         body.put("model", model);
-        body.put("max_tokens", 1500);
+        body.put("max_tokens", 2500);
         body.put("temperature", 0.1);
         ArrayNode messages = body.putArray("messages");
         messages.addObject().put("role", "user").put("content", prompt);
@@ -468,6 +604,75 @@ public final class AutomationIntentParserService {
                 step.expectedText = step.targetDescription;
             }
         }
+    }
+
+    private static void ensurePlanQuality(AutomationContracts.ActionPlan plan, boolean autonomousMode, int remainingStepBudget) {
+        if (plan == null) {
+            throw new IllegalStateException("Planner returned no plan.");
+        }
+        if (plan.requiresClarification) {
+            if (plan.clarificationQuestion == null || plan.clarificationQuestion.isBlank()) {
+                plan.clarificationQuestion = "Please clarify the exact action and visible UI target.";
+            }
+            return;
+        }
+        if (plan.goalAchieved && (plan.steps == null || plan.steps.isEmpty())) {
+            return;
+        }
+        if (plan.steps == null || plan.steps.isEmpty()) {
+            throw new IllegalStateException("Planner returned an empty step list.");
+        }
+        if (autonomousMode && remainingStepBudget > 0 && plan.steps.size() > remainingStepBudget) {
+            throw new IllegalStateException("Planner exceeded remaining step budget.");
+        }
+        for (AutomationContracts.ActionStep step : plan.steps) {
+            if (step == null) {
+                throw new IllegalStateException("Planner returned an invalid step.");
+            }
+            String action = step.action == null ? "" : step.action.trim().toLowerCase(Locale.ROOT);
+            if (!SUPPORTED_ACTIONS.contains(action)) {
+                throw new IllegalStateException("Unsupported planner action: " + action);
+            }
+            if ("navigate".equals(action)) {
+                if (step.url == null || step.url.isBlank()) {
+                    throw new IllegalStateException("Navigate step is missing url.");
+                }
+                continue;
+            }
+            if ("type".equals(action) && (step.value == null || step.value.isBlank())) {
+                throw new IllegalStateException("Type step is missing value.");
+            }
+            if ("assert_text".equals(action)) {
+                if (isBlank(step.expectedText) && isBlank(step.selector)) {
+                    throw new IllegalStateException("assert_text step needs expectedText or selector.");
+                }
+                continue;
+            }
+            if (!hasTargetSignal(step)) {
+                throw new IllegalStateException("Step target is ambiguous for action: " + action);
+            }
+        }
+    }
+
+    private static boolean hasTargetSignal(AutomationContracts.ActionStep step) {
+        return !isBlank(step.selector) || !isBlank(step.targetDescription) || !isBlank(step.expectedText);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isBlank();
+    }
+
+    private static AutomationContracts.ActionPlan clarificationPlan(String question) {
+        AutomationContracts.ActionPlan plan = new AutomationContracts.ActionPlan();
+        plan.commandId = UUID.randomUUID().toString();
+        plan.requiresClarification = true;
+        plan.clarificationQuestion = question == null || question.isBlank()
+                ? "Please clarify the action you want to perform in the browser."
+                : question;
+        plan.goalAchieved = false;
+        plan.completionReason = "";
+        plan.steps = new ArrayList<>();
+        return plan;
     }
 
     private static AutomationContracts.ActionPlan heuristicFallback(String raw) {
@@ -582,17 +787,18 @@ public final class AutomationIntentParserService {
     }
 
     private static String buildHistorySnippet(List<String> executionHistory) {
-        if (executionHistory == null || executionHistory.isEmpty()) return "(none)";
-        int start = Math.max(0, executionHistory.size() - 20);
+        if (executionHistory == null || executionHistory.isEmpty()) return "(none — no steps executed yet)";
+        int start = Math.max(0, executionHistory.size() - 40);
         StringBuilder sb = new StringBuilder();
+        sb.append("(").append(executionHistory.size()).append(" actions executed so far)\n");
         for (int i = start; i < executionHistory.size(); i++) {
             String row = executionHistory.get(i);
             if (row == null || row.isBlank()) continue;
             sb.append("- ").append(row).append("\n");
         }
         String out = sb.toString().trim();
-        if (out.isBlank()) return "(none)";
-        return out.length() > 3000 ? out.substring(out.length() - 3000) : out;
+        if (out.isBlank()) return "(none — no steps executed yet)";
+        return out.length() > 5000 ? out.substring(out.length() - 5000) : out;
     }
 
     private static String resolveApiKey(String provider, Map<String, String> aiConfig) {

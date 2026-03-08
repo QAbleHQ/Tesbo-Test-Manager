@@ -1,4 +1,4 @@
-name: Deploy BetterCases to DigitalOcean
+name: Deploy TesboX to DigitalOcean
 
 on:
   workflow_dispatch:

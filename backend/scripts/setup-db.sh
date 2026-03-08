@@ -2,7 +2,7 @@
 # Creates PostgreSQL role "postgres" and database "bettercases" (when you have a superuser).
 # If you get "permission denied", use Docker instead: from project root run: docker compose up -d
 set -e
-echo "Setting up PostgreSQL for BetterCases..."
+echo "Setting up PostgreSQL for TesboX..."
 if ! psql -d postgres -v ON_ERROR_STOP=1 -c "
 DO \$\$
 BEGIN

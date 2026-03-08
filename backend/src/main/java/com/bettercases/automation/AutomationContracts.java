@@ -37,6 +37,7 @@ public final class AutomationContracts {
         public String script;
         public Integer scriptVersion;
         public String startUrl;
+        public Integer actionDelayMs;
     }
 
     public static class ActionPlan {
@@ -73,6 +74,9 @@ public final class AutomationContracts {
         public String status;
         public String currentUrl;
         public String selectorUsed;
+        public String resolvedLocatorType;
+        public java.util.List<java.util.Map<String, Object>> locatorCandidatesTried;
+        public java.util.List<String> waitsApplied;
         public java.util.Map<String, Object> highlight;
         public String message;
         public String screenshotPath;

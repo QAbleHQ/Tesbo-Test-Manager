@@ -168,8 +168,8 @@ public final class InvitationService {
 
     private static void sendWorkspaceInvitationEmail(String email, String organizationName, String token) {
         String link = Config.FRONTEND_URL + "/invite/" + token;
-        String subject = "You are invited to join " + organizationName + " on BetterCases";
-        String body = "You have been invited to join the workspace \"" + organizationName + "\" on BetterCases.\n\n"
+        String subject = "You are invited to join " + organizationName + " on TesboX";
+        String body = "You have been invited to join the workspace \"" + organizationName + "\" on TesboX.\n\n"
                 + "Open this secure invite link to join:\n"
                 + link + "\n\n"
                 + "This invitation expires in " + INVITATION_EXPIRY_HOURS + " hours.";

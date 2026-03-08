@@ -1,6 +1,7 @@
 package com.bettercases.automation;
 
 import com.bettercases.Config;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.net.URI;
@@ -14,6 +15,9 @@ import java.util.UUID;
 
 public final class AutomationAgentClient {
     private static final ObjectMapper mapper = new ObjectMapper();
+    static {
+        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
     private static final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
@@ -88,11 +92,12 @@ public final class AutomationAgentClient {
         }
     }
 
-    public static Map<String, Object> runPlaywrightScriptInSession(UUID sessionId, UUID executionId, String script, String startUrl) {
+    public static Map<String, Object> runPlaywrightScriptInSession(UUID sessionId, UUID executionId, String script, String startUrl, Integer actionDelayMs) {
         String body = send("/internal/sessions/" + sessionId + "/run-script", "POST", Map.of(
                 "executionId", executionId.toString(),
                 "script", script == null ? "" : script,
-                "startUrl", startUrl == null ? "" : startUrl
+                "startUrl", startUrl == null ? "" : startUrl,
+                "actionDelayMs", actionDelayMs == null ? 0 : Math.max(0, actionDelayMs)
         ), Duration.ofSeconds(300));
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});

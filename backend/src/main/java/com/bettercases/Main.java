@@ -102,6 +102,7 @@ public final class Main {
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/trace", AutomationSessionHandler::downloadLatestTrace);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/reset", AutomationSessionHandler::reset);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);

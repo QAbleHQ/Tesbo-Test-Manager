@@ -1,6 +1,6 @@
 # Action Contract (MVP)
 
-This contract is shared between BetterCases backend and `automation-agent`.
+This contract is shared between TesboX backend and `automation-agent`.
 
 ## ActionPlan
 

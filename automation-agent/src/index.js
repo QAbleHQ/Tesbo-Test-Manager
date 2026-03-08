@@ -105,7 +105,7 @@ app.post("/internal/playwright/run", async (req, res) => {
 
 app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
   const { sessionId } = req.params;
-  const { executionId, script, startUrl } = req.body || {};
+  const { executionId, script, startUrl, actionDelayMs } = req.body || {};
   if (!executionId || !script) {
     res.status(400).json({ error: "executionId and script are required" });
     return;
@@ -115,7 +115,8 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
       sessionId,
       String(executionId),
       String(script),
-      typeof startUrl === "string" ? startUrl : null
+      typeof startUrl === "string" ? startUrl : null,
+      Number.isFinite(Number(actionDelayMs)) ? Number(actionDelayMs) : 0
     );
     res.json(result);
   } catch (err) {

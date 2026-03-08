@@ -98,6 +98,7 @@ function buildSessionState(sessionId, browser, context, page) {
     currentUrl: page.url(),
     lastScreenshotPath: null,
     lastVideoPath: null,
+    lastTracePath: null,
     events: [],
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -158,6 +159,7 @@ async function resetSession(sessionId, startUrl) {
   currentSession.currentUrl = page.url();
   currentSession.lastScreenshotPath = null;
   currentSession.lastVideoPath = null;
+  currentSession.lastTracePath = null;
   currentSession.updatedAt = nowIso();
   await takeScreenshot(currentSession).catch(() => {});
   pushEvent(currentSession, {
@@ -178,6 +180,18 @@ async function takeScreenshot(session) {
   session.lastScreenshotPath = outputPath;
   session.updatedAt = nowIso();
   return outputPath;
+}
+
+async function takeScreenshotSafe(session, timeoutMs = 5000) {
+  try {
+    const bounded = await Promise.race([
+      takeScreenshot(session),
+      new Promise((resolve) => setTimeout(() => resolve(null), Math.max(500, timeoutMs))),
+    ]);
+    return typeof bounded === "string" && bounded ? bounded : session.lastScreenshotPath || null;
+  } catch {
+    return session.lastScreenshotPath || null;
+  }
 }
 
 async function takeStandaloneScreenshot(page, id) {
@@ -479,8 +493,9 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
   };
 }
 
-async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null) {
+async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null, actionDelayMs = 0) {
   await ensureScreenshotDir();
+  await ensureTraceDir();
   const session = getSession(sessionId);
   if (!session) {
     throw new Error("Session not found");
@@ -490,13 +505,18 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
   let status = "passed";
   let errorMessage = null;
   let screenshotPath = null;
+  let tracePath = null;
   let currentUrl = session.currentUrl || "";
   let stepCounter = 0;
+  const normalizedActionDelayMs = Math.max(0, Math.min(5000, Number(actionDelayMs) || 0));
   const recordStep = async (action, detail, fn) => {
     const stepStartedAt = Date.now();
     const stepId = `step-${++stepCounter}`;
     try {
       const result = await fn();
+      if (normalizedActionDelayMs > 0) {
+        await session.page.waitForTimeout(normalizedActionDelayMs);
+      }
       const stepScreenshotPath = await takeScreenshot(session).catch(() => null);
       logs.push({
         kind: "step",
@@ -528,6 +548,7 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
   };
 
   try {
+    await session.context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
     if (startUrl) {
       await navigateToStartUrl(session.page, startUrl);
     }
@@ -551,6 +572,12 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
       message: errorMessage,
       ts: new Date().toISOString(),
     });
+  } finally {
+    tracePath = path.join(config.traceDir, `${executionId}-${Date.now()}.zip`);
+    await session.context.tracing.stop({ path: tracePath }).catch(() => {
+      tracePath = null;
+    });
+    session.lastTracePath = tracePath;
   }
 
   pushEvent(session, {
@@ -567,6 +594,7 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
     currentUrl,
     logs,
     screenshotPath,
+    tracePath,
     errorMessage,
     durationMs: Date.now() - startedAt,
   };
@@ -747,12 +775,14 @@ function buildLocatorCandidates(page, rawTarget, actionType = "click") {
     candidates.push({ label: `selector:${raw}`, locator: page.locator(raw), strict: true });
   }
 
+  // Prefer explicit automation hooks first.
+  candidates.push({ label: `testid:${textTarget}`, locator: page.getByTestId(regex), strict: true });
+
   // Natural-language candidates for unknown layouts/frameworks.
   candidates.push({ label: `label-exact:${textTarget}`, locator: page.getByLabel(exactRegex), strict: true });
   candidates.push({ label: `label:${textTarget}`, locator: page.getByLabel(regex), strict: false });
   candidates.push({ label: `placeholder-exact:${textTarget}`, locator: page.getByPlaceholder(exactRegex), strict: true });
   candidates.push({ label: `placeholder:${textTarget}`, locator: page.getByPlaceholder(regex), strict: false });
-  candidates.push({ label: `testid:${textTarget}`, locator: page.getByTestId(regex), strict: true });
   if (actionType === "type") {
     candidates.push({ label: `role:textbox-exact:${textTarget}`, locator: page.getByRole("textbox", { name: exactRegex }), strict: true });
     candidates.push({ label: `role:textbox:${textTarget}`, locator: page.getByRole("textbox", { name: regex }), strict: false });
@@ -775,16 +805,164 @@ function buildLocatorCandidates(page, rawTarget, actionType = "click") {
   return candidates;
 }
 
+function buildTargetVariants(rawTarget) {
+  const raw = String(rawTarget || "").trim();
+  if (!raw) return [];
+  const variants = [];
+  const seen = new Set();
+  const push = (value) => {
+    const normalized = String(value || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    variants.push(normalized);
+  };
+
+  push(raw);
+
+  const stripped = stripSurroundingQuotes(normalizeTargetText(raw));
+  push(stripped);
+  push(stripped.replace(/^the\s+/i, ""));
+
+  // Prefer concise UI labels over narrative descriptions.
+  const compact = stripped.replace(/\s+\b(on|in|at|from|for|within|inside|under|near)\b.+$/i, "");
+  push(compact);
+
+  for (const part of stripped.split(/\s+\bor\b\s+/i)) push(part);
+  for (const part of stripped.split(/[|,/]/)) push(part);
+
+  const quoted = stripped.match(/"([^"]+)"|'([^']+)'/g) || [];
+  for (const token of quoted) push(token.replace(/^['"]|['"]$/g, ""));
+
+  return variants.slice(0, 8);
+}
+
+async function resolveLocatorFromTargetVariants(page, rawTarget, actionType, timeout) {
+  const variants = buildTargetVariants(rawTarget);
+  const aggregateTried = [];
+  let firstAmbiguity = null;
+
+  for (const variant of variants) {
+    const candidates = buildLocatorCandidates(page, variant, actionType);
+    const resolved = await resolveUsableLocator(page, candidates, timeout);
+    const scopedTried = (resolved?.tried || []).map((entry) => ({
+      ...entry,
+      targetVariant: variant,
+    }));
+    aggregateTried.push(...scopedTried);
+    if (resolved?.locator) {
+      return {
+        ...resolved,
+        targetVariant: variant,
+        tried: aggregateTried,
+      };
+    }
+    if (resolved?.ambiguityError && !firstAmbiguity) {
+      firstAmbiguity = resolved.ambiguityError;
+    }
+  }
+
+  return {
+    locator: null,
+    ambiguityError: firstAmbiguity,
+    tried: aggregateTried,
+  };
+}
+
+async function analyzeStepDom(page, step, rawTarget) {
+  const variants = buildTargetVariants(rawTarget);
+  const domSummary = await page
+    .evaluate(() => {
+      const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
+        .map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 6);
+      const forms = document.querySelectorAll("form").length;
+      const visibleInputs = Array.from(document.querySelectorAll("input, textarea, select")).filter((el) => {
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden";
+      }).length;
+      const visibleButtons = Array.from(document.querySelectorAll("button, [role='button'], input[type='submit']")).filter((el) => {
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden";
+      }).length;
+      const visibleLinks = Array.from(document.querySelectorAll("a[href]")).filter((el) => {
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden";
+      }).length;
+      return {
+        url: window.location.href,
+        title: document.title || "",
+        headings,
+        forms,
+        visibleInputs,
+        visibleButtons,
+        visibleLinks,
+      };
+    })
+    .catch(() => ({
+      url: "",
+      title: "",
+      headings: [],
+      forms: 0,
+      visibleInputs: 0,
+      visibleButtons: 0,
+      visibleLinks: 0,
+    }));
+
+  const targetSignals = [];
+  for (const variant of variants.slice(0, 4)) {
+    const signal = { targetVariant: variant, textMatches: 0, roleButtonMatches: 0, roleLinkMatches: 0, labelMatches: 0 };
+    try {
+      signal.textMatches = await page.getByText(new RegExp(escapeForRegex(variant), "i")).count();
+    } catch {}
+    try {
+      signal.roleButtonMatches = await page.getByRole("button", { name: new RegExp(escapeForRegex(variant), "i") }).count();
+    } catch {}
+    try {
+      signal.roleLinkMatches = await page.getByRole("link", { name: new RegExp(escapeForRegex(variant), "i") }).count();
+    } catch {}
+    try {
+      signal.labelMatches = await page.getByLabel(new RegExp(escapeForRegex(variant), "i")).count();
+    } catch {}
+    targetSignals.push(signal);
+  }
+
+  return {
+    action: step?.action || "",
+    rawTarget: rawTarget || "",
+    targetVariants: variants,
+    domSummary,
+    targetSignals,
+  };
+}
+
+function inferLocatorKind(label) {
+  const normalized = String(label || "").toLowerCase();
+  if (!normalized) return "unknown";
+  if (normalized.startsWith("testid:")) return "testid";
+  if (normalized.startsWith("role:")) return "role";
+  if (normalized.startsWith("label:") || normalized.startsWith("label-exact:")) return "label";
+  if (normalized.startsWith("placeholder:") || normalized.startsWith("placeholder-exact:")) return "placeholder";
+  if (normalized.startsWith("text:") || normalized.startsWith("text-exact:")) return "text";
+  if (normalized.startsWith("selector:")) return "selector";
+  if (normalized.startsWith("xpath:")) return "xpath";
+  return "unknown";
+}
+
 async function resolveUsableLocator(page, candidates, timeout = 3000) {
   let bestAmbiguous = null;
+  const tried = [];
   for (const candidate of candidates) {
     try {
       const count = await candidate.locator.count();
+      tried.push({ label: candidate.label, count, strict: !!candidate.strict, error: null });
       if (!count || count < 1) continue;
       if (count === 1) {
         const only = candidate.locator.first();
         await only.waitFor({ state: "attached", timeout });
-        return { label: candidate.label, locator: only, candidateCount: count };
+        return { label: candidate.label, locator: only, candidateCount: count, tried };
       }
 
       const visibleMatches = [];
@@ -802,16 +980,41 @@ async function resolveUsableLocator(page, candidates, timeout = 3000) {
       if (!bestAmbiguous || candidate.strict) {
         bestAmbiguous = { label: candidate.label, count, strict: !!candidate.strict };
       }
-    } catch {
-      // try next candidate
+    } catch (error) {
+      tried.push({
+        label: candidate.label,
+        count: null,
+        strict: !!candidate.strict,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
   if (bestAmbiguous) {
     return {
       ambiguityError: `Ambiguous target matched ${bestAmbiguous.count} elements via ${bestAmbiguous.label}. Provide a more specific target description.`,
+      tried,
     };
   }
-  return null;
+  return { tried };
+}
+
+async function ensureActionable(locator, actionType, timeout = 4000) {
+  await locator.waitFor({ state: "visible", timeout });
+  if (actionType === "click" || actionType === "assert_clickable") {
+    const enabled = await locator.isEnabled({ timeout });
+    if (!enabled) throw new Error("Target is visible but not enabled");
+  }
+  if (actionType === "type") {
+    const editable = await locator
+      .evaluate((node) => {
+        if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement) {
+          return !node.disabled && !node.readOnly;
+        }
+        return typeof node === "object" && "isContentEditable" in node ? !!node.isContentEditable : false;
+      })
+      .catch(() => false);
+    if (!editable) throw new Error("Target is visible but not editable");
+  }
 }
 
 async function readTargetValue(page, targetSelector) {
@@ -854,6 +1057,11 @@ async function executeStep(session, commandId, step) {
   let selectorUsed = step.selector || step.targetDescription || null;
   let successMessage = "Step executed successfully";
   let highlight = null;
+  let resolvedLocatorType = "unknown";
+  let locatorCandidatesTried = [];
+  const waitsApplied = [];
+  let preStepAnalysis = null;
+  let preStepScreenshotPath = null;
   pushEvent(session, {
     type: "step_started",
     commandId,
@@ -862,6 +1070,19 @@ async function executeStep(session, commandId, step) {
   });
   try {
     const timeout = Number.isFinite(step.timeoutMs) ? step.timeoutMs : 10000;
+    const targetSeed = step.selector || step.targetDescription || step.expectedText || "";
+    preStepScreenshotPath = await takeScreenshotSafe(session, 5000);
+    preStepAnalysis = await analyzeStepDom(session.page, step, targetSeed);
+    waitsApplied.push("preStepDomAnalysis");
+    pushEvent(session, {
+      type: "step_dom_analyzed",
+      commandId,
+      stepId,
+      action: step.action,
+      preStepScreenshotPath,
+      analysis: preStepAnalysis,
+    });
+
     const snapshotState = async () =>
       session.page.evaluate(() => {
         const body = document.body;
@@ -896,27 +1117,33 @@ async function executeStep(session, commandId, step) {
 
     if (step.action === "navigate") {
       await session.page.goto(step.url, { waitUntil: "domcontentloaded", timeout });
+      waitsApplied.push("goto:domcontentloaded");
     } else if (step.action === "click") {
       const target = step.selector || step.targetDescription || step.expectedText || "";
-      const resolved = await resolveUsableLocator(session.page, buildLocatorCandidates(session.page, target, "click"), timeout);
-      if (!resolved) {
+      const resolved = await resolveLocatorFromTargetVariants(session.page, target, "click", timeout);
+      locatorCandidatesTried = resolved?.tried || [];
+      if (!resolved || !resolved.locator) {
+        if (resolved?.ambiguityError) throw new Error(resolved.ambiguityError);
         throw new Error(`Unable to locate clickable target: ${target}`);
       }
-      if (resolved.ambiguityError) {
-        throw new Error(resolved.ambiguityError);
-      }
       selectorUsed = resolved.label;
+      resolvedLocatorType = inferLocatorKind(resolved.label);
       highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
+      await ensureActionable(resolved.locator, "click", timeout);
+      waitsApplied.push("visible", "enabled");
       const before = await snapshotState().catch(() => null);
       await resolved.locator.click({ timeout }).catch(async () => {
         await resolved.locator.scrollIntoViewIfNeeded().catch(() => {});
+        waitsApplied.push("scrollIntoViewIfNeeded");
         await resolved.locator.click({ timeout });
       });
       await session.page.waitForTimeout(180).catch(() => {});
+      waitsApplied.push("postClickDelay:180ms");
       let after = await snapshotState().catch(() => null);
       if (!hasImpact(before, after)) {
         await resolved.locator.click({ timeout, force: true });
         await session.page.waitForTimeout(220).catch(() => {});
+        waitsApplied.push("forceClickFallback", "postClickDelay:220ms");
         after = await snapshotState().catch(() => null);
       }
       if (!hasImpact(before, after)) {
@@ -928,6 +1155,7 @@ async function executeStep(session, commandId, step) {
           }
         });
         await session.page.waitForTimeout(260).catch(() => {});
+        waitsApplied.push("domClickFallback", "postClickDelay:260ms");
         after = await snapshotState().catch(() => null);
       }
       if (!hasImpact(before, after)) {
@@ -936,16 +1164,18 @@ async function executeStep(session, commandId, step) {
     } else if (step.action === "type") {
       const value = step.value || "";
       const target = step.selector || step.targetDescription || step.expectedText || "";
-      const resolved = await resolveUsableLocator(session.page, buildLocatorCandidates(session.page, target, "type"), timeout);
-      if (!resolved) {
+      const resolved = await resolveLocatorFromTargetVariants(session.page, target, "type", timeout);
+      locatorCandidatesTried = resolved?.tried || [];
+      if (!resolved || !resolved.locator) {
+        if (resolved?.ambiguityError) throw new Error(resolved.ambiguityError);
         throw new Error(`Unable to locate input target: ${target}`);
       }
-      if (resolved.ambiguityError) {
-        throw new Error(resolved.ambiguityError);
-      }
       selectorUsed = resolved.label;
+      resolvedLocatorType = inferLocatorKind(resolved.label);
       highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
-      const beforeValue = await readTargetValue(session.page, step.selector);
+      await ensureActionable(resolved.locator, "type", timeout);
+      waitsApplied.push("visible", "editable");
+      const beforeValue = await resolved.locator.inputValue().catch(() => readTargetValue(session.page, step.selector));
       let typed = false;
       let afterValue = null;
       const tagName = await resolved.locator
@@ -953,10 +1183,12 @@ async function executeStep(session, commandId, step) {
         .catch(() => "");
       if (tagName === "select") {
         await resolved.locator.selectOption({ label: value }).catch(async () => {
+          waitsApplied.push("selectOption:labelFallbackToValue");
           await resolved.locator.selectOption({ value }).catch(() => {});
         });
       } else {
         await resolved.locator.fill(value, { timeout }).catch(() => {});
+        waitsApplied.push("fill");
       }
       afterValue = await resolved.locator.inputValue().catch(() => null);
       if (afterValue != null && String(afterValue).toLowerCase().includes(String(value).toLowerCase())) {
@@ -964,6 +1196,7 @@ async function executeStep(session, commandId, step) {
       }
       if (!typed) {
         await resolved.locator.click({ timeout }).catch(() => {});
+        waitsApplied.push("focusBeforeKeyboardType");
         await session.page.keyboard.type(value).catch(() => {});
         afterValue = await resolved.locator.inputValue().catch(() => null);
         if (afterValue != null && String(afterValue).toLowerCase().includes(String(value).toLowerCase())) {
@@ -994,6 +1227,7 @@ async function executeStep(session, commandId, step) {
             node.dispatchEvent(new Event("input", { bubbles: true }));
           }
         }, value);
+        waitsApplied.push("domSetValueFallback");
         afterValue = await resolved.locator.inputValue().catch(() => null);
         if (afterValue != null && String(afterValue).toLowerCase().includes(String(value).toLowerCase())) {
           typed = true;
@@ -1005,42 +1239,72 @@ async function executeStep(session, commandId, step) {
         );
       }
     } else if (step.action === "assert_visible") {
-      const selector = step.selector || (step.targetDescription ? `text=${step.targetDescription}` : null) || (step.expectedText ? `text=${step.expectedText}` : null);
-      if (!selector) throw new Error("assert_visible requires selector or expectedText");
-      const locator = session.page.locator(selector).first();
-      await locator.waitFor({ state: "visible", timeout });
-      highlight = await locatorHighlightBox(locator, session.page, step.targetDescription || step.expectedText || selector);
+      const target = step.selector || step.targetDescription || step.expectedText || "";
+      if (!target) throw new Error("assert_visible requires selector, targetDescription, or expectedText");
+      const resolved = await resolveLocatorFromTargetVariants(session.page, target, "click", timeout);
+      locatorCandidatesTried = resolved?.tried || [];
+      if (resolved?.ambiguityError) throw new Error(resolved.ambiguityError);
+      if (!resolved || !resolved.locator) throw new Error(`Unable to resolve visibility assertion target: ${target}`);
+      selectorUsed = resolved.label;
+      resolvedLocatorType = inferLocatorKind(resolved.label);
+      try {
+        await resolved.locator.waitFor({ state: "visible", timeout });
+      } catch {
+        waitsApplied.push("assertRetryAfterSnapshot");
+        await snapshotState().catch(() => null);
+        await session.page.waitForTimeout(350).catch(() => {});
+        await resolved.locator.waitFor({ state: "visible", timeout });
+      }
+      waitsApplied.push("visible");
+      highlight = await locatorHighlightBox(resolved.locator, session.page, target || resolved.label);
     } else if (step.action === "assert_text") {
       const expected = (step.expectedText || "").trim();
       if (!expected) throw new Error("assert_text requires expectedText");
       if (step.selector) {
         const locator = session.page.locator(step.selector).first();
+        selectorUsed = step.selector;
+        resolvedLocatorType = "selector";
         highlight = await locatorHighlightBox(locator, session.page, step.selector);
         const text = await locator.innerText({ timeout });
         if (!text.toLowerCase().includes(expected.toLowerCase())) {
           throw new Error(`Text mismatch. Expected contains "${expected}", got "${text}"`);
         }
       } else {
-        const body = await session.page.locator("body").innerText({ timeout });
-        if (!body.toLowerCase().includes(expected.toLowerCase())) {
-          throw new Error(`Text "${expected}" not found on page`);
+        const resolved = await resolveLocatorFromTargetVariants(session.page, expected, "click", timeout);
+        locatorCandidatesTried = resolved?.tried || [];
+        if (resolved?.ambiguityError) throw new Error(resolved.ambiguityError);
+        if (resolved?.locator) {
+          selectorUsed = resolved.label;
+          resolvedLocatorType = inferLocatorKind(resolved.label);
+          await resolved.locator.first().waitFor({ state: "visible", timeout });
+          waitsApplied.push("visible");
+          highlight = await locatorHighlightBox(resolved.locator.first(), session.page, expected);
+        } else {
+          const body = await session.page.locator("body").innerText({ timeout });
+          if (!body.toLowerCase().includes(expected.toLowerCase())) {
+            throw new Error(`Text "${expected}" not found on page`);
+          }
+          waitsApplied.push("bodyTextContains");
         }
       }
     } else if (step.action === "assert_clickable") {
       const target = step.selector || step.targetDescription || step.expectedText || "";
-      const resolved = await resolveUsableLocator(session.page, buildLocatorCandidates(session.page, target, "click"), timeout);
-      if (!resolved) throw new Error("assert_clickable requires selector, targetDescription, or expectedText");
+      const resolved = await resolveLocatorFromTargetVariants(session.page, target, "click", timeout);
+      locatorCandidatesTried = resolved?.tried || [];
+      if (!resolved || !resolved.locator) throw new Error("assert_clickable requires selector, targetDescription, or expectedText");
       if (resolved.ambiguityError) throw new Error(resolved.ambiguityError);
       selectorUsed = resolved.label;
+      resolvedLocatorType = inferLocatorKind(resolved.label);
       const locator = resolved.locator;
-      await locator.waitFor({ state: "visible", timeout });
+      await ensureActionable(locator, "assert_clickable", timeout);
+      waitsApplied.push("visible", "enabled");
       const enabled = await locator.isEnabled({ timeout });
       highlight = await locatorHighlightBox(locator, session.page, target || resolved.label);
       if (!enabled) throw new Error(`Element is not clickable: ${target}`);
     } else {
       throw new Error(`Unsupported action: ${step.action}`);
     }
-    const screenshotPath = await takeScreenshot(session);
+    const screenshotPath = await takeScreenshotSafe(session, 5000);
     session.currentUrl = session.page.url();
     const result = {
       commandId,
@@ -1049,15 +1313,20 @@ async function executeStep(session, commandId, step) {
       status: "passed",
       currentUrl: session.currentUrl,
       selectorUsed,
+      resolvedLocatorType,
+      locatorCandidatesTried,
+      waitsApplied,
       highlight,
       message: successMessage,
       screenshotPath,
+      preStepScreenshotPath,
+      preStepAnalysis,
       durationMs: Date.now() - startedAt,
     };
     pushEvent(session, { type: "step_finished", ...result });
     return result;
   } catch (error) {
-    const screenshotPath = await takeScreenshot(session).catch(() => null);
+    const screenshotPath = await takeScreenshotSafe(session, 5000);
     session.currentUrl = session.page.url();
     const result = {
       commandId,
@@ -1066,9 +1335,14 @@ async function executeStep(session, commandId, step) {
       status: "failed",
       currentUrl: session.currentUrl,
       selectorUsed,
+      resolvedLocatorType,
+      locatorCandidatesTried,
+      waitsApplied,
       highlight,
       message: error instanceof Error ? error.message : "Step failed",
       screenshotPath,
+      preStepScreenshotPath,
+      preStepAnalysis,
       durationMs: Date.now() - startedAt,
     };
     pushEvent(session, { type: "step_failed", ...result });
@@ -1252,7 +1526,7 @@ async function manualAction(sessionId, action) {
     } else {
       throw new Error(`Unsupported manual action: ${action.actionType}`);
     }
-    const screenshotPath = await takeScreenshot(session);
+    const screenshotPath = await takeScreenshotSafe(session, 5000);
     session.currentUrl = session.page.url();
     return {
       status: "passed",
@@ -1267,7 +1541,7 @@ async function manualAction(sessionId, action) {
       durationMs: Date.now() - startedAt,
     };
   } catch (error) {
-    const screenshotPath = await takeScreenshot(session).catch(() => null);
+    const screenshotPath = await takeScreenshotSafe(session, 5000);
     return {
       status: "failed",
       actionType: action.actionType,
@@ -1309,13 +1583,53 @@ function sessionState(sessionId) {
     .innerText()
     .then((v) => (v || "").slice(0, 4000))
     .catch(() => "");
-  return Promise.all([pageTitlePromise, pageTextPromise]).then(([pageTitle, pageText]) => ({
+  const domSummaryPromise = session.page
+    .evaluate(() => {
+      const collectVisible = (selector) =>
+        Array.from(document.querySelectorAll(selector)).filter((el) => {
+          const style = window.getComputedStyle(el);
+          return style.display !== "none" && style.visibility !== "hidden";
+        });
+      const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
+        .map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 8);
+      const buttons = collectVisible("button, [role='button'], input[type='submit']");
+      const links = collectVisible("a[href]");
+      const inputs = collectVisible("input, textarea, select, [contenteditable='true']");
+      return {
+        title: document.title || "",
+        url: window.location.href,
+        headings,
+        forms: document.querySelectorAll("form").length,
+        visibleButtons: buttons.length,
+        visibleLinks: links.length,
+        visibleInputs: inputs.length,
+        buttonLabels: buttons
+          .map((el) => (el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 10),
+        linkLabels: links
+          .map((el) => (el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 10),
+        inputHints: inputs
+          .map((el) => el.getAttribute("aria-label") || el.getAttribute("name") || el.getAttribute("placeholder") || "")
+          .map((v) => (v || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 12),
+      };
+    })
+    .catch(() => null);
+  return Promise.all([pageTitlePromise, pageTextPromise, domSummaryPromise]).then(([pageTitle, pageText, domSummary]) => ({
     id: session.id,
     currentUrl: session.currentUrl,
     pageTitle,
     pageText,
+    domSummary,
     lastScreenshotPath: session.lastScreenshotPath,
     lastVideoPath: session.lastVideoPath,
+    lastTracePath: session.lastTracePath,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
     events: session.events.slice(-100),

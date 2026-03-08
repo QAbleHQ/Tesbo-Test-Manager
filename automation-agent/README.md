@@ -1,10 +1,10 @@
 # automation-agent
 
-Node.js Playwright runtime for BetterCases automation sessions.
+Node.js Playwright runtime for TesboX automation sessions.
 
 ## What this service does
 
-- Creates isolated browser sessions per BetterCases automation session.
+- Creates isolated browser sessions per TesboX automation session.
 - Executes structured action plans (`navigate`, `click`, `type`) step-by-step.
 - Captures screenshots and emits stream snapshots for live browser visibility.
 - Exposes internal APIs used by the Java backend orchestrator.

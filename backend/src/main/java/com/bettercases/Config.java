@@ -49,6 +49,11 @@ public final class Config {
     public static final String AUTOMATION_AGENT_BASE_URL = getEnv("AUTOMATION_AGENT_BASE_URL", "http://localhost:7400");
     public static final String AUTOMATION_AGENT_SHARED_TOKEN = getEnv("AUTOMATION_AGENT_SHARED_TOKEN", "");
     public static final int AUTOMATION_STEP_TIMEOUT_MS = Integer.parseInt(getEnv("AUTOMATION_STEP_TIMEOUT_MS", "10000"));
+    public static final int AUTOMATION_AUTONOMOUS_MAX_TURNS = Integer.parseInt(getEnv("AUTOMATION_AUTONOMOUS_MAX_TURNS", "15"));
+    public static final int AUTOMATION_AUTONOMOUS_MAX_STEPS = Integer.parseInt(getEnv("AUTOMATION_AUTONOMOUS_MAX_STEPS", "50"));
+    public static final boolean AUTOMATION_AUTONOMOUS_VERBOSE_EVENTS = Boolean.parseBoolean(
+            getEnv("AUTOMATION_AUTONOMOUS_VERBOSE_EVENTS", "false")
+    );
     public static final String AUTOMATION_EXECUTION_MODE = getEnv("AUTOMATION_EXECUTION_MODE", "queue").trim().toLowerCase();
     public static final int AUTOMATION_QUEUE_MAX_RETRIES = Integer.parseInt(getEnv("AUTOMATION_QUEUE_MAX_RETRIES", "2"));
     public static final int AUTOMATION_QUEUE_STALE_MINUTES = Integer.parseInt(getEnv("AUTOMATION_QUEUE_STALE_MINUTES", "5"));

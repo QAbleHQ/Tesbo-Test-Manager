@@ -1,5 +1,6 @@
 package com.bettercases.automation;
 
+import com.bettercases.Config;
 import com.bettercases.audit.AuditService;
 import com.bettercases.auth.SessionFilter;
 import com.bettercases.project.ProjectService;
@@ -185,6 +186,7 @@ public final class AutomationSessionHandler {
     private static void executeQueuedCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal) {
         String currentUrl = "";
         String pageText = "";
+        String domPlanningContext = "";
         try {
             Map<String, Object> persistedSession = AutomationSessionService.getSession(envelope.sessionId, envelope.projectId, envelope.userId)
                     .orElseThrow(io.javalin.http.NotFoundResponse::new);
@@ -200,21 +202,34 @@ public final class AutomationSessionHandler {
             if (liveText instanceof String s) {
                 pageText = s;
             }
+            domPlanningContext = buildDomPlanningContext(liveState);
         } catch (Exception ignored) {}
 
         if (!envelope.autonomousMode) {
-            executeChatCommand(envelope, cancelSignal, currentUrl, pageText);
+            executeChatCommand(envelope, cancelSignal, currentUrl, pageText, domPlanningContext);
             return;
         }
-        executeAutonomousCommand(envelope, cancelSignal, currentUrl, pageText);
+        executeAutonomousCommand(envelope, cancelSignal, currentUrl, pageText, domPlanningContext);
     }
 
-    private static void executeChatCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal, String currentUrl, String pageText) {
+    private static void executeChatCommand(
+            CommandEnvelope envelope,
+            AtomicBoolean cancelSignal,
+            String currentUrl,
+            String pageText,
+            String domPlanningContext
+    ) {
         if (cancelSignal.get()) {
             appendCancelledEvent(envelope, "Command was stopped before execution started.");
             return;
         }
-        AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(envelope.projectId, envelope.objective, currentUrl, pageText);
+        AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(
+                envelope.projectId,
+                envelope.objective,
+                currentUrl,
+                pageText,
+                domPlanningContext
+        );
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId,
                 plan.requiresClarification ? "clarification_required" : "command_received",
@@ -263,9 +278,15 @@ public final class AutomationSessionHandler {
         );
     }
 
-    private static void executeAutonomousCommand(CommandEnvelope envelope, AtomicBoolean cancelSignal, String currentUrl, String pageText) {
-        final int MAX_AUTONOMOUS_TURNS = 8;
-        final int MAX_AUTONOMOUS_STEPS = 32;
+    private static void executeAutonomousCommand(
+            CommandEnvelope envelope,
+            AtomicBoolean cancelSignal,
+            String currentUrl,
+            String pageText,
+            String domPlanningContext
+    ) {
+        final int MAX_AUTONOMOUS_TURNS = Math.max(1, Config.AUTOMATION_AUTONOMOUS_MAX_TURNS);
+        final int MAX_AUTONOMOUS_STEPS = Math.max(1, Config.AUTOMATION_AUTONOMOUS_MAX_STEPS);
         int executedSteps = 0;
         int turnCount = 0;
         int noActionTurns = 0;
@@ -300,12 +321,14 @@ public final class AutomationSessionHandler {
 
             String loopUrl = latestUrl;
             String loopText = pageText;
+            String loopDomContext = domPlanningContext;
             try {
                 Map<String, Object> liveState = AutomationAgentClient.getSessionState(envelope.sessionId);
                 Object liveUrl = liveState.get("currentUrl");
                 if (liveUrl instanceof String s && !s.isBlank()) loopUrl = s;
                 Object liveText = liveState.get("pageText");
                 if (liveText instanceof String s) loopText = s;
+                loopDomContext = buildDomPlanningContext(liveState);
             } catch (Exception ignored) {}
 
             int remaining = Math.max(0, MAX_AUTONOMOUS_STEPS - executedSteps);
@@ -314,6 +337,7 @@ public final class AutomationSessionHandler {
                     envelope.objective,
                     loopUrl,
                     loopText,
+                    loopDomContext,
                     history,
                     remaining
             );
@@ -353,6 +377,7 @@ public final class AutomationSessionHandler {
                         envelope.objective,
                         loopUrl,
                         loopText,
+                        loopDomContext,
                         history,
                         remaining
                 );
@@ -445,25 +470,56 @@ public final class AutomationSessionHandler {
                 evaluatingPayload.put("step", step);
                 evaluatingPayload.put("evaluateText", evaluateText);
                 evaluatingPayload.put("actionText", actionText);
-                AutomationSessionService.addEvent(
-                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_step_evaluating",
-                        envelope.rawCommand,
-                        evaluatingPayload,
-                        null,
-                        null
-                );
-
-                AutomationContracts.AgentExecuteResponse stepResponse = AutomationAgentClient.executeSteps(
-                        envelope.sessionId,
-                        envelope.commandId.toString(),
-                        List.of(step)
-                );
-                if (stepResponse.results == null || stepResponse.results.isEmpty()) {
-                    completionReason = "Autonomous run stopped because no step result was produced.";
-                    hasFailure = true;
-                    break;
+                if (Config.AUTOMATION_AUTONOMOUS_VERBOSE_EVENTS) {
+                    AutomationSessionService.addEvent(
+                            envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "autonomous_step_evaluating",
+                            envelope.rawCommand,
+                            evaluatingPayload,
+                            null,
+                            null
+                    );
                 }
-                AutomationContracts.StepResult stepResult = stepResponse.results.get(0);
+
+                AutomationContracts.AgentExecuteResponse stepResponse = null;
+                AutomationContracts.StepResult stepResult;
+                try {
+                    stepResponse = AutomationAgentClient.executeSteps(
+                            envelope.sessionId,
+                            envelope.commandId.toString(),
+                            List.of(step)
+                    );
+                    if (stepResponse.results == null || stepResponse.results.isEmpty()) {
+                        stepResult = syntheticFailedStepResult(
+                                envelope.commandId,
+                                step,
+                                loopUrl,
+                                "No step result was produced by automation agent."
+                        );
+                    } else {
+                        stepResult = stepResponse.results.get(0);
+                    }
+                } catch (Exception stepError) {
+                    String message = stepError.getMessage() == null || stepError.getMessage().isBlank()
+                            ? "Automation agent request failed for this step."
+                            : stepError.getMessage();
+                    stepResult = syntheticFailedStepResult(envelope.commandId, step, loopUrl, message);
+                    Map<String, Object> transportPayload = new HashMap<>();
+                    transportPayload.put("mode", "autonomous");
+                    transportPayload.put("turn", turn);
+                    transportPayload.put("stepIndex", stepIndex + 1);
+                    transportPayload.put("stepCount", boundedSteps.size());
+                    transportPayload.put("intentLabel", turnIntentLabel);
+                    transportPayload.put("step", step);
+                    transportPayload.put("error", message);
+                    AutomationSessionService.addEvent(
+                            envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId,
+                            "autonomous_step_transport_failed",
+                            envelope.rawCommand,
+                            transportPayload,
+                            null,
+                            null
+                    );
+                }
                 turnResults.add(stepResult);
                 allResults.add(stepResult);
                 executedSteps++;
@@ -471,14 +527,17 @@ public final class AutomationSessionHandler {
                 else {
                     turnFailed++;
                     hasFailure = true;
-                    failedAction = step.action == null ? "" : step.action;
-                    expectedOutcome = actionText;
-                    observedOutcome = stepResult.message == null || stepResult.message.isBlank()
-                            ? "Step failed without a detailed error message."
-                            : stepResult.message;
+                    if (failedAction.isBlank()) {
+                        failedAction = step.action == null ? "" : step.action;
+                        expectedOutcome = actionText;
+                        observedOutcome = stepResult.message == null || stepResult.message.isBlank()
+                                ? "Step failed without a detailed error message."
+                                : stepResult.message;
+                    }
                 }
+                String responseUrl = stepResponse == null ? null : stepResponse.currentUrl;
                 turnCurrentUrl = stepResult.currentUrl == null || stepResult.currentUrl.isBlank()
-                        ? stepResponse.currentUrl
+                        ? responseUrl
                         : stepResult.currentUrl;
                 if (stepResult.screenshotPath != null && !stepResult.screenshotPath.isBlank()) {
                     turnScreenshotPath = stepResult.screenshotPath;
@@ -507,9 +566,8 @@ public final class AutomationSessionHandler {
                         stepResult.screenshotPath
                 );
 
-                if (hasFailure) {
-                    break;
-                }
+                // Continue executing the remaining planned steps for this turn even if one step fails.
+                // This preserves full-turn execution semantics and richer diagnostics for generated scripts.
             }
 
             if (cancelled) break;
@@ -628,6 +686,26 @@ public final class AutomationSessionHandler {
         );
     }
 
+    private static AutomationContracts.StepResult syntheticFailedStepResult(
+            UUID commandId,
+            AutomationContracts.ActionStep step,
+            String currentUrl,
+            String message
+    ) {
+        AutomationContracts.StepResult result = new AutomationContracts.StepResult();
+        result.commandId = commandId == null ? "" : commandId.toString();
+        result.stepId = step == null || step.id == null || step.id.isBlank() ? "step-runtime-failed" : step.id;
+        result.action = step == null || step.action == null ? "" : step.action;
+        result.status = "failed";
+        result.currentUrl = currentUrl == null ? "" : currentUrl;
+        result.selectorUsed = step != null && step.selector != null ? step.selector : null;
+        result.highlight = null;
+        result.message = message == null || message.isBlank() ? "Step failed due to runtime error." : message;
+        result.screenshotPath = null;
+        result.durationMs = 0L;
+        return result;
+    }
+
     public static void getSession(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -670,11 +748,11 @@ public final class AutomationSessionHandler {
                     null
             );
         }
-        ctx.status(202).json(Map.of(
-                "stopRequested", stopRequested,
-                "activeCommandId", activeCommandId,
-                "queuedCount", state == null ? 0 : state.queue.size()
-        ));
+        Map<String, Object> response = new HashMap<>();
+        response.put("stopRequested", stopRequested);
+        response.put("activeCommandId", activeCommandId);
+        response.put("queuedCount", state == null ? 0 : state.queue.size());
+        ctx.status(202).json(response);
     }
 
     public static void stream(Context ctx) {
@@ -735,6 +813,30 @@ public final class AutomationSessionHandler {
             }
         } catch (Exception e) {
             ctx.status(502).json(Map.of("error", "Failed to proxy live stream"));
+        }
+    }
+
+    public static void downloadLatestTrace(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        Map<String, Object> state = AutomationAgentClient.getSessionState(sessionId);
+        String tracePath = state.get("lastTracePath") instanceof String s ? s : null;
+        if (tracePath == null || tracePath.isBlank()) {
+            throw new io.javalin.http.NotFoundResponse("Trace artifact not found");
+        }
+        try {
+            byte[] bytes = Files.readAllBytes(Path.of(tracePath));
+            ctx.contentType("application/zip");
+            ctx.header("Cache-Control", "no-cache, no-store, must-revalidate");
+            ctx.header("Pragma", "no-cache");
+            ctx.header("Expires", "0");
+            ctx.header("Content-Disposition", "attachment; filename=\"automation-trace-" + sessionId + ".zip\"");
+            ctx.result(bytes);
+        } catch (Exception e) {
+            throw new io.javalin.http.NotFoundResponse("Trace artifact not found");
         }
     }
 
@@ -923,9 +1025,13 @@ public final class AutomationSessionHandler {
         }
         String startUrl = body != null && body.startUrl != null && !body.startUrl.isBlank() ? body.startUrl : null;
         UUID executionId = UUID.randomUUID();
-        Map<String, Object> result = AutomationAgentClient.runPlaywrightScriptInSession(sessionId, executionId, script, startUrl);
+        Integer requestedDelay = body != null ? body.actionDelayMs : null;
+        Integer actionDelayMs = requestedDelay == null ? 0 : Math.max(0, Math.min(5000, requestedDelay));
+        Map<String, Object> result = AutomationAgentClient.runPlaywrightScriptInSession(sessionId, executionId, script, startUrl, actionDelayMs);
         String currentUrl = result.get("currentUrl") instanceof String s ? s : null;
         String screenshotPath = result.get("screenshotPath") instanceof String s ? s : null;
+        String tracePath = result.get("tracePath") instanceof String s ? s : null;
+        String videoPath = result.get("videoPath") instanceof String s ? s : null;
         String runStatus = result.get("status") instanceof String s ? s : "failed";
         String errorMessage = result.get("errorMessage") instanceof String s ? s : null;
 
@@ -936,7 +1042,9 @@ public final class AutomationSessionHandler {
                 Map.of(
                         "scriptRun", true,
                         "scriptVersion", body != null && body.scriptVersion != null ? body.scriptVersion : 0,
-                        "status", runStatus
+                        "status", runStatus,
+                        "tracePath", tracePath == null ? "" : tracePath,
+                        "videoPath", videoPath == null ? "" : videoPath
                 )
         );
 
@@ -949,6 +1057,8 @@ public final class AutomationSessionHandler {
         executionResult.put("status", runStatus);
         executionResult.put("currentUrl", currentUrl == null ? "" : currentUrl);
         executionResult.put("screenshotPath", screenshotPath == null ? "" : screenshotPath);
+        executionResult.put("tracePath", tracePath == null ? "" : tracePath);
+        executionResult.put("videoPath", videoPath == null ? "" : videoPath);
         executionResult.put("errorMessage", errorMessage == null ? "" : errorMessage);
         executionResult.put("durationMs", result.get("durationMs"));
         executionResult.put("logs", result.get("logs"));
@@ -1023,45 +1133,52 @@ public final class AutomationSessionHandler {
     private static String describeEvaluation(AutomationContracts.ActionStep step) {
         String target = friendlyStepTarget(step);
         if (step == null || step.action == null) {
-            return "I will evaluate the current page state before taking the next action.";
+            return "Thinking: I will inspect the current DOM structure and visible UI layout, then pick the safest next interaction using stable locators.";
         }
         return switch (step.action) {
-            case "navigate" -> "I will evaluate whether navigating to the target page is the next best move.";
-            case "click" -> "I will first confirm " + target + " is visible and clickable before interacting.";
+            case "navigate" -> "Thinking: I will validate current context first, then navigate only if it moves us toward the objective. " +
+                    "I will preserve user-like flow and avoid unnecessary redirects.";
+            case "click" -> "Thinking: I will inspect DOM + screen layout, locate " + target + " using role/label/testid/text priority, " +
+                    "and verify it is actionable before click. If missing, I will explore nearby controls and alternate visible labels.";
             case "type" -> {
                 if (looksLikeDropdown(step)) {
-                    yield "I will first confirm " + target + " is a dropdown/selection control before choosing the option.";
+                    yield "Thinking: I will confirm " + target + " is a selection control from DOM semantics and visual layout, " +
+                            "then choose the intended option. If exact label is missing, I will search equivalent options in the same section.";
                 }
-                yield "I will first confirm " + target + " is ready for input before typing.";
+                yield "Thinking: I will confirm " + target + " is the intended input via DOM + visible layout, then type as a real user would. " +
+                        "If not found, I will explore related input fields with equivalent labels/placeholders.";
             }
-            case "assert_visible" -> "I will verify " + target + " is visible on the page.";
-            case "assert_text" -> "I will verify the expected text is present" +
-                    (step.expectedText != null && !step.expectedText.isBlank() ? " (" + step.expectedText + ")." : ".");
-            case "assert_clickable" -> "I will verify " + target + " is enabled and clickable.";
-            default -> "I will evaluate the page state before executing this action.";
+            case "assert_visible" -> "Thinking: I will verify " + target + " is visible using concrete on-screen evidence. " +
+                    "If it is not found directly, I will inspect nearby UI regions and alternate labels before concluding failure.";
+            case "assert_text" -> "Thinking: I will validate expected text using DOM-grounded checks and visible content context" +
+                    (step.expectedText != null && !step.expectedText.isBlank() ? " (" + step.expectedText + ")." : ".") +
+                    " If exact match is absent, I will check equivalent nearby text candidates.";
+            case "assert_clickable" -> "Thinking: I will confirm " + target + " is visible, enabled, and interactable in current layout. " +
+                    "If not immediately found, I will probe equivalent actionable controls in the same UI context.";
+            default -> "Thinking: I will analyze DOM + layout, choose stable locators, and proceed with the safest next action.";
         };
     }
 
     private static String describeAction(AutomationContracts.ActionStep step) {
         String target = friendlyStepTarget(step);
         if (step == null || step.action == null) {
-            return "Now I will perform the next action.";
+            return "Action: I will execute the next planned interaction.";
         }
         return switch (step.action) {
-            case "navigate" -> "Now I will open " + (step.url == null || step.url.isBlank() ? "the required URL." : step.url + ".");
-            case "click" -> "Now I will click " + target + ".";
+            case "navigate" -> "Action: open " + (step.url == null || step.url.isBlank() ? "the required URL." : step.url + ".");
+            case "click" -> "Action: click " + target + ".";
             case "type" -> {
                 if (looksLikeDropdown(step)) {
                     String option = step.value == null || step.value.isBlank() ? "the required option" : "\"" + step.value + "\"";
-                    yield "Now I will select " + option + " from " + target + ".";
+                    yield "Action: select " + option + " from " + target + ".";
                 }
                 String value = step.value == null || step.value.isBlank() ? "the required value" : "\"" + step.value + "\"";
-                yield "Now I will type " + value + " into " + target + ".";
+                yield "Action: type " + value + " into " + target + ".";
             }
-            case "assert_visible" -> "Now I will validate that " + target + " is visible.";
-            case "assert_text" -> "Now I will validate that the expected text appears on the page.";
-            case "assert_clickable" -> "Now I will validate that " + target + " is clickable.";
-            default -> "Now I will execute the planned action.";
+            case "assert_visible" -> "Action: validate that " + target + " is visible.";
+            case "assert_text" -> "Action: validate that the expected text appears on the page.";
+            case "assert_clickable" -> "Action: validate that " + target + " is clickable.";
+            default -> "Action: execute the planned step.";
         };
     }
 
@@ -1097,6 +1214,43 @@ public final class AutomationSessionHandler {
         if (hasClick) return "UI interaction";
         if (hasAssert) return "Verification";
         return "Autonomous action";
+    }
+
+    private static String buildDomPlanningContext(Map<String, Object> liveState) {
+        if (liveState == null) return "";
+        Object rawDomSummary = liveState.get("domSummary");
+        if (!(rawDomSummary instanceof Map<?, ?> domSummary)) return "";
+        StringBuilder sb = new StringBuilder();
+        appendContextField(sb, "title", domSummary.get("title"));
+        appendContextField(sb, "url", domSummary.get("url"));
+        appendContextField(sb, "headings", domSummary.get("headings"));
+        appendContextField(sb, "forms", domSummary.get("forms"));
+        appendContextField(sb, "visibleButtons", domSummary.get("visibleButtons"));
+        appendContextField(sb, "visibleLinks", domSummary.get("visibleLinks"));
+        appendContextField(sb, "visibleInputs", domSummary.get("visibleInputs"));
+        appendContextField(sb, "buttonLabels", domSummary.get("buttonLabels"));
+        appendContextField(sb, "linkLabels", domSummary.get("linkLabels"));
+        appendContextField(sb, "inputHints", domSummary.get("inputHints"));
+        String context = sb.toString().trim();
+        return context.length() > 2800 ? context.substring(0, 2800) : context;
+    }
+
+    private static void appendContextField(StringBuilder sb, String key, Object value) {
+        if (sb == null || key == null || key.isBlank() || value == null) return;
+        String normalized;
+        if (value instanceof List<?> list) {
+            normalized = list.stream()
+                    .filter(item -> item != null && !String.valueOf(item).isBlank())
+                    .map(String::valueOf)
+                    .limit(16)
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("");
+        } else {
+            normalized = String.valueOf(value).trim();
+        }
+        if (normalized.isBlank()) return;
+        if (sb.length() > 0) sb.append('\n');
+        sb.append("- ").append(key).append(": ").append(normalized);
     }
 
     private static boolean shouldAutoGenerateSteps(UUID projectId, UUID userId) {
