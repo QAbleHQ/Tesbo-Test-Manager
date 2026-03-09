@@ -2,6 +2,7 @@
 
 import { useParams } from "next/navigation";
 import { useEffect, useState, useMemo } from "react";
+import Image from "next/image";
 import {
   getPublicSharedRun,
   getPublicSharedExecutions,
@@ -204,7 +205,7 @@ export default function PublicSharedRunPage() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
               </svg>
             </div>
-            <span className="font-semibold text-zinc-900 dark:text-zinc-100">BetterCases</span>
+            <Image src="/tesbox-logo-transparent.png" alt="TesboX" width={120} height={34} className="h-7 w-auto" />
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-400">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -359,8 +360,10 @@ export default function PublicSharedRunPage() {
         </div>
 
         {/* Footer */}
-        <div className="mt-8 text-center text-xs text-zinc-400 pb-8">
-          Shared via <span className="font-medium">BetterCases</span> &mdash; Test Case Management
+        <div className="mt-8 flex items-center justify-center gap-2 text-xs text-zinc-400 pb-8">
+          <span>Shared via</span>
+          <Image src="/tesbox-logo-transparent.png" alt="TesboX" width={90} height={26} className="h-5 w-auto" />
+          <span>&mdash; Test Case Management</span>
         </div>
       </main>
     </div>

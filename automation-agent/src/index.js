@@ -6,6 +6,7 @@ import {
   createSession,
   resetSession,
   executeSteps,
+  executeStagehand,
   manualAction,
   runPlaywrightScript,
   runPlaywrightScriptInSession,
@@ -43,14 +44,42 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/internal/sessions", async (req, res) => {
-  const { sessionId, startUrl } = req.body || {};
+  const {
+    sessionId,
+    startUrl,
+    projectId,
+    testcaseId,
+    browserbaseApiKey,
+    browserbaseProjectId,
+    modelProvider,
+    modelApiKey,
+    model,
+  } = req.body || {};
   if (!sessionId) {
     res.status(400).json({ error: "sessionId required" });
     return;
   }
+  const options = {};
+  if (modelApiKey) {
+    options.browserbaseApiKey = browserbaseApiKey;
+    options.browserbaseProjectId = browserbaseProjectId;
+    options.modelProvider = modelProvider || "openai";
+    options.modelApiKey = modelApiKey;
+    options.model = model;
+    const scopeProject = typeof projectId === "string" ? projectId.trim() : "";
+    const scopeTestcase = typeof testcaseId === "string" ? testcaseId.trim() : "";
+    if (scopeProject && scopeTestcase) {
+      options.cacheScope = `${scopeProject}/${scopeTestcase}`;
+    } else if (scopeProject) {
+      options.cacheScope = `${scopeProject}/${sessionId}`;
+    }
+  }
   try {
-    await createSession(sessionId, typeof startUrl === "string" ? startUrl : null);
-    res.status(201).json({ sessionId });
+    const state = await createSession(sessionId, typeof startUrl === "string" ? startUrl : null, options);
+    res.status(201).json({
+      sessionId,
+      sessionType: state?.type === "stagehand" ? "stagehand" : "playwright",
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const code = err instanceof SessionCreationError ? err.code : "SESSION_CREATION_FAILED";
@@ -89,14 +118,46 @@ app.post("/internal/sessions/:sessionId/execute", async (req, res) => {
   }
 });
 
+app.post("/internal/sessions/:sessionId/execute-stagehand", async (req, res) => {
+  const { sessionId } = req.params;
+  const { commandId, objective } = req.body || {};
+  if (!commandId || !objective || typeof objective !== "string") {
+    res.status(400).json({ error: "commandId and objective are required" });
+    return;
+  }
+  try {
+    const result = await executeStagehand(sessionId, commandId, objective.trim());
+    res.json(result);
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : "Stagehand execution failed" });
+  }
+});
+
 app.post("/internal/playwright/run", async (req, res) => {
-  const { executionId, script, startUrl } = req.body || {};
+  const {
+    executionId,
+    script,
+    startUrl,
+    modelProvider,
+    modelApiKey,
+    model,
+    browserbaseApiKey,
+    browserbaseProjectId,
+    cacheScope,
+  } = req.body || {};
   if (!executionId || !script) {
     res.status(400).json({ error: "executionId and script are required" });
     return;
   }
   try {
-    const result = await runPlaywrightScript(String(executionId), String(script), typeof startUrl === "string" ? startUrl : null);
+    const result = await runPlaywrightScript(String(executionId), String(script), typeof startUrl === "string" ? startUrl : null, {
+      modelProvider: typeof modelProvider === "string" ? modelProvider : "openai",
+      modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
+      model: typeof model === "string" ? model : "",
+      browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
+      browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
+      cacheScope: typeof cacheScope === "string" ? cacheScope : "",
+    });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Playwright run failed" });
@@ -105,7 +166,18 @@ app.post("/internal/playwright/run", async (req, res) => {
 
 app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
   const { sessionId } = req.params;
-  const { executionId, script, startUrl, actionDelayMs } = req.body || {};
+  const {
+    executionId,
+    script,
+    startUrl,
+    actionDelayMs,
+    modelProvider,
+    modelApiKey,
+    model,
+    browserbaseApiKey,
+    browserbaseProjectId,
+    cacheScope,
+  } = req.body || {};
   if (!executionId || !script) {
     res.status(400).json({ error: "executionId and script are required" });
     return;
@@ -116,7 +188,15 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
       String(executionId),
       String(script),
       typeof startUrl === "string" ? startUrl : null,
-      Number.isFinite(Number(actionDelayMs)) ? Number(actionDelayMs) : 0
+      Number.isFinite(Number(actionDelayMs)) ? Number(actionDelayMs) : 0,
+      {
+        modelProvider: typeof modelProvider === "string" ? modelProvider : "openai",
+        modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
+        model: typeof model === "string" ? model : "",
+        browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
+        browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
+        cacheScope: typeof cacheScope === "string" ? cacheScope : "",
+      }
     );
     res.json(result);
   } catch (err) {
@@ -137,6 +217,12 @@ app.post("/internal/queue/jobs", async (req, res) => {
     providerPayload,
     shardIndex,
     shardTotal,
+    modelProvider,
+    modelApiKey,
+    model,
+    browserbaseApiKey,
+    browserbaseProjectId,
+    cacheScope,
   } = req.body || {};
   if (!jobId || !runId || !cycleId || !executionId || !script) {
     res.status(400).json({ error: "jobId, runId, cycleId, executionId, and script are required" });
@@ -155,6 +241,12 @@ app.post("/internal/queue/jobs", async (req, res) => {
       providerPayload: providerPayload && typeof providerPayload === "object" ? providerPayload : {},
       shardIndex: Number.isFinite(Number(shardIndex)) ? Number(shardIndex) : 1,
       shardTotal: Number.isFinite(Number(shardTotal)) ? Number(shardTotal) : 1,
+      modelProvider: typeof modelProvider === "string" ? modelProvider : "",
+      modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
+      model: typeof model === "string" ? model : "",
+      browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
+      browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
+      cacheScope: typeof cacheScope === "string" ? cacheScope : "",
     });
     res.status(202).json(queued);
   } catch (err) {

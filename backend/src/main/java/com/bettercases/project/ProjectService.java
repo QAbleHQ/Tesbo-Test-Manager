@@ -37,6 +37,7 @@ public final class ProjectService {
                 pm.executeUpdate();
             }
             SuiteService.ensureDefaultSuiteExists(projectId);
+            ensureBrowserAgentMapping(projectId, c);
             return Map.of(
                     "id", projectId.toString(),
                     "key", rs.getString("key"),
@@ -231,6 +232,16 @@ public final class ProjectService {
         if ("qa_member".equals(normalized)) return "member";
         if ("viewer".equals(normalized)) return "member";
         return normalized;
+    }
+
+    private static void ensureBrowserAgentMapping(UUID projectId, Connection c) throws SQLException {
+        String automationJson = "{\"automation\":{\"browserAgent\":\"default\"}}";
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) || ?::jsonb, updated_at = now() WHERE id = ?")) {
+            ps.setString(1, automationJson);
+            ps.setObject(2, projectId);
+            ps.executeUpdate();
+        }
     }
 
     private static String normalizeProjectRole(String role) {

@@ -65,6 +65,7 @@ public final class AutomationContracts {
         public String commandId;
         public String currentUrl;
         public List<StepResult> results;
+        public java.util.List<java.util.Map<String, Object>> stagehandActions;
     }
 
     public static class StepResult {

@@ -59,6 +59,10 @@ public final class Config {
     public static final int AUTOMATION_QUEUE_STALE_MINUTES = Integer.parseInt(getEnv("AUTOMATION_QUEUE_STALE_MINUTES", "5"));
     public static final String AUTOMATION_QUEUE_SHARED_TOKEN = getEnv("AUTOMATION_QUEUE_SHARED_TOKEN", "").trim();
 
+    // Browserbase platform account (env vars) — used when project uses "default" browser agent
+    public static final String BROWSERBASE_API_KEY = getEnv("BROWSERBASE_API_KEY", "").trim();
+    public static final String BROWSERBASE_PROJECT_ID = getEnv("BROWSERBASE_PROJECT_ID", "").trim();
+
     private static Map<String, String> loadDotEnv() {
         Map<String, String> map = new HashMap<>();
         for (Path dir : new Path[]{

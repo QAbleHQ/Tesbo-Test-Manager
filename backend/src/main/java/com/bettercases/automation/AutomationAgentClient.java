@@ -10,6 +10,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -22,11 +23,33 @@ public final class AutomationAgentClient {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    public static void createSession(UUID sessionId, String startUrl) {
-        send("/internal/sessions", "POST", Map.of(
-                "sessionId", sessionId.toString(),
-                "startUrl", startUrl == null ? "" : startUrl
-        ));
+    public static Map<String, Object> createSession(
+            UUID sessionId,
+            String startUrl,
+            UUID projectId,
+            UUID testcaseId,
+            String browserbaseApiKey,
+            String browserbaseProjectId,
+            String modelProvider,
+            String modelApiKey,
+            String model
+    ) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("sessionId", sessionId.toString());
+        payload.put("startUrl", startUrl == null ? "" : startUrl);
+        if (projectId != null) payload.put("projectId", projectId.toString());
+        if (testcaseId != null) payload.put("testcaseId", testcaseId.toString());
+        if (browserbaseApiKey != null && !browserbaseApiKey.isBlank()) payload.put("browserbaseApiKey", browserbaseApiKey);
+        if (browserbaseProjectId != null && !browserbaseProjectId.isBlank()) payload.put("browserbaseProjectId", browserbaseProjectId);
+        if (modelProvider != null && !modelProvider.isBlank()) payload.put("modelProvider", modelProvider);
+        if (modelApiKey != null && !modelApiKey.isBlank()) payload.put("modelApiKey", modelApiKey);
+        if (model != null && !model.isBlank()) payload.put("model", model);
+        String body = send("/internal/sessions", "POST", payload);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent create session response", e);
+        }
     }
 
     public static AutomationContracts.AgentExecuteResponse executeSteps(UUID sessionId, String commandId, java.util.List<AutomationContracts.ActionStep> steps) {
@@ -38,6 +61,18 @@ public final class AutomationAgentClient {
             return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse automation agent execute response", e);
+        }
+    }
+
+    public static AutomationContracts.AgentExecuteResponse executeStagehand(UUID sessionId, String commandId, String objective) {
+        String body = send("/internal/sessions/" + sessionId + "/execute-stagehand", "POST", Map.of(
+                "commandId", commandId,
+                "objective", objective == null ? "" : objective
+        ), Duration.ofSeconds(240));
+        try {
+            return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse stagehand execute response", e);
         }
     }
 
@@ -79,12 +114,28 @@ public final class AutomationAgentClient {
         }
     }
 
-    public static Map<String, Object> runPlaywrightScript(UUID executionId, String script, String startUrl) {
-        String body = send("/internal/playwright/run", "POST", Map.of(
-                "executionId", executionId.toString(),
-                "script", script == null ? "" : script,
-                "startUrl", startUrl == null ? "" : startUrl
-        ), Duration.ofSeconds(180));
+    public static Map<String, Object> runPlaywrightScript(
+            UUID executionId,
+            String script,
+            String startUrl,
+            String modelProvider,
+            String modelApiKey,
+            String model,
+            String browserbaseApiKey,
+            String browserbaseProjectId,
+            String cacheScope
+    ) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("executionId", executionId.toString());
+        payload.put("script", script == null ? "" : script);
+        payload.put("startUrl", startUrl == null ? "" : startUrl);
+        if (modelProvider != null && !modelProvider.isBlank()) payload.put("modelProvider", modelProvider);
+        if (modelApiKey != null && !modelApiKey.isBlank()) payload.put("modelApiKey", modelApiKey);
+        if (model != null && !model.isBlank()) payload.put("model", model);
+        if (browserbaseApiKey != null && !browserbaseApiKey.isBlank()) payload.put("browserbaseApiKey", browserbaseApiKey);
+        if (browserbaseProjectId != null && !browserbaseProjectId.isBlank()) payload.put("browserbaseProjectId", browserbaseProjectId);
+        if (cacheScope != null && !cacheScope.isBlank()) payload.put("cacheScope", cacheScope);
+        String body = send("/internal/playwright/run", "POST", payload, Duration.ofSeconds(180));
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {

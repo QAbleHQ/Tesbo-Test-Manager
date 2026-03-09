@@ -130,14 +130,6 @@ export default function ExecutionDetailPage() {
     }
   }
 
-  if (!execution) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
-    );
-  }
-
   const executedSteps =
     automationReport?.logs?.filter((log) => log.kind === "step" || !!log.stepId || !!log.action) ?? [];
   const latestScreenshotUrl = useMemo(() => {
@@ -147,6 +139,14 @@ export default function ExecutionDetailPage() {
     }
     return automationReport?.screenshotUrl || null;
   }, [automationReport?.screenshotUrl, executedSteps]);
+
+  if (!execution) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-zinc-500">Loading…</p>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -298,7 +298,7 @@ export default function ExecutionDetailPage() {
                           href={`https://trace.playwright.dev/?trace=${encodeURIComponent(automationReport.traceUrl)}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-flex items-center rounded-md bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
+                          className="inline-flex items-center rounded-md border border-emerald-800 bg-emerald-700 px-2.5 py-1.5 text-sm font-semibold !text-white visited:!text-white shadow-sm transition-colors hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-1 dark:border-emerald-300 dark:bg-emerald-500 dark:!text-zinc-950 dark:hover:bg-emerald-400"
                         >
                           Open in Trace Viewer
                         </a>

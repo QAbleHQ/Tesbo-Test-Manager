@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getProject, logout } from "@/lib/api";
@@ -22,6 +23,13 @@ const projectNavSections = [
       { href: "cycles", label: "Test Run", icon: "play" },
       { href: "bugs", label: "Bugs", icon: "bug" },
       { href: "reports", label: "Test Reports", icon: "chart" },
+    ],
+  },
+  {
+    section: "Agents",
+    items: [
+      { href: "agents", label: "Agents", icon: "agent" },
+      { href: "agents/aegis/reviews", label: "Reviews", icon: "clipboard" },
     ],
   },
   {
@@ -63,6 +71,7 @@ type MenuIconName =
   | "specs"
   | "tests"
   | "analytics"
+  | "agent"
   | "settings"
   | "users"
   | "plug"
@@ -179,6 +188,13 @@ function MenuIcon({ name, className = "h-4 w-4" }: { name: MenuIconName; classNa
       return (
         <svg {...common}>
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 20V10M10 20V4M16 20v-8M22 20v-4" />
+        </svg>
+      );
+    case "agent":
+      return (
+        <svg {...common}>
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 2L3 7v6c0 5.25 3.75 10 9 11 5.25-1 9-5.75 9-11V7l-9-5z" />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4" />
         </svg>
       );
     case "settings":
@@ -327,11 +343,21 @@ export default function Sidebar() {
       <div className="p-3 border-b border-[var(--border)] flex items-center justify-between gap-2">
         <Link
           href="/projects"
-          className={`font-semibold text-[var(--primary)] dark:text-zinc-100 hover:opacity-80 truncate ${
-            isCollapsed ? "sr-only" : ""
-          }`}
+          className={`flex items-center ${isCollapsed ? "justify-center w-8 h-8" : ""}`}
+          aria-label="TesboX"
         >
-          BetterCases
+          {isCollapsed ? (
+            <span className="font-semibold text-[var(--primary)] dark:text-zinc-100">TX</span>
+          ) : (
+            <Image
+              src="/tesbox-logo-transparent.png"
+              alt="TesboX"
+              width={120}
+              height={34}
+              priority
+              className="h-8 w-auto"
+            />
+          )}
         </Link>
         <button
           type="button"

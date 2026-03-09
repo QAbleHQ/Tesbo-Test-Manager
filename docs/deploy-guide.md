@@ -1,4 +1,4 @@
-## BetterCases DigitalOcean CI/CD Guide
+## TesboX DigitalOcean CI/CD Guide
 
 ### Overview
 - Images are built from `frontend/Dockerfile` and `backend/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
@@ -33,7 +33,7 @@ Backend runtime secrets:
 
 ### Deploy flow
 1. Add/update all required GitHub secrets.
-2. Trigger `Deploy BetterCases to DigitalOcean` from GitHub Actions (`workflow_dispatch`).
+2. Trigger `Deploy TesboX to DigitalOcean` from GitHub Actions (`workflow_dispatch`).
 3. Workflow builds and pushes `frontend` and `backend` images tagged with commit SHA and `latest`.
 4. Workflow copies compose files to:
    - Frontend: `/opt/bettercases/frontend`
@@ -51,3 +51,12 @@ Backend runtime secrets:
 On each droplet set `IMAGE_TAG=<tag>` in `/opt/bettercases/<service>/.env`, then run:
 - `docker compose pull`
 - `docker compose up -d --remove-orphans`
+
+### Stagehand cache note (DigitalOcean)
+- You asked to store Stagehand cache in DB.
+- Current Stagehand SDK cache is file/server-oriented; we now persist file cache locally + store action trace in DB.
+
+DigitalOcean guidance:
+- For `automation-agent`, keep `STAGEHAND_CACHE_DIR` on persistent disk (or a mounted volume) so cache survives container restarts.
+- Keep DB persistence enabled for Stagehand action trace/events (this is already handled by backend automation session events).
+- If you rotate droplets without persistent volumes, Stagehand file cache is rebuilt, but DB action trace remains available.

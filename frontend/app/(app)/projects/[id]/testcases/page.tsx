@@ -17,9 +17,12 @@ import {
   deleteTestCase,
   bulkUpdateTestCases,
   bulkDeleteTestCases,
+  getAgentSettings,
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
+import { runAegisInBackground, recoverOrphanedTasks } from "@/lib/aegis-runner";
+import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
 const PAGE_SIZE = 100;
 const TESTCASE_STATUSES = ["Draft", "In Review", "Approved", "Deprecated", "Archived"];
@@ -35,7 +38,7 @@ const TESTCASE_TYPES = [
   "Performance",
   "Security",
 ];
-const AUTOMATION_FEASIBILITY_OPTIONS = ["Yes", "No", "Not Automated", "Automated"];
+const AUTOMATION_FEASIBILITY_OPTIONS = ["In Planning", "Not able to Automate", "Ready for the Automation", "Automated"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "view" | "edit" | "create";
@@ -73,13 +76,14 @@ export default function TestCasesPage() {
   const [panelLoading, setPanelLoading] = useState(false);
   const [panelSaving, setPanelSaving] = useState(false);
   const [panelError, setPanelError] = useState<string | null>(null);
+  const [panelSuccess, setPanelSuccess] = useState<string | null>(null);
   const [submitAction, setSubmitAction] = useState<"create" | "create-next">("create");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
-  const [automationStatus, setAutomationStatus] = useState("Not Automated");
+  const [automationStatus, setAutomationStatus] = useState("In Planning");
   const [automationScript, setAutomationScript] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
@@ -107,6 +111,7 @@ export default function TestCasesPage() {
   const [allCasesSuiteFilter, setAllCasesSuiteFilter] = useState("all");
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("bySuites");
+  
 
   const loadData = useCallback(async () => {
     const suiteList = await listSuites(projectId);
@@ -121,7 +126,8 @@ export default function TestCasesPage() {
       }
       loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
     });
-  }, [router, loadData]);
+    recoverOrphanedTasks(projectId);
+  }, [router, loadData, projectId]);
 
   const visibleSuites = useMemo(
     () => [...suites].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -242,7 +248,7 @@ export default function TestCasesPage() {
     setPreconditions((data.preconditions as string) ?? "");
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
-    setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setAutomationStatus((data.automationStatus as string) ?? "In Planning");
     setAutomationScript((data.automationScript as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
     setAttachments((data.attachments as string) ?? "");
@@ -261,7 +267,7 @@ export default function TestCasesPage() {
     setPreconditions("");
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
-    setAutomationStatus("Not Automated");
+    setAutomationStatus("In Planning");
     setAutomationScript("");
     setEstimatedDuration("");
     setAttachments("");
@@ -482,6 +488,7 @@ export default function TestCasesPage() {
     if (panelMode !== "create" && panelMode !== "edit") return;
     setPanelSaving(true);
     setPanelError(null);
+    setPanelSuccess(null);
     try {
       if (panelMode === "create") {
         const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
@@ -502,6 +509,12 @@ export default function TestCasesPage() {
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+          }
+        }
         setSuiteCasesPage(1);
         setSuiteSearch("");
         setDebouncedSuiteSearch("");
@@ -510,6 +523,8 @@ export default function TestCasesPage() {
         setSuiteTypeFilter("all");
         setSuiteAutomationFilter("all");
         await refreshData(1);
+        setPanelSuccess("Test case created successfully. Aegis is working on it in the background.");
+        setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
           resetForm(suiteId || (viewMode === "allCases" ? null : activeSuiteId));
         } else {
@@ -534,6 +549,14 @@ export default function TestCasesPage() {
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, panelTestcaseId, title, "", "ready_for_automation");
+          }
+        }
+        setPanelSuccess("Test case updated successfully.");
+        setTimeout(() => setPanelSuccess(null), 4000);
         await refreshData();
         await openViewPanel(panelTestcaseId);
       }
@@ -548,6 +571,7 @@ export default function TestCasesPage() {
 
   return (
     <main className="px-6 py-6">
+      <AegisBackgroundIndicator />
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Test case repository</h1>
@@ -840,13 +864,23 @@ export default function TestCasesPage() {
                             <td className="px-4 py-2">{tc.status}</td>
                             <td className="px-4 py-2 text-zinc-500">{new Date(tc.updatedAt).toLocaleDateString()}</td>
                             <td className="px-4 py-2">
-                              <button
-                                type="button"
-                                onClick={() => router.push(`/projects/${projectId}/testcases/${tc.id}/automate`)}
-                                className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
-                              >
-                                Automate
-                              </button>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); runAegisInBackground(projectId, tc.id, tc.title, tc.externalId || "", "manual"); }}
+                                  className="rounded border border-[#2e7d32]/40 px-2 py-1 text-xs text-[#2e7d32] hover:bg-[#e8f5eb] dark:border-green-700/40 dark:text-green-400 dark:hover:bg-green-900/20"
+                                  title="Add to Aegis automation queue"
+                                >
+                                  Aegis Queue
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => router.push(`/projects/${projectId}/testcases/${tc.id}/automate`)}
+                                  className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                                >
+                                  Automate
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))}
@@ -895,25 +929,51 @@ export default function TestCasesPage() {
                 <aside className="absolute right-0 top-0 h-full w-full border-l border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 lg:w-1/2">
                   <div className="mb-4 flex items-center justify-between">
                     <h3 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-                      {panelMode === "create" ? "Create Test Case" : panelMode === "edit" ? "Edit Test Case" : "Test Case Details"}
+                      {panelMode === "create"
+                        ? "Create Test Case"
+                        : panelMode === "edit"
+                          ? "Edit Test Case"
+                          : "Quick Access"}
                     </h3>
                     <div className="flex items-center gap-2">
                       {panelMode === "view" && (
                         <button
                           type="button"
-                          onClick={() => panelTestcaseId && router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)}
-                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                          onClick={() =>
+                            panelTestcaseId && router.push(`/projects/${projectId}/testcases/${panelTestcaseId}`)
+                          }
+                          aria-label="Open full details page"
+                          title="Open full details page"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded border border-zinc-300 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
                         >
-                          Automate
+                          <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+                            <path
+                              d="M7.5 4.5h8v8M15.5 4.5l-9 9"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                            <path
+                              d="M12.5 10.5V15.5H4.5V7.5H9.5"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
                         </button>
                       )}
                       {panelMode === "view" && (
                         <button
                           type="button"
-                          onClick={() => setPanelMode("edit")}
-                          className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                          onClick={() =>
+                            panelTestcaseId &&
+                            router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)
+                          }
+                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
                         >
-                          Edit
+                          Open Automate
                         </button>
                       )}
                       <button
@@ -930,6 +990,11 @@ export default function TestCasesPage() {
                   {panelError && (
                     <p className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
                       {panelError}
+                    </p>
+                  )}
+                  {panelSuccess && (
+                    <p className="mb-3 rounded border border-[#2e7d32]/30 bg-[#e8f5eb] px-3 py-2 text-sm text-[#2e7d32] dark:border-green-700/40 dark:bg-green-900/20 dark:text-green-300">
+                      {panelSuccess}
                     </p>
                   )}
 
@@ -1057,6 +1122,55 @@ export default function TestCasesPage() {
                         </div>
                       </div>
                       <div className="pt-2 flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            panelTestcaseId && router.push(`/projects/${projectId}/testcases/${panelTestcaseId}`)
+                          }
+                          aria-label="Open full details page"
+                          title="Open full details page"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded border border-zinc-300 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                        >
+                          <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+                            <path
+                              d="M7.5 4.5h8v8M15.5 4.5l-9 9"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                            <path
+                              d="M12.5 10.5V15.5H4.5V7.5H9.5"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (panelTestcaseId) {
+                              runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
+                              setPanelSuccess("Added to Aegis queue. Automation will start shortly.");
+                              setTimeout(() => setPanelSuccess(null), 4000);
+                            }
+                          }}
+                          className="rounded border border-[#2e7d32]/40 px-3 py-1 text-sm text-[#2e7d32] hover:bg-[#e8f5eb] dark:border-green-700/40 dark:text-green-400 dark:hover:bg-green-900/20"
+                        >
+                          Add to Aegis Queue
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            panelTestcaseId &&
+                            router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)
+                          }
+                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                        >
+                          Open Automate
+                        </button>
                         <button
                           type="button"
                           onClick={() => void handleArchivePanelTestCase()}

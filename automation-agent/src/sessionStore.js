@@ -3,6 +3,13 @@ import path from "node:path";
 import { chromium } from "playwright";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
+import {
+  createStagehandSession,
+  executeStagehandObjective,
+  getStagehandSessionState,
+  closeStagehandSession,
+  runStagehandScript,
+} from "./stagehandSession.js";
 
 const sessions = new Map();
 let sessionCreateInFlight = 0;
@@ -109,7 +116,14 @@ function getSession(sessionId) {
   return sessions.get(sessionId) || null;
 }
 
-async function createSession(sessionId, startUrl) {
+/**
+ * Create a session. When model config is provided, uses Stagehand (LOCAL or BROWSERBASE).
+ * @param {string} sessionId
+ * @param {string|null} startUrl
+ * @param {object} [options] - Optional:
+ *   { browserbaseApiKey, browserbaseProjectId, modelProvider, modelApiKey, model, cacheScope }
+ */
+async function createSession(sessionId, startUrl, options = {}) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
   if (sessionCreateInFlight >= Math.max(1, config.sessionCreateConcurrency)) {
     throw new SessionCreationError(
@@ -119,6 +133,29 @@ async function createSession(sessionId, startUrl) {
   }
   sessionCreateInFlight += 1;
   try {
+    const {
+      browserbaseApiKey,
+      browserbaseProjectId,
+      modelProvider,
+      modelApiKey,
+      model,
+      cacheScope,
+    } = options;
+
+    const useStagehand = Boolean(modelApiKey);
+
+    if (useStagehand) {
+      const state = await createStagehandSession(
+        sessionId,
+        startUrl,
+        { apiKey: browserbaseApiKey, projectId: browserbaseProjectId },
+        { provider: modelProvider, apiKey: modelApiKey, model },
+        { cacheScope }
+      );
+      sessions.set(sessionId, state);
+      return state;
+    }
+
     try {
       await ensureScreenshotDir();
       await ensureVideoDir();
@@ -128,14 +165,18 @@ async function createSession(sessionId, startUrl) {
     const { browser, context, page } = await launchBrowserContext(startUrl);
     const state = buildSessionState(sessionId, browser, context, page);
     sessions.set(sessionId, state);
-    // Capture initial view so UI can render immediately after startup.
     await takeScreenshot(state).catch(() => {});
     state.currentUrl = page.url();
     logInfo("session_created", { sessionId });
     return state;
   } catch (error) {
     if (error instanceof SessionCreationError) throw error;
-    throw new SessionCreationError("SESSION_CREATION_FAILED", "Unable to create automation session", error);
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new SessionCreationError(
+      "SESSION_CREATION_FAILED",
+      `Unable to create automation session: ${detail}`,
+      error
+    );
   } finally {
     sessionCreateInFlight -= 1;
   }
@@ -363,7 +404,19 @@ function extractPlaywrightTestBody(script) {
   throw new Error("Invalid script format: unterminated test body");
 }
 
-async function runPlaywrightScript(executionId, script, startUrl = null) {
+function isStagehandScript(script) {
+  if (!script || typeof script !== "string") return false;
+  return (
+    /@automation-language:\s*stagehand-ts/i.test(script) ||
+    /(^|\W)stagehand\.(act|extract|agent|observe)\s*\(/i.test(script) ||
+    /new\s+Stagehand\s*\(/i.test(script)
+  );
+}
+
+async function runPlaywrightScript(executionId, script, startUrl = null, options = {}) {
+  if (isStagehandScript(script)) {
+    return runStagehandScript(executionId, script, startUrl, options);
+  }
   await ensureScreenshotDir();
   await ensureVideoDir();
   await ensureTraceDir();
@@ -493,7 +546,10 @@ async function runPlaywrightScript(executionId, script, startUrl = null) {
   };
 }
 
-async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null, actionDelayMs = 0) {
+async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null, actionDelayMs = 0, options = {}) {
+  if (isStagehandScript(script)) {
+    return runStagehandScript(executionId, script, startUrl, options);
+  }
   await ensureScreenshotDir();
   await ensureTraceDir();
   const session = getSession(sessionId);
@@ -1369,6 +1425,15 @@ async function executeSteps(sessionId, commandId, steps) {
   };
 }
 
+async function executeStagehand(sessionId, commandId, objective) {
+  const session = getSession(sessionId);
+  if (!session) throw new Error("Session not found");
+  if (session.type !== "stagehand") {
+    throw new Error("Session is not a Stagehand session. Use execute with steps for Playwright sessions.");
+  }
+  return executeStagehandObjective(session, commandId, objective);
+}
+
 async function manualAction(sessionId, action) {
   const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
@@ -1558,25 +1623,51 @@ async function closeSession(sessionId) {
   if (!session) return { videoPath: null };
   sessions.delete(sessionId);
   let videoPath = null;
-  try {
-    const video = session.page.video();
-    await session.page.close().catch(() => {});
-    if (video) {
-      videoPath = await video.path().catch(() => null);
+  if (session.type === "stagehand") {
+    await closeStagehandSession(session);
+  } else {
+    try {
+      const video = session.page?.video?.();
+      await session.page?.close?.().catch(() => {});
+      if (video) {
+        videoPath = await video.path().catch(() => null);
+      }
+    } catch {
+      // no-op
     }
-  } catch {
-    // no-op
+    session.lastVideoPath = videoPath;
+    await session.context?.close?.().catch(() => {});
+    await session.browser?.close?.().catch(() => {});
   }
-  session.lastVideoPath = videoPath;
-  await session.context.close().catch(() => {});
-  await session.browser.close().catch(() => {});
   logInfo("session_closed", { sessionId });
   return { videoPath };
 }
 
-function sessionState(sessionId) {
+async function sessionState(sessionId) {
   const session = getSession(sessionId);
   if (!session) return null;
+  if (session.type === "stagehand") {
+    const { currentUrl, pageText, domSummary } = await getStagehandSessionState(session);
+    let domSummaryObj = null;
+    try {
+      domSummaryObj = domSummary ? JSON.parse(domSummary) : null;
+    } catch {
+      domSummaryObj = { raw: domSummary };
+    }
+    return {
+      id: session.id,
+      currentUrl,
+      pageTitle: "",
+      pageText,
+      domSummary: domSummaryObj,
+      lastScreenshotPath: session.lastScreenshotPath,
+      lastVideoPath: session.lastVideoPath,
+      lastTracePath: session.lastTracePath,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      events: session.events?.slice?.(-100) ?? [],
+    };
+  }
   const pageTitlePromise = session.page.title().catch(() => "");
   const pageTextPromise = session.page
     .locator("body")
@@ -1660,6 +1751,7 @@ export {
   SessionCreationError,
   resetSession,
   executeSteps,
+  executeStagehand,
   manualAction,
   runPlaywrightScript,
   runPlaywrightScriptInSession,

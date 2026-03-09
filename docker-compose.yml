@@ -1,4 +1,4 @@
-# PostgreSQL for BetterCases. Use this if your local Postgres has no "postgres" role.
+# PostgreSQL for TesboX. Use this if your local Postgres has no "postgres" role.
 # Start: docker compose up -d
 # Stop:  docker compose down
 services:

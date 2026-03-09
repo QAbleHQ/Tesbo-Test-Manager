@@ -11,9 +11,12 @@ import {
   createTestCase,
   listSuites,
   listTestCases,
+  getAgentSettings,
   type SuiteNode,
   type TestCaseListItem,
 } from "@/lib/api";
+import { runAegisInBackground } from "@/lib/aegis-runner";
+import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type ScriptHistoryEntry = {
@@ -49,7 +52,7 @@ export default function TestCaseDetailPage() {
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([]);
   const [testData, setTestData] = useState("");
-  const [automationStatus, setAutomationStatus] = useState("No");
+  const [automationStatus, setAutomationStatus] = useState("In Planning");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
@@ -64,6 +67,8 @@ export default function TestCaseDetailPage() {
   const [status, setStatus] = useState("Draft");
   const [suiteId, setSuiteId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saveNotification, setSaveNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  
 
   async function loadAllCases(): Promise<TestCaseListItem[]> {
     let offset = 0;
@@ -129,7 +134,7 @@ export default function TestCaseDetailPage() {
         setDescription((p.description as string) ?? "");
         setPreconditions((p.preconditions as string) ?? "");
         setTestData((p.testData as string) ?? "");
-        setAutomationStatus((p.automationStatus as string) ?? "No");
+        setAutomationStatus((p.automationStatus as string) ?? "In Planning");
         setEstimatedDuration((p.estimatedDuration as string) ?? "");
         setAttachments((p.attachments as string) ?? "");
         setAutomationTags(parseTagString((p.automationTags as string) ?? ""));
@@ -186,7 +191,7 @@ export default function TestCaseDetailPage() {
     try {
       if (isNew) {
         const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
-        await createTestCase(projectId, {
+        const created = await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
           description,
@@ -203,13 +208,19 @@ export default function TestCaseDetailPage() {
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+          }
+        }
         if (action === "create-next") {
           setTitle("");
           setDescription("");
           setPreconditions("");
           setSteps([{ stepNumber: 1, action: "", expectedResult: "" }]);
           setTestData("");
-          setAutomationStatus("No");
+          setAutomationStatus("In Planning");
           setEstimatedDuration("");
           setAttachments("");
           setAutomationTags([]);
@@ -249,7 +260,19 @@ export default function TestCaseDetailPage() {
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, testcaseId, title, "", "ready_for_automation");
+          }
+        }
+        setSaveNotification({ type: "success", message: "Test case updated successfully." });
+        setTimeout(() => setSaveNotification(null), 4000);
       }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save test case.";
+      setSaveNotification({ type: "error", message });
+      setTimeout(() => setSaveNotification(null), 6000);
     } finally {
       setSaving(false);
     }
@@ -270,6 +293,12 @@ export default function TestCaseDetailPage() {
   async function onStartAutomation() {
     if (isNew) return;
     router.push(`/projects/${projectId}/testcases/${testcaseId}/automate`);
+  }
+
+  function onOpenLivePreviewRerun() {
+    if (isNew) return;
+    const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
+    window.open(rerunUrl, "_blank", "noopener,noreferrer");
   }
 
   if (tc === null && !isNew) {
@@ -293,8 +322,6 @@ export default function TestCaseDetailPage() {
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
       <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center gap-4">
-        <Link href="/projects" className="font-semibold text-zinc-900 dark:text-zinc-100">BetterCases</Link>
-        <span className="text-zinc-500">/</span>
         <Link href={`/projects/${projectId}/dashboard`} className="text-zinc-700 dark:text-zinc-300">Project</Link>
         <span className="text-zinc-500">/</span>
         <Link href={`/projects/${projectId}/testcases`} className="text-zinc-700 dark:text-zinc-300">Test cases</Link>
@@ -302,6 +329,31 @@ export default function TestCaseDetailPage() {
         <span className="text-zinc-700 dark:text-zinc-300">{isNew ? "New" : (tc as Record<string, string>)?.externalId}</span>
       </header>
       <main className="max-w-3xl mx-auto px-4 py-8">
+        <AegisBackgroundIndicator />
+        {saveNotification && (
+          <div className={`mb-6 flex items-center justify-between rounded-lg border px-4 py-3 ${
+            saveNotification.type === "success"
+              ? "border-[#2e7d32]/30 bg-[#e8f5eb] dark:border-green-700/40 dark:bg-green-900/20"
+              : "border-red-300 bg-red-50 dark:border-red-700/40 dark:bg-red-900/20"
+          }`}>
+            <p className={`text-sm ${
+              saveNotification.type === "success"
+                ? "text-[#2e7d32] dark:text-green-300"
+                : "text-red-700 dark:text-red-300"
+            }`}>{saveNotification.message}</p>
+            <button
+              type="button"
+              onClick={() => setSaveNotification(null)}
+              className={`ml-4 text-sm ${
+                saveNotification.type === "success"
+                  ? "text-[#2e7d32] hover:text-[#1b5e20] dark:text-green-300"
+                  : "text-red-600 hover:text-red-800 dark:text-red-300"
+              }`}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="space-y-6">
           <div>
             <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Title</label>
@@ -412,9 +464,10 @@ export default function TestCaseDetailPage() {
                 onChange={(e) => setAutomationStatus(e.target.value)}
                 className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
+                <option value="In Planning">In Planning</option>
+                <option value="Not able to Automate">Not able to Automate</option>
+                <option value="Ready for the Automation">Ready for the Automation</option>
                 <option value="Automated">Automated</option>
-                <option value="Yes">Yes</option>
-                <option value="No">No</option>
               </select>
             </div>
             <div>
@@ -468,13 +521,33 @@ export default function TestCaseDetailPage() {
             <div className="mb-1 flex items-center justify-between">
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
               {!isNew && (
-                <button
-                  type="button"
-                  onClick={() => void onStartAutomation()}
-                  className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
-                >
-                  Open Automate
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      runAegisInBackground(projectId, testcaseId, title, "", "manual");
+                      setSaveNotification({ type: "success", message: "Added to Aegis queue. Automation will start shortly." });
+                      setTimeout(() => setSaveNotification(null), 4000);
+                    }}
+                    className="rounded border border-[#2e7d32]/40 bg-[#e8f5eb] px-2 py-1 text-xs font-medium text-[#2e7d32] hover:bg-[#c8e6c9] dark:border-green-800 dark:bg-green-950/30 dark:text-green-300 dark:hover:bg-green-900/40"
+                  >
+                    Add to Aegis Queue
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onStartAutomation()}
+                    className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
+                  >
+                    Open Automate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onOpenLivePreviewRerun}
+                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  >
+                    Re Run Last Test (Live Preview)
+                  </button>
+                </div>
               )}
             </div>
             <p className="mb-2 text-xs text-zinc-500">

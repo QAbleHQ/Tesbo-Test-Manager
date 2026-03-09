@@ -173,6 +173,7 @@ public final class Main {
         app.get("/api/projects/{projectId}/reports/repository-summary", com.bettercases.reporting.ReportingHandler::repositorySummary);
 
         app.post("/api/projects/{projectId}/ai/generate-testcases", com.bettercases.ai.AiHandler::generateTestCases);
+        app.post("/api/projects/{projectId}/ai/review-script", com.bettercases.ai.AiHandler::reviewScript);
         app.get("/api/projects/{projectId}/ai/generation-history", com.bettercases.ai.AiHandler::listHistory);
         app.post("/api/projects/{projectId}/ai/generation-history/{requestId}/save", com.bettercases.ai.AiHandler::trackSave);
 

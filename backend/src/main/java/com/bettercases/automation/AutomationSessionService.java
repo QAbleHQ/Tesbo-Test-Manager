@@ -169,6 +169,7 @@ public final class AutomationSessionService {
 
     public static void finalizeIntoTestcase(UUID projectId, UUID testcaseId, UUID userId,
                                             String framework, String repo, String path, String testName, String script,
+                                            String scriptLanguage,
                                             List<Map<String, Object>> generatedSteps) {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canEditCases()) {
@@ -199,7 +200,7 @@ public final class AutomationSessionService {
             }
             try (PreparedStatement up = c.prepareStatement(
                     "UPDATE testcases SET automation_status = 'Automated', automation_framework = ?, automation_repo = ?, automation_path = ?, " +
-                            "automation_test_name = ?, automation_script = ?, automation_script_language = 'playwright-ts', " +
+                            "automation_test_name = ?, automation_script = ?, automation_script_language = COALESCE(?, 'playwright-ts'), " +
                             "automation_script_version = COALESCE(automation_script_version, 0) + 1, steps = COALESCE(?::jsonb, steps), automated_at = now(), automated_by = ?, updated_at = now() " +
                             "WHERE id = ? AND project_id = ?")) {
                 String generatedStepsJson = null;
@@ -211,10 +212,11 @@ public final class AutomationSessionService {
                 up.setString(3, path);
                 up.setString(4, testName);
                 up.setString(5, script);
-                up.setString(6, generatedStepsJson);
-                up.setObject(7, userId);
-                up.setObject(8, testcaseId);
-                up.setObject(9, projectId);
+                up.setString(6, scriptLanguage == null || scriptLanguage.isBlank() ? "playwright-ts" : scriptLanguage);
+                up.setString(7, generatedStepsJson);
+                up.setObject(8, userId);
+                up.setObject(9, testcaseId);
+                up.setObject(10, projectId);
                 up.executeUpdate();
             }
         } catch (SQLException e) {
@@ -224,7 +226,6 @@ public final class AutomationSessionService {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private static Map<String, Object> parseJsonObject(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try {

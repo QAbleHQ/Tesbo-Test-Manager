@@ -1,6 +1,8 @@
 package com.bettercases.automation;
 
+import com.bettercases.Database;
 import com.bettercases.Config;
+import com.bettercases.ai.AiHandler;
 import com.bettercases.audit.AuditService;
 import com.bettercases.auth.SessionFilter;
 import com.bettercases.project.ProjectService;
@@ -15,6 +17,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
@@ -72,7 +77,33 @@ public final class AutomationSessionHandler {
         Map<String, Object> session = AutomationSessionService.startSession(projectId, testcaseId, userId, startUrl);
         UUID sessionId = UUID.fromString(String.valueOf(session.get("id")));
         try {
-            AutomationAgentClient.createSession(sessionId, startUrl);
+            BrowserbaseCredentialsService.Credentials browserbase = BrowserbaseCredentialsService.resolve(projectId);
+            Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
+            String provider = String.valueOf(aiConfig.getOrDefault("provider", "openai")).trim().toLowerCase();
+            if (!"anthropic".equals(provider)) provider = "openai";
+            String modelApiKey = "anthropic".equals(provider)
+                    ? String.valueOf(aiConfig.getOrDefault("anthropicApiKey", "")).trim()
+                    : String.valueOf(aiConfig.getOrDefault("openAiApiKey", "")).trim();
+            String model = String.valueOf(aiConfig.getOrDefault("model", "")).trim();
+
+            Map<String, Object> agentSession = AutomationAgentClient.createSession(
+                    sessionId,
+                    startUrl,
+                    projectId,
+                    testcaseId,
+                    browserbase.apiKey(),
+                    browserbase.projectId(),
+                    provider,
+                    modelApiKey,
+                    model
+            );
+            String sessionType = String.valueOf(agentSession.getOrDefault("sessionType", "playwright"));
+            Map<String, Object> browserMeta = new HashMap<>();
+            browserMeta.put("sessionType", sessionType);
+            if (browserbase.projectId() != null && !browserbase.projectId().isBlank()) {
+                browserMeta.put("browserbaseProjectId", browserbase.projectId());
+            }
+            AutomationSessionService.touchState(sessionId, startUrl == null ? "" : startUrl, null, browserMeta);
         } catch (Exception e) {
             AutomationSessionService.markSessionStartFailed(sessionId, "Session start failed: " + e.getMessage());
             throw new io.javalin.http.ServiceUnavailableResponse("Failed to create automation session: " + e.getMessage());
@@ -187,10 +218,21 @@ public final class AutomationSessionHandler {
         String currentUrl = "";
         String pageText = "";
         String domPlanningContext = "";
+        String sessionType = "playwright";
         try {
             Map<String, Object> persistedSession = AutomationSessionService.getSession(envelope.sessionId, envelope.projectId, envelope.userId)
                     .orElseThrow(io.javalin.http.NotFoundResponse::new);
             currentUrl = (String) persistedSession.get("currentUrl");
+            Object rawMeta = persistedSession.get("browserContextMeta");
+            if (rawMeta instanceof String metaJson && !metaJson.isBlank()) {
+                try {
+                    Map<String, Object> meta = mapper.readValue(metaJson, new TypeReference<>() {});
+                    Object type = meta.get("sessionType");
+                    if (type instanceof String s && !s.isBlank()) {
+                        sessionType = s.trim().toLowerCase();
+                    }
+                } catch (Exception ignored) {}
+            }
         } catch (Exception ignored) {}
         try {
             Map<String, Object> liveState = AutomationAgentClient.getSessionState(envelope.sessionId);
@@ -204,6 +246,11 @@ public final class AutomationSessionHandler {
             }
             domPlanningContext = buildDomPlanningContext(liveState);
         } catch (Exception ignored) {}
+
+        if ("stagehand".equals(sessionType)) {
+            executeStagehandCommand(envelope, cancelSignal, currentUrl);
+            return;
+        }
 
         if (!envelope.autonomousMode) {
             executeChatCommand(envelope, cancelSignal, currentUrl, pageText, domPlanningContext);
@@ -276,6 +323,190 @@ public final class AutomationSessionHandler {
                 executionPayload,
                 screenshotPath
         );
+    }
+
+    /**
+     * Execute command using Stagehand agent (Browserbase-backed autonomous flow).
+     * For Stagehand sessions, both chat and autonomous commands are executed as a single autonomous objective.
+     */
+    private static void executeStagehandCommand(
+            CommandEnvelope envelope,
+            AtomicBoolean cancelSignal,
+            String currentUrl
+    ) {
+        if (cancelSignal.get()) {
+            appendCancelledEvent(envelope, "Command was stopped before Stagehand execution started.");
+            return;
+        }
+
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_received",
+                envelope.rawCommand,
+                Map.of(
+                        "mode", "stagehand",
+                        "objective", envelope.objective
+                ),
+                null,
+                null
+        );
+
+        String stagehandObjective = buildStagehandExecutionObjective(envelope);
+        AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeStagehand(
+                envelope.sessionId,
+                envelope.commandId.toString(),
+                stagehandObjective
+        );
+        String screenshotPath = null;
+        if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
+            screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
+        }
+        Map<String, Object> browserMeta = new HashMap<>();
+        browserMeta.put("sessionType", "stagehand");
+        browserMeta.put("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size());
+        AutomationSessionService.touchState(
+                envelope.sessionId,
+                executeResponse.currentUrl == null || executeResponse.currentUrl.isBlank() ? currentUrl : executeResponse.currentUrl,
+                screenshotPath,
+                browserMeta
+        );
+        Map<String, Object> executionPayload = new HashMap<>();
+        executionPayload.put("mode", "stagehand");
+        executionPayload.put("currentUrl", executeResponse.currentUrl);
+        executionPayload.put("results", executeResponse.results);
+        executionPayload.put("stagehandActions", executeResponse.stagehandActions == null ? List.of() : executeResponse.stagehandActions);
+        executionPayload.put("cancelled", false);
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
+                envelope.rawCommand,
+                Map.of(
+                        "mode", "stagehand",
+                        "objective", envelope.objective,
+                        "stagehandObjective", stagehandObjective,
+                        "steps", buildStagehandReplaySteps(executeResponse.results)
+                ),
+                executionPayload,
+                screenshotPath
+        );
+    }
+
+    private static String buildStagehandExecutionObjective(CommandEnvelope envelope) {
+        String goal = envelope.objective == null ? "" : envelope.objective.trim();
+        if (goal.isBlank()) {
+            goal = envelope.rawCommand == null ? "" : envelope.rawCommand.trim();
+        }
+
+        Map<String, Object> testcase = loadTestcaseContext(envelope.projectId, envelope.testcaseId);
+        String title = String.valueOf(testcase.getOrDefault("title", "")).trim();
+        String description = String.valueOf(testcase.getOrDefault("description", "")).trim();
+        String preconditions = String.valueOf(testcase.getOrDefault("preconditions", "")).trim();
+        String postconditions = String.valueOf(testcase.getOrDefault("postconditions", "")).trim();
+        String steps = String.valueOf(testcase.getOrDefault("steps", "")).trim();
+        String testData = String.valueOf(testcase.getOrDefault("testData", "")).trim();
+
+        List<Map<String, Object>> events = AutomationSessionService.listEvents(envelope.sessionId, 200);
+        List<String> feedbackSignals = extractRecentFeedbackSignals(events, envelope.rawCommand);
+
+        StringBuilder objective = new StringBuilder();
+        objective.append("Primary Goal:\n").append(goal).append("\n\n");
+        if (!title.isBlank()) objective.append("Test Case Title:\n").append(title).append("\n\n");
+        if (!description.isBlank()) objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
+        if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
+        if (!steps.isBlank()) objective.append("Expected Steps:\n").append(limitBlock(steps, 3000)).append("\n\n");
+        if (!testData.isBlank()) objective.append("Test Data (use exact values):\n").append(limitBlock(testData, 1500)).append("\n\n");
+        if (!postconditions.isBlank()) objective.append("Expected Outcome:\n").append(limitBlock(postconditions, 1200)).append("\n\n");
+        if (!feedbackSignals.isEmpty()) {
+            objective.append("User Feedback / Preferences (latest first):\n");
+            for (String feedback : feedbackSignals) {
+                objective.append("- ").append(limitBlock(feedback, 300)).append("\n");
+            }
+            objective.append("\n");
+        }
+
+        objective.append("Execution Requirements:\n")
+                .append("1) Perform MULTI-STEP browser actions to satisfy the full test goal, not a single action.\n")
+                .append("2) Complete all required testcase steps and stop only when the intended end state is reached.\n")
+                .append("3) Use provided test data values exactly where applicable.\n")
+                .append("4) Validate outcomes with assertions: prefer Stagehand extraction/assertion checks.\n")
+                .append("5) If a strict Stagehand assertion is not reliable for a specific check, still verify via deterministic page evidence before finishing.\n")
+                .append("6) Avoid unnecessary exploration once required goals are satisfied.\n");
+        return objective.toString().trim();
+    }
+
+    private static List<String> extractRecentFeedbackSignals(List<Map<String, Object>> events, String currentRawCommand) {
+        if (events == null || events.isEmpty()) return List.of();
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        String current = currentRawCommand == null ? "" : currentRawCommand.trim();
+        for (int i = events.size() - 1; i >= 0 && out.size() < 5; i--) {
+            Map<String, Object> event = events.get(i);
+            if (event == null) continue;
+            String eventType = String.valueOf(event.getOrDefault("eventType", "")).trim();
+            if (!"command_received".equalsIgnoreCase(eventType)) continue;
+            String rawCommand = String.valueOf(event.getOrDefault("rawCommand", "")).trim();
+            if (rawCommand.isBlank()) continue;
+            if (rawCommand.equals(current)) continue;
+            String lower = rawCommand.toLowerCase();
+            if (lower.startsWith("autonomous mode objective:")) continue;
+            if (lower.startsWith("run script")) continue;
+            out.add(rawCommand);
+        }
+        return out;
+    }
+
+    private static String limitBlock(String value, int maxChars) {
+        if (value == null) return "";
+        String normalized = value.replace("\r", "").trim();
+        if (normalized.length() <= maxChars) return normalized;
+        return normalized.substring(0, Math.max(0, maxChars)) + "...";
+    }
+
+    private static Map<String, Object> loadTestcaseContext(UUID projectId, UUID testcaseId) {
+        String sql = """
+                SELECT title, description, preconditions, postconditions, steps, test_data
+                FROM testcases
+                WHERE id = ? AND project_id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, testcaseId);
+            ps.setObject(2, projectId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) return Map.of();
+            Map<String, Object> out = new HashMap<>();
+            out.put("title", rs.getString("title"));
+            out.put("description", rs.getString("description"));
+            out.put("preconditions", rs.getString("preconditions"));
+            out.put("postconditions", rs.getString("postconditions"));
+            out.put("steps", rs.getString("steps"));
+            out.put("testData", rs.getString("test_data"));
+            return out;
+        } catch (Exception ignored) {
+            return Map.of();
+        }
+    }
+
+    private static List<Map<String, Object>> buildStagehandReplaySteps(List<AutomationContracts.StepResult> results) {
+        if (results == null || results.isEmpty()) return List.of();
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (AutomationContracts.StepResult result : results) {
+            if (result == null) continue;
+            if (!"passed".equalsIgnoreCase(String.valueOf(result.status))) continue;
+            Map<String, Object> step = new HashMap<>();
+            step.put("id", result.stepId == null ? "" : result.stepId);
+            step.put("action", result.action == null || result.action.isBlank() ? "act" : result.action);
+            String selectorUsed = result.selectorUsed == null ? "" : result.selectorUsed.trim();
+            if (selectorUsed.startsWith("xpath:")) {
+                step.put("selector", "xpath=" + selectorUsed.substring("xpath:".length()).trim());
+            } else if (selectorUsed.startsWith("selector:")) {
+                step.put("selector", selectorUsed.substring("selector:".length()).trim());
+            } else if (!selectorUsed.isBlank()) {
+                step.put("targetDescription", selectorUsed);
+            }
+            if (result.message != null && !result.message.isBlank()) {
+                step.put("targetDescription", result.message);
+            }
+            out.add(step);
+        }
+        return out;
     }
 
     private static void executeAutonomousCommand(
@@ -850,10 +1081,18 @@ public final class AutomationSessionHandler {
         AutomationContracts.FinalizeBody body = ctx.bodyAsClass(AutomationContracts.FinalizeBody.class);
 
         List<Map<String, Object>> events = AutomationSessionService.listEvents(sessionId, 5000);
-        String generatedScript = AutomationScriptBuilderService.buildPlaywrightScript(
+        String detectedSessionType = detectSessionType(session);
+        boolean stagehandSession = "stagehand".equalsIgnoreCase(detectedSessionType);
+        String generatedScript = stagehandSession
+                ? AutomationScriptBuilderService.buildStagehandScript(
+                body != null ? body.testName : null,
+                events
+        )
+                : AutomationScriptBuilderService.buildPlaywrightScript(
                 body != null ? body.testName : null,
                 events
         );
+        String scriptLanguage = stagehandSession ? "stagehand-ts" : "playwright-ts";
         boolean shouldGenerateSteps = shouldAutoGenerateSteps(projectId, userId);
         List<Map<String, Object>> generatedSteps = shouldGenerateSteps
                 ? AutomationScriptBuilderService.buildTestSteps(events)
@@ -884,11 +1123,12 @@ public final class AutomationSessionHandler {
                 projectId,
                 testcaseId,
                 userId,
-                body != null && body.framework != null ? body.framework : "Playwright",
+                body != null && body.framework != null ? body.framework : (stagehandSession ? "Stagehand" : "Playwright"),
                 body != null ? body.repo : null,
                 body != null ? body.path : null,
                 body != null && body.testName != null ? body.testName : "Generated Test",
                 scriptToSave,
+                scriptLanguage,
                 stepsToSave
         );
         AutomationSessionService.markSessionEnded(sessionId, "completed");
@@ -902,6 +1142,22 @@ public final class AutomationSessionHandler {
             AuditService.logActivity(userId, projectId, "automation_session_finalized", "testcase", testcaseId.toString(), null);
         } catch (Exception ignored) {}
         ctx.json(Map.of("status", "ok", "script", scriptToSave));
+    }
+
+    private static String detectSessionType(Map<String, Object> session) {
+        if (session == null) return "playwright";
+        Object browserMetaRaw = session.get("browserContextMeta");
+        if (!(browserMetaRaw instanceof String metaJson) || metaJson.isBlank()) return "playwright";
+        try {
+            Map<String, Object> meta = mapper.readValue(metaJson, new TypeReference<>() {});
+            Object sessionType = meta.get("sessionType");
+            if (sessionType instanceof String s && !s.isBlank()) {
+                return s.trim().toLowerCase();
+            }
+        } catch (Exception ignored) {
+            // default
+        }
+        return "playwright";
     }
 
     public static void manualAction(Context ctx) {

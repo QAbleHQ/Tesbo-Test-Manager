@@ -27,6 +27,7 @@ type ChatMessage = {
 };
 
 type AutomationMode = "autonomous" | "live";
+type AutonomousTraceMode = "normal" | "debug";
 
 type TimelineItem = {
   timeLabel: string;
@@ -58,22 +59,47 @@ type ScriptVersionOption = {
   scriptVersion: number | null;
 };
 
+type IntentSource = "testcase-intent" | "custom-command";
+
+type TestCaseIntentDetails = {
+  title: string;
+  description: string;
+  preconditions: string;
+  testData: string;
+  stepsSummary: string[];
+};
+
 export default function AutomateTestCasePage() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
   const testcaseId = params.tcId as string;
-  const bootstrapSessionId = searchParams.get("sessionId");
+  const bootstrap = useMemo(
+    () => ({
+      sessionId: searchParams.get("sessionId"),
+      openInLivePreview: searchParams.get("livePreview") === "1",
+    }),
+    [searchParams]
+  );
+  const bootstrapSessionId = bootstrap.sessionId;
+  const openInLivePreview = bootstrap.openInLivePreview;
 
   const [testcaseTitle, setTestcaseTitle] = useState("Test Case");
+  const [testcaseIntentDetails, setTestcaseIntentDetails] = useState<TestCaseIntentDetails>({
+    title: "Test Case",
+    description: "",
+    preconditions: "",
+    testData: "",
+    stepsSummary: [],
+  });
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<AutomationSession | null>(null);
   const [command, setCommand] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
   const [stoppingCommand, setStoppingCommand] = useState(false);
-  const [chatPaneRatio, setChatPaneRatio] = useState(44);
+  const [chatPaneRatio, setChatPaneRatio] = useState(30);
   const [resizingPanes, setResizingPanes] = useState(false);
   const [desktopSplitEnabled, setDesktopSplitEnabled] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
@@ -82,6 +108,7 @@ export default function AutomateTestCasePage() {
   const [streamState, setStreamState] = useState<"Connecting" | "Live" | "Lagging" | "Disconnected">("Connecting");
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
   const [mode, setMode] = useState<AutomationMode>("autonomous");
+  const [autonomousTraceMode, setAutonomousTraceMode] = useState<AutonomousTraceMode>("normal");
   const [sessionStartupState, setSessionStartupState] = useState<SessionStartupState>("select-environment");
   const [sessionStartupError, setSessionStartupError] = useState<string | null>(null);
   const [liveStreamFailed, setLiveStreamFailed] = useState(false);
@@ -95,6 +122,8 @@ export default function AutomateTestCasePage() {
   const [scriptVersionOptions, setScriptVersionOptions] = useState<ScriptVersionOption[]>([]);
   const [versionPickerOpen, setVersionPickerOpen] = useState(false);
   const [selectedVersionKey, setSelectedVersionKey] = useState<string>("");
+  const [intentSource, setIntentSource] = useState<IntentSource>("testcase-intent");
+  const [autoStartFromIntent, setAutoStartFromIntent] = useState(true);
   const [aiConfigured, setAiConfigured] = useState(true);
   const [aiProvider, setAiProvider] = useState<"openai" | "anthropic">("openai");
   const [lastClickTarget, setLastClickTarget] = useState<{ xRatio: number; yRatio: number } | null>(null);
@@ -104,6 +133,7 @@ export default function AutomateTestCasePage() {
   const dragStartRef = useRef<{ xRatio: number; yRatio: number } | null>(null);
   const suppressClickRef = useRef(false);
   const lastScrollAtRef = useRef(0);
+  const autoIntentStartedForSessionRef = useRef<string | null>(null);
   const splitPaneRef = useRef<HTMLDivElement | null>(null);
   const liveViewportRef = useRef<HTMLDivElement | null>(null);
   const chatLogRef = useRef<HTMLDivElement | null>(null);
@@ -112,6 +142,8 @@ export default function AutomateTestCasePage() {
   const processingKeyQueueRef = useRef(false);
   const streamedAutonomousEventIdsRef = useRef<Set<string>>(new Set());
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
+  const verboseAutonomousEvents = process.env.NEXT_PUBLIC_AUTONOMOUS_VERBOSE_EVENTS === "true";
+  const showAutonomousDebugTrace = verboseAutonomousEvents || autonomousTraceMode === "debug";
   const isLiveMode = mode === "live";
   const isAutonomousMode = mode === "autonomous";
   const startupReady = sessionStartupState === "ready";
@@ -180,6 +212,52 @@ export default function AutomateTestCasePage() {
     } catch {
       return {};
     }
+  }
+
+  function parseTestCaseSteps(raw: unknown): string[] {
+    if (typeof raw !== "string" || !raw.trim()) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .map((step) => {
+          const candidate = step as { action?: unknown; expectedResult?: unknown };
+          const action = typeof candidate.action === "string" ? candidate.action.trim() : "";
+          const expectedResult =
+            typeof candidate.expectedResult === "string" ? candidate.expectedResult.trim() : "";
+          if (!action && !expectedResult) return "";
+          if (action && expectedResult) return `${action} -> Expect: ${expectedResult}`;
+          return action || `Expect: ${expectedResult}`;
+        })
+        .filter((line): line is string => Boolean(line));
+    } catch {
+      return [];
+    }
+  }
+
+  function buildIntentObjective(details: TestCaseIntentDetails): string {
+    const lines: string[] = [];
+    const title = details.title.trim() || "Untitled test case";
+    lines.push(`Run and automate this test case: "${title}".`);
+    if (details.description.trim()) {
+      lines.push(`Intent/Description: ${details.description.trim()}`);
+    }
+    if (details.preconditions.trim()) {
+      lines.push(`Preconditions: ${details.preconditions.trim()}`);
+    }
+    if (details.testData.trim()) {
+      lines.push(`Test data: ${details.testData.trim()}`);
+    }
+    if (details.stepsSummary.length > 0) {
+      lines.push("Steps to follow:");
+      details.stepsSummary.forEach((step, idx) => {
+        lines.push(`${idx + 1}. ${step}`);
+      });
+    }
+    lines.push(
+      "Use this intent to execute the flow end-to-end, adapt to current DOM when needed, and generate robust assertions for expected outcomes."
+    );
+    return lines.join("\n");
   }
 
   function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
@@ -488,7 +566,19 @@ export default function AutomateTestCasePage() {
       }
       getTestCase(projectId, testcaseId)
         .then((tc) => {
-          setTestcaseTitle((tc.title as string) || "Generated Test");
+          const title = (tc.title as string) || "Generated Test";
+          const description = typeof tc.description === "string" ? tc.description : "";
+          const preconditions = typeof tc.preconditions === "string" ? tc.preconditions : "";
+          const testData = typeof tc.testData === "string" ? tc.testData : "";
+          const stepsSummary = parseTestCaseSteps(tc.steps);
+          setTestcaseTitle(title);
+          setTestcaseIntentDetails({
+            title,
+            description,
+            preconditions,
+            testData,
+            stepsSummary,
+          });
           const currentScript = typeof tc.automationScript === "string" ? tc.automationScript : "";
           const currentVersionRaw = Number(tc.automationScriptVersion ?? 0);
           const currentScriptVersion = Number.isFinite(currentVersionRaw) && currentVersionRaw > 0 ? currentVersionRaw : 1;
@@ -535,6 +625,9 @@ export default function AutomateTestCasePage() {
         })
         .catch(() => {});
       if (bootstrapSessionId) {
+        if (openInLivePreview) {
+          setMode("live");
+        }
         setSessionId(bootstrapSessionId);
         setSessionStartupState("waiting-stream");
         setMessages([
@@ -557,7 +650,7 @@ export default function AutomateTestCasePage() {
           if (environments.length > 0) {
             setSelectedEnvironmentUrl(environments[0].url);
           }
-          if (!aiState.configured) {
+          if (openInLivePreview || !aiState.configured) {
             setMode("live");
           }
           setSessionStartupState("select-environment");
@@ -566,7 +659,30 @@ export default function AutomateTestCasePage() {
           setSessionStartupState("select-environment");
         });
     });
-  }, [projectId, testcaseId, router, bootstrapSessionId]);
+  }, [projectId, testcaseId, router, bootstrap]);
+
+  const testcaseIntentObjective = useMemo(
+    () => buildIntentObjective(testcaseIntentDetails),
+    [testcaseIntentDetails]
+  );
+
+  useEffect(() => {
+    if (!sessionId || !startupReady || !aiConfigured || !isAutonomousMode) return;
+    if (!autoStartFromIntent || intentSource !== "testcase-intent") return;
+    if (bootstrapSessionId) return;
+    if (autoIntentStartedForSessionRef.current === sessionId) return;
+    autoIntentStartedForSessionRef.current = sessionId;
+    void executeCommand(testcaseIntentObjective, { forceAutonomous: true });
+  }, [
+    sessionId,
+    startupReady,
+    aiConfigured,
+    isAutonomousMode,
+    autoStartFromIntent,
+    intentSource,
+    bootstrapSessionId,
+    testcaseIntentObjective,
+  ]);
 
   async function onStartSessionWithEnvironment() {
     if (sessionStartupState === "starting") return;
@@ -758,6 +874,7 @@ export default function AutomateTestCasePage() {
       }
 
       if (event.eventType === "autonomous_step_evaluating") {
+        if (!showAutonomousDebugTrace) continue;
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
         const stepCount = typeof parsed.stepCount === "number" ? parsed.stepCount : null;
@@ -855,7 +972,7 @@ export default function AutomateTestCasePage() {
         tertiary: item.tertiary,
       };
     });
-  }, [session?.events]);
+  }, [session?.events, showAutonomousDebugTrace]);
 
   const liveImageSrc = useMemo(() => {
     if (!sessionId) return "";
@@ -937,6 +1054,7 @@ export default function AutomateTestCasePage() {
         const planLines = steps.map((step, idx) => describeStepLine(step, idx + 1));
         newChatLines.push([planIntro, ...planLines].join("\n"));
       } else if (event.eventType === "autonomous_step_evaluating") {
+        if (!showAutonomousDebugTrace) continue;
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         const stepIndex = typeof parsed.stepIndex === "number" ? parsed.stepIndex : null;
         const stepCount = typeof parsed.stepCount === "number" ? parsed.stepCount : null;
@@ -944,8 +1062,8 @@ export default function AutomateTestCasePage() {
         const actionText = asText(parsed.actionText);
         const prefix = `${turn ? `Turn ${turn}` : "Turn"}${stepIndex ? ` · Step ${stepIndex}${stepCount ? `/${stepCount}` : ""}` : ""}`;
         newChatLines.push(
-          `${prefix}\nEvaluate: ${evaluateText || "I am checking the page state first."}\nAction: ${
-            actionText || "I will perform the planned interaction next."
+          `${prefix}\n${evaluateText || "Thinking: I am checking DOM and UI state first."}\n${
+            actionText || "Action: I will perform the planned interaction next."
           }`
         );
       } else if (event.eventType === "autonomous_step_executed") {
@@ -1018,7 +1136,7 @@ export default function AutomateTestCasePage() {
     if (newChatLines.length > 0) {
       setMessages((prev) => [...prev, ...newChatLines.map((line) => ({ role: "assistant" as const, content: line }))]);
     }
-  }, [isAutonomousMode, session?.events]);
+  }, [isAutonomousMode, session?.events, showAutonomousDebugTrace]);
 
   async function executeCommand(
     input: string,
@@ -1039,7 +1157,7 @@ export default function AutomateTestCasePage() {
     }
     const value = input.trim();
     const outboundCommand = shouldUseAutonomousMode
-      ? `Autonomous mode objective: ${value}. Think step-by-step based on current DOM/page content, execute the full flow, and include meaningful validation assertions in the plan.`
+      ? `Autonomous mode objective: ${value}. Before any action, analyze the current DOM and identify stable locator candidates (role/label/testid/text) for each target. Use concise DOM-grounded target descriptions, then execute the full flow and include meaningful validation assertions in the plan.`
       : value;
     setSending(true);
     setMessages((prev) => [...prev, { role: "user", content: value }]);
@@ -1090,8 +1208,14 @@ export default function AutomateTestCasePage() {
   }
 
   async function onSendCommand() {
-    if (!command.trim()) return;
-    const value = command.trim();
+    const commandAddon = command.trim();
+    if (intentSource === "custom-command" && !commandAddon) return;
+    const value =
+      intentSource === "testcase-intent"
+        ? commandAddon
+          ? `${testcaseIntentObjective}\n\nAdditional user instruction:\n${commandAddon}`
+          : testcaseIntentObjective
+        : commandAddon;
     setCommand("");
     await executeCommand(value);
   }
@@ -1498,48 +1622,83 @@ Stop when pass/fail outcome is clear and summarize results.`;
         </div>
       </header>
 
-      <main className="p-4">
-        <div ref={splitPaneRef} className="flex flex-col gap-4 lg:h-[calc(100vh-96px)] lg:flex-row lg:gap-0">
+      <main className="p-3 lg:p-2">
+        <div
+          ref={splitPaneRef}
+          className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white lg:h-[calc(100vh-96px)] lg:flex-row-reverse lg:[direction:ltr] dark:border-zinc-700 dark:bg-zinc-900"
+        >
         <section
-          className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-2 lg:order-1" : ""} flex min-h-[320px] flex-col lg:rounded-r-none`}
+          className="flex min-h-[320px] flex-col p-2.5"
           style={desktopSplitEnabled ? { width: `${chatPaneRatio}%` } : undefined}
         >
-          <h2 className="mb-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Assistant</h2>
-          <p className="mb-3 text-xs text-zinc-500">
-            {isAutonomousMode
-              ? "Autonomous mode: provide a goal, the bot explains each step, evaluates first, performs action, and verifies outcomes."
-              : "Live mode: you interact with browser directly, and the bot suggests assertions."}
-          </p>
+          <div className="mb-2 flex items-center justify-between gap-2 px-1">
+            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Assistant</h2>
+            {isAutonomousMode && (
+              <div className="inline-flex items-center gap-1 rounded-full border border-zinc-300 bg-zinc-100 p-0.5 text-[11px] dark:border-zinc-700 dark:bg-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => setAutonomousTraceMode("normal")}
+                  className={`rounded-full px-2 py-0.5 ${
+                    autonomousTraceMode === "normal"
+                      ? "bg-white text-zinc-900 dark:bg-zinc-200 dark:text-zinc-900"
+                      : "text-zinc-600 dark:text-zinc-300"
+                  }`}
+                >
+                  Normal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAutonomousTraceMode("debug")}
+                  className={`rounded-full px-2 py-0.5 ${
+                    autonomousTraceMode === "debug"
+                      ? "bg-white text-zinc-900 dark:bg-zinc-200 dark:text-zinc-900"
+                      : "text-zinc-600 dark:text-zinc-300"
+                  }`}
+                >
+                  Debug
+                </button>
+              </div>
+            )}
+          </div>
           {!aiConfigured && (
-            <p className="mb-3 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
+            <p className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
               {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable Autonomous mode commands. Live mode is available for recording.`}
             </p>
           )}
           <div
             ref={chatLogRef}
-            className="mb-3 h-[420px] min-h-[220px] overflow-auto rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950 lg:h-auto lg:flex-1"
+            className="mb-2 h-[420px] min-h-[220px] overflow-auto rounded-xl border border-zinc-200 bg-zinc-50/80 p-2 dark:border-zinc-700 dark:bg-zinc-950/60 lg:h-auto lg:flex-1"
           >
-            <div className="space-y-3">
-              {messages.map((message, idx) => (
-                <div
-                  key={idx}
-                  className={`rounded p-2 text-sm ${
-                    message.role === "user"
-                      ? "ml-10 bg-blue-600 text-white"
-                      : "mr-10 bg-white text-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                  }`}
-                >
-                  {message.content}
+            <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+              {messages.length === 0 && (
+                <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
+                  Start by sending a goal. Example: run login flow and verify dashboard is visible.
                 </div>
-              ))}
+              )}
+              {messages.map((message, idx) => {
+                const isUser = message.role === "user";
+                return (
+                  <div key={idx} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                    <div
+                      className={`max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-relaxed ${
+                        isUser
+                          ? "bg-blue-600 text-white"
+                          : "border border-zinc-200 bg-white text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                      }`}
+                    >
+                      {message.content}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
-          <div className="flex items-end gap-2">
-            <div className="relative w-full">
+          <div className="rounded-xl border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="relative">
               <textarea
                 value={command}
                 disabled={!startupReady || !aiConfigured}
-                rows={3}
+                rows={2}
                 onChange={(e) => setCommand(e.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
@@ -1550,11 +1709,13 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 placeholder={
                   !aiConfigured
                     ? "Add AI API key in Project Settings to use this mode"
+                    : intentSource === "testcase-intent"
+                    ? "Optional extra guidance..."
                     : isAutonomousMode
-                    ? "Describe the end goal. Example: complete signup flow and verify success page"
-                    : "Live mode tip: interact manually, or run an autonomous goal from here"
+                    ? "Describe the end goal..."
+                    : "Live mode tip: interact manually, or run a goal from here"
                 }
-                className="w-full resize-none rounded border border-zinc-300 px-3 py-2 pr-12 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                className="w-full resize-none rounded-2xl border border-zinc-300 px-3 py-2 pr-12 text-sm dark:border-zinc-700 dark:bg-zinc-900"
               />
               <button
                 type="button"
@@ -1565,31 +1726,31 @@ Stop when pass/fail outcome is clear and summarize results.`;
                     ? (stoppingCommand ? "Stopping command" : "Stop current command")
                     : sending
                       ? "Queueing command"
-                      : "Start autonomous run (Enter)"
+                      : "Send (Enter)"
                 }
                 aria-label={
                   commandInProgress
                     ? (stoppingCommand ? "Stopping command" : "Stop current command")
                     : sending
                       ? "Queueing command"
-                      : "Start autonomous run"
+                      : "Send"
                 }
-                className={`absolute right-2 bottom-3 flex h-8 w-8 items-center justify-center rounded-md text-sm font-semibold text-white disabled:opacity-50 ${
+                className={`absolute right-2 bottom-2 flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold text-white disabled:opacity-50 ${
                   commandInProgress
                     ? "bg-red-600 hover:bg-red-700"
                     : "bg-blue-600 hover:bg-blue-700"
                 }`}
               >
-                {commandInProgress ? (stoppingCommand ? "…" : "■") : sending ? "…" : "↵"}
+                {commandInProgress ? (stoppingCommand ? "…" : "■") : sending ? "…" : "↑"}
               </button>
             </div>
           </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
             <button
               type="button"
               onClick={() => void onRunIndividualTest()}
               disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured}
-              className="rounded border border-blue-300 bg-blue-50 px-2 py-1.5 text-xs text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 disabled:opacity-50"
+              className="rounded-full border border-blue-300 bg-blue-50 px-2.5 py-1 text-[11px] text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 disabled:opacity-50"
             >
               {quickActionBusy === "run" ? "Running test..." : "Run Current Test"}
             </button>
@@ -1597,12 +1758,12 @@ Stop when pass/fail outcome is clear and summarize results.`;
               type="button"
               onClick={() => void onRerunIndividualTest()}
               disabled={!startupReady || sending || Boolean(quickActionBusy)}
-              className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 disabled:opacity-50"
+              className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 disabled:opacity-50"
             >
               {quickActionBusy === "rerun" ? "Re-running..." : "Re Run Last Test (Live Preview)"}
             </button>
           </div>
-          <p className="mt-2 text-[11px] text-zinc-500">
+          <p className="mt-1 text-[11px] text-zinc-500">
             Quick actions run inside the current automation session, so you can watch each run directly in Live Browser preview.
           </p>
         </section>
@@ -1616,20 +1777,15 @@ Stop when pass/fail outcome is clear and summarize results.`;
           <div className={`h-16 w-1 rounded ${resizingPanes ? "bg-blue-500" : "bg-zinc-300 dark:bg-zinc-700"}`} />
         </div>
         <section
-          className={`rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900 ${isLiveMode ? "order-1 lg:order-2" : ""} flex min-h-[320px] flex-col lg:rounded-l-none`}
+          className="flex min-h-[320px] flex-col border-t border-zinc-200 p-3 dark:border-zinc-700 lg:border-t-0"
           style={desktopSplitEnabled ? { width: `${100 - chatPaneRatio}%` } : undefined}
         >
-          <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Live Browser</h2>
-          <p className="mb-2 text-xs text-zinc-500">
-            {isLiveMode
-              ? "Live mode increases stream refresh for near real-time browser playback and manual action recording."
-              : "Autonomous mode uses medium refresh while the agent plans and executes in the browser."}
-          </p>
+          <h2 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Live Browser</h2>
           <div
             ref={liveViewportRef}
             tabIndex={0}
             onKeyDown={onLiveViewportKeyDown}
-            className={`mb-3 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[78vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
+            className={`mb-2 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[78vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
           >
             {shouldShowLiveStream && !liveStreamFailed ? (
               <img
@@ -1677,7 +1833,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
             )}
           </div>
           {isLiveMode && (
-            <div className="mb-3 flex gap-2">
+            <div className="mb-2 flex gap-2">
               <input
                 value={manualText}
                 onChange={(e) => setManualText(e.target.value)}
@@ -1715,33 +1871,13 @@ Stop when pass/fail outcome is clear and summarize results.`;
             </div>
           )}
           {isLiveMode && (
-            <p className="mb-2 text-[11px] text-zinc-500">
+            <p className="mb-1 text-[11px] text-zinc-500">
               Tip: click target input in live browser first, then type on your keyboard while live viewport is focused.
             </p>
           )}
-          <p className="mb-3 text-xs text-zinc-500">
+          <p className="mb-1 text-xs text-zinc-500">
             Current URL: {session?.currentUrl || "-"}
           </p>
-          <p className="mb-3 text-xs text-zinc-500">
-            Runtime: {commandInProgress ? "Running" : "Idle"} | Queue: {queuedCommandCount}
-          </p>
-          <div ref={timelineLogRef} className="h-[160px] overflow-auto rounded border border-zinc-200 p-2 text-xs dark:border-zinc-700">
-            <p className="mb-2 font-medium">Recent Step Events</p>
-            <div className="space-y-1">
-              {timeline.map((event, idx) => (
-                <div key={`${event.timeLabel}-${event.actionLabel}-${idx}`} className="rounded bg-zinc-50 px-2 py-1 dark:bg-zinc-800">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-[11px] text-zinc-500">{event.timeLabel}</span>
-                    <span className="font-semibold">{event.actionLabel}</span>
-                  </div>
-                  {event.primary && <p className="mt-0.5 break-words text-zinc-800 dark:text-zinc-100">{event.primary}</p>}
-                  {event.secondary && <p className="mt-0.5 break-words text-zinc-600 dark:text-zinc-300">{event.secondary}</p>}
-                  {event.tertiary && <p className="mt-0.5 break-words text-zinc-500 dark:text-zinc-400">{event.tertiary}</p>}
-                </div>
-              ))}
-              {timeline.length === 0 && <p className="text-zinc-500">No recent step events yet.</p>}
-            </div>
-          </div>
         </section>
         </div>
       </main>
@@ -1843,6 +1979,52 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 <p className="mt-1 text-[11px] text-zinc-500">No saved environments found in project settings.</p>
               </div>
             )}
+            <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/40">
+              <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">Test Intent Preferences</p>
+              <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                Choose how the session should begin after browser startup.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300">Intent Source</span>
+                <button
+                  type="button"
+                  onClick={() => setIntentSource("testcase-intent")}
+                  className={`rounded-full px-2.5 py-1 text-[11px] ${
+                    intentSource === "testcase-intent"
+                      ? "bg-blue-600 text-white"
+                      : "border border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
+                  }`}
+                >
+                  Test case
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIntentSource("custom-command")}
+                  className={`rounded-full px-2.5 py-1 text-[11px] ${
+                    intentSource === "custom-command"
+                      ? "bg-blue-600 text-white"
+                      : "border border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
+                  }`}
+                >
+                  Custom
+                </button>
+              </div>
+              {intentSource === "testcase-intent" && (
+                <label className="mt-3 inline-flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-200">
+                  <input
+                    type="checkbox"
+                    checked={autoStartFromIntent}
+                    onChange={(event) => setAutoStartFromIntent(event.target.checked)}
+                  />
+                  Start testcase intent automatically after setup
+                </label>
+              )}
+              {intentSource === "custom-command" && (
+                <p className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Session will start without running a test intent automatically. You can start manually from chat.
+                </p>
+              )}
+            </div>
             {sessionStartupError && <p className="mt-3 text-xs text-red-600 dark:text-red-400">{sessionStartupError}</p>}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
@@ -1858,7 +2040,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 disabled={testRunEnvironments.length === 0 && !customEnvironmentUrl.trim()}
                 className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                Start Automate
+                {intentSource === "testcase-intent" && autoStartFromIntent ? "Start and Run Intent" : "Start Automate"}
               </button>
             </div>
           </div>

@@ -11,10 +11,7 @@ public final class AutomationExecutionOrchestratorService {
     public static Map<String, Object> enqueueRun(
             UUID cycleId,
             List<CycleAutomationRunService.ExecutionScriptRow> rows,
-            String startUrl,
-            String executionProvider,
-            int maxParallel,
-            Map<String, Object> providerConfig,
+            CycleAutomationRunService.CycleAutomationConfig automationConfig,
             int maxRetries
     ) {
         UUID activeRun = AutomationExecutionQueueService.findActiveRunId(cycleId);
@@ -25,10 +22,10 @@ public final class AutomationExecutionOrchestratorService {
                 cycleId,
                 rows,
                 maxRetries,
-                startUrl,
-                executionProvider,
-                maxParallel,
-                providerConfig
+                automationConfig.startUrl(),
+                automationConfig.executionProvider(),
+                automationConfig.maxParallel(),
+                automationConfig.providerConfig()
         );
         List<Map<String, Object>> jobs = AutomationExecutionQueueService.listQueueableJobs(runId);
         for (Map<String, Object> job : jobs) {
@@ -46,6 +43,12 @@ public final class AutomationExecutionOrchestratorService {
                 payload.put("providerPayload", job.get("providerPayload"));
                 payload.put("shardIndex", job.get("shardIndex"));
                 payload.put("shardTotal", job.get("shardTotal"));
+                payload.put("modelProvider", automationConfig.modelProvider());
+                payload.put("modelApiKey", automationConfig.modelApiKey());
+                payload.put("model", automationConfig.model());
+                payload.put("browserbaseApiKey", automationConfig.browserbaseApiKey());
+                payload.put("browserbaseProjectId", automationConfig.browserbaseProjectId());
+                payload.put("cacheScope", String.valueOf(cycleId) + "/" + String.valueOf(job.get("executionId")));
                 Map<String, Object> queued = AutomationAgentClient.enqueueAutomationJob(payload);
                 String queueJobId = queued.get("queueJobId") instanceof String s ? s : String.valueOf(job.get("jobId"));
                 AutomationExecutionQueueService.markJobEnqueued(jobId, queueJobId);
@@ -58,8 +61,8 @@ public final class AutomationExecutionOrchestratorService {
                 "cycleId", cycleId.toString(),
                 "status", "running",
                 "totalCases", rows.size(),
-                "executionProvider", executionProvider,
-                "maxParallel", maxParallel
+                "executionProvider", automationConfig.executionProvider(),
+                "maxParallel", automationConfig.maxParallel()
         );
     }
 
