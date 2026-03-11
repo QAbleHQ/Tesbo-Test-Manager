@@ -254,8 +254,14 @@ public final class CycleHandler {
         SessionFilter.requireUserId(ctx);
         ctx.json(Map.of(
                 "queue", safeQueueStats(),
-                "runs", AutomationQueueMetricsService.currentRunMetrics()
+                "runs", AutomationQueueMetricsService.currentRunMetrics(),
+                "autoscaling", AutomationQueueAutoscalingService.recommendWorkers()
         ));
+    }
+
+    public static void autoscalingRecommendation(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        ctx.json(AutomationQueueAutoscalingService.recommendWorkers());
     }
 
     private static Map<String, Object> safeQueueStats() {

@@ -1,5 +1,6 @@
 package com.bettercases.cycle;
 
+import com.bettercases.Config;
 import com.bettercases.automation.AutomationAgentClient;
 
 import java.util.LinkedHashMap;
@@ -9,6 +10,7 @@ import java.util.UUID;
 
 public final class AutomationExecutionOrchestratorService {
     public static Map<String, Object> enqueueRun(
+            UUID projectId,
             UUID cycleId,
             List<CycleAutomationRunService.ExecutionScriptRow> rows,
             CycleAutomationRunService.CycleAutomationConfig automationConfig,
@@ -18,6 +20,21 @@ public final class AutomationExecutionOrchestratorService {
         if (activeRun != null) {
             throw new io.javalin.http.ConflictResponse("An automated run is already in progress for this test run.");
         }
+        int activeProjectRuns = AutomationExecutionQueueService.countActiveRunsForProject(projectId);
+        if (activeProjectRuns >= Math.max(1, Config.AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Project queue is at active run capacity. Please wait for current runs to finish."
+            );
+        }
+        int queuedProjectJobs = AutomationExecutionQueueService.countQueuedJobsForProject(projectId);
+        int incomingQueueable = (int) rows.stream().filter(r -> r.script() != null && !r.script().isBlank()).count();
+        int maxQueuedPerProject = Math.max(1, Config.AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT);
+        if (queuedProjectJobs + incomingQueueable > maxQueuedPerProject) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Project queue is at capacity. Reduce batch size or wait for queued jobs to drain."
+            );
+        }
+        Map<UUID, Long> estimatedDurations = AutomationExecutionQueueService.estimateExecutionDurationsMillisForRows(rows);
         UUID runId = AutomationExecutionQueueService.createRunWithJobs(
                 cycleId,
                 rows,
@@ -25,7 +42,8 @@ public final class AutomationExecutionOrchestratorService {
                 automationConfig.startUrl(),
                 automationConfig.executionProvider(),
                 automationConfig.maxParallel(),
-                automationConfig.providerConfig()
+                automationConfig.providerConfig(),
+                estimatedDurations
         );
         List<Map<String, Object>> jobs = AutomationExecutionQueueService.listQueueableJobs(runId);
         for (Map<String, Object> job : jobs) {
@@ -62,7 +80,8 @@ public final class AutomationExecutionOrchestratorService {
                 "status", "running",
                 "totalCases", rows.size(),
                 "executionProvider", automationConfig.executionProvider(),
-                "maxParallel", automationConfig.maxParallel()
+                "maxParallel", automationConfig.maxParallel(),
+                "estimatedScheduling", "duration-aware"
         );
     }
 

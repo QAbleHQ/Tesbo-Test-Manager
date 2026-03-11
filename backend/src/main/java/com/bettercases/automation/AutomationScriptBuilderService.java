@@ -13,10 +13,11 @@ public final class AutomationScriptBuilderService {
         sb.append("test('").append(escape(sanitizedName)).append("', async ({ page }) => {\n");
         sb.append("  const pickLocator = async (hints = {}, kind = 'generic') => {\n");
         sb.append("    const candidates = [];\n");
+        sb.append("    const isBrittleXPath = (value = '') => /^xpath\\s*=\\s*(\\/html\\b|\\/\\*\\[name\\(\\)='html'\\])/i.test(value.trim());\n");
         sb.append("    const selector = (hints.selector || '').trim();\n");
         sb.append("    const targetDescription = (hints.targetDescription || '').trim();\n");
         sb.append("    const expectedText = (hints.expectedText || '').trim();\n");
-        sb.append("    if (selector) candidates.push(page.locator(selector));\n");
+        sb.append("    if (selector && !isBrittleXPath(selector)) candidates.push(page.locator(selector));\n");
         sb.append("    const labelHint = targetDescription\n");
         sb.append("      .replace(/\\bin\\s+.+$/i, '')\n");
         sb.append("      .replace(/\\b(field|textbox|text box|input|button|link)\\b/gi, '')\n");
@@ -177,8 +178,10 @@ public final class AutomationScriptBuilderService {
                             asText(parsed == null ? null : parsed.get("status")),
                             asText(execution == null ? null : execution.get("status"))
                     );
+                    int before = out.size();
                     collectStepsFromStagehandActions(out, stagehandActions, commandStatus);
-                    continue;
+                    int extracted = out.size() - before;
+                    if (extracted > 0) continue;
                 }
                 if (parsed == null) continue;
                 collectStepsFromBundle(out, parsed.get("steps"), execution == null ? null : execution.get("results"));
@@ -221,26 +224,154 @@ public final class AutomationScriptBuilderService {
                 appendExtractAssertions(out, result);
                 continue;
             }
+            if ("fillformvision".equals(type)) {
+                List<Map<String, Object>> pwArgs = asListOfMaps(entry.get("playwrightArguments"));
+                List<Map<String, Object>> fields = pwArgs.isEmpty() ? asListOfMaps(entry.get("fields")) : pwArgs;
+                for (Map<String, Object> field : fields) {
+                    String desc = firstNonBlank(asText(field.get("action")), asText(field.get("description")));
+                    String value = firstNonBlank(asText(field.get("value")), asText(field.get("originalValue")));
+                    if (desc.isBlank() && value.isBlank()) continue;
+                    Map<String, Object> step = new HashMap<>();
+                    step.put("action", "type");
+                    step.put("targetDescription", desc);
+                    step.put("value", value);
+                    out.add(step);
+                }
+                continue;
+            }
+            if ("click".equals(type)) {
+                String describe = firstNonBlank(
+                        asText(entry.get("describe")),
+                        firstNonBlank(asText(entry.get("description")), asText(entry.get("instruction")))
+                );
+                if (!describe.isBlank()) {
+                    Map<String, Object> step = new HashMap<>();
+                    step.put("action", "click");
+                    step.put("targetDescription", describe);
+                    out.add(step);
+                    continue;
+                }
+            }
+            String actionField = asText(entry.get("action")).toLowerCase();
+            if (actionField.startsWith("assert") || type.startsWith("assert")) {
+                String assertAction = actionField.startsWith("assert") ? actionField : type;
+                Map<String, Object> step = new HashMap<>();
+                step.put("action", assertAction);
+                String target = asText(entry.get("targetDescription"));
+                String expectedText = asText(entry.get("expectedText"));
+                String playwright = asText(entry.get("playwright"));
+                if (!target.isBlank()) step.put("targetDescription", target);
+                if (!expectedText.isBlank()) step.put("expectedText", expectedText);
+                if (!playwright.isBlank()) step.put("playwright", playwright);
+                String selector = asText(entry.get("selector"));
+                if (!selector.isBlank()) step.put("selector", selector);
+                out.add(step);
+                continue;
+            }
+            if (appendStagehandPlaywrightAction(out, entry)) continue;
             List<Map<String, Object>> nestedActions = asListOfMaps(entry.get("actions"));
             boolean emitted = false;
             for (Map<String, Object> nested : nestedActions) {
                 emitted |= appendStagehandPlaywrightAction(out, nested);
             }
             if (emitted) continue;
+            if (appendStagehandInstructionAction(out, entry)) continue;
             if (appendStagehandPlaywrightAction(out, asMap(entry.get("playwrightArguments")))) continue;
+            for (Map<String, Object> pwa : asListOfMaps(entry.get("playwrightArguments"))) {
+                if (appendStagehandPlaywrightAction(out, pwa)) {
+                    emitted = true;
+                }
+            }
+            if (emitted) continue;
             appendStagehandPlaywrightAction(out, entry);
         }
     }
 
+    private static boolean appendStagehandInstructionAction(List<Map<String, Object>> out, Map<String, Object> source) {
+        if (source == null || source.isEmpty()) return false;
+        String actionName = firstNonBlank(
+                asText(source.get("action")),
+                firstNonBlank(asText(source.get("type")),
+                        firstNonBlank(asText(source.get("tool")), asText(source.get("name"))))
+        ).toLowerCase();
+        String instruction = asText(source.get("instruction"));
+        String describe = asText(source.get("describe"));
+        String target = firstNonBlank(describe, instruction);
+        String value = firstNonBlank(asText(source.get("value")), asText(source.get("text")));
+        Map<String, Object> argumentsMap = asMap(source.get("arguments"));
+        if (argumentsMap != null && !argumentsMap.isEmpty()) {
+            String argDescribe = asText(argumentsMap.get("describe"));
+            if (!argDescribe.isBlank()) target = argDescribe;
+            String argValue = firstNonBlank(asText(argumentsMap.get("value")), asText(argumentsMap.get("text")));
+            if (!argValue.isBlank()) value = argValue;
+        }
+
+        if (actionName.contains("click")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "click");
+            if (!target.isBlank()) step.put("targetDescription", target);
+            out.add(step);
+            return true;
+        }
+        if (actionName.contains("type") || actionName.contains("fill")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "type");
+            if (!target.isBlank()) step.put("targetDescription", target);
+            if (!value.isBlank()) step.put("value", value);
+            out.add(step);
+            return true;
+        }
+        if (actionName.contains("press") || actionName.contains("key")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "press");
+            step.put("key", firstNonBlank(asText(source.get("key")), "Enter"));
+            out.add(step);
+            return true;
+        }
+        if (actionName.startsWith("assert")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", actionName);
+            if (!target.isBlank()) step.put("targetDescription", target);
+            String expectedText = asText(source.get("expectedText"));
+            if (!expectedText.isBlank()) step.put("expectedText", expectedText);
+            String playwright = asText(source.get("playwright"));
+            if (!playwright.isBlank()) step.put("playwright", playwright);
+            out.add(step);
+            return true;
+        }
+        if (actionName.contains("goto") || actionName.contains("navigate")) {
+            String url = firstNonBlank(asText(source.get("url")), asText(argumentsMap == null ? null : argumentsMap.get("url")));
+            if (!url.isBlank()) {
+                Map<String, Object> step = new HashMap<>();
+                step.put("action", "navigate");
+                step.put("url", url);
+                out.add(step);
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean appendStagehandPlaywrightAction(List<Map<String, Object>> out, Map<String, Object> source) {
         if (source == null || source.isEmpty()) return false;
-        String method = asText(source.get("method")).toLowerCase();
+        String method = firstNonBlank(asText(source.get("method")), asText(source.get("action"))).toLowerCase();
         String selector = normalizeSelector(asText(source.get("selector")));
         String firstArg = firstStagehandArgument(source.get("arguments"));
+        if (firstArg.isBlank()) {
+            firstArg = firstNonBlank(asText(source.get("text")), asText(source.get("value")));
+        }
         if (("fill".equals(method) || "type".equals(method)) && !selector.isBlank()) {
             Map<String, Object> step = new HashMap<>();
             step.put("action", "type");
             step.put("selector", selector);
+            step.put("value", firstArg);
+            out.add(step);
+            return true;
+        }
+        if ("type".equals(method) && selector.isBlank() && !firstArg.isBlank()) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "type");
+            step.put("selector", "activeElement");
             step.put("value", firstArg);
             out.add(step);
             return true;
@@ -250,6 +381,13 @@ public final class AutomationScriptBuilderService {
             Map<String, Object> step = new HashMap<>();
             step.put("action", "click");
             step.put("selector", selector);
+            out.add(step);
+            return true;
+        }
+        if ("press".equals(method) || "keypress".equals(method)) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "press");
+            step.put("key", firstNonBlank(firstArg, "Enter"));
             out.add(step);
             return true;
         }
@@ -441,7 +579,15 @@ public final class AutomationScriptBuilderService {
     }
 
     private static boolean appendStepAction(StringBuilder sb, Map<String, Object> parsed) {
+        String aiPlaywright = asText(parsed.get("playwright"));
+        if (!aiPlaywright.isBlank()) {
+            sb.append("  ").append(aiPlaywright).append("\n");
+            return true;
+        }
         String action = String.valueOf(parsed.getOrDefault("action", ""));
+        if ("act".equalsIgnoreCase(action)) {
+            action = inferActionForGenericAct(parsed);
+        }
         String runtimeSelectorUsed = firstNonBlank(
                 asText(parsed.get("runtimeSelectorUsed")),
                 asText(parsed.get("selectorUsed"))
@@ -470,12 +616,17 @@ public final class AutomationScriptBuilderService {
                 sb.append("  await ").append(runtimeLocatorExpr).append(".click();\n");
                 return true;
             }
-            if (!selector.isBlank()) {
+            if (!selector.isBlank() && !isBrittleSelector(selector)) {
                 sb.append("  await page.locator('").append(escape(selector)).append("').first().click();\n");
                 return true;
             }
             if (!targetDescription.isBlank()) {
                 sb.append("  await (await pickLocator({ targetDescription: '").append(escape(targetDescription))
+                        .append("' }, 'click')).click();\n");
+                return true;
+            }
+            if (!selector.isBlank()) {
+                sb.append("  await (await pickLocator({ selector: '").append(escape(selector))
                         .append("' }, 'click')).click();\n");
                 return true;
             }
@@ -497,13 +648,18 @@ public final class AutomationScriptBuilderService {
                 sb.append("  await ").append(runtimeLocatorExpr).append(".fill('").append(escape(value)).append("');\n");
                 return true;
             }
-            if (!selector.isBlank() && !"activeElement".equals(selector)) {
+            if (!selector.isBlank() && !"activeElement".equals(selector) && !isBrittleSelector(selector)) {
                 sb.append("  await page.locator('").append(escape(selector)).append("').first().fill('")
                         .append(escape(value)).append("');\n");
                 return true;
             }
             if (!targetDescription.isBlank()) {
                 sb.append("  await (await pickLocator({ targetDescription: '").append(escape(targetDescription))
+                        .append("' }, 'type')).fill('").append(escape(value)).append("');\n");
+                return true;
+            }
+            if (!selector.isBlank() && !"activeElement".equals(selector)) {
+                sb.append("  await (await pickLocator({ selector: '").append(escape(selector))
                         .append("' }, 'type')).fill('").append(escape(value)).append("');\n");
                 return true;
             }
@@ -521,7 +677,7 @@ public final class AutomationScriptBuilderService {
                 sb.append("  await expect(").append(runtimeLocatorExpr).append(").toBeVisible();\n");
                 return true;
             }
-            if (!selector.isBlank()) {
+            if (!selector.isBlank() && !isBrittleSelector(selector)) {
                 sb.append("  await expect(page.locator('").append(escape(selector)).append("').first()).toBeVisible();\n");
                 return true;
             }
@@ -544,7 +700,7 @@ public final class AutomationScriptBuilderService {
                         .append(escape(expectedText)).append("');\n");
                 return true;
             }
-            if (!selector.isBlank() && !expectedText.isBlank()) {
+            if (!selector.isBlank() && !isBrittleSelector(selector) && !expectedText.isBlank()) {
                 sb.append("  await expect(page.locator('").append(escape(selector)).append("').first()).toContainText('")
                         .append(escape(expectedText)).append("');\n");
                 return true;
@@ -569,7 +725,7 @@ public final class AutomationScriptBuilderService {
                 sb.append("  await expect(").append(runtimeLocatorExpr).append(").toBeEnabled();\n");
                 return true;
             }
-            if (!selector.isBlank()) {
+            if (!selector.isBlank() && !isBrittleSelector(selector)) {
                 sb.append("  await expect(page.locator('").append(escape(selector)).append("').first()).toBeEnabled();\n");
                 return true;
             }
@@ -618,6 +774,20 @@ public final class AutomationScriptBuilderService {
         return false;
     }
 
+    private static String inferActionForGenericAct(Map<String, Object> parsed) {
+        String value = asText(parsed.get("value"));
+        if (!value.isBlank()) return "type";
+        String target = (
+                asText(parsed.get("targetDescription")) + " " +
+                asText(parsed.get("selector")) + " " +
+                asText(parsed.get("expectedText"))
+        ).toLowerCase();
+        if (target.contains("password") || target.contains("email") || target.contains("input") || target.contains("field")) {
+            return "type";
+        }
+        return "click";
+    }
+
     private static String runtimeLocatorExpression(String runtimeSelectorUsed) {
         String value = asText(runtimeSelectorUsed);
         if (value.isBlank()) return "";
@@ -627,7 +797,9 @@ public final class AutomationScriptBuilderService {
         }
         if (value.startsWith("xpath:")) {
             String selector = value.substring("xpath:".length()).trim();
-            return selector.isBlank() ? "" : "page.locator('xpath=" + escape(selector) + "').first()";
+            if (selector.isBlank()) return "";
+            if (selector.startsWith("/html") || selector.startsWith("/*[name()='html']")) return "";
+            return "page.locator('xpath=" + escape(selector) + "').first()";
         }
         if (value.startsWith("testid:")) {
             String testId = value.substring("testid:".length()).trim();
@@ -1036,9 +1208,28 @@ public final class AutomationScriptBuilderService {
         return value;
     }
 
+    private static boolean isBrittleSelector(String selector) {
+        String value = asText(selector).toLowerCase();
+        if (value.isBlank()) return false;
+        return value.startsWith("xpath=/html") || value.startsWith("xpath=/*[name()='html']");
+    }
+
     private static String firstStagehandArgument(Object argumentsObj) {
-        if (!(argumentsObj instanceof List<?> args) || args.isEmpty()) return "";
-        return asText(args.get(0));
+        if (argumentsObj instanceof List<?> args) {
+            if (args.isEmpty()) return "";
+            return asText(args.get(0));
+        }
+        if (argumentsObj instanceof Map<?, ?> mapValue) {
+            Object describe = mapValue.get("describe");
+            if (describe != null) return asText(describe);
+            Object value = mapValue.get("value");
+            if (value != null) return asText(value);
+            Object text = mapValue.get("text");
+            if (text != null) return asText(text);
+            Object url = mapValue.get("url");
+            if (url != null) return asText(url);
+        }
+        return "";
     }
 
     private static Integer asPositiveInt(Object value) {

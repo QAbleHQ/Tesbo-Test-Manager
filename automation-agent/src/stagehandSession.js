@@ -16,6 +16,44 @@ try {
   Stagehand = null;
 }
 
+const DEFAULT_STAGEHAND_AGENT_MODE = "hybrid";
+const DEFAULT_LIVE_VIEWPORT = { width: 1600, height: 900 };
+
+const ACTION_CONVERTER_SYSTEM_PROMPT = `You are a Playwright test automation expert.
+Your job: convert raw browser automation agent actions into clean, executable Playwright code lines.
+
+LOCATOR PRIORITY (use the FIRST that works):
+1. page.getByRole('button', { name: '...' }) — for buttons, links, tabs
+2. page.getByLabel('...') — for labeled form inputs (email, password, etc.)
+3. page.getByPlaceholder('...') — for inputs with placeholder text
+4. page.getByText('...', { exact: false }) — for visible text
+5. page.locator('css-selector') — last resort; NEVER use XPath
+
+CODE RULES:
+- .fill('value') for text inputs, .click() for buttons/links
+- Always add .first() before the final action
+- page.goto('url') for navigation, page.waitForTimeout(ms) for waits
+- Use { exact: false } where appropriate for fuzzy matching
+
+RETURN: a JSON object { "steps": [ ... ] } — nothing else.`.trim();
+
+const STABLE_LOCATOR_SYSTEM_PROMPT = `
+When interacting with page elements, always prefer stable selectors in this order:
+1) data-testid / data-test / id attributes
+2) accessible role + accessible name
+3) associated label text for form controls
+4) placeholder or name attributes
+
+Avoid absolute XPath selectors like /html/body/... unless there is no other workable option.
+If multiple candidates match, choose the most semantically stable target.
+`.trim();
+
+function normalizeAgentMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (mode === "dom" || mode === "hybrid" || mode === "cua") return mode;
+  return DEFAULT_STAGEHAND_AGENT_MODE;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -29,6 +67,38 @@ async function takeScreenshot(page, sessionId) {
   const outputPath = path.join(config.screenshotDir, fileName);
   await page.screenshot({ path: outputPath, fullPage: true });
   return outputPath;
+}
+
+async function enforceLiveViewport(page) {
+  if (!page) return;
+  try {
+    await page.setViewportSize?.(DEFAULT_LIVE_VIEWPORT);
+  } catch {
+    // best effort
+  }
+
+  // Try maximizing browser window when CDP is available (local Chromium).
+  try {
+    const context = page.context?.();
+    if (context?.newCDPSession) {
+      const cdp = await context.newCDPSession(page);
+      const windowInfo = await cdp.send("Browser.getWindowForTarget").catch(() => null);
+      const windowId = windowInfo?.windowId;
+      if (windowId != null) {
+        await cdp
+          .send("Browser.setWindowBounds", {
+            windowId,
+            bounds: {
+              width: DEFAULT_LIVE_VIEWPORT.width,
+              height: DEFAULT_LIVE_VIEWPORT.height,
+            },
+          })
+          .catch(() => {});
+      }
+    }
+  } catch {
+    // best effort
+  }
 }
 
 /**
@@ -64,6 +134,11 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
   const cacheScope = String(runtimeConfig?.cacheScope || sessionId).replace(/[^a-zA-Z0-9._-]/g, "_");
   const cacheDir = path.join(config.stagehandCacheDir, cacheScope);
   await fs.mkdir(cacheDir, { recursive: true });
+  const agentMode = normalizeAgentMode(runtimeConfig?.agentMode || config.stagehandAgentMode);
+  const agentSystemPrompt =
+    typeof runtimeConfig?.agentSystemPrompt === "string" && runtimeConfig.agentSystemPrompt.trim()
+      ? runtimeConfig.agentSystemPrompt.trim()
+      : STABLE_LOCATOR_SYSTEM_PROMPT;
   const useBrowserbase = Boolean(browserbaseApiKey && browserbaseProjectId);
   const stagehandConfig = {
     env: useBrowserbase ? "BROWSERBASE" : "LOCAL",
@@ -71,6 +146,18 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     model: {
       modelName: resolvedModelName,
       apiKey: modelApiKey,
+    },
+    localBrowserLaunchOptions: {
+      headless: config.headless,
+      args: [`--window-size=${DEFAULT_LIVE_VIEWPORT.width},${DEFAULT_LIVE_VIEWPORT.height}`],
+    },
+    browserbaseSessionCreateParams: {
+      browserSettings: {
+        viewport: {
+          width: DEFAULT_LIVE_VIEWPORT.width,
+          height: DEFAULT_LIVE_VIEWPORT.height,
+        },
+      },
     },
   };
   if (useBrowserbase) {
@@ -87,13 +174,18 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     throw new Error("Stagehand did not create a page");
   }
 
+  // Keep live preview geometry stable across sessions and providers.
+  await enforceLiveViewport(page);
+
   if (startUrl && startUrl.trim()) {
     try {
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await enforceLiveViewport(page);
     } catch (err) {
       logError("stagehand_start_url_failed", { sessionId, startUrl, error: String(err) });
       try {
         await page.goto(startUrl, { waitUntil: "load", timeout: 60000 });
+        await enforceLiveViewport(page);
       } catch {
         // Continue with whatever page we have
       }
@@ -114,7 +206,14 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     updatedAt: nowIso(),
     cacheScope,
     cacheDir,
+    agentMode,
+    agentSystemPrompt,
     mode: useBrowserbase ? "browserbase" : "local",
+    modelConfig: {
+      provider,
+      apiKey: modelApiKey,
+      model: resolvedModelName,
+    },
   };
 
   try {
@@ -130,6 +229,73 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     cacheDir,
   });
   return state;
+}
+
+const ASSERTION_INTENT_RE = /\b(verify|assert|check|confirm|ensure|validate)\b/i;
+const ASSERTION_CONDITION_RE = /\b(visible|displayed|present|shows?|contains?|exists?|appear|seen)\b/i;
+
+function isAssertionCommand(text) {
+  return ASSERTION_INTENT_RE.test(text) && ASSERTION_CONDITION_RE.test(text);
+}
+
+function extractAssertionTargets(text) {
+  const cleaned = text
+    .replace(/^user\s+instruction:\s*/i, "")
+    .replace(/\nexecution\s+rules:[\s\S]*/i, "")
+    .trim();
+
+  const patterns = [
+    /(?:verify|assert|check|confirm|ensure|validate)\s+(?:that\s+)?(?:the\s+)?["']?(.+?)["']?\s+(?:text\s+)?(?:is|are)\s+(?:visible|displayed|present|shown)/i,
+    /(?:verify|assert|check|confirm|ensure|validate)\s+(?:that\s+)?["']?(.+?)["']?\s+(?:appears?|exists?|shows?|contains?)/i,
+    /(?:verify|assert|check|confirm|ensure|validate)\s+(?:that\s+)?(?:the\s+)?(?:text\s+)?["'](.+?)["']/i,
+    /(?:verify|assert|check|confirm|ensure|validate)\s+(?:that\s+)?(?:the\s+)?(.+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = cleaned.match(pattern);
+    if (match?.[1]) {
+      const raw = match[1]
+        .replace(/\b(text|is|are|visible|displayed|present|on the page)\b/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (raw.length > 0 && raw.length < 200) return [raw];
+    }
+  }
+  return [];
+}
+
+/**
+ * Run Playwright-level assertion checks on the live page.
+ * Returns concrete assertion action objects with playwright code.
+ */
+async function runPageAssertions(page, targets) {
+  const assertionSteps = [];
+  for (const target of targets) {
+    const escaped = target.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    try {
+      const locator = page.getByText(target, { exact: false }).first();
+      const visible = await locator.isVisible().catch(() => false);
+      assertionSteps.push({
+        type: "act",
+        action: "assert_visible",
+        targetDescription: target,
+        expectedText: target,
+        description: `Verify "${target}" is visible on the page`,
+        playwright: `await expect(page.getByText('${escaped}', { exact: false }).first()).toBeVisible();`,
+        _verificationResult: visible ? "passed" : "failed",
+      });
+    } catch {
+      assertionSteps.push({
+        type: "act",
+        action: "assert_visible",
+        targetDescription: target,
+        expectedText: target,
+        description: `Verify "${target}" is visible on the page`,
+        playwright: `await expect(page.getByText('${escaped}', { exact: false }).first()).toBeVisible();`,
+        _verificationResult: "failed",
+      });
+    }
+  }
+  return assertionSteps;
 }
 
 /**
@@ -149,7 +315,10 @@ export async function executeStagehandObjective(session, commandId, objective) {
   const maxSteps = 30;
 
   try {
-    const agent = stagehand.agent();
+    const agent = stagehand.agent({
+      mode: session.agentMode || DEFAULT_STAGEHAND_AGENT_MODE,
+      systemPrompt: session.agentSystemPrompt || STABLE_LOCATOR_SYSTEM_PROMPT,
+    });
     const result = await agent.execute({
       instruction: objective,
       maxSteps,
@@ -166,30 +335,45 @@ export async function executeStagehandObjective(session, commandId, objective) {
       screenshotPath = session.lastScreenshotPath;
     }
 
-    const steps = result?.steps ?? result?.actions ?? [];
-    const normalizedActions = Array.isArray(steps)
-      ? steps.map((step, index) => {
-          if (step && typeof step === "object") return step;
-          return {
-            index: index + 1,
-            action: "act",
-            description: String(step || ""),
-          };
-        })
+    const rawSteps = result?.steps ?? result?.actions ?? [];
+    const rawStepsFiltered = Array.isArray(rawSteps)
+      ? rawSteps.filter((s) => s && typeof s === "object")
       : [];
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
+    const normalizedActions = await convertActionsWithAI(
+      rawStepsFiltered,
+      session.currentUrl,
+      session.modelConfig,
+      objective
+    );
+
+    // Detect assertion/verification commands and add concrete assertion steps
+    const assertionTargets = isAssertionCommand(objective)
+      ? extractAssertionTargets(objective)
+      : [];
+    const hasAssertionSteps = normalizedActions.some(
+      (a) => a && typeof a.action === "string" && a.action.startsWith("assert")
+    );
+    if (assertionTargets.length > 0 && !hasAssertionSteps) {
+      const assertionSteps = await runPageAssertions(page, assertionTargets);
+      for (const step of assertionSteps) {
+        normalizedActions.push(step);
+      }
+    }
+
+    for (let i = 0; i < normalizedActions.length; i++) {
+      const step = normalizedActions[i];
       const xpath = typeof step === "object" && step ? String(step.xpath || "") : "";
       const selectorUsed = xpath ? `xpath:${xpath}` : null;
+      const verificationResult = step?._verificationResult;
       results.push({
         commandId,
         stepId: `step-${i + 1}`,
-        action: typeof step === "string" ? step : step?.action ?? "act",
-        status: "passed",
+        action: step?.action || step?.type || "act",
+        status: verificationResult || "passed",
         currentUrl: session.currentUrl,
         selectorUsed,
-        message: typeof step === "string" ? step : step?.description ?? "Executed",
-        screenshotPath: i === steps.length - 1 ? screenshotPath : null,
+        message: step?.description || step?.instruction || "Executed",
+        screenshotPath: i === normalizedActions.length - 1 ? screenshotPath : null,
         durationMs: 0,
       });
     }
@@ -297,6 +481,261 @@ export async function closeStagehandSession(session) {
   }
 }
 
+/**
+ * Strip large/binary fields from actions before sending to the LLM.
+ */
+function sanitizeActionsForPrompt(actions) {
+  return actions.map((action) => {
+    const clean = {};
+    for (const [key, value] of Object.entries(action)) {
+      if (key === "data" || key === "screenshot") continue;
+      if (key === "messages" || key === "usage") continue;
+      if (typeof value === "string" && value.length > 600) {
+        clean[key] = value.slice(0, 400) + "…(truncated)";
+      } else {
+        clean[key] = value;
+      }
+    }
+    return clean;
+  });
+}
+
+/**
+ * Call the configured LLM (OpenAI or Anthropic) to intelligently convert
+ * raw Stagehand agent actions into clean Playwright code.
+ * Falls back to the static flattenStagehandAgentActions on failure.
+ */
+async function convertActionsWithAI(rawActions, currentUrl, modelConfig, objective = "") {
+  if (!rawActions || rawActions.length === 0) return [];
+  if (!modelConfig?.apiKey) return flattenStagehandAgentActions(rawActions);
+
+  const sanitized = sanitizeActionsForPrompt(rawActions);
+
+  const assertionHint = isAssertionCommand(objective)
+    ? `\n\nIMPORTANT: The user's original objective was a VERIFICATION/ASSERTION command: "${objective}"
+If the actions list is empty or only contains screenshot/done, you MUST still generate assertion steps.
+Use: await expect(page.getByText('...', { exact: false }).first()).toBeVisible();
+Set action to "assert_visible" for these steps.`
+    : "";
+
+  const userPrompt = `Convert these browser automation actions to Playwright code.
+Current URL: ${currentUrl || "unknown"}
+${objective ? `Original user objective: ${objective}` : ""}
+
+Actions:
+${JSON.stringify(sanitized, null, 2)}
+
+Return ONLY a JSON object with this structure:
+{
+  "steps": [
+    {
+      "action": "type",
+      "playwright": "await page.getByLabel('Email', { exact: false }).first().fill('user@example.com');",
+      "description": "Enter email address into the Email field",
+      "targetDescription": "Email",
+      "value": "user@example.com"
+    }
+  ]
+}
+
+Rules:
+- Skip "screenshot" and "done" actions entirely
+- For "fillFormVision" actions, create one step per field using the fields/playwrightArguments array
+- For "click" actions, use the describe/description for the role/text locator
+- For "wait" actions, use page.waitForTimeout(ms)
+- action must be one of: navigate, click, type, wait, press, assert_visible, assert_text
+- For verification/assertion objectives, use: await expect(page.getByText('...', { exact: false }).first()).toBeVisible();
+- targetDescription should be a short element label (e.g. "Email", "Password", "Log in")
+- playwright must be a single executable Playwright code line${assertionHint}`;
+
+  try {
+    const provider = (modelConfig.provider || "openai").toLowerCase();
+    const apiKey = modelConfig.apiKey;
+    let modelName = modelConfig.model || "";
+    if (modelName.includes("/")) {
+      modelName = modelName.split("/").slice(1).join("/");
+    }
+
+    let responseText;
+
+    if (provider === "anthropic") {
+      modelName = modelName || "claude-sonnet-4-5-20250929";
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: modelName,
+          max_tokens: 4096,
+          temperature: 0,
+          system: ACTION_CONVERTER_SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userPrompt }],
+        }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`Anthropic API ${resp.status}: ${body.slice(0, 200)}`);
+      }
+      const data = await resp.json();
+      responseText = data.content?.[0]?.text || "";
+    } else {
+      modelName = modelName || "gpt-4o";
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          temperature: 0,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: ACTION_CONVERTER_SYSTEM_PROMPT },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`OpenAI API ${resp.status}: ${body.slice(0, 200)}`);
+      }
+      const data = await resp.json();
+      responseText = data.choices?.[0]?.message?.content || "";
+    }
+
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("No JSON found in LLM response");
+    const parsed = JSON.parse(jsonMatch[0]);
+    const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+    if (steps.length === 0) throw new Error("LLM returned empty steps");
+
+    logInfo("ai_action_convert_success", { stepCount: steps.length });
+
+    return steps.map((step) => ({
+      type: step.action === "wait" ? "wait" : "act",
+      action: step.action || "act",
+      instruction: step.description || "",
+      targetDescription: step.targetDescription || "",
+      value: step.value || "",
+      description: step.description || "",
+      playwright: step.playwright || "",
+      ...(step.action === "wait"
+        ? { timeMs: parseInt(String(step.playwright || "").match(/\d+/)?.[0]) || 2000 }
+        : {}),
+    }));
+  } catch (err) {
+    logError("ai_action_convert_failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return flattenStagehandAgentActions(rawActions);
+  }
+}
+
+/**
+ * Convert high-level Stagehand agent actions (screenshot, fillFormVision, click, done)
+ * into concrete playwright-compatible action objects (type, click, wait).
+ * If the input already contains concrete steps (with nested method/selector),
+ * it is returned unchanged.
+ */
+function flattenStagehandAgentActions(rawActions) {
+  if (!Array.isArray(rawActions) || rawActions.length === 0) return rawActions;
+
+  const hasConcrete = rawActions.some(
+    (a) =>
+      a &&
+      typeof a === "object" &&
+      Array.isArray(a.actions) &&
+      a.actions.some((n) => n && (n.method || n.selector))
+  );
+  if (hasConcrete) return rawActions;
+
+  const hasAgentTypes = rawActions.some((a) => {
+    const t = String(a?.type || "").toLowerCase();
+    return t === "screenshot" || t === "fillformvision" || t === "done";
+  });
+  if (!hasAgentTypes) return rawActions;
+
+  const concrete = [];
+  for (const action of rawActions) {
+    if (!action || typeof action !== "object") continue;
+    const type = String(action.type || "").toLowerCase();
+
+    if (type === "screenshot" || type === "done") continue;
+
+    if (type === "fillformvision") {
+      const pwArgs = Array.isArray(action.playwrightArguments)
+        ? action.playwrightArguments
+        : [];
+      const fields = pwArgs.length > 0 ? pwArgs : Array.isArray(action.fields) ? action.fields : [];
+      for (const field of fields) {
+        if (!field || typeof field !== "object") continue;
+        const desc = String(field.action || field.description || "").trim();
+        const val = String(field.value || field.originalValue || "").trim();
+        if (!val && !desc) continue;
+        concrete.push({
+          type: "act",
+          action: "type",
+          instruction: desc,
+          targetDescription: desc,
+          value: val,
+          description: desc,
+        });
+      }
+      continue;
+    }
+
+    if (type === "click") {
+      const desc = String(
+        action.describe || action.description || action.instruction || ""
+      ).trim();
+      if (!desc) continue;
+      concrete.push({
+        type: "act",
+        action: "click",
+        instruction: desc,
+        targetDescription: desc,
+        description: desc,
+      });
+      continue;
+    }
+
+    if (type === "wait") {
+      const ms = Number(action.timeMs || action.waited || 0);
+      if (ms > 0) {
+        concrete.push({ type: "wait", action: "wait", timeMs: ms });
+      }
+      continue;
+    }
+
+    if (type === "type" || type === "fill") {
+      const val = String(action.value || action.text || "").trim();
+      const sel = String(action.selector || "").trim();
+      const desc = String(
+        action.describe || action.description || action.instruction || ""
+      ).trim();
+      concrete.push({
+        type: "act",
+        action: "type",
+        instruction: desc,
+        targetDescription: desc,
+        selector: sel,
+        value: val,
+        description: desc,
+      });
+      continue;
+    }
+
+    if (action.type || action.action) {
+      concrete.push(action);
+    }
+  }
+  return concrete.length > 0 ? concrete : rawActions;
+}
+
 function sanitizeStagehandScript(script) {
   if (!script || typeof script !== "string") return "";
   let body = script;
@@ -306,6 +745,49 @@ function sanitizeStagehandScript(script) {
   body = body.replace(/^\s*export\s+default\s+/gm, "");
   body = body.replace(/^\s*export\s+/gm, "");
   return body.trim();
+}
+
+function createResilientAgent(agent, logs) {
+  if (!agent || typeof agent !== "object") return agent;
+  const originalAct = typeof agent.act === "function" ? agent.act.bind(agent) : null;
+  if (!originalAct) return agent;
+
+  return new Proxy(agent, {
+    get(target, prop, receiver) {
+      if (prop !== "act") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args) => {
+        try {
+          return await originalAct(...args);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const firstArg = args[0];
+          const canRetryWithoutXPath =
+            firstArg &&
+            typeof firstArg === "object" &&
+            (Object.prototype.hasOwnProperty.call(firstArg, "xPath") ||
+              Object.prototype.hasOwnProperty.call(firstArg, "xpath")) &&
+            /xPath|xpath/i.test(message);
+          if (!canRetryWithoutXPath) throw err;
+
+          const payload = { ...firstArg };
+          delete payload.xPath;
+          delete payload.xpath;
+          delete payload.targetXPath;
+          delete payload.targetXpath;
+
+          logs.push({
+            level: "warn",
+            message: "Stagehand act selector failed; retrying without xPath hint.",
+            ts: new Date().toISOString(),
+          });
+          return originalAct(payload, ...args.slice(1));
+        }
+      };
+    },
+  });
 }
 
 export async function runStagehandScript(executionId, script, startUrl = null, options = {}) {
@@ -355,13 +837,17 @@ export async function runStagehandScript(executionId, script, startUrl = null, o
     if (!sanitizedScript) {
       throw new Error("Stagehand script is empty");
     }
-    const agent = session.stagehand.agent();
+    const agent = session.stagehand.agent({
+      mode: session.agentMode || DEFAULT_STAGEHAND_AGENT_MODE,
+      systemPrompt: session.agentSystemPrompt || STABLE_LOCATOR_SYSTEM_PROMPT,
+    });
+    const resilientAgent = createResilientAgent(agent, logs);
     const assert = (condition, message = "Assertion failed") => {
       if (!condition) throw new Error(message);
     };
     const AsyncFunction = Object.getPrototypeOf(async function noop() {}).constructor;
     const fn = new AsyncFunction("stagehand", "page", "agent", "z", "assert", sanitizedScript);
-    await fn(session.stagehand, page, agent, z, assert);
+    await fn(session.stagehand, page, resilientAgent, z, assert);
 
     currentUrl = page.url();
     screenshotPath = await takeScreenshot(page, String(executionId)).catch(() => null);

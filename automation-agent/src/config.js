@@ -25,6 +25,11 @@ function loadDotEnv() {
 }
 
 const DOT_ENV = loadDotEnv();
+const SERVICE_ROLE = env("AUTOMATION_SERVICE_ROLE", "all").toLowerCase();
+const NORMALIZED_SERVICE_ROLE =
+  SERVICE_ROLE === "api" || SERVICE_ROLE === "worker" || SERVICE_ROLE === "all"
+    ? SERVICE_ROLE
+    : "all";
 
 function env(name, fallback) {
   const fromDotEnv = DOT_ENV.get(name);
@@ -44,17 +49,20 @@ export const config = {
   videoDir: path.resolve(env("VIDEO_DIR", "./artifacts/videos")),
   traceDir: path.resolve(env("TRACE_DIR", "./artifacts/traces")),
   stagehandCacheDir: path.resolve(env("STAGEHAND_CACHE_DIR", "./artifacts/stagehand-cache")),
+  stagehandAgentMode: env("STAGEHAND_AGENT_MODE", "hybrid"),
   recordVideo: env("RECORD_VIDEO", "true") !== "false",
   sharedToken: env("AGENT_SHARED_TOKEN", ""),
   workerId: env("WORKER_ID", `worker-${Math.random().toString(36).slice(2, 10)}`),
   backendBaseUrl: env("BACKEND_BASE_URL", "http://localhost:7000"),
   backendSharedToken: env("AUTOMATION_QUEUE_SHARED_TOKEN", ""),
   redisUrl: env("REDIS_URL", "redis://localhost:6379"),
+  queuePrefix: env("AUTOMATION_QUEUE_PREFIX", "bull"),
   queueName: env("AUTOMATION_QUEUE_NAME", "automation-execution-jobs"),
   queueEnabled: env("AUTOMATION_QUEUE_ENABLED", "true") !== "false",
   queueDefaultRetries: Number(env("AUTOMATION_QUEUE_MAX_RETRIES", "2")),
   queueConcurrency: Number(env("AUTOMATION_QUEUE_CONCURRENCY", "2")),
   queueHeartbeatMs: Number(env("AUTOMATION_QUEUE_HEARTBEAT_MS", "5000")),
+  serviceRole: NORMALIZED_SERVICE_ROLE,
   enableLambdaTestProvider: env("AUTOMATION_PROVIDER_LAMBDATEST_ENABLED", "false") === "true",
   enableBrowserStackProvider: env("AUTOMATION_PROVIDER_BROWSERSTACK_ENABLED", "false") === "true",
 };

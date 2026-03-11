@@ -158,7 +158,7 @@ public final class AutomationAgentClient {
     }
 
     public static Map<String, Object> enqueueAutomationJob(Map<String, Object> payload) {
-        String body = send("/internal/queue/jobs", "POST", payload);
+        String body = sendQueue("/internal/queue/jobs", "POST", payload);
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {
@@ -167,11 +167,11 @@ public final class AutomationAgentClient {
     }
 
     public static void cancelRunQueue(UUID runId) {
-        send("/internal/queue/runs/" + runId + "/cancel", "POST", Map.of());
+        sendQueue("/internal/queue/runs/" + runId + "/cancel", "POST", Map.of());
     }
 
     public static Map<String, Object> queueStats() {
-        String body = send("/internal/queue/stats", "GET", null, Duration.ofSeconds(5));
+        String body = sendQueue("/internal/queue/stats", "GET", null, Duration.ofSeconds(5));
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {
@@ -184,9 +184,21 @@ public final class AutomationAgentClient {
     }
 
     private static String send(String path, String method, Object payload, Duration timeout) {
+        return send(Config.AUTOMATION_AGENT_BASE_URL, path, method, payload, timeout);
+    }
+
+    private static String sendQueue(String path, String method, Object payload) {
+        return sendQueue(path, method, payload, Duration.ofSeconds(40));
+    }
+
+    private static String sendQueue(String path, String method, Object payload, Duration timeout) {
+        return send(Config.AUTOMATION_QUEUE_API_BASE_URL, path, method, payload, timeout);
+    }
+
+    private static String send(String baseUrl, String path, String method, Object payload, Duration timeout) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
-                    .uri(URI.create(Config.AUTOMATION_AGENT_BASE_URL + path))
+                    .uri(URI.create(baseUrl + path))
                     .timeout(timeout == null ? Duration.ofSeconds(40) : timeout)
                     .header("Content-Type", "application/json");
             if (!Config.AUTOMATION_AGENT_SHARED_TOKEN.isBlank()) {

@@ -24,6 +24,15 @@ Backend runtime secrets:
 - `TESBO_SPACES_ENDPOINT`, `TESBO_SPACES_REGION`, `TESBO_SPACES_BUCKET`
 - `TESBO_SPACES_ACCESS_KEY`, `TESBO_SPACES_SECRET_KEY`
 - `TESBO_SIGNED_URL_TTL_SECONDS`
+- `AUTOMATION_AGENT_BASE_URL` (automation session API)
+- `AUTOMATION_QUEUE_API_BASE_URL` (queue enqueue/cancel/stats API; can be separate service)
+- `AUTOMATION_QUEUE_SHARED_TOKEN`
+- `AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT`
+- `AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT`
+- `AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS`
+- `AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS`
+- `AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER`
+- `AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS`
 
 ### Droplet prep (run once)
 1. Install Docker and Compose plugin:
@@ -60,3 +69,22 @@ DigitalOcean guidance:
 - For `automation-agent`, keep `STAGEHAND_CACHE_DIR` on persistent disk (or a mounted volume) so cache survives container restarts.
 - Keep DB persistence enabled for Stagehand action trace/events (this is already handled by backend automation session events).
 - If you rotate droplets without persistent volumes, Stagehand file cache is rebuilt, but DB action trace remains available.
+
+### Queue execution split services (recommended)
+
+- Deploy `automation-agent` in two roles:
+  - `AUTOMATION_SERVICE_ROLE=api` for queue API + session API
+  - `AUTOMATION_SERVICE_ROLE=worker` for queue processing only
+- Point backend to:
+  - `AUTOMATION_AGENT_BASE_URL=http://<automation-api-host>:7400`
+  - `AUTOMATION_QUEUE_API_BASE_URL=http://<automation-api-host>:7400`
+- Scale worker replicas independently (KEDA/queue depth preferred).
+
+### Queue admission and autoscaling
+
+- Backend now enforces per-project execution pressure limits before enqueue:
+  - max active runs per project
+  - max queued jobs per project
+- Backend exposes autoscaling recommendation:
+  - `GET /api/internal/automation/autoscaling-recommendation`
+  - recommendation uses queued + running job pressure and min/max worker bounds.

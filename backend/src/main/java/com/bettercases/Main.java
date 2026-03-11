@@ -141,6 +141,7 @@ public final class Main {
         app.get("/api/cycles/{cycleId}/execute-automated/{runId}/status", CycleHandler::getAutomatedRunStatus);
         app.post("/api/cycles/{cycleId}/execute-automated/{runId}/cancel", CycleHandler::cancelAutomatedRun);
         app.get("/api/internal/automation/queue-metrics", CycleHandler::queueMetrics);
+        app.get("/api/internal/automation/autoscaling-recommendation", CycleHandler::autoscalingRecommendation);
         app.post("/api/cycles/{cycleId}/share", CycleHandler::toggleShare);
         app.get("/api/projects/{projectId}/cycles/schedules", CycleHandler::listSchedules);
         app.post("/api/projects/{projectId}/cycles/schedules", CycleHandler::createSchedule);

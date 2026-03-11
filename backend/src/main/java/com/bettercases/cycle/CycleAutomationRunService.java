@@ -60,7 +60,9 @@ public final class CycleAutomationRunService {
         if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
             assertQueueExecutionAvailable();
             markManualRequiredNotes(rows);
+            UUID projectId = CycleService.getProjectIdForCycle(cycleId);
             return AutomationExecutionOrchestratorService.enqueueRun(
+                    projectId,
                     cycleId,
                     rows,
                     automationConfig,

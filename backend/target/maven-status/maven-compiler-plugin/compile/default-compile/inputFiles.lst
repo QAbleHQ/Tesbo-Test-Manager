@@ -19,10 +19,12 @@
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationScriptBuilderService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationSessionHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationSessionService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/BrowserbaseCredentialsService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/bug/BugHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/bug/BugService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationExecutionOrchestratorService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationExecutionQueueService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationQueueAutoscalingService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationQueueCallbackHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/AutomationQueueMetricsService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/cycle/CycleAutomationRunService.java

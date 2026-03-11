@@ -22,6 +22,7 @@ services:
       dockerfile: Dockerfile
     environment:
       PORT: 7400
+      AUTOMATION_SERVICE_ROLE: api
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
       AUTOMATION_QUEUE_ENABLED: "true"
@@ -38,6 +39,7 @@ services:
       dockerfile: Dockerfile
     environment:
       PORT: 7401
+      AUTOMATION_SERVICE_ROLE: worker
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
       AUTOMATION_QUEUE_ENABLED: "true"

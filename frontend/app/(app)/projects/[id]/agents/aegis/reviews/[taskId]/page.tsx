@@ -6,19 +6,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getStoredAgentTasks,
   updateAgentTaskStatus,
+  updateAgentTaskScript,
   deleteAgentTask,
   getAgentSettings,
   getProject,
-  getTestCase,
   startAutomationSession,
-  sendAutomationCommand,
   getAutomationSession,
+  runAutomationPlaywrightScript,
   cancelAutomationSession,
   type AgentTask,
   type AgentTaskStatus,
   type TestEnvironmentSetting,
 } from "@/lib/api";
-import { buildIntentObjective, extractGeneratedScript, getRunByTaskId, onRunsChanged, type AegisRunLogEntry } from "@/lib/aegis-runner";
+import { getRunByTaskId, onRunsChanged, type AegisRunLogEntry } from "@/lib/aegis-runner";
 import { runAegisInBackground } from "@/lib/aegis-runner";
 import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
@@ -134,6 +134,8 @@ export default function ReviewDetailPage() {
   const [feedbackText, setFeedbackText] = useState("");
   const [copied, setCopied] = useState(false);
   const [actionDone, setActionDone] = useState<string | null>(null);
+  const [isEditingScript, setIsEditingScript] = useState(false);
+  const [editableScript, setEditableScript] = useState("");
   const [showRejectConfirm, setShowRejectConfirm] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
 
@@ -171,6 +173,12 @@ export default function ReviewDetailPage() {
   }, [projectId, taskId]);
 
   useEffect(() => { loadTask(); }, [loadTask]);
+
+  useEffect(() => {
+    if (!isEditingScript) {
+      setEditableScript(task?.script ?? "");
+    }
+  }, [task?.script, isEditingScript]);
 
   // Subscribe to background run changes for observation mode
   useEffect(() => {
@@ -320,6 +328,14 @@ export default function ReviewDetailPage() {
 
   const handleRunPreview = useCallback(async () => {
     if (!task) return;
+    const scriptToRun = (isEditingScript ? editableScript : task.script) ?? "";
+    if (!scriptToRun.trim()) {
+      setPreviewLogs([]);
+      setPreviewStatus("failed");
+      setActiveTab("live_preview");
+      addPreviewLog("No script available to run. Generate or save a script first.", "error");
+      return;
+    }
     cancelledRef.current = false;
     setPreviewStatus("starting");
     setPreviewLogs([]);
@@ -356,62 +372,52 @@ export default function ReviewDetailPage() {
     }
 
     try {
-      addPreviewLog("Fetching test case details...", "info");
-      const tc = await getTestCase(projectId, task.testcaseId);
-
-      addPreviewLog("Building intent from test case...", "info");
-      const intent = buildIntentObjective(tc);
-
       addPreviewLog(`Starting browser session on ${envUrl}...`, "info");
       const { id: sessionId } = await startAutomationSession(projectId, task.testcaseId, { startUrl: envUrl });
       setPreviewSessionId(sessionId);
       setPreviewStatus("running");
 
-      addPreviewLog("Session created. Sending automation command...", "info");
-      await sendAutomationCommand(projectId, sessionId, intent);
-      addPreviewLog("Agent is executing the test case. Watch the live preview below.", "action");
-
-      let finished = false;
-      let pollCount = 0;
-      const maxPolls = 300;
-
-      while (!finished && pollCount < maxPolls && !cancelledRef.current) {
-        await new Promise((r) => setTimeout(r, 2000));
-        pollCount++;
-        try {
-          const session = await getAutomationSession(projectId, sessionId);
-          consumeSessionHighlights(session, "preview");
-          const runtime = session.runtime;
-          if (!runtime?.isRunning && (runtime?.queuedCount ?? 0) === 0) {
-            finished = true;
-            const script = extractGeneratedScript(session);
-            if (script) {
-              addPreviewLog("Execution completed. Script validated successfully.", "success");
-            } else {
-              addPreviewLog("Execution completed. No script actions captured.", "success");
-            }
-            setPreviewStatus("completed");
-          }
-        } catch {
-          finished = true;
-          addPreviewLog("Session polling failed.", "error");
-          setPreviewStatus("failed");
-        }
+      addPreviewLog("Session created. Executing saved script...", "info");
+      const result = await runAutomationPlaywrightScript(projectId, sessionId, {
+        script: scriptToRun,
+        startUrl: envUrl,
+        actionDelayMs: 700,
+      });
+      try {
+        const session = await getAutomationSession(projectId, sessionId);
+        consumeSessionHighlights(session, "preview");
+      } catch {
+        // best effort for highlight sync
       }
 
-      if (!finished && cancelledRef.current) {
+      if (cancelledRef.current) {
         try { await cancelAutomationSession(projectId, sessionId); } catch {}
         addPreviewLog("Preview run cancelled.", "info");
         setPreviewStatus("idle");
-      } else if (!finished) {
-        addPreviewLog("Timed out waiting for execution to complete.", "error");
-        setPreviewStatus("failed");
+      } else {
+        const status = typeof result.status === "string" ? result.status.toLowerCase() : "failed";
+        const passed = status === "passed" || status === "success";
+        if (passed) {
+          addPreviewLog("Script execution completed successfully.", "success");
+          setPreviewStatus("completed");
+        } else {
+          const message = typeof result.errorMessage === "string" && result.errorMessage.trim()
+            ? result.errorMessage.trim()
+            : "Script execution failed.";
+          addPreviewLog(`Script execution failed: ${message}`, "error");
+          setPreviewStatus("failed");
+        }
       }
     } catch (err) {
-      addPreviewLog(`Failed to start preview: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
-      setPreviewStatus("failed");
+      if (cancelledRef.current) {
+        addPreviewLog("Preview run cancelled.", "info");
+        setPreviewStatus("idle");
+      } else {
+        addPreviewLog(`Failed to start preview: ${err instanceof Error ? err.message : "Unknown error"}`, "error");
+        setPreviewStatus("failed");
+      }
     }
-  }, [task, projectId, addPreviewLog, consumeSessionHighlights]);
+  }, [task, projectId, addPreviewLog, consumeSessionHighlights, editableScript, isEditingScript]);
 
   const handleStopPreview = useCallback(async () => {
     cancelledRef.current = true;
@@ -479,9 +485,30 @@ export default function ReviewDetailPage() {
 
   const handleCopyScript = () => {
     if (task?.script && typeof navigator !== "undefined") {
-      navigator.clipboard.writeText(task.script);
+      navigator.clipboard.writeText(isEditingScript ? editableScript : task.script);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleStartEditScript = () => {
+    setEditableScript(task?.script ?? "");
+    setIsEditingScript(true);
+  };
+
+  const handleCancelEditScript = () => {
+    setEditableScript(task?.script ?? "");
+    setIsEditingScript(false);
+  };
+
+  const handleSaveScript = () => {
+    if (!task) return;
+    const updated = updateAgentTaskScript(projectId, "aegis", taskId, editableScript);
+    if (updated) {
+      setTask({ ...updated });
+      setIsEditingScript(false);
+      setActionDone("script_saved");
+      setTimeout(() => setActionDone(null), 3000);
     }
   };
 
@@ -958,6 +985,30 @@ export default function ReviewDetailPage() {
                     Run & Preview
                   </button>
                 )}
+                {task.status === "pending_review" && task.script && !isEditingScript && (
+                  <button
+                    onClick={handleStartEditScript}
+                    className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  >
+                    Edit Script
+                  </button>
+                )}
+                {task.status === "pending_review" && task.script && isEditingScript && (
+                  <>
+                    <button
+                      onClick={handleCancelEditScript}
+                      className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleSaveScript}
+                      className="rounded-lg bg-[var(--primary)] px-3 py-1 text-xs font-medium text-white hover:opacity-90"
+                    >
+                      Save Script
+                    </button>
+                  </>
+                )}
                 <button
                   onClick={handleCopyScript}
                   className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--primary)] hover:bg-[#e8f5eb] dark:hover:bg-zinc-800"
@@ -967,9 +1018,18 @@ export default function ReviewDetailPage() {
               </div>
             </div>
             {task.script ? (
-              <pre className="p-4 text-sm text-[var(--foreground)] overflow-x-auto leading-relaxed font-mono bg-zinc-50 dark:bg-zinc-900 max-h-[500px] overflow-y-auto">
-                {task.script}
-              </pre>
+              isEditingScript ? (
+                <textarea
+                  value={editableScript}
+                  onChange={(e) => setEditableScript(e.target.value)}
+                  spellCheck={false}
+                  className="w-full min-h-[500px] p-4 text-sm text-[var(--foreground)] leading-relaxed font-mono bg-zinc-50 dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/40 resize-y"
+                />
+              ) : (
+                <pre className="p-4 text-sm text-[var(--foreground)] overflow-x-auto leading-relaxed font-mono bg-zinc-50 dark:bg-zinc-900 max-h-[500px] overflow-y-auto">
+                  {task.script}
+                </pre>
+              )
             ) : (
               <div className="p-8 text-center text-sm text-[var(--muted)]">No script generated for this task.</div>
             )}
@@ -1336,6 +1396,7 @@ export default function ReviewDetailPage() {
           }`}>
             {actionDone === "approved" && "Script approved and saved to the test case."}
             {actionDone === "rejected" && "Script has been rejected. The generated changes have been discarded."}
+            {actionDone === "script_saved" && "Script changes saved."}
             {actionDone === "feedback_sent" && "Feedback sent. Aegis is already working on the revision in the background."}
             {actionDone === "requeued" && "Aegis is re-running this task in the background."}
           </div>
@@ -1435,6 +1496,19 @@ export default function ReviewDetailPage() {
                   Send Feedback & Re-run Aegis
                 </button>
               </div>
+
+              <div className="rounded-lg border border-[var(--border)] bg-zinc-50 p-4 dark:bg-zinc-900/40">
+                <h4 className="text-sm font-semibold text-[var(--foreground)]">Automate by Self</h4>
+                <p className="mt-1 text-xs text-[var(--muted)]">
+                  If you are not satisfied with the autonomous result, continue in AI Assisted or Manual Live mode and automate the flow yourself.
+                </p>
+                <Link
+                  href={`/projects/${projectId}/testcases/${task.testcaseId}/automate`}
+                  className="mt-3 inline-flex rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                >
+                  Open Automate by Self
+                </Link>
+              </div>
             </div>
           </>
         )}
@@ -1504,10 +1578,14 @@ export default function ReviewDetailPage() {
           </div>
         )}
 
-        <div className="mt-6 pt-4 border-t border-[var(--border)]">
+        <div className="mt-6 rounded-lg border border-red-200 bg-red-50/70 p-4 dark:border-red-800 dark:bg-red-900/10">
+          <h4 className="text-sm font-semibold text-red-700 dark:text-red-400">Danger Zone</h4>
+          <p className="mt-1 text-xs text-red-700/80 dark:text-red-300/80">
+            Delete this review task permanently. This action cannot be undone.
+          </p>
           <button
             onClick={handleDeleteTask}
-            className="rounded-lg border border-red-300 dark:border-red-800 px-4 py-2 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+            className="mt-3 rounded-lg border border-red-300 bg-white px-4 py-2 text-xs font-medium text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-zinc-900 dark:text-red-400 dark:hover:bg-red-900/20 transition-colors"
           >
             Delete Task
           </button>

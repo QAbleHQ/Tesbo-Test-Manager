@@ -340,6 +340,11 @@ export default function TestCasesPage() {
     setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, [field]: value } : step)));
   }
 
+  function openSingleTestRun(testcaseId: string) {
+    const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
+    window.open(rerunUrl, "_blank", "noopener,noreferrer");
+  }
+
   async function refreshData(pageOverride?: number) {
     await loadData();
     await loadSelectedSuiteCases(pageOverride);
@@ -804,7 +809,7 @@ export default function TestCasesPage() {
                           <th className="px-4 py-2">Priority</th>
                           <th className="px-4 py-2">Status</th>
                           <th className="px-4 py-2">Updated</th>
-                          <th className="px-4 py-2">Automation</th>
+                          <th className="px-4 py-2">Run</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -867,18 +872,14 @@ export default function TestCasesPage() {
                               <div className="flex items-center gap-1.5">
                                 <button
                                   type="button"
-                                  onClick={(e) => { e.stopPropagation(); runAegisInBackground(projectId, tc.id, tc.title, tc.externalId || "", "manual"); }}
-                                  className="rounded border border-[#2e7d32]/40 px-2 py-1 text-xs text-[#2e7d32] hover:bg-[#e8f5eb] dark:border-green-700/40 dark:text-green-400 dark:hover:bg-green-900/20"
-                                  title="Add to Aegis automation queue"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openSingleTestRun(tc.id);
+                                  }}
+                                  className="rounded border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+                                  title="Run this single test case"
                                 >
-                                  Aegis Queue
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => router.push(`/projects/${projectId}/testcases/${tc.id}/automate`)}
-                                  className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
-                                >
-                                  Automate
+                                  Run Single Test
                                 </button>
                               </div>
                             </td>
@@ -962,18 +963,6 @@ export default function TestCasesPage() {
                               strokeLinejoin="round"
                             />
                           </svg>
-                        </button>
-                      )}
-                      {panelMode === "view" && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            panelTestcaseId &&
-                            router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)
-                          }
-                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
-                        >
-                          Open Automate
                         </button>
                       )}
                       <button
@@ -1152,24 +1141,12 @@ export default function TestCasesPage() {
                           type="button"
                           onClick={() => {
                             if (panelTestcaseId) {
-                              runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
-                              setPanelSuccess("Added to Aegis queue. Automation will start shortly.");
-                              setTimeout(() => setPanelSuccess(null), 4000);
+                              openSingleTestRun(panelTestcaseId);
                             }
                           }}
-                          className="rounded border border-[#2e7d32]/40 px-3 py-1 text-sm text-[#2e7d32] hover:bg-[#e8f5eb] dark:border-green-700/40 dark:text-green-400 dark:hover:bg-green-900/20"
+                          className="rounded border border-emerald-300 px-3 py-1 text-sm text-emerald-700 hover:bg-emerald-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
                         >
-                          Add to Aegis Queue
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            panelTestcaseId &&
-                            router.push(`/projects/${projectId}/testcases/${panelTestcaseId}/automate`)
-                          }
-                          className="rounded border border-blue-300 px-3 py-1 text-sm text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950/40"
-                        >
-                          Open Automate
+                          Run Single Test
                         </button>
                         <button
                           type="button"

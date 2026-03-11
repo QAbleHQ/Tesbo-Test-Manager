@@ -1091,6 +1091,7 @@ interface PendingQueueItem {
   queueSource: AgentTaskQueueSource;
   botReviewCycle: number;
   botFeedback: string[];
+  previousScript?: string | null;
 }
 
 const pendingQueue: PendingQueueItem[] = [];
@@ -1111,6 +1112,7 @@ async function processNextInQueue(): Promise<void> {
       1,
       next.botReviewCycle,
       next.botFeedback,
+      next.previousScript ?? null,
     );
   } finally {
     isProcessingQueue = false;
@@ -1133,6 +1135,7 @@ export async function runAegisInBackground(
   options?: {
     botReviewCycle?: number;
     botFeedback?: string[];
+    previousScript?: string | null;
   },
 ): Promise<void> {
   if (activeRuns.has(testcaseId)) return;
@@ -1150,6 +1153,7 @@ export async function runAegisInBackground(
       queueSource,
       botReviewCycle: Math.max(1, options?.botReviewCycle ?? 1),
       botFeedback: Array.isArray(options?.botFeedback) ? options.botFeedback : [],
+      previousScript: typeof options?.previousScript === "string" ? options.previousScript : null,
     });
     return;
   }
@@ -1162,6 +1166,7 @@ export async function runAegisInBackground(
     queueSource,
     botReviewCycle: Math.max(1, options?.botReviewCycle ?? 1),
     botFeedback: Array.isArray(options?.botFeedback) ? options.botFeedback : [],
+    previousScript: typeof options?.previousScript === "string" ? options.previousScript : null,
   });
   processNextInQueue();
 }
@@ -1199,6 +1204,7 @@ async function executeAegisRun(
   attempt: number = 1,
   botReviewCycle: number = 1,
   botFeedback: string[] = [],
+  forcedPreviousScript: string | null = null,
 ): Promise<void> {
   if (activeRuns.has(testcaseId)) return;
 
@@ -1230,7 +1236,17 @@ async function executeAegisRun(
       activeRuns.delete(testcaseId);
       notifyListeners();
       await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-      return executeAegisRun(projectId, testcaseId, title, externalId, queueSource, attempt + 1, botReviewCycle, botFeedback);
+      return executeAegisRun(
+        projectId,
+        testcaseId,
+        title,
+        externalId,
+        queueSource,
+        attempt + 1,
+        botReviewCycle,
+        botFeedback,
+        forcedPreviousScript
+      );
     }
     addRunLog(testcaseId, `${reason} — all ${MAX_RETRIES} attempts exhausted.`, "error");
     updateRunPhase(testcaseId, "failed");
@@ -1291,7 +1307,7 @@ async function executeAegisRun(
       (t) => t.testcaseId === testcaseId && t.feedback.length > 0 && (t.status === "in_progress" || t.status === "needs_revision")
     );
     const reviewerFeedback = [...(previousTask?.feedback.map((fb) => fb.message) || []), ...botFeedback];
-    const previousScript = previousTask?.script ?? null;
+    const previousScript = forcedPreviousScript || previousTask?.script || null;
 
     if (reviewerFeedback && reviewerFeedback.length > 0) {
       addRunLog(testcaseId, `Revision run — addressing ${reviewerFeedback.length} feedback item(s)`, "action");

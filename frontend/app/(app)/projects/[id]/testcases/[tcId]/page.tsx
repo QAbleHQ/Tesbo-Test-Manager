@@ -67,6 +67,7 @@ export default function TestCaseDetailPage() {
   const [status, setStatus] = useState("Draft");
   const [suiteId, setSuiteId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [assigningToAegis, setAssigningToAegis] = useState(false);
   const [saveNotification, setSaveNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
   
 
@@ -290,15 +291,34 @@ export default function TestCaseDetailPage() {
     setSteps((s) => s.map((st, idx) => (idx === i ? { ...st, [field]: value } : st)));
   }
 
-  async function onStartAutomation() {
-    if (isNew) return;
-    router.push(`/projects/${projectId}/testcases/${testcaseId}/automate`);
-  }
-
   function onOpenLivePreviewRerun() {
     if (isNew) return;
     const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
     window.open(rerunUrl, "_blank", "noopener,noreferrer");
+  }
+
+  async function onAssignToAegisQueue() {
+    if (isNew || assigningToAegis) return;
+    setAssigningToAegis(true);
+    try {
+      const currentExternalId = String((tc as Record<string, unknown> | null)?.externalId ?? "");
+      const currentTitle = String((tc as Record<string, unknown> | null)?.title ?? "");
+      await runAegisInBackground(
+        projectId,
+        testcaseId,
+        title.trim() || currentTitle || "Untitled test case",
+        currentExternalId,
+        "manual"
+      );
+      setSaveNotification({ type: "success", message: "Assigned to Aegis. Task added to queue." });
+      setTimeout(() => setSaveNotification(null), 4000);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Failed to assign test case to Aegis queue.";
+      setSaveNotification({ type: "error", message });
+      setTimeout(() => setSaveNotification(null), 6000);
+    } finally {
+      setAssigningToAegis(false);
+    }
   }
 
   if (tc === null && !isNew) {
@@ -524,24 +544,6 @@ export default function TestCaseDetailPage() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      runAegisInBackground(projectId, testcaseId, title, "", "manual");
-                      setSaveNotification({ type: "success", message: "Added to Aegis queue. Automation will start shortly." });
-                      setTimeout(() => setSaveNotification(null), 4000);
-                    }}
-                    className="rounded border border-[#2e7d32]/40 bg-[#e8f5eb] px-2 py-1 text-xs font-medium text-[#2e7d32] hover:bg-[#c8e6c9] dark:border-green-800 dark:bg-green-950/30 dark:text-green-300 dark:hover:bg-green-900/40"
-                  >
-                    Add to Aegis Queue
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void onStartAutomation()}
-                    className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-900/40"
-                  >
-                    Open Automate
-                  </button>
-                  <button
-                    type="button"
                     onClick={onOpenLivePreviewRerun}
                     className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
                   >
@@ -551,7 +553,7 @@ export default function TestCaseDetailPage() {
               )}
             </div>
             <p className="mb-2 text-xs text-zinc-500">
-              You can edit script manually here, or use Automate to generate and update it.
+              You can edit the script manually here and use the run action to validate the latest flow.
             </p>
             <p className="mb-2 text-xs text-zinc-500">
               Current script version: <span className="font-medium">{currentScriptVersionLabel}</span>
@@ -587,8 +589,18 @@ export default function TestCaseDetailPage() {
           </div>
           <div className="flex gap-2">
             {!isNew && (
+              <button
+                type="button"
+                onClick={() => void onAssignToAegisQueue()}
+                disabled={assigningToAegis || saving}
+                className="rounded-lg border border-amber-300 bg-amber-50 py-2 px-4 text-sm font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200 dark:hover:bg-amber-900/40"
+              >
+                {assigningToAegis ? "Assigning..." : "Assign to Aegis"}
+              </button>
+            )}
+            {!isNew && (
               <span className="rounded-lg border border-blue-200 bg-blue-50 py-2 px-4 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-300">
-                You can edit script manually above or use Automate from the script section.
+                Update script and use the run action from the script section to validate changes.
               </span>
             )}
             <button

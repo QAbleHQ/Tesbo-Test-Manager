@@ -25,6 +25,14 @@ import {
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
+function hasApiRole() {
+  return config.serviceRole === "all" || config.serviceRole === "api";
+}
+
+function hasWorkerRole() {
+  return config.serviceRole === "all" || config.serviceRole === "worker";
+}
+
 function isAuthorized(req) {
   if (!config.sharedToken) return true;
   const token = req.header("x-agent-token");
@@ -40,7 +48,12 @@ app.use("/internal", (req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "automation-agent" });
+  res.json({
+    status: "ok",
+    service: "automation-agent",
+    role: config.serviceRole,
+    queueEnabled: config.queueEnabled,
+  });
 });
 
 app.post("/internal/sessions", async (req, res) => {
@@ -205,6 +218,10 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
 });
 
 app.post("/internal/queue/jobs", async (req, res) => {
+  if (!hasApiRole()) {
+    res.status(503).json({ error: "Queue enqueue API disabled for this service role" });
+    return;
+  }
   const {
     jobId,
     runId,
@@ -255,6 +272,10 @@ app.post("/internal/queue/jobs", async (req, res) => {
 });
 
 app.post("/internal/queue/runs/:runId/cancel", async (req, res) => {
+  if (!hasApiRole()) {
+    res.status(503).json({ error: "Queue cancel API disabled for this service role" });
+    return;
+  }
   try {
     await cancelRun(req.params.runId);
     res.status(204).end();
@@ -264,6 +285,10 @@ app.post("/internal/queue/runs/:runId/cancel", async (req, res) => {
 });
 
 app.get("/internal/queue/stats", async (_req, res) => {
+  if (!hasApiRole() && !hasWorkerRole()) {
+    res.status(503).json({ error: "Queue stats API disabled for this service role" });
+    return;
+  }
   try {
     res.json(await queueStats());
   } catch (err) {
@@ -291,7 +316,8 @@ app.get("/internal/sessions/:sessionId/state", async (req, res) => {
 });
 
 app.get("/internal/sessions/:sessionId/live", async (req, res) => {
-  const session = getSession(req.params.sessionId);
+  const { sessionId } = req.params;
+  const session = getSession(sessionId);
   if (!session) {
     res.status(404).json({ error: "Session not found" });
     return;
@@ -326,19 +352,26 @@ app.get("/internal/sessions/:sessionId/live", async (req, res) => {
 
   const writeFrame = async () => {
     if (cancelled || busy || streamClosed) return;
+    const activeSession = getSession(sessionId);
+    if (!activeSession?.page) {
+      closeStream();
+      return;
+    }
     busy = true;
     try {
-      const buffer = await session.page.screenshot({ type: "jpeg", quality: 55 });
+      const buffer = await activeSession.page.screenshot({ type: "jpeg", quality: 55 });
       res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buffer.length}\r\n\r\n`);
       res.write(buffer);
       res.write("\r\n");
-      session.currentUrl = session.page.url();
-      session.updatedAt = new Date().toISOString();
+      activeSession.currentUrl = activeSession.page.url();
+      activeSession.updatedAt = new Date().toISOString();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const normalizedMessage = message.toLowerCase();
       const closedContext =
         message.includes("Target page, context or browser has been closed") ||
-        message.includes("Target closed");
+        message.includes("Target closed") ||
+        normalizedMessage.includes("session with given id not found");
       if (!closedContext) {
         logError("live_frame_failed", { error: message });
       }
@@ -373,6 +406,13 @@ app.use((err, _req, res, _next) => {
 
 app.listen(config.port, () => {
   startCleanupWatchdog();
-  startQueueWorker();
-  logInfo("automation_agent_started", { port: config.port, headless: config.headless });
+  if (hasWorkerRole()) {
+    startQueueWorker();
+  }
+  logInfo("automation_agent_started", {
+    port: config.port,
+    headless: config.headless,
+    role: config.serviceRole,
+    queueEnabled: config.queueEnabled,
+  });
 });

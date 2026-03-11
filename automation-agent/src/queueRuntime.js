@@ -36,7 +36,10 @@ function ensureQueue() {
     connectionRef = new IORedis(config.redisUrl, { maxRetriesPerRequest: null });
   }
   if (!queueRef) {
-    queueRef = new Queue(config.queueName, { connection: connectionRef });
+    queueRef = new Queue(config.queueName, {
+      connection: connectionRef,
+      prefix: config.queuePrefix,
+    });
   }
   return queueRef;
 }
@@ -119,8 +122,12 @@ export async function queueStats() {
     "paused"
   );
   return {
+    prefix: config.queuePrefix,
     queueName: config.queueName,
+    queueWaitListName: `${config.queuePrefix}:${config.queueName}:wait`,
     workerId: config.workerId,
+    role: config.serviceRole,
+    concurrency: Math.max(1, config.queueConcurrency),
     ...counts,
   };
 }
@@ -185,6 +192,7 @@ export function startQueueWorker() {
     },
     {
       connection: connectionRef,
+      prefix: config.queuePrefix,
       concurrency: Math.max(1, config.queueConcurrency),
     }
   );

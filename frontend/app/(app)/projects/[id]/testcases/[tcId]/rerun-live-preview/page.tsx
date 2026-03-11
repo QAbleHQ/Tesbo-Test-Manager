@@ -17,6 +17,7 @@ import {
   type AutomationSession,
   type TestEnvironmentSetting,
 } from "@/lib/api";
+import { runAegisInBackground } from "@/lib/aegis-runner";
 
 type ScriptVersionOption = {
   key: string;
@@ -60,6 +61,7 @@ export default function RerunLivePreviewPage() {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
   const [testcaseTitle, setTestcaseTitle] = useState("Test Case");
+  const [testcaseExternalId, setTestcaseExternalId] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<AutomationSession | null>(null);
   const [sessionStartupState, setSessionStartupState] = useState<SessionStartupState>("idle");
@@ -77,6 +79,11 @@ export default function RerunLivePreviewPage() {
   const [runBusy, setRunBusy] = useState(false);
   const [runStatusMessage, setRunStatusMessage] = useState<string | null>(null);
   const [lastRunTraceAvailable, setLastRunTraceAvailable] = useState(false);
+  const [lastRunFailed, setLastRunFailed] = useState(false);
+  const [lastRunScript, setLastRunScript] = useState("");
+  const [aegisInstruction, setAegisInstruction] = useState("");
+  const [sendToAegisBusy, setSendToAegisBusy] = useState(false);
+  const [sendToAegisMessage, setSendToAegisMessage] = useState<string | null>(null);
 
   const selectedStartUrl = (selectedEnvironmentUrl || customEnvironmentUrl).trim();
   const startupReady = sessionStartupState === "ready";
@@ -90,6 +97,7 @@ export default function RerunLivePreviewPage() {
       Promise.all([getProject(projectId), getTestCase(projectId, testcaseId)])
         .then(([project, tc]) => {
           setTestcaseTitle(((tc.title as string) || "Test Case").trim() || "Test Case");
+          setTestcaseExternalId(typeof tc.externalId === "string" ? tc.externalId : "");
 
           const parsedSettings = parseProjectSettings(project.settings);
           const environments = normalizeTestRunEnvironments(parsedSettings.testRunEnvironments);
@@ -256,6 +264,8 @@ export default function RerunLivePreviewPage() {
 
   async function onRunSelectedVersion() {
     if (runBusy) return;
+    setLastRunFailed(false);
+    setSendToAegisMessage(null);
     setRunStatusMessage("Preparing test run...");
     if (!selectedStartUrl) {
       setRunStatusMessage("Select or enter an Environment URL before running the test.");
@@ -287,6 +297,8 @@ export default function RerunLivePreviewPage() {
       });
       const runStatus = typeof result.status === "string" ? result.status.toLowerCase() : "failed";
       const passed = runStatus === "passed";
+      setLastRunScript(selected.script);
+      setLastRunFailed(!passed);
       const durationMs = typeof result.durationMs === "number" ? result.durationMs : null;
       const durationText = durationMs != null ? ` in ${(durationMs / 1000).toFixed(1)}s` : "";
       const errorText =
@@ -328,6 +340,41 @@ export default function RerunLivePreviewPage() {
     }
     await cancelAutomationSession(projectId, sessionId);
     router.push(`/projects/${projectId}/testcases/${testcaseId}`);
+  }
+
+  async function onSendFailedScriptToAegis() {
+    if (sendToAegisBusy || !lastRunFailed) return;
+    if (!lastRunScript.trim()) {
+      setSendToAegisMessage("No failed script found. Run the test first, then send it to Aegis.");
+      return;
+    }
+    setSendToAegisBusy(true);
+    setSendToAegisMessage(null);
+    try {
+      const instruction = aegisInstruction.trim();
+      const feedback = [
+        "Script failed during rerun-live-preview. Fix the script so it passes reliably.",
+        instruction
+          ? `Customer instruction: ${instruction}`
+          : "Customer instruction: Focus on fixing this failure and keeping assertions stable.",
+      ];
+      await runAegisInBackground(
+        projectId,
+        testcaseId,
+        testcaseTitle,
+        testcaseExternalId,
+        "failed_fix",
+        {
+          botFeedback: feedback,
+          previousScript: lastRunScript,
+        }
+      );
+      setSendToAegisMessage("Failed script sent to Aegis. Track progress in Aegis Reviews.");
+    } catch (error: unknown) {
+      setSendToAegisMessage(error instanceof Error ? error.message : "Failed to send script to Aegis.");
+    } finally {
+      setSendToAegisBusy(false);
+    }
   }
 
   return (
@@ -413,6 +460,40 @@ export default function RerunLivePreviewPage() {
               </div>
             )}
           </div>
+
+          {lastRunFailed && (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30">
+              <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                Test failed. Send this script to Aegis to fix it.
+              </p>
+              <textarea
+                value={aegisInstruction}
+                onChange={(e) => setAegisInstruction(e.target.value)}
+                rows={3}
+                placeholder="Add customer instruction for Aegis (optional)"
+                className="mt-2 w-full rounded border border-amber-300 bg-white px-2 py-1.5 text-xs text-zinc-900 dark:border-amber-800 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void onSendFailedScriptToAegis()}
+                  disabled={sendToAegisBusy}
+                  className="rounded border border-amber-400 bg-amber-100 px-2 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-60 dark:border-amber-700 dark:bg-amber-900/40 dark:text-amber-200 dark:hover:bg-amber-900/60"
+                >
+                  {sendToAegisBusy ? "Sending..." : "Send to Aegis Fix"}
+                </button>
+                <Link
+                  href={`/projects/${projectId}/agents/aegis/reviews`}
+                  className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+                >
+                  Open Aegis Reviews
+                </Link>
+              </div>
+              {sendToAegisMessage && (
+                <p className="mt-2 text-xs text-amber-900 dark:text-amber-200">{sendToAegisMessage}</p>
+              )}
+            </div>
+          )}
 
           <button
             type="button"

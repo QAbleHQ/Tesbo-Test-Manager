@@ -326,8 +326,9 @@ public final class AutomationSessionHandler {
     }
 
     /**
-     * Execute command using Stagehand agent (Browserbase-backed autonomous flow).
-     * For Stagehand sessions, both chat and autonomous commands are executed as a single autonomous objective.
+     * Execute command using Stagehand agent.
+     * Chat mode should follow the latest user instruction exactly.
+     * Autonomous mode can expand into richer end-to-end execution.
      */
     private static void executeStagehandCommand(
             CommandEnvelope envelope,
@@ -350,7 +351,9 @@ public final class AutomationSessionHandler {
                 null
         );
 
-        String stagehandObjective = buildStagehandExecutionObjective(envelope);
+        String stagehandObjective = envelope.autonomousMode
+                ? buildStagehandExecutionObjective(envelope)
+                : buildStagehandChatObjective(envelope);
         AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeStagehand(
                 envelope.sessionId,
                 envelope.commandId.toString(),
@@ -430,6 +433,23 @@ public final class AutomationSessionHandler {
                 .append("5) If a strict Stagehand assertion is not reliable for a specific check, still verify via deterministic page evidence before finishing.\n")
                 .append("6) Avoid unnecessary exploration once required goals are satisfied.\n");
         return objective.toString().trim();
+    }
+
+    private static String buildStagehandChatObjective(CommandEnvelope envelope) {
+        String instruction = envelope.objective == null ? "" : envelope.objective.trim();
+        if (instruction.isBlank()) {
+            instruction = envelope.rawCommand == null ? "" : envelope.rawCommand.trim();
+        }
+        if (instruction.isBlank()) {
+            return "Follow the latest user instruction exactly.";
+        }
+        return ("User instruction:\n" + instruction + "\n\n"
+                + "Execution rules:\n"
+                + "1) Follow the latest user instruction exactly as written.\n"
+                + "2) Do only what is required for this instruction; do not expand scope.\n"
+                + "3) If the instruction is single-step (for example: click a button), perform that single step and stop.\n"
+                + "4) Do not enter text, credentials, or perform extra navigation unless explicitly requested.\n"
+                + "5) If the target is ambiguous, choose the closest visible match by label/text and execute once.");
     }
 
     private static List<String> extractRecentFeedbackSignals(List<Map<String, Object>> events, String currentRawCommand) {
@@ -1081,18 +1101,11 @@ public final class AutomationSessionHandler {
         AutomationContracts.FinalizeBody body = ctx.bodyAsClass(AutomationContracts.FinalizeBody.class);
 
         List<Map<String, Object>> events = AutomationSessionService.listEvents(sessionId, 5000);
-        String detectedSessionType = detectSessionType(session);
-        boolean stagehandSession = "stagehand".equalsIgnoreCase(detectedSessionType);
-        String generatedScript = stagehandSession
-                ? AutomationScriptBuilderService.buildStagehandScript(
-                body != null ? body.testName : null,
-                events
-        )
-                : AutomationScriptBuilderService.buildPlaywrightScript(
+        String generatedScript = AutomationScriptBuilderService.buildPlaywrightScript(
                 body != null ? body.testName : null,
                 events
         );
-        String scriptLanguage = stagehandSession ? "stagehand-ts" : "playwright-ts";
+        String scriptLanguage = "playwright-ts";
         boolean shouldGenerateSteps = shouldAutoGenerateSteps(projectId, userId);
         List<Map<String, Object>> generatedSteps = shouldGenerateSteps
                 ? AutomationScriptBuilderService.buildTestSteps(events)
@@ -1123,7 +1136,7 @@ public final class AutomationSessionHandler {
                 projectId,
                 testcaseId,
                 userId,
-                body != null && body.framework != null ? body.framework : (stagehandSession ? "Stagehand" : "Playwright"),
+                body != null && body.framework != null ? body.framework : "Playwright",
                 body != null ? body.repo : null,
                 body != null ? body.path : null,
                 body != null && body.testName != null ? body.testName : "Generated Test",
@@ -1142,22 +1155,6 @@ public final class AutomationSessionHandler {
             AuditService.logActivity(userId, projectId, "automation_session_finalized", "testcase", testcaseId.toString(), null);
         } catch (Exception ignored) {}
         ctx.json(Map.of("status", "ok", "script", scriptToSave));
-    }
-
-    private static String detectSessionType(Map<String, Object> session) {
-        if (session == null) return "playwright";
-        Object browserMetaRaw = session.get("browserContextMeta");
-        if (!(browserMetaRaw instanceof String metaJson) || metaJson.isBlank()) return "playwright";
-        try {
-            Map<String, Object> meta = mapper.readValue(metaJson, new TypeReference<>() {});
-            Object sessionType = meta.get("sessionType");
-            if (sessionType instanceof String s && !s.isBlank()) {
-                return s.trim().toLowerCase();
-            }
-        } catch (Exception ignored) {
-            // default
-        }
-        return "playwright";
     }
 
     public static void manualAction(Context ctx) {

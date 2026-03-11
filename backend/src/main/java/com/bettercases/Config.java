@@ -47,6 +47,7 @@ public final class Config {
     public static final String TESBO_SPACES_SECRET_KEY = getEnv("TESBO_SPACES_SECRET_KEY", "").trim();
     public static final int TESBO_SIGNED_URL_TTL_SECONDS = Integer.parseInt(getEnv("TESBO_SIGNED_URL_TTL_SECONDS", "600"));
     public static final String AUTOMATION_AGENT_BASE_URL = getEnv("AUTOMATION_AGENT_BASE_URL", "http://localhost:7400");
+    public static final String AUTOMATION_QUEUE_API_BASE_URL = getEnv("AUTOMATION_QUEUE_API_BASE_URL", AUTOMATION_AGENT_BASE_URL);
     public static final String AUTOMATION_AGENT_SHARED_TOKEN = getEnv("AUTOMATION_AGENT_SHARED_TOKEN", "");
     public static final int AUTOMATION_STEP_TIMEOUT_MS = Integer.parseInt(getEnv("AUTOMATION_STEP_TIMEOUT_MS", "10000"));
     public static final int AUTOMATION_AUTONOMOUS_MAX_TURNS = Integer.parseInt(getEnv("AUTOMATION_AUTONOMOUS_MAX_TURNS", "15"));
@@ -58,6 +59,18 @@ public final class Config {
     public static final int AUTOMATION_QUEUE_MAX_RETRIES = Integer.parseInt(getEnv("AUTOMATION_QUEUE_MAX_RETRIES", "2"));
     public static final int AUTOMATION_QUEUE_STALE_MINUTES = Integer.parseInt(getEnv("AUTOMATION_QUEUE_STALE_MINUTES", "5"));
     public static final String AUTOMATION_QUEUE_SHARED_TOKEN = getEnv("AUTOMATION_QUEUE_SHARED_TOKEN", "").trim();
+    public static final int AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT", "3"));
+    public static final int AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT", "300"));
+    public static final int AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS", "0"));
+    public static final int AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS", "50"));
+    public static final int AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER", "2"));
+    public static final int AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS =
+            Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS", "0"));
 
     // Browserbase platform account (env vars) — used when project uses "default" browser agent
     public static final String BROWSERBASE_API_KEY = getEnv("BROWSERBASE_API_KEY", "").trim();

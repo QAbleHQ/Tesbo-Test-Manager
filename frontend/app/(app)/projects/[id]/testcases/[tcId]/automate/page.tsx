@@ -16,7 +16,6 @@ import {
   cancelAutomationSession,
   stopAutomationCommand,
   sendAutomationManualAction,
-  runAutomationPlaywrightScript,
   type AutomationSession,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -27,7 +26,6 @@ type ChatMessage = {
 };
 
 type AutomationMode = "autonomous" | "live";
-type AutonomousTraceMode = "normal" | "debug";
 
 type TimelineItem = {
   timeLabel: string;
@@ -42,6 +40,7 @@ type ReviewStep = {
   action: string;
   expectedResult: string;
   playwright: string;
+  status?: string;
 };
 
 type SessionStartupState = "select-environment" | "starting" | "waiting-stream" | "ready";
@@ -52,14 +51,7 @@ type BotHighlight = {
   heightRatio?: number;
   label?: string;
 };
-type ScriptVersionOption = {
-  key: string;
-  label: string;
-  script: string;
-  scriptVersion: number | null;
-};
-
-type IntentSource = "testcase-intent" | "custom-command";
+type AutomateEntryMode = "smart" | "autonomous" | "assisted" | "manual";
 
 type TestCaseIntentDetails = {
   title: string;
@@ -79,11 +71,22 @@ export default function AutomateTestCasePage() {
     () => ({
       sessionId: searchParams.get("sessionId"),
       openInLivePreview: searchParams.get("livePreview") === "1",
+      entry: (() => {
+        const raw = (searchParams.get("entry") || "").toLowerCase();
+        if (raw === "autonomous" || raw === "assisted" || raw === "manual") {
+          return raw as AutomateEntryMode;
+        }
+        if (raw === "smart") {
+          return "assisted";
+        }
+        return "assisted" as AutomateEntryMode;
+      })(),
     }),
     [searchParams]
   );
   const bootstrapSessionId = bootstrap.sessionId;
   const openInLivePreview = bootstrap.openInLivePreview;
+  const bootstrapEntryMode = bootstrap.entry;
 
   const [testcaseTitle, setTestcaseTitle] = useState("Test Case");
   const [testcaseIntentDetails, setTestcaseIntentDetails] = useState<TestCaseIntentDetails>({
@@ -99,7 +102,7 @@ export default function AutomateTestCasePage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
   const [stoppingCommand, setStoppingCommand] = useState(false);
-  const [chatPaneRatio, setChatPaneRatio] = useState(30);
+  const [chatPaneRatio, setChatPaneRatio] = useState(26);
   const [resizingPanes, setResizingPanes] = useState(false);
   const [desktopSplitEnabled, setDesktopSplitEnabled] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
@@ -107,8 +110,7 @@ export default function AutomateTestCasePage() {
   const [reviewSteps, setReviewSteps] = useState<ReviewStep[]>([]);
   const [streamState, setStreamState] = useState<"Connecting" | "Live" | "Lagging" | "Disconnected">("Connecting");
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
-  const [mode, setMode] = useState<AutomationMode>("autonomous");
-  const [autonomousTraceMode, setAutonomousTraceMode] = useState<AutonomousTraceMode>("normal");
+  const [mode, setMode] = useState<AutomationMode>("live");
   const [sessionStartupState, setSessionStartupState] = useState<SessionStartupState>("select-environment");
   const [sessionStartupError, setSessionStartupError] = useState<string | null>(null);
   const [liveStreamFailed, setLiveStreamFailed] = useState(false);
@@ -116,41 +118,33 @@ export default function AutomateTestCasePage() {
   const [sessionStartUrl, setSessionStartUrl] = useState("");
   const [selectedEnvironmentUrl, setSelectedEnvironmentUrl] = useState("");
   const [customEnvironmentUrl, setCustomEnvironmentUrl] = useState("");
-  const [manualText, setManualText] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
-  const [quickActionBusy, setQuickActionBusy] = useState<"run" | "rerun" | null>(null);
-  const [scriptVersionOptions, setScriptVersionOptions] = useState<ScriptVersionOption[]>([]);
-  const [versionPickerOpen, setVersionPickerOpen] = useState(false);
-  const [selectedVersionKey, setSelectedVersionKey] = useState<string>("");
-  const [intentSource, setIntentSource] = useState<IntentSource>("testcase-intent");
-  const [autoStartFromIntent, setAutoStartFromIntent] = useState(true);
+  const [quickActionBusy, setQuickActionBusy] = useState<"run" | null>(null);
+  const [reviewScriptOpen, setReviewScriptOpen] = useState(false);
   const [aiConfigured, setAiConfigured] = useState(true);
   const [aiProvider, setAiProvider] = useState<"openai" | "anthropic">("openai");
   const [lastClickTarget, setLastClickTarget] = useState<{ xRatio: number; yRatio: number } | null>(null);
   const [cursorPulse, setCursorPulse] = useState(false);
-  const [keyboardCapture, setKeyboardCapture] = useState(true);
   const [botHighlight, setBotHighlight] = useState<BotHighlight | null>(null);
   const dragStartRef = useRef<{ xRatio: number; yRatio: number } | null>(null);
   const suppressClickRef = useRef(false);
   const lastScrollAtRef = useRef(0);
-  const autoIntentStartedForSessionRef = useRef<string | null>(null);
   const splitPaneRef = useRef<HTMLDivElement | null>(null);
   const liveViewportRef = useRef<HTMLDivElement | null>(null);
   const chatLogRef = useRef<HTMLDivElement | null>(null);
-  const timelineLogRef = useRef<HTMLDivElement | null>(null);
   const keyQueueRef = useRef<Array<{ actionType: "press" | "type"; key?: string; text?: string }>>([]);
   const processingKeyQueueRef = useRef(false);
   const streamedAutonomousEventIdsRef = useRef<Set<string>>(new Set());
+  const streamedTimelineEntriesRef = useRef<Set<string>>(new Set());
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
   const verboseAutonomousEvents = process.env.NEXT_PUBLIC_AUTONOMOUS_VERBOSE_EVENTS === "true";
-  const showAutonomousDebugTrace = verboseAutonomousEvents || autonomousTraceMode === "debug";
+  const showAutonomousDebugTrace = verboseAutonomousEvents;
   const isLiveMode = mode === "live";
   const isAutonomousMode = mode === "autonomous";
   const startupReady = sessionStartupState === "ready";
   const selectedStartUrl = (selectedEnvironmentUrl || customEnvironmentUrl).trim();
   const runtimeInfo = session?.runtime;
   const commandInProgress = Boolean(runtimeInfo?.isRunning);
-  const queuedCommandCount = Number(runtimeInfo?.queuedCount || 0);
 
   function asText(value: unknown): string {
     return typeof value === "string" ? value : "";
@@ -258,6 +252,19 @@ export default function AutomateTestCasePage() {
       "Use this intent to execute the flow end-to-end, adapt to current DOM when needed, and generate robust assertions for expected outcomes."
     );
     return lines.join("\n");
+  }
+
+  function bootstrapMessageForEntry(entry: AutomateEntryMode): string {
+    if (entry === "autonomous") {
+      return "AI Assisted mode selected. Chat guidance is active with live preview.";
+    }
+    if (entry === "assisted") {
+      return "AI Assisted mode selected. Use guided commands while watching live browser, and intervene whenever needed.";
+    }
+    if (entry === "manual") {
+      return "Manual Live mode selected. Interact directly on the browser and use assistant suggestions for assertions.";
+    }
+    return "AI Assisted mode selected. Provide guidance in chat and watch execution in live preview.";
   }
 
   function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
@@ -373,31 +380,117 @@ export default function AutomateTestCasePage() {
     return fromSelector ? `${fromSelector} text box` : "";
   }
 
+  function normalizeSelector(value: unknown): string {
+    const selector = asText(value).trim();
+    if (!selector) return "";
+    if (selector.startsWith("xpath:")) return `xpath=${selector.slice("xpath:".length)}`;
+    return selector;
+  }
+
+  function runtimeSelectorToSelector(runtimeSelectorUsed: string): string {
+    if (runtimeSelectorUsed.startsWith("selector:")) return runtimeSelectorUsed.slice("selector:".length).trim();
+    if (runtimeSelectorUsed.startsWith("xpath:")) return `xpath=${runtimeSelectorUsed.slice("xpath:".length).trim()}`;
+    return "";
+  }
+
+  function runtimeSelectorToTarget(runtimeSelectorUsed: string): string {
+    const idx = runtimeSelectorUsed.lastIndexOf(":");
+    if (idx < 0 || idx + 1 >= runtimeSelectorUsed.length) return "";
+    return runtimeSelectorUsed.slice(idx + 1).trim();
+  }
+
+  function mergeStepWithResult(
+    stepRaw: Record<string, unknown>,
+    resultRaw: Record<string, unknown>
+  ): Record<string, unknown> {
+    const merged: Record<string, unknown> = { ...stepRaw };
+    const runtimeSelectorUsed = asText(resultRaw.selectorUsed);
+    if (runtimeSelectorUsed) {
+      merged.runtimeSelectorUsed = runtimeSelectorUsed;
+      if (!asText(merged.selector)) {
+        const derivedSelector = runtimeSelectorToSelector(runtimeSelectorUsed);
+        if (derivedSelector) merged.selector = derivedSelector;
+      }
+      if (!asText(merged.targetDescription)) {
+        const derivedTarget = runtimeSelectorToTarget(runtimeSelectorUsed);
+        if (derivedTarget) merged.targetDescription = derivedTarget;
+      }
+      if (asText(merged.action) === "assert_text" && !asText(merged.expectedText)) {
+        const derivedExpected = runtimeSelectorToTarget(runtimeSelectorUsed);
+        if (derivedExpected) merged.expectedText = derivedExpected;
+      }
+    }
+    const status = asText(resultRaw.status);
+    if (status) merged.__status = status;
+    const message = asText(resultRaw.message);
+    if (message) merged.__message = message;
+    return merged;
+  }
+
+  function cleanLocatorLabel(raw: string): string {
+    let label = raw;
+    const intoMatch = label.match(/(?:type|enter|fill)\s+.+?\s+into\s+(?:the\s+)?(.+)/i);
+    if (intoMatch) label = intoMatch[1];
+    return label
+      .replace(/\s*[-–—]\s*.+$/, "")
+      .replace(/\b(field|input|textbox|text\s*box)\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim() || raw.trim();
+  }
+
   function playwrightLineForAction(parsed: Record<string, unknown>): string {
-    const action = asText(parsed.action);
+    const actionRaw = asText(parsed.action).toLowerCase();
+    const action =
+      actionRaw === "act"
+        ? (() => {
+            const value = asText(parsed.value);
+            const target = `${asText(parsed.targetDescription)} ${asText(parsed.selector)}`.toLowerCase();
+            if (value) return "type";
+            if (target.includes("password") || target.includes("email") || target.includes("input")) return "type";
+            return "click";
+          })()
+        : actionRaw;
     if (action === "navigate") {
       const url = asText(parsed.url);
       return url ? `await page.goto('${url.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` : "// navigate step unavailable";
     }
     if (action === "click") {
       const selector = asText(parsed.selector);
+      const targetDescription = asText(parsed.targetDescription);
       if (selector) {
         return `await page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first().click();`;
+      }
+      if (targetDescription) {
+        const label = cleanLocatorLabel(targetDescription);
+        const escaped = label.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        return `await page.getByRole('button', { name: '${escaped}', exact: false }).or(page.getByText('${escaped}', { exact: false })).first().click();`;
       }
       return "// click target unavailable";
     }
     if (action === "type") {
       const selector = asText(parsed.selector);
       const value = asText(parsed.value);
+      const targetDescription = asText(parsed.targetDescription);
       const escapedValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       if (selector && selector !== "activeElement") {
         return `await page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first().fill('${escapedValue}');`;
+      }
+      if (targetDescription && value) {
+        const label = cleanLocatorLabel(targetDescription);
+        const escaped = label.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        return `await page.getByLabel('${escaped}', { exact: false }).first().fill('${escapedValue}');`;
       }
       return value ? `await page.keyboard.type('${escapedValue}');` : "// type value unavailable";
     }
     if (action === "press") {
       const key = asText(parsed.key) || "Enter";
       return `await page.keyboard.press('${key.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');`;
+    }
+    if (action === "wait") {
+      const durationMs = Number(parsed.durationMs);
+      return Number.isFinite(durationMs) && durationMs > 0
+        ? `await page.waitForTimeout(${Math.round(durationMs)});`
+        : "// wait duration unavailable";
     }
     if (action === "assert_visible") {
       const selector = asText(parsed.selector);
@@ -425,6 +518,26 @@ export default function AutomateTestCasePage() {
         ? `await expect(page.locator('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}').first()).toBeEnabled();`
         : "// clickable assertion target unavailable";
     }
+    if (action === "assert_url") {
+      const url = asText(parsed.url);
+      return url ? `await expect(page).toHaveURL('${url.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` : "// url assertion unavailable";
+    }
+    if (actionRaw === "act") {
+      const targetDescription = asText(parsed.targetDescription);
+      const value = asText(parsed.value);
+      if (targetDescription && value) {
+        const label = cleanLocatorLabel(targetDescription);
+        const escaped = label.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const escapedValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        return `await page.getByLabel('${escaped}', { exact: false }).first().fill('${escapedValue}');`;
+      }
+      if (targetDescription) {
+        const label = cleanLocatorLabel(targetDescription);
+        const escaped = label.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        return `await page.getByText('${escaped}', { exact: false }).first().click();`;
+      }
+      return "// unsupported stagehand act: missing target details";
+    }
     return `// unsupported action: ${action || "unknown"}`;
   }
 
@@ -451,6 +564,11 @@ export default function AutomateTestCasePage() {
       const key = asText(parsed.key) || "Enter";
       actionText = `Press ${key}.`;
       expectedResult = `The application handles the ${key} key action successfully.`;
+    } else if (action === "wait") {
+      const durationMs = Number(parsed.durationMs);
+      const waitMs = Number.isFinite(durationMs) && durationMs > 0 ? Math.round(durationMs) : 0;
+      actionText = waitMs > 0 ? `Wait for ${waitMs} ms.` : "Wait for the page to stabilize.";
+      expectedResult = "The UI has enough time to finish async updates before the next step.";
     } else if (action === "drag") {
       const start = asText(parsed.startSelector);
       const end = asText(parsed.endSelector);
@@ -481,12 +599,262 @@ export default function AutomateTestCasePage() {
       actionText = `Perform action: ${action}.`;
       expectedResult = "The action completes successfully.";
     }
+    const status = asText(parsed.__status || parsed.status);
+    const statusSuffix = status && status.toLowerCase() !== "passed" ? ` [${status}]` : "";
+    const aiPlaywright = asText(parsed.playwright);
     return {
       id: `review-step-${index + 1}-${action}`,
-      action: actionText,
+      action: `${actionText}${statusSuffix}`,
       expectedResult,
-      playwright: playwrightLineForAction(parsed),
+      playwright: aiPlaywright || playwrightLineForAction(parsed),
+      status,
     };
+  }
+
+  function parseStagehandActionsForReplay(
+    execution: Record<string, unknown>,
+    rawCommand: string
+  ): Record<string, unknown>[] {
+    const actions = Array.isArray(execution.stagehandActions)
+      ? (execution.stagehandActions as Array<Record<string, unknown>>)
+      : [];
+    const mapped: Record<string, unknown>[] = [];
+    const mapMethodAction = (methodRaw: unknown, selectorRaw: unknown, firstArgRaw: unknown): boolean => {
+      const method = asText(methodRaw).toLowerCase();
+      const selector = normalizeSelector(selectorRaw);
+      const firstArg = asText(firstArgRaw);
+      if ((method === "fill" || method === "type") && selector) {
+        mapped.push({ action: "type", selector, value: firstArg });
+        return true;
+      }
+      if ((method === "click" || method === "dblclick" || method === "check" || method === "uncheck") && selector) {
+        mapped.push({ action: "click", selector });
+        return true;
+      }
+      if (method === "press") {
+        mapped.push({ action: "press", key: firstArg || "Enter" });
+        return true;
+      }
+      if ((method === "goto" || method === "navigate") && firstArg) {
+        mapped.push({ action: "navigate", url: firstArg });
+        return true;
+      }
+      return false;
+    };
+    const mapInstructionAction = (sourceRaw: unknown): boolean => {
+      const source = asRecord(sourceRaw);
+      if (Object.keys(source).length === 0) return false;
+      const argumentsMap = asRecord(source.arguments);
+      const actionName = (
+        asText(source.action) ||
+        asText(source.type) ||
+        asText(source.tool) ||
+        asText(source.name)
+      ).toLowerCase();
+      const instruction = asText(source.instruction);
+      const describe = asText(source.describe);
+      const aiPlaywright = asText(source.playwright);
+      const targetDescription =
+        asText(source.targetDescription) ||
+        asText(argumentsMap.describe) || describe || instruction;
+      const value =
+        asText(argumentsMap.value) ||
+        asText(argumentsMap.text) ||
+        asText(source.value) ||
+        asText(source.text);
+      const url = asText(argumentsMap.url) || asText(source.url);
+
+      if (actionName.includes("click")) {
+        mapped.push({
+          action: "click",
+          ...(targetDescription ? { targetDescription } : {}),
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+        });
+        return true;
+      }
+      if (actionName.includes("type") || actionName.includes("fill")) {
+        mapped.push({
+          action: "type",
+          ...(targetDescription ? { targetDescription } : {}),
+          ...(value ? { value } : {}),
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+        });
+        return true;
+      }
+      if (actionName.includes("press") || actionName.includes("key")) {
+        mapped.push({
+          action: "press",
+          key: asText(source.key) || "Enter",
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+        });
+        return true;
+      }
+      if ((actionName.includes("goto") || actionName.includes("navigate")) && url) {
+        mapped.push({
+          action: "navigate",
+          url,
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+        });
+        return true;
+      }
+      if (actionName.startsWith("assert")) {
+        mapped.push({
+          action: asText(source.action) || actionName,
+          ...(targetDescription ? { targetDescription } : {}),
+          ...(asText(source.expectedText) ? { expectedText: asText(source.expectedText) } : {}),
+          ...(asText(source.selector) ? { selector: asText(source.selector) } : {}),
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+          ...(asText(source._verificationResult) ? { __status: asText(source._verificationResult) } : {}),
+        });
+        return true;
+      }
+      return false;
+    };
+
+    for (const item of actions) {
+      const actionName = asText(item.type || item.action || item.tool || item.name).toLowerCase();
+
+      if (actionName === "wait") {
+        const durationMs = Number(item.timeMs);
+        if (Number.isFinite(durationMs) && durationMs > 0) {
+          mapped.push({
+            action: "wait",
+            durationMs: Math.round(durationMs),
+            ...(asText(item.playwright) ? { playwright: asText(item.playwright) } : {}),
+          });
+        }
+        continue;
+      }
+
+      if (actionName === "extract") {
+        const result = asRecord(item.result);
+        for (const value of Object.values(result)) {
+          if (typeof value === "string") {
+            const text = value.trim();
+            if (!text) continue;
+            if (/^https?:\/\//i.test(text)) {
+              mapped.push({ action: "assert_url", url: text });
+            } else {
+              mapped.push({ action: "assert_text", expectedText: text });
+            }
+            continue;
+          }
+          if (Array.isArray(value)) {
+            for (const child of value) {
+              const text = asText(child).trim();
+              if (!text) continue;
+              mapped.push({ action: "assert_text", expectedText: text });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (actionName === "fillformvision") {
+        const pwArgs = Array.isArray(item.playwrightArguments) ? item.playwrightArguments : [];
+        const fields = pwArgs.length > 0 ? pwArgs : (Array.isArray(item.fields) ? item.fields : []);
+        for (const field of fields) {
+          const f = asRecord(field);
+          const desc = asText(f.action || f.description).trim();
+          const val = asText(f.value || f.originalValue).trim();
+          if (val || desc) {
+            mapped.push({ action: "type", targetDescription: desc, value: val });
+          }
+        }
+        continue;
+      }
+
+      if (actionName.startsWith("assert")) {
+        const aiPlaywright = asText(item.playwright);
+        mapped.push({
+          action: asText(item.action) || actionName,
+          ...(asText(item.targetDescription) ? { targetDescription: asText(item.targetDescription) } : {}),
+          ...(asText(item.expectedText) ? { expectedText: asText(item.expectedText) } : {}),
+          ...(asText(item.selector) ? { selector: asText(item.selector) } : {}),
+          ...(asText(item.url) ? { url: asText(item.url) } : {}),
+          ...(aiPlaywright ? { playwright: aiPlaywright } : {}),
+          ...(asText(item._verificationResult) ? { __status: asText(item._verificationResult) } : {}),
+        });
+        continue;
+      }
+
+      let emitted = false;
+      const nestedActions = Array.isArray(item.actions) ? item.actions : [];
+      for (const nested of nestedActions) {
+        const action = asRecord(nested);
+        const args = Array.isArray(action.arguments) ? action.arguments : [];
+        const firstArg = args.length > 0 ? args[0] : "";
+        if (mapMethodAction(action.method, action.selector, firstArg)) {
+          emitted = true;
+        }
+      }
+      if (emitted) {
+        continue;
+      }
+
+      const topArgs = Array.isArray(item.arguments) ? item.arguments : [];
+      const topFirstArg = topArgs.length > 0 ? topArgs[0] : item.value;
+      if (mapMethodAction(item.method, item.selector, topFirstArg)) {
+        continue;
+      }
+      if (mapInstructionAction(item)) {
+        continue;
+      }
+
+      if (Array.isArray(item.playwrightArguments)) {
+        let pwEmitted = false;
+        for (const pwa of item.playwrightArguments) {
+          const pwArg = asRecord(pwa);
+          const val = asText(pwArg.value || pwArg.originalValue);
+          const desc = asText(pwArg.action || pwArg.description);
+          if (val || desc) {
+            mapped.push({ action: "type", targetDescription: desc, value: val });
+            pwEmitted = true;
+          }
+        }
+        if (pwEmitted) continue;
+      }
+      const playwrightArguments = asRecord(item.playwrightArguments);
+      if (Object.keys(playwrightArguments).length > 0) {
+        const pwArgs = Array.isArray(playwrightArguments.arguments) ? playwrightArguments.arguments : [];
+        const pwFirstArg = pwArgs.length > 0 ? pwArgs[0] : "";
+        if (mapMethodAction(playwrightArguments.method, playwrightArguments.selector, pwFirstArg)) {
+          continue;
+        }
+      }
+
+      const fallbackSelector = normalizeSelector(item.selector);
+      if (actionName.includes("click") && fallbackSelector) {
+        mapped.push({ action: "click", selector: fallbackSelector });
+        continue;
+      }
+      if ((actionName.includes("type") || actionName.includes("fill")) && fallbackSelector) {
+        mapped.push({
+          action: "type",
+          selector: fallbackSelector,
+          value: asText(item.text || item.value),
+        });
+        continue;
+      }
+      if (actionName.includes("press") || actionName.includes("key")) {
+        mapped.push({ action: "press", key: asText(item.key || item.value || "Enter") });
+        continue;
+      }
+      if (actionName.includes("goto") || actionName.includes("navigate")) {
+        const url = asText(item.url || execution.currentUrl);
+        if (url) mapped.push({ action: "navigate", url });
+      }
+    }
+    if (mapped.length > 0) return mapped;
+
+    const command = rawCommand.trim().toLowerCase();
+    if (command.startsWith("click ")) {
+      return [{ action: "click", targetDescription: rawCommand.replace(/^click\s+/i, "").trim() }];
+    }
+    if (command.startsWith("enter ") || command.startsWith("type ")) {
+      return [{ action: "type", targetDescription: rawCommand }];
+    }
+    return [];
   }
 
   function collectStepsForFinalize(events: AutomationSession["events"]): ReviewStep[] {
@@ -505,15 +873,14 @@ export default function AutomateTestCasePage() {
       const parsed = asRecord(event.parsedAction);
       const execution = asRecord(event.executionResult);
       if (event.eventType === "autonomous_step_executed") {
-        if (!isPassedStatus(parsed.status)) continue;
         const turn = typeof parsed.turn === "number" ? parsed.turn : null;
         if (turn != null && successfulAutonomousTurns.size > 0 && !successfulAutonomousTurns.has(turn)) continue;
         const step = asRecord(parsed.step);
-        if (Object.keys(step).length > 0) actions.push(step);
+        const result = asRecord(execution.result);
+        if (Object.keys(step).length > 0) actions.push(mergeStepWithResult(step, result));
         continue;
       }
       if (event.eventType === "autonomous_turn_executed" && !hasAutonomousStepEvents) {
-        if (!isPassedStatus(parsed.status)) continue;
         const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
         const results = Array.isArray(parsed.results) ? parsed.results : [];
         if (results.length === 0) {
@@ -521,8 +888,9 @@ export default function AutomateTestCasePage() {
         } else {
           const bound = Math.min(steps.length, results.length);
           for (let i = 0; i < bound; i += 1) {
+            const step = asRecord(steps[i]);
             const result = asRecord(results[i]);
-            if (isPassedStatus(result.status)) actions.push(asRecord(steps[i]));
+            actions.push(mergeStepWithResult(step, result));
           }
         }
         continue;
@@ -531,6 +899,13 @@ export default function AutomateTestCasePage() {
         const parsedMode = asText(parsed.mode).toLowerCase();
         const executionMode = asText(execution.mode).toLowerCase();
         if (parsedMode === "autonomous" || executionMode === "autonomous") continue;
+        if (executionMode === "stagehand" || parsedMode === "stagehand") {
+          const stagehandMapped = parseStagehandActionsForReplay(execution, asText(event.rawCommand));
+          if (stagehandMapped.length > 0) {
+            for (const item of stagehandMapped) actions.push(asRecord(item));
+            continue;
+          }
+        }
         const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
         const results = Array.isArray(execution.results) ? execution.results : [];
         if (results.length === 0) {
@@ -538,16 +913,20 @@ export default function AutomateTestCasePage() {
         } else {
           const bound = Math.min(steps.length, results.length);
           for (let i = 0; i < bound; i += 1) {
+            const step = asRecord(steps[i]);
             const result = asRecord(results[i]);
-            if (isPassedStatus(result.status)) actions.push(asRecord(steps[i]));
+            actions.push(mergeStepWithResult(step, result));
           }
         }
         continue;
       }
       if (event.eventType === "manual_action_executed" || event.eventType === "step_finished") {
-        const status = asText(execution.status);
-        if (status && !isPassedStatus(status)) continue;
-        if (Object.keys(parsed).length > 0) actions.push(parsed);
+        const merged = {
+          ...parsed,
+          ...(asText(execution.status) ? { __status: asText(execution.status) } : {}),
+          ...(asText(execution.message) ? { __message: asText(execution.message) } : {}),
+        };
+        if (Object.keys(parsed).length > 0) actions.push(merged);
       }
     }
     const steps: ReviewStep[] = [];
@@ -579,62 +958,16 @@ export default function AutomateTestCasePage() {
             testData,
             stepsSummary,
           });
-          const currentScript = typeof tc.automationScript === "string" ? tc.automationScript : "";
-          const currentVersionRaw = Number(tc.automationScriptVersion ?? 0);
-          const currentScriptVersion = Number.isFinite(currentVersionRaw) && currentVersionRaw > 0 ? currentVersionRaw : 1;
-          const historyRaw = Array.isArray(tc.automationScriptHistory)
-            ? (tc.automationScriptHistory as Array<Record<string, unknown>>)
-            : [];
-          const historyOptions: ScriptVersionOption[] = historyRaw
-            .map((entry, idx) => {
-              const script = typeof entry.script === "string" ? entry.script : "";
-              if (!script.trim()) return null;
-              const scriptVersionRaw = Number(entry.scriptVersion ?? 0);
-              const scriptVersion = Number.isFinite(scriptVersionRaw) && scriptVersionRaw > 0 ? scriptVersionRaw : null;
-              const isCurrent = entry.isCurrent === true;
-              return {
-                key: `history-${idx}`,
-                label: isCurrent ? `v${scriptVersion ?? currentScriptVersion} (Latest)` : `v${scriptVersion ?? "previous"}`,
-                script,
-                scriptVersion,
-              };
-            })
-            .filter((entry): entry is ScriptVersionOption => entry !== null);
-          const currentOption =
-            currentScript.trim().length > 0
-              ? [
-                  {
-                    key: "current",
-                    label: `v${currentScriptVersion} (Latest)`,
-                    script: currentScript,
-                    scriptVersion: currentScriptVersion,
-                  } satisfies ScriptVersionOption,
-                ]
-              : [];
-          const merged = [...currentOption, ...historyOptions.filter((entry) => entry.key !== "current")];
-          const deduped: ScriptVersionOption[] = [];
-          const seen = new Set<string>();
-          for (const option of merged) {
-            const token = `${option.scriptVersion ?? "none"}::${option.script.slice(0, 80)}`;
-            if (seen.has(token)) continue;
-            seen.add(token);
-            deduped.push(option);
-          }
-          setScriptVersionOptions(deduped);
-          setSelectedVersionKey(deduped[0]?.key ?? "");
         })
         .catch(() => {});
       if (bootstrapSessionId) {
-        if (openInLivePreview) {
-          setMode("live");
-        }
+        setMode("live");
         setSessionId(bootstrapSessionId);
         setSessionStartupState("waiting-stream");
         setMessages([
           {
             role: "assistant",
-            content:
-              "Automation session started. Choose a mode: Autonomous (agent plans and executes) or Live (you interact while I suggest assertions).",
+            content: `Automation session started. ${bootstrapMessageForEntry(bootstrapEntryMode)}`,
           },
         ]);
         return;
@@ -650,39 +983,16 @@ export default function AutomateTestCasePage() {
           if (environments.length > 0) {
             setSelectedEnvironmentUrl(environments[0].url);
           }
-          if (openInLivePreview || !aiState.configured) {
-            setMode("live");
-          }
+          setMode("live");
           setSessionStartupState("select-environment");
         })
         .catch(() => {
           setSessionStartupState("select-environment");
         });
     });
-  }, [projectId, testcaseId, router, bootstrap]);
+  }, [projectId, testcaseId, router, bootstrap, openInLivePreview, bootstrapSessionId, bootstrapEntryMode]);
 
-  const testcaseIntentObjective = useMemo(
-    () => buildIntentObjective(testcaseIntentDetails),
-    [testcaseIntentDetails]
-  );
-
-  useEffect(() => {
-    if (!sessionId || !startupReady || !aiConfigured || !isAutonomousMode) return;
-    if (!autoStartFromIntent || intentSource !== "testcase-intent") return;
-    if (bootstrapSessionId) return;
-    if (autoIntentStartedForSessionRef.current === sessionId) return;
-    autoIntentStartedForSessionRef.current = sessionId;
-    void executeCommand(testcaseIntentObjective, { forceAutonomous: true });
-  }, [
-    sessionId,
-    startupReady,
-    aiConfigured,
-    isAutonomousMode,
-    autoStartFromIntent,
-    intentSource,
-    bootstrapSessionId,
-    testcaseIntentObjective,
-  ]);
+  const testcaseIntentObjective = useMemo(() => buildIntentObjective(testcaseIntentDetails), [testcaseIntentDetails]);
 
   async function onStartSessionWithEnvironment() {
     if (sessionStartupState === "starting") return;
@@ -697,8 +1007,9 @@ export default function AutomateTestCasePage() {
       setMessages([
         {
           role: "assistant",
-          content:
-            "Automation session started. Waiting for browser stream to become ready. Choose Autonomous or Live mode after stream is available.",
+          content: `Automation session started. ${bootstrapMessageForEntry(
+            bootstrapEntryMode
+          )} Waiting for browser stream to become ready.`,
         },
       ]);
     } catch (error: unknown) {
@@ -817,6 +1128,36 @@ export default function AutomateTestCasePage() {
       }
 
       if (event.eventType === "command_executed") {
+        const stagehandActions = Array.isArray(execution.stagehandActions)
+          ? (execution.stagehandActions as Array<Record<string, unknown>>)
+          : [];
+        for (const action of stagehandActions) {
+          const reasoning = toText(action.reasoning);
+          const instruction = toText(action.instruction);
+          const message = toText(action.message || action.description);
+          const actionName = toText(action.action);
+          if (reasoning) {
+            rawItems.push({
+              at,
+              actionLabel: "Thinking",
+              primary: safeSnippet(reasoning, 220),
+            });
+          }
+          if (instruction) {
+            rawItems.push({
+              at,
+              actionLabel: "Plan",
+              primary: safeSnippet(instruction, 220),
+            });
+          }
+          if (actionName || message) {
+            rawItems.push({
+              at,
+              actionLabel: actionName ? `Action: ${actionName}` : "Action",
+              primary: safeSnippet(message || actionName, 220),
+            });
+          }
+        }
         const results = Array.isArray(execution.results) ? execution.results : [];
         if (results.length > 0) {
           for (const step of results as Array<Record<string, unknown>>) {
@@ -986,6 +1327,7 @@ export default function AutomateTestCasePage() {
 
   useEffect(() => {
     streamedAutonomousEventIdsRef.current = new Set();
+    streamedTimelineEntriesRef.current = new Set();
     setBotHighlight(null);
   }, [sessionId]);
 
@@ -993,11 +1335,6 @@ export default function AutomateTestCasePage() {
     if (!chatLogRef.current) return;
     chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
   }, [messages]);
-
-  useEffect(() => {
-    if (!timelineLogRef.current) return;
-    timelineLogRef.current.scrollTop = timelineLogRef.current.scrollHeight;
-  }, [timeline]);
 
   useEffect(() => {
     if (!resizingPanes) return;
@@ -1138,12 +1475,29 @@ export default function AutomateTestCasePage() {
     }
   }, [isAutonomousMode, session?.events, showAutonomousDebugTrace]);
 
+  useEffect(() => {
+    if (timeline.length === 0) return;
+    const fresh: ChatMessage[] = [];
+    for (const item of timeline) {
+      const key = `${item.timeLabel}|${item.actionLabel}|${item.primary || ""}|${item.secondary || ""}|${item.tertiary || ""}`;
+      if (streamedTimelineEntriesRef.current.has(key)) continue;
+      streamedTimelineEntriesRef.current.add(key);
+      const lines = [`[${item.timeLabel}] ${item.actionLabel}${item.primary ? ` - ${item.primary}` : ""}`];
+      if (item.secondary) lines.push(item.secondary);
+      if (item.tertiary) lines.push(item.tertiary);
+      fresh.push({ role: "assistant", content: lines.join("\n") });
+    }
+    if (fresh.length > 0) {
+      setMessages((prev) => [...prev, ...fresh]);
+    }
+  }, [timeline]);
+
   async function executeCommand(
     input: string,
     options?: { forceAutonomous?: boolean }
   ) {
     if (!sessionId || !startupReady || !input.trim() || sending) return;
-    const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode || isLiveMode;
+    const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
     if (shouldUseAutonomousMode && !aiConfigured) {
       setMessages((prev) => [
         ...prev,
@@ -1208,14 +1562,8 @@ export default function AutomateTestCasePage() {
   }
 
   async function onSendCommand() {
-    const commandAddon = command.trim();
-    if (intentSource === "custom-command" && !commandAddon) return;
-    const value =
-      intentSource === "testcase-intent"
-        ? commandAddon
-          ? `${testcaseIntentObjective}\n\nAdditional user instruction:\n${commandAddon}`
-          : testcaseIntentObjective
-        : commandAddon;
+    const value = command.trim();
+    if (!value) return;
     setCommand("");
     await executeCommand(value);
   }
@@ -1234,53 +1582,10 @@ Stop when pass/fail outcome is clear and summarize results.`;
     }
   }
 
-  async function onRerunIndividualTest() {
-    if (!sessionId || !startupReady || sending || quickActionBusy) return;
-    if (scriptVersionOptions.length === 0) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "No Playwright script version is available to rerun yet. Save or generate a script first.",
-        },
-      ]);
-      return;
-    }
-    setVersionPickerOpen(true);
-  }
-
-  async function onRunSelectedVersion() {
-    if (!sessionId || !startupReady || sending || quickActionBusy) return;
-    const selected = scriptVersionOptions.find((item) => item.key === selectedVersionKey);
-    if (!selected) return;
-    setQuickActionBusy("rerun");
-    setVersionPickerOpen(false);
-    try {
-      await resetSessionForFreshRun();
-      const result = await runAutomationPlaywrightScript(projectId, sessionId, {
-        script: selected.script,
-        scriptVersion: selected.scriptVersion,
-        startUrl: sessionStartUrl || selectedStartUrl || undefined,
-      });
-      const runStatus = typeof result.status === "string" ? result.status.toLowerCase() : "failed";
-      const passed = runStatus === "passed";
-      const durationMs = typeof result.durationMs === "number" ? result.durationMs : null;
-      const durationText = durationMs != null ? ` in ${(durationMs / 1000).toFixed(1)}s` : "";
-      const errorText =
-        !passed && typeof result.errorMessage === "string" && result.errorMessage.trim()
-          ? ` Error: ${result.errorMessage.trim()}`
-          : "";
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: `${selected.label} run ${passed ? "PASSED" : "FAILED"}${durationText}.${errorText}`,
-        },
-      ]);
-      setStreamState("Live");
-    } finally {
-      setQuickActionBusy(null);
-    }
+  function onOpenReviewCurrentScript() {
+    const nextReviewSteps = collectStepsForFinalize(session?.events || []);
+    setReviewSteps(nextReviewSteps);
+    setReviewScriptOpen(true);
   }
 
   function onOpenFinalizeReview() {
@@ -1331,6 +1636,18 @@ Stop when pass/fail outcome is clear and summarize results.`;
     liveViewportRef.current?.focus();
     setManualBusy(true);
     try {
+      if (commandInProgress) {
+        const stopResult = await stopAutomationCommand(projectId, sessionId);
+        if (stopResult.stopRequested) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "User control acquired. Stopped active agent command so your manual actions take priority.",
+            },
+          ]);
+        }
+      }
       const result = await sendAutomationManualAction(projectId, sessionId, {
         actionType: "click",
         xRatio,
@@ -1340,11 +1657,14 @@ Stop when pass/fail outcome is clear and summarize results.`;
       const suggestion = targetText
         ? `Assertion suggestion: verify "${targetText}" is visible after this click.`
         : "Assertion suggestion: verify the next state (URL, heading, or CTA visibility) after this click.";
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Manual click recorded in live mode." },
-        { role: "assistant", content: suggestion },
-      ]);
+      const combinedMessage = `Manual click recorded in live mode. ${suggestion}`;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.content === combinedMessage) {
+          return prev;
+        }
+        return [...prev, { role: "assistant", content: combinedMessage }];
+      });
       setStreamState("Live");
     } catch (error) {
       setMessages((prev) => [
@@ -1353,119 +1673,6 @@ Stop when pass/fail outcome is clear and summarize results.`;
       ]);
     } finally {
       setManualBusy(false);
-    }
-  }
-
-  async function onManualType() {
-    if (!sessionId || !startupReady || !isLiveMode || manualBusy || !manualText.trim()) return;
-    const text = manualText;
-    setManualText("");
-    setManualBusy(true);
-    try {
-      await sendAutomationManualAction(projectId, sessionId, {
-        actionType: "type",
-        text,
-        xRatio: lastClickTarget?.xRatio,
-        yRatio: lastClickTarget?.yRatio,
-      });
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Manual typing recorded in live mode." },
-        { role: "assistant", content: `Assertion suggestion: verify the field value contains "${text}".` },
-      ]);
-    } catch (error) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: error instanceof Error ? error.message : "Manual typing failed." },
-      ]);
-    } finally {
-      setManualBusy(false);
-    }
-  }
-
-  async function onManualPressEnter() {
-    if (!sessionId || !startupReady || !isLiveMode || manualBusy) return;
-    setManualBusy(true);
-    try {
-      const result = await sendAutomationManualAction(projectId, sessionId, {
-        actionType: "press",
-        key: "Enter",
-        xRatio: lastClickTarget?.xRatio,
-        yRatio: lastClickTarget?.yRatio,
-      });
-      const currentUrl = typeof result.currentUrl === "string" ? result.currentUrl : "";
-      const suggestion = currentUrl
-        ? `Assertion suggestion: verify URL is "${currentUrl}" after pressing Enter.`
-        : "Assertion suggestion: verify submit action completed successfully after pressing Enter.";
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Manual Enter key recorded." },
-        { role: "assistant", content: suggestion },
-      ]);
-    } catch (error) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: error instanceof Error ? error.message : "Manual key press failed." },
-      ]);
-    } finally {
-      setManualBusy(false);
-    }
-  }
-
-  async function processKeyboardQueue() {
-    if (processingKeyQueueRef.current || !sessionId || !startupReady) return;
-    processingKeyQueueRef.current = true;
-    try {
-      while (keyQueueRef.current.length > 0) {
-        const item = keyQueueRef.current.shift();
-        if (!item) continue;
-        await sendAutomationManualAction(projectId, sessionId, {
-          actionType: item.actionType,
-          key: item.key,
-          text: item.text,
-          xRatio: lastClickTarget?.xRatio,
-          yRatio: lastClickTarget?.yRatio,
-        });
-      }
-    } catch {
-      // drop failures silently to avoid chat spam during fast typing
-    } finally {
-      processingKeyQueueRef.current = false;
-    }
-  }
-
-  function enqueueKeyboardAction(item: { actionType: "press" | "type"; key?: string; text?: string }) {
-    keyQueueRef.current.push(item);
-    void processKeyboardQueue();
-  }
-
-  function onLiveViewportKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    if (!startupReady || !isLiveMode || !keyboardCapture || !sessionId) return;
-    const target = event.target as HTMLElement | null;
-    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
-    event.preventDefault();
-    const key = event.key;
-    if (key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
-      enqueueKeyboardAction({ actionType: "type", text: key });
-      return;
-    }
-    const allowed = new Set([
-      "Enter",
-      "Backspace",
-      "Tab",
-      "Escape",
-      "ArrowUp",
-      "ArrowDown",
-      "ArrowLeft",
-      "ArrowRight",
-      "Delete",
-      "Home",
-      "End",
-      "PageUp",
-      "PageDown",
-    ]);
-    if (allowed.has(key)) {
-      enqueueKeyboardAction({ actionType: "press", key });
     }
   }
 
@@ -1488,6 +1695,18 @@ Stop when pass/fail outcome is clear and summarize results.`;
     suppressClickRef.current = true;
     setManualBusy(true);
     try {
+      if (commandInProgress) {
+        const stopResult = await stopAutomationCommand(projectId, sessionId);
+        if (stopResult.stopRequested) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "User control acquired. Stopped active agent command so your manual actions take priority.",
+            },
+          ]);
+        }
+      }
       await sendAutomationManualAction(projectId, sessionId, {
         actionType: "drag",
         xRatio: start.xRatio,
@@ -1522,23 +1741,74 @@ Stop when pass/fail outcome is clear and summarize results.`;
     }
   }
 
+  async function processKeyboardQueue() {
+    if (processingKeyQueueRef.current || !sessionId || !startupReady) return;
+    processingKeyQueueRef.current = true;
+    try {
+      while (keyQueueRef.current.length > 0) {
+        const item = keyQueueRef.current.shift();
+        if (!item) continue;
+        await sendAutomationManualAction(projectId, sessionId, {
+          actionType: item.actionType,
+          key: item.key,
+          text: item.text,
+          xRatio: lastClickTarget?.xRatio,
+          yRatio: lastClickTarget?.yRatio,
+        });
+      }
+    } catch {
+      // keep chat clean during rapid typing bursts
+    } finally {
+      processingKeyQueueRef.current = false;
+    }
+  }
+
+  function enqueueKeyboardAction(item: { actionType: "press" | "type"; key?: string; text?: string }) {
+    keyQueueRef.current.push(item);
+    void processKeyboardQueue();
+  }
+
+  function onLiveViewportKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!startupReady || !isLiveMode || !sessionId) return;
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+    event.preventDefault();
+    const key = event.key;
+    if (key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      enqueueKeyboardAction({ actionType: "type", text: key });
+      return;
+    }
+    const allowed = new Set([
+      "Enter",
+      "Backspace",
+      "Tab",
+      "Escape",
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "Delete",
+      "Home",
+      "End",
+      "PageUp",
+      "PageDown",
+    ]);
+    if (allowed.has(key)) {
+      enqueueKeyboardAction({ actionType: "press", key });
+    }
+  }
+
   function getPointerRatio(img: HTMLImageElement, clientX: number, clientY: number): { xRatio: number; yRatio: number } | null {
     const rect = img.getBoundingClientRect();
-    const naturalWidth = img.naturalWidth || 1366;
-    const naturalHeight = img.naturalHeight || 768;
-    const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight);
-    const renderedWidth = naturalWidth * scale;
-    const renderedHeight = naturalHeight * scale;
-    const offsetX = (rect.width - renderedWidth) / 2;
-    const offsetY = (rect.height - renderedHeight) / 2;
-    const localX = clientX - rect.left - offsetX;
-    const localY = clientY - rect.top - offsetY;
-    if (localX < 0 || localY < 0 || localX > renderedWidth || localY > renderedHeight) {
+    if (!rect.width || !rect.height) return null;
+    const localX = clientX - rect.left;
+    const localY = clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX > rect.width || localY > rect.height) {
       return null;
     }
     return {
-      xRatio: localX / renderedWidth,
-      yRatio: localY / renderedHeight,
+      xRatio: localX / rect.width,
+      yRatio: localY / rect.height,
     };
   }
 
@@ -1587,22 +1857,8 @@ Stop when pass/fail outcome is clear and summarize results.`;
         </div>
         <div className="flex items-center gap-2">
           <span className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700">{streamState}</span>
-          <div className="flex items-center rounded border border-zinc-300 p-0.5 text-xs dark:border-zinc-700">
-            {(["autonomous", "live"] as AutomationMode[]).map((item) => (
-              <button
-                key={item}
-                type="button"
-                onClick={() => setMode(item)}
-                disabled={!startupReady || (item === "autonomous" && !aiConfigured)}
-                className={`rounded px-2 py-1 capitalize ${
-                  mode === item
-                    ? "bg-emerald-600 text-white"
-                    : "text-zinc-700 dark:text-zinc-200"
-                }`}
-              >
-                {item}
-              </button>
-            ))}
+          <div className="flex items-center rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300">
+            AI Assisted Chat
           </div>
           <button
             type="button"
@@ -1633,36 +1889,10 @@ Stop when pass/fail outcome is clear and summarize results.`;
         >
           <div className="mb-2 flex items-center justify-between gap-2 px-1">
             <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Assistant</h2>
-            {isAutonomousMode && (
-              <div className="inline-flex items-center gap-1 rounded-full border border-zinc-300 bg-zinc-100 p-0.5 text-[11px] dark:border-zinc-700 dark:bg-zinc-800">
-                <button
-                  type="button"
-                  onClick={() => setAutonomousTraceMode("normal")}
-                  className={`rounded-full px-2 py-0.5 ${
-                    autonomousTraceMode === "normal"
-                      ? "bg-white text-zinc-900 dark:bg-zinc-200 dark:text-zinc-900"
-                      : "text-zinc-600 dark:text-zinc-300"
-                  }`}
-                >
-                  Normal
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAutonomousTraceMode("debug")}
-                  className={`rounded-full px-2 py-0.5 ${
-                    autonomousTraceMode === "debug"
-                      ? "bg-white text-zinc-900 dark:bg-zinc-200 dark:text-zinc-900"
-                      : "text-zinc-600 dark:text-zinc-300"
-                  }`}
-                >
-                  Debug
-                </button>
-              </div>
-            )}
           </div>
           {!aiConfigured && (
             <p className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
-              {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable Autonomous mode commands. Live mode is available for recording.`}
+              {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable chat-driven AI commands.`}
             </p>
           )}
           <div
@@ -1709,41 +1939,43 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 placeholder={
                   !aiConfigured
                     ? "Add AI API key in Project Settings to use this mode"
-                    : intentSource === "testcase-intent"
-                    ? "Optional extra guidance..."
-                    : isAutonomousMode
-                    ? "Describe the end goal..."
-                    : "Live mode tip: interact manually, or run a goal from here"
+                    : "Tell the agent exactly what to do. Example: Click the Log in button."
                 }
                 className="w-full resize-none rounded-2xl border border-zinc-300 px-3 py-2 pr-12 text-sm dark:border-zinc-700 dark:bg-zinc-900"
               />
               <button
                 type="button"
-                onClick={() => void (commandInProgress ? onStopCurrentCommand() : onSendCommand())}
-                disabled={commandInProgress ? stoppingCommand || !sessionId || !startupReady : sending || !sessionId || !startupReady || !aiConfigured}
+                onClick={() => void onSendCommand()}
+                disabled={sending || !sessionId || !startupReady || !aiConfigured || !command.trim()}
                 title={
-                  commandInProgress
-                    ? (stoppingCommand ? "Stopping command" : "Stop current command")
-                    : sending
-                      ? "Queueing command"
-                      : "Send (Enter)"
+                  sending
+                    ? "Queueing command"
+                    : "Send (Enter)"
                 }
                 aria-label={
-                  commandInProgress
-                    ? (stoppingCommand ? "Stopping command" : "Stop current command")
-                    : sending
-                      ? "Queueing command"
-                      : "Send"
+                  sending
+                    ? "Queueing command"
+                    : "Send"
                 }
                 className={`absolute right-2 bottom-2 flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold text-white disabled:opacity-50 ${
-                  commandInProgress
-                    ? "bg-red-600 hover:bg-red-700"
-                    : "bg-blue-600 hover:bg-blue-700"
+                  "bg-blue-600 hover:bg-blue-700"
                 }`}
               >
-                {commandInProgress ? (stoppingCommand ? "…" : "■") : sending ? "…" : "↑"}
+                {sending ? "…" : "↑"}
               </button>
             </div>
+            {commandInProgress && (
+              <div className="mt-2 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => void onStopCurrentCommand()}
+                  disabled={stoppingCommand || !sessionId || !startupReady}
+                  className="rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-800 dark:bg-red-950/20 dark:text-red-300 disabled:opacity-50"
+                >
+                  {stoppingCommand ? "Stopping..." : "Stop Current Command"}
+                </button>
+              </div>
+            )}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
             <button
@@ -1756,16 +1988,13 @@ Stop when pass/fail outcome is clear and summarize results.`;
             </button>
             <button
               type="button"
-              onClick={() => void onRerunIndividualTest()}
-              disabled={!startupReady || sending || Boolean(quickActionBusy)}
+              onClick={onOpenReviewCurrentScript}
+              disabled={!sessionId}
               className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 disabled:opacity-50"
             >
-              {quickActionBusy === "rerun" ? "Re-running..." : "Re Run Last Test (Live Preview)"}
+              Review Current Script
             </button>
           </div>
-          <p className="mt-1 text-[11px] text-zinc-500">
-            Quick actions run inside the current automation session, so you can watch each run directly in Live Browser preview.
-          </p>
         </section>
         <div
           className="hidden lg:flex lg:w-3 lg:cursor-col-resize lg:items-center lg:justify-center"
@@ -1785,13 +2014,13 @@ Stop when pass/fail outcome is clear and summarize results.`;
             ref={liveViewportRef}
             tabIndex={0}
             onKeyDown={onLiveViewportKeyDown}
-            className={`mb-2 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[78vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
+            className={`mb-2 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[84vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
           >
             {shouldShowLiveStream && !liveStreamFailed ? (
               <img
                 src={liveImageSrc}
                 alt="Live browser stream"
-                className={`h-full w-full object-contain ${isLiveMode ? "cursor-crosshair" : "cursor-default"}`}
+                className={`h-full w-full object-fill ${isLiveMode ? "cursor-crosshair" : "cursor-default"}`}
                 onLoad={() => setLiveStreamFailed(false)}
                 onError={() => setLiveStreamFailed(true)}
                 onClick={onLiveImageClick}
@@ -1805,7 +2034,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               <img
                 src={screenshotDataUrl}
                 alt="Live browser snapshot"
-                className="h-full w-full object-contain"
+                className="h-full w-full object-fill"
               />
             ) : (
               <p className="text-sm text-zinc-500">Waiting for browser stream...</p>
@@ -1832,49 +2061,6 @@ Stop when pass/fail outcome is clear and summarize results.`;
               />
             )}
           </div>
-          {isLiveMode && (
-            <div className="mb-2 flex gap-2">
-              <input
-                value={manualText}
-                onChange={(e) => setManualText(e.target.value)}
-                placeholder="Type text into currently focused element"
-                className="w-full rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-              />
-              <button
-                type="button"
-                onClick={() => void onManualType()}
-                disabled={!startupReady || manualBusy || !manualText.trim()}
-                className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 disabled:opacity-50"
-              >
-                Type
-              </button>
-              <button
-                type="button"
-                onClick={() => void onManualPressEnter()}
-                disabled={!startupReady || manualBusy}
-                className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 disabled:opacity-50"
-              >
-                Enter
-              </button>
-              <button
-                type="button"
-                onClick={() => setKeyboardCapture((prev) => !prev)}
-                disabled={!startupReady}
-                className={`rounded border px-2 py-1.5 text-xs ${
-                  keyboardCapture
-                    ? "border-emerald-500 text-emerald-700 dark:border-emerald-500 dark:text-emerald-300"
-                    : "border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
-                }`}
-              >
-                {keyboardCapture ? "Keyboard Capture On" : "Keyboard Capture Off"}
-              </button>
-            </div>
-          )}
-          {isLiveMode && (
-            <p className="mb-1 text-[11px] text-zinc-500">
-              Tip: click target input in live browser first, then type on your keyboard while live viewport is focused.
-            </p>
-          )}
           <p className="mb-1 text-xs text-zinc-500">
             Current URL: {session?.currentUrl || "-"}
           </p>
@@ -1912,6 +2098,9 @@ Stop when pass/fail outcome is clear and summarize results.`;
                         </div>
                         <p className="text-sm text-zinc-800 dark:text-zinc-100">{step.action}</p>
                         <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{step.expectedResult}</p>
+                        <pre className="mt-2 overflow-auto rounded bg-zinc-950 p-2 text-[11px] text-zinc-100">
+                          {step.playwright}
+                        </pre>
                       </div>
                     ))
                   )}
@@ -1945,12 +2134,46 @@ Stop when pass/fail outcome is clear and summarize results.`;
           </div>
         </div>
       )}
+      {reviewScriptOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-4xl rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Current Script Preview</h3>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              This script includes actions captured so far from both chat-guided AI steps and manual live interactions.
+            </p>
+            {reviewSteps.length > 0 && (
+              <div className="mt-3 max-h-[180px] space-y-2 overflow-auto rounded border border-zinc-200 p-2 dark:border-zinc-700">
+                {reviewSteps.map((step, index) => (
+                  <div key={`${step.id}-preview`} className="rounded bg-zinc-50 p-2 dark:bg-zinc-800/40">
+                    <p className="text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">Step {index + 1}</p>
+                    <pre className="mt-1 overflow-auto rounded bg-zinc-950 p-2 text-[11px] text-zinc-100">
+                      {step.playwright}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+            <pre className="mt-4 max-h-[460px] overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-100">
+              {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
+            </pre>
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setReviewScriptOpen(false)}
+                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {!bootstrapSessionId && sessionStartupState === "select-environment" && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Choose Environment</h3>
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Select a test environment URL to start browser automation. Live mode works without AI keys; Autonomous commands require provider API key in project settings.
+              Select a test environment URL to start browser automation.
             </p>
             {testRunEnvironments.length > 0 ? (
               <div className="mt-4">
@@ -1979,52 +2202,6 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 <p className="mt-1 text-[11px] text-zinc-500">No saved environments found in project settings.</p>
               </div>
             )}
-            <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/40">
-              <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">Test Intent Preferences</p>
-              <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-                Choose how the session should begin after browser startup.
-              </p>
-              <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300">Intent Source</span>
-                <button
-                  type="button"
-                  onClick={() => setIntentSource("testcase-intent")}
-                  className={`rounded-full px-2.5 py-1 text-[11px] ${
-                    intentSource === "testcase-intent"
-                      ? "bg-blue-600 text-white"
-                      : "border border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
-                  }`}
-                >
-                  Test case
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setIntentSource("custom-command")}
-                  className={`rounded-full px-2.5 py-1 text-[11px] ${
-                    intentSource === "custom-command"
-                      ? "bg-blue-600 text-white"
-                      : "border border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-200"
-                  }`}
-                >
-                  Custom
-                </button>
-              </div>
-              {intentSource === "testcase-intent" && (
-                <label className="mt-3 inline-flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-200">
-                  <input
-                    type="checkbox"
-                    checked={autoStartFromIntent}
-                    onChange={(event) => setAutoStartFromIntent(event.target.checked)}
-                  />
-                  Start testcase intent automatically after setup
-                </label>
-              )}
-              {intentSource === "custom-command" && (
-                <p className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400">
-                  Session will start without running a test intent automatically. You can start manually from chat.
-                </p>
-              )}
-            </div>
             {sessionStartupError && <p className="mt-3 text-xs text-red-600 dark:text-red-400">{sessionStartupError}</p>}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
@@ -2040,7 +2217,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 disabled={testRunEnvironments.length === 0 && !customEnvironmentUrl.trim()}
                 className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                {intentSource === "testcase-intent" && autoStartFromIntent ? "Start and Run Intent" : "Start Automate"}
+                Start Automate
               </button>
             </div>
           </div>
@@ -2054,47 +2231,6 @@ Stop when pass/fail outcome is clear and summarize results.`;
               Browser is spinning up and opening environment URL. Please wait for live stream before interaction.
             </p>
           )}
-        </div>
-      )}
-      {versionPickerOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
-            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Choose Script Version to Re-run</h3>
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Select which Playwright script version should run in live preview for pass/fail verification.
-            </p>
-            <div className="mt-3">
-              <label className="mb-1 block text-xs font-medium text-zinc-600 dark:text-zinc-300">Script Version</label>
-              <select
-                value={selectedVersionKey}
-                onChange={(event) => setSelectedVersionKey(event.target.value)}
-                className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-              >
-                {scriptVersionOptions.map((option) => (
-                  <option key={option.key} value={option.key}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setVersionPickerOpen(false)}
-                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void onRunSelectedVersion()}
-                disabled={!selectedVersionKey}
-                className="rounded bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-              >
-                Run Selected Version
-              </button>
-            </div>
-          </div>
         </div>
       )}
     </div>

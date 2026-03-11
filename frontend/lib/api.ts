@@ -862,6 +862,21 @@ export function updateAgentTaskStatus(
   return task;
 }
 
+export function updateAgentTaskScript(
+  projectId: string,
+  agentType: string,
+  taskId: string,
+  script: string
+): AgentTask | null {
+  const tasks = getStoredAgentTasks(projectId, agentType);
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return null;
+  task.script = script;
+  task.updatedAt = new Date().toISOString();
+  saveAgentTasks(projectId, agentType, tasks);
+  return task;
+}
+
 export function deleteAgentTask(projectId: string, agentType: string, taskId: string): boolean {
   const tasks = getStoredAgentTasks(projectId, agentType);
   const idx = tasks.findIndex((t) => t.id === taskId);
@@ -1169,6 +1184,22 @@ export async function getAutomatedRunStatus(cycleId: string, runId: string): Pro
 
 export async function getLatestAutomatedRunStatus(cycleId: string): Promise<AutomatedRunLiveStatus> {
   return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/latest/status`);
+}
+
+export interface AutomationAutoscalingRecommendation {
+  desiredWorkers: number;
+  minWorkers: number;
+  maxWorkers: number;
+  targetJobsPerWorker: number;
+  warmWorkers: number;
+  queuedJobs: number;
+  runningJobs: number;
+  activeRuns: number;
+  scaleReason: string;
+}
+
+export async function getAutomationAutoscalingRecommendation(): Promise<AutomationAutoscalingRecommendation> {
+  return api<AutomationAutoscalingRecommendation>("/api/internal/automation/autoscaling-recommendation");
 }
 
 export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {

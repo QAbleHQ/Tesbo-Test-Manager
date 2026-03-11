@@ -564,6 +564,13 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
   let tracePath = null;
   let currentUrl = session.currentUrl || "";
   let stepCounter = 0;
+  const sessionContext =
+    session.context ||
+    (typeof session.page?.context === "function" ? session.page.context() : null);
+  const tracing =
+    sessionContext && typeof sessionContext === "object" && sessionContext.tracing
+      ? sessionContext.tracing
+      : null;
   const normalizedActionDelayMs = Math.max(0, Math.min(5000, Number(actionDelayMs) || 0));
   const recordStep = async (action, detail, fn) => {
     const stepStartedAt = Date.now();
@@ -604,7 +611,9 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
   };
 
   try {
-    await session.context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
+    if (tracing && typeof tracing.start === "function") {
+      await tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
+    }
     if (startUrl) {
       await navigateToStartUrl(session.page, startUrl);
     }
@@ -629,10 +638,12 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
       ts: new Date().toISOString(),
     });
   } finally {
-    tracePath = path.join(config.traceDir, `${executionId}-${Date.now()}.zip`);
-    await session.context.tracing.stop({ path: tracePath }).catch(() => {
-      tracePath = null;
-    });
+    if (tracing && typeof tracing.stop === "function") {
+      tracePath = path.join(config.traceDir, `${executionId}-${Date.now()}.zip`);
+      await tracing.stop({ path: tracePath }).catch(() => {
+        tracePath = null;
+      });
+    }
     session.lastTracePath = tracePath;
   }
 
@@ -1088,11 +1099,49 @@ async function readTargetValue(page, targetSelector) {
     .catch(() => null);
 }
 
+async function resolveViewport(page) {
+  const fallback = { width: 1366, height: 768 };
+  if (!page) return fallback;
+  try {
+    if (typeof page.viewportSize === "function") {
+      const viewport = page.viewportSize();
+      if (viewport && Number(viewport.width) > 0 && Number(viewport.height) > 0) {
+        return { width: Number(viewport.width), height: Number(viewport.height) };
+      }
+    }
+  } catch {
+    // fall through to evaluate-based dimensions
+  }
+  try {
+    const dimensions = await page.evaluate(() => {
+      const width = Math.max(
+        0,
+        Number(window.innerWidth || 0),
+        Number(document.documentElement?.clientWidth || 0),
+        Number(document.body?.clientWidth || 0)
+      );
+      const height = Math.max(
+        0,
+        Number(window.innerHeight || 0),
+        Number(document.documentElement?.clientHeight || 0),
+        Number(document.body?.clientHeight || 0)
+      );
+      return { width, height };
+    });
+    if (dimensions && Number(dimensions.width) > 0 && Number(dimensions.height) > 0) {
+      return { width: Number(dimensions.width), height: Number(dimensions.height) };
+    }
+  } catch {
+    // fallback
+  }
+  return fallback;
+}
+
 async function locatorHighlightBox(locator, page, label = null) {
   try {
     const box = await locator.boundingBox();
     if (!box) return null;
-    const viewport = page.viewportSize() || { width: 1366, height: 768 };
+    const viewport = await resolveViewport(page);
     if (!viewport.width || !viewport.height) return null;
     const clamp = (value) => Math.max(0, Math.min(1, value));
     return {
@@ -1438,7 +1487,7 @@ async function manualAction(sessionId, action) {
   const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
   const startedAt = Date.now();
-  const viewport = session.page.viewportSize() || { width: 1366, height: 768 };
+  const viewport = await resolveViewport(session.page);
   let targetSelector = null;
   let targetText = null;
   let targetHtml = null;
