@@ -6,6 +6,7 @@ import { logError, logInfo } from "./logger.js";
 import {
   createStagehandSession,
   executeStagehandObjective,
+  executeStagehandWithTelemetry,
   getStagehandSessionState,
   closeStagehandSession,
   runStagehandScript,
@@ -96,8 +97,21 @@ async function launchBrowserContext(startUrl) {
   }
 }
 
+function attachPopupListener(session) {
+  const ctx = session.context || (typeof session.page?.context === "function" ? session.page.context() : null);
+  if (!ctx || session._popupListenerAttached) return;
+  if (typeof ctx.on !== "function") return;
+  session._popupListenerAttached = true;
+  ctx.on("page", (newPage) => {
+    logInfo("popup_detected", { sessionId: session.id, url: newPage.url() });
+    session.page = newPage;
+    session.currentUrl = newPage.url();
+    session.updatedAt = nowIso();
+  });
+}
+
 function buildSessionState(sessionId, browser, context, page) {
-  return {
+  const state = {
     id: sessionId,
     browser,
     context,
@@ -110,6 +124,8 @@ function buildSessionState(sessionId, browser, context, page) {
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
+  attachPopupListener(state);
+  return state;
 }
 
 function getSession(sessionId) {
@@ -1474,11 +1490,15 @@ async function executeSteps(sessionId, commandId, steps) {
   };
 }
 
-async function executeStagehand(sessionId, commandId, objective) {
+async function executeStagehand(sessionId, commandId, objective, options = {}) {
   const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
   if (session.type !== "stagehand") {
     throw new Error("Session is not a Stagehand session. Use execute with steps for Playwright sessions.");
+  }
+  const useTelemetry = options.useTelemetry ?? config.useTelemetry;
+  if (useTelemetry) {
+    return executeStagehandWithTelemetry(session, commandId, objective);
   }
   return executeStagehandObjective(session, commandId, objective);
 }
@@ -1486,8 +1506,10 @@ async function executeStagehand(sessionId, commandId, objective) {
 async function manualAction(sessionId, action) {
   const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
+  attachPopupListener(session);
   const startedAt = Date.now();
-  const viewport = await resolveViewport(session.page);
+  const page = session.page;
+  const viewport = await resolveViewport(page);
   let targetSelector = null;
   let targetText = null;
   let targetHtml = null;
@@ -1499,11 +1521,43 @@ async function manualAction(sessionId, action) {
       const yRatio = typeof action.yRatio === "number" ? action.yRatio : 0.5;
       const x = Math.max(1, Math.min(viewport.width - 1, Math.round(xRatio * viewport.width)));
       const y = Math.max(1, Math.min(viewport.height - 1, Math.round(yRatio * viewport.height)));
-      const info = await elementInfoAtPoint(session.page, x, y).catch(() => null);
+      logInfo("manual_click_start", { sessionId, xRatio, yRatio, x, y, viewport });
+      const info = await elementInfoAtPoint(page, x, y).catch((err) => {
+        logError("elementInfoAtPoint_failed", { sessionId, x, y, error: err?.message || String(err) });
+        return null;
+      });
       targetSelector = info?.selector ?? null;
       targetText = info?.text ?? null;
       targetHtml = info?.html ?? null;
-      await session.page.mouse.click(x, y);
+      logInfo("manual_click_target", { sessionId, targetSelector, targetText: targetText?.slice(0, 60) });
+      const urlBefore = page.url();
+      const isStagehandPage = session.type === "stagehand";
+      if (isStagehandPage && typeof page.click === "function") {
+        await page.click(x, y);
+      } else if (page.mouse && typeof page.mouse.click === "function") {
+        await page.mouse.click(x, y);
+      } else {
+        logError("manual_click_no_method", { sessionId, hasClick: typeof page.click, hasMouse: !!page.mouse });
+      }
+      const waitFn = typeof page.waitForTimeout === "function" ? (ms) => page.waitForTimeout(ms) : (ms) => new Promise((r) => setTimeout(r, ms));
+      await waitFn(100).catch(() => {});
+      await page.evaluate(({ px, py }) => {
+        const el = document.elementFromPoint(px, py);
+        if (!el) return;
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: px, clientY: py, view: window }));
+        if (el instanceof HTMLAnchorElement || el.closest?.("a")) {
+          const link = el instanceof HTMLAnchorElement ? el : el.closest("a");
+          if (link?.href && !link.getAttribute("href")?.startsWith("#") && !link.getAttribute("href")?.startsWith("javascript:")) {
+            window.location.href = link.href;
+          }
+        }
+      }, { px: x, py: y }).catch(() => {});
+      await waitFn(150).catch(() => {});
+      const urlAfter = page.url();
+      if (urlAfter !== urlBefore) {
+        const wfls = typeof page.waitForLoadState === "function" ? page.waitForLoadState("domcontentloaded", { timeout: 5000 }) : waitFn(1000);
+        await wfls.catch(() => {});
+      }
       pushEvent(session, {
         type: "manual_step_finished",
         action: "click",
@@ -1519,12 +1573,16 @@ async function manualAction(sessionId, action) {
       const y = Math.max(1, Math.min(viewport.height - 1, Math.round(yRatio * viewport.height)));
       const toX = Math.max(1, Math.min(viewport.width - 1, Math.round(toXRatio * viewport.width)));
       const toY = Math.max(1, Math.min(viewport.height - 1, Math.round(toYRatio * viewport.height)));
-      startSelector = await selectorAtPoint(session.page, x, y).catch(() => null);
-      endSelector = await selectorAtPoint(session.page, toX, toY).catch(() => null);
-      await session.page.mouse.move(x, y);
-      await session.page.mouse.down();
-      await session.page.mouse.move(toX, toY, { steps: 12 });
-      await session.page.mouse.up();
+      startSelector = await selectorAtPoint(page, x, y).catch(() => null);
+      endSelector = await selectorAtPoint(page, toX, toY).catch(() => null);
+      if (session.type === "stagehand" && typeof page.dragAndDrop === "function") {
+        await page.dragAndDrop(x, y, toX, toY);
+      } else if (page.mouse) {
+        await page.mouse.move(x, y);
+        await page.mouse.down();
+        await page.mouse.move(toX, toY, { steps: 12 });
+        await page.mouse.up();
+      }
       pushEvent(session, {
         type: "manual_step_finished",
         action: "drag",
@@ -1535,7 +1593,13 @@ async function manualAction(sessionId, action) {
     } else if (action.actionType === "scroll") {
       const deltaX = typeof action.deltaX === "number" ? action.deltaX : 0;
       const deltaY = typeof action.deltaY === "number" ? action.deltaY : 0;
-      await session.page.mouse.wheel(deltaX, deltaY);
+      if (page.mouse && typeof page.mouse.wheel === "function") {
+        await page.mouse.wheel(deltaX, deltaY);
+      } else if (typeof page.scroll === "function") {
+        await page.scroll(viewport.width / 2, viewport.height / 2, { deltaX, deltaY }).catch(() => {});
+      } else {
+        await page.evaluate(({ dx, dy }) => window.scrollBy(dx, dy), { dx: deltaX, dy: deltaY }).catch(() => {});
+      }
       pushEvent(session, {
         type: "manual_step_finished",
         action: "scroll",
@@ -1543,17 +1607,24 @@ async function manualAction(sessionId, action) {
         deltaY,
       });
     } else if (action.actionType === "type") {
+      const isStagehandPage = session.type === "stagehand";
       const text = action.text || "";
       if (typeof action.xRatio === "number" && typeof action.yRatio === "number") {
         const x = Math.max(1, Math.min(viewport.width - 1, Math.round(action.xRatio * viewport.width)));
         const y = Math.max(1, Math.min(viewport.height - 1, Math.round(action.yRatio * viewport.height)));
-        const info = await elementInfoAtPoint(session.page, x, y).catch(() => null);
+        const info = await elementInfoAtPoint(page, x, y).catch(() => null);
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
-        await session.page.mouse.click(x, y);
-        await session.page.evaluate(({ px, py }) => {
+        if (isStagehandPage && typeof page.click === "function") {
+          await page.click(x, y);
+        } else if (page.mouse && typeof page.mouse.click === "function") {
+          await page.mouse.click(x, y);
+        }
+        await page.evaluate(({ px, py }) => {
           const el = document.elementFromPoint(px, py);
+          if (!el) return;
+          el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: px, clientY: py, view: window }));
           const editable =
             el instanceof HTMLInputElement ||
             el instanceof HTMLTextAreaElement ||
@@ -1565,33 +1636,35 @@ async function manualAction(sessionId, action) {
           }
         }, { px: x, py: y });
       }
-      const activeIsEditable = await session.page.evaluate(() => {
+      const activeIsEditable = await page.evaluate(() => {
         const el = document.activeElement;
         if (!el) return false;
         if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return true;
         return typeof el === "object" && "isContentEditable" in el ? !!el.isContentEditable : false;
       });
-      if (!activeIsEditable) {
-        const fallback = session.page.locator("input, textarea, [contenteditable='true']").first();
+      if (!activeIsEditable && typeof page.locator === "function") {
+        const fallback = page.locator("input, textarea, [contenteditable='true']").first();
         if ((await fallback.count()) > 0) {
           await fallback.click({ timeout: 2000 }).catch(() => {});
         }
       }
       if (!targetSelector) {
-        const info = await activeElementInfo(session.page).catch(() => null);
+        const info = await activeElementInfo(page).catch(() => null);
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
       }
       let typed = false;
-      try {
-        await session.page.keyboard.type(text);
-        typed = true;
-      } catch {
-        typed = false;
+      if (page.keyboard && typeof page.keyboard.type === "function") {
+        try {
+          await page.keyboard.type(text);
+          typed = true;
+        } catch {
+          typed = false;
+        }
       }
       if (!typed) {
-        await session.page.evaluate((value) => {
+        await page.evaluate((value) => {
           const el = document.activeElement;
           if (!el) return;
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -1614,23 +1687,36 @@ async function manualAction(sessionId, action) {
         value: text,
       });
     } else if (action.actionType === "press") {
+      const isStagehandPage = session.type === "stagehand";
       const key = action.key || "Enter";
       if (typeof action.xRatio === "number" && typeof action.yRatio === "number") {
         const x = Math.max(1, Math.min(viewport.width - 1, Math.round(action.xRatio * viewport.width)));
         const y = Math.max(1, Math.min(viewport.height - 1, Math.round(action.yRatio * viewport.height)));
-        const info = await elementInfoAtPoint(session.page, x, y).catch(() => null);
+        const info = await elementInfoAtPoint(page, x, y).catch(() => null);
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
-        await session.page.mouse.click(x, y);
+        if (isStagehandPage && typeof page.click === "function") {
+          await page.click(x, y);
+        } else if (page.mouse && typeof page.mouse.click === "function") {
+          await page.mouse.click(x, y);
+        }
       }
       if (!targetSelector) {
-        const info = await activeElementInfo(session.page).catch(() => null);
+        const info = await activeElementInfo(page).catch(() => null);
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
       }
-      await session.page.keyboard.press(key);
+      if (page.keyboard && typeof page.keyboard.press === "function") {
+        await page.keyboard.press(key);
+      } else {
+        await page.evaluate((k) => {
+          document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
+          document.activeElement?.dispatchEvent(new KeyboardEvent("keypress", { key: k, bubbles: true }));
+          document.activeElement?.dispatchEvent(new KeyboardEvent("keyup", { key: k, bubbles: true }));
+        }, key);
+      }
       pushEvent(session, {
         type: "manual_step_finished",
         action: "press",
@@ -1641,7 +1727,7 @@ async function manualAction(sessionId, action) {
       throw new Error(`Unsupported manual action: ${action.actionType}`);
     }
     const screenshotPath = await takeScreenshotSafe(session, 5000);
-    session.currentUrl = session.page.url();
+    session.currentUrl = page.url();
     return {
       status: "passed",
       actionType: action.actionType,
@@ -1655,11 +1741,12 @@ async function manualAction(sessionId, action) {
       durationMs: Date.now() - startedAt,
     };
   } catch (error) {
+    logError("manual_action_failed", { sessionId, actionType: action.actionType, error: error?.message || String(error) });
     const screenshotPath = await takeScreenshotSafe(session, 5000);
     return {
       status: "failed",
       actionType: action.actionType,
-      currentUrl: session.page.url(),
+      currentUrl: page?.url?.() || session.currentUrl || "",
       screenshotPath,
       message: error instanceof Error ? error.message : "Manual action failed",
       durationMs: Date.now() - startedAt,

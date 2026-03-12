@@ -415,7 +415,14 @@ public final class AutomationSessionHandler {
         if (!description.isBlank()) objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
         if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
         if (!steps.isBlank()) objective.append("Expected Steps:\n").append(limitBlock(steps, 3000)).append("\n\n");
-        if (!testData.isBlank()) objective.append("Test Data (use exact values):\n").append(limitBlock(testData, 1500)).append("\n\n");
+        if (!testData.isBlank()) {
+            objective.append("Test Data (use exact values):\n").append(limitBlock(testData, 1500)).append("\n\n");
+            String credentialsBlock = formatLoginCredentials(testData);
+            if (!credentialsBlock.isBlank()) {
+                objective.append("CRITICAL - Login credentials (use EXACTLY; never use user@example.com or password123):\n")
+                        .append(credentialsBlock).append("\n\n");
+            }
+        }
         if (!postconditions.isBlank()) objective.append("Expected Outcome:\n").append(limitBlock(postconditions, 1200)).append("\n\n");
         if (!feedbackSignals.isEmpty()) {
             objective.append("User Feedback / Preferences (latest first):\n");
@@ -427,8 +434,8 @@ public final class AutomationSessionHandler {
 
         objective.append("Execution Requirements:\n")
                 .append("1) Perform MULTI-STEP browser actions to satisfy the full test goal, not a single action.\n")
-                .append("2) Complete all required testcase steps and stop only when the intended end state is reached.\n")
-                .append("3) Use provided test data values exactly where applicable.\n")
+                .append("2) Complete login FIRST with the exact credentials from Test Data above. Only after login succeeds, proceed to post-login steps (e.g. program tabs, create program).\n")
+                .append("3) Use provided test data values exactly where applicable. For login forms: fill Email and Password with the exact values from Test Data / Login credentials. Never use placeholder values.\n")
                 .append("4) Validate outcomes with assertions: prefer Stagehand extraction/assertion checks.\n")
                 .append("5) If a strict Stagehand assertion is not reliable for a specific check, still verify via deterministic page evidence before finishing.\n")
                 .append("6) Avoid unnecessary exploration once required goals are satisfied.\n");
@@ -477,6 +484,24 @@ public final class AutomationSessionHandler {
         String normalized = value.replace("\r", "").trim();
         if (normalized.length() <= maxChars) return normalized;
         return normalized.substring(0, Math.max(0, maxChars)) + "...";
+    }
+
+    /** Parse login credentials from test data (e.g. "Credentials : email/password" or "email / password"). */
+    private static String formatLoginCredentials(String testData) {
+        if (testData == null || testData.isBlank()) return "";
+        String s = testData.replace("\r", "").trim();
+        // Match patterns like "Credentials : email@domain.com/ password" or "email@domain.com / password"
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "(?i)(?:credentials?\\s*[:=]?\\s*)?([^\\s/]+@[^\\s/]+)\\s*/\\s*([^\\s]+)"
+        ).matcher(s);
+        if (m.find()) {
+            String email = m.group(1).trim();
+            String password = m.group(2).trim();
+            if (!email.isBlank() && !password.isBlank()) {
+                return "Email: " + email + ", Password: " + password;
+            }
+        }
+        return "";
     }
 
     private static Map<String, Object> loadTestcaseContext(UUID projectId, UUID testcaseId) {

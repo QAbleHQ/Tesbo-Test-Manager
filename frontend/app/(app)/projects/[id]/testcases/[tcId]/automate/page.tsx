@@ -1653,9 +1653,17 @@ Stop when pass/fail outcome is clear and summarize results.`;
         xRatio,
         yRatio,
       });
+      if (result.status === "failed") {
+        const failMsg = typeof result.message === "string" ? result.message : "Click did not reach the target element.";
+        setMessages((prev) => [...prev, { role: "assistant", content: `Click failed: ${failMsg}` }]);
+        setStreamState("Live");
+        return;
+      }
       const targetText = typeof result.targetText === "string" ? result.targetText.trim() : "";
-      const suggestion = targetText
-        ? `Assertion suggestion: verify "${targetText}" is visible after this click.`
+      const selector = typeof result.selector === "string" ? result.selector.trim() : "";
+      const clickTarget = targetText || selector || "";
+      const suggestion = clickTarget
+        ? `Clicked "${clickTarget}". Assertion suggestion: verify the next state after this click.`
         : "Assertion suggestion: verify the next state (URL, heading, or CTA visibility) after this click.";
       const combinedMessage = `Manual click recorded in live mode. ${suggestion}`;
       setMessages((prev) => {

@@ -133,13 +133,15 @@ app.post("/internal/sessions/:sessionId/execute", async (req, res) => {
 
 app.post("/internal/sessions/:sessionId/execute-stagehand", async (req, res) => {
   const { sessionId } = req.params;
-  const { commandId, objective } = req.body || {};
+  const { commandId, objective, useTelemetry } = req.body || {};
   if (!commandId || !objective || typeof objective !== "string") {
     res.status(400).json({ error: "commandId and objective are required" });
     return;
   }
   try {
-    const result = await executeStagehand(sessionId, commandId, objective.trim());
+    const result = await executeStagehand(sessionId, commandId, objective.trim(), {
+      useTelemetry: typeof useTelemetry === "boolean" ? useTelemetry : undefined,
+    });
     res.json(result);
   } catch (err) {
     res.status(404).json({ error: err instanceof Error ? err.message : "Stagehand execution failed" });

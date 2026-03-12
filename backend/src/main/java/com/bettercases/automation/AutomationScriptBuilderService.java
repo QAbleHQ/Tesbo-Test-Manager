@@ -296,8 +296,11 @@ public final class AutomationScriptBuilderService {
         ).toLowerCase();
         String instruction = asText(source.get("instruction"));
         String describe = asText(source.get("describe"));
-        String target = firstNonBlank(describe, instruction);
+        String targetDescription = asText(source.get("targetDescription"));
+        String description = asText(source.get("description"));
+        String target = firstNonBlank(describe, firstNonBlank(instruction, firstNonBlank(targetDescription, description)));
         String value = firstNonBlank(asText(source.get("value")), asText(source.get("text")));
+        String playwrightCode = asText(source.get("playwright"));
         Map<String, Object> argumentsMap = asMap(source.get("arguments"));
         if (argumentsMap != null && !argumentsMap.isEmpty()) {
             String argDescribe = asText(argumentsMap.get("describe"));
@@ -310,6 +313,7 @@ public final class AutomationScriptBuilderService {
             Map<String, Object> step = new HashMap<>();
             step.put("action", "click");
             if (!target.isBlank()) step.put("targetDescription", target);
+            if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
             out.add(step);
             return true;
         }
@@ -318,6 +322,7 @@ public final class AutomationScriptBuilderService {
             step.put("action", "type");
             if (!target.isBlank()) step.put("targetDescription", target);
             if (!value.isBlank()) step.put("value", value);
+            if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
             out.add(step);
             return true;
         }
@@ -325,6 +330,7 @@ public final class AutomationScriptBuilderService {
             Map<String, Object> step = new HashMap<>();
             step.put("action", "press");
             step.put("key", firstNonBlank(asText(source.get("key")), "Enter"));
+            if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
             out.add(step);
             return true;
         }
@@ -345,9 +351,33 @@ public final class AutomationScriptBuilderService {
                 Map<String, Object> step = new HashMap<>();
                 step.put("action", "navigate");
                 step.put("url", url);
+                if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
                 out.add(step);
                 return true;
             }
+        }
+        if (actionName.contains("scroll")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "scroll");
+            if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
+            out.add(step);
+            return true;
+        }
+        if (actionName.contains("drag")) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", "drag");
+            if (!playwrightCode.isBlank()) step.put("playwright", playwrightCode);
+            out.add(step);
+            return true;
+        }
+        if (!playwrightCode.isBlank()) {
+            Map<String, Object> step = new HashMap<>();
+            step.put("action", actionName.isBlank() ? "act" : actionName);
+            step.put("playwright", playwrightCode);
+            if (!target.isBlank()) step.put("targetDescription", target);
+            if (!value.isBlank()) step.put("value", value);
+            out.add(step);
+            return true;
         }
         return false;
     }

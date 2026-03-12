@@ -8,6 +8,8 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
+import { executeScenarioWithTelemetry, planScenario } from "./telemetry/executor.js";
+import { compileTelemetryToActions } from "./telemetry/compiler.js";
 
 let Stagehand;
 try {
@@ -142,6 +144,8 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
   const useBrowserbase = Boolean(browserbaseApiKey && browserbaseProjectId);
   const stagehandConfig = {
     env: useBrowserbase ? "BROWSERBASE" : "LOCAL",
+    experimental: true,
+    disableAPI: true,
     cacheDir,
     model: {
       modelName: resolvedModelName,
@@ -192,10 +196,12 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     }
   }
 
+  const context = stagehand.context;
   const state = {
     id: sessionId,
     type: "stagehand",
     stagehand,
+    context,
     page,
     currentUrl: page.url(),
     lastScreenshotPath: null,
@@ -215,6 +221,16 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
       model: resolvedModelName,
     },
   };
+
+  if (typeof context.on === "function") {
+    context.on("page", (newPage) => {
+      logInfo("stagehand_popup_detected", { sessionId, url: newPage.url() });
+      state.page = newPage;
+      state.currentUrl = newPage.url();
+      state.updatedAt = nowIso();
+    });
+  }
+  state._popupListenerAttached = true;
 
   try {
     state.lastScreenshotPath = await takeScreenshot(page, sessionId);
@@ -299,6 +315,292 @@ async function runPageAssertions(page, targets) {
 }
 
 /**
+ * Convert captured onStepFinish tool calls into normalized Playwright-compatible
+ * action objects. This is the most reliable conversion path because it uses the
+ * actual tool names and arguments from the Stagehand agent execution.
+ */
+function convertToolCallsToActions(toolCalls, currentUrl) {
+  const actions = [];
+  for (const tc of toolCalls) {
+    const { toolName, args, result: toolResult } = tc;
+    const name = String(toolName || "").toLowerCase();
+
+    if (["screenshot", "done", "think", "ariatree"].includes(name)) continue;
+
+    if (name === "click") {
+      const describe = String(args?.describe || args?.instruction || "").trim();
+      if (!describe) continue;
+      const escaped = describe.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      actions.push({
+        type: "act",
+        action: "click",
+        targetDescription: describe,
+        description: `Click on ${describe}`,
+        playwright: `await page.getByRole('button', { name: '${escaped}', exact: false }).or(page.getByText('${escaped}', { exact: false })).first().click();`,
+      });
+      continue;
+    }
+
+    if (name === "type") {
+      const describe = String(args?.describe || args?.instruction || "").trim();
+      const text = String(args?.text || args?.value || "").trim();
+      if (!text) continue;
+      const escapedDesc = (describe || "text field").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const escapedValue = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      actions.push({
+        type: "act",
+        action: "type",
+        targetDescription: describe || "text field",
+        value: text,
+        description: `Type "${text}" into ${describe || "text field"}`,
+        playwright: `await page.getByLabel('${escapedDesc}', { exact: false }).first().fill('${escapedValue}');`,
+      });
+      continue;
+    }
+
+    if (name === "act") {
+      const instruction = String(args?.instruction || args?.action || "").trim();
+      if (!instruction) continue;
+      const escaped = instruction.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const isType = /\b(type|fill|enter|input|write)\b/i.test(instruction);
+      if (isType) {
+        const valueMatch =
+          instruction.match(/(?:type|fill|enter|input|write)\s+["'](.+?)["']\s/i) ||
+          instruction.match(/["'](.+?)["']/);
+        const value = valueMatch?.[1] || "";
+        const targetMatch = instruction.match(/(?:into?|on)\s+(?:the\s+)?["']?(.+?)["']?\s*$/i);
+        const target = targetMatch?.[1] || instruction;
+        const escapedTarget = target.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const escapedValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        actions.push({
+          type: "act",
+          action: "type",
+          targetDescription: target,
+          value,
+          description: instruction,
+          playwright:
+            target && value
+              ? `await page.getByLabel('${escapedTarget}', { exact: false }).first().fill('${escapedValue}');`
+              : `// act: ${escaped}`,
+        });
+      } else {
+        actions.push({
+          type: "act",
+          action: "click",
+          targetDescription: instruction,
+          description: instruction,
+          playwright: `await page.getByText('${escaped}', { exact: false }).first().click();`,
+        });
+      }
+      continue;
+    }
+
+    if (name === "goto" || name === "navigate") {
+      const url = String(args?.url || "").trim();
+      if (!url) continue;
+      const escaped = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      actions.push({
+        type: "act",
+        action: "navigate",
+        url,
+        description: `Navigate to ${url}`,
+        playwright: `await page.goto('${escaped}');`,
+      });
+      continue;
+    }
+
+    if (name === "keys" || name === "press") {
+      const key = String(args?.keys || args?.key || "").trim();
+      if (!key) continue;
+      const escaped = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      actions.push({
+        type: "act",
+        action: "press",
+        key,
+        description: `Press ${key}`,
+        playwright: `await page.keyboard.press('${escaped}');`,
+      });
+      continue;
+    }
+
+    if (name === "scroll") {
+      const direction = String(args?.direction || "down").trim().toLowerCase();
+      const pixels = Number(args?.pixels || args?.scrolledPixels || 300);
+      const deltaX = direction.includes("left") ? -pixels : direction.includes("right") ? pixels : 0;
+      const deltaY = direction.includes("up") ? -pixels : pixels;
+      actions.push({
+        type: "act",
+        action: "scroll",
+        description: `Scroll ${direction}`,
+        playwright: `await page.mouse.wheel(${deltaX}, ${deltaY});`,
+      });
+      continue;
+    }
+
+    if (name === "wait") {
+      const waited = Number(args?.timeMs || toolResult?.waited || 2000);
+      actions.push({
+        type: "wait",
+        action: "wait",
+        timeMs: waited,
+        description: `Wait for ${waited}ms`,
+        playwright: `await page.waitForTimeout(${waited});`,
+      });
+      continue;
+    }
+
+    if (name === "fillform" || name === "fillformvision") {
+      const fields = Array.isArray(toolResult?.playwrightArguments)
+        ? toolResult.playwrightArguments
+        : Array.isArray(args?.fields)
+          ? args.fields
+          : [];
+      for (const field of fields) {
+        if (!field || typeof field !== "object") continue;
+        const desc = String(field.action || field.description || "").trim();
+        const val = String(field.value || field.originalValue || "").trim();
+        if (!val && !desc) continue;
+        const escapedDesc = (desc || "field").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const escapedValue = val.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        actions.push({
+          type: "act",
+          action: "type",
+          targetDescription: desc,
+          value: val,
+          description: desc,
+          playwright: `await page.getByLabel('${escapedDesc}', { exact: false }).first().fill('${escapedValue}');`,
+        });
+      }
+      continue;
+    }
+
+    if (name === "navback") {
+      actions.push({
+        type: "act",
+        action: "navigate",
+        description: "Navigate back",
+        playwright: "await page.goBack();",
+      });
+      continue;
+    }
+
+    if (name === "extract") {
+      if (toolResult && typeof toolResult === "object") {
+        for (const value of Object.values(toolResult)) {
+          if (typeof value === "string" && value.trim()) {
+            const escaped = value.trim().replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+            actions.push({
+              type: "act",
+              action: "assert_text",
+              expectedText: value.trim(),
+              description: `Verify "${value.trim()}" is present`,
+              playwright: `await expect(page.getByText('${escaped}', { exact: false }).first()).toBeVisible();`,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (name === "draganddrop" || name === "drag") {
+      const startDesc = String(args?.startDescribe || args?.startDescription || "source").trim();
+      const endDesc = String(args?.endDescribe || args?.endDescription || "target").trim();
+      const escapedStart = startDesc.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const escapedEnd = endDesc.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      actions.push({
+        type: "act",
+        action: "drag",
+        startSelector: startDesc,
+        endSelector: endDesc,
+        description: `Drag ${startDesc} to ${endDesc}`,
+        playwright: `await page.getByText('${escapedStart}', { exact: false }).first().dragTo(page.getByText('${escapedEnd}', { exact: false }).first());`,
+      });
+      continue;
+    }
+  }
+  return actions;
+}
+
+/**
+ * Execute using telemetry-driven observe→act→extract flow.
+ * Produces reliable Playwright scripts from structured telemetry.
+ */
+export async function executeStagehandWithTelemetry(session, commandId, objective) {
+  if (session.type !== "stagehand" || !session.stagehand) {
+    throw new Error("Session is not a Stagehand session");
+  }
+
+  const plan = planScenario(objective);
+  if (plan.length === 0) {
+    return executeStagehandObjective(session, commandId, objective);
+  }
+
+  try {
+    const { success, events, stagehandActions: rawActions, results } = await executeScenarioWithTelemetry(
+      session,
+      objective,
+      { plan, continueOnFailure: true }
+    );
+
+    session.currentUrl = session.page.url();
+    session.updatedAt = nowIso();
+
+    let screenshotPath = session.lastScreenshotPath;
+    try {
+      screenshotPath = await takeScreenshot(session.page, session.id);
+      session.lastScreenshotPath = screenshotPath;
+    } catch {
+      // keep existing
+    }
+
+    const compiledActions = events.length > 0 ? compileTelemetryToActions(events) : rawActions;
+
+    const stepResults = results.map((r, i) => ({
+      commandId,
+      stepId: r.stepId || `step-${i + 1}`,
+      action: r.success ? "act" : "agent_execute",
+      status: r.success ? "passed" : "failed",
+      currentUrl: session.currentUrl,
+      selectorUsed: null,
+      message: r.instruction || (r.success ? "Executed" : r.error),
+      screenshotPath: i === results.length - 1 ? screenshotPath : null,
+      durationMs: 0,
+    }));
+
+    if (stepResults.length === 0) {
+      stepResults.push({
+        commandId,
+        stepId: "step-1",
+        action: "agent_execute",
+        status: success ? "passed" : "failed",
+        currentUrl: session.currentUrl,
+        message: "Telemetry execution completed",
+        screenshotPath,
+        durationMs: 0,
+      });
+    }
+
+    logInfo("stagehand_telemetry_complete", {
+      sessionId: session.id,
+      eventCount: events.length,
+      actionCount: compiledActions.length,
+    });
+
+    return {
+      commandId,
+      currentUrl: session.currentUrl,
+      results: stepResults,
+      stagehandActions: compiledActions,
+      telemetryEvents: events,
+      completed: success,
+    };
+  } catch (err) {
+    logError("stagehand_telemetry_failed", { sessionId: session.id, error: String(err) });
+    return executeStagehandObjective(session, commandId, objective);
+  }
+}
+
+/**
  * Execute an autonomous objective using Stagehand's agent.
  * @param {object} session - Stagehand session state
  * @param {string} commandId - Command ID for tracking
@@ -315,6 +617,7 @@ export async function executeStagehandObjective(session, commandId, objective) {
   const maxSteps = 30;
 
   try {
+    const capturedToolCalls = [];
     const agent = stagehand.agent({
       mode: session.agentMode || DEFAULT_STAGEHAND_AGENT_MODE,
       systemPrompt: session.agentSystemPrompt || STABLE_LOCATOR_SYSTEM_PROMPT,
@@ -322,6 +625,26 @@ export async function executeStagehandObjective(session, commandId, objective) {
     const result = await agent.execute({
       instruction: objective,
       maxSteps,
+      callbacks: {
+        onStepFinish: async (event) => {
+          try {
+            const toolCalls = event.toolCalls || [];
+            const toolResults = event.toolResults || [];
+            for (const tc of toolCalls) {
+              const matchingResult = toolResults.find(
+                (tr) => tr.toolCallId === tc.toolCallId
+              );
+              capturedToolCalls.push({
+                toolName: tc.toolName,
+                args: tc.args || {},
+                result: matchingResult?.result ?? null,
+              });
+            }
+          } catch {
+            // non-fatal: don't break agent execution
+          }
+        },
+      },
     });
 
     session.currentUrl = page.url();
@@ -335,16 +658,37 @@ export async function executeStagehandObjective(session, commandId, objective) {
       screenshotPath = session.lastScreenshotPath;
     }
 
-    const rawSteps = result?.steps ?? result?.actions ?? [];
-    const rawStepsFiltered = Array.isArray(rawSteps)
-      ? rawSteps.filter((s) => s && typeof s === "object")
-      : [];
-    const normalizedActions = await convertActionsWithAI(
-      rawStepsFiltered,
-      session.currentUrl,
-      session.modelConfig,
-      objective
-    );
+    // Primary path: convert captured tool calls directly (most reliable)
+    let normalizedActions = [];
+    if (capturedToolCalls.length > 0) {
+      normalizedActions = convertToolCallsToActions(capturedToolCalls, session.currentUrl);
+      if (normalizedActions.length > 0) {
+        logInfo("stagehand_actions_from_tool_calls", {
+          sessionId: session.id,
+          actionCount: normalizedActions.length,
+          toolCallCount: capturedToolCalls.length,
+        });
+      }
+    }
+
+    // Fallback: LLM-based conversion from result.actions
+    if (normalizedActions.length === 0) {
+      const rawSteps = result?.steps ?? result?.actions ?? [];
+      const rawStepsFiltered = Array.isArray(rawSteps)
+        ? rawSteps.filter((s) => s && typeof s === "object")
+        : [];
+      logInfo("stagehand_fallback_to_ai_convert", {
+        sessionId: session.id,
+        rawStepCount: rawStepsFiltered.length,
+        capturedToolCallCount: capturedToolCalls.length,
+      });
+      normalizedActions = await convertActionsWithAI(
+        rawStepsFiltered,
+        session.currentUrl,
+        session.modelConfig,
+        objective
+      );
+    }
 
     // Detect assertion/verification commands and add concrete assertion steps
     const assertionTargets = isAssertionCommand(objective)
@@ -539,11 +883,18 @@ Return ONLY a JSON object with this structure:
 }
 
 Rules:
-- Skip "screenshot" and "done" actions entirely
-- For "fillFormVision" actions, create one step per field using the fields/playwrightArguments array
+- Skip "screenshot", "done", "think", and "ariaTree" actions entirely
+- For "fillFormVision"/"fillForm" actions, create one step per field using the fields/playwrightArguments array
 - For "click" actions, use the describe/description for the role/text locator
+- For "act" actions (DOM mode semantic actions), determine if it's a click or type from the instruction text:
+  -- If the instruction mentions typing/filling/entering, create a "type" action
+  -- Otherwise create a "click" action using the instruction as targetDescription
+- For "goto"/"navigate" actions, create a navigate step with page.goto(url)
+- For "keys"/"press" actions, create a press step with page.keyboard.press(key)
+- For "scroll" actions, create a scroll step with page.mouse.wheel(deltaX, deltaY)
 - For "wait" actions, use page.waitForTimeout(ms)
-- action must be one of: navigate, click, type, wait, press, assert_visible, assert_text
+- For "extract" actions, create assert_text steps for any extracted text values
+- action must be one of: navigate, click, type, wait, press, scroll, assert_visible, assert_text
 - For verification/assertion objectives, use: await expect(page.getByText('...', { exact: false }).first()).toBeVisible();
 - targetDescription should be a short element label (e.g. "Email", "Password", "Log in")
 - playwright must be a single executable Playwright code line${assertionHint}`;
@@ -636,10 +987,10 @@ Rules:
 }
 
 /**
- * Convert high-level Stagehand agent actions (screenshot, fillFormVision, click, done)
- * into concrete playwright-compatible action objects (type, click, wait).
- * If the input already contains concrete steps (with nested method/selector),
- * it is returned unchanged.
+ * Convert high-level Stagehand agent actions into concrete playwright-compatible
+ * action objects. Handles all Stagehand v3 tool types:
+ * DOM mode: act, fillForm, extract, goto, scroll, keys, screenshot, wait, done, think
+ * Hybrid mode: click, type, dragAndDrop, clickAndHold, fillFormVision + DOM tools
  */
 function flattenStagehandAgentActions(rawActions) {
   if (!Array.isArray(rawActions) || rawActions.length === 0) return rawActions;
@@ -653,20 +1004,14 @@ function flattenStagehandAgentActions(rawActions) {
   );
   if (hasConcrete) return rawActions;
 
-  const hasAgentTypes = rawActions.some((a) => {
-    const t = String(a?.type || "").toLowerCase();
-    return t === "screenshot" || t === "fillformvision" || t === "done";
-  });
-  if (!hasAgentTypes) return rawActions;
-
   const concrete = [];
   for (const action of rawActions) {
     if (!action || typeof action !== "object") continue;
     const type = String(action.type || "").toLowerCase();
 
-    if (type === "screenshot" || type === "done") continue;
+    if (type === "screenshot" || type === "done" || type === "think" || type === "ariatree") continue;
 
-    if (type === "fillformvision") {
+    if (type === "fillformvision" || type === "fillform") {
       const pwArgs = Array.isArray(action.playwrightArguments)
         ? action.playwrightArguments
         : [];
@@ -676,6 +1021,8 @@ function flattenStagehandAgentActions(rawActions) {
         const desc = String(field.action || field.description || "").trim();
         const val = String(field.value || field.originalValue || "").trim();
         if (!val && !desc) continue;
+        const escapedDesc = (desc || "field").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const escapedValue = val.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         concrete.push({
           type: "act",
           action: "type",
@@ -683,6 +1030,7 @@ function flattenStagehandAgentActions(rawActions) {
           targetDescription: desc,
           value: val,
           description: desc,
+          playwright: `await page.getByLabel('${escapedDesc}', { exact: false }).first().fill('${escapedValue}');`,
         });
       }
       continue;
@@ -693,12 +1041,105 @@ function flattenStagehandAgentActions(rawActions) {
         action.describe || action.description || action.instruction || ""
       ).trim();
       if (!desc) continue;
+      const escaped = desc.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       concrete.push({
         type: "act",
         action: "click",
         instruction: desc,
         targetDescription: desc,
         description: desc,
+        playwright: `await page.getByRole('button', { name: '${escaped}', exact: false }).or(page.getByText('${escaped}', { exact: false })).first().click();`,
+      });
+      continue;
+    }
+
+    if (type === "act") {
+      const instruction = String(action.instruction || action.action || action.describe || action.description || "").trim();
+      if (!instruction) continue;
+      const escaped = instruction.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const isType = /\b(type|fill|enter|input|write)\b/i.test(instruction);
+      if (isType) {
+        const valueMatch =
+          instruction.match(/(?:type|fill|enter|input|write)\s+["'](.+?)["']\s/i) ||
+          instruction.match(/["'](.+?)["']/);
+        const value = valueMatch?.[1] || "";
+        const targetMatch = instruction.match(/(?:into?|on)\s+(?:the\s+)?["']?(.+?)["']?\s*$/i);
+        const target = targetMatch?.[1] || instruction;
+        const escapedTarget = target.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const escapedValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        concrete.push({
+          type: "act",
+          action: "type",
+          instruction,
+          targetDescription: target,
+          value,
+          description: instruction,
+          playwright:
+            target && value
+              ? `await page.getByLabel('${escapedTarget}', { exact: false }).first().fill('${escapedValue}');`
+              : `// act: ${escaped}`,
+        });
+      } else {
+        concrete.push({
+          type: "act",
+          action: "click",
+          instruction,
+          targetDescription: instruction,
+          description: instruction,
+          playwright: `await page.getByText('${escaped}', { exact: false }).first().click();`,
+        });
+      }
+      continue;
+    }
+
+    if (type === "goto" || type === "navigate") {
+      const url = String(action.url || action.instruction || "").trim();
+      if (!url) continue;
+      const escaped = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      concrete.push({
+        type: "act",
+        action: "navigate",
+        url,
+        description: `Navigate to ${url}`,
+        playwright: `await page.goto('${escaped}');`,
+      });
+      continue;
+    }
+
+    if (type === "navback") {
+      concrete.push({
+        type: "act",
+        action: "navigate",
+        description: "Navigate back",
+        playwright: "await page.goBack();",
+      });
+      continue;
+    }
+
+    if (type === "keys" || type === "press") {
+      const key = String(action.keys || action.key || action.instruction || "").trim();
+      if (!key) continue;
+      const escaped = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      concrete.push({
+        type: "act",
+        action: "press",
+        key,
+        description: `Press ${key}`,
+        playwright: `await page.keyboard.press('${escaped}');`,
+      });
+      continue;
+    }
+
+    if (type === "scroll") {
+      const direction = String(action.direction || "down").trim().toLowerCase();
+      const pixels = Number(action.pixels || action.scrolledPixels || 300);
+      const deltaX = direction.includes("left") ? -pixels : direction.includes("right") ? pixels : 0;
+      const deltaY = direction.includes("up") ? -pixels : pixels;
+      concrete.push({
+        type: "act",
+        action: "scroll",
+        description: `Scroll ${direction}`,
+        playwright: `await page.mouse.wheel(${deltaX}, ${deltaY});`,
       });
       continue;
     }
@@ -706,7 +1147,12 @@ function flattenStagehandAgentActions(rawActions) {
     if (type === "wait") {
       const ms = Number(action.timeMs || action.waited || 0);
       if (ms > 0) {
-        concrete.push({ type: "wait", action: "wait", timeMs: ms });
+        concrete.push({
+          type: "wait",
+          action: "wait",
+          timeMs: ms,
+          playwright: `await page.waitForTimeout(${ms});`,
+        });
       }
       continue;
     }
@@ -717,6 +1163,8 @@ function flattenStagehandAgentActions(rawActions) {
       const desc = String(
         action.describe || action.description || action.instruction || ""
       ).trim();
+      const escapedDesc = (desc || "field").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const escapedValue = val.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       concrete.push({
         type: "act",
         action: "type",
@@ -725,12 +1173,43 @@ function flattenStagehandAgentActions(rawActions) {
         selector: sel,
         value: val,
         description: desc,
+        playwright: sel
+          ? `await page.locator('${sel.replace(/'/g, "\\'")}').first().fill('${escapedValue}');`
+          : `await page.getByLabel('${escapedDesc}', { exact: false }).first().fill('${escapedValue}');`,
+      });
+      continue;
+    }
+
+    if (type === "extract") {
+      continue;
+    }
+
+    if (type === "draganddrop" || type === "drag") {
+      const startDesc = String(action.startDescribe || action.startDescription || "source").trim();
+      const endDesc = String(action.endDescribe || action.endDescription || "target").trim();
+      const escapedStart = startDesc.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const escapedEnd = endDesc.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      concrete.push({
+        type: "act",
+        action: "drag",
+        startSelector: startDesc,
+        endSelector: endDesc,
+        description: `Drag ${startDesc} to ${endDesc}`,
+        playwright: `await page.getByText('${escapedStart}', { exact: false }).first().dragTo(page.getByText('${escapedEnd}', { exact: false }).first());`,
       });
       continue;
     }
 
     if (action.type || action.action) {
-      concrete.push(action);
+      const desc = String(action.describe || action.description || action.instruction || "").trim();
+      const val = String(action.value || action.text || "").trim();
+      if (desc || val) {
+        concrete.push({
+          ...action,
+          targetDescription: desc || action.targetDescription,
+          value: val || action.value,
+        });
+      }
     }
   }
   return concrete.length > 0 ? concrete : rawActions;

@@ -140,6 +140,10 @@ export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedba
     lines.push("### Test Data");
     lines.push(testData);
     lines.push("");
+    if (/@|credentials?|password|login/i.test(testData)) {
+      lines.push("**CRITICAL:** For login forms, use the EXACT credentials from Test Data above. Never use placeholder values like user@example.com or password123.");
+      lines.push("");
+    }
   }
 
   if (steps.length > 0) {
@@ -155,6 +159,7 @@ export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedba
   }
 
   lines.push("### Execution Guidelines");
+  lines.push("- Complete login FIRST with the exact credentials from Test Data. Only after login succeeds, proceed to post-login steps.");
   lines.push("- First, observe and understand the current page layout, navigation, and available controls.");
   lines.push("- Navigate the application naturally as a real user would — read labels, understand context, find the right elements.");
   lines.push("- If a step mentions a feature or page, explore the UI to locate it rather than guessing selectors.");
@@ -231,6 +236,25 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       if (Number.isFinite(durationMs) && durationMs > 0) {
         pushCapture({ action: "wait", durationMs: Math.round(durationMs) }, status, source);
       }
+      return;
+    }
+    const normalizedAction = asText(entry.action).toLowerCase();
+    const playwrightCode = asText(entry.playwright);
+    if (normalizedAction && playwrightCode) {
+      const cap: Record<string, unknown> = {
+        action: normalizedAction,
+        playwright: playwrightCode,
+      };
+      const entryValue = asText(entry.value);
+      const entryUrl = asText(entry.url);
+      const entryKey = asText(entry.key);
+      const entryExpected = asText(entry.expectedText);
+      if (entryValue) cap.value = entryValue;
+      if (entryUrl) cap.url = entryUrl;
+      if (entryKey) cap.key = entryKey;
+      if (entryExpected) cap.expectedText = entryExpected;
+      if (entry.timeMs != null) cap.durationMs = Number(entry.timeMs);
+      pushCapture(cap, status, source);
       return;
     }
     const nestedActions = Array.isArray(entry.actions) ? entry.actions : [];
@@ -377,7 +401,10 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
     const url = asText(a.url);
     const passed = isPassedStatus(capture.status);
     let emitted = false;
-    if (passed && action === "navigate" && url) {
+    if (passed && asText(a.playwright)) {
+      lines.push(`  ${asText(a.playwright)}`);
+      emitted = true;
+    } else if (passed && action === "navigate" && url) {
       lines.push(`  await page.goto('${esc(url)}');`);
       emitted = true;
     } else if (passed && action === "click" && selector) {
@@ -406,6 +433,9 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       emitted = true;
     } else if (passed && action === "assert_url" && url) {
       lines.push(`  await expect(page).toHaveURL('${esc(url)}');`);
+      emitted = true;
+    } else if (passed && action === "scroll") {
+      lines.push("  await page.mouse.wheel(0, 300);");
       emitted = true;
     }
     if (emitted) {

@@ -200,6 +200,10 @@ function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedback?: st
     lines.push("### Test Data");
     lines.push(testData);
     lines.push("");
+    if (/@|credentials?|password|login/i.test(testData)) {
+      lines.push("**CRITICAL:** For login forms, use the EXACT credentials from Test Data above. Never use placeholder values like user@example.com or password123.");
+      lines.push("");
+    }
   }
 
   if (steps.length > 0) {
@@ -209,12 +213,13 @@ function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedback?: st
   }
 
   lines.push("### Execution Guidelines");
+  lines.push("- Complete login FIRST with the exact credentials from Test Data. Only after login succeeds, proceed to post-login steps.");
   lines.push("- First, observe and understand the current page layout, navigation, and available controls.");
   lines.push("- Navigate the application naturally as a real user would — read labels, understand context, find the right elements.");
   lines.push("- If a step mentions a feature or page, explore the UI to locate it rather than guessing selectors.");
   lines.push("- Adapt to the actual DOM structure — if expected elements are not where anticipated, look for alternative paths.");
   lines.push("- Generate meaningful assertions that verify business outcomes, not just element presence.");
-  lines.push("- When entering test data, use realistic values that match the field context.");
+  lines.push("- When entering test data, use the EXACT values from the Test Data section above. Do NOT invent or substitute values.");
   lines.push("- Handle loading states, transitions, and dynamic content gracefully.");
 
   return lines.join("\n");
