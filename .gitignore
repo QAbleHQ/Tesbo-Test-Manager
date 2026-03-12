@@ -12,6 +12,7 @@
 
 # Local uploaded/generated artifacts
 /backend/uploads/tesbo-artifacts/
+/automation-agent/artifacts/
 
 # Local validation screenshots
 /localhost-screenshot.png
