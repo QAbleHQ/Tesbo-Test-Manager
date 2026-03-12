@@ -291,6 +291,37 @@ function extractGeneratedScript(session: AutomationSession): string | null {
       }
       return;
     }
+    const normalizedAction = asText(entry.action).toLowerCase();
+    let playwrightCode = asText(entry.playwright);
+    if (!playwrightCode && normalizedAction) {
+      const targetDesc = asText(entry.targetDescription || entry.description).trim();
+      const val = asText(entry.value).trim();
+      const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      if (targetDesc && (normalizedAction === "click" || normalizedAction === "type")) {
+        if (normalizedAction === "type" && val) {
+          playwrightCode = `await page.getByLabel('${esc(targetDesc)}', { exact: false }).or(page.getByPlaceholder('${esc(targetDesc)}', { exact: false })).first().fill('${esc(val)}');`;
+        } else if (normalizedAction === "click") {
+          playwrightCode = `await page.getByRole('button', { name: '${esc(targetDesc)}', exact: false }).or(page.getByText('${esc(targetDesc)}', { exact: false })).first().click();`;
+        }
+      }
+    }
+    if (normalizedAction && playwrightCode) {
+      const cap: Record<string, unknown> = {
+        action: normalizedAction,
+        playwright: playwrightCode,
+      };
+      const entryValue = asText(entry.value);
+      const entryUrl = asText(entry.url);
+      const entryKey = asText(entry.key);
+      const entryExpected = asText(entry.expectedText);
+      if (entryValue) cap.value = entryValue;
+      if (entryUrl) cap.url = entryUrl;
+      if (entryKey) cap.key = entryKey;
+      if (entryExpected) cap.expectedText = entryExpected;
+      if (entry.timeMs != null) cap.durationMs = Number(entry.timeMs);
+      pushCapture(cap, status, source);
+      return;
+    }
     const nestedActions = Array.isArray(entry.actions) ? entry.actions : [];
     let emitted = false;
     for (const nestedRaw of nestedActions) {

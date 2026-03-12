@@ -50,8 +50,8 @@ export const config = {
   traceDir: path.resolve(env("TRACE_DIR", "./artifacts/traces")),
   stagehandCacheDir: path.resolve(env("STAGEHAND_CACHE_DIR", "./artifacts/stagehand-cache")),
   stagehandAgentMode: env("STAGEHAND_AGENT_MODE", "hybrid"),
-  /** Use telemetry (observe→act per step) vs full agent mode. Agent mode performs actions more reliably. */
-  useTelemetry: env("USE_TELEMETRY", "false") === "true",
+  /** Use telemetry (observe→act per step) vs full agent mode. Telemetry produces better Playwright scripts from successful acts. */
+  useTelemetry: env("USE_TELEMETRY", "true") === "true",
   recordVideo: env("RECORD_VIDEO", "true") !== "false",
   sharedToken: env("AGENT_SHARED_TOKEN", ""),
   workerId: env("WORKER_ID", `worker-${Math.random().toString(36).slice(2, 10)}`),
