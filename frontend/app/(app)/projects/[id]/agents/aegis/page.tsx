@@ -229,6 +229,13 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => asRecord(item))
+    .filter((item) => Object.keys(item).length > 0);
+}
+
 function isPassedStatus(value: unknown): boolean {
   const n = asText(value).toLowerCase();
   return n === "passed" || n === "success";
@@ -560,6 +567,79 @@ export default function AegisAgentPage() {
     setLog((prev) => [...prev, entry]);
   }, []);
 
+  const logStagehandSessionEvent = useCallback(
+    (testcaseId: string, event: AutomationSession["events"][number]) => {
+      const parsed = asRecord(event?.parsedAction);
+      const execution = asRecord(event?.executionResult);
+      const eventType = asText(event?.eventType);
+
+      if (eventType === "stagehand_plan_sent" || eventType === "stagehand_plan_compiled") {
+        const plan = asRecordArray(parsed.stagehandPlan);
+        if (plan.length > 0) {
+          addLog(testcaseId, `Plan sent to Aegis (${plan.length} steps).`, "info");
+          for (let i = 0; i < Math.min(plan.length, 10); i += 1) {
+            const instruction = asText(plan[i].instruction);
+            if (instruction) addLog(testcaseId, `Plan ${i + 1}: ${instruction}`, "info");
+          }
+        } else if (eventType === "stagehand_plan_sent") {
+          addLog(testcaseId, "Plan sent to Aegis.", "info");
+        }
+        return;
+      }
+
+      if (eventType === "stagehand_execution_started") {
+        addLog(testcaseId, "Aegis started Stagehand execution.", "action");
+        return;
+      }
+
+      if (eventType === "stagehand_step_observed") {
+        const stepId = asText(parsed.stepId) || "step";
+        const instruction = asText(parsed.instruction);
+        const chosenReason = asText(parsed.chosenReason);
+        const message = instruction
+          ? `Stagehand observing ${stepId}: ${instruction}`
+          : `Stagehand observing ${stepId}.`;
+        addLog(testcaseId, chosenReason ? `${message} (${chosenReason})` : message, "action");
+        return;
+      }
+
+      if (eventType === "stagehand_step_acted") {
+        const stepId = asText(parsed.stepId) || "step";
+        const instruction = asText(parsed.instruction);
+        const success = parsed.success === true;
+        const cacheStatus = asText(parsed.cacheStatus);
+        const message = asText(parsed.message);
+        let text = instruction
+          ? `Stagehand acting ${stepId}: ${instruction}`
+          : `Stagehand acting ${stepId}.`;
+        if (message) text += ` (${message})`;
+        if (cacheStatus) text += ` [cache: ${cacheStatus}]`;
+        addLog(testcaseId, text, success ? "success" : "error");
+        return;
+      }
+
+      if (eventType === "stagehand_step_extracted") {
+        const stepId = asText(parsed.stepId) || "step";
+        const instruction = asText(parsed.instruction);
+        const text = instruction
+          ? `Stagehand verifying ${stepId}: ${instruction}`
+          : `Stagehand verifying ${stepId}.`;
+        addLog(testcaseId, text, "action");
+        return;
+      }
+
+      if (eventType === "command_executed") {
+        const mode = asText(parsed.mode);
+        if (mode !== "stagehand") return;
+        const telemetryEvents = asRecordArray(execution.telemetryEvents);
+        if (telemetryEvents.length > 0) {
+          addLog(testcaseId, `Stagehand logs captured: ${telemetryEvents.length} events.`, "info");
+        }
+      }
+    },
+    [addLog]
+  );
+
   useEffect(() => {
     authMe().then((me) => {
       if (!me) { router.replace("/login"); return; }
@@ -715,6 +795,7 @@ export default function AegisAgentPage() {
         addLog(item.testcaseId, "Session created. Sending autonomous command...", "info");
         await sendAutomationCommand(projectId, sessionId, intent);
         addLog(item.testcaseId, "Agent is executing the test case...", "action");
+        const handledEventIds = new Set<string>();
 
         let finished = false;
         let pollCount = 0;
@@ -724,6 +805,14 @@ export default function AegisAgentPage() {
           pollCount++;
           try {
             const session = await getAutomationSession(projectId, sessionId);
+            if (Array.isArray(session.events) && session.events.length > 0) {
+              for (const event of session.events) {
+                const eventId = asText(event?.id);
+                if (!eventId || handledEventIds.has(eventId)) continue;
+                handledEventIds.add(eventId);
+                logStagehandSessionEvent(item.testcaseId, event);
+              }
+            }
             const runtime = session.runtime;
             if (!runtime?.isRunning && (runtime?.queuedCount ?? 0) === 0) {
               finished = true;

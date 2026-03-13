@@ -74,11 +74,57 @@ function parseTestCaseSteps(raw: unknown): string[] {
   }
 }
 
+function extractCredentialEntries(rawTestData: string): Array<{ key: string; value: string }> {
+  const text = rawTestData.trim();
+  if (!text) return [];
+  const out: Array<{ key: string; value: string }> = [];
+  const pushIfCredential = (keyRaw: unknown, valueRaw: unknown) => {
+    const key = String(keyRaw ?? "").trim();
+    const value = String(valueRaw ?? "").trim();
+    if (!key || !value) return;
+    if (!/(user(name)?|email|login|password|pass(word)?|otp|token|pin)/i.test(key)) return;
+    if (/^(none|null|undefined)$/i.test(value)) return;
+    out.push({ key, value });
+  };
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+          pushIfCredential(k, v);
+        }
+      }
+    }
+  } catch {
+    // Non-JSON test data is handled below.
+  }
+
+  if (out.length > 0) return out;
+
+  for (const lineRaw of text.split(/\r?\n/)) {
+    const line = lineRaw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const kv = line.split(/[:=]/);
+    if (kv.length < 2) continue;
+    const key = kv[0].trim();
+    const value = kv.slice(1).join(":").trim();
+    pushIfCredential(key, value);
+  }
+
+  const dedup = new Map<string, string>();
+  for (const item of out) {
+    dedup.set(item.key.toLowerCase(), item.value);
+  }
+  return Array.from(dedup.entries()).map(([k, v]) => ({ key: k, value: v }));
+}
+
 export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedback?: string[], previousScript?: string | null): string {
   const title = asText(tc.title).trim() || "Untitled test case";
   const description = asText(tc.description).trim();
   const preconditions = asText(tc.preconditions).trim();
   const testData = asText(tc.testData).trim();
+  const credentialEntries = extractCredentialEntries(testData);
   const priority = asText(tc.priority).trim();
   const type = asText(tc.type).trim();
   const steps = parseTestCaseSteps(tc.steps);
@@ -140,6 +186,14 @@ export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedba
     lines.push("### Test Data");
     lines.push(testData);
     lines.push("");
+    if (credentialEntries.length > 0) {
+      lines.push("### Credentials (EXACT VALUES ONLY)");
+      for (const item of credentialEntries) {
+        lines.push(`- ${item.key}: ${item.value}`);
+      }
+      lines.push("Use these exact credential values for authentication. Do NOT replace with placeholders.");
+      lines.push("");
+    }
     if (/@|credentials?|password|login/i.test(testData)) {
       lines.push("**CRITICAL:** For login forms, use the EXACT credentials from Test Data above. Never use placeholder values like user@example.com or password123.");
       lines.push("");
@@ -352,6 +406,7 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
         }
       }
     } else if (event.eventType === "command_executed") {
+      const captureCountBefore = captures.length;
       const stagehandActions = Array.isArray(execution.stagehandActions) ? execution.stagehandActions : [];
       if (stagehandActions.length > 0) {
         const status = inferStagehandStatus(parsed, execution);
@@ -368,6 +423,58 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
         const bound = Math.min(steps.length, results.length);
         for (let i = 0; i < bound; i += 1) {
           pushCapture(steps[i], asRecord(results[i]).status, "command_executed");
+        }
+      }
+      if (captures.length === captureCountBefore) {
+        // Fallback path: when Stagehand returns no normalized actions/replay steps,
+        // derive coarse captures from raw result entries so script preview is still generated.
+        const results = Array.isArray(execution.results) ? execution.results : [];
+        const overallStatus = normalizeStatus(parsed.status || execution.status);
+        for (const resultRaw of results) {
+          const result = asRecord(resultRaw);
+          const action = asText(result.action).toLowerCase();
+          const status = normalizeStatus(result.status || overallStatus);
+          const selectorUsed = normalizeSelector(result.selectorUsed);
+          const currentUrl = asText(result.currentUrl || execution.currentUrl);
+          const message = asText(result.message);
+
+          if ((action === "navigate" || action === "goto") && currentUrl) {
+            pushCapture({ action: "navigate", url: currentUrl }, status, "command_executed_result_fallback");
+            continue;
+          }
+          if ((action === "click" || action === "dblclick" || action === "check" || action === "uncheck") && selectorUsed) {
+            pushCapture({ action: "click", selector: selectorUsed }, status, "command_executed_result_fallback");
+            continue;
+          }
+          if ((action === "type" || action === "fill") && selectorUsed) {
+            pushCapture({ action: "type", selector: selectorUsed }, status, "command_executed_result_fallback");
+            continue;
+          }
+          if (action === "assert_url" && currentUrl) {
+            pushCapture({ action: "assert_url", url: currentUrl }, status, "command_executed_result_fallback");
+            continue;
+          }
+          if (message) {
+            pushCapture(
+              {
+                action: action || "act",
+                targetDescription: message,
+                ...(selectorUsed ? { selector: selectorUsed } : {}),
+              },
+              status,
+              "command_executed_result_fallback"
+            );
+          }
+        }
+        if (captures.length === captureCountBefore) {
+          const currentUrl = asText(execution.currentUrl);
+          if (currentUrl) {
+            pushCapture(
+              { action: "navigate", url: currentUrl, targetDescription: "Execution completed; preserving final URL." },
+              overallStatus,
+              "command_executed_result_fallback"
+            );
+          }
         }
       }
     }

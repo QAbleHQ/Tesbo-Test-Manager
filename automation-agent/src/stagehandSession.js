@@ -530,6 +530,18 @@ export async function executeStagehandWithTelemetry(session, commandId, objectiv
     throw new Error("Session is not a Stagehand session");
   }
 
+  // Clear the local act-cache before every run so stale cached actions from a
+  // previous run (e.g. ones that used <UNKNOWN> values) are never replayed.
+  if (session.cacheDir) {
+    try {
+      await fs.rm(session.cacheDir, { recursive: true, force: true });
+      await fs.mkdir(session.cacheDir, { recursive: true });
+      logInfo("stagehand_act_cache_cleared", { sessionId: session.id, cacheDir: session.cacheDir });
+    } catch (err) {
+      logError("stagehand_act_cache_clear_failed", { sessionId: session.id, error: String(err) });
+    }
+  }
+
   const plan = planScenario(objective);
   if (plan.length === 0) {
     return executeStagehandObjective(session, commandId, objective);
@@ -592,6 +604,7 @@ export async function executeStagehandWithTelemetry(session, commandId, objectiv
       results: stepResults,
       stagehandActions: compiledActions,
       telemetryEvents: events,
+      telemetryPlan: plan,
       completed: success,
     };
   } catch (err) {

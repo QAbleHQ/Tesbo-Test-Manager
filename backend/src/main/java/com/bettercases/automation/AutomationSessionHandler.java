@@ -354,6 +354,30 @@ public final class AutomationSessionHandler {
         String stagehandObjective = envelope.autonomousMode
                 ? buildStagehandExecutionObjective(envelope)
                 : buildStagehandChatObjective(envelope);
+        List<Map<String, Object>> stagehandPlanPreview = extractStagehandPlanPreview(stagehandObjective);
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_plan_sent",
+                envelope.rawCommand,
+                Map.of(
+                        "mode", "stagehand",
+                        "objective", envelope.objective,
+                        "stagehandObjective", stagehandObjective,
+                        "stagehandPlan", stagehandPlanPreview
+                ),
+                null,
+                null
+        );
+        AutomationSessionService.addEvent(
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_execution_started",
+                envelope.rawCommand,
+                Map.of(
+                        "mode", "stagehand",
+                        "stage", "running",
+                        "plannedStepCount", stagehandPlanPreview.size()
+                ),
+                null,
+                null
+        );
         AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeStagehand(
                 envelope.sessionId,
                 envelope.commandId.toString(),
@@ -377,7 +401,10 @@ public final class AutomationSessionHandler {
         executionPayload.put("currentUrl", executeResponse.currentUrl);
         executionPayload.put("results", executeResponse.results);
         executionPayload.put("stagehandActions", executeResponse.stagehandActions == null ? List.of() : executeResponse.stagehandActions);
+        executionPayload.put("telemetryEvents", executeResponse.telemetryEvents == null ? List.of() : executeResponse.telemetryEvents);
+        executionPayload.put("telemetryPlan", executeResponse.telemetryPlan == null ? List.of() : executeResponse.telemetryPlan);
         executionPayload.put("cancelled", false);
+        appendStagehandTelemetryEvents(envelope, executeResponse, screenshotPath);
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
                 envelope.rawCommand,
@@ -390,6 +417,66 @@ public final class AutomationSessionHandler {
                 executionPayload,
                 screenshotPath
         );
+    }
+
+    private static void appendStagehandTelemetryEvents(
+            CommandEnvelope envelope,
+            AutomationContracts.AgentExecuteResponse executeResponse,
+            String defaultScreenshotPath
+    ) {
+        List<Map<String, Object>> plan = executeResponse.telemetryPlan == null ? List.of() : executeResponse.telemetryPlan;
+        if (!plan.isEmpty()) {
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_plan_compiled",
+                    envelope.rawCommand,
+                    Map.of(
+                            "mode", "stagehand",
+                            "stagehandPlan", plan,
+                            "plannedStepCount", plan.size()
+                    ),
+                    null,
+                    null
+            );
+        }
+
+        List<Map<String, Object>> telemetryEvents = executeResponse.telemetryEvents == null ? List.of() : executeResponse.telemetryEvents;
+        for (Map<String, Object> telemetry : telemetryEvents) {
+            if (telemetry == null || telemetry.isEmpty()) continue;
+            String eventType = String.valueOf(telemetry.getOrDefault("eventType", "")).trim().toLowerCase();
+            String mappedType = switch (eventType) {
+                case "observe" -> "stagehand_step_observed";
+                case "act" -> "stagehand_step_acted";
+                case "extract" -> "stagehand_step_extracted";
+                default -> "stagehand_step_event";
+            };
+            Map<String, Object> parsedAction = new HashMap<>();
+            parsedAction.put("mode", "stagehand");
+            parsedAction.put("stage", eventType.isBlank() ? "unknown" : eventType);
+            parsedAction.put("stepId", String.valueOf(telemetry.getOrDefault("stepId", "")));
+            parsedAction.put("instruction", String.valueOf(telemetry.getOrDefault("instruction", "")));
+            parsedAction.put("success", telemetry.get("success"));
+            parsedAction.put("chosenReason", telemetry.get("chosenReason"));
+            parsedAction.put("chosenIndex", telemetry.get("chosenIndex"));
+            parsedAction.put("retryCount", telemetry.get("retryCount"));
+            parsedAction.put("cacheStatus", telemetry.get("cacheStatus"));
+            parsedAction.put("message", telemetry.get("message"));
+            parsedAction.put("actionDescription", telemetry.get("actionDescription"));
+            parsedAction.put("elapsedMs", telemetry.get("elapsedMs"));
+            parsedAction.put("actAttempts", telemetry.get("actAttempts"));
+            parsedAction.put("actions", telemetry.get("actions"));
+            parsedAction.put("candidates", telemetry.get("candidates"));
+            parsedAction.put("result", telemetry.get("result"));
+            String screenshotPath = asSafeText(telemetry.get("screenshotAfter"));
+            if (screenshotPath.isBlank()) screenshotPath = asSafeText(telemetry.get("screenshotBefore"));
+            if (screenshotPath.isBlank()) screenshotPath = defaultScreenshotPath == null ? "" : defaultScreenshotPath;
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, mappedType,
+                    envelope.rawCommand,
+                    parsedAction,
+                    telemetry,
+                    screenshotPath.isBlank() ? null : screenshotPath
+            );
+        }
     }
 
     private static String buildStagehandExecutionObjective(CommandEnvelope envelope) {
@@ -457,6 +544,33 @@ public final class AutomationSessionHandler {
                 + "3) If the instruction is single-step (for example: click a button), perform that single step and stop.\n"
                 + "4) Do not enter text, credentials, or perform extra navigation unless explicitly requested.\n"
                 + "5) If the target is ambiguous, choose the closest visible match by label/text and execute once.");
+    }
+
+    private static List<Map<String, Object>> extractStagehandPlanPreview(String objective) {
+        if (objective == null || objective.isBlank()) return List.of();
+        String[] lines = objective.replace("\r", "").split("\n");
+        java.util.ArrayList<Map<String, Object>> out = new java.util.ArrayList<>();
+        boolean inStepSection = false;
+        for (String lineRaw : lines) {
+            String line = lineRaw == null ? "" : lineRaw.trim();
+            if (line.isBlank()) continue;
+            String lower = line.toLowerCase();
+            if (lower.startsWith("expected steps:") || lower.startsWith("### steps to execute")) {
+                inStepSection = true;
+                continue;
+            }
+            if (inStepSection && (lower.startsWith("test data") || lower.startsWith("execution requirements") || lower.startsWith("expected outcome"))) {
+                break;
+            }
+            if (!inStepSection) continue;
+            String normalized = line.replaceFirst("^\\d+\\.\\s*", "").trim();
+            if (normalized.isBlank()) continue;
+            Map<String, Object> step = new HashMap<>();
+            step.put("id", "preview-" + (out.size() + 1));
+            step.put("instruction", normalized);
+            out.add(step);
+        }
+        return out;
     }
 
     private static List<String> extractRecentFeedbackSignals(List<Map<String, Object>> events, String currentRawCommand) {
@@ -1529,6 +1643,12 @@ public final class AutomationSessionHandler {
         if (normalized.isBlank()) return;
         if (sb.length() > 0) sb.append('\n');
         sb.append("- ").append(key).append(": ").append(normalized);
+    }
+
+    private static String asSafeText(Object value) {
+        if (value == null) return "";
+        String out = String.valueOf(value).trim();
+        return "null".equalsIgnoreCase(out) ? "" : out;
     }
 
     private static boolean shouldAutoGenerateSteps(UUID projectId, UUID userId) {

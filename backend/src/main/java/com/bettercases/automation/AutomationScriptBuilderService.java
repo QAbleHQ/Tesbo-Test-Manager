@@ -230,7 +230,8 @@ public final class AutomationScriptBuilderService {
                 for (Map<String, Object> field : fields) {
                     String desc = firstNonBlank(asText(field.get("action")), asText(field.get("description")));
                     String value = firstNonBlank(asText(field.get("value")), asText(field.get("originalValue")));
-                    if (desc.isBlank() && value.isBlank()) continue;
+                    // Skip fill entries that have no value — they represent uncaptured/failed input steps.
+                    if (value.isBlank()) continue;
                     Map<String, Object> step = new HashMap<>();
                     step.put("action", "type");
                     step.put("targetDescription", desc);
@@ -391,6 +392,9 @@ public final class AutomationScriptBuilderService {
             firstArg = firstNonBlank(asText(source.get("text")), asText(source.get("value")));
         }
         if (("fill".equals(method) || "type".equals(method)) && !selector.isBlank()) {
+            if (firstArg.isBlank()) {
+                return false; // skip fill/type steps where no value was captured
+            }
             Map<String, Object> step = new HashMap<>();
             step.put("action", "type");
             step.put("selector", selector);
@@ -674,6 +678,10 @@ public final class AutomationScriptBuilderService {
             String selector = String.valueOf(parsed.getOrDefault("selector", ""));
             String value = String.valueOf(parsed.getOrDefault("value", ""));
             String targetDescription = String.valueOf(parsed.getOrDefault("targetDescription", ""));
+            // Never emit a fill/type step without a value — it means the action wasn't captured correctly.
+            if (value.isBlank()) {
+                return false;
+            }
             if (!runtimeLocatorExpr.isBlank()) {
                 sb.append("  await ").append(runtimeLocatorExpr).append(".fill('").append(escape(value)).append("');\n");
                 return true;
