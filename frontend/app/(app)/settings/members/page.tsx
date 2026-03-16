@@ -29,6 +29,15 @@ function roleLabel(role: string): string {
   return match?.label ?? "Member";
 }
 
+function normalizeWsRole(role: string): string {
+  const n = role.trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (n === "project_admin") return "admin";
+  if (n === "test_manager") return "manager";
+  if (n === "qa_member" || n === "viewer") return "member";
+  if (["owner", "admin", "manager", "member"].includes(n)) return n;
+  return "member";
+}
+
 export default function WorkspaceMembersPage() {
   const router = useRouter();
   const [workspace, setWorkspace] = useState<{ name: string } | null>(null);
@@ -42,6 +51,8 @@ export default function WorkspaceMembersPage() {
   const [error, setError] = useState("");
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [revokingInviteId, setRevokingInviteId] = useState<string | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [changingRoleId, setChangingRoleId] = useState<string | null>(null);
 
   const load = useCallback(() => {
     authMe().then((me) => {
@@ -49,6 +60,7 @@ export default function WorkspaceMembersPage() {
         router.replace("/login");
         return;
       }
+      setCurrentUserId(me.userId);
       Promise.all([getWorkspace(), listWorkspaceMembers()])
         .then(async ([ws, list]) => {
           setWorkspace(ws);
@@ -100,6 +112,42 @@ export default function WorkspaceMembersPage() {
       setError(err instanceof Error ? err.message : "Failed to remove");
     } finally {
       setRemovingId(null);
+    }
+  }
+
+  const myWsRole = currentUserId
+    ? normalizeWsRole(members.find((m) => m.userId === currentUserId)?.role ?? "member")
+    : "member";
+  const canManage = myWsRole === "owner" || myWsRole === "admin" || myWsRole === "manager";
+
+  function wsAssignableRoles(): { value: string; label: string }[] {
+    if (myWsRole === "owner") return [{ value: "owner", label: "Owner" }, { value: "admin", label: "Admin" }, { value: "manager", label: "Manager" }, { value: "member", label: "Member" }];
+    if (myWsRole === "admin") return [{ value: "manager", label: "Manager" }, { value: "member", label: "Member" }];
+    if (myWsRole === "manager") return [{ value: "member", label: "Member" }];
+    return [];
+  }
+
+  function canChangeWsRole(member: WorkspaceMemberType): boolean {
+    if (!canManage) return false;
+    if (member.userId === currentUserId) return false;
+    const targetRole = normalizeWsRole(member.role);
+    if (targetRole === "owner") return false;
+    if (myWsRole === "manager" && (targetRole === "admin" || targetRole === "owner")) return false;
+    if (myWsRole === "admin" && (targetRole === "admin" || targetRole === "owner")) return false;
+    return true;
+  }
+
+  async function handleChangeWsRole(userId: string, newRoleValue: string) {
+    setChangingRoleId(userId);
+    setMessage("");
+    setError("");
+    try {
+      await addWorkspaceMember({ userId, role: newRoleValue });
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to change role");
+    } finally {
+      setChangingRoleId(null);
     }
   }
 
@@ -222,36 +270,73 @@ export default function WorkspaceMembersPage() {
         )}
       </section>
 
-      <ul className="mt-6 divide-y divide-zinc-200 dark:divide-zinc-700">
-        {members.map((m) => (
-          <li
-            key={m.userId}
-            className="py-3 flex items-center justify-between gap-4"
-          >
-            <div>
-              <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                {m.name || m.email}
-              </span>
-              <span className="ml-2 text-sm text-zinc-500 dark:text-zinc-400">
-                {m.email}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-zinc-500 dark:text-zinc-400">
-                {roleLabel(m.role)}
-              </span>
-              <button
-                type="button"
-                onClick={() => handleRemove(m.userId)}
-                disabled={removingId === m.userId}
-                className="text-sm text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
-              >
-                {removingId === m.userId ? "Removing…" : "Remove"}
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
+      <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-zinc-50 dark:bg-zinc-800/60">
+              <tr className="text-left text-zinc-600 dark:text-zinc-300">
+                <th className="px-4 py-3 font-medium">Name</th>
+                <th className="px-4 py-3 font-medium">Email</th>
+                <th className="px-4 py-3 font-medium">Role</th>
+                <th className="px-4 py-3 font-medium text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {members.map((m) => {
+                const editable = canChangeWsRole(m);
+                return (
+                  <tr key={m.userId} className="border-t border-zinc-200 dark:border-zinc-700">
+                    <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">
+                      {m.name || "—"}
+                      {m.userId === currentUserId && (
+                        <span className="ml-1.5 text-xs text-zinc-400">(you)</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">{m.email}</td>
+                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">
+                      {editable ? (
+                        <select
+                          value={normalizeWsRole(m.role)}
+                          onChange={(e) => handleChangeWsRole(m.userId, e.target.value)}
+                          disabled={changingRoleId === m.userId}
+                          className="rounded-md border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm text-zinc-900 dark:text-zinc-100 disabled:opacity-50"
+                        >
+                          {wsAssignableRoles().map((r) => (
+                            <option key={r.value} value={r.value}>{r.label}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="inline-flex items-center rounded-md bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                          {roleLabel(m.role)}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {canManage && m.userId !== currentUserId && normalizeWsRole(m.role) !== "owner" && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemove(m.userId)}
+                          disabled={removingId === m.userId}
+                          className="text-sm text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                        >
+                          {removingId === m.userId ? "Removing…" : "Remove"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {members.length === 0 && !loading && (
+                <tr className="border-t border-zinc-200 dark:border-zinc-700">
+                  <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                    No members in this workspace yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </main>
   );
 }

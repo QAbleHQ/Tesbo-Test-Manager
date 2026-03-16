@@ -16,6 +16,7 @@
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationAgentClient.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationContracts.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationIntentParserService.java
+/Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationRecordingService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationScriptBuilderService.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationSessionHandler.java
 /Users/lifetools/BetterCasesv3/backend/src/main/java/com/bettercases/automation/AutomationSessionService.java

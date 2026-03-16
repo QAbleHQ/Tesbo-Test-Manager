@@ -417,6 +417,10 @@ public final class AutomationSessionHandler {
                 executionPayload,
                 screenshotPath
         );
+
+        Map<String, Object> inlineRecording = executeResponse.recording;
+        String inlineScript = executeResponse.recordedScript;
+        persistRecordingSnapshot(envelope, inlineRecording, inlineScript);
     }
 
     private static void appendStagehandTelemetryEvents(
@@ -1206,6 +1210,146 @@ public final class AutomationSessionHandler {
         }
     }
 
+    public static void getRecording(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+
+        // Try live agent first (for active sessions)
+        try {
+            Map<String, Object> recording = AutomationAgentClient.getRecording(sessionId);
+            Object hasRecording = recording.get("hasRecording");
+            if (hasRecording instanceof Boolean b && b) {
+                ctx.json(recording);
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        // Fall back to persisted recording in DB
+        Optional<Map<String, Object>> persisted = AutomationRecordingService.getLatestBySession(sessionId);
+        if (persisted.isPresent()) {
+            Map<String, Object> data = persisted.get();
+            Map<String, Object> response = new HashMap<>();
+            response.put("sessionId", sessionId.toString());
+            response.put("hasRecording", true);
+            response.put("stats", data.get("stats"));
+            response.put("timeline", data.get("timeline"));
+            response.put("partialScript", data.get("playwrightScript"));
+            response.put("recordingId", data.get("id"));
+            response.put("persisted", true);
+            ctx.json(response);
+            return;
+        }
+
+        // Legacy fallback: check events table
+        Map<String, Object> legacyRecording = loadPersistedRecording(sessionId);
+        if (legacyRecording != null) {
+            ctx.json(legacyRecording);
+            return;
+        }
+
+        ctx.status(200).json(Map.of(
+                "sessionId", sessionId.toString(),
+                "hasRecording", false,
+                "message", "Recording unavailable"
+        ));
+    }
+
+    public static void getRecordingById(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID recordingId = UUID.fromString(ctx.pathParam("recordingId"));
+        Map<String, Object> recording = AutomationRecordingService.getRecording(recordingId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        if (!projectId.toString().equals(recording.get("projectId"))) {
+            throw new io.javalin.http.NotFoundResponse();
+        }
+        ctx.json(recording);
+    }
+
+    public static void listRecordingsByTestcase(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID testcaseId = UUID.fromString(ctx.pathParam("testcaseId"));
+        String limitParam = ctx.queryParam("limit");
+        int limit = 20;
+        if (limitParam != null) {
+            try { limit = Integer.parseInt(limitParam); } catch (NumberFormatException ignored) {}
+        }
+        List<Map<String, Object>> recordings = AutomationRecordingService.listByTestcase(projectId, testcaseId, limit);
+        ctx.json(recordings);
+    }
+
+    public static void listRecordingsByProject(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        String limitParam = ctx.queryParam("limit");
+        int limit = 20;
+        if (limitParam != null) {
+            try { limit = Integer.parseInt(limitParam); } catch (NumberFormatException ignored) {}
+        }
+        List<Map<String, Object>> recordings = AutomationRecordingService.listByProject(projectId, limit);
+        ctx.json(recordings);
+    }
+
+    private static Map<String, Object> buildSummaryFromPersisted(Map<String, Object> data) {
+        Map<String, Object> summary = new HashMap<>();
+        summary.put("runId", data.get("runId"));
+        summary.put("state", data.get("state"));
+        summary.put("startedAt", data.get("startedAt"));
+        summary.put("stoppedAt", data.get("stoppedAt"));
+        summary.put("stats", data.get("stats"));
+        return summary;
+    }
+
+    public static void compileRecording(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        Map<String, Object> body;
+        try {
+            String raw = ctx.body();
+            com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
+            body = raw == null || raw.isBlank() ? Map.of() : om.readValue(raw, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            body = Map.of();
+        }
+
+        // Try live agent first
+        try {
+            Map<String, Object> result = AutomationAgentClient.compileRecording(sessionId, body);
+            ctx.json(result);
+            return;
+        } catch (Exception ignored) {}
+
+        // Fall back to persisted recording
+        Optional<Map<String, Object>> persisted = AutomationRecordingService.getLatestBySession(sessionId);
+        if (persisted.isPresent()) {
+            Map<String, Object> data = persisted.get();
+            Map<String, Object> response = new HashMap<>();
+            response.put("sessionId", sessionId.toString());
+            response.put("runId", data.get("runId"));
+            response.put("script", data.get("playwrightScript"));
+            response.put("summary", buildSummaryFromPersisted(data));
+            response.put("recording", data);
+            response.put("persisted", true);
+            ctx.json(response);
+            return;
+        }
+
+        // Legacy fallback
+        Map<String, Object> legacyRecording = loadPersistedRecording(sessionId);
+        if (legacyRecording != null) {
+            ctx.json(legacyRecording);
+            return;
+        }
+        ctx.status(200).json(Map.of("error", "Recording unavailable"));
+    }
+
     public static void downloadLatestTrace(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -1643,6 +1787,76 @@ public final class AutomationSessionHandler {
         if (normalized.isBlank()) return;
         if (sb.length() > 0) sb.append('\n');
         sb.append("- ").append(key).append(": ").append(normalized);
+    }
+
+    /**
+     * Persist recording to the dedicated automation_recordings table.
+     * Falls back to fetching from the agent if inline recording data is not provided.
+     */
+    private static void persistRecordingSnapshot(CommandEnvelope envelope,
+                                                  Map<String, Object> inlineRecording,
+                                                  String inlineScript) {
+        try {
+            Map<String, Object> recordingData = inlineRecording;
+            if (recordingData == null || recordingData.isEmpty()) {
+                Map<String, Object> agentRecording = AutomationAgentClient.getRecording(envelope.sessionId);
+                Object hasRecording = agentRecording.get("hasRecording");
+                if (!(hasRecording instanceof Boolean b && b)) return;
+                recordingData = new HashMap<>();
+                recordingData.put("runId", agentRecording.get("summary") instanceof Map<?, ?> m ? m.get("runId") : null);
+                recordingData.put("scenarioName", agentRecording.get("summary") instanceof Map<?, ?> m ? m.get("scenarioName") : null);
+                recordingData.put("state", agentRecording.get("summary") instanceof Map<?, ?> m ? m.get("state") : "stopped");
+                recordingData.put("startedAt", agentRecording.get("summary") instanceof Map<?, ?> m ? m.get("startedAt") : null);
+                recordingData.put("stoppedAt", agentRecording.get("summary") instanceof Map<?, ?> m ? m.get("stoppedAt") : null);
+                recordingData.put("stats", agentRecording.get("stats"));
+                recordingData.put("timeline", agentRecording.get("timeline"));
+                recordingData.put("recordedScript", agentRecording.get("partialScript"));
+            }
+            if (inlineScript != null && !inlineScript.isBlank()) {
+                recordingData.put("recordedScript", inlineScript);
+            }
+
+            UUID recordingId = AutomationRecordingService.saveRecording(
+                    envelope.projectId, envelope.testcaseId, envelope.sessionId, envelope.commandId,
+                    recordingData
+            );
+
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId,
+                    envelope.commandId, "recording_persisted",
+                    envelope.rawCommand,
+                    Map.of("recordingId", recordingId.toString(), "hasRecording", true),
+                    null,
+                    null
+            );
+        } catch (Exception e) {
+            // Non-fatal: recording persistence should never break the main flow
+            try {
+                AutomationSessionService.addEvent(
+                        envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId,
+                        envelope.commandId, "recording_persist_failed",
+                        envelope.rawCommand,
+                        Map.of("error", e.getMessage() != null ? e.getMessage() : "Unknown error"),
+                        null,
+                        null
+                );
+            } catch (Exception ignored) {}
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> loadPersistedRecording(UUID sessionId) {
+        List<Map<String, Object>> events = AutomationSessionService.listEvents(sessionId, 5000);
+        for (int i = events.size() - 1; i >= 0; i--) {
+            Map<String, Object> event = events.get(i);
+            if (event == null) continue;
+            if (!"recording_captured".equals(event.get("eventType"))) continue;
+            Object parsedAction = event.get("parsedAction");
+            if (parsedAction instanceof Map<?, ?> recording) {
+                return (Map<String, Object>) recording;
+            }
+        }
+        return null;
     }
 
     private static String asSafeText(Object value) {

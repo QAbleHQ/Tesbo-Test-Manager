@@ -1802,6 +1802,7 @@ async function sessionState(sessionId) {
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       events: session.events?.slice?.(-100) ?? [],
+      stagehandLogs: session.stagehandLogs?.slice?.(-50) ?? [],
     };
   }
   const pageTitlePromise = session.page.title().catch(() => "");

@@ -75,6 +75,16 @@ function hasLoginIntent(instruction) {
   return LOGIN_INTENT_RE.test(String(instruction || ""));
 }
 
+/** True only when the step is a full login submission (fill + submit), not just filling one field. */
+function isLoginSubmitStep(instruction) {
+  const text = String(instruction || "").toLowerCase();
+  // Must have login intent AND a submission/click verb
+  const hasSubmit = /\b(click|press|submit|log in|sign in|tap)\b/.test(text);
+  const hasCredentialFill = /\b(login|log in|sign in|authenticate|credential)\b/.test(text) ||
+    (/\b(email|username)\b/.test(text) && /\bpassword\b/.test(text));
+  return hasSubmit && hasCredentialFill;
+}
+
 function enrichInstructionWithCredentials(instruction, credentials = {}) {
   const base = String(instruction || "").trim();
   if (!base) return base;
@@ -192,7 +202,7 @@ async function takeScreenshot(page, runId, prefix) {
  * @returns {Promise<{ success: boolean, result?: object, error?: string }>}
  */
 export async function executeStep(ctx, stepId, instruction, events) {
-  const { stagehand, page, runId, modelConfig, credentials } = ctx;
+  const { stagehand, page, runId, modelConfig, credentials, recorder } = ctx;
   const effectiveInstruction = enrichInstructionWithCredentials(instruction, credentials);
   const url = page.url();
   const modelOpt = modelConfig?.apiKey
@@ -210,7 +220,7 @@ export async function executeStep(ctx, stepId, instruction, events) {
     candidates = await stagehand.observe(effectiveInstruction, { ...modelOpt, timeout: 15000 });
   } catch (err) {
     logError("telemetry_observe_failed", { runId, stepId, instruction: effectiveInstruction, error: String(err) });
-    events.push({
+    const observeFailEvent = {
       runId,
       stepId,
       timestamp: nowIso(),
@@ -221,7 +231,9 @@ export async function executeStep(ctx, stepId, instruction, events) {
       chosenIndex: -1,
       chosenReason: "observe_failed",
       elapsedMs: Date.now() - observeStart,
-    });
+    };
+    events.push(observeFailEvent);
+    recorder?.record(observeFailEvent);
     // Fallback: try act directly
   }
 
@@ -229,7 +241,7 @@ export async function executeStep(ctx, stepId, instruction, events) {
   const chosenIndex = candidateChoice.index;
   const chosenReason = candidateChoice.reason;
 
-  events.push({
+  const observeEvent = {
     runId,
     stepId,
     timestamp: nowIso(),
@@ -245,7 +257,9 @@ export async function executeStep(ctx, stepId, instruction, events) {
     chosenIndex,
     chosenReason,
     elapsedMs: Date.now() - observeStart,
-  });
+  };
+  events.push(observeEvent);
+  recorder?.record(observeEvent);
 
   const screenshotBefore = await takeScreenshot(page, runId, `step-${stepId}-before`);
   const urlBefore = page.url();
@@ -293,7 +307,7 @@ export async function executeStep(ctx, stepId, instruction, events) {
           });
         }
         const elapsedMs = Date.now() - observeStart;
-        events.push({
+        const actFailEvent = {
           runId,
           stepId,
           timestamp: nowIso(),
@@ -313,7 +327,9 @@ export async function executeStep(ctx, stepId, instruction, events) {
           retryCount,
           failureReason: err instanceof Error ? err.message : String(err),
           actAttempts,
-        });
+        };
+        events.push(actFailEvent);
+        recorder?.record(actFailEvent);
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
       await new Promise((r) => setTimeout(r, 1000 * retryCount));
@@ -336,14 +352,14 @@ export async function executeStep(ctx, stepId, instruction, events) {
       }))
     : [];
 
-  // Post-login guard: if the instruction was login-related and the URL did not
-  // change after the action, treat this as a login failure so subsequent steps
-  // don't run against the login page.
-  const isLoginStep = hasLoginIntent(effectiveInstruction);
+  // Post-login guard: only trigger when this step is a complete login submission
+  // (fill credentials + click submit). Filling a single field like "enter password"
+  // does not navigate and must NOT be treated as a login failure.
+  const isLoginStep = isLoginSubmitStep(effectiveInstruction);
   if (isLoginStep && urlAfter === urlBefore) {
     const loginFailMsg = "Login step did not navigate away from login page — credentials may not have been applied correctly.";
     logError("telemetry_login_no_navigation", { runId, stepId, url: urlBefore, instruction: effectiveInstruction });
-    events.push({
+    const loginFailEvent = {
       runId,
       stepId,
       timestamp: nowIso(),
@@ -364,11 +380,13 @@ export async function executeStep(ctx, stepId, instruction, events) {
       cacheStatus: actResult?.cacheStatus,
       retryCount,
       actAttempts,
-    });
+    };
+    events.push(loginFailEvent);
+    recorder?.record(loginFailEvent);
     return { success: false, error: loginFailMsg };
   }
 
-  events.push({
+  const actEvent = {
     runId,
     stepId,
     timestamp: nowIso(),
@@ -389,7 +407,9 @@ export async function executeStep(ctx, stepId, instruction, events) {
     cacheStatus: actResult?.cacheStatus,
     retryCount,
     actAttempts,
-  });
+  };
+  events.push(actEvent);
+  recorder?.record(actEvent);
 
   return {
     success: Boolean(actResult?.success),
@@ -402,7 +422,7 @@ export async function executeStep(ctx, stepId, instruction, events) {
  * Execute an assertion/verification step using extract.
  */
 async function executeExtractStep(ctx, stepId, instruction, events) {
-  const { stagehand, page, runId, modelConfig } = ctx;
+  const { stagehand, page, runId, modelConfig, recorder } = ctx;
   const url = page.url();
   const modelOpt = modelConfig?.apiKey
     ? { model: { modelName: modelConfig.model || "openai/gpt-4o", apiKey: modelConfig.apiKey } }
@@ -420,7 +440,7 @@ async function executeExtractStep(ctx, stepId, instruction, events) {
     logError("telemetry_extract_failed", { runId, stepId, instruction, error: String(err) });
   }
 
-  events.push({
+  const extractEvent = {
     runId,
     stepId,
     timestamp: nowIso(),
@@ -430,7 +450,9 @@ async function executeExtractStep(ctx, stepId, instruction, events) {
     result,
     usage: "assertion",
     elapsedMs: Date.now() - start,
-  });
+  };
+  events.push(extractEvent);
+  recorder?.record(extractEvent);
 
   return {
     success,
@@ -452,9 +474,9 @@ export function planScenario(scenario) {
   const stepSectionStartRe =
     /^\s{0,3}(?:#{1,6}\s*)?(?:steps?\s+to\s+execute|expected\s+steps?|test\s+steps?)\b/i;
   const stepSectionStopRe =
-    /^\s{0,3}(?:#{1,6}\s*)?(?:completion\s+checklist|execution\s+guidelines|critical\b|goal\s+completion|objective|intent|description|preconditions|test\s+data|credentials)\b/i;
+    /^\s{0,3}(?:#{1,6}\s*)?(?:completion\s+checklist|execution\s+guidelines|critical\b|goal\s+completion|test\s+data|execution\s+requirements|critical\s*-\s*login|user\s+feedback)\b/i;
   const looksLikeGuideline = (value) =>
-    /^(do not|don't|never|always|first[, ]|then[, ]|adapt to|cross-reference|only set|login is|generate meaningful|handle loading)/i.test(value);
+    /^(do not|don't|never|always|first[, ]|then[, ]|adapt to|cross-reference|only set|login is|generate meaningful|handle loading|perform multi.?step|complete login|use provided|validate outcomes|avoid unnecessary)/i.test(value);
 
   let inStepSection = false;
   let hasExplicitStepSection = false;
@@ -514,7 +536,10 @@ export function planScenario(scenario) {
     }
   }
 
-  if (steps.length === 0 && text.length > 15) {
+  // Only fall back to a single-step plan when there is no explicit step section.
+  // If there was a "### Steps to Execute" section but it yielded 0 steps, return
+  // empty so the caller can fall back to agent.execute() with the full objective.
+  if (steps.length === 0 && !hasExplicitStepSection && text.length > 15) {
     steps.push({ stepId: "step-1", instruction: text.slice(0, 500) });
   }
 
@@ -532,6 +557,7 @@ export async function executeScenarioWithTelemetry(session, scenario, options = 
   const runId = options.runId || randomUUID();
   const { stagehand, page, modelConfig } = session;
   const credentials = extractCredentialsFromScenario(scenario);
+  const recorder = options.recorder || null;
 
   const plan = options.plan || planScenario(scenario);
   const events = [];
@@ -540,15 +566,24 @@ export async function executeScenarioWithTelemetry(session, scenario, options = 
 
   logInfo("telemetry_executor_start", { runId, stepCount: plan.length });
 
-  for (const { stepId, instruction } of plan) {
+  for (let idx = 0; idx < plan.length; idx++) {
+    const { stepId, instruction } = plan[idx];
+    if (typeof options.onStepStart === "function") {
+      try { options.onStepStart(stepId, instruction, idx); } catch { /* non-fatal */ }
+    }
+
     const stepResult = await executeStep(
-      { stagehand, page, runId, modelConfig, credentials },
+      { stagehand, page, runId, modelConfig, credentials, recorder },
       stepId,
       instruction,
       events
     );
 
     results.push({ stepId, instruction, ...stepResult });
+
+    if (typeof options.onStepComplete === "function") {
+      try { options.onStepComplete(stepId, instruction, idx, stepResult); } catch { /* non-fatal */ }
+    }
 
     if (stepResult.actions?.length) {
       for (const a of stepResult.actions) {

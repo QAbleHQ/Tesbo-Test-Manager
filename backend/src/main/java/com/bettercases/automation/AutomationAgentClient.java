@@ -157,6 +157,24 @@ public final class AutomationAgentClient {
         }
     }
 
+    public static Map<String, Object> getRecording(UUID sessionId) {
+        String body = send("/internal/sessions/" + sessionId + "/recording", "GET", null);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent recording response", e);
+        }
+    }
+
+    public static Map<String, Object> compileRecording(UUID sessionId, Map<String, Object> options) {
+        String body = send("/internal/sessions/" + sessionId + "/recording/compile", "POST", options == null ? Map.of() : options);
+        try {
+            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse automation agent recording compile response", e);
+        }
+    }
+
     public static Map<String, Object> enqueueAutomationJob(Map<String, Object> payload) {
         String body = sendQueue("/internal/queue/jobs", "POST", payload);
         try {

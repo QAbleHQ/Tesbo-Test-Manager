@@ -18,7 +18,7 @@ import {
   type AgentTaskStatus,
   type TestEnvironmentSetting,
 } from "@/lib/api";
-import { getRunByTaskId, onRunsChanged, type AegisRunLogEntry } from "@/lib/aegis-runner";
+import { getRunByTaskId, onRunsChanged, type AegisRunLogEntry, type AegisBackgroundRun } from "@/lib/aegis-runner";
 import { runAegisInBackground } from "@/lib/aegis-runner";
 import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
@@ -81,13 +81,11 @@ function phaseFromTaskStatus(status: AgentTaskStatus): string {
 
 function normalizeTaskLogsForObserve(task: AgentTask | null): AegisRunLogEntry[] {
   if (!task || !Array.isArray(task.logs)) return [];
+  const validTypes = new Set<string>(["thinking", "action", "info", "success", "error", "bot_review", "navigation", "milestone"]);
   return task.logs.map((entry) => {
     const parsedTs = Date.parse(entry.ts);
-    const type = entry.type as AegisRunLogEntry["type"];
-    const safeType: AegisRunLogEntry["type"] =
-      type === "thinking" || type === "action" || type === "info" || type === "success" || type === "error" || type === "bot_review"
-        ? type
-        : "info";
+    const type = entry.type as string;
+    const safeType: AegisRunLogEntry["type"] = validTypes.has(type) ? (type as AegisRunLogEntry["type"]) : "info";
     return {
       ts: Number.isNaN(parsedTs) ? Date.now() : parsedTs,
       message: entry.message,
@@ -158,12 +156,41 @@ export default function ReviewDetailPage() {
   const [showObserveBotReview, setShowObserveBotReview] = useState(false);
   const [chatPaneRatio, setChatPaneRatio] = useState(35);
   const [resizingPanes, setResizingPanes] = useState(false);
+  const [observeCurrentUrl, setObserveCurrentUrl] = useState<string | null>(null);
+  const [observeCurrentAction, setObserveCurrentAction] = useState<string | null>(null);
+  const [observeStepsCompleted, setObserveStepsCompleted] = useState<number>(0);
+  const [observeStepsTotal, setObserveStepsTotal] = useState<number>(0);
+  const [observeStartTime, setObserveStartTime] = useState<number | null>(null);
+  const [observeElapsed, setObserveElapsed] = useState<number>(0);
   const splitPaneRef = useRef<HTMLDivElement | null>(null);
   const observeLogRef = useRef<HTMLDivElement | null>(null);
   const observeSeenEventIdsRef = useRef<Set<string>>(new Set());
   const observeHighlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isObserving = task?.status === "in_progress" || task?.status === "queued" || task?.status === "bot_reviewing";
+
+  const formatElapsed = (ms: number) => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  };
+
+  const formatDuration = (ms: number) => {
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+  };
+
+  const formatRelativeTime = (entryTs: number, firstTs: number) => {
+    const diff = entryTs - firstTs;
+    if (diff < 1000) return "+0s";
+    const totalSeconds = Math.floor(diff / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes > 0) return `+${minutes}m${seconds > 0 ? ` ${seconds}s` : ""}`;
+    return `+${seconds}s`;
+  };
 
   const loadTask = useCallback(() => {
     const tasks = getStoredAgentTasks(projectId, "aegis");
@@ -190,17 +217,30 @@ export default function ReviewDetailPage() {
         setObserveLogs([...run.logs]);
         setObserveSessionId(run.phase === "bot_reviewing" ? (run.reviewSessionId || run.sessionId) : run.sessionId);
         setObservePhase(run.phase);
+        setObserveCurrentUrl(run.currentUrl || null);
+        setObserveCurrentAction(run.currentAction || null);
+        if (typeof run.stepsCompleted === "number") setObserveStepsCompleted(run.stepsCompleted);
+        if (typeof run.stepsTotal === "number") setObserveStepsTotal(run.stepsTotal);
+        if (run.phaseStartedAt && !observeStartTime) setObserveStartTime(run.phaseStartedAt);
       } else if (found && (found.status === "queued" || found.status === "in_progress" || found.status === "bot_reviewing")) {
         setObserveLogs(normalizeTaskLogsForObserve(found));
         setObserveSessionId(found.sessionId || null);
         setObservePhase(phaseFromTaskStatus(found.status));
       }
-      // Re-load task from storage to pick up status changes
       if (found) setTask(found);
     };
     syncFromRun();
     return onRunsChanged(syncFromRun);
-  }, [projectId, taskId]);
+  }, [projectId, taskId, observeStartTime]);
+
+  // Elapsed time ticker
+  useEffect(() => {
+    if (!isObserving || !observeStartTime) return;
+    const tick = () => setObserveElapsed(Date.now() - observeStartTime);
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [isObserving, observeStartTime]);
 
   useEffect(() => {
     setObserveStreamFailed(false);
@@ -551,6 +591,59 @@ export default function ReviewDetailPage() {
           ? "Queued"
           : "Working...";
 
+    const firstLogTs = observeLogs.length > 0 ? observeLogs[0].ts : null;
+
+    const logTypeConfig: Record<string, { bg: string; icon: React.ReactNode; label: string; textColor: string }> = {
+      thinking: {
+        bg: "bg-gradient-to-r from-blue-50 to-violet-50 dark:from-blue-900/15 dark:to-violet-900/15 border border-blue-200/60 dark:border-blue-800/40",
+        icon: <svg className="h-3.5 w-3.5 text-blue-500 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>,
+        label: "REASONING",
+        textColor: "text-blue-800 dark:text-blue-200",
+      },
+      action: {
+        bg: "bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-100 dark:border-emerald-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>,
+        label: "ACTION",
+        textColor: "text-emerald-700 dark:text-emerald-300",
+      },
+      navigation: {
+        bg: "bg-indigo-50 dark:bg-indigo-900/10 border border-indigo-100 dark:border-indigo-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>,
+        label: "NAVIGATION",
+        textColor: "text-indigo-700 dark:text-indigo-300",
+      },
+      milestone: {
+        bg: "bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>,
+        label: "MILESTONE",
+        textColor: "text-amber-700 dark:text-amber-300",
+      },
+      bot_review: {
+        bg: "bg-purple-50 dark:bg-purple-900/10 border border-purple-100 dark:border-purple-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
+        label: "REVIEW",
+        textColor: "text-purple-700 dark:text-purple-300",
+      },
+      success: {
+        bg: "bg-green-50 dark:bg-green-900/10 border border-green-100 dark:border-green-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>,
+        label: "SUCCESS",
+        textColor: "text-green-700 dark:text-green-300",
+      },
+      error: {
+        bg: "bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/30",
+        icon: <svg className="h-3.5 w-3.5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>,
+        label: "ERROR",
+        textColor: "text-red-700 dark:text-red-300",
+      },
+      info: {
+        bg: "bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800",
+        icon: <svg className="h-3.5 w-3.5 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
+        label: "INFO",
+        textColor: "text-[var(--foreground)]",
+      },
+    };
+
     return (
       <div className="flex flex-col h-screen">
         {/* Top Bar */}
@@ -569,6 +662,11 @@ export default function ReviewDetailPage() {
                   </span>
                   {phaseLabel}
                 </span>
+                {observeElapsed > 0 && (
+                  <span className="text-[10px] text-[var(--muted)] font-mono tabular-nums">
+                    {formatElapsed(observeElapsed)}
+                  </span>
+                )}
               </div>
               <p className="text-xs text-[var(--muted)] truncate max-w-md">{task.testcaseTitle}</p>
             </div>
@@ -597,6 +695,8 @@ export default function ReviewDetailPage() {
                 }`}>
                   {isPast && !isCurrent ? (
                     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                  ) : isCurrent ? (
+                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
                   ) : (
                     i + 1
                   )}
@@ -610,76 +710,142 @@ export default function ReviewDetailPage() {
           })}
         </div>
 
+        {/* Current Status Banner */}
+        {(observeCurrentAction || observeCurrentUrl) && (
+          <div className="flex items-center gap-3 border-b border-[var(--border)] bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-900/10 dark:to-indigo-900/10 px-4 py-2 shrink-0">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <div className="flex h-5 w-5 items-center justify-center shrink-0">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+              </div>
+              {observeCurrentAction && (
+                <span className="text-xs font-medium text-blue-700 dark:text-blue-300 truncate">
+                  {observeCurrentAction}
+                </span>
+              )}
+            </div>
+            {observeCurrentUrl && (
+              <div className="flex items-center gap-1.5 shrink-0 max-w-[40%]">
+                <svg className="h-3 w-3 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
+                </svg>
+                <span className="text-[10px] text-indigo-600 dark:text-indigo-400 truncate font-mono">
+                  {observeCurrentUrl}
+                </span>
+              </div>
+            )}
+            {observeStepsTotal > 0 && (
+              <div className="flex items-center gap-1.5 shrink-0">
+                <div className="h-1.5 w-16 rounded-full bg-blue-200 dark:bg-blue-800 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-blue-500 transition-all duration-500"
+                    style={{ width: `${Math.round((observeStepsCompleted / observeStepsTotal) * 100)}%` }}
+                  />
+                </div>
+                <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 tabular-nums">
+                  {observeStepsCompleted}/{observeStepsTotal}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Split pane: Bot Chat + Live Preview */}
         <div ref={splitPaneRef} className="flex flex-1 min-h-0 overflow-hidden" style={{ userSelect: resizingPanes ? "none" : undefined }}>
           {/* Left Panel — Bot Thinking & Actions */}
           <div className="flex flex-col border-r border-[var(--border)] overflow-hidden" style={{ width: `${chatPaneRatio}%` }}>
             <div className="px-4 py-2.5 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Bot Activity</span>
-                <span className="text-xs text-[var(--muted)]">({observeLogs.length} events)</span>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Bot Activity</span>
+                  <span className="text-xs text-[var(--muted)]">({observeLogs.length} events)</span>
+                </div>
+                {observeElapsed > 0 && (
+                  <span className="text-[10px] font-mono text-[var(--muted)] tabular-nums">
+                    Elapsed: {formatElapsed(observeElapsed)}
+                  </span>
+                )}
               </div>
             </div>
-            <div ref={observeLogRef} className="flex-1 overflow-y-auto p-3 space-y-1.5">
-              {observeLogs.map((entry, i) => (
-                <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${
-                  entry.type === "thinking"
-                    ? "bg-blue-50 dark:bg-blue-900/10 border border-blue-100 dark:border-blue-900/30"
-                    : entry.type === "action"
-                      ? "bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-100 dark:border-emerald-900/30"
-                      : entry.type === "bot_review"
-                        ? "bg-purple-50 dark:bg-purple-900/10 border border-purple-100 dark:border-purple-900/30"
-                        : entry.type === "success"
-                          ? "bg-green-50 dark:bg-green-900/10 border border-green-100 dark:border-green-900/30"
-                          : entry.type === "error"
-                            ? "bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/30"
-                            : "bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800"
-                }`}>
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    {entry.type === "thinking" && (
-                      <svg className="h-3 w-3 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+            <div ref={observeLogRef} className="flex-1 overflow-y-auto p-3 space-y-1">
+              {observeLogs.map((entry, i) => {
+                const config = logTypeConfig[entry.type] || logTypeConfig.info;
+                const relTime = firstLogTs ? formatRelativeTime(entry.ts, firstLogTs) : null;
+                const isMilestone = entry.type === "milestone";
+                const isThinking = entry.type === "thinking";
+                const isLongReasoning = isThinking && entry.message.length > 180;
+                return (
+                  <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${isMilestone ? "ring-1 ring-amber-300 dark:ring-amber-700 " : ""}${isThinking ? "border-l-[3px] border-l-blue-400 dark:border-l-blue-500 " : ""}${config.bg}`}>
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      {config.icon}
+                      {relTime && (
+                        <span className="text-[10px] font-mono text-[var(--muted)] tabular-nums">{relTime}</span>
+                      )}
+                      <span className={`text-[10px] font-semibold uppercase ${
+                        entry.type === "thinking" ? "text-blue-500" :
+                        entry.type === "action" ? "text-emerald-500" :
+                        entry.type === "navigation" ? "text-indigo-500" :
+                        entry.type === "milestone" ? "text-amber-500" :
+                        entry.type === "bot_review" ? "text-purple-500" :
+                        entry.type === "success" ? "text-green-500" :
+                        entry.type === "error" ? "text-red-500" :
+                        "text-zinc-400"
+                      }`}>{config.label}</span>
+                      {isThinking && (
+                        <span className="inline-flex items-center gap-0.5 ml-1">
+                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "0ms" }} />
+                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "150ms" }} />
+                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "300ms" }} />
+                        </span>
+                      )}
+                      {entry.stepProgress && (
+                        <span className="text-[10px] text-[var(--muted)] ml-auto tabular-nums">
+                          Step {entry.stepProgress.current}/{entry.stepProgress.total}
+                        </span>
+                      )}
+                      {entry.durationMs != null && entry.durationMs > 0 && (
+                        <span className="text-[10px] text-[var(--muted)] ml-auto font-mono tabular-nums">
+                          {formatDuration(entry.durationMs)}
+                        </span>
+                      )}
+                    </div>
+                    {isThinking ? (
+                      <p className={`${config.textColor} italic whitespace-pre-wrap`}>
+                        {isLongReasoning ? entry.message.slice(0, 180) + "…" : entry.message}
+                      </p>
+                    ) : (
+                      <p className={config.textColor}>{entry.message}</p>
                     )}
-                    {entry.type === "action" && (
-                      <svg className="h-3 w-3 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    {isLongReasoning && (
+                      <details className="mt-1">
+                        <summary className="text-[10px] text-blue-500 cursor-pointer hover:text-blue-600 select-none">
+                          Show full reasoning
+                        </summary>
+                        <p className={`${config.textColor} italic mt-1 whitespace-pre-wrap text-[11px] leading-relaxed`}>
+                          {entry.message}
+                        </p>
+                      </details>
                     )}
-                    {entry.type === "bot_review" && (
-                      <svg className="h-3 w-3 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    {entry.detail && (
+                      <p className="mt-1 text-[10px] text-[var(--muted)] break-words">
+                        {entry.detail}
+                      </p>
                     )}
-                    {entry.type === "success" && (
-                      <svg className="h-3 w-3 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                    {entry.url && entry.type === "navigation" && (
+                      <div className="mt-1 flex items-center gap-1">
+                        <svg className="h-2.5 w-2.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
+                        </svg>
+                        <span className="text-[10px] font-mono text-indigo-500 dark:text-indigo-400 truncate">{entry.url}</span>
+                      </div>
                     )}
-                    {entry.type === "error" && (
-                      <svg className="h-3 w-3 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                    )}
-                    <span className="text-[10px] text-[var(--muted)]">{new Date(entry.ts).toLocaleTimeString()}</span>
-                    <span className={`text-[10px] font-semibold uppercase ${
-                      entry.type === "thinking" ? "text-blue-500" :
-                      entry.type === "action" ? "text-emerald-500" :
-                      entry.type === "bot_review" ? "text-purple-500" :
-                      entry.type === "success" ? "text-green-500" :
-                      entry.type === "error" ? "text-red-500" :
-                      "text-zinc-400"
-                    }`}>{entry.type === "bot_review" ? "review" : entry.type}</span>
                   </div>
-                  <p className={`${
-                    entry.type === "thinking" ? "text-blue-700 dark:text-blue-300" :
-                    entry.type === "action" ? "text-emerald-700 dark:text-emerald-300" :
-                    entry.type === "bot_review" ? "text-purple-700 dark:text-purple-300" :
-                    entry.type === "success" ? "text-green-700 dark:text-green-300" :
-                    entry.type === "error" ? "text-red-700 dark:text-red-300" :
-                    "text-[var(--foreground)]"
-                  }`}>{entry.message}</p>
-                  {entry.detail && (
-                    <p className="mt-1 text-[10px] text-[var(--muted)] break-words">
-                      {entry.detail}
-                    </p>
-                  )}
-                </div>
-              ))}
+                );
+              })}
               {observeLogs.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
                   <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent mb-3" />
                   <p className="text-xs text-[var(--muted)]">Waiting for bot activity...</p>
+                  <p className="text-[10px] text-[var(--muted)] mt-1">The bot is initializing. Activity will appear here in real time.</p>
                 </div>
               )}
             </div>
@@ -1239,23 +1405,60 @@ export default function ReviewDetailPage() {
         {activeTab === "logs" && (
           <div className="max-h-[500px] overflow-y-auto">
             <div className="px-4 py-2.5 border-b border-[var(--border)]">
-              <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Execution Logs</span>
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Execution Timeline</span>
+                <span className="text-xs text-[var(--muted)]">{task.logs.length} events</span>
+              </div>
             </div>
             {task.logs.length > 0 ? (
-              <div className="p-4 space-y-1">
-                {task.logs.map((entry, i) => (
-                  <div key={i} className="text-xs leading-relaxed font-mono">
-                    <span className="text-[var(--muted)]">{new Date(entry.ts).toLocaleTimeString()} </span>
-                    <span className={
-                      entry.type === "success" ? "text-green-600 dark:text-green-400" :
-                      entry.type === "error" ? "text-red-600 dark:text-red-400" :
-                      entry.type === "action" ? "text-[var(--primary)]" :
-                      "text-[var(--foreground)]"
-                    }>
-                      {entry.message}
-                    </span>
-                  </div>
-                ))}
+              <div className="p-3 space-y-1">
+                {task.logs.map((entry, i) => {
+                  const entryTs = Date.parse(entry.ts);
+                  const firstTs = Date.parse(task.logs[0].ts);
+                  const relTime = !Number.isNaN(entryTs) && !Number.isNaN(firstTs) ? formatRelativeTime(entryTs, firstTs) : null;
+                  const typeColor =
+                    entry.type === "success" ? "text-green-600 dark:text-green-400" :
+                    entry.type === "error" ? "text-red-600 dark:text-red-400" :
+                    entry.type === "action" ? "text-emerald-600 dark:text-emerald-400" :
+                    entry.type === "thinking" ? "text-blue-600 dark:text-blue-400" :
+                    entry.type === "navigation" ? "text-indigo-600 dark:text-indigo-400" :
+                    entry.type === "milestone" ? "text-amber-600 dark:text-amber-400" :
+                    entry.type === "bot_review" ? "text-purple-600 dark:text-purple-400" :
+                    "text-[var(--foreground)]";
+                  const typeBadge =
+                    entry.type === "success" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" :
+                    entry.type === "error" ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" :
+                    entry.type === "action" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" :
+                    entry.type === "thinking" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" :
+                    entry.type === "navigation" ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400" :
+                    entry.type === "milestone" ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" :
+                    entry.type === "bot_review" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                    "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400";
+                  const isThinkingEntry = entry.type === "thinking";
+                  const isLong = isThinkingEntry && entry.message.length > 200;
+                  return (
+                    <div key={i} className={`flex items-start gap-2 text-xs leading-relaxed py-1 ${isThinkingEntry ? "border-l-2 border-l-blue-300 dark:border-l-blue-600 pl-2 bg-blue-50/40 dark:bg-blue-900/10 rounded-r-md -ml-1" : ""}`}>
+                      {relTime && (
+                        <span className="text-[10px] font-mono text-[var(--muted)] w-10 text-right shrink-0 tabular-nums pt-0.5">{relTime}</span>
+                      )}
+                      <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-bold uppercase shrink-0 ${typeBadge}`}>
+                        {entry.type === "bot_review" ? "review" : entry.type === "thinking" ? "reasoning" : entry.type}
+                      </span>
+                      {isThinkingEntry ? (
+                        <span className={`${typeColor} italic`}>
+                          {isLong ? (
+                            <details>
+                              <summary className="cursor-pointer select-none not-italic">{entry.message.slice(0, 150)}…</summary>
+                              <span className="block mt-1 whitespace-pre-wrap">{entry.message}</span>
+                            </details>
+                          ) : entry.message}
+                        </span>
+                      ) : (
+                        <span className={typeColor}>{entry.message}</span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div className="p-8 text-center text-sm text-[var(--muted)]">No logs available.</div>

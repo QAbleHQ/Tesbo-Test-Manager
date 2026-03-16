@@ -29,4 +29,6 @@
     <include file="changes/V23_automation_execution_queue.sql" relativeToChangelogFile="true"/>
     <include file="changes/V24_parallel_execution_settings.sql" relativeToChangelogFile="true"/>
     <include file="changes/V25_execution_automation_trace.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V26_automation_recordings.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V27_automation_recordings_timeline.sql" relativeToChangelogFile="true"/>
 </databaseChangeLog>

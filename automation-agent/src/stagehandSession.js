@@ -10,6 +10,8 @@ import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
 import { executeScenarioWithTelemetry, planScenario } from "./telemetry/executor.js";
 import { compileTelemetryToActions } from "./telemetry/compiler.js";
+import { ActionRecorder } from "./telemetry/recorder.js";
+import { BrowserRecorder } from "./telemetry/browserRecorder.js";
 
 let Stagehand;
 try {
@@ -142,11 +144,23 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
       ? runtimeConfig.agentSystemPrompt.trim()
       : STABLE_LOCATOR_SYSTEM_PROMPT;
   const useBrowserbase = Boolean(browserbaseApiKey && browserbaseProjectId);
+  const stagehandLogs = [];
+  const stagehandLogger = (line) => {
+    const msg = line.message || "";
+    const cat = line.category || "";
+    const level = line.level ?? 1;
+    stagehandLogs.push({ ts: Date.now(), message: msg, category: cat, level });
+    if (stagehandLogs.length > 500) stagehandLogs.shift();
+    logInfo("stagehand_sdk_log", { sessionId, category: cat, level, message: msg.slice(0, 300) });
+  };
+
   const stagehandConfig = {
     env: useBrowserbase ? "BROWSERBASE" : "LOCAL",
     experimental: true,
     disableAPI: true,
     cacheDir,
+    verbose: 1,
+    logger: stagehandLogger,
     model: {
       modelName: resolvedModelName,
       apiKey: modelApiKey,
@@ -208,6 +222,7 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     lastVideoPath: null,
     lastTracePath: null,
     events: [],
+    stagehandLogs,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     cacheScope,
@@ -236,6 +251,17 @@ export async function createStagehandSession(sessionId, startUrl, credentials, m
     state.lastScreenshotPath = await takeScreenshot(page, sessionId);
   } catch {
     // Non-fatal
+  }
+
+  // Attach browser-level recorder (actor-agnostic DOM event capture).
+  // Uses console.log bridge — compatible with Stagehand's page proxy.
+  const browserRecorder = new BrowserRecorder({ sessionId });
+  try {
+    await browserRecorder.attach(page);
+    state.browserRecorder = browserRecorder;
+  } catch (err) {
+    logError("browser_recorder_attach_failed", { sessionId, error: String(err) });
+    state.browserRecorder = null;
   }
 
   logInfo("stagehand_session_created", {
@@ -328,7 +354,13 @@ function convertToolCallsToActions(toolCalls, currentUrl) {
     if (["screenshot", "done", "think", "ariatree"].includes(name)) continue;
 
     if (name === "click") {
-      const describe = String(args?.describe || args?.instruction || "").trim();
+      let describe = String(
+        args?.describe || args?.instruction || args?.element || args?.text ||
+        args?.target || args?.selector || args?.description || ""
+      ).trim();
+      if (!describe) {
+        describe = extractDescriptionFromResult(toolResult);
+      }
       if (!describe) continue;
       const escaped = describe.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       actions.push({
@@ -454,7 +486,11 @@ function convertToolCallsToActions(toolCalls, currentUrl) {
         ? toolResult.playwrightArguments
         : Array.isArray(args?.fields)
           ? args.fields
-          : [];
+          : Array.isArray(toolResult?.fields)
+            ? toolResult.fields
+            : Array.isArray(args?.formFields)
+              ? args.formFields
+              : [];
       for (const field of fields) {
         if (!field || typeof field !== "object") continue;
         const desc = String(field.action || field.description || "").trim();
@@ -542,16 +578,66 @@ export async function executeStagehandWithTelemetry(session, commandId, objectiv
     }
   }
 
+  const recorder = new ActionRecorder({
+    runId: commandId,
+    scenarioName: objective.slice(0, 200),
+  });
+  recorder.start();
+  session.recorder = recorder;
+
+  const pushSessionEvent = (eventData) => {
+    if (!session.events) session.events = [];
+    session.events.push({ ...eventData, createdAt: nowIso() });
+    if (session.events.length > 2000) {
+      session.events.splice(0, session.events.length - 2000);
+    }
+    session.updatedAt = nowIso();
+  };
+
   const plan = planScenario(objective);
   if (plan.length === 0) {
-    return executeStagehandObjective(session, commandId, objective);
+    return executeStagehandObjective(session, commandId, objective, recorder);
   }
+
+  pushSessionEvent({
+    type: "stagehand_agent_reasoning",
+    commandId,
+    stepIndex: 0,
+    reasoning: `Planned ${plan.length} steps for execution`,
+    url: session.page.url(),
+    plan: plan.map((s, i) => ({ index: i + 1, instruction: s.instruction })),
+  });
 
   try {
     const { success, events, stagehandActions: rawActions, results } = await executeScenarioWithTelemetry(
       session,
       objective,
-      { plan, continueOnFailure: true }
+      {
+        plan,
+        continueOnFailure: true,
+        recorder,
+        onStepStart: (stepId, instruction, index) => {
+          pushSessionEvent({
+            type: "stagehand_agent_reasoning",
+            commandId,
+            stepIndex: index + 1,
+            reasoning: `Step ${index + 1}/${plan.length}: ${instruction}`,
+            url: session.page.url(),
+          });
+        },
+        onStepComplete: (stepId, instruction, index, stepResult) => {
+          pushSessionEvent({
+            type: "stagehand_agent_action",
+            commandId,
+            stepIndex: index + 1,
+            toolName: stepResult.success ? "act" : "act_failed",
+            args: { instruction },
+            reasoning: stepResult.success ? `Completed: ${instruction}` : `Failed: ${stepResult.error || instruction}`,
+            url: session.page.url(),
+            success: stepResult.success,
+          });
+        },
+      }
     );
 
     session.currentUrl = session.page.url();
@@ -592,25 +678,437 @@ export async function executeStagehandWithTelemetry(session, commandId, objectiv
       });
     }
 
+    recorder.stop();
+    const browserRecTelemetry = session.browserRecorder;
+    if (browserRecTelemetry) browserRecTelemetry.stop();
+
     logInfo("stagehand_telemetry_complete", {
       sessionId: session.id,
       eventCount: events.length,
       actionCount: compiledActions.length,
+      recorderEntryCount: recorder.entryCount,
+      browserRecordedActions: browserRecTelemetry ? browserRecTelemetry.actionCount : 0,
     });
 
-    return {
+    const browserPlaywrightActions = browserRecTelemetry ? browserRecTelemetry.getPlaywrightActions() : [];
+
+    // Script + actions come exclusively from BrowserRecorder (actor-agnostic layer).
+    // ActionRecorder/Stagehand data kept only as metadata.
+    const returnTelemetry = {
       commandId,
       currentUrl: session.currentUrl,
       results: stepResults,
-      stagehandActions: compiledActions,
+      stagehandActions: browserPlaywrightActions.length > 0
+        ? browserPlaywrightActions.map((ba) => ({
+            type: ba.action === "scroll" ? "scroll" : ba.action === "navigate" ? "navigate" : "act",
+            action: ba.action || "act",
+            instruction: ba.target || "",
+            targetDescription: ba.target || "",
+            value: ba.value || "",
+            description: ba.target ? `${ba.action}: ${ba.target}` : ba.action,
+            playwright: ba.playwright || "",
+            selector: ba.selector || "",
+            selectorMethod: ba.selectorMethod || "unknown",
+          }))
+        : [],
       telemetryEvents: events,
       telemetryPlan: plan,
       completed: success,
+      recording: recorder.toJSON(),
+      recordedScript: browserRecTelemetry
+        ? browserRecTelemetry.toPlaywrightScript()
+        : "// No browser recording available",
     };
+    if (browserRecTelemetry) {
+      returnTelemetry.browserRecording = browserRecTelemetry.toJSON();
+    }
+    return returnTelemetry;
   } catch (err) {
+    recorder.stop();
+    const browserRecTelErr = session.browserRecorder;
+    if (browserRecTelErr) browserRecTelErr.stop();
     logError("stagehand_telemetry_failed", { sessionId: session.id, error: String(err) });
-    return executeStagehandObjective(session, commandId, objective);
+    return executeStagehandObjective(session, commandId, objective, recorder);
   }
+}
+
+/**
+ * Extract a human-readable description of a click target from the AI reasoning text.
+ * Returns the best short label found, or "" if nothing useful.
+ */
+function extractClickTargetFromReasoning(reasoning) {
+  if (!reasoning || typeof reasoning !== "string") return "";
+  const patterns = [
+    /(?:click|tap|press)\s+(?:on\s+)?(?:the\s+)?["'](.+?)["']\s*(?:button|link|tab|option|menu|icon)?/i,
+    /(?:click|tap|press)\s+(?:on\s+)?(?:the\s+)?["'](.+?)["']/i,
+    /(?:click|tap|press)\s+(?:on\s+)?(?:the\s+)?(.+?)\s+(?:button|link|tab|option|menu|icon)/i,
+    /(?:clicking|tapping|pressing)\s+(?:on\s+)?(?:the\s+)?["'](.+?)["']/i,
+    /(?:clicking|tapping|pressing)\s+(?:on\s+)?(?:the\s+)?(.+?)\s+(?:button|link|tab|option|menu|icon)/i,
+  ];
+  for (const pat of patterns) {
+    const m = reasoning.match(pat);
+    if (m?.[1]) {
+      const label = m[1].trim();
+      if (label.length > 2 && label.length < 120) return label;
+    }
+  }
+  return "";
+}
+
+/**
+ * Extract fill-field info from AI reasoning text for fillFormVision calls.
+ * Returns an array of { label, value } objects.
+ */
+function extractFieldsFromReasoning(reasoning) {
+  if (!reasoning || typeof reasoning !== "string") return [];
+  const fields = [];
+  const patterns = [
+    /(?:Email|email)\s*(?:field\s+)?(?:shows?|with|=|:)\s*["']?([^\n"',]+)/i,
+    /(?:Password|password)\s*(?:field\s+)?(?:shows?|with|=|:)\s*["']?([^\n"',]+)/i,
+    /(?:Username|username)\s*(?:field\s+)?(?:shows?|with|=|:)\s*["']?([^\n"',]+)/i,
+  ];
+  const labels = ["Email", "Password", "Username"];
+  for (let i = 0; i < patterns.length; i++) {
+    const m = reasoning.match(patterns[i]);
+    if (m?.[1]) {
+      const val = m[1].trim().replace(/["']+$/, "").trim();
+      if (val && val.length > 1 && !/^•+$/.test(val)) {
+        fields.push({ label: labels[i], value: val });
+      }
+    }
+  }
+  return fields;
+}
+
+/**
+ * Extract a description for a tool result or toolResult from Stagehand.
+ * Tries various known property patterns for the resolved element.
+ */
+function extractDescriptionFromResult(toolResult) {
+  if (!toolResult || typeof toolResult !== "object") return "";
+  const candidates = [
+    toolResult.description,
+    toolResult.elementDescription,
+    toolResult.resolvedElement,
+    toolResult.message,
+    toolResult.selector,
+    toolResult.text,
+    toolResult.label,
+    toolResult.ariaLabel,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim().length > 1 && c.trim().length < 200) {
+      return c.trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * Record a single agent tool call directly to the recorder's unified timeline.
+ * Handles every Stagehand V3 tool type with robust arg/result extraction.
+ *
+ * @param {ActionRecorder} recorder
+ * @param {string} toolName - Lowercased tool name
+ * @param {object} args - Tool call arguments from the agent
+ * @param {*} toolResult - Matched tool result
+ * @param {string} stepId
+ * @param {string} currentUrl
+ * @param {string} [reasoningText] - AI reasoning from the same onStepFinish event
+ */
+function recordToolCallToTimeline(recorder, toolName, args, toolResult, stepId, currentUrl, reasoningText) {
+  if (!recorder) return;
+
+  // #region agent log
+  fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:recordToolCallToTimeline',message:'tool_call_raw_data',data:{toolName,argKeys:Object.keys(args||{}),args:JSON.parse(JSON.stringify(args||{},(_k,v)=>typeof v==='string'&&v.length>200?v.slice(0,200)+'…':v)),resultType:typeof toolResult,resultKeys:toolResult&&typeof toolResult==='object'?Object.keys(toolResult):[],resultPreview:toolResult&&typeof toolResult==='object'?JSON.parse(JSON.stringify(toolResult,(_k,v)=>typeof v==='string'&&v.length>200?v.slice(0,200)+'…':v)):String(toolResult).slice(0,200),reasoningSnippet:String(reasoningText||'').slice(0,300),stepId},timestamp:Date.now(),hypothesisId:'H1-H4'})}).catch(()=>{});
+  // #endregion
+
+  if (toolName === "fillform" || toolName === "fillformvision") {
+    const fields =
+      (Array.isArray(toolResult?.playwrightArguments) && toolResult.playwrightArguments) ||
+      (Array.isArray(args?.fields) && args.fields) ||
+      (Array.isArray(toolResult?.fields) && toolResult.fields) ||
+      (Array.isArray(args?.formFields) && args.formFields) ||
+      (Array.isArray(toolResult?.formFields) && toolResult.formFields) ||
+      [];
+
+    // #region agent log
+    fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:fillform_handler',message:'fillform_data',data:{stepId,fieldsFound:fields.length,fieldsPreview:fields.slice(0,5),reasoningFields:extractFieldsFromReasoning(reasoningText),argsKeys:Object.keys(args||{}),resultKeys:toolResult&&typeof toolResult==='object'?Object.keys(toolResult):[],hasPlaywrightArgs:Array.isArray(toolResult?.playwrightArguments),hasArgsFields:Array.isArray(args?.fields),hasResultFields:Array.isArray(toolResult?.fields)},timestamp:Date.now(),hypothesisId:'H1'})}).catch(()=>{});
+    // #endregion
+
+    if (fields.length > 0) {
+      for (const field of fields) {
+        if (!field || typeof field !== "object") continue;
+        const label = String(
+          field.label || field.action || field.description || field.name || field.selector || "field"
+        ).trim();
+        const val = String(field.value || field.originalValue || field.text || field.fillValue || "").trim();
+        if (!val && !label) continue;
+        recorder.recordAction({
+          tool: toolName,
+          action: "type",
+          target: label,
+          value: val,
+          playwright: `await page.getByLabel('${escPw(label)}', { exact: false }).first().fill('${escPw(val)}');`,
+          description: `Fill "${label}" with "${val}"`,
+          stepId,
+          url: currentUrl,
+        });
+      }
+      return;
+    }
+
+    // Try to reconstruct fields from the reasoning text
+    const reasoningFields = extractFieldsFromReasoning(reasoningText);
+    if (reasoningFields.length > 0) {
+      for (const rf of reasoningFields) {
+        recorder.recordAction({
+          tool: toolName,
+          action: "type",
+          target: rf.label,
+          value: rf.value,
+          playwright: `await page.getByLabel('${escPw(rf.label)}', { exact: false }).first().fill('${escPw(rf.value)}');`,
+          description: `Fill "${rf.label}" with "${rf.value}"`,
+          stepId,
+          url: currentUrl,
+        });
+      }
+      return;
+    }
+
+    const instruction = String(args?.instruction || args?.describe || args?.description || "").trim();
+    if (instruction) {
+      recorder.recordAction({
+        tool: toolName,
+        action: "type",
+        target: instruction,
+        playwright: `// fillFormVision: ${escPw(instruction)}`,
+        description: instruction,
+        stepId,
+        url: currentUrl,
+      });
+    } else {
+      logInfo("recorder_fillform_no_fields", {
+        stepId,
+        toolName,
+        argKeys: Object.keys(args || {}),
+        resultKeys: Object.keys(toolResult || {}),
+        reasoningSnippet: String(reasoningText || "").slice(0, 200),
+      });
+    }
+    return;
+  }
+
+  if (toolName === "click") {
+    let describe = String(
+      args?.describe || args?.instruction || args?.element || args?.text ||
+      args?.target || args?.selector || args?.description ||
+      ""
+    ).trim();
+
+    const fromArgs = describe;
+
+    if (!describe) {
+      describe = extractDescriptionFromResult(toolResult);
+    }
+
+    const fromResult = !fromArgs ? describe : "";
+
+    if (!describe) {
+      describe = extractClickTargetFromReasoning(reasoningText);
+    }
+
+    // #region agent log
+    fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:click_handler',message:'click_resolution',data:{stepId,fromArgs,fromResult,fromReasoning:!fromArgs&&!fromResult?describe:'',finalDescribe:describe,reasoningFull:String(reasoningText||'').slice(0,500)},timestamp:Date.now(),hypothesisId:'H2-H4'})}).catch(()=>{});
+    // #endregion
+
+    if (!describe) {
+      logInfo("recorder_click_no_describe", {
+        stepId,
+        argKeys: Object.keys(args || {}),
+        resultType: typeof toolResult,
+        resultKeys: toolResult && typeof toolResult === "object" ? Object.keys(toolResult) : [],
+        reasoningSnippet: String(reasoningText || "").slice(0, 200),
+      });
+      return;
+    }
+    recorder.recordAction({
+      tool: "click",
+      action: "click",
+      target: describe,
+      playwright: `await page.getByRole('button', { name: '${escPw(describe)}', exact: false }).or(page.getByText('${escPw(describe)}', { exact: false })).first().click();`,
+      description: `Click on "${describe}"`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "type" || toolName === "fill") {
+    const describe = String(args?.describe || args?.instruction || args?.element || args?.description || "text field").trim();
+    const text = String(args?.text || args?.value || "").trim();
+    if (!text) return;
+    recorder.recordAction({
+      tool: toolName,
+      action: "type",
+      target: describe,
+      value: text,
+      playwright: `await page.getByLabel('${escPw(describe)}', { exact: false }).first().fill('${escPw(text)}');`,
+      description: `Type "${text}" into "${describe}"`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "goto" || toolName === "navigate") {
+    const url = String(args?.url || "").trim();
+    if (!url) return;
+    recorder.recordAction({
+      tool: toolName,
+      action: "navigate",
+      target: url,
+      playwright: `await page.goto('${escPw(url)}');`,
+      description: `Navigate to ${url}`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "wait") {
+    const ms = Number(args?.timeMs || toolResult?.waited || 2000);
+    recorder.recordAction({
+      tool: "wait",
+      action: "wait",
+      playwright: `await page.waitForTimeout(${ms});`,
+      description: `Wait for ${ms}ms`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "keys" || toolName === "press") {
+    const key = String(args?.keys || args?.key || "").trim();
+    if (!key) return;
+    recorder.recordAction({
+      tool: toolName,
+      action: "press",
+      target: key,
+      playwright: `await page.keyboard.press('${escPw(key)}');`,
+      description: `Press ${key}`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "scroll") {
+    const direction = String(args?.direction || "down").trim().toLowerCase();
+    const pixels = Number(args?.pixels || args?.scrolledPixels || 300);
+    const deltaX = direction.includes("left") ? -pixels : direction.includes("right") ? pixels : 0;
+    const deltaY = direction.includes("up") ? -pixels : pixels;
+    recorder.recordAction({
+      tool: "scroll",
+      action: "scroll",
+      target: direction,
+      playwright: `await page.mouse.wheel(${deltaX}, ${deltaY});`,
+      description: `Scroll ${direction}`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "extract") {
+    if (toolResult && typeof toolResult === "object") {
+      const assertions = [];
+      for (const [, value] of Object.entries(toolResult)) {
+        if (typeof value === "string" && value.trim() && value.trim().length < 200) {
+          const escaped = escPw(value.trim());
+          assertions.push({
+            playwright: `await expect(page.getByText('${escaped}', { exact: false }).first()).toBeVisible();`,
+            description: `Verify "${value.trim()}" is present`,
+          });
+        }
+      }
+      for (const a of assertions) {
+        recorder.recordAction({
+          tool: "extract",
+          action: "assert_visible",
+          target: a.description,
+          playwright: a.playwright,
+          description: a.description,
+          stepId,
+          url: currentUrl,
+        });
+      }
+      recorder.recordResult({
+        tool: "extract",
+        data: toolResult,
+        assertions: assertions.map((a) => a.playwright),
+        stepId,
+        url: currentUrl,
+      });
+    }
+    return;
+  }
+
+  if (toolName === "navback") {
+    recorder.recordAction({
+      tool: "navback",
+      action: "navigate",
+      playwright: "await page.goBack();",
+      description: "Navigate back",
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "draganddrop" || toolName === "drag") {
+    const startDesc = String(args?.startDescribe || args?.startDescription || "source").trim();
+    const endDesc = String(args?.endDescribe || args?.endDescription || "target").trim();
+    recorder.recordAction({
+      tool: toolName,
+      action: "drag",
+      target: `${startDesc} → ${endDesc}`,
+      playwright: `await page.getByText('${escPw(startDesc)}', { exact: false }).first().dragTo(page.getByText('${escPw(endDesc)}', { exact: false }).first());`,
+      description: `Drag ${startDesc} to ${endDesc}`,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (toolName === "done") {
+    const message = typeof args?.message === "string"
+      ? args.message
+      : typeof toolResult === "string" ? toolResult : null;
+    recorder.recordResult({
+      tool: "done",
+      data: toolResult,
+      message,
+      stepId,
+      url: currentUrl,
+    });
+    return;
+  }
+
+  if (!["screenshot", "ariatree", "think"].includes(toolName)) {
+    logInfo("recorder_unhandled_tool", {
+      stepId,
+      toolName,
+      argKeys: Object.keys(args || {}),
+      resultType: typeof toolResult,
+    });
+  }
+}
+
+function escPw(s) {
+  if (typeof s !== "string") return "";
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
 /**
@@ -620,14 +1118,28 @@ export async function executeStagehandWithTelemetry(session, commandId, objectiv
  * @param {string} objective - Natural language objective (e.g. from buildIntentObjective)
  * @returns {Promise<object>} Result with steps, screenshot, currentUrl, etc.
  */
-export async function executeStagehandObjective(session, commandId, objective) {
+export async function executeStagehandObjective(session, commandId, objective, recorder = null) {
   if (session.type !== "stagehand" || !session.stagehand) {
     throw new Error("Session is not a Stagehand session");
+  }
+
+  if (recorder && !recorder.isRecording) {
+    recorder.start();
   }
 
   const { stagehand, page } = session;
   const results = [];
   const maxSteps = 30;
+  let stepCounter = 0;
+
+  const pushSessionEvent = (eventData) => {
+    if (!session.events) session.events = [];
+    session.events.push({ ...eventData, createdAt: nowIso() });
+    if (session.events.length > 2000) {
+      session.events.splice(0, session.events.length - 2000);
+    }
+    session.updatedAt = nowIso();
+  };
 
   try {
     const capturedToolCalls = [];
@@ -641,17 +1153,74 @@ export async function executeStagehandObjective(session, commandId, objective) {
       callbacks: {
         onStepFinish: async (event) => {
           try {
+            const reasoningText = event.text || "";
+            const currentUrl = page.url();
+
+            if (reasoningText.trim()) {
+              if (recorder) {
+                recorder.recordReasoning(reasoningText, {
+                  stepId: `agent-step-${stepCounter + 1}`,
+                  url: currentUrl,
+                });
+              }
+
+              pushSessionEvent({
+                type: "stagehand_agent_reasoning",
+                commandId,
+                stepIndex: stepCounter,
+                reasoning: reasoningText.trim(),
+                url: currentUrl,
+              });
+            }
+
             const toolCalls = event.toolCalls || [];
             const toolResults = event.toolResults || [];
+
+            // #region agent log
+            fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:onStepFinish_raw',message:'raw_event_structure',data:{eventKeys:Object.keys(event||{}),toolCallCount:toolCalls.length,toolResultCount:toolResults.length,firstTC:toolCalls[0]?{allKeys:Object.keys(toolCalls[0]),toolName:toolCalls[0].toolName,hasArgs:toolCalls[0].args!==undefined,hasInput:toolCalls[0].input!==undefined,hasParameters:toolCalls[0].parameters!==undefined,hasArguments:toolCalls[0].arguments!==undefined,toolCallId:toolCalls[0].toolCallId,rawPreview:JSON.stringify(toolCalls[0],(_k,v)=>typeof v==='string'&&v.length>100?v.slice(0,100)+'…':v).slice(0,600)}:null,firstTR:toolResults[0]?{allKeys:Object.keys(toolResults[0]),hasResult:toolResults[0].result!==undefined,hasOutput:toolResults[0].output!==undefined,hasContent:toolResults[0].content!==undefined,rawPreview:JSON.stringify(toolResults[0],(_k,v)=>typeof v==='string'&&v.length>100?v.slice(0,100)+'…':v).slice(0,600)}:null},timestamp:Date.now(),hypothesisId:'RAW_STRUCTURE'})}).catch(()=>{});
+            // #endregion
+
             for (const tc of toolCalls) {
               const matchingResult = toolResults.find(
                 (tr) => tr.toolCallId === tc.toolCallId
               );
-              capturedToolCalls.push({
+              const captured = {
                 toolName: tc.toolName,
                 args: tc.args || {},
                 result: matchingResult?.result ?? null,
+              };
+              capturedToolCalls.push(captured);
+
+              stepCounter++;
+              const stepId = `agent-step-${stepCounter}`;
+
+              const toolName = String(tc.toolName || "").toLowerCase();
+              const args = tc.args || {};
+              const toolResult = captured.result;
+              const safeArgs = {};
+              for (const [key, value] of Object.entries(args)) {
+                if (key === "screenshot" || key === "data") continue;
+                if (typeof value === "string" && value.length > 300) {
+                  safeArgs[key] = value.slice(0, 250) + "…";
+                } else {
+                  safeArgs[key] = value;
+                }
+              }
+
+              pushSessionEvent({
+                type: "stagehand_agent_action",
+                commandId,
+                stepIndex: stepCounter,
+                toolName: tc.toolName,
+                args: safeArgs,
+                reasoning: event.reasoning || event.text || null,
+                url: currentUrl,
+                success: matchingResult?.result !== undefined,
               });
+
+              if (recorder) {
+                recordToolCallToTimeline(recorder, toolName, args, toolResult, stepId, currentUrl, reasoningText);
+              }
             }
           } catch {
             // non-fatal: don't break agent execution
@@ -659,6 +1228,20 @@ export async function executeStagehandObjective(session, commandId, objective) {
         },
       },
     });
+
+    if (recorder && result?.actions) {
+      const existingCount = recorder.getReasoningLog().length;
+      if (existingCount === 0) {
+        for (const action of result.actions) {
+          if (action?.reasoning && typeof action.reasoning === "string" && action.reasoning.trim()) {
+            recorder.recordReasoning(action.reasoning, {
+              stepId: action.type || null,
+              url: action.pageUrl || page.url(),
+            });
+          }
+        }
+      }
+    }
 
     session.currentUrl = page.url();
     session.updatedAt = nowIso();
@@ -671,36 +1254,48 @@ export async function executeStagehandObjective(session, commandId, objective) {
       screenshotPath = session.lastScreenshotPath;
     }
 
-    // Primary path: convert captured tool calls directly (most reliable)
-    let normalizedActions = [];
-    if (capturedToolCalls.length > 0) {
-      normalizedActions = convertToolCallsToActions(capturedToolCalls, session.currentUrl);
-      if (normalizedActions.length > 0) {
-        logInfo("stagehand_actions_from_tool_calls", {
-          sessionId: session.id,
-          actionCount: normalizedActions.length,
-          toolCallCount: capturedToolCalls.length,
-        });
-      }
+    // --- Browser-level recording (actor-agnostic, page-side DOM events) ---
+    const browserRecorder = session.browserRecorder;
+    let browserActions = [];
+    if (browserRecorder) {
+      browserRecorder.stop();
+      browserActions = browserRecorder.getPlaywrightActions();
+      logInfo("browser_recorder_results", {
+        sessionId: session.id,
+        browserActionCount: browserActions.length,
+        summary: browserRecorder.getSummary(),
+      });
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:browser_recorder_final',message:'browser_recorder_output',data:{browserActionCount:browserActions.length,summary:browserRecorder.getSummary(),actions:browserActions.map(a=>({seq:a.seq,action:a.action,target:a.target,selector:a.selector?.slice(0,100),selectorMethod:a.selectorMethod,value:a.value?.slice(0,50)}))},timestamp:Date.now(),hypothesisId:'BROWSER'})}).catch(()=>{});
+      // #endregion
     }
 
-    // Fallback: LLM-based conversion from result.actions
-    if (normalizedActions.length === 0) {
-      const rawSteps = result?.steps ?? result?.actions ?? [];
-      const rawStepsFiltered = Array.isArray(rawSteps)
-        ? rawSteps.filter((s) => s && typeof s === "object")
-        : [];
-      logInfo("stagehand_fallback_to_ai_convert", {
+    // normalizedActions come exclusively from the BrowserRecorder (actor-agnostic
+    // DOM event capture). The ActionRecorder (Stagehand tool calls) is kept only
+    // as debug metadata — it never feeds into the generated Playwright script.
+    let normalizedActions = [];
+
+    if (browserActions.length > 0) {
+      logInfo("using_browser_recorder_as_primary", {
         sessionId: session.id,
-        rawStepCount: rawStepsFiltered.length,
-        capturedToolCallCount: capturedToolCalls.length,
+        browserActionCount: browserActions.length,
       });
-      normalizedActions = await convertActionsWithAI(
-        rawStepsFiltered,
-        session.currentUrl,
-        session.modelConfig,
-        objective
-      );
+      normalizedActions = browserActions.map((ba) => ({
+        type: ba.action === "scroll" ? "scroll" : ba.action === "navigate" ? "navigate" : "act",
+        action: ba.action || "act",
+        instruction: ba.target || "",
+        targetDescription: ba.target || "",
+        value: ba.value || "",
+        description: ba.target ? `${ba.action}: ${ba.target}` : ba.action,
+        playwright: ba.playwright || "",
+        selector: ba.selector || "",
+        selectorMethod: ba.selectorMethod || "unknown",
+      }));
+    } else {
+      logInfo("browser_recorder_no_actions", {
+        sessionId: session.id,
+        reason: "BrowserRecorder captured 0 actions — script will be empty",
+      });
     }
 
     // Detect assertion/verification commands and add concrete assertion steps
@@ -749,16 +1344,48 @@ export async function executeStagehandObjective(session, commandId, objective) {
       });
     }
 
-    return {
+    if (recorder) recorder.stop();
+
+    logInfo("stagehand_recording_complete", {
+      sessionId: session.id,
+      timelineEntries: recorder ? recorder.entryCount : 0,
+      actionsRecorded: recorder ? recorder.getActions().length : 0,
+      normalizedActions: normalizedActions.length,
+      browserRecordedActions: browserActions.length,
+      scriptSource: "BrowserRecorder",
+    });
+
+    // #region agent log
+    fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'stagehandSession.js:final_output',message:'final_normalized_actions',data:{normalizedCount:normalizedActions.length,scriptSource:'BrowserRecorder',browserActionCount:browserActions.length,actions:normalizedActions.map((a,i)=>({idx:i,action:a.action,target:a.targetDescription?.slice(0,80),playwright:a.playwright?.slice(0,120),selectorMethod:a.selectorMethod}))},timestamp:Date.now(),hypothesisId:'FINAL'})}).catch(()=>{});
+    // #endregion
+
+    const returnObj = {
       commandId,
       currentUrl: session.currentUrl,
       results,
       stagehandActions: normalizedActions,
       completed: true,
     };
+
+    // Script comes exclusively from the BrowserRecorder (actor-agnostic layer).
+    // ActionRecorder data is kept as debug metadata only.
+    if (browserRecorder) {
+      returnObj.recordedScript = browserRecorder.toPlaywrightScript({
+        testName: recorder?.scenarioName || "recorded browser test",
+      });
+      returnObj.browserRecording = browserRecorder.toJSON();
+    }
+    if (recorder) {
+      returnObj.recording = recorder.toJSON();
+    }
+    return returnObj;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logError("stagehand_execute_failed", { sessionId: session.id, commandId, error: msg });
+
+    if (recorder) recorder.stop();
+    const browserRecorderErr = session.browserRecorder;
+    if (browserRecorderErr) browserRecorderErr.stop();
 
     let screenshotPath = session.lastScreenshotPath;
     try {
@@ -770,7 +1397,23 @@ export async function executeStagehandObjective(session, commandId, objective) {
     session.currentUrl = page.url();
     session.updatedAt = nowIso();
 
-    return {
+    // Even on failure, browser recorder may have captured useful actions
+    let failActions = [];
+    if (browserRecorderErr) {
+      failActions = browserRecorderErr.getPlaywrightActions().map((ba) => ({
+        type: ba.action === "scroll" ? "scroll" : ba.action === "navigate" ? "navigate" : "act",
+        action: ba.action || "act",
+        instruction: ba.target || "",
+        targetDescription: ba.target || "",
+        value: ba.value || "",
+        description: ba.target ? `${ba.action}: ${ba.target}` : ba.action,
+        playwright: ba.playwright || "",
+        selector: ba.selector || "",
+        selectorMethod: ba.selectorMethod || "unknown",
+      }));
+    }
+
+    const returnObj = {
       commandId,
       currentUrl: session.currentUrl,
       results: [
@@ -785,9 +1428,21 @@ export async function executeStagehandObjective(session, commandId, objective) {
           durationMs: 0,
         },
       ],
-      stagehandActions: [],
+      stagehandActions: failActions,
       completed: false,
     };
+
+    // Script comes exclusively from the BrowserRecorder.
+    if (browserRecorderErr) {
+      returnObj.recordedScript = browserRecorderErr.toPlaywrightScript({
+        testName: recorder?.scenarioName || "recorded browser test",
+      });
+      returnObj.browserRecording = browserRecorderErr.toJSON();
+    }
+    if (recorder) {
+      returnObj.recording = recorder.toJSON();
+    }
+    return returnObj;
   }
 }
 

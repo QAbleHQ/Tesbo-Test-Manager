@@ -505,6 +505,145 @@ export async function getAutomationStreamState(projectId: string, sessionId: str
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/stream`);
 }
 
+export interface RecordingAction {
+  type: string;
+  action: string;
+  playwright: string;
+  targetDescription?: string;
+  value?: string;
+  url?: string;
+}
+
+/** Unified timeline entry — every recording interaction in chronological order. */
+export interface TimelineEntry {
+  seq: number;
+  kind: "action" | "reasoning" | "result";
+  ts: string;
+  stepId?: string | null;
+  url?: string | null;
+  tool?: string | null;
+  action?: string | null;
+  playwright?: string | null;
+  target?: string | null;
+  value?: string | null;
+  description?: string | null;
+  text?: string | null;
+  toolName?: string | null;
+  data?: Record<string, unknown> | null;
+  message?: string | null;
+  assertions?: string[];
+}
+
+/** Summary stats computed from the unified timeline. */
+export interface RecordingStats {
+  totalEntries: number;
+  actionCount: number;
+  reasoningCount: number;
+  resultCount: number;
+  clickCount: number;
+  typeCount: number;
+  navigateCount: number;
+  waitCount: number;
+  pressCount: number;
+  scrollCount: number;
+  assertCount: number;
+  playwrightLineCount: number;
+}
+
+export interface RecordingSummary {
+  runId: string;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  totalEvents: number;
+  observeCount: number;
+  actCount: number;
+  successfulActCount: number;
+  extractCount: number;
+  navigateCount: number;
+  compiledActionCount: number;
+}
+
+export interface ReasoningEntry {
+  text: string;
+  timestamp: string;
+  stepId: string | null;
+  url: string | null;
+  toolName: string | null;
+  _seq: number;
+}
+
+export interface RecordingState {
+  sessionId: string;
+  hasRecording: boolean;
+  message?: string;
+  summary?: RecordingSummary;
+  actions?: RecordingAction[];
+  reasoningLog?: ReasoningEntry[];
+  partialScript?: string;
+}
+
+export async function getAutomationRecording(projectId: string, sessionId: string): Promise<RecordingState> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording`);
+}
+
+export async function compileAutomationRecording(
+  projectId: string,
+  sessionId: string,
+  options?: { scenario?: string; addHeader?: boolean }
+): Promise<{ sessionId: string; runId: string; script: string; summary: RecordingSummary; recording: Record<string, unknown> }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording/compile`, {
+    method: "POST",
+    body: options ?? {},
+  });
+}
+
+export interface PersistedRecording {
+  id: string;
+  projectId: string;
+  testcaseId: string | null;
+  sessionId: string | null;
+  commandId: string | null;
+  runId: string;
+  scenarioName: string | null;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  timeline?: TimelineEntry[];
+  stats: RecordingStats;
+  playwrightScript: string | null;
+  startUrl: string | null;
+  finalUrl: string | null;
+  durationMs: number;
+  success: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listRecordingsByTestcase(
+  projectId: string,
+  testcaseId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/recordings${params}`);
+}
+
+export async function listRecordingsByProject(
+  projectId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/automation/recordings${params}`);
+}
+
+export async function getPersistedRecording(
+  projectId: string,
+  recordingId: string
+): Promise<PersistedRecording> {
+  return api(`/api/projects/${projectId}/automation/recordings/${recordingId}`);
+}
+
 export async function resetAutomationSession(
   projectId: string,
   sessionId: string,

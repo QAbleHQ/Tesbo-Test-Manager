@@ -7,6 +7,7 @@ import {
   startAutomationSession,
   sendAutomationCommand,
   getAutomationSession,
+  getAutomationStreamState,
   finalizeAutomationSession,
   runAutomationPlaywrightScript,
   reviewAutomationScriptWithAi,
@@ -581,7 +582,11 @@ export interface AegisRunLogEntry {
   ts: number;
   message: string;
   detail?: string;
-  type: "thinking" | "action" | "info" | "success" | "error" | "bot_review";
+  type: "thinking" | "action" | "info" | "success" | "error" | "bot_review" | "navigation" | "milestone";
+  url?: string;
+  stepProgress?: { current: number; total: number };
+  durationMs?: number;
+  category?: "browser" | "session" | "agent" | "review" | "system";
 }
 
 export interface AegisBackgroundRun {
@@ -593,6 +598,11 @@ export interface AegisBackgroundRun {
   sessionId: string | null;
   reviewSessionId: string | null;
   logs: AegisRunLogEntry[];
+  currentUrl?: string;
+  currentAction?: string;
+  stepsCompleted?: number;
+  stepsTotal?: number;
+  phaseStartedAt?: number;
 }
 
 const activeRuns = new Map<string, AegisBackgroundRun>();
@@ -623,14 +633,37 @@ function notifyListeners() {
   listeners.forEach((fn) => fn());
 }
 
-function addRunLog(testcaseId: string, message: string, type: AegisRunLogEntry["type"]) {
+function addRunLog(
+  testcaseId: string,
+  message: string,
+  type: AegisRunLogEntry["type"],
+  extras?: Partial<Pick<AegisRunLogEntry, "detail" | "url" | "stepProgress" | "durationMs" | "category">>
+) {
   const run = activeRuns.get(testcaseId);
   if (!run) return;
   const previous = run.logs[run.logs.length - 1];
-  if (previous && previous.type === type && previous.message === message) {
+  if (previous && previous.type === type && previous.message === message && previous.detail === extras?.detail) {
     return;
   }
-  run.logs.push({ ts: Date.now(), message, type });
+  run.logs.push({ ts: Date.now(), message, type, ...extras });
+  if (extras?.url && extras.url !== run.currentUrl) {
+    run.currentUrl = extras.url;
+  }
+  notifyListeners();
+}
+
+function updateRunCurrentAction(testcaseId: string, action: string) {
+  const run = activeRuns.get(testcaseId);
+  if (!run) return;
+  run.currentAction = action;
+  notifyListeners();
+}
+
+function updateRunStepProgress(testcaseId: string, completed: number, total: number) {
+  const run = activeRuns.get(testcaseId);
+  if (!run) return;
+  run.stepsCompleted = completed;
+  run.stepsTotal = total;
   notifyListeners();
 }
 
@@ -654,7 +687,8 @@ function addRunLogWithDetail(
   testcaseId: string,
   message: string,
   type: AegisRunLogEntry["type"],
-  detail?: string
+  detail?: string,
+  extras?: Partial<Pick<AegisRunLogEntry, "url" | "stepProgress" | "durationMs" | "category">>
 ) {
   const run = activeRuns.get(testcaseId);
   if (!run) return;
@@ -662,8 +696,32 @@ function addRunLogWithDetail(
   if (previous && previous.type === type && previous.message === message && previous.detail === detail) {
     return;
   }
-  run.logs.push({ ts: Date.now(), message, type, detail });
+  run.logs.push({ ts: Date.now(), message, type, detail, ...extras });
+  if (extras?.url && extras.url !== run.currentUrl) {
+    run.currentUrl = extras.url;
+  }
   notifyListeners();
+}
+
+function friendlyToolName(tool: string): string {
+  const map: Record<string, string> = {
+    click: "Clicking element",
+    type: "Typing text",
+    fill: "Filling field",
+    goto: "Navigating to page",
+    navigate: "Navigating to page",
+    scroll: "Scrolling page",
+    wait: "Waiting for page",
+    extract: "Extracting data from page",
+    observe: "Observing page elements",
+    act: "Performing action",
+    screenshot: "Taking screenshot",
+    keys: "Pressing keyboard keys",
+    hover: "Hovering over element",
+    select: "Selecting option",
+    fillForm: "Filling form fields",
+  };
+  return map[tool.toLowerCase()] || `Using tool: ${tool}`;
 }
 
 function logStagehandActionEntry(
@@ -680,18 +738,29 @@ function logStagehandActionEntry(
   const xpath = readString(action.xpath);
   const url = readString(action.url);
   const argumentsText = readString(action.arguments);
+  const value = readString(action.value);
+  const targetDescription = readString(action.targetDescription || action.description);
+  const stepExtras: Partial<Pick<AegisRunLogEntry, "url" | "stepProgress" | "category">> = {
+    stepProgress: { current: index + 1, total },
+    category: "agent",
+  };
+  if (url) stepExtras.url = url;
+
+  updateRunStepProgress(testcaseId, index + 1, total);
 
   if (reasoning) {
-    addRunLogWithDetail(testcaseId, reasoning, "thinking");
+    addRunLogWithDetail(testcaseId, reasoning, "thinking", undefined, stepExtras);
+    updateRunCurrentAction(testcaseId, reasoning);
     return;
   }
 
   if (category === "action" && message.toLowerCase().includes("checking for page navigation")) {
     addRunLogWithDetail(
       testcaseId,
-      "Checking whether the page navigated after the last interaction.",
-      "action",
-      xpath ? `Target: ${truncateMiddle(xpath)}` : undefined
+      "Checking if the page navigated after interaction",
+      "info",
+      xpath ? `Element: ${truncateMiddle(xpath)}` : undefined,
+      stepExtras
     );
     return;
   }
@@ -699,44 +768,54 @@ function logStagehandActionEntry(
   if (category === "action" && message.toLowerCase().includes("no new (frame) url detected")) {
     addRunLogWithDetail(
       testcaseId,
-      "No navigation detected; staying on the current page.",
+      "Page stayed on current URL — no navigation occurred",
       "info",
-      url ? `URL: ${url}` : undefined
+      url ? `Current URL: ${url}` : undefined,
+      stepExtras
     );
     return;
   }
 
   if (tool) {
-    addRunLogWithDetail(
-      testcaseId,
-      `Using tool: ${tool}.`,
-      "action",
-      argumentsText ? `Input: ${truncateMiddle(argumentsText, 140)}` : undefined
-    );
+    const friendly = friendlyToolName(tool);
+    let detail = "";
+    if (targetDescription) detail = targetDescription;
+    else if (argumentsText) detail = truncateMiddle(argumentsText, 140);
+    else if (value) detail = `Value: "${truncateMiddle(value, 60)}"`;
+
+    const logType: AegisRunLogEntry["type"] =
+      tool.toLowerCase() === "goto" || tool.toLowerCase() === "navigate" ? "navigation" : "action";
+
+    addRunLogWithDetail(testcaseId, friendly, logType, detail || undefined, stepExtras);
+    updateRunCurrentAction(testcaseId, `${friendly}${detail ? ` — ${detail}` : ""}`);
     return;
   }
 
   if (instruction) {
     addRunLogWithDetail(
       testcaseId,
-      "Planning next extraction/check.",
+      "Planning next verification step",
       "thinking",
-      truncateMiddle(instruction, 160)
+      truncateMiddle(instruction, 160),
+      stepExtras
     );
+    updateRunCurrentAction(testcaseId, `Planning: ${truncateMiddle(instruction, 80)}`);
     return;
   }
 
   const method = readString(action.method);
   const description = readString(action.description);
   if (method || description) {
-    const head = method ? `Action: ${method}` : "Action performed";
-    const suffix = description ? ` (${description})` : "";
+    const friendlyMethod = method ? friendlyToolName(method) : "Performing action";
+    const suffix = description ? `: ${description}` : "";
     addRunLogWithDetail(
       testcaseId,
-      `${head}${suffix}.`,
+      `${friendlyMethod}${suffix}`,
       "action",
-      xpath ? `Target: ${truncateMiddle(xpath)}` : undefined
+      xpath ? `Element: ${truncateMiddle(xpath)}` : undefined,
+      stepExtras
     );
+    updateRunCurrentAction(testcaseId, `${friendlyMethod}${suffix}`);
     return;
   }
 
@@ -745,15 +824,18 @@ function logStagehandActionEntry(
       testcaseId,
       message,
       category === "api" ? "error" : "info",
-      `Stagehand step ${index + 1}/${total}`
+      `Step ${index + 1} of ${total}`,
+      stepExtras
     );
     return;
   }
 
   addRunLogWithDetail(
     testcaseId,
-    `Stagehand step ${index + 1}/${total} completed.`,
-    "info"
+    `Completed step ${index + 1} of ${total}`,
+    "info",
+    undefined,
+    stepExtras
   );
 }
 
@@ -813,6 +895,21 @@ function findOrCreateTask(
   return task;
 }
 
+function reviewCategoryLabel(key: string): string {
+  switch (key) {
+    case "goal_validation": return "Goal Validation";
+    case "rerun_validation": return "Rerun Validation";
+    case "plan_steps_alignment": return "Plan/Steps Alignment";
+    case "assertion_validation": return "Assertion Validation";
+    case "code_quality": return "Code Quality";
+    case "rerun_execution": return "Rerun Execution";
+    case "goal_assertion_coverage": return "Goal & Assertions Coverage";
+    case "minimum_criteria": return "Minimum Criteria";
+    case "improvement_opportunities": return "Improvement Opportunities";
+    default: return key;
+  }
+}
+
 function buildStepValidationList(tc: Record<string, unknown>): string[] {
   return parseTestCaseSteps(tc.steps);
 }
@@ -829,8 +926,8 @@ async function runBotReview(
   const validatedSteps: BotReviewResult["validatedSteps"] = [];
   const assertionSuggestions: NonNullable<BotReviewResult["assertionSuggestions"]> = [];
 
-  addRunLog(testcaseId, `Bot Reviewer [Cycle ${reviewCycle}/${MAX_BOT_REVIEW_CYCLES}]: Starting validation...`, "bot_review");
-  addRunLog(testcaseId, "Bot Reviewer: Creating verification session for rerun validation...", "thinking");
+  addRunLog(testcaseId, `Bot Review cycle ${reviewCycle} of ${MAX_BOT_REVIEW_CYCLES} — Starting automated validation`, "milestone", { category: "review" });
+  addRunLog(testcaseId, "Preparing verification session to re-execute the generated script...", "thinking", { category: "review" });
 
   let scriptRanSuccessfully = false;
   let runError: string | null = null;
@@ -839,7 +936,8 @@ async function runBotReview(
     const { id: reviewSessionId } = await startAutomationSession(projectId, testcaseId, { startUrl: envUrl });
     updateRunSessionId(testcaseId, reviewSessionId, "reviewSessionId");
 
-    addRunLog(testcaseId, "Bot Reviewer: Executing generated script against application...", "action");
+    addRunLog(testcaseId, "Re-executing the generated script against the live application...", "action", { category: "review" });
+    updateRunCurrentAction(testcaseId, "Bot Review: Executing script verification");
 
     const result = await runAutomationPlaywrightScript(projectId, reviewSessionId, {
       script,
@@ -851,20 +949,21 @@ async function runBotReview(
     scriptRanSuccessfully = status === "passed";
 
     if (scriptRanSuccessfully) {
-      addRunLog(testcaseId, "Bot Reviewer: Script executed successfully.", "success");
+      addRunLog(testcaseId, "Script re-execution passed — all actions completed without errors", "success", { category: "review" });
     } else {
       runError = typeof result.errorMessage === "string" ? result.errorMessage : "Script execution failed";
-      addRunLog(testcaseId, `Bot Reviewer: Script execution failed — ${runError}`, "error");
+      addRunLog(testcaseId, `Script re-execution failed: ${runError}`, "error", { category: "review" });
     }
 
     try { await cancelAutomationSession(projectId, reviewSessionId); } catch {}
     updateRunSessionId(testcaseId, null, "reviewSessionId");
   } catch (err) {
     runError = err instanceof Error ? err.message : "Failed to run review session";
-    addRunLog(testcaseId, `Bot Reviewer: Could not start review session — ${runError}`, "error");
+    addRunLog(testcaseId, `Could not start review session: ${runError}`, "error", { category: "review" });
   }
 
-  addRunLog(testcaseId, "Bot Reviewer: Validating script-to-goal and step alignment...", "thinking");
+    addRunLog(testcaseId, "Validating script coverage: checking each test step against generated actions...", "thinking", { category: "review" });
+    updateRunCurrentAction(testcaseId, "Bot Review: Validating step coverage");
 
   const scriptLower = script.toLowerCase();
   const rawScriptLines = script.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -1054,7 +1153,12 @@ async function runBotReview(
     });
 
     const icon = covered ? "PASS" : "WARN";
-    addRunLog(testcaseId, `Bot Reviewer: Step ${i + 1} [${icon}] — ${step} — ${detail}`, "bot_review");
+    addRunLog(
+      testcaseId,
+      `Step ${i + 1}: ${step}`,
+      "bot_review",
+      { detail: `${icon} — ${detail}`, stepProgress: { current: i + 1, total: steps.length }, category: "review" }
+    );
   }
 
   const allStepsPassed = validatedSteps.every((s) => s.passed);
@@ -1162,7 +1266,8 @@ async function runBotReview(
   };
 
   try {
-    addRunLog(testcaseId, "Bot Reviewer: Requesting AI-based script review...", "thinking");
+    addRunLog(testcaseId, "Running AI-powered deep analysis on the generated script...", "thinking", { category: "review" });
+    updateRunCurrentAction(testcaseId, "Bot Review: AI deep analysis");
     const aiReview = await reviewAutomationScriptWithAi(projectId, {
       testcaseId,
       testcaseTitle: asText(tc.title).trim(),
@@ -1185,35 +1290,49 @@ async function runBotReview(
       categories: aiCategories.length > 0 ? aiCategories : reviewResult.categories,
       assertionSuggestions: aiAssertions.length > 0 ? aiAssertions : reviewResult.assertionSuggestions,
     };
-    addRunLog(testcaseId, "Bot Reviewer: AI review completed and applied.", "bot_review");
+    addRunLog(testcaseId, "AI review analysis completed and applied", "bot_review", { category: "review" });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown AI review error";
-    addRunLog(testcaseId, `Bot Reviewer: AI review unavailable (${message}). Using fallback review.`, "error");
+    addRunLog(testcaseId, `AI review unavailable (${message}). Using heuristic-based review as fallback.`, "error", { category: "review" });
   }
 
   if (reviewResult.categories && reviewResult.categories.length > 0) {
-    for (const category of reviewResult.categories) {
-      const marker = category.passed ? "PASS" : "FAIL";
-      addRunLog(testcaseId, `Bot Reviewer: ${category.key} [${marker}] — ${category.detail}`, "bot_review");
+    addRunLog(testcaseId, "Review categories summary:", "bot_review", { category: "review" });
+    for (const cat of reviewResult.categories) {
+      const marker = cat.passed ? "PASS" : "FAIL";
+      addRunLog(
+        testcaseId,
+        `${reviewCategoryLabel(cat.key)}: ${marker}`,
+        "bot_review",
+        { detail: cat.detail, category: "review" }
+      );
     }
   }
   for (const item of reviewResult.feedback) {
-    addRunLog(testcaseId, `Bot Reviewer: Failure reason — ${item}`, "error");
+    addRunLog(testcaseId, `Issue found: ${item}`, "error", { category: "review" });
   }
   if (reviewResult.assertionSuggestions && reviewResult.assertionSuggestions.length > 0) {
-    addRunLog(testcaseId, `Bot Reviewer: ${reviewResult.assertionSuggestions.length} assertion suggestion(s) generated.`, "bot_review");
+    addRunLog(
+      testcaseId,
+      `${reviewResult.assertionSuggestions.length} assertion improvement${reviewResult.assertionSuggestions.length > 1 ? "s" : ""} suggested`,
+      "bot_review",
+      { category: "review" }
+    );
     for (const suggestion of reviewResult.assertionSuggestions) {
       addRunLog(
         testcaseId,
-        `Bot Reviewer: Assertion suggestion for "${suggestion.step}" — ${suggestion.suggestion}`,
+        `Suggestion for "${suggestion.step}": ${suggestion.suggestion}`,
         "bot_review",
+        { detail: suggestion.reason, category: "review" }
       );
     }
   }
   if (reviewResult.status === "passed") {
-    addRunLog(testcaseId, "Bot Reviewer: All validations passed. Sending to human review.", "success");
+    addRunLog(testcaseId, "All validations passed. Script is ready for human review.", "milestone", { category: "review" });
+    updateRunCurrentAction(testcaseId, "Review passed — awaiting human review");
   } else {
-    addRunLog(testcaseId, `Bot Reviewer: Validation failed (${reviewResult.feedback.length} issue${reviewResult.feedback.length > 1 ? "s" : ""}). Will retry.`, "error");
+    addRunLog(testcaseId, `Validation found ${reviewResult.feedback.length} issue${reviewResult.feedback.length > 1 ? "s" : ""}. Attempting to fix and retry...`, "error", { category: "review" });
+    updateRunCurrentAction(testcaseId, "Review failed — retrying");
   }
 
   return reviewResult;
@@ -1346,6 +1465,7 @@ async function executeAegisRun(
   if (activeRuns.has(testcaseId)) return;
 
   const queuedTask = findOrCreateTask(projectId, testcaseId, title, externalId, "queued", queueSource);
+  const runStartTime = Date.now();
   activeRuns.set(testcaseId, {
     testcaseId,
     taskId: queuedTask.id,
@@ -1354,14 +1474,18 @@ async function executeAegisRun(
     title,
     sessionId: null,
     reviewSessionId: null,
+    currentUrl: undefined,
+    currentAction: attempt > 1 ? "Retrying..." : "Initializing",
+    phaseStartedAt: runStartTime,
     logs: attempt > 1
-      ? [{ ts: Date.now(), message: `Retry attempt ${attempt}/${MAX_RETRIES}. Restarting from scratch...`, type: "info" }]
+      ? [{ ts: runStartTime, message: `Retry attempt ${attempt}/${MAX_RETRIES}. Restarting from scratch...`, type: "info", category: "system" }]
       : [{
-          ts: Date.now(),
+          ts: runStartTime,
           message: botReviewCycle > 1
             ? `Task re-queued by Bot Review (cycle ${botReviewCycle}/${MAX_BOT_REVIEW_CYCLES}). Preparing environment...`
             : "Task queued. Preparing environment...",
           type: "info",
+          category: "system",
         }],
   });
   notifyListeners();
@@ -1423,21 +1547,35 @@ async function executeAegisRun(
       return;
     }
 
-    addRunLog(testcaseId, `Environment resolved: ${envUrl}`, "info");
+    addRunLog(testcaseId, `Environment resolved: ${envUrl}`, "milestone", { url: envUrl, category: "system" });
+    updateRunCurrentAction(testcaseId, "Resolving environment");
 
     const now1 = new Date().toISOString();
     upsertAgentTask(projectId, "aegis", { ...queuedTask, status: "in_progress", updatedAt: now1 });
     updateRunPhase(testcaseId, "building");
+    const run = activeRuns.get(testcaseId);
+    if (run) run.phaseStartedAt = Date.now();
 
     let tc;
     try {
+      addRunLog(testcaseId, "Loading test case definition...", "info", { category: "system" });
+      updateRunCurrentAction(testcaseId, "Loading test case");
       tc = await getTestCase(projectId, testcaseId);
     } catch (fetchErr) {
       const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      addRunLog(testcaseId, `Failed to fetch test case: ${msg}`, "error");
+      addRunLog(testcaseId, `Failed to fetch test case: ${msg}`, "error", { category: "system" });
       throw fetchErr;
     }
-    addRunLog(testcaseId, "Analyzing test case intent and steps...", "thinking");
+
+    const tcSteps = parseTestCaseSteps(tc.steps);
+    const stepCountMsg = tcSteps.length > 0 ? `Found ${tcSteps.length} test step${tcSteps.length > 1 ? "s" : ""} to execute` : "No structured steps defined — using free-form objective";
+    addRunLog(testcaseId, stepCountMsg, "info", { category: "agent" });
+    if (tcSteps.length > 0) {
+      updateRunStepProgress(testcaseId, 0, tcSteps.length);
+    }
+
+    addRunLog(testcaseId, "Analyzing test case intent and building execution plan...", "thinking", { category: "agent" });
+    updateRunCurrentAction(testcaseId, "Building execution plan");
 
     const currentTasks = getStoredAgentTasks(projectId, "aegis");
     const previousTask = currentTasks.find(
@@ -1447,92 +1585,248 @@ async function executeAegisRun(
     const previousScript = forcedPreviousScript || previousTask?.script || null;
 
     if (reviewerFeedback && reviewerFeedback.length > 0) {
-      addRunLog(testcaseId, `Revision run — addressing ${reviewerFeedback.length} feedback item(s)`, "action");
+      addRunLog(testcaseId, `Revision run — addressing ${reviewerFeedback.length} feedback item(s)`, "milestone", { category: "agent" });
+      for (const fb of reviewerFeedback) {
+        addRunLog(testcaseId, `Feedback to address: "${truncateMiddle(fb, 120)}"`, "info", { category: "agent" });
+      }
     }
 
     const intent = buildIntentObjective(tc, reviewerFeedback, previousScript);
-    addRunLog(testcaseId, "Creating browser session...", "action");
+    addRunLog(testcaseId, "Launching browser session...", "action", { category: "browser" });
+    updateRunCurrentAction(testcaseId, "Launching browser");
 
     let sessionId: string;
+    const sessionCreateStart = Date.now();
     try {
       const sessionResult = await startAutomationSession(projectId, testcaseId, { startUrl: envUrl });
       sessionId = sessionResult.id;
     } catch (sessErr) {
       const msg = sessErr instanceof Error ? sessErr.message : String(sessErr);
-      addRunLog(testcaseId, `Failed to create session: ${msg}`, "error");
+      addRunLog(testcaseId, `Failed to create browser session: ${msg}`, "error", { category: "browser" });
       throw sessErr;
     }
+    const sessionCreateDuration = Date.now() - sessionCreateStart;
     updateRunSessionId(testcaseId, sessionId);
 
     const latestForSession = getStoredAgentTasks(projectId, "aegis").find((t) => t.id === queuedTask.id) || queuedTask;
     upsertAgentTask(projectId, "aegis", { ...latestForSession, sessionId, updatedAt: new Date().toISOString() });
 
-    addRunLog(testcaseId, "Session created. Bot is exploring and automating...", "action");
+    addRunLog(testcaseId, `Browser session started successfully`, "milestone", {
+      durationMs: sessionCreateDuration,
+      url: envUrl,
+      category: "browser",
+    });
+    addRunLog(testcaseId, `Navigating to ${envUrl}`, "navigation", { url: envUrl, category: "browser" });
+    updateRunCurrentAction(testcaseId, `Navigating to ${envUrl}`);
+
     const autonomousCommand = `Autonomous mode objective: ${intent}`;
     try {
       await sendAutomationCommand(projectId, sessionId, autonomousCommand);
     } catch (cmdErr) {
       const msg = cmdErr instanceof Error ? cmdErr.message : String(cmdErr);
-      addRunLog(testcaseId, `Failed to send automation command: ${msg}`, "error");
+      addRunLog(testcaseId, `Failed to send automation command: ${msg}`, "error", { category: "agent" });
       throw cmdErr;
     }
-    addRunLog(testcaseId, "Autonomous command sent. Executing full test case...", "thinking");
+    addRunLog(testcaseId, "Bot is now executing the test case autonomously", "milestone", { category: "agent" });
+    updateRunCurrentAction(testcaseId, "Executing test case autonomously");
 
     let finished = false;
     let pollCount = 0;
     const maxPolls = 300;
     let lastEventCount = 0;
+    let lastAgentEventCount = 0;
+    let lastSdkLogCount = 0;
     let consecutivePollErrors = 0;
+    let lastTrackedUrl = envUrl;
+    let actionCount = 0;
+    const executionStartTime = Date.now();
+    const processedAgentEventKeys = new Set<string>();
 
     while (!finished && pollCount < maxPolls) {
       await new Promise((r) => setTimeout(r, 2000));
       pollCount++;
       try {
-        const session = await getAutomationSession(projectId, sessionId);
+        const [session, streamState] = await Promise.all([
+          getAutomationSession(projectId, sessionId),
+          getAutomationStreamState(projectId, sessionId).catch(() => null),
+        ]);
         consecutivePollErrors = 0;
         const runtime = session.runtime;
+
+        const agentEvents = (streamState?.events ?? []) as Array<Record<string, unknown>>;
+        if (agentEvents.length > lastAgentEventCount) {
+          for (let ai = lastAgentEventCount; ai < agentEvents.length; ai++) {
+            const agentEvent = agentEvents[ai];
+            const agentType = asText(agentEvent.type);
+            if (agentType !== "stagehand_agent_reasoning" && agentType !== "stagehand_agent_action") continue;
+            const dedupeKey = `${agentType}:${agentEvent.createdAt}:${ai}`;
+            if (processedAgentEventKeys.has(dedupeKey)) continue;
+            processedAgentEventKeys.add(dedupeKey);
+
+            if (agentType === "stagehand_agent_reasoning") {
+              const reasoning = asText(agentEvent.reasoning);
+              const agentUrl = asText(agentEvent.url);
+              const plan = agentEvent.plan as Array<{ index: number; instruction: string }> | undefined;
+
+              if (agentUrl && agentUrl !== lastTrackedUrl) {
+                addRunLog(testcaseId, `Navigated to: ${agentUrl}`, "navigation", { url: agentUrl, category: "browser" });
+                lastTrackedUrl = agentUrl;
+                const runRef = activeRuns.get(testcaseId);
+                if (runRef) runRef.currentUrl = agentUrl;
+              }
+
+              if (reasoning) {
+                addRunLog(testcaseId, reasoning, "thinking", { url: agentUrl || undefined, category: "agent" });
+                updateRunCurrentAction(testcaseId, truncateMiddle(reasoning, 100));
+              }
+
+              if (Array.isArray(plan) && plan.length > 0) {
+                for (const step of plan) {
+                  addRunLog(
+                    testcaseId,
+                    `Plan step ${step.index}: ${step.instruction}`,
+                    "info",
+                    { stepProgress: { current: step.index, total: plan.length }, category: "agent" }
+                  );
+                }
+              }
+            } else if (agentType === "stagehand_agent_action") {
+              const toolName = asText(agentEvent.toolName);
+              const reasoning = asText(agentEvent.reasoning);
+              const agentUrl = asText(agentEvent.url);
+              const success = agentEvent.success !== false;
+              const args = agentEvent.args as Record<string, unknown> | undefined;
+
+              if (agentUrl && agentUrl !== lastTrackedUrl) {
+                addRunLog(testcaseId, `Navigated to: ${agentUrl}`, "navigation", { url: agentUrl, category: "browser" });
+                lastTrackedUrl = agentUrl;
+                const runRef = activeRuns.get(testcaseId);
+                if (runRef) runRef.currentUrl = agentUrl;
+              }
+
+              actionCount++;
+              const friendly = toolName ? friendlyToolName(toolName) : "Performing action";
+              let detail = "";
+              if (args) {
+                const desc = asText(args.describe || args.instruction || args.text || args.url);
+                if (desc) detail = truncateMiddle(desc, 100);
+              }
+
+              addRunLog(
+                testcaseId,
+                `${friendly}${detail ? ` — ${detail}` : ""}`,
+                success ? "action" : "error",
+                { url: agentUrl || undefined, category: "agent" }
+              );
+
+              if (reasoning) {
+                addRunLog(testcaseId, reasoning, "thinking", { category: "agent" });
+              }
+
+              updateRunCurrentAction(testcaseId, `${friendly}${detail ? ` — ${detail}` : ""}`);
+            }
+          }
+          lastAgentEventCount = agentEvents.length;
+        }
+
+        const sdkLogs = (streamState?.stagehandLogs ?? []) as Array<Record<string, unknown>>;
+        if (sdkLogs.length > lastSdkLogCount) {
+          for (let si = lastSdkLogCount; si < sdkLogs.length; si++) {
+            const log = sdkLogs[si];
+            const msg = asText(log.message);
+            const cat = asText(log.category);
+            if (!msg) continue;
+            const skipCategories = new Set(["screenshot", "cache", "dom", "html"]);
+            if (skipCategories.has(cat.toLowerCase())) continue;
+            if (msg.length < 5) continue;
+
+            const isReasoning = cat === "agent" || /reason|think|plan|decid|analyz/i.test(msg);
+            addRunLog(
+              testcaseId,
+              `[Stagehand${cat ? ` · ${cat}` : ""}] ${msg}`,
+              isReasoning ? "thinking" : "info",
+              { category: "agent" }
+            );
+          }
+          lastSdkLogCount = sdkLogs.length;
+        }
 
         if (session.events && session.events.length > lastEventCount) {
           for (let i = lastEventCount; i < session.events.length; i++) {
             const event = session.events[i];
             const parsed = event.parsedAction as Record<string, unknown> | null;
+            const executionResult = event.executionResult as Record<string, unknown> | null;
+
+            const eventUrl = asText(executionResult?.currentUrl || executionResult?.urlAfter);
+            if (eventUrl && eventUrl !== lastTrackedUrl) {
+              addRunLog(testcaseId, `Navigated to: ${eventUrl}`, "navigation", { url: eventUrl, category: "browser" });
+              lastTrackedUrl = eventUrl;
+              const runRef = activeRuns.get(testcaseId);
+              if (runRef) runRef.currentUrl = eventUrl;
+            }
+
             if (event.eventType === "autonomous_step_evaluating") {
-              addRunLog(testcaseId, "Thinking: Analyzing page state and planning next action...", "thinking");
+              addRunLog(testcaseId, "Analyzing current page and deciding next action...", "thinking", { category: "agent" });
+              updateRunCurrentAction(testcaseId, "Analyzing page state");
             } else if (event.eventType === "autonomous_step_executed" || event.eventType === "autonomous_turn_executed") {
               const status = parsed ? asText(parsed.status) : "";
               const stepData = parsed?.step as Record<string, unknown> | undefined;
               const action = stepData ? asText(stepData.action) : "";
               const selector = stepData ? asText(stepData.selector) : "";
               const value = stepData ? asText(stepData.value) : "";
-              let desc = action;
-              if (selector) desc += ` on "${selector}"`;
-              if (value) desc += ` with "${value}"`;
-              const icon = isPassedStatus(status) ? "OK" : "FAIL";
-              if (desc) addRunLog(testcaseId, `Action [${icon}]: ${desc}`, "action");
+              const targetDesc = stepData ? asText(stepData.targetDescription || stepData.description) : "";
+              actionCount++;
+
+              const friendlyAction = action ? friendlyToolName(action) : "Performing action";
+              let detail = "";
+              if (targetDesc) detail = targetDesc;
+              else if (selector) detail = `on "${truncateMiddle(selector, 60)}"`;
+              if (value) detail += (detail ? " " : "") + `with "${truncateMiddle(value, 40)}"`;
+
+              const succeeded = isPassedStatus(status);
+              const logType: AegisRunLogEntry["type"] = succeeded ? "action" : "error";
+              addRunLog(testcaseId, `${friendlyAction}${detail ? ` — ${detail}` : ""}`, logType, {
+                category: "agent",
+                url: eventUrl || undefined,
+              });
+              updateRunCurrentAction(testcaseId, `${friendlyAction}${detail ? ` — ${detail}` : ""}`);
+              if (!succeeded) {
+                addRunLog(testcaseId, `Action did not succeed as expected (status: ${status || "unknown"})`, "error", { category: "agent" });
+              }
             } else if (event.eventType === "command_executed") {
-              const executionResult = event.executionResult as Record<string, unknown> | null;
               const stagehandActionsRaw = executionResult?.stagehandActions;
               const stagehandActions = Array.isArray(stagehandActionsRaw)
                 ? (stagehandActionsRaw as Array<Record<string, unknown>>)
                 : [];
               if (stagehandActions.length > 0) {
+                addRunLog(testcaseId, `Processing batch of ${stagehandActions.length} action${stagehandActions.length > 1 ? "s" : ""}...`, "info", { category: "agent" });
                 for (let j = 0; j < stagehandActions.length; j += 1) {
                   const action = stagehandActions[j] || {};
                   logStagehandActionEntry(testcaseId, action, j, stagehandActions.length);
+                  actionCount++;
                 }
               } else {
                 const resultsRaw = executionResult?.results;
                 const results = Array.isArray(resultsRaw) ? (resultsRaw as Array<Record<string, unknown>>) : [];
-                for (let j = 0; j < results.length; j += 1) {
-                  const step = results[j] || {};
-                  const actionName = asText(step.action) || "act";
-                  const status = asText(step.status).toLowerCase();
-                  const marker = status === "passed" || status === "success" ? "OK" : status ? status.toUpperCase() : "INFO";
-                  const message = asText(step.message);
-                  addRunLog(testcaseId, `Stagehand [${j + 1}/${results.length}] [${marker}] ${actionName}${message ? ` — ${message}` : ""}`, "action");
+                if (results.length > 0) {
+                  for (let j = 0; j < results.length; j += 1) {
+                    const step = results[j] || {};
+                    const actionName = asText(step.action) || "act";
+                    const status = asText(step.status).toLowerCase();
+                    const succeeded = status === "passed" || status === "success";
+                    const stepMessage = asText(step.message);
+                    const friendlyAction = friendlyToolName(actionName);
+                    actionCount++;
+                    addRunLog(
+                      testcaseId,
+                      `${friendlyAction}${stepMessage ? ` — ${stepMessage}` : ""}`,
+                      succeeded ? "action" : "error",
+                      { stepProgress: { current: j + 1, total: results.length }, category: "agent" }
+                    );
+                  }
                 }
               }
-              addRunLog(testcaseId, "Command batch completed.", "info");
+              addRunLog(testcaseId, `Completed action batch (${actionCount} total actions so far)`, "info", { category: "agent" });
             }
           }
           lastEventCount = session.events.length;
@@ -1540,13 +1834,28 @@ async function executeAegisRun(
 
         if (!runtime?.isRunning && (runtime?.queuedCount ?? 0) === 0) {
           finished = true;
+          const executionDuration = Date.now() - executionStartTime;
           const script = extractGeneratedScript(session);
           if (script) {
             try { await finalizeAutomationSession(projectId, sessionId, { script }); } catch {}
-            addRunLog(testcaseId, "Script generated successfully.", "success");
+            const lineCount = script.split("\n").length;
+            addRunLog(testcaseId, `Script generated successfully (${lineCount} lines, ${actionCount} actions captured)`, "success", {
+              durationMs: executionDuration,
+              category: "agent",
+            });
           } else {
-            addRunLog(testcaseId, "Execution completed but no script actions captured.", "error");
+            addRunLog(testcaseId, "Execution completed but no script actions were captured", "error", {
+              durationMs: executionDuration,
+              category: "agent",
+            });
           }
+
+          const totalDuration = Date.now() - runStartTime;
+          addRunLog(testcaseId, `Automation phase completed in ${(totalDuration / 1000).toFixed(1)}s`, "milestone", {
+            durationMs: totalDuration,
+            category: "system",
+          });
+          updateRunCurrentAction(testcaseId, "Automation completed");
 
           const now2 = new Date().toISOString();
           const finalTask = getStoredAgentTasks(projectId, "aegis").find((t) => t.id === queuedTask.id) || queuedTask;
@@ -1561,7 +1870,7 @@ async function executeAegisRun(
             updatedAt: now2,
             completedAt: now2,
           });
-          addRunLog(testcaseId, "Automation completed. Script queued for Review Bot / user review.", "info");
+          addRunLog(testcaseId, "Script queued for review. Moving to validation phase...", "info", { category: "system" });
           updateRunPhase(testcaseId, "completed");
           activeRuns.set(testcaseId, { ...activeRuns.get(testcaseId)!, status: "completed" });
           notifyListeners();
@@ -1573,7 +1882,7 @@ async function executeAegisRun(
           finished = true;
           await retryOrFail("Session polling failed repeatedly");
         } else {
-          addRunLog(testcaseId, `Session poll error (${consecutivePollErrors}/3), will retry...`, "error");
+          addRunLog(testcaseId, `Connection interrupted (attempt ${consecutivePollErrors}/3), reconnecting...`, "error", { category: "system" });
         }
       }
     }

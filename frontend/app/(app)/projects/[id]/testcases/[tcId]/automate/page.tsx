@@ -16,13 +16,29 @@ import {
   cancelAutomationSession,
   stopAutomationCommand,
   sendAutomationManualAction,
+  getAutomationRecording,
   type AutomationSession,
   type TestEnvironmentSetting,
+  type RecordingAction,
+  type RecordingSummary,
+  type ReasoningEntry,
 } from "@/lib/api";
 
 type ChatMessage = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "recording" | "reasoning";
   content: string;
+  recordingMeta?: {
+    action: string;
+    playwright: string;
+    target?: string;
+    value?: string;
+    status?: "success" | "failed" | "assertion";
+  };
+  reasoningMeta?: {
+    stepId: string | null;
+    url: string | null;
+    timestamp: string;
+  };
 };
 
 type AutomationMode = "autonomous" | "live";
@@ -136,6 +152,9 @@ export default function AutomateTestCasePage() {
   const processingKeyQueueRef = useRef(false);
   const streamedAutonomousEventIdsRef = useRef<Set<string>>(new Set());
   const streamedTimelineEntriesRef = useRef<Set<string>>(new Set());
+  const lastRecordingActionCountRef = useRef(0);
+  const lastReasoningCountRef = useRef(0);
+  const [recordingSummary, setRecordingSummary] = useState<RecordingSummary | null>(null);
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
   const verboseAutonomousEvents = process.env.NEXT_PUBLIC_AUTONOMOUS_VERBOSE_EVENTS === "true";
   const showAutonomousDebugTrace = verboseAutonomousEvents;
@@ -1492,6 +1511,112 @@ export default function AutomateTestCasePage() {
     }
   }, [timeline]);
 
+  const prevCommandInProgressRef = useRef(false);
+
+  useEffect(() => {
+    if (!sessionId) return;
+
+    const processRecordingData = (actions: RecordingAction[], reasoningLog: ReasoningEntry[], summary: RecordingSummary) => {
+      setRecordingSummary(summary);
+      const prevActionCount = lastRecordingActionCountRef.current;
+      const prevReasoningCount = lastReasoningCountRef.current;
+      const hasNewActions = actions.length > prevActionCount;
+      const hasNewReasoning = reasoningLog.length > prevReasoningCount;
+      if (!hasNewActions && !hasNewReasoning) return;
+
+      const newMessages: ChatMessage[] = [];
+
+      const newReasonings = reasoningLog.slice(prevReasoningCount);
+      lastReasoningCountRef.current = reasoningLog.length;
+      for (const r of newReasonings) {
+        newMessages.push({
+          role: "reasoning" as const,
+          content: r.text,
+          reasoningMeta: {
+            stepId: r.stepId,
+            url: r.url,
+            timestamp: r.timestamp,
+          },
+        });
+      }
+
+      const newActions = actions.slice(prevActionCount);
+      lastRecordingActionCountRef.current = actions.length;
+      for (const a of newActions) {
+        const actionType = (a.action || "act").toLowerCase();
+        const isAssertion = actionType.startsWith("assert");
+        const actionLabel =
+          actionType === "click" ? "Click" :
+          actionType === "type" || actionType === "fill" ? "Fill" :
+          actionType === "navigate" ? "Navigate" :
+          actionType === "press" ? "Key Press" :
+          actionType === "scroll" ? "Scroll" :
+          actionType === "hover" ? "Hover" :
+          actionType === "select" ? "Select" :
+          isAssertion ? "Assert" :
+          actionType.charAt(0).toUpperCase() + actionType.slice(1);
+        const targetLine = a.targetDescription ? ` on "${a.targetDescription}"` : "";
+        const valueLine = a.value ? ` with value "${a.value}"` : "";
+        const content = `${actionLabel}${targetLine}${valueLine}`;
+        newMessages.push({
+          role: "recording" as const,
+          content,
+          recordingMeta: {
+            action: actionType,
+            playwright: a.playwright,
+            target: a.targetDescription,
+            value: a.value,
+            status: isAssertion ? "assertion" : "success",
+          },
+        });
+      }
+
+      if (newMessages.length > 0) {
+        setMessages((prev) => [...prev, ...newMessages]);
+      }
+    };
+
+    if (!commandInProgress && prevCommandInProgressRef.current) {
+      prevCommandInProgressRef.current = false;
+      (async () => {
+        try {
+          const rec = await getAutomationRecording(projectId, sessionId);
+          if (rec.hasRecording && rec.actions && rec.summary) {
+            processRecordingData(rec.actions, rec.reasoningLog || [], rec.summary);
+            if (rec.summary.compiledActionCount > 0) {
+              setMessages((prev) => [...prev, {
+                role: "assistant",
+                content: `Recording complete: ${rec.summary.compiledActionCount} action${rec.summary.compiledActionCount === 1 ? "" : "s"} captured (${rec.summary.successfulActCount} successful, ${rec.summary.extractCount} assertion${rec.summary.extractCount === 1 ? "" : "s"}).`,
+              }]);
+            }
+          }
+        } catch { /* ignore */ }
+      })();
+      return;
+    }
+    prevCommandInProgressRef.current = commandInProgress;
+
+    if (!commandInProgress) return;
+
+    let cancelled = false;
+    const pollRecording = async () => {
+      try {
+        const rec = await getAutomationRecording(projectId, sessionId);
+        if (cancelled) return;
+        if (!rec.hasRecording || !rec.actions || !rec.summary) return;
+        processRecordingData(rec.actions, rec.reasoningLog || [], rec.summary);
+      } catch {
+        // Recording endpoint may not be available yet
+      }
+    };
+    void pollRecording();
+    const id = setInterval(() => void pollRecording(), 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [projectId, sessionId, commandInProgress]);
+
   async function executeCommand(
     input: string,
     options?: { forceAutonomous?: boolean }
@@ -1514,6 +1639,9 @@ export default function AutomateTestCasePage() {
       ? `Autonomous mode objective: ${value}. Before any action, analyze the current DOM and identify stable locator candidates (role/label/testid/text) for each target. Use concise DOM-grounded target descriptions, then execute the full flow and include meaningful validation assertions in the plan.`
       : value;
     setSending(true);
+    lastRecordingActionCountRef.current = 0;
+    lastReasoningCountRef.current = 0;
+    setRecordingSummary(null);
     setMessages((prev) => [...prev, { role: "user", content: value }]);
     try {
       const response = await sendAutomationCommand(projectId, sessionId, outboundCommand);
@@ -1865,6 +1993,20 @@ Stop when pass/fail outcome is clear and summarize results.`;
         </div>
         <div className="flex items-center gap-2">
           <span className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700">{streamState}</span>
+          {recordingSummary && recordingSummary.state === "recording" && (
+            <span className="flex items-center gap-1.5 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs font-medium text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-300">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-500 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-red-600" />
+              </span>
+              REC {recordingSummary.compiledActionCount}
+            </span>
+          )}
+          {recordingSummary && recordingSummary.state === "stopped" && (
+            <span className="rounded border border-zinc-400 bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+              REC Done ({recordingSummary.compiledActionCount})
+            </span>
+          )}
           <div className="flex items-center rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300">
             AI Assisted Chat
           </div>
@@ -1915,6 +2057,79 @@ Stop when pass/fail outcome is clear and summarize results.`;
               )}
               {messages.map((message, idx) => {
                 const isUser = message.role === "user";
+                const isRecording = message.role === "recording";
+                const isReasoning = message.role === "reasoning";
+
+                if (isReasoning) {
+                  return (
+                    <div key={idx} className="flex justify-start">
+                      <div className="max-w-[92%] rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950/30">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-xs">🧠</span>
+                          <span className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+                            Bot Reasoning
+                          </span>
+                          {message.reasoningMeta?.url && (
+                            <span className="ml-auto text-[10px] text-amber-500 dark:text-amber-500 truncate max-w-[200px]" title={message.reasoningMeta.url}>
+                              {message.reasoningMeta.url.replace(/^https?:\/\//, "").split("/").slice(0, 2).join("/")}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs leading-relaxed text-amber-900 dark:text-amber-100 whitespace-pre-wrap">
+                          {message.content}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                }
+
+                if (isRecording && message.recordingMeta) {
+                  const meta = message.recordingMeta;
+                  const actionIcon =
+                    meta.action === "click" ? "🖱" :
+                    meta.action === "type" || meta.action === "fill" ? "⌨" :
+                    meta.action === "navigate" ? "🔗" :
+                    meta.action === "press" ? "⎋" :
+                    meta.action === "scroll" ? "↕" :
+                    meta.action === "hover" ? "👆" :
+                    meta.action.startsWith("assert") ? "✓" : "●";
+                  const borderColor =
+                    meta.status === "assertion"
+                      ? "border-purple-300 dark:border-purple-700"
+                      : meta.status === "failed"
+                        ? "border-red-300 dark:border-red-700"
+                        : "border-emerald-300 dark:border-emerald-700";
+                  const bgColor =
+                    meta.status === "assertion"
+                      ? "bg-purple-50 dark:bg-purple-950/30"
+                      : meta.status === "failed"
+                        ? "bg-red-50 dark:bg-red-950/30"
+                        : "bg-emerald-50 dark:bg-emerald-950/30";
+                  const labelColor =
+                    meta.status === "assertion"
+                      ? "text-purple-700 dark:text-purple-300"
+                      : meta.status === "failed"
+                        ? "text-red-700 dark:text-red-300"
+                        : "text-emerald-700 dark:text-emerald-300";
+                  return (
+                    <div key={idx} className="flex justify-start">
+                      <div className={`max-w-[92%] rounded-xl border ${borderColor} ${bgColor} px-3 py-2 text-sm`}>
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-xs">{actionIcon}</span>
+                          <span className={`text-xs font-semibold uppercase tracking-wide ${labelColor}`}>
+                            Recorded
+                          </span>
+                          <span className={`text-xs font-medium ${labelColor}`}>
+                            {message.content}
+                          </span>
+                        </div>
+                        <div className="mt-1 rounded-md bg-zinc-900 px-2.5 py-1.5 font-mono text-xs text-emerald-400 dark:bg-zinc-950">
+                          {meta.playwright}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                }
                 return (
                   <div key={idx} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
                     <div

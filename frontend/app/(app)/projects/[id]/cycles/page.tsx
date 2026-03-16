@@ -77,7 +77,9 @@ export default function TestRunsPage() {
   const [environment, setEnvironment] = useState("");
   const [buildVersion, setBuildVersion] = useState("");
   const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
+  const [canManageRuns, setCanManageRuns] = useState(false);
 
   function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
     if (typeof raw !== "string" || !raw.trim()) return {};
@@ -108,6 +110,8 @@ export default function TestRunsPage() {
         setRuns(runsData);
         const parsedSettings = parseProjectSettings(project.settings);
         setEnvironmentOptions(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
+        const myRole = (project.myRole as string ?? "").toLowerCase();
+        setCanManageRuns(["owner", "admin", "manager"].includes(myRole));
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -128,11 +132,14 @@ export default function TestRunsPage() {
     e.preventDefault();
     if (!name.trim() || !environment.trim()) return;
     setSaving(true);
+    setFormError(null);
     try {
       await createTestRun(projectId, { name, description, environment, buildVersion });
       setShowCreate(false);
       resetForm();
       load();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Failed to create test run.");
     } finally {
       setSaving(false);
     }
@@ -151,11 +158,14 @@ export default function TestRunsPage() {
     e.preventDefault();
     if (!editRun || !environment.trim()) return;
     setSaving(true);
+    setFormError(null);
     try {
       await updateTestRun(editRun.id, { name, description, environment, buildVersion });
       setEditRun(null);
       resetForm();
       load();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Failed to update test run.");
     } finally {
       setSaving(false);
     }
@@ -165,10 +175,13 @@ export default function TestRunsPage() {
   async function handleDelete() {
     if (!deleteTarget) return;
     setSaving(true);
+    setFormError(null);
     try {
       await deleteTestRun(deleteTarget.id);
       setDeleteTarget(null);
       load();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Failed to delete test run.");
     } finally {
       setSaving(false);
     }
@@ -201,23 +214,26 @@ export default function TestRunsPage() {
             Create and manage test runs to track execution progress.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              resetForm();
-              setShowCreate(true);
-            }}
-            className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium transition-colors"
-          >
-            + New Test Run
-          </button>
-          <Link
-            href={`/projects/${projectId}/cycles/schedule`}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
-          >
-            Schedule Run
-          </Link>
-        </div>
+        {canManageRuns && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                resetForm();
+                setFormError(null);
+                setShowCreate(true);
+              }}
+              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium transition-colors"
+            >
+              + New Test Run
+            </button>
+            <Link
+              href={`/projects/${projectId}/cycles/schedule`}
+              className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
+            >
+              Schedule Run
+            </Link>
+          </div>
+        )}
       </div>
 
       {/* Empty state */}
@@ -226,7 +242,11 @@ export default function TestRunsPage() {
           <svg className="mx-auto w-12 h-12 mb-3 text-zinc-300 dark:text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
           </svg>
-          <p className="text-sm">No test runs yet. Create one to get started.</p>
+          <p className="text-sm">
+            {canManageRuns
+              ? "No test runs yet. Create one to get started."
+              : "No test runs have been created for this project yet."}
+          </p>
         </div>
       )}
 
@@ -285,32 +305,36 @@ export default function TestRunsPage() {
                   )}
 
                   {/* Actions */}
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openEdit(r);
-                      }}
-                      className="p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
-                      title="Edit"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                      </svg>
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteTarget(r);
-                      }}
-                      className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-zinc-400 hover:text-red-600"
-                      title="Delete"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
-                  </div>
+                  {canManageRuns && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormError(null);
+                          openEdit(r);
+                        }}
+                        className="p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
+                        title="Edit"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormError(null);
+                          setDeleteTarget(r);
+                        }}
+                        className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-zinc-400 hover:text-red-600"
+                        title="Delete"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -396,10 +420,15 @@ export default function TestRunsPage() {
               />
             </div>
           </div>
+          {formError && (
+            <p className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+              {formError}
+            </p>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setShowCreate(false)}
+              onClick={() => { setShowCreate(false); setFormError(null); }}
               className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
             >
               Cancel
@@ -484,12 +513,18 @@ export default function TestRunsPage() {
               />
             </div>
           </div>
+          {formError && (
+            <p className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+              {formError}
+            </p>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
               onClick={() => {
                 setEditRun(null);
                 resetForm();
+                setFormError(null);
               }}
               className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
             >
@@ -520,9 +555,14 @@ export default function TestRunsPage() {
           ? This will remove all associated test case executions. This action
           cannot be undone.
         </p>
+        {formError && (
+          <p className="mb-4 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+            {formError}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
-            onClick={() => setDeleteTarget(null)}
+            onClick={() => { setDeleteTarget(null); setFormError(null); }}
             className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
           >
             Cancel

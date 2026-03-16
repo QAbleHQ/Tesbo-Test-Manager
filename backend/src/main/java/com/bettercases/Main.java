@@ -108,6 +108,11 @@ public final class Main {
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/manual-actions", AutomationSessionHandler::manualAction);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/run-script", AutomationSessionHandler::runPlaywrightScript);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/recording", AutomationSessionHandler::getRecording);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/recording/compile", AutomationSessionHandler::compileRecording);
+        app.get("/api/projects/{projectId}/automation/recordings", AutomationSessionHandler::listRecordingsByProject);
+        app.get("/api/projects/{projectId}/automation/recordings/{recordingId}", AutomationSessionHandler::getRecordingById);
+        app.get("/api/projects/{projectId}/testcases/{testcaseId}/automation/recordings", AutomationSessionHandler::listRecordingsByTestcase);
 
         app.get("/api/projects/{projectId}/plans", PlanHandler::list);
         app.post("/api/projects/{projectId}/plans", PlanHandler::create);

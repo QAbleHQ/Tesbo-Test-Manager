@@ -154,8 +154,11 @@ export default function ProjectSettingsPage() {
   const [membersLoading, setMembersLoading] = useState(true);
   const [memberError, setMemberError] = useState<string | null>(null);
   const [addUserId, setAddUserId] = useState("");
+  const [addRole, setAddRole] = useState<string>("member");
   const [addingMember, setAddingMember] = useState(false);
   const [removingMemberId, setRemovingMemberId] = useState<string | null>(null);
+  const [changingRoleId, setChangingRoleId] = useState<string | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [deletingProject, setDeletingProject] = useState(false);
   const jiraTabEnabled = jiraStatus?.connected === true;
 
@@ -234,6 +237,7 @@ export default function ProjectSettingsPage() {
         router.replace("/login");
         return;
       }
+      setCurrentUserId(me.userId);
       getProject(projectId).then((p) => {
         setProject(p);
         setName((p.name as string) ?? "");
@@ -475,6 +479,28 @@ export default function ProjectSettingsPage() {
   const memberIds = new Set(projectMembers.map((member) => member.userId));
   const availableToAdd = workspaceMembers.filter((member) => !memberIds.has(member.userId));
 
+  const currentUserRole = currentUserId
+    ? normalizeRole(projectMembers.find((m) => m.userId === currentUserId)?.role ?? "member")
+    : "member";
+  const canManageMembers = currentUserRole === "owner" || currentUserRole === "admin" || currentUserRole === "manager";
+
+  function assignableRoles(): { value: string; label: string }[] {
+    if (currentUserRole === "owner") return [{ value: "owner", label: "Owner" }, { value: "admin", label: "Admin" }, { value: "manager", label: "Manager" }, { value: "member", label: "Member" }];
+    if (currentUserRole === "admin") return [{ value: "manager", label: "Manager" }, { value: "member", label: "Member" }];
+    if (currentUserRole === "manager") return [{ value: "member", label: "Member" }];
+    return [];
+  }
+
+  function canChangeRole(member: ProjectMember): boolean {
+    if (!canManageMembers) return false;
+    if (member.userId === currentUserId) return false;
+    const targetRole = normalizeRole(member.role);
+    if (targetRole === "owner") return false;
+    if (currentUserRole === "manager" && (targetRole === "admin" || targetRole === "owner")) return false;
+    if (currentUserRole === "admin" && (targetRole === "admin" || targetRole === "owner")) return false;
+    return true;
+  }
+
   async function handleAddMember(e: React.FormEvent) {
     e.preventDefault();
     if (!addUserId) {
@@ -484,13 +510,28 @@ export default function ProjectSettingsPage() {
     setAddingMember(true);
     setMemberError(null);
     try {
-      await addProjectMember(projectId, { userId: addUserId, role: "member" });
+      await addProjectMember(projectId, { userId: addUserId, role: addRole });
       setAddUserId("");
+      setAddRole("member");
       await loadMembers();
     } catch {
       setMemberError("Failed to add project member.");
     } finally {
       setAddingMember(false);
+    }
+  }
+
+  async function handleChangeRole(userId: string, newRole: string) {
+    setChangingRoleId(userId);
+    setMemberError(null);
+    try {
+      await addProjectMember(projectId, { userId, role: newRole });
+      await loadMembers();
+    } catch (err) {
+      const text = err instanceof Error ? err.message : "Failed to change member role.";
+      setMemberError(text);
+    } finally {
+      setChangingRoleId(null);
     }
   }
 
@@ -1033,9 +1074,9 @@ export default function ProjectSettingsPage() {
             </div>
           </div>
 
-          {availableToAdd.length > 0 && (
+          {availableToAdd.length > 0 && canManageMembers && (
             <form onSubmit={handleAddMember} className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
-              <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+              <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
                 <div>
                   <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
                     Add workspace member
@@ -1051,6 +1092,21 @@ export default function ProjectSettingsPage() {
                       <option key={member.userId} value={member.userId}>
                         {member.name || member.email} ({member.email})
                       </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Role
+                  </label>
+                  <select
+                    value={addRole}
+                    onChange={(e) => setAddRole(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
+                    disabled={addingMember || membersLoading}
+                  >
+                    {assignableRoles().map((r) => (
+                      <option key={r.value} value={r.value}>{r.label}</option>
                     ))}
                   </select>
                 </div>
@@ -1081,25 +1137,50 @@ export default function ProjectSettingsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {projectMembers.map((member) => (
+                  {projectMembers.map((member) => {
+                    const editable = canChangeRole(member);
+                    return (
                     <tr key={member.userId} className="border-t border-zinc-200 dark:border-zinc-700">
-                      <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">{member.name || "—"}</td>
+                      <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">
+                        {member.name || "—"}
+                        {member.userId === currentUserId && (
+                          <span className="ml-1.5 text-xs text-zinc-400">(you)</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">{member.email}</td>
                       <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">
-                        {roleLabel(member.role)}
+                        {editable ? (
+                          <select
+                            value={normalizeRole(member.role)}
+                            onChange={(e) => handleChangeRole(member.userId, e.target.value)}
+                            disabled={changingRoleId === member.userId}
+                            className="rounded-md border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm text-zinc-900 dark:text-zinc-100 disabled:opacity-50"
+                          >
+                            {assignableRoles().map((r) => (
+                              <option key={r.value} value={r.value}>{r.label}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="inline-flex items-center rounded-md bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                            {roleLabel(member.role)}
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveMember(member.userId)}
-                          disabled={removingMemberId === member.userId}
-                          className="text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
-                        >
-                          {removingMemberId === member.userId ? "Removing…" : "Remove"}
-                        </button>
+                        {canManageMembers && member.userId !== currentUserId && normalizeRole(member.role) !== "owner" && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMember(member.userId)}
+                            disabled={removingMemberId === member.userId}
+                            className="text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                          >
+                            {removingMemberId === member.userId ? "Removing…" : "Remove"}
+                          </button>
+                        )}
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {!membersLoading && projectMembers.length === 0 && (
                     <tr className="border-t border-zinc-200 dark:border-zinc-700">
                       <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
