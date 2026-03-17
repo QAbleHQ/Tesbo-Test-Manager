@@ -6,7 +6,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
-COPY artifacts ./artifacts
+RUN mkdir -p ./artifacts/screenshots ./artifacts/videos ./artifacts/traces ./artifacts/stagehand-cache
 
 ENV PORT=7400
 EXPOSE 7400
