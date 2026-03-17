@@ -109,6 +109,7 @@ public final class TestCaseService {
         RbacService.requireProjectRole(userId, projectId);
         String sql = "SELECT id, project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, " +
                 "priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name, automation_framework, automation_tags, " +
+                "automation_script, automation_script_language, automation_script_version, automated_at, automated_by, " +
                 "owner_id, component, status, created_at, updated_at, jira_issue_key, jira_url FROM testcases WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -139,6 +140,23 @@ public final class TestCaseService {
                 m.put("automationTestName", rs.getString("automation_test_name") != null ? rs.getString("automation_test_name") : "");
                 m.put("automationFramework", rs.getString("automation_framework") != null ? rs.getString("automation_framework") : "");
                 m.put("automationTags", rs.getString("automation_tags") != null ? rs.getString("automation_tags") : "");
+                m.put("automationScript", rs.getString("automation_script") != null ? rs.getString("automation_script") : "");
+                m.put("automationScriptLanguage", rs.getString("automation_script_language") != null ? rs.getString("automation_script_language") : "");
+                m.put("automationScriptVersion", rs.getInt("automation_script_version"));
+                String currentScript = rs.getString("automation_script") != null ? rs.getString("automation_script") : "";
+                String currentScriptLanguage = rs.getString("automation_script_language") != null ? rs.getString("automation_script_language") : "";
+                int currentScriptVersion = rs.getInt("automation_script_version");
+                String testcaseUpdatedAt = rs.getTimestamp("updated_at").toInstant().toString();
+                m.put("automationScriptHistory", listAutomationScriptHistory(
+                        testcaseId,
+                        currentScript,
+                        currentScriptLanguage,
+                        currentScriptVersion,
+                        testcaseUpdatedAt
+                ));
+                m.put("automatedAt", rs.getTimestamp("automated_at") != null ? rs.getTimestamp("automated_at").toInstant().toString() : null);
+                Object automatedBy = rs.getObject("automated_by");
+                m.put("automatedBy", automatedBy != null ? automatedBy.toString() : null);
                 m.put("ownerId", ownerId != null ? ownerId.toString() : null);
                 m.put("component", rs.getString("component") != null ? rs.getString("component") : "");
                 m.put("status", rs.getString("status"));
@@ -184,9 +202,12 @@ public final class TestCaseService {
         if (!RbacService.getProjectRole(userId, projectId).get().canEditCases())
             throw new io.javalin.http.ForbiddenResponse("Cannot create test cases");
         String externalId = dto.externalId != null && !dto.externalId.isBlank() ? dto.externalId : nextExternalId(projectId);
+        String resolvedAutomationStatus = (dto.automationScript != null && !dto.automationScript.isBlank())
+                ? "Automated"
+                : (dto.automationStatus != null ? dto.automationStatus : "No");
         String sql = "INSERT INTO testcases (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, " +
-                "priority, severity, type, automation_status, automation_tags, owner_id, component, status, jira_issue_key, jira_url) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, external_id, title, created_at";
+                "priority, severity, type, automation_status, automation_tags, automation_script, automation_script_language, automation_script_version, owner_id, component, status, jira_issue_key, jira_url) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, external_id, title, created_at";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
@@ -218,28 +239,41 @@ public final class TestCaseService {
                 ps.setNull(13, java.sql.Types.VARCHAR);
             }
             ps.setString(14, dto.type != null ? dto.type : "Functional");
-            ps.setString(15, dto.automationStatus != null ? dto.automationStatus : "No");
+            ps.setString(15, resolvedAutomationStatus);
             if (dto.automationTags != null && !dto.automationTags.isBlank()) {
                 ps.setString(16, dto.automationTags);
             } else {
                 ps.setNull(16, java.sql.Types.VARCHAR);
             }
-            ps.setObject(17, dto.ownerId != null && !dto.ownerId.isBlank() ? UUID.fromString(dto.ownerId) : userId);
-            if (dto.component != null && !dto.component.isBlank()) {
-                ps.setString(18, dto.component);
+            if (dto.automationScript != null) {
+                ps.setString(17, dto.automationScript);
+            } else {
+                ps.setNull(17, java.sql.Types.VARCHAR);
+            }
+            if (dto.automationScriptLanguage != null && !dto.automationScriptLanguage.isBlank()) {
+                ps.setString(18, dto.automationScriptLanguage);
+            } else if (dto.automationScript != null && !dto.automationScript.isBlank()) {
+                ps.setString(18, "playwright-ts");
             } else {
                 ps.setNull(18, java.sql.Types.VARCHAR);
             }
-            ps.setString(19, dto.status != null ? dto.status : "Draft");
-            if (dto.jiraIssueKey != null && !dto.jiraIssueKey.isBlank()) {
-                ps.setString(20, dto.jiraIssueKey);
-            } else {
-                ps.setNull(20, java.sql.Types.VARCHAR);
-            }
-            if (dto.jiraUrl != null && !dto.jiraUrl.isBlank()) {
-                ps.setString(21, dto.jiraUrl);
+            ps.setInt(19, dto.automationScript != null && !dto.automationScript.isBlank() ? 1 : 0);
+            ps.setObject(20, dto.ownerId != null && !dto.ownerId.isBlank() ? UUID.fromString(dto.ownerId) : userId);
+            if (dto.component != null && !dto.component.isBlank()) {
+                ps.setString(21, dto.component);
             } else {
                 ps.setNull(21, java.sql.Types.VARCHAR);
+            }
+            ps.setString(22, dto.status != null ? dto.status : "Draft");
+            if (dto.jiraIssueKey != null && !dto.jiraIssueKey.isBlank()) {
+                ps.setString(23, dto.jiraIssueKey);
+            } else {
+                ps.setNull(23, java.sql.Types.VARCHAR);
+            }
+            if (dto.jiraUrl != null && !dto.jiraUrl.isBlank()) {
+                ps.setString(24, dto.jiraUrl);
+            } else {
+                ps.setNull(24, java.sql.Types.VARCHAR);
             }
             ResultSet rs = ps.executeQuery();
             rs.next();
@@ -267,8 +301,8 @@ public final class TestCaseService {
                 rs.next();
                 nextVersion = rs.getInt(1);
             }
-            try (PreparedStatement sel = c.prepareStatement("SELECT title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, priority, severity, type, automation_status, automation_tags, status FROM testcases WHERE id = ?");
-                 PreparedStatement ins = c.prepareStatement("INSERT INTO testcase_versions (testcase_id, version, snapshot) SELECT id, ?, jsonb_build_object('title', title, 'description', description, 'preconditions', preconditions, 'postconditions', postconditions, 'steps', steps, 'test_data', test_data, 'estimated_duration', estimated_duration, 'attachments', attachments, 'priority', priority, 'severity', severity, 'type', type, 'automation_status', automation_status, 'automation_tags', automation_tags, 'status', status) FROM testcases WHERE id = ?")) {
+            try (PreparedStatement sel = c.prepareStatement("SELECT title, description, preconditions, postconditions, steps, test_data, estimated_duration, attachments, priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name, automation_framework, automation_tags, automation_script, automation_script_language, automation_script_version, status FROM testcases WHERE id = ?");
+                 PreparedStatement ins = c.prepareStatement("INSERT INTO testcase_versions (testcase_id, version, snapshot) SELECT id, ?, jsonb_build_object('title', title, 'description', description, 'preconditions', preconditions, 'postconditions', postconditions, 'steps', steps, 'test_data', test_data, 'estimated_duration', estimated_duration, 'attachments', attachments, 'priority', priority, 'severity', severity, 'type', type, 'automation_status', automation_status, 'automation_repo', automation_repo, 'automation_path', automation_path, 'automation_test_name', automation_test_name, 'automation_framework', automation_framework, 'automation_tags', automation_tags, 'automation_script', automation_script, 'automation_script_language', automation_script_language, 'automation_script_version', automation_script_version, 'status', status) FROM testcases WHERE id = ?")) {
                 sel.setObject(1, testcaseId);
                 ResultSet rs = sel.executeQuery();
                 if (rs.next()) {
@@ -280,10 +314,15 @@ public final class TestCaseService {
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+        String resolvedAutomationStatus = (dto.automationScript != null && !dto.automationScript.isBlank())
+                ? "Automated"
+                : dto.automationStatus;
         String sql = "UPDATE testcases SET title = COALESCE(?, title), description = COALESCE(?, description), preconditions = COALESCE(?, preconditions), " +
                 "postconditions = COALESCE(?, postconditions), steps = COALESCE(?::jsonb, steps), test_data = COALESCE(?, test_data), estimated_duration = ?, attachments = ?, " +
                 "priority = COALESCE(?, priority), severity = ?, type = COALESCE(?, type), automation_status = COALESCE(?, automation_status), " +
                 "automation_repo = ?, automation_path = ?, automation_test_name = ?, automation_framework = ?, automation_tags = ?, " +
+                "automation_script = COALESCE(?, automation_script), automation_script_language = COALESCE(?, automation_script_language), " +
+                "automation_script_version = CASE WHEN ? IS NOT NULL THEN COALESCE(automation_script_version, 0) + 1 ELSE automation_script_version END, " +
                 "owner_id = CASE WHEN ?::uuid IS NOT NULL THEN ?::uuid ELSE owner_id END, component = COALESCE(?, component), status = COALESCE(?, status), " +
                 "suite_id = CASE WHEN ?::uuid IS NOT NULL THEN ?::uuid ELSE suite_id END, updated_at = now() WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
@@ -300,19 +339,22 @@ public final class TestCaseService {
             ps.setString(9, dto.priority);
             ps.setString(10, dto.severity);
             ps.setString(11, dto.type);
-            ps.setString(12, dto.automationStatus);
+            ps.setString(12, resolvedAutomationStatus);
             ps.setString(13, dto.automationRepo);
             ps.setString(14, dto.automationPath);
             ps.setString(15, dto.automationTestName);
             ps.setString(16, dto.automationFramework);
             ps.setString(17, dto.automationTags);
-            ps.setString(18, dto.ownerId);
-            ps.setString(19, dto.ownerId);
-            ps.setString(20, dto.component);
-            ps.setString(21, dto.status);
-            ps.setString(22, suiteId);
-            ps.setString(23, suiteId);
-            ps.setObject(24, testcaseId);
+            ps.setString(18, dto.automationScript);
+            ps.setString(19, dto.automationScriptLanguage);
+            ps.setString(20, dto.automationScript);
+            ps.setString(21, dto.ownerId);
+            ps.setString(22, dto.ownerId);
+            ps.setString(23, dto.component);
+            ps.setString(24, dto.status);
+            ps.setString(25, suiteId);
+            ps.setString(26, suiteId);
+            ps.setObject(27, testcaseId);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -419,6 +461,69 @@ public final class TestCaseService {
         return counts;
     }
 
+    private static List<Map<String, Object>> listAutomationScriptHistory(
+            UUID testcaseId,
+            String currentScript,
+            String currentScriptLanguage,
+            int currentScriptVersion,
+            String testcaseUpdatedAt
+    ) {
+        List<Map<String, Object>> history = new ArrayList<>();
+
+        if (currentScript != null && !currentScript.isBlank()) {
+            Map<String, Object> current = new HashMap<>();
+            current.put("scriptVersion", Math.max(1, currentScriptVersion));
+            current.put("testcaseVersion", null);
+            current.put("script", currentScript);
+            current.put("language", currentScriptLanguage == null ? "" : currentScriptLanguage);
+            current.put("capturedAt", testcaseUpdatedAt);
+            current.put("isCurrent", true);
+            history.add(current);
+        }
+
+        String sql = "SELECT version, created_at, " +
+                "COALESCE(snapshot->>'automation_script', '') AS script, " +
+                "COALESCE(snapshot->>'automation_script_language', '') AS script_language, " +
+                "COALESCE(NULLIF(snapshot->>'automation_script_version', '')::int, 0) AS script_version " +
+                "FROM testcase_versions WHERE testcase_id = ? ORDER BY created_at DESC";
+
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, testcaseId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                String script = rs.getString("script");
+                if (script == null || script.isBlank()) continue;
+                int scriptVersion = rs.getInt("script_version");
+                boolean duplicate = false;
+                for (Map<String, Object> entry : history) {
+                    Object existingScriptVersion = entry.get("scriptVersion");
+                    Object existingScript = entry.get("script");
+                    if (existingScriptVersion instanceof Number n &&
+                            n.intValue() == scriptVersion &&
+                            script.equals(existingScript)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                Map<String, Object> row = new HashMap<>();
+                row.put("scriptVersion", scriptVersion);
+                row.put("testcaseVersion", rs.getInt("version"));
+                row.put("script", script);
+                row.put("language", rs.getString("script_language"));
+                row.put("capturedAt", rs.getTimestamp("created_at").toInstant().toString());
+                row.put("isCurrent", false);
+                history.add(row);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+
+        return history;
+    }
+
     public static class CreateDto {
         public String externalId;
         public String suiteId;
@@ -435,6 +540,8 @@ public final class TestCaseService {
         public String type;
         public String automationStatus;
         public String automationTags;
+        public String automationScript;
+        public String automationScriptLanguage;
         public String ownerId;
         public String component;
         public String status;
@@ -460,6 +567,8 @@ public final class TestCaseService {
         public String automationTestName;
         public String automationFramework;
         public String automationTags;
+        public String automationScript;
+        public String automationScriptLanguage;
         public String ownerId;
         public String component;
         public String status;

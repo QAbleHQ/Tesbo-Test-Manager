@@ -1,4 +1,4 @@
-name: Deploy BetterCases to DigitalOcean
+name: Deploy TesboX to DigitalOcean
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ env:
   REGISTRY: ${{ secrets.DOCR_REGISTRY }}
   FRONTEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_FRONTEND }}
   BACKEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_BACKEND }}
+  AUTOMATION_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_AUTOMATION }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
@@ -58,6 +59,22 @@ jobs:
           docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
           docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
           docker push "${BACKEND_IMAGE_CLEAN}:latest"
+
+      - name: Build and push automation image
+        run: |
+          set -euo pipefail
+          AUTOMATION_IMAGE_CLEAN="$(printf '%s' "${AUTOMATION_IMAGE}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+
+          if [[ -z "${AUTOMATION_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "AUTOMATION_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f automation-agent/Dockerfile -t "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" automation-agent
+          docker push "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${AUTOMATION_IMAGE_CLEAN}:latest"
+          docker push "${AUTOMATION_IMAGE_CLEAN}:latest"
 
   deploy-frontend:
     needs: build-and-push
@@ -138,8 +155,72 @@ jobs:
           TESBO_SPACES_ACCESS_KEY=${{ secrets.TESBO_SPACES_ACCESS_KEY }}
           TESBO_SPACES_SECRET_KEY=${{ secrets.TESBO_SPACES_SECRET_KEY }}
           TESBO_SIGNED_URL_TTL_SECONDS=${{ secrets.TESBO_SIGNED_URL_TTL_SECONDS }}
+          AUTOMATION_EXECUTION_MODE=${{ secrets.AUTOMATION_EXECUTION_MODE }}
+          AUTOMATION_AGENT_BASE_URL=${{ secrets.AUTOMATION_AGENT_BASE_URL }}
+          AUTOMATION_QUEUE_API_BASE_URL=${{ secrets.AUTOMATION_QUEUE_API_BASE_URL }}
+          AUTOMATION_QUEUE_SHARED_TOKEN=${{ secrets.AUTOMATION_QUEUE_SHARED_TOKEN }}
+          AUTOMATION_QUEUE_MAX_RETRIES=${{ secrets.AUTOMATION_QUEUE_MAX_RETRIES }}
+          AUTOMATION_QUEUE_STALE_MINUTES=${{ secrets.AUTOMATION_QUEUE_STALE_MINUTES }}
+          AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT=${{ secrets.AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT }}
+          AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT=${{ secrets.AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT }}
+          AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS }}
+          AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS }}
+          AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER }}
+          AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS }}
+          BROWSERBASE_API_KEY=${{ secrets.BROWSERBASE_API_KEY }}
+          BROWSERBASE_PROJECT_ID=${{ secrets.BROWSERBASE_PROJECT_ID }}
           EOF"
 
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
+
+  deploy-automation:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy automation
+        env:
+          DROPLET_IP: ${{ secrets.DROPLET_AUTOMATION_IP }}
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          set -e
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/automation"
+          scp -o StrictHostKeyChecking=no deploy/automation/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/automation/docker-compose.yml
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/automation/.env <<'EOF'
+          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
+          DOCR_REPO_AUTOMATION=${{ secrets.DOCR_REPO_AUTOMATION }}
+          IMAGE_TAG=${{ github.sha }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/automation/app.env <<'EOF'
+          PLAYWRIGHT_HEADLESS=true
+          SESSION_TTL_MS=900000
+          SESSION_CREATE_CONCURRENCY=2
+          START_URL_TIMEOUT_MS=60000
+          SCREENSHOT_DIR=/app/artifacts/screenshots
+          TRACE_DIR=/app/artifacts/traces
+          STAGEHAND_CACHE_DIR=/app/artifacts/stagehand-cache
+          USE_TELEMETRY=true
+          AUTOMATION_QUEUE_ENABLED=true
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          AUTOMATION_QUEUE_PREFIX=${{ secrets.AUTOMATION_QUEUE_PREFIX }}
+          AUTOMATION_QUEUE_NAME=${{ secrets.AUTOMATION_QUEUE_NAME }}
+          AUTOMATION_QUEUE_MAX_RETRIES=${{ secrets.AUTOMATION_QUEUE_MAX_RETRIES }}
+          AUTOMATION_QUEUE_HEARTBEAT_MS=5000
+          BACKEND_BASE_URL=${{ secrets.BACKEND_BASE_URL }}
+          AUTOMATION_QUEUE_SHARED_TOKEN=${{ secrets.AUTOMATION_QUEUE_SHARED_TOKEN }}
+          AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
+          EOF"
+
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/automation && docker compose pull && docker compose up -d --remove-orphans"
+          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "sleep 5 && docker compose -f /opt/bettercases/automation/docker-compose.yml ps"

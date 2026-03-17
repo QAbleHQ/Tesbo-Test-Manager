@@ -54,6 +54,17 @@ public final class RemoteAiService implements AiService {
         throw new RuntimeException("AI provider returned an invalid response format");
     }
 
+    public String completeText(String systemPrompt, String userPrompt, double temperature) {
+        String safeSystem = (systemPrompt == null || systemPrompt.isBlank())
+                ? "You are a helpful assistant."
+                : systemPrompt;
+        String safeUser = userPrompt == null ? "" : userPrompt;
+        if (provider == Provider.OPENAI) {
+            return callOpenAiWithSystemPrompt(safeSystem, safeUser, temperature);
+        }
+        return callAnthropicWithSystemPrompt(safeSystem, safeUser, temperature);
+    }
+
     @Override
     public String improveTestCase(String testCaseJson, String instruction) {
         return testCaseJson;
@@ -110,6 +121,35 @@ public final class RemoteAiService implements AiService {
         }
     }
 
+    private String callOpenAiWithSystemPrompt(String systemPrompt, String userPrompt, double temperature) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("model", model != null && !model.isBlank() ? model : DEFAULT_OPENAI_MODEL);
+        ArrayNode messages = body.putArray("messages");
+        messages.addObject()
+                .put("role", "system")
+                .put("content", systemPrompt);
+        messages.addObject().put("role", "user").put("content", userPrompt);
+        body.put("temperature", temperature);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(OPENAI_ENDPOINT))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
+                .build();
+        String response = sendRequest(request);
+        try {
+            JsonNode root = mapper.readTree(response);
+            JsonNode content = root.path("choices").path(0).path("message").path("content");
+            if (content.isMissingNode() || content.isNull() || content.asText().isBlank()) {
+                throw new RuntimeException("OpenAI returned empty completion");
+            }
+            return content.asText();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse OpenAI response", e);
+        }
+    }
+
     private String callAnthropic(String prompt) {
         ObjectNode body = mapper.createObjectNode();
         body.put("model", model != null && !model.isBlank() ? model : DEFAULT_ANTHROPIC_MODEL);
@@ -141,6 +181,43 @@ public final class RemoteAiService implements AiService {
                 "provider_response provider=anthropic model=" + activeModel +
                         " body=" + AiLoggers.truncate(response, 2500)
         );
+        try {
+            JsonNode root = mapper.readTree(response);
+            JsonNode contentArray = root.path("content");
+            if (!contentArray.isArray()) throw new RuntimeException("Anthropic content not found");
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode part : contentArray) {
+                if ("text".equals(part.path("type").asText())) {
+                    sb.append(part.path("text").asText(""));
+                }
+            }
+            String text = sb.toString().trim();
+            if (text.isBlank()) throw new RuntimeException("Anthropic returned empty completion");
+            return text;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse Anthropic response", e);
+        }
+    }
+
+    private String callAnthropicWithSystemPrompt(String systemPrompt, String userPrompt, double temperature) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("model", model != null && !model.isBlank() ? model : DEFAULT_ANTHROPIC_MODEL);
+        body.put("max_tokens", 3000);
+        body.put("temperature", temperature);
+        body.put("system", systemPrompt);
+        ArrayNode messages = body.putArray("messages");
+        messages.addObject()
+                .put("role", "user")
+                .put("content", userPrompt);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(ANTHROPIC_ENDPOINT))
+                .header("Content-Type", "application/json")
+                .header("x-api-key", apiKey)
+                .header("anthropic-version", "2023-06-01")
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
+                .build();
+        String response = sendRequest(request);
         try {
             JsonNode root = mapper.readTree(response);
             JsonNode contentArray = root.path("content");

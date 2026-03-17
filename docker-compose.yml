@@ -1,4 +1,4 @@
-# PostgreSQL for BetterCases. Use this if your local Postgres has no "postgres" role.
+# PostgreSQL for TesboX. Use this if your local Postgres has no "postgres" role.
 # Start: docker compose up -d
 # Stop:  docker compose down
 services:
@@ -12,5 +12,43 @@ services:
       - "5432:5432"
     volumes:
       - bettercases_pgdata:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  automation-agent:
+    build:
+      context: ./automation-agent
+      dockerfile: Dockerfile
+    environment:
+      PORT: 7400
+      AUTOMATION_SERVICE_ROLE: api
+      REDIS_URL: redis://redis:6379
+      BACKEND_BASE_URL: http://host.docker.internal:7000
+      AUTOMATION_QUEUE_ENABLED: "true"
+      AUTOMATION_QUEUE_SHARED_TOKEN: changeme
+      AGENT_SHARED_TOKEN: changeme
+      AUTOMATION_QUEUE_CONCURRENCY: 2
+    depends_on:
+      - redis
+    ports:
+      - "7400:7400"
+  automation-worker:
+    build:
+      context: ./automation-agent
+      dockerfile: Dockerfile
+    environment:
+      PORT: 7401
+      AUTOMATION_SERVICE_ROLE: worker
+      REDIS_URL: redis://redis:6379
+      BACKEND_BASE_URL: http://host.docker.internal:7000
+      AUTOMATION_QUEUE_ENABLED: "true"
+      AUTOMATION_QUEUE_SHARED_TOKEN: changeme
+      AGENT_SHARED_TOKEN: changeme
+      AUTOMATION_QUEUE_CONCURRENCY: 4
+    depends_on:
+      - redis
+    ports:
+      - "7401:7401"
 volumes:
   bettercases_pgdata:

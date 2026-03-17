@@ -2,6 +2,8 @@ package com.bettercases.cycle;
 
 import com.bettercases.audit.AuditService;
 import com.bettercases.auth.SessionFilter;
+import com.bettercases.automation.AutomationAgentClient;
+import com.bettercases.tesbo.TesboArtifactStorageService;
 import io.javalin.http.Context;
 
 import java.util.List;
@@ -32,6 +34,10 @@ public final class CycleHandler {
         CreateBody body = ctx.bodyAsClass(CreateBody.class);
         if (body == null || body.name == null || body.name.isBlank()) {
             ctx.status(400).json(Map.of("error", "name is required"));
+            return;
+        }
+        if (body.environment == null || body.environment.isBlank()) {
+            ctx.status(400).json(Map.of("error", "environment is required"));
             return;
         }
         Map<String, Object> result = CycleService.create(projectId, userId, body.name, body.description, body.environment, body.buildVersion);
@@ -111,6 +117,10 @@ public final class CycleHandler {
             ctx.status(400).json(Map.of("error", "planId required"));
             return;
         }
+        if (body.environment == null || body.environment.isBlank()) {
+            ctx.status(400).json(Map.of("error", "environment is required"));
+            return;
+        }
         String name = body.name != null ? body.name : "Test Run";
         Map<String, Object> result = CycleService.createFromPlan(projectId, userId, UUID.fromString(body.planId), name, body.environment, body.buildVersion);
         try {
@@ -127,6 +137,10 @@ public final class CycleHandler {
         CreateFromCasesBody body = ctx.bodyAsClass(CreateFromCasesBody.class);
         if (body == null || body.testcaseIds == null || body.testcaseIds.isEmpty()) {
             ctx.status(400).json(Map.of("error", "testcaseIds required"));
+            return;
+        }
+        if (body.environment == null || body.environment.isBlank()) {
+            ctx.status(400).json(Map.of("error", "environment is required"));
             return;
         }
         List<UUID> ids = body.testcaseIds.stream().map(UUID::fromString).collect(Collectors.toList());
@@ -154,6 +168,152 @@ public final class CycleHandler {
         if (body == null) body = new UpdateExecutionBody();
         UUID assigneeId = body.assigneeId != null ? UUID.fromString(body.assigneeId) : null;
         CycleService.updateExecution(executionId, userId, body.status, assigneeId, body.actualResult, body.defectKey, body.defectUrl);
+        ctx.status(204);
+    }
+
+    /* ───── GET automation report for execution ───── */
+    public static void getExecutionAutomationReport(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID executionId = UUID.fromString(ctx.pathParam("executionId"));
+        ctx.json(ExecutionAutomationReportService.get(cycleId, executionId, userId));
+    }
+
+    /* ───── STREAM automation video for execution ───── */
+    public static void streamExecutionAutomationVideo(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID executionId = UUID.fromString(ctx.pathParam("executionId"));
+        try {
+            TesboArtifactStorageService.ArtifactReadResult result =
+                    ExecutionAutomationReportService.getVideoArtifact(cycleId, executionId, userId);
+            if (result.redirect()) {
+                ctx.redirect(result.redirectUrl());
+                return;
+            }
+            if (result.contentType() != null) ctx.contentType(result.contentType());
+            ctx.result(result.stream());
+        } catch (io.javalin.http.HttpResponseException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new io.javalin.http.NotFoundResponse("Automation video not found");
+        }
+    }
+
+    public static void streamExecutionAutomationTrace(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID executionId = UUID.fromString(ctx.pathParam("executionId"));
+        try {
+            TesboArtifactStorageService.ArtifactReadResult result =
+                    ExecutionAutomationReportService.getTraceArtifact(cycleId, executionId, userId);
+            if (result.redirect()) {
+                ctx.redirect(result.redirectUrl());
+                return;
+            }
+            if (result.contentType() != null) ctx.contentType(result.contentType());
+            ctx.result(result.stream());
+        } catch (io.javalin.http.HttpResponseException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new io.javalin.http.NotFoundResponse("Automation trace not found");
+        }
+    }
+
+    /* ───── RUN automated test cases (manual trigger) ───── */
+    public static void executeAutomated(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        ctx.status(202).json(CycleAutomationRunService.executeAutomatedAsync(cycleId, userId, false));
+    }
+
+    /* ───── CANCEL automated run ───── */
+    public static void cancelAutomatedRun(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID runId = UUID.fromString(ctx.pathParam("runId"));
+        CycleAutomationRunService.cancelRun(cycleId, runId, userId);
+        ctx.status(204);
+    }
+
+    /* ───── GET automated run live status ───── */
+    public static void getAutomatedRunStatus(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        UUID runId = UUID.fromString(ctx.pathParam("runId"));
+        ctx.json(CycleAutomationRunService.getRunStatus(cycleId, runId, userId));
+    }
+
+    public static void getLatestAutomatedRunStatus(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
+        ctx.json(CycleAutomationRunService.getLatestRunStatus(cycleId, userId));
+    }
+
+    public static void queueMetrics(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        ctx.json(Map.of(
+                "queue", safeQueueStats(),
+                "runs", AutomationQueueMetricsService.currentRunMetrics(),
+                "autoscaling", AutomationQueueAutoscalingService.recommendWorkers()
+        ));
+    }
+
+    public static void autoscalingRecommendation(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        ctx.json(AutomationQueueAutoscalingService.recommendWorkers());
+    }
+
+    private static Map<String, Object> safeQueueStats() {
+        try {
+            return AutomationAgentClient.queueStats();
+        } catch (Exception e) {
+            return Map.of("status", "unavailable", "error", e.getMessage());
+        }
+    }
+
+    /* ───── LIST schedules ───── */
+    public static void listSchedules(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        ctx.json(CycleRunScheduleService.list(projectId, userId));
+    }
+
+    /* ───── CREATE schedule ───── */
+    public static void createSchedule(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        CreateScheduleBody body = ctx.bodyAsClass(CreateScheduleBody.class);
+        if (body == null || body.cycleId == null || body.name == null || body.scheduleType == null) {
+            ctx.status(400).json(Map.of("error", "cycleId, name, and scheduleType are required"));
+            return;
+        }
+        UUID cycleId = UUID.fromString(body.cycleId);
+        Map<String, Object> created = CycleRunScheduleService.create(
+                projectId, userId, cycleId, body.name, body.scheduleType, body.runAt,
+                body.intervalMinutes, body.timezone, body.enabled
+        );
+        ctx.status(201).json(created);
+    }
+
+    /* ───── UPDATE schedule ───── */
+    public static void updateSchedule(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID scheduleId = UUID.fromString(ctx.pathParam("scheduleId"));
+        UpdateScheduleBody body = ctx.bodyAsClass(UpdateScheduleBody.class);
+        if (body == null) body = new UpdateScheduleBody();
+        CycleRunScheduleService.update(
+                scheduleId, userId, body.name, body.enabled, body.scheduleType, body.runAt,
+                body.intervalMinutes, body.timezone, body.cycleId
+        );
+        ctx.status(204);
+    }
+
+    /* ───── DELETE schedule ───── */
+    public static void deleteSchedule(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID scheduleId = UUID.fromString(ctx.pathParam("scheduleId"));
+        CycleRunScheduleService.delete(scheduleId, userId);
         ctx.status(204);
     }
 
@@ -273,5 +433,25 @@ public final class CycleHandler {
 
     public static class ToggleShareBody {
         public boolean enabled;
+    }
+
+    public static class CreateScheduleBody {
+        public String cycleId;
+        public String name;
+        public String scheduleType;
+        public String runAt;
+        public Integer intervalMinutes;
+        public String timezone;
+        public Boolean enabled;
+    }
+
+    public static class UpdateScheduleBody {
+        public String cycleId;
+        public String name;
+        public String scheduleType;
+        public String runAt;
+        public Integer intervalMinutes;
+        public String timezone;
+        public Boolean enabled;
     }
 }

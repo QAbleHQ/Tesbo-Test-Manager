@@ -237,6 +237,7 @@ function DocumentsTab({ projectId }: { projectId: string }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [imagePreview, setImagePreview] = useState<{ url: string; name: string } | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(
@@ -262,6 +263,7 @@ function DocumentsTab({ projectId }: { projectId: string }) {
 
   async function handleSaveNote(title: string, content: string) {
     setSaving(true);
+    setErrorMsg(null);
     try {
       if (editingItem) {
         await updateKnowledgeBaseItem(projectId, editingItem.id, { title, content });
@@ -271,8 +273,8 @@ function DocumentsTab({ projectId }: { projectId: string }) {
       setNoteModalOpen(false);
       setEditingItem(null);
       await load(search);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed to save note. Please try again.");
     } finally {
       setSaving(false);
     }
@@ -282,13 +284,14 @@ function DocumentsTab({ projectId }: { projectId: string }) {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     setUploading(true);
+    setErrorMsg(null);
     try {
       for (let i = 0; i < files.length; i++) {
         await uploadKnowledgeBaseFile(projectId, files[i]);
       }
       await load(search);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Upload failed. Please try again.");
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -297,12 +300,13 @@ function DocumentsTab({ projectId }: { projectId: string }) {
 
   async function handleDelete(itemId: string) {
     setDeletingId(itemId);
+    setErrorMsg(null);
     try {
       await deleteKnowledgeBaseItem(projectId, itemId);
       setItems((prev) => prev.filter((it) => it.id !== itemId));
       setTotal((prev) => prev - 1);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed to delete item. Please try again.");
     } finally {
       setDeletingId(null);
     }
@@ -356,7 +360,8 @@ function DocumentsTab({ projectId }: { projectId: string }) {
         ref={fileInputRef}
         type="file"
         multiple
-        className="hidden"
+        className="absolute w-0 h-0 overflow-hidden opacity-0 pointer-events-none"
+        tabIndex={-1}
         accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.pdf,.png,.jpg,.jpeg,.gif,.webp"
         onChange={handleFileUpload}
       />
@@ -391,6 +396,18 @@ function DocumentsTab({ projectId }: { projectId: string }) {
           {total} item{total !== 1 ? "s" : ""}
         </span>
       </div>
+
+      {/* Error banner */}
+      {errorMsg && (
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-4 py-2.5 text-sm text-red-700 dark:text-red-400">
+          <span>{errorMsg}</span>
+          <button onClick={() => setErrorMsg(null)} className="ml-3 text-red-500 hover:text-red-700 dark:hover:text-red-300">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
 
       {/* Search */}
       <SearchBar
@@ -569,14 +586,20 @@ function DocumentsTab({ projectId }: { projectId: string }) {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                       </svg>
                     </button>
-                    <svg
-                      className={`w-4 h-4 text-zinc-400 transition-transform ${isExpanded ? "rotate-180" : ""}`}
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
+                    <button
+                      onClick={() => setExpandedId(isExpanded ? null : item.id)}
+                      title={isExpanded ? "Collapse" : "Expand"}
+                      className="rounded-lg p-1.5 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
                     >
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                    </svg>
+                      <svg
+                        className={`w-4 h-4 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </button>
                   </div>
                 </div>
 

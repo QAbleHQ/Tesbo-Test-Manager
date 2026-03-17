@@ -13,8 +13,13 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "BetterCases",
+  title: "TesboX",
   description: "AI-Powered Test Case Management",
+  icons: {
+    icon: "/tesbox-logo-transparent.png",
+    shortcut: "/tesbox-logo-transparent.png",
+    apple: "/tesbox-logo-transparent.png",
+  },
 };
 
 export default function RootLayout({

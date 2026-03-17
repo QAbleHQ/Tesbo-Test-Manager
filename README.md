@@ -1,4 +1,4 @@
-# BetterCases — AI-Powered Test Case Management
+# TesboX — AI-Powered Test Case Management
 
 ## Stack
 

@@ -3,7 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { authMe, listPlans, createPlan, type PlanListItem } from "@/lib/api";
+import { authMe, listPlans, createPlan, getProject, type PlanListItem } from "@/lib/api";
 
 function StatusBadge({ count, label, color }: { count: number; label: string; color: string }) {
   if (count === 0) return null;
@@ -37,9 +37,11 @@ export default function PlansPage() {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newRelease, setNewRelease] = useState("");
+  const [canManagePlans, setCanManagePlans] = useState(false);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -47,8 +49,15 @@ export default function PlansPage() {
         router.replace("/login");
         return;
       }
-      listPlans(projectId)
-        .then((data) => setPlans(data as unknown as PlanListItem[]))
+      Promise.all([
+        listPlans(projectId),
+        getProject(projectId),
+      ])
+        .then(([plansData, projectData]) => {
+          setPlans(plansData as unknown as PlanListItem[]);
+          const myRole = (projectData.myRole as string ?? "").toLowerCase();
+          setCanManagePlans(["owner", "admin", "manager"].includes(myRole));
+        })
         .catch(() => router.replace("/projects"))
         .finally(() => setLoading(false));
     });
@@ -58,6 +67,7 @@ export default function PlansPage() {
     e.preventDefault();
     if (!newName.trim()) return;
     setCreating(true);
+    setCreateError(null);
     try {
       const p = await createPlan(projectId, {
         name: newName.trim(),
@@ -66,6 +76,8 @@ export default function PlansPage() {
       });
       router.push(`/projects/${projectId}/plans/${p.id}`);
       router.refresh();
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : "Failed to create test plan.");
     } finally {
       setCreating(false);
     }
@@ -92,15 +104,17 @@ export default function PlansPage() {
             Organize test runs and track overall testing progress
           </p>
         </div>
-        <button
-          onClick={() => setShowCreate(!showCreate)}
-          className="inline-flex items-center gap-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 text-sm font-medium transition-colors"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-          </svg>
-          New Plan
-        </button>
+        {canManagePlans && (
+          <button
+            onClick={() => setShowCreate(!showCreate)}
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 text-sm font-medium transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            New Plan
+          </button>
+        )}
       </div>
 
       {/* Create form */}
@@ -140,11 +154,16 @@ export default function PlansPage() {
               />
             </div>
           </div>
+          {createError && (
+            <p className="mt-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+              {createError}
+            </p>
+          )}
           <div className="flex items-center gap-3 mt-4">
             <button type="submit" disabled={creating || !newName.trim()} className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2 px-4 text-sm font-medium transition-colors">
               {creating ? "Creating..." : "Create Plan"}
             </button>
-            <button type="button" onClick={() => { setShowCreate(false); setNewName(""); setNewDesc(""); setNewRelease(""); }} className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 py-2 px-4 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors">
+            <button type="button" onClick={() => { setShowCreate(false); setNewName(""); setNewDesc(""); setNewRelease(""); setCreateError(null); }} className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 py-2 px-4 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors">
               Cancel
             </button>
           </div>
@@ -158,13 +177,19 @@ export default function PlansPage() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
           </svg>
           <h3 className="mt-4 text-sm font-semibold text-zinc-900 dark:text-zinc-100">No test plans yet</h3>
-          <p className="mt-1 text-sm text-zinc-500">Create your first test plan to organize test runs and track progress.</p>
-          <button
-            onClick={() => setShowCreate(true)}
-            className="mt-4 inline-flex items-center gap-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 text-sm font-medium transition-colors"
-          >
-            Create Test Plan
-          </button>
+          <p className="mt-1 text-sm text-zinc-500">
+            {canManagePlans
+              ? "Create your first test plan to organize test runs and track progress."
+              : "No test plans have been created for this project yet."}
+          </p>
+          {canManagePlans && (
+            <button
+              onClick={() => setShowCreate(true)}
+              className="mt-4 inline-flex items-center gap-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 text-sm font-medium transition-colors"
+            >
+              Create Test Plan
+            </button>
+          )}
         </div>
       ) : (
         <div className="space-y-3">

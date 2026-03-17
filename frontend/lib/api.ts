@@ -214,6 +214,11 @@ export async function deleteProject(id: string): Promise<void> {
   await api(`/api/projects/${id}`, { method: "DELETE" });
 }
 
+export interface TestEnvironmentSetting {
+  name: string;
+  url: string;
+}
+
 export interface AiGeneratedDraft {
   title: string;
   preconditions: string;
@@ -421,6 +426,605 @@ export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: str
   return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
 }
 
+export interface AutomationSession {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  userId: string;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  currentUrl: string | null;
+  browserContextMeta: string | null;
+  lastScreenshotPath: string | null;
+  updatedAt: string;
+  runtime?: {
+    activeCommandId: string | null;
+    queuedCount: number;
+    isRunning: boolean;
+  };
+  events: Array<{
+    id: string;
+    commandId: string | null;
+    eventType: string;
+    rawCommand: string | null;
+    parsedAction?: Record<string, unknown> | null;
+    executionResult?: Record<string, unknown> | null;
+    screenshotPath: string | null;
+    createdAt: string;
+  }>;
+}
+
+export async function startAutomationSession(
+  projectId: string,
+  testcaseId: string,
+  data?: { startUrl?: string }
+): Promise<{ id: string; startedAt: string }> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/sessions`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function sendAutomationCommand(
+  projectId: string,
+  sessionId: string,
+  command: string
+): Promise<{
+  commandId: string;
+  requiresClarification: boolean;
+  clarificationQuestion?: string;
+  queued?: boolean;
+  queueDepth?: number;
+  result?: Record<string, unknown>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands`, {
+    method: "POST",
+    body: { command },
+  });
+}
+
+export async function stopAutomationCommand(
+  projectId: string,
+  sessionId: string
+): Promise<{
+  stopRequested: boolean;
+  activeCommandId: string | null;
+  queuedCount: number;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands/stop`, {
+    method: "POST",
+  });
+}
+
+export async function getAutomationSession(projectId: string, sessionId: string): Promise<AutomationSession> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}`);
+}
+
+export async function getAutomationStreamState(projectId: string, sessionId: string): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/stream`);
+}
+
+export interface RecordingAction {
+  type: string;
+  action: string;
+  playwright: string;
+  targetDescription?: string;
+  value?: string;
+  url?: string;
+}
+
+/** Unified timeline entry — every recording interaction in chronological order. */
+export interface TimelineEntry {
+  seq: number;
+  kind: "action" | "reasoning" | "result";
+  ts: string;
+  stepId?: string | null;
+  url?: string | null;
+  tool?: string | null;
+  action?: string | null;
+  playwright?: string | null;
+  target?: string | null;
+  value?: string | null;
+  description?: string | null;
+  text?: string | null;
+  toolName?: string | null;
+  data?: Record<string, unknown> | null;
+  message?: string | null;
+  assertions?: string[];
+}
+
+/** Summary stats computed from the unified timeline. */
+export interface RecordingStats {
+  totalEntries: number;
+  actionCount: number;
+  reasoningCount: number;
+  resultCount: number;
+  clickCount: number;
+  typeCount: number;
+  navigateCount: number;
+  waitCount: number;
+  pressCount: number;
+  scrollCount: number;
+  assertCount: number;
+  playwrightLineCount: number;
+}
+
+export interface RecordingSummary {
+  runId: string;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  totalEvents: number;
+  observeCount: number;
+  actCount: number;
+  successfulActCount: number;
+  extractCount: number;
+  navigateCount: number;
+  compiledActionCount: number;
+}
+
+export interface ReasoningEntry {
+  text: string;
+  timestamp: string;
+  stepId: string | null;
+  url: string | null;
+  toolName: string | null;
+  _seq: number;
+}
+
+export interface RecordingState {
+  sessionId: string;
+  hasRecording: boolean;
+  message?: string;
+  summary?: RecordingSummary;
+  actions?: RecordingAction[];
+  reasoningLog?: ReasoningEntry[];
+  partialScript?: string;
+}
+
+export async function getAutomationRecording(projectId: string, sessionId: string): Promise<RecordingState> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording`);
+}
+
+export async function compileAutomationRecording(
+  projectId: string,
+  sessionId: string,
+  options?: { scenario?: string; addHeader?: boolean }
+): Promise<{ sessionId: string; runId: string; script: string; summary: RecordingSummary; recording: Record<string, unknown> }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording/compile`, {
+    method: "POST",
+    body: options ?? {},
+  });
+}
+
+export interface PersistedRecording {
+  id: string;
+  projectId: string;
+  testcaseId: string | null;
+  sessionId: string | null;
+  commandId: string | null;
+  runId: string;
+  scenarioName: string | null;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  timeline?: TimelineEntry[];
+  stats: RecordingStats;
+  playwrightScript: string | null;
+  startUrl: string | null;
+  finalUrl: string | null;
+  durationMs: number;
+  success: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listRecordingsByTestcase(
+  projectId: string,
+  testcaseId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/recordings${params}`);
+}
+
+export async function listRecordingsByProject(
+  projectId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/automation/recordings${params}`);
+}
+
+export async function getPersistedRecording(
+  projectId: string,
+  recordingId: string
+): Promise<PersistedRecording> {
+  return api(`/api/projects/${projectId}/automation/recordings/${recordingId}`);
+}
+
+export async function resetAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: { startUrl?: string }
+): Promise<{ sessionId: string; currentUrl?: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/reset`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function finalizeAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: {
+    testName?: string;
+    framework?: string;
+    repo?: string;
+    path?: string;
+    script?: string;
+    steps?: Array<{ stepNumber?: number; action?: string; expectedResult?: string }>;
+  }
+): Promise<{ status: string; script: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/finalize`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function cancelAutomationSession(projectId: string, sessionId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/automation/sessions/${sessionId}/cancel`, { method: "POST" });
+}
+
+export async function sendAutomationManualAction(
+  projectId: string,
+  sessionId: string,
+  data: {
+    actionType: "click" | "type" | "press" | "drag" | "scroll";
+    xRatio?: number;
+    yRatio?: number;
+    toXRatio?: number;
+    toYRatio?: number;
+    deltaX?: number;
+    deltaY?: number;
+    text?: string;
+    key?: string;
+  }
+): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/manual-actions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function runAutomationPlaywrightScript(
+  projectId: string,
+  sessionId: string,
+  data: {
+    script: string;
+    scriptVersion?: number | null;
+    startUrl?: string;
+    actionDelayMs?: number;
+  }
+): Promise<{
+  status: "passed" | "failed" | string;
+  currentUrl?: string;
+  errorMessage?: string | null;
+  screenshotPath?: string | null;
+  tracePath?: string | null;
+  videoPath?: string | null;
+  durationMs?: number;
+  logs?: Array<Record<string, unknown>>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/run-script`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export function getAutomationSessionTraceUrl(projectId: string, sessionId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/automation/sessions/${sessionId}/trace`;
+}
+
+// Agent Runs (Aegis)
+
+export interface AgentRunItem {
+  id: string;
+  testcaseId: string;
+  testcaseTitle: string;
+  testcaseExternalId?: string;
+  status: "pending" | "in_progress" | "completed" | "failed" | "cancelled";
+  sessionId?: string | null;
+  scriptGenerated?: string | null;
+  errorMessage?: string | null;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  orderIndex: number;
+}
+
+export interface AgentRun {
+  id: string;
+  projectId: string;
+  agentType: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  startUrl: string;
+  items: AgentRunItem[];
+  startedAt: string;
+  endedAt?: string | null;
+  createdBy?: string;
+}
+
+export async function startAgentRun(
+  projectId: string,
+  data: {
+    agentType: string;
+    testcaseIds: string[];
+    startUrl: string;
+    config?: { headless?: boolean; maxStepsPerTestCase?: number };
+  }
+): Promise<{ runId: string }> {
+  return api(`/api/projects/${projectId}/agent-runs`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function getAgentRun(projectId: string, runId: string): Promise<AgentRun> {
+  return api(`/api/projects/${projectId}/agent-runs/${runId}`);
+}
+
+export async function listAgentRuns(projectId: string): Promise<AgentRun[]> {
+  return api(`/api/projects/${projectId}/agent-runs`);
+}
+
+export async function cancelAgentRun(projectId: string, runId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/agent-runs/${runId}/cancel`, { method: "POST" });
+}
+
+export function getAgentRunLiveUrl(projectId: string, runId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/agent-runs/${runId}/live`;
+}
+
+export async function getAgentRunItemScript(
+  projectId: string,
+  runId: string,
+  itemId: string
+): Promise<{ script: string }> {
+  return api(`/api/projects/${projectId}/agent-runs/${runId}/items/${itemId}/script`);
+}
+
+// Agent Settings
+
+export interface AgentSettings {
+  defaultEnvironmentUrl?: string;
+  defaultEnvironmentName?: string;
+  autoStartOnReady?: boolean;
+  reviewBotEnabled?: boolean;
+  autoReviewOnScriptReady?: boolean;
+  reviewInstruction?: string;
+}
+
+export function getAgentSettings(projectId: string, agentType: string): AgentSettings {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(`agent-settings:${projectId}:${agentType}`);
+    const parsed = raw ? (JSON.parse(raw) as AgentSettings) : {};
+    if (parsed.autoStartOnReady === undefined) parsed.autoStartOnReady = true;
+    return parsed;
+  } catch {
+    return { autoStartOnReady: true };
+  }
+}
+
+export function saveAgentSettings(projectId: string, agentType: string, settings: AgentSettings): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(`agent-settings:${projectId}:${agentType}`, JSON.stringify(settings));
+}
+
+// Aegis auto-queue: test cases marked "Ready for Automation" are queued here
+
+export function getAegisAutoQueue(projectId: string): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(`aegis-auto-queue:${projectId}`);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function addToAegisAutoQueue(projectId: string, testcaseId: string): void {
+  if (typeof window === "undefined") return;
+  const queue = getAegisAutoQueue(projectId);
+  if (!queue.includes(testcaseId)) {
+    queue.push(testcaseId);
+    localStorage.setItem(`aegis-auto-queue:${projectId}`, JSON.stringify(queue));
+  }
+}
+
+export function clearAegisAutoQueue(projectId: string): void {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(`aegis-auto-queue:${projectId}`);
+}
+
+// Agent Review Tasks
+
+export type AgentTaskStatus = "pending_review" | "approved" | "rejected" | "needs_revision" | "in_progress" | "queued" | "bot_reviewing";
+
+export interface AgentReviewFeedback {
+  id: string;
+  userId: string;
+  message: string;
+  createdAt: string;
+}
+
+export type AgentTaskQueueSource = "ready_for_automation" | "revision" | "manual" | "failed_fix";
+
+export interface BotReviewResult {
+  status: "passed" | "failed";
+  feedback: string[];
+  validatedSteps: Array<{ step: string; passed: boolean; detail?: string }>;
+  assertionSuggestions?: Array<{
+    step: string;
+    suggestion: string;
+    reason: string;
+  }>;
+  categories?: Array<{
+    key:
+      | "goal_validation"
+      | "rerun_validation"
+      | "plan_steps_alignment"
+      | "assertion_validation"
+      | "code_quality"
+      | "rerun_execution"
+      | "goal_assertion_coverage"
+      | "minimum_criteria"
+      | "improvement_opportunities";
+    passed: boolean;
+    detail: string;
+  }>;
+  reviewCycle?: number;
+  maxReviewCycles?: number;
+  reviewedAt: string;
+  scriptRanSuccessfully: boolean;
+}
+
+export interface AiScriptReviewRequest {
+  testcaseId: string;
+  testcaseTitle: string;
+  testcaseDescription?: string;
+  steps: string[];
+  script: string;
+  rerunPassed: boolean;
+  rerunError?: string | null;
+  reviewInstruction?: string;
+}
+
+export async function reviewAutomationScriptWithAi(
+  projectId: string,
+  data: AiScriptReviewRequest
+): Promise<{
+  status: "passed" | "failed";
+  summary?: string;
+  categories?: Array<{
+    key:
+      | "goal_validation"
+      | "rerun_validation"
+      | "plan_steps_alignment"
+      | "assertion_validation"
+      | "code_quality"
+      | "rerun_execution"
+      | "goal_assertion_coverage"
+      | "minimum_criteria"
+      | "improvement_opportunities";
+    passed: boolean;
+    detail: string;
+  }>;
+  validatedSteps?: Array<{ step: string; passed: boolean; detail?: string }>;
+  feedback?: string[];
+  assertionSuggestions?: Array<{ step: string; suggestion: string; reason: string }>;
+}> {
+  return api(`/api/projects/${projectId}/ai/review-script`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export interface AgentTask {
+  id: string;
+  projectId: string;
+  agentType: string;
+  testcaseId: string;
+  testcaseTitle: string;
+  testcaseExternalId: string;
+  status: AgentTaskStatus;
+  queueSource?: AgentTaskQueueSource;
+  script?: string | null;
+  sessionId?: string | null;
+  tracePath?: string | null;
+  videoPath?: string | null;
+  screenshotPath?: string | null;
+  logs: Array<{ ts: string; message: string; type: string }>;
+  feedback: AgentReviewFeedback[];
+  botReview?: BotReviewResult | null;
+  runId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  duration?: number;
+}
+
+export function getStoredAgentTasks(projectId: string, agentType: string): AgentTask[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(`agent-tasks:${projectId}:${agentType}`);
+    return raw ? (JSON.parse(raw) as AgentTask[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveAgentTasks(projectId: string, agentType: string, tasks: AgentTask[]): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(`agent-tasks:${projectId}:${agentType}`, JSON.stringify(tasks));
+}
+
+export function upsertAgentTask(projectId: string, agentType: string, task: AgentTask): void {
+  const tasks = getStoredAgentTasks(projectId, agentType);
+  const idx = tasks.findIndex((t) => t.id === task.id);
+  if (idx >= 0) tasks[idx] = task; else tasks.unshift(task);
+  saveAgentTasks(projectId, agentType, tasks);
+}
+
+export function updateAgentTaskStatus(
+  projectId: string,
+  agentType: string,
+  taskId: string,
+  status: AgentTaskStatus,
+  feedback?: string
+): AgentTask | null {
+  const tasks = getStoredAgentTasks(projectId, agentType);
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return null;
+  task.status = status;
+  task.updatedAt = new Date().toISOString();
+  if (feedback) {
+    task.feedback.push({
+      id: `fb-${Date.now()}`,
+      userId: "current-user",
+      message: feedback,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  saveAgentTasks(projectId, agentType, tasks);
+  return task;
+}
+
+export function updateAgentTaskScript(
+  projectId: string,
+  agentType: string,
+  taskId: string,
+  script: string
+): AgentTask | null {
+  const tasks = getStoredAgentTasks(projectId, agentType);
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return null;
+  task.script = script;
+  task.updatedAt = new Date().toISOString();
+  saveAgentTasks(projectId, agentType, tasks);
+  return task;
+}
+
+export function deleteAgentTask(projectId: string, agentType: string, taskId: string): boolean {
+  const tasks = getStoredAgentTasks(projectId, agentType);
+  const idx = tasks.findIndex((t) => t.id === taskId);
+  if (idx < 0) return false;
+  tasks.splice(idx, 1);
+  saveAgentTasks(projectId, agentType, tasks);
+  return true;
+}
+
 // Plans
 export async function listPlans(projectId: string): Promise<Record<string, unknown>[]> {
   return api(`/api/projects/${projectId}/plans`);
@@ -568,6 +1172,95 @@ export interface ExecutionItem {
   defectUrl: string;
 }
 
+export interface AutomatedRunResult {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  totalCases: number;
+  executionProvider?: string;
+  maxParallel?: number;
+}
+
+export interface AutomatedRunLiveStatusItem {
+  executionId: string;
+  title: string;
+  externalId: string;
+  status: "queued" | "running" | "passed" | "failed" | "manual" | "cancelled";
+  index: number;
+  message?: string;
+}
+
+export interface AutomatedRunLiveStatus {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  endedAt?: string;
+  currentExecutionId?: string;
+  totalCases: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  executionProvider?: string;
+  maxParallel?: number;
+  error?: string;
+  items: AutomatedRunLiveStatusItem[];
+}
+
+export interface ExecutionAutomationLogItem {
+  kind?: string;
+  stepId?: string;
+  action?: string;
+  status?: string;
+  message?: string;
+  selectorUsed?: string;
+  currentUrl?: string;
+  durationMs?: number;
+  screenshotPath?: string;
+  screenshotUrl?: string;
+  detail?: Record<string, unknown>;
+  ts?: string;
+}
+
+export interface ExecutionAutomationReport {
+  id?: string;
+  cycleId?: string;
+  executionId: string;
+  status: string;
+  startedAt?: string;
+  endedAt?: string;
+  logs: ExecutionAutomationLogItem[];
+  videoAvailable: boolean;
+  videoUrl?: string | null;
+  traceAvailable?: boolean;
+  traceUrl?: string | null;
+  tracePath?: string | null;
+  screenshotPath?: string | null;
+  screenshotUrl?: string | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TestRunSchedule {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  name: string;
+  enabled: boolean;
+  scheduleType: "one_time" | "recurring";
+  runAt: string | null;
+  intervalMinutes: number | null;
+  timezone: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export async function listTestRuns(projectId: string): Promise<TestRunListItem[]> {
   return api(`/api/projects/${projectId}/cycles`);
 }
@@ -576,7 +1269,7 @@ export async function getTestRun(cycleId: string): Promise<TestRunDetail> {
   return api(`/api/cycles/${cycleId}`);
 }
 
-export async function createTestRun(projectId: string, data: { name: string; description?: string; environment?: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
+export async function createTestRun(projectId: string, data: { name: string; description?: string; environment: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
   return api(`/api/projects/${projectId}/cycles`, { method: "POST", body: data });
 }
 
@@ -596,7 +1289,7 @@ export async function removeTestCaseFromRun(cycleId: string, testcaseId: string)
   await api(`/api/cycles/${cycleId}/testcases/${testcaseId}`, { method: "DELETE" });
 }
 
-export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment?: string; buildVersion?: string }): Promise<{ id: string }> {
+export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment: string; buildVersion?: string }): Promise<{ id: string }> {
   return api(`/api/projects/${projectId}/cycles/from-plan`, { method: "POST", body: data });
 }
 
@@ -606,6 +1299,87 @@ export async function listCycleExecutions(cycleId: string): Promise<ExecutionIte
 
 export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
+}
+
+export async function getExecutionAutomationReport(cycleId: string, executionId: string): Promise<ExecutionAutomationReport> {
+  return api<ExecutionAutomationReport>(`/api/cycles/${cycleId}/executions/${executionId}/automation-report`);
+}
+
+export function getExecutionAutomationVideoUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-video`;
+}
+
+export function getExecutionAutomationTraceUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-trace`;
+}
+
+export async function executeAutomatedTestRun(cycleId: string): Promise<AutomatedRunResult> {
+  return api<AutomatedRunResult>(`/api/cycles/${cycleId}/execute-automated`, { method: "POST" });
+}
+
+export async function getAutomatedRunStatus(cycleId: string, runId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/${runId}/status`);
+}
+
+export async function getLatestAutomatedRunStatus(cycleId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/latest/status`);
+}
+
+export interface AutomationAutoscalingRecommendation {
+  desiredWorkers: number;
+  minWorkers: number;
+  maxWorkers: number;
+  targetJobsPerWorker: number;
+  warmWorkers: number;
+  queuedJobs: number;
+  runningJobs: number;
+  activeRuns: number;
+  scaleReason: string;
+}
+
+export async function getAutomationAutoscalingRecommendation(): Promise<AutomationAutoscalingRecommendation> {
+  return api<AutomationAutoscalingRecommendation>("/api/internal/automation/autoscaling-recommendation");
+}
+
+export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {
+  return api<TestRunSchedule[]>(`/api/projects/${projectId}/cycles/schedules`);
+}
+
+export async function createTestRunSchedule(
+  projectId: string,
+  data: {
+    cycleId: string;
+    name: string;
+    scheduleType: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<TestRunSchedule> {
+  return api<TestRunSchedule>(`/api/projects/${projectId}/cycles/schedules`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function updateTestRunSchedule(
+  scheduleId: string,
+  data: {
+    cycleId?: string;
+    name?: string;
+    scheduleType?: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteTestRunSchedule(scheduleId: string): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "DELETE" });
 }
 
 // Sharing

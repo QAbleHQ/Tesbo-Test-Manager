@@ -1,7 +1,7 @@
 # Tesbo UI/UX Validation Checklist
 
 ## Context
-Comparing portal.tesbo.io (reference) vs local BetterCasesv3 implementation
+Comparing portal.tesbo.io (reference) vs local TesboXv3 implementation
 
 **Reference URL**: https://portal.tesbo.io/runs/aabb4124-9c80-4085-9899-489221895785
 **Local URL**: http://localhost:3000/projects/{projectId}/tesbo-reports/runs
@@ -148,7 +148,7 @@ Comparing portal.tesbo.io (reference) vs local BetterCasesv3 implementation
 
 ---
 
-### ✅ Localhost BetterCasesv3
+### ✅ Localhost TesboXv3
 
 #### Authentication
 - [ ] OTP flow appearance

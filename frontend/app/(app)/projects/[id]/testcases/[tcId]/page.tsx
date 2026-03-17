@@ -11,11 +11,22 @@ import {
   createTestCase,
   listSuites,
   listTestCases,
+  getAgentSettings,
   type SuiteNode,
   type TestCaseListItem,
 } from "@/lib/api";
+import { runAegisInBackground } from "@/lib/aegis-runner";
+import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
+type ScriptHistoryEntry = {
+  scriptVersion: number;
+  testcaseVersion: number | null;
+  script: string;
+  language: string;
+  capturedAt: string;
+  isCurrent: boolean;
+};
 
 const FETCH_LIMIT = 100;
 
@@ -41,16 +52,24 @@ export default function TestCaseDetailPage() {
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([]);
   const [testData, setTestData] = useState("");
-  const [automationStatus, setAutomationStatus] = useState("No");
+  const [automationStatus, setAutomationStatus] = useState("In Planning");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
+  const [automationScript, setAutomationScript] = useState("");
+  const [automationScriptVersion, setAutomationScriptVersion] = useState(0);
+  const [scriptVersionHistory, setScriptVersionHistory] = useState<ScriptHistoryEntry[]>([]);
+  const [selectedScriptHistoryKey, setSelectedScriptHistoryKey] = useState("current");
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
   const [existingTagSuggestions, setExistingTagSuggestions] = useState<string[]>([]);
   const [type, setType] = useState("Functional");
   const [priority, setPriority] = useState("P2");
   const [status, setStatus] = useState("Draft");
   const [suiteId, setSuiteId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [assigningToAegis, setAssigningToAegis] = useState(false);
+  const [saveNotification, setSaveNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  
 
   async function loadAllCases(): Promise<TestCaseListItem[]> {
     let offset = 0;
@@ -99,6 +118,10 @@ export default function TestCaseDetailPage() {
         setEstimatedDuration("");
         setAttachments("");
         setAutomationTags([]);
+        setAutomationScript("");
+        setAutomationScriptVersion(0);
+        setScriptVersionHistory([]);
+        setSelectedScriptHistoryKey("current");
         setType("Functional");
         setPriority("P2");
         setStatus("Draft");
@@ -112,10 +135,37 @@ export default function TestCaseDetailPage() {
         setDescription((p.description as string) ?? "");
         setPreconditions((p.preconditions as string) ?? "");
         setTestData((p.testData as string) ?? "");
-        setAutomationStatus((p.automationStatus as string) ?? "No");
+        setAutomationStatus((p.automationStatus as string) ?? "In Planning");
         setEstimatedDuration((p.estimatedDuration as string) ?? "");
         setAttachments((p.attachments as string) ?? "");
         setAutomationTags(parseTagString((p.automationTags as string) ?? ""));
+        setAutomationScript((p.automationScript as string) ?? "");
+        const loadedScriptVersion = Number(p.automationScriptVersion ?? 0);
+        setAutomationScriptVersion(Number.isFinite(loadedScriptVersion) ? loadedScriptVersion : 0);
+        const historyRaw = Array.isArray(p.automationScriptHistory)
+          ? (p.automationScriptHistory as Array<Record<string, unknown>>)
+              .map((entry): ScriptHistoryEntry | null => {
+                const script = typeof entry.script === "string" ? entry.script : "";
+                if (!script.trim()) return null;
+                const scriptVersion = Number(entry.scriptVersion ?? 0);
+                const testcaseVersionRaw =
+                  entry.testcaseVersion == null ? null : Number(entry.testcaseVersion);
+                return {
+                  scriptVersion: Number.isFinite(scriptVersion) ? scriptVersion : 0,
+                  testcaseVersion:
+                    testcaseVersionRaw != null && Number.isFinite(testcaseVersionRaw)
+                      ? testcaseVersionRaw
+                      : null,
+                  script,
+                  language: typeof entry.language === "string" ? entry.language : "",
+                  capturedAt: typeof entry.capturedAt === "string" ? entry.capturedAt : "",
+                  isCurrent: entry.isCurrent === true,
+                };
+              })
+              .filter((entry): entry is ScriptHistoryEntry => entry !== null)
+          : [];
+        setScriptVersionHistory(historyRaw);
+        setSelectedScriptHistoryKey("current");
         setType((p.type as string) ?? "Functional");
         setSuiteId((p.suiteId as string) ?? "");
         const s = (p.steps as string) ?? "[]";
@@ -141,31 +191,41 @@ export default function TestCaseDetailPage() {
     setSaving(true);
     try {
       if (isNew) {
-        await createTestCase(projectId, {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
+        const created = await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
           description,
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+          }
+        }
         if (action === "create-next") {
           setTitle("");
           setDescription("");
           setPreconditions("");
           setSteps([{ stepNumber: 1, action: "", expectedResult: "" }]);
           setTestData("");
-          setAutomationStatus("No");
+          setAutomationStatus("In Planning");
           setEstimatedDuration("");
           setAttachments("");
           setAutomationTags([]);
+          setAutomationScript("");
           setType("Functional");
           setPriority("P2");
           setStatus("Draft");
@@ -183,6 +243,7 @@ export default function TestCaseDetailPage() {
         }
         router.refresh();
       } else {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await updateTestCase(projectId, testcaseId, {
           suiteId: suiteId || undefined,
           title,
@@ -190,15 +251,29 @@ export default function TestCaseDetailPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, testcaseId, title, "", "ready_for_automation");
+          }
+        }
+        setSaveNotification({ type: "success", message: "Test case updated successfully." });
+        setTimeout(() => setSaveNotification(null), 4000);
       }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save test case.";
+      setSaveNotification({ type: "error", message });
+      setTimeout(() => setSaveNotification(null), 6000);
     } finally {
       setSaving(false);
     }
@@ -216,6 +291,36 @@ export default function TestCaseDetailPage() {
     setSteps((s) => s.map((st, idx) => (idx === i ? { ...st, [field]: value } : st)));
   }
 
+  function onOpenLivePreviewRerun() {
+    if (isNew) return;
+    const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
+    window.open(rerunUrl, "_blank", "noopener,noreferrer");
+  }
+
+  async function onAssignToAegisQueue() {
+    if (isNew || assigningToAegis) return;
+    setAssigningToAegis(true);
+    try {
+      const currentExternalId = String((tc as Record<string, unknown> | null)?.externalId ?? "");
+      const currentTitle = String((tc as Record<string, unknown> | null)?.title ?? "");
+      await runAegisInBackground(
+        projectId,
+        testcaseId,
+        title.trim() || currentTitle || "Untitled test case",
+        currentExternalId,
+        "manual"
+      );
+      setSaveNotification({ type: "success", message: "Assigned to Aegis. Task added to queue." });
+      setTimeout(() => setSaveNotification(null), 4000);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Failed to assign test case to Aegis queue.";
+      setSaveNotification({ type: "error", message });
+      setTimeout(() => setSaveNotification(null), 6000);
+    } finally {
+      setAssigningToAegis(false);
+    }
+  }
+
   if (tc === null && !isNew) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -224,11 +329,19 @@ export default function TestCaseDetailPage() {
     );
   }
 
+  const previousScriptHistory = scriptVersionHistory.filter((entry) => !entry.isCurrent);
+  const selectedHistoryEntry =
+    selectedScriptHistoryKey === "current"
+      ? null
+      : previousScriptHistory[Number(selectedScriptHistoryKey.replace("history-", ""))] || null;
+  const displayedScript = selectedHistoryEntry ? selectedHistoryEntry.script : automationScript;
+  const currentScriptVersionLabel = automationScript.trim()
+    ? `v${Math.max(1, automationScriptVersion)}`
+    : "Not versioned yet";
+
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
       <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center gap-4">
-        <Link href="/projects" className="font-semibold text-zinc-900 dark:text-zinc-100">BetterCases</Link>
-        <span className="text-zinc-500">/</span>
         <Link href={`/projects/${projectId}/dashboard`} className="text-zinc-700 dark:text-zinc-300">Project</Link>
         <span className="text-zinc-500">/</span>
         <Link href={`/projects/${projectId}/testcases`} className="text-zinc-700 dark:text-zinc-300">Test cases</Link>
@@ -236,6 +349,31 @@ export default function TestCaseDetailPage() {
         <span className="text-zinc-700 dark:text-zinc-300">{isNew ? "New" : (tc as Record<string, string>)?.externalId}</span>
       </header>
       <main className="max-w-3xl mx-auto px-4 py-8">
+        <AegisBackgroundIndicator />
+        {saveNotification && (
+          <div className={`mb-6 flex items-center justify-between rounded-lg border px-4 py-3 ${
+            saveNotification.type === "success"
+              ? "border-[#2e7d32]/30 bg-[#e8f5eb] dark:border-green-700/40 dark:bg-green-900/20"
+              : "border-red-300 bg-red-50 dark:border-red-700/40 dark:bg-red-900/20"
+          }`}>
+            <p className={`text-sm ${
+              saveNotification.type === "success"
+                ? "text-[#2e7d32] dark:text-green-300"
+                : "text-red-700 dark:text-red-300"
+            }`}>{saveNotification.message}</p>
+            <button
+              type="button"
+              onClick={() => setSaveNotification(null)}
+              className={`ml-4 text-sm ${
+                saveNotification.type === "success"
+                  ? "text-[#2e7d32] hover:text-[#1b5e20] dark:text-green-300"
+                  : "text-red-600 hover:text-red-800 dark:text-red-300"
+              }`}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="space-y-6">
           <div>
             <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Title</label>
@@ -346,8 +484,10 @@ export default function TestCaseDetailPage() {
                 onChange={(e) => setAutomationStatus(e.target.value)}
                 className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
-                <option value="Yes">Yes</option>
-                <option value="No">No</option>
+                <option value="In Planning">In Planning</option>
+                <option value="Not able to Automate">Not able to Automate</option>
+                <option value="Ready for the Automation">Ready for the Automation</option>
+                <option value="Automated">Automated</option>
               </select>
             </div>
             <div>
@@ -398,6 +538,46 @@ export default function TestCaseDetailPage() {
             />
           </div>
           <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+              {!isNew && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onOpenLivePreviewRerun}
+                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  >
+                    Re Run Last Test (Live Preview)
+                  </button>
+                </div>
+              )}
+            </div>
+            <p className="mb-2 text-xs text-zinc-500">
+              You can edit the script manually here and use the run action to validate the latest flow.
+            </p>
+            <p className="mb-2 text-xs text-zinc-500">
+              Current script version: <span className="font-medium">{currentScriptVersionLabel}</span>
+              {previousScriptHistory.length > 0
+                ? ` • ${previousScriptHistory.length} previous version${previousScriptHistory.length === 1 ? "" : "s"}`
+                : ""}
+            </p>
+            <button
+              type="button"
+              onClick={() => setVersionHistoryOpen(true)}
+              disabled={scriptVersionHistory.length === 0}
+              className="mb-2 text-xs text-blue-600 hover:underline disabled:text-zinc-400 disabled:no-underline"
+            >
+              View Version History
+            </button>
+            <textarea
+              value={automationScript}
+              onChange={(e) => setAutomationScript(e.target.value)}
+              rows={14}
+              placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
+              className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-900"
+            />
+          </div>
+          <div>
             <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Attachments</label>
             <textarea
               value={attachments}
@@ -408,6 +588,21 @@ export default function TestCaseDetailPage() {
             />
           </div>
           <div className="flex gap-2">
+            {!isNew && (
+              <button
+                type="button"
+                onClick={() => void onAssignToAegisQueue()}
+                disabled={assigningToAegis || saving}
+                className="rounded-lg border border-amber-300 bg-amber-50 py-2 px-4 text-sm font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200 dark:hover:bg-amber-900/40"
+              >
+                {assigningToAegis ? "Assigning..." : "Assign to Aegis"}
+              </button>
+            )}
+            {!isNew && (
+              <span className="rounded-lg border border-blue-200 bg-blue-50 py-2 px-4 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-300">
+                Update script and use the run action from the script section to validate changes.
+              </span>
+            )}
             <button
               type="submit"
               value="create"
@@ -437,6 +632,69 @@ export default function TestCaseDetailPage() {
           </div>
         </form>
       </main>
+      {versionHistoryOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-5xl rounded-xl border border-zinc-200 bg-white p-4 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Script Version History</h3>
+              <button
+                type="button"
+                onClick={() => setVersionHistoryOpen(false)}
+                className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700"
+              >
+                Close
+              </button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-[220px_1fr]">
+              <div className="max-h-[60vh] overflow-auto rounded border border-zinc-200 p-2 dark:border-zinc-700">
+                <div className="space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedScriptHistoryKey("current")}
+                    className={`w-full rounded px-2 py-1 text-left text-xs ${
+                      selectedScriptHistoryKey === "current"
+                        ? "bg-blue-600 text-white"
+                        : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                    }`}
+                  >
+                    {`v${Math.max(1, automationScriptVersion)} (Latest)`}
+                  </button>
+                  {previousScriptHistory.map((entry, idx) => {
+                    const itemKey = `history-${idx}`;
+                    return (
+                      <button
+                        key={`${entry.scriptVersion}-${idx}`}
+                        type="button"
+                        onClick={() => setSelectedScriptHistoryKey(itemKey)}
+                        className={`w-full rounded px-2 py-1 text-left text-xs ${
+                          selectedScriptHistoryKey === itemKey
+                            ? "bg-blue-600 text-white"
+                            : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                        }`}
+                      >
+                        {`v${entry.scriptVersion}`}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="rounded border border-zinc-200 p-2 dark:border-zinc-700">
+                <textarea
+                  value={displayedScript}
+                  readOnly
+                  rows={24}
+                  className="h-[60vh] w-full rounded border border-zinc-300 bg-zinc-50 px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-950"
+                />
+                {selectedHistoryEntry?.testcaseVersion != null && (
+                  <p className="mt-2 text-[11px] text-zinc-500">
+                    Snapshot from testcase version {selectedHistoryEntry.testcaseVersion}.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -23,4 +23,12 @@
     <include file="changes/V17_tesbo_run_metadata.sql" relativeToChangelogFile="true"/>
     <include file="changes/V18_tesbo_artifact_storage_keys.sql" relativeToChangelogFile="true"/>
     <include file="changes/V19_tesbo_case_detail_fields.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V20_automation_sessions_and_scripts.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V21_cycle_run_schedules.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V22_execution_automation_reports.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V23_automation_execution_queue.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V24_parallel_execution_settings.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V25_execution_automation_trace.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V26_automation_recordings.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V27_automation_recordings_timeline.sql" relativeToChangelogFile="true"/>
 </databaseChangeLog>

@@ -15,9 +15,11 @@ import {
   createCycleFromPlan,
   associateRunWithPlan,
   dissociateRunFromPlan,
+  getProject,
   type PlanRunItem,
   type PlanProgress,
   type TestRunListItem,
+  type TestEnvironmentSetting,
 } from "@/lib/api";
 
 /* ───── Shared UI components ───── */
@@ -95,6 +97,8 @@ export default function PlanDetailPage() {
   const [creatingCycle, setCreatingCycle] = useState(false);
   const [newCycleName, setNewCycleName] = useState("");
   const [showCreateCycle, setShowCreateCycle] = useState(false);
+  const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
+  const [selectedEnvironment, setSelectedEnvironment] = useState("");
 
   // Associate existing run
   const [showAssociate, setShowAssociate] = useState(false);
@@ -111,22 +115,53 @@ export default function PlanDetailPage() {
   // Tab state
   const [activeTab, setActiveTab] = useState<"runs" | "items">("runs");
 
+  function parseProjectSettings(raw: unknown): { testRunEnvironments?: Array<{ name?: string; url?: string }> } {
+    if (typeof raw !== "string" || !raw.trim()) return {};
+    try {
+      const parsed = JSON.parse(raw) as { testRunEnvironments?: Array<{ name?: string; url?: string }> };
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item) => {
+        const candidate = item as { name?: unknown; url?: unknown };
+        const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+        const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+        if (!name || !url) return null;
+        return { name, url };
+      })
+      .filter((item): item is TestEnvironmentSetting => item !== null);
+  }
+
   const loadData = useCallback(async () => {
     try {
-      const [p, i, r, pg] = await Promise.all([
+      const [p, i, r, pg, project] = await Promise.all([
         getPlan(planId),
         listPlanItems(planId),
         listPlanRuns(planId),
         getPlanProgress(planId),
+        getProject(projectId),
       ]);
       setPlan(p);
       setItems(i);
       setRuns(r);
       setProgress(pg);
+      const parsedSettings = parseProjectSettings(project.settings);
+      const environments = normalizeTestRunEnvironments(parsedSettings.testRunEnvironments);
+      setEnvironmentOptions(environments);
+      setSelectedEnvironment((prev) => {
+        if (prev && environments.some((item) => item.name === prev)) return prev;
+        return environments[0]?.name ?? "";
+      });
     } catch {
       router.replace("/projects");
     }
-  }, [planId, router]);
+  }, [planId, projectId, router]);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -140,10 +175,11 @@ export default function PlanDetailPage() {
 
   async function handleCreateCycle(e: React.FormEvent) {
     e.preventDefault();
+    if (!selectedEnvironment.trim()) return;
     const name = newCycleName.trim() || planName || "Test Run";
     setCreatingCycle(true);
     try {
-      const c = await createCycleFromPlan(projectId, { planId, name });
+      await createCycleFromPlan(projectId, { planId, name, environment: selectedEnvironment });
       setShowCreateCycle(false);
       setNewCycleName("");
       await loadData();
@@ -385,8 +421,8 @@ export default function PlanDetailPage() {
 
             {/* Create new cycle form */}
             {showCreateCycle && (
-              <form onSubmit={handleCreateCycle} className="mb-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4 flex items-end gap-3">
-                <div className="flex-1">
+              <form onSubmit={handleCreateCycle} className="mb-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4 space-y-3">
+                <div>
                   <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400 mb-1">Run Name</label>
                   <input
                     value={newCycleName}
@@ -396,12 +432,50 @@ export default function PlanDetailPage() {
                     autoFocus
                   />
                 </div>
-                <button type="submit" disabled={creatingCycle} className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2 px-4 text-sm font-medium transition-colors shrink-0">
-                  {creatingCycle ? "Creating..." : "Create"}
-                </button>
-                <button type="button" onClick={() => setShowCreateCycle(false)} className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 py-2 px-3 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors shrink-0">
-                  Cancel
-                </button>
+                <div>
+                  <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400 mb-1">
+                    Environment <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    value={selectedEnvironment}
+                    onChange={(e) => setSelectedEnvironment(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                    required
+                  >
+                    <option value="">Select environment</option>
+                    {environmentOptions.map((env) => (
+                      <option key={env.name} value={env.name}>
+                        {env.name}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedEnvironment && (
+                    <p className="mt-1 text-xs text-zinc-500">
+                      URL: {environmentOptions.find((item) => item.name === selectedEnvironment)?.url ?? "Not available"}
+                    </p>
+                  )}
+                  {environmentOptions.length === 0 && (
+                    <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                      No environments configured in project settings.
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="submit"
+                    disabled={creatingCycle || !selectedEnvironment.trim() || environmentOptions.length === 0}
+                    className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2 px-4 text-sm font-medium transition-colors"
+                  >
+                    {creatingCycle ? "Creating..." : "Create"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateCycle(false)}
+                    className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 py-2 px-3 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </form>
             )}
 

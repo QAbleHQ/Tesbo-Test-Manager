@@ -5,11 +5,14 @@ import com.bettercases.auth.SessionFilter;
 import com.bettercases.invitation.InvitationHandler;
 import com.bettercases.onboarding.OnboardingHandler;
 import com.bettercases.project.ProjectHandler;
+import com.bettercases.automation.AutomationSessionHandler;
 import com.bettercases.suite.SuiteHandler;
 import com.bettercases.tesbo.TesboReportsHandler;
 import com.bettercases.testcase.TestCaseHandler;
 import com.bettercases.plan.PlanHandler;
 import com.bettercases.cycle.CycleHandler;
+import com.bettercases.cycle.CycleScheduleWorker;
+import com.bettercases.cycle.AutomationQueueCallbackHandler;
 import com.bettercases.workspace.WorkspaceHandler;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
@@ -93,6 +96,23 @@ public final class Main {
         app.post("/api/projects/{projectId}/testcases/bulk-update", com.bettercases.testcase.BulkUpdateHandler::bulkUpdate);
         app.post("/api/projects/{projectId}/testcases/bulk-delete", com.bettercases.testcase.BulkUpdateHandler::bulkDelete);
         app.get("/api/projects/{projectId}/testcases/linked-jira-keys", TestCaseHandler::linkedJiraKeys);
+        app.post("/api/projects/{projectId}/testcases/{testcaseId}/automation/sessions", AutomationSessionHandler::start);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands", AutomationSessionHandler::runCommand);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands/stop", AutomationSessionHandler::stopActiveCommand);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/trace", AutomationSessionHandler::downloadLatestTrace);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/reset", AutomationSessionHandler::reset);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/manual-actions", AutomationSessionHandler::manualAction);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/run-script", AutomationSessionHandler::runPlaywrightScript);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/recording", AutomationSessionHandler::getRecording);
+        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/recording/compile", AutomationSessionHandler::compileRecording);
+        app.get("/api/projects/{projectId}/automation/recordings", AutomationSessionHandler::listRecordingsByProject);
+        app.get("/api/projects/{projectId}/automation/recordings/{recordingId}", AutomationSessionHandler::getRecordingById);
+        app.get("/api/projects/{projectId}/testcases/{testcaseId}/automation/recordings", AutomationSessionHandler::listRecordingsByTestcase);
 
         app.get("/api/projects/{projectId}/plans", PlanHandler::list);
         app.post("/api/projects/{projectId}/plans", PlanHandler::create);
@@ -116,13 +136,32 @@ public final class Main {
         app.delete("/api/cycles/{cycleId}/testcases/{testcaseId}", CycleHandler::removeTestCase);
         app.get("/api/cycles/{cycleId}/executions", CycleHandler::listExecutions);
         app.patch("/api/cycles/{cycleId}/executions/{executionId}", CycleHandler::updateExecution);
+        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-report", CycleHandler::getExecutionAutomationReport);
+        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-video", CycleHandler::streamExecutionAutomationVideo);
+        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-trace", CycleHandler::streamExecutionAutomationTrace);
         app.post("/api/cycles/{cycleId}/executions/bulk-assign", CycleHandler::bulkAssign);
         app.post("/api/cycles/{cycleId}/executions/bulk-status", CycleHandler::bulkUpdateStatus);
+        app.post("/api/cycles/{cycleId}/execute-automated", CycleHandler::executeAutomated);
+        app.get("/api/cycles/{cycleId}/execute-automated/latest/status", CycleHandler::getLatestAutomatedRunStatus);
+        app.get("/api/cycles/{cycleId}/execute-automated/{runId}/status", CycleHandler::getAutomatedRunStatus);
+        app.post("/api/cycles/{cycleId}/execute-automated/{runId}/cancel", CycleHandler::cancelAutomatedRun);
+        app.get("/api/internal/automation/queue-metrics", CycleHandler::queueMetrics);
+        app.get("/api/internal/automation/autoscaling-recommendation", CycleHandler::autoscalingRecommendation);
         app.post("/api/cycles/{cycleId}/share", CycleHandler::toggleShare);
+        app.get("/api/projects/{projectId}/cycles/schedules", CycleHandler::listSchedules);
+        app.post("/api/projects/{projectId}/cycles/schedules", CycleHandler::createSchedule);
+        app.patch("/api/cycles/schedules/{scheduleId}", CycleHandler::updateSchedule);
+        app.delete("/api/cycles/schedules/{scheduleId}", CycleHandler::deleteSchedule);
 
         // Public sharing endpoints (no authentication required)
         app.get("/api/public/shared-runs/{token}", CycleHandler::getPublicRun);
         app.get("/api/public/shared-runs/{token}/executions", CycleHandler::getPublicExecutions);
+
+        // Internal queue callbacks (worker -> backend)
+        app.post("/api/internal/automation/jobs/{jobId}/start", AutomationQueueCallbackHandler::start);
+        app.post("/api/internal/automation/jobs/{jobId}/heartbeat", AutomationQueueCallbackHandler::heartbeat);
+        app.post("/api/internal/automation/jobs/{jobId}/complete", AutomationQueueCallbackHandler::complete);
+        app.post("/api/internal/automation/jobs/{jobId}/fail", AutomationQueueCallbackHandler::fail);
 
         app.get("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::list);
         app.post("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::create);
@@ -140,6 +179,7 @@ public final class Main {
         app.get("/api/projects/{projectId}/reports/repository-summary", com.bettercases.reporting.ReportingHandler::repositorySummary);
 
         app.post("/api/projects/{projectId}/ai/generate-testcases", com.bettercases.ai.AiHandler::generateTestCases);
+        app.post("/api/projects/{projectId}/ai/review-script", com.bettercases.ai.AiHandler::reviewScript);
         app.get("/api/projects/{projectId}/ai/generation-history", com.bettercases.ai.AiHandler::listHistory);
         app.post("/api/projects/{projectId}/ai/generation-history/{requestId}/save", com.bettercases.ai.AiHandler::trackSave);
 
@@ -206,6 +246,7 @@ public final class Main {
             ctx.status(500).json(java.util.Map.of("error", "Internal server error"));
         });
 
+        CycleScheduleWorker.start();
         app.start(Config.SERVER_PORT);
         System.out.println("Backend running on http://localhost:" + Config.SERVER_PORT);
     }

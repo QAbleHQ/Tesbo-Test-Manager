@@ -3,6 +3,7 @@
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 import { requestOtp } from "@/lib/api";
 
 function LoginForm() {
@@ -44,7 +45,14 @@ function LoginForm() {
     <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950 px-4">
       <div className="w-full max-w-sm space-y-8">
         <div className="text-center">
-          <h1 className="text-2xl font-semibold text-[var(--foreground)] dark:text-zinc-100">BetterCases</h1>
+          <Image
+            src="/tesbox-logo-transparent.png"
+            alt="TesboX"
+            width={280}
+            height={80}
+            priority
+            className="mx-auto h-14 w-auto"
+          />
           <p className="mt-1 text-sm text-[var(--muted)]">Sign in with your email</p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">

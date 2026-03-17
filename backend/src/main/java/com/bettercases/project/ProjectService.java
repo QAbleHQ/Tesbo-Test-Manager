@@ -37,6 +37,7 @@ public final class ProjectService {
                 pm.executeUpdate();
             }
             SuiteService.ensureDefaultSuiteExists(projectId);
+            ensureBrowserAgentMapping(projectId, c);
             return Map.of(
                     "id", projectId.toString(),
                     "key", rs.getString("key"),
@@ -76,22 +77,24 @@ public final class ProjectService {
     }
 
     public static Optional<Map<String, Object>> getProject(UUID projectId, UUID userId) {
-        if (!RbacService.hasProjectAccess(userId, projectId)) return Optional.empty();
+        Optional<Role> roleOpt = RbacService.getProjectRole(userId, projectId);
+        if (roleOpt.isEmpty()) return Optional.empty();
         String sql = "SELECT id, organization_id, key, name, description, settings, archived_at, created_at, updated_at FROM projects WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
             ResultSet rs = ps.executeQuery();
             if (rs.next()) {
-                return Optional.of(Map.<String, Object>of(
-                        "id", rs.getObject("id").toString(),
-                        "key", rs.getString("key"),
-                        "name", rs.getString("name"),
-                        "description", rs.getString("description") != null ? rs.getString("description") : "",
-                        "settings", rs.getString("settings") != null ? rs.getString("settings") : "{}",
-                        "createdAt", rs.getTimestamp("created_at").toInstant().toString(),
-                        "updatedAt", rs.getTimestamp("updated_at").toInstant().toString()
-                ));
+                Map<String, Object> result = new java.util.LinkedHashMap<>();
+                result.put("id", rs.getObject("id").toString());
+                result.put("key", rs.getString("key"));
+                result.put("name", rs.getString("name"));
+                result.put("description", rs.getString("description") != null ? rs.getString("description") : "");
+                result.put("settings", rs.getString("settings") != null ? rs.getString("settings") : "{}");
+                result.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
+                result.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());
+                result.put("myRole", roleOpt.get().name().toLowerCase());
+                return Optional.of(result);
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -231,6 +234,16 @@ public final class ProjectService {
         if ("qa_member".equals(normalized)) return "member";
         if ("viewer".equals(normalized)) return "member";
         return normalized;
+    }
+
+    private static void ensureBrowserAgentMapping(UUID projectId, Connection c) throws SQLException {
+        String automationJson = "{\"automation\":{\"browserAgent\":\"default\"}}";
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) || ?::jsonb, updated_at = now() WHERE id = ?")) {
+            ps.setString(1, automationJson);
+            ps.setObject(2, projectId);
+            ps.executeUpdate();
+        }
     }
 
     private static String normalizeProjectRole(String role) {

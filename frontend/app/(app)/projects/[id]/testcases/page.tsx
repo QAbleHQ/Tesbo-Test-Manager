@@ -17,9 +17,12 @@ import {
   deleteTestCase,
   bulkUpdateTestCases,
   bulkDeleteTestCases,
+  getAgentSettings,
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
+import { runAegisInBackground, recoverOrphanedTasks } from "@/lib/aegis-runner";
+import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 
 const PAGE_SIZE = 100;
 const TESTCASE_STATUSES = ["Draft", "In Review", "Approved", "Deprecated", "Archived"];
@@ -35,10 +38,11 @@ const TESTCASE_TYPES = [
   "Performance",
   "Security",
 ];
-const AUTOMATION_FEASIBILITY_OPTIONS = ["Yes", "No", "Not Automated"];
+const AUTOMATION_FEASIBILITY_OPTIONS = ["In Planning", "Not able to Automate", "Ready for the Automation", "Automated"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
-type PanelMode = "closed" | "view" | "edit" | "create";
+type PanelMode = "closed" | "edit" | "create";
+type PanelTab = "overview" | "steps" | "automation";
 type BulkAction = "" | "delete" | "update" | "archive";
 type ViewMode = "bySuites" | "allCases";
 
@@ -69,17 +73,20 @@ export default function TestCasesPage() {
   const [newSuiteName, setNewSuiteName] = useState("");
   const [isCreatingSuite, setIsCreatingSuite] = useState(false);
   const [panelMode, setPanelMode] = useState<PanelMode>("closed");
+  const [panelTab, setPanelTab] = useState<PanelTab>("overview");
   const [panelTestcaseId, setPanelTestcaseId] = useState<string | null>(null);
   const [panelLoading, setPanelLoading] = useState(false);
   const [panelSaving, setPanelSaving] = useState(false);
   const [panelError, setPanelError] = useState<string | null>(null);
+  const [panelSuccess, setPanelSuccess] = useState<string | null>(null);
   const [submitAction, setSubmitAction] = useState<"create" | "create-next">("create");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
-  const [automationStatus, setAutomationStatus] = useState("Not Automated");
+  const [automationStatus, setAutomationStatus] = useState("In Planning");
+  const [automationScript, setAutomationScript] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
   const [automationTags, setAutomationTags] = useState<string[]>([]);
@@ -106,6 +113,7 @@ export default function TestCasesPage() {
   const [allCasesSuiteFilter, setAllCasesSuiteFilter] = useState("all");
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("bySuites");
+  
 
   const loadData = useCallback(async () => {
     const suiteList = await listSuites(projectId);
@@ -120,7 +128,8 @@ export default function TestCasesPage() {
       }
       loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
     });
-  }, [router, loadData]);
+    recoverOrphanedTasks(projectId);
+  }, [router, loadData, projectId]);
 
   const visibleSuites = useMemo(
     () => [...suites].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -241,7 +250,8 @@ export default function TestCasesPage() {
     setPreconditions((data.preconditions as string) ?? "");
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
-    setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setAutomationStatus((data.automationStatus as string) ?? "In Planning");
+    setAutomationScript((data.automationScript as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
     setAttachments((data.attachments as string) ?? "");
     setAutomationTags(parseTagString((data.automationTags as string) ?? ""));
@@ -259,7 +269,8 @@ export default function TestCasesPage() {
     setPreconditions("");
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
-    setAutomationStatus("Not Automated");
+    setAutomationStatus("In Planning");
+    setAutomationScript("");
     setEstimatedDuration("");
     setAttachments("");
     setAutomationTags([]);
@@ -275,6 +286,7 @@ export default function TestCasesPage() {
     setPanelError(null);
     setPanelTestcaseId(null);
     setPanelMode("create");
+    setPanelTab("overview");
     resetForm(viewMode === "allCases" ? null : activeSuiteId);
   }
 
@@ -282,7 +294,8 @@ export default function TestCasesPage() {
     setPanelError(null);
     setPanelLoading(true);
     setPanelTestcaseId(testcaseId);
-    setPanelMode("view");
+    setPanelMode("edit");
+    setPanelTab("overview");
     try {
       const data = await getTestCase(projectId, testcaseId);
       fillFormFromTestCase(data);
@@ -329,6 +342,11 @@ export default function TestCasesPage() {
 
   function updateStep(index: number, field: keyof Step, value: string | number) {
     setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, [field]: value } : step)));
+  }
+
+  function openSingleTestRun(testcaseId: string) {
+    const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
+    window.open(rerunUrl, "_blank", "noopener,noreferrer");
   }
 
   async function refreshData(pageOverride?: number) {
@@ -479,8 +497,10 @@ export default function TestCasesPage() {
     if (panelMode !== "create" && panelMode !== "edit") return;
     setPanelSaving(true);
     setPanelError(null);
+    setPanelSuccess(null);
     try {
       if (panelMode === "create") {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         const created = await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
@@ -488,14 +508,22 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+          }
+        }
         setSuiteCasesPage(1);
         setSuiteSearch("");
         setDebouncedSuiteSearch("");
@@ -504,12 +532,15 @@ export default function TestCasesPage() {
         setSuiteTypeFilter("all");
         setSuiteAutomationFilter("all");
         await refreshData(1);
+        setPanelSuccess("Test case created successfully. Aegis is working on it in the background.");
+        setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
           resetForm(suiteId || (viewMode === "allCases" ? null : activeSuiteId));
         } else {
           await openViewPanel(created.id);
         }
       } else if (panelMode === "edit" && panelTestcaseId) {
+        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await updateTestCase(projectId, panelTestcaseId, {
           suiteId: suiteId || undefined,
           title,
@@ -517,16 +548,28 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus,
+          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
           automationTags: automationTags.join(", "),
+          automationScript,
+          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
         });
+        if (effectiveAutomationStatus === "Ready for the Automation") {
+          const settings = getAgentSettings(projectId, "aegis");
+          if (settings.autoStartOnReady) {
+            runAegisInBackground(projectId, panelTestcaseId, title, "", "ready_for_automation");
+          }
+        }
+        setPanelSuccess("Test case updated successfully.");
+        setTimeout(() => setPanelSuccess(null), 4000);
         await refreshData();
+        const savedTab = panelTab;
         await openViewPanel(panelTestcaseId);
+        setPanelTab(savedTab);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to save test case.";
@@ -539,6 +582,7 @@ export default function TestCasesPage() {
 
   return (
     <main className="px-6 py-6">
+      <AegisBackgroundIndicator />
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Test case repository</h1>
@@ -771,6 +815,7 @@ export default function TestCasesPage() {
                           <th className="px-4 py-2">Priority</th>
                           <th className="px-4 py-2">Status</th>
                           <th className="px-4 py-2">Updated</th>
+                          <th className="px-4 py-2">Run</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -829,6 +874,21 @@ export default function TestCasesPage() {
                             <td className="px-4 py-2">{tc.priority}</td>
                             <td className="px-4 py-2">{tc.status}</td>
                             <td className="px-4 py-2 text-zinc-500">{new Date(tc.updatedAt).toLocaleDateString()}</td>
+                            <td className="px-4 py-2">
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openSingleTestRun(tc.id);
+                                  }}
+                                  className="rounded border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+                                  title="Run this single test case"
+                                >
+                                  Run Single Test
+                                </button>
+                              </div>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -873,420 +933,500 @@ export default function TestCasesPage() {
                   onClick={closePanel}
                   className="absolute inset-0 bg-black/35"
                 />
-                <aside className="absolute right-0 top-0 h-full w-full border-l border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 lg:w-1/2">
-                  <div className="mb-4 flex items-center justify-between">
-                    <h3 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-                      {panelMode === "create" ? "Create Test Case" : panelMode === "edit" ? "Edit Test Case" : "Test Case Details"}
-                    </h3>
-                    <div className="flex items-center gap-2">
-                      {panelMode === "view" && (
+                <aside className="absolute right-0 top-0 h-full w-1/2 min-w-[480px] border-l border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 flex flex-col">
+                  {/* Panel header */}
+                  <div className="flex shrink-0 items-start justify-between gap-3 border-b border-zinc-200 px-6 py-4 dark:border-zinc-700">
+                    <div className="min-w-0 flex-1">
+                      <p className="mb-0.5 text-xs font-medium uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                        {panelMode === "create" ? "New Test Case" : "Test Case"}
+                      </p>
+                      <h3 className="truncate text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+                        {panelMode === "create" ? "Create Test Case" : (title || "Untitled")}
+                      </h3>
+                      {panelMode === "edit" && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                          {status && (
+                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                              status === "Approved" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300" :
+                              status === "In Review" ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300" :
+                              status === "Draft" ? "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" :
+                              "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                            }`}>{status}</span>
+                          )}
+                          {priority && (
+                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                              priority === "P0" ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300" :
+                              priority === "P1" ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300" :
+                              "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                            }`}>{priority}</span>
+                          )}
+                          {panelJiraIssueKey && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/20 dark:text-blue-300">
+                              <svg viewBox="0 0 24 24" className="h-3 w-3 shrink-0" fill="currentColor" aria-hidden="true">
+                                <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
+                              </svg>
+                              {panelJiraUrl ? (
+                                <a href={panelJiraUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">{panelJiraIssueKey}</a>
+                              ) : panelJiraIssueKey}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {panelMode === "edit" && panelTestcaseId && (
                         <button
                           type="button"
-                          onClick={() => setPanelMode("edit")}
-                          className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                          onClick={() => openSingleTestRun(panelTestcaseId)}
+                          className="rounded-lg border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
                         >
-                          Edit
+                          Run Test
                         </button>
                       )}
                       <button
                         type="button"
-                        aria-label="Cancel"
+                        aria-label="Close panel"
                         onClick={closePanel}
-                        className="rounded border border-zinc-300 px-2 py-1 text-sm leading-none hover:bg-zinc-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
                       >
-                        X
+                        <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+                          <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
                       </button>
                     </div>
                   </div>
 
-                  {panelError && (
-                    <p className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
-                      {panelError}
-                    </p>
+                  {/* Tabs (only for edit mode) */}
+                  {panelMode === "edit" && (
+                    <div className="flex shrink-0 gap-0 border-b border-zinc-200 px-6 dark:border-zinc-700">
+                      {(["overview", "steps", "automation"] as PanelTab[]).map((tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => setPanelTab(tab)}
+                          className={`-mb-px border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
+                            panelTab === tab
+                              ? "border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400"
+                              : "border-transparent text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
+                          }`}
+                        >
+                          {tab === "overview" ? "Overview" : tab === "steps" ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}` : "Automation"}
+                        </button>
+                      ))}
+                    </div>
                   )}
 
-                  <div className="h-[calc(100vh-6rem)] overflow-y-auto pr-1">
-                    {panelLoading ? (
-                      <p className="text-sm text-zinc-500">Loading test case...</p>
-                    ) : panelMode === "view" ? (
-                      <div className="space-y-5 text-base">
-                      <div>
-                        <p className="mb-1 text-sm font-medium text-zinc-500">Title</p>
-                        <p className="font-semibold text-zinc-900 dark:text-zinc-100">{title || "-"}</p>
-                      </div>
-                      {panelJiraIssueKey && (
-                        <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 dark:border-blue-800 dark:bg-blue-900/20">
-                          <svg viewBox="0 0 24 24" className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" fill="currentColor">
-                            <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
-                          </svg>
-                          <span className="text-sm text-blue-700 dark:text-blue-300">
-                            Linked to Jira ticket{" "}
-                            {panelJiraUrl ? (
-                              <a href={panelJiraUrl} target="_blank" rel="noopener noreferrer" className="font-semibold hover:underline">
-                                {panelJiraIssueKey}
-                              </a>
-                            ) : (
-                              <span className="font-semibold">{panelJiraIssueKey}</span>
-                            )}
-                          </span>
-                        </div>
+                  {/* Alerts */}
+                  {(panelError || panelSuccess) && (
+                    <div className="shrink-0 px-6 pt-3">
+                      {panelError && (
+                        <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+                          {panelError}
+                        </p>
                       )}
-                      <div>
-                        <p className="mb-1 text-sm font-medium text-zinc-500">Description</p>
-                        <p className="whitespace-pre-wrap leading-7 text-zinc-700 dark:text-zinc-300">{description || "-"}</p>
-                      </div>
-                      <div>
-                        <p className="mb-1 text-sm font-medium text-zinc-500">Preconditions</p>
-                        <p className="whitespace-pre-wrap leading-7 text-zinc-700 dark:text-zinc-300">{preconditions || "-"}</p>
-                      </div>
-                      <div>
-                        <p className="mb-1 text-sm font-medium text-zinc-500">Test Data</p>
-                        <p className="whitespace-pre-wrap leading-7 text-zinc-700 dark:text-zinc-300">{testData || "-"}</p>
-                      </div>
-                      <div className="grid grid-cols-3 gap-3">
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Suite</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">
-                            {suites.find((suite) => suite.id === suiteId)?.name || "No suite"}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Type</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">{type || "-"}</p>
-                        </div>
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Automation Feasibility</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">{automationStatus || "-"}</p>
-                        </div>
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Priority</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">{priority}</p>
-                        </div>
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Status</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">{status}</p>
+                      {panelSuccess && (
+                        <p className="rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700 dark:border-green-700/40 dark:bg-green-900/20 dark:text-green-300">
+                          {panelSuccess}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Scrollable body */}
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    {panelLoading ? (
+                      <div className="flex items-center justify-center p-12">
+                        <div className="flex flex-col items-center gap-3">
+                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-300 border-t-blue-600" />
+                          <p className="text-sm text-zinc-500">Loading test case...</p>
                         </div>
                       </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Estimated Duration</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">{estimatedDuration || "-"}</p>
-                        </div>
-                        <div>
-                          <p className="mb-1 text-sm font-medium text-zinc-500">Tags / Labels</p>
-                          <p className="text-zinc-700 dark:text-zinc-300">
-                            {automationTags.length > 0 ? automationTags.join(", ") : "-"}
-                          </p>
-                        </div>
-                      </div>
-                      <div>
-                        <p className="mb-1 text-sm font-medium text-zinc-500">Attachments</p>
-                        <p className="whitespace-pre-wrap leading-7 text-zinc-700 dark:text-zinc-300">{attachments || "-"}</p>
-                      </div>
-                      <div>
-                        <div className="mb-2 flex items-center justify-between">
-                          <p className="text-sm font-semibold uppercase tracking-wide text-zinc-500">Test Steps</p>
-                          <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-                            {steps.length} step{steps.length === 1 ? "" : "s"}
-                          </span>
-                        </div>
-                        <div className="space-y-3">
-                          {steps.length === 0 ? (
-                            <div className="rounded-lg border border-dashed border-zinc-300 p-3 text-sm text-zinc-500 dark:border-zinc-700">
-                              No steps added.
+                    ) : (
+                      <form onSubmit={handlePanelSubmit} id="panel-form">
+                        {/* CREATE MODE — single-scroll form with all fields */}
+                        {panelMode === "create" && (
+                          <div className="space-y-5 px-6 py-5">
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Title <span className="text-red-500">*</span></label>
+                              <input
+                                type="text"
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                required
+                                placeholder="Describe what this test case validates"
+                                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                              />
                             </div>
-                          ) : (
-                            steps.map((step, index) => (
-                              <div
-                                key={`${step.stepNumber ?? index}-${index}`}
-                                className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-700 dark:bg-zinc-900/60"
-                              >
-                                <div className="mb-2 flex items-center gap-2">
-                                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">
-                                    {index + 1}
-                                  </span>
-                                  <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Step {index + 1}</p>
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Description</label>
+                              <textarea
+                                value={description}
+                                onChange={(e) => setDescription(e.target.value)}
+                                rows={3}
+                                placeholder="What does this test case cover?"
+                                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                              />
+                            </div>
+                            <div className="grid grid-cols-3 gap-3">
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Suite</label>
+                                <select
+                                  value={suiteId}
+                                  onChange={(e) => setSuiteId(e.target.value)}
+                                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                >
+                                  <option value="">No suite</option>
+                                  {suites.map((suite) => (
+                                    <option key={suite.id} value={suite.id}>{suite.name}</option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Type</label>
+                                <select value={type} onChange={(e) => setType(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                  {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                                </select>
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Priority</label>
+                                <select value={priority} onChange={(e) => setPriority(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                  {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                                </select>
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Status</label>
+                                <select value={status} onChange={(e) => setStatus(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                  {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Estimated Duration</label>
+                                <input
+                                  type="text"
+                                  value={estimatedDuration}
+                                  onChange={(e) => setEstimatedDuration(e.target.value)}
+                                  placeholder="e.g. 10 min"
+                                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                />
+                              </div>
+                              <div>
+                                <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Automation</label>
+                                <select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                  {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                                </select>
+                              </div>
+                            </div>
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Preconditions</label>
+                              <textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={2} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                            </div>
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Test Data</label>
+                              <textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                            </div>
+                            <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
+                            {/* Test steps section */}
+                            <div>
+                              <div className="mb-3 flex items-center justify-between">
+                                <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Test Steps</label>
+                                <button type="button" onClick={addStep} className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-300">
+                                  + Add step
+                                </button>
+                              </div>
+                              <div className="space-y-3">
+                                {steps.map((step, index) => (
+                                  <div key={index} className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-700 dark:bg-zinc-900/60">
+                                    <div className="mb-2 flex items-center justify-between">
+                                      <div className="flex items-center gap-2">
+                                        <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">{index + 1}</span>
+                                        <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Step {index + 1}</p>
+                                      </div>
+                                      {steps.length > 1 && (
+                                        <button type="button" onClick={() => removeStep(index)} className="rounded px-2 py-1 text-xs text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/40">Remove</button>
+                                      )}
+                                    </div>
+                                    <div className="grid gap-2">
+                                      <div>
+                                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">Action</label>
+                                        <textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="w-full rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                                      </div>
+                                      <div>
+                                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">Expected Result</label>
+                                        <textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="w-full rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+                              <textarea
+                                value={automationScript}
+                                onChange={(e) => setAutomationScript(e.target.value)}
+                                rows={8}
+                                placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
+                                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-900"
+                              />
+                              <p className="mt-1 text-xs text-zinc-500">Saving with script content will mark automation status as Automated.</p>
+                            </div>
+                            <div>
+                              <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Attachments</label>
+                              <textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                            </div>
+                          </div>
+                        )}
+
+                        {/* EDIT MODE — tabbed content */}
+                        {panelMode === "edit" && (
+                          <>
+                            {/* Overview tab */}
+                            {panelTab === "overview" && (
+                              <div className="space-y-5 px-6 py-5">
+                                <div>
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Title <span className="text-red-500">*</span></label>
+                                  <input
+                                    type="text"
+                                    value={title}
+                                    onChange={(e) => setTitle(e.target.value)}
+                                    required
+                                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-zinc-600 dark:bg-zinc-900"
+                                  />
                                 </div>
-                                <div className="space-y-2">
+                                <div>
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Description</label>
+                                  <textarea
+                                    value={description}
+                                    onChange={(e) => setDescription(e.target.value)}
+                                    rows={4}
+                                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Preconditions</label>
+                                  <textarea
+                                    value={preconditions}
+                                    onChange={(e) => setPreconditions(e.target.value)}
+                                    rows={3}
+                                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Test Data</label>
+                                  <textarea
+                                    value={testData}
+                                    onChange={(e) => setTestData(e.target.value)}
+                                    rows={2}
+                                    placeholder="Input data, sample values, or setup-specific data"
+                                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                  />
+                                </div>
+                                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                                   <div>
-                                    <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-500">Action</p>
-                                    <p className="whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">{step.action || "-"}</p>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Suite</label>
+                                    <select value={suiteId} onChange={(e) => setSuiteId(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                      <option value="">No suite</option>
+                                      {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
+                                    </select>
                                   </div>
                                   <div>
-                                    <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-500">Expected Result</p>
-                                    <p className="whitespace-pre-wrap text-zinc-700 dark:text-zinc-300">{step.expectedResult || "-"}</p>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Type</label>
+                                    <select value={type} onChange={(e) => setType(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                      {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                                    </select>
                                   </div>
+                                  <div>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Priority</label>
+                                    <select value={priority} onChange={(e) => setPriority(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                      {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Status</label>
+                                    <select value={status} onChange={(e) => setStatus(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                      {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Estimated Duration</label>
+                                    <input
+                                      type="text"
+                                      value={estimatedDuration}
+                                      onChange={(e) => setEstimatedDuration(e.target.value)}
+                                      placeholder="e.g. 10 min"
+                                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Automation</label>
+                                    <select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                      {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                                    </select>
+                                  </div>
+                                </div>
+                                <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
+                                <div>
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Attachments</label>
+                                  <textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
                                 </div>
                               </div>
-                            ))
-                          )}
-                        </div>
-                      </div>
-                      <div className="pt-2 flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => void handleArchivePanelTestCase()}
-                          disabled={panelSaving}
-                          className="rounded border border-amber-300 px-3 py-1 text-sm text-amber-700 hover:bg-amber-50 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-950/40"
-                        >
-                          {panelSaving ? "Archiving..." : "Archive"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleDeletePanelTestCase()}
-                          disabled={panelSaving}
-                          className="rounded border border-red-300 px-3 py-1 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
-                        >
-                          {panelSaving ? "Deleting..." : "Delete"}
-                        </button>
-                      </div>
-                    </div>
-                    ) : (
-                      <form onSubmit={handlePanelSubmit} className="space-y-4">
-                      <div>
-                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Title</label>
-                        <input
-                          type="text"
-                          value={title}
-                          onChange={(e) => setTitle(e.target.value)}
-                          required
-                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Description</label>
-                        <textarea
-                          value={description}
-                          onChange={(e) => setDescription(e.target.value)}
-                          rows={3}
-                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Preconditions</label>
-                        <textarea
-                          value={preconditions}
-                          onChange={(e) => setPreconditions(e.target.value)}
-                          rows={2}
-                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Test Data</label>
-                        <textarea
-                          value={testData}
-                          onChange={(e) => setTestData(e.target.value)}
-                          rows={2}
-                          placeholder="Input data, sample values, or setup-specific data"
-                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                        />
-                      </div>
-                      <div>
-                        <div className="mb-2 flex items-center justify-between">
-                          <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Test Steps</label>
-                          <button
-                            type="button"
-                            onClick={addStep}
-                            className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-300"
-                          >
-                            + Add step
-                          </button>
-                        </div>
-                        <div className="space-y-3">
-                          {steps.map((step, index) => (
-                            <div
-                              key={index}
-                              className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-700 dark:bg-zinc-900/60"
-                            >
-                              <div className="mb-2 flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">
-                                    {index + 1}
-                                  </span>
-                                  <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Step {index + 1}</p>
-                                </div>
-                                {steps.length > 1 && (
-                                  <button
-                                    type="button"
-                                    onClick={() => removeStep(index)}
-                                    className="rounded px-2 py-1 text-xs text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/40"
-                                  >
-                                    Remove
+                            )}
+
+                            {/* Steps tab */}
+                            {panelTab === "steps" && (
+                              <div className="px-6 py-5">
+                                <div className="mb-4 flex items-center justify-between">
+                                  <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                                    {steps.length} step{steps.length === 1 ? "" : "s"}
+                                  </p>
+                                  <button type="button" onClick={addStep} className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-300">
+                                    + Add step
                                   </button>
+                                </div>
+                                {steps.length === 0 ? (
+                                  <div className="rounded-xl border border-dashed border-zinc-300 p-8 text-center dark:border-zinc-700">
+                                    <p className="text-sm text-zinc-500">No steps yet. Add your first step above.</p>
+                                  </div>
+                                ) : (
+                                  <div className="space-y-3">
+                                    {steps.map((step, index) => (
+                                      <div key={index} className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+                                        <div className="mb-3 flex items-center justify-between">
+                                          <div className="flex items-center gap-2">
+                                            <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">{index + 1}</span>
+                                            <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Step {index + 1}</p>
+                                          </div>
+                                          {steps.length > 1 && (
+                                            <button type="button" onClick={() => removeStep(index)} className="rounded-lg px-2 py-1 text-xs text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-950/40">Remove</button>
+                                          )}
+                                        </div>
+                                        <div className="grid gap-3">
+                                          <div>
+                                            <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Action</label>
+                                            <textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                                          </div>
+                                          <div>
+                                            <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Expected Result</label>
+                                            <textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900" />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
                                 )}
                               </div>
-                              <div className="grid gap-2">
+                            )}
+
+                            {/* Automation tab */}
+                            {panelTab === "automation" && (
+                              <div className="space-y-5 px-6 py-5">
                                 <div>
-                                  <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-                                    Action
-                                  </label>
+                                  <div className="mb-3 flex items-center justify-between">
+                                    <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+                                    {panelTestcaseId && (
+                                      <div className="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
+                                            setPanelSuccess("Added to Aegis queue.");
+                                            setTimeout(() => setPanelSuccess(null), 4000);
+                                          }}
+                                          className="inline-flex items-center gap-1.5 rounded-lg border border-violet-300 bg-violet-50 px-3 py-1.5 text-xs font-medium text-violet-700 hover:bg-violet-100 dark:border-violet-700 dark:bg-violet-900/20 dark:text-violet-300 dark:hover:bg-violet-900/40"
+                                        >
+                                          Send to Aegis
+                                        </button>
+                                        <a
+                                          href={`/projects/${projectId}/testcases/${panelTestcaseId}/automate`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                                        >
+                                          Open in Aegis
+                                        </a>
+                                      </div>
+                                    )}
+                                  </div>
                                   <textarea
-                                    placeholder="Describe the action to perform"
-                                    value={step.action ?? ""}
-                                    onChange={(e) => updateStep(index, "action", e.target.value)}
-                                    rows={2}
-                                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                                    value={automationScript}
+                                    onChange={(e) => setAutomationScript(e.target.value)}
+                                    rows={16}
+                                    placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
+                                    className="w-full rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-2 font-mono text-xs leading-relaxed dark:border-zinc-600 dark:bg-zinc-950"
                                   />
+                                  <p className="mt-1.5 text-xs text-zinc-500">Saving with script content will mark automation status as Automated.</p>
                                 </div>
                                 <div>
-                                  <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-                                    Expected Result
-                                  </label>
-                                  <textarea
-                                    placeholder="Describe the expected outcome"
-                                    value={step.expectedResult ?? ""}
-                                    onChange={(e) => updateStep(index, "expectedResult", e.target.value)}
-                                    rows={2}
-                                    className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                                  />
+                                  <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Automation Feasibility</label>
+                                  <select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)} className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900">
+                                    {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                                  </select>
                                 </div>
                               </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Suite</label>
-                          <select
-                            value={suiteId}
-                            onChange={(e) => setSuiteId(e.target.value)}
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          >
-                            <option value="">No suite</option>
-                            {suites.map((suite) => (
-                              <option key={suite.id} value={suite.id}>
-                                {suite.name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Test case type</label>
-                          <select
-                            value={type}
-                            onChange={(e) => setType(e.target.value)}
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          >
-                            <option value="Functional">Functional</option>
-                            <option value="Regression">Regression</option>
-                            <option value="Smoke">Smoke</option>
-                            <option value="Sanity">Sanity</option>
-                            <option value="Integration">Integration</option>
-                            <option value="API">API</option>
-                            <option value="UI">UI</option>
-                            <option value="Performance">Performance</option>
-                            <option value="Security">Security</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Automation Feasibility</label>
-                          <select
-                            value={automationStatus}
-                            onChange={(e) => setAutomationStatus(e.target.value)}
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          >
-                            {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Priority</label>
-                          <select
-                            value={priority}
-                            onChange={(e) => setPriority(e.target.value)}
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          >
-                            <option value="P0">P0</option>
-                            <option value="P1">P1</option>
-                            <option value="P2">P2</option>
-                            <option value="P3">P3</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Status</label>
-                          <select
-                            value={status}
-                            onChange={(e) => setStatus(e.target.value)}
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          >
-                            <option value="Draft">Draft</option>
-                            <option value="In Review">In Review</option>
-                            <option value="Approved">Approved</option>
-                            <option value="Deprecated">Deprecated</option>
-                            <option value="Archived">Archived</option>
-                          </select>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                        <div>
-                          <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Estimated Duration</label>
-                          <input
-                            type="text"
-                            value={estimatedDuration}
-                            onChange={(e) => setEstimatedDuration(e.target.value)}
-                            placeholder="e.g. 10 min"
-                            className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                          />
-                        </div>
-                        <TagInput
-                          label="Tags / Labels"
-                          selectedTags={automationTags}
-                          onChange={setAutomationTags}
-                          suggestions={existingTagSuggestions}
-                          placeholder="Type a tag then press Enter"
-                        />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Attachments</label>
-                        <textarea
-                          value={attachments}
-                          onChange={(e) => setAttachments(e.target.value)}
-                          rows={2}
-                          placeholder="Links/paths to screenshots, logs, or reference docs"
-                          className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          type="submit"
-                          onClick={() => setSubmitAction("create")}
-                          disabled={panelSaving}
-                          className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-                        >
-                          {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save"}
-                        </button>
-                        {panelMode === "create" && (
-                          <button
-                            type="submit"
-                            onClick={() => setSubmitAction("create-next")}
-                            disabled={panelSaving}
-                            className="rounded border border-blue-300 px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-800 dark:text-blue-300 dark:hover:bg-blue-950/30"
-                          >
-                            {panelSaving ? "Saving..." : "Create and Add Next"}
-                          </button>
+                            )}
+                          </>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (panelMode === "edit" && panelTestcaseId) {
-                              void openViewPanel(panelTestcaseId);
-                              return;
-                            }
-                            closePanel();
-                          }}
-                          disabled={panelSaving}
-                          className="rounded border border-zinc-300 px-3 py-2 text-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </form>
+                      </form>
                     )}
                   </div>
+
+                  {/* Sticky footer with actions */}
+                  {!panelLoading && (
+                    <div className="shrink-0 border-t border-zinc-200 bg-white px-6 py-4 dark:border-zinc-700 dark:bg-zinc-900">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="submit"
+                            form="panel-form"
+                            onClick={() => setSubmitAction("create")}
+                            disabled={panelSaving}
+                            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save changes"}
+                          </button>
+                          {panelMode === "create" && (
+                            <button
+                              type="submit"
+                              form="panel-form"
+                              onClick={() => setSubmitAction("create-next")}
+                              disabled={panelSaving}
+                              className="rounded-lg border border-blue-300 px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-800 dark:text-blue-300 dark:hover:bg-blue-950/30"
+                            >
+                              {panelSaving ? "Saving..." : "Create & Add Next"}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={closePanel}
+                            disabled={panelSaving}
+                            className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                        {panelMode === "edit" && panelTestcaseId && (
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void handleArchivePanelTestCase()}
+                              disabled={panelSaving}
+                              className="rounded-lg border border-amber-200 px-3 py-2 text-xs font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-950/40"
+                            >
+                              Archive
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleDeletePanelTestCase()}
+                              disabled={panelSaving}
+                              className="rounded-lg border border-red-200 px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-950/40"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </aside>
               </div>
             )}
