@@ -87,6 +87,7 @@ function RunStatusBadge({ status }: { status: string }) {
   const cls: Record<string, string> = {
     Planning: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
     "In Progress": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
+    Hold: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
     Completed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
   };
   return (

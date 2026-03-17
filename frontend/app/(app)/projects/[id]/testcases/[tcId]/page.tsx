@@ -522,10 +522,11 @@ export default function TestCaseDetailPage() {
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Estimated Duration</label>
               <input
-                type="text"
+                type="number"
+                min="0"
                 value={estimatedDuration}
                 onChange={(e) => setEstimatedDuration(e.target.value)}
-                placeholder="e.g. 10 min"
+                placeholder="Minutes (e.g. 10)"
                 className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               />
             </div>

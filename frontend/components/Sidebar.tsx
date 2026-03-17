@@ -16,9 +16,9 @@ const projectNavSections = [
     ],
   },
   {
-    section: "Test Case Management",
+    section: "Tests",
     items: [
-      { href: "testcases", label: "Test case Repository", icon: "list" },
+      { href: "testcases", label: "Repository", icon: "list" },
       { href: "plans", label: "Test Plan", icon: "clipboard" },
       { href: "cycles", label: "Test Run", icon: "play" },
       { href: "bugs", label: "Bugs", icon: "bug" },

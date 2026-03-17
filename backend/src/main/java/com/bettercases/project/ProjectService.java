@@ -17,9 +17,13 @@ import java.util.UUID;
 public final class ProjectService {
     /** Create a new project in the given organization; caller must be an org member. Adds creator as owner. */
     public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description) {
-        String normalizedKey = key != null ? key.trim().toUpperCase().replaceAll("[^A-Z0-9]", "") : "";
-        if (normalizedKey.isEmpty()) normalizedKey = "PROJ";
-        normalizedKey = normalizedKey.substring(0, Math.min(32, normalizedKey.length()));
+        String normalizedKey = key != null ? key.trim().toUpperCase().replaceAll("[^A-Z]", "") : "";
+        if (normalizedKey.length() < 3) {
+            String fromName = name != null ? name.trim().toUpperCase().replaceAll("[^A-Z]", "") : "";
+            normalizedKey = fromName.length() >= 3 ? fromName.substring(0, 3) : (fromName + "PRJ").substring(0, 3);
+        } else {
+            normalizedKey = normalizedKey.substring(0, 3);
+        }
 
         String sql = "INSERT INTO projects (organization_id, key, name, description) VALUES (?, ?, ?, ?) RETURNING id, key, name, created_at";
         try (Connection c = Database.getDataSource().getConnection();

@@ -1057,6 +1057,7 @@ export async function addPlanItem(planId: string, data: { suiteId?: string; test
 // Plan Runs & Progress
 export interface PlanRunItem {
   id: string;
+  externalId: string;
   name: string;
   description: string;
   status: string;
@@ -1089,6 +1090,7 @@ export interface PlanProgress {
 
 export interface PlanListItem {
   id: string;
+  externalId: string;
   name: string;
   description: string;
   targetRelease: string;
@@ -1121,6 +1123,7 @@ export async function dissociateRunFromPlan(cycleId: string): Promise<void> {
 // Test Runs (Cycles)
 export interface TestRunListItem {
   id: string;
+  externalId: string;
   planId: string | null;
   name: string;
   description: string;
@@ -1139,6 +1142,7 @@ export interface TestRunListItem {
 
 export interface TestRunDetail {
   id: string;
+  externalId: string;
   projectId: string;
   planId: string | null;
   name: string;
