@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  automation-api:
+    image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - app.env
+    environment:
+      - PORT=7400
+      - AUTOMATION_SERVICE_ROLE=api
+      - AUTOMATION_QUEUE_CONCURRENCY=2
+    ports:
+      - "7400:7400"
+    volumes:
+      - ./artifacts:/app/artifacts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7400/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  automation-worker:
+    image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - app.env
+    environment:
+      - PORT=7401
+      - AUTOMATION_SERVICE_ROLE=worker
+      - AUTOMATION_QUEUE_CONCURRENCY=4
+    volumes:
+      - ./artifacts:/app/artifacts

@@ -1,16 +1,16 @@
 ## TesboX DigitalOcean CI/CD Guide
 
 ### Overview
-- Images are built from `frontend/Dockerfile` and `backend/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
-- Backend and frontend are deployed on separate droplets using files in `deploy/backend/` and `deploy/frontend/`.
+- Images are built from `frontend/Dockerfile`, `backend/Dockerfile`, and `automation-agent/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
+- Backend, frontend, and automation services are deployed on separate droplets using files in `deploy/backend/`, `deploy/frontend/`, and `deploy/automation/`.
 - PostgreSQL is external (managed DB or self-hosted) and configured through `DATABASE_*` env vars.
 - Artifact storage supports `local` or DigitalOcean Spaces (`TESBO_*` keys).
 
 ### Required GitHub secrets
 - `DO_API_TOKEN`
 - `DOCR_REGISTRY` (example: `registry.digitalocean.com/your-registry`)
-- `DOCR_REPO_FRONTEND`, `DOCR_REPO_BACKEND`
-- `DROPLET_FRONTEND_IP`, `DROPLET_BACKEND_IP`
+- `DOCR_REPO_FRONTEND`, `DOCR_REPO_BACKEND`, `DOCR_REPO_AUTOMATION`
+- `DROPLET_FRONTEND_IP`, `DROPLET_BACKEND_IP`, `DROPLET_AUTOMATION_IP`
 - `SSH_PRIVATE_KEY`
 - `NEXT_PUBLIC_API_URL` (example: `https://api.yourdomain.com`)
 
@@ -33,6 +33,16 @@ Backend runtime secrets:
 - `AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS`
 - `AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER`
 - `AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS`
+- `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`
+
+Automation runtime secrets:
+- `REDIS_URL`
+- `BACKEND_BASE_URL`
+- `AGENT_SHARED_TOKEN`
+- `AUTOMATION_QUEUE_SHARED_TOKEN`
+- `AUTOMATION_QUEUE_PREFIX`
+- `AUTOMATION_QUEUE_NAME`
+- `AUTOMATION_QUEUE_MAX_RETRIES`
 
 ### Droplet prep (run once)
 1. Install Docker and Compose plugin:
@@ -43,10 +53,11 @@ Backend runtime secrets:
 ### Deploy flow
 1. Add/update all required GitHub secrets.
 2. Trigger `Deploy TesboX to DigitalOcean` from GitHub Actions (`workflow_dispatch`).
-3. Workflow builds and pushes `frontend` and `backend` images tagged with commit SHA and `latest`.
+3. Workflow builds and pushes `frontend`, `backend`, and `automation-agent` images tagged with commit SHA and `latest`.
 4. Workflow copies compose files to:
    - Frontend: `/opt/bettercases/frontend`
    - Backend: `/opt/bettercases/backend`
+   - Automation: `/opt/bettercases/automation`
 5. Workflow writes `.env` and `app.env`, then runs:
    - `docker compose pull`
    - `docker compose up -d --remove-orphans`
