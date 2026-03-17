@@ -1581,12 +1581,13 @@ export default function AutomateTestCasePage() {
       (async () => {
         try {
           const rec = await getAutomationRecording(projectId, sessionId);
-          if (rec.hasRecording && rec.actions && rec.summary) {
-            processRecordingData(rec.actions, rec.reasoningLog || [], rec.summary);
-            if (rec.summary.compiledActionCount > 0) {
+          const summary = rec.summary;
+          if (rec.hasRecording && rec.actions && summary) {
+            processRecordingData(rec.actions, rec.reasoningLog || [], summary);
+            if (summary.compiledActionCount > 0) {
               setMessages((prev) => [...prev, {
                 role: "assistant",
-                content: `Recording complete: ${rec.summary.compiledActionCount} action${rec.summary.compiledActionCount === 1 ? "" : "s"} captured (${rec.summary.successfulActCount} successful, ${rec.summary.extractCount} assertion${rec.summary.extractCount === 1 ? "" : "s"}).`,
+                content: `Recording complete: ${summary.compiledActionCount} action${summary.compiledActionCount === 1 ? "" : "s"} captured (${summary.successfulActCount} successful, ${summary.extractCount} assertion${summary.extractCount === 1 ? "" : "s"}).`,
               }]);
             }
           }

@@ -496,8 +496,8 @@ export default function ProjectSettingsPage() {
     if (member.userId === currentUserId) return false;
     const targetRole = normalizeRole(member.role);
     if (targetRole === "owner") return false;
-    if (currentUserRole === "manager" && (targetRole === "admin" || targetRole === "owner")) return false;
-    if (currentUserRole === "admin" && (targetRole === "admin" || targetRole === "owner")) return false;
+    if (currentUserRole === "manager" && targetRole === "admin") return false;
+    if (currentUserRole === "admin" && targetRole === "admin") return false;
     return true;
   }
 

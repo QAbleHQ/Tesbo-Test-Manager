@@ -26,6 +26,7 @@ function StatusBadge({ status }: { status: AgentTaskStatus }) {
     needs_revision: { label: "Needs Revision", cls: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" },
     in_progress: { label: "In Progress", cls: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" },
     queued: { label: "Queued", cls: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" },
+    bot_reviewing: { label: "Bot Reviewing", cls: "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400" },
   };
   const c = config[status];
   return (
