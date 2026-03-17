@@ -16,7 +16,7 @@ public final class SuiteService {
     public static List<Map<String, Object>> listTree(UUID projectId, UUID userId) {
         RbacService.requireProjectRole(userId, projectId);
         ensureDefaultSuiteExists(projectId);
-        String sql = "SELECT id, parent_id, name, position, created_at FROM suites WHERE project_id = ? ORDER BY parent_id NULLS FIRST, position, name";
+        String sql = "SELECT s.id, s.parent_id, s.name, s.position, s.created_at, COALESCE(tc.cnt, 0) AS test_case_count FROM suites s LEFT JOIN (SELECT suite_id, COUNT(*) AS cnt FROM testcases GROUP BY suite_id) tc ON tc.suite_id = s.id WHERE s.project_id = ? ORDER BY s.parent_id NULLS FIRST, s.position, s.name";
         List<Map<String, Object>> rows = new ArrayList<>();
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -30,6 +30,7 @@ public final class SuiteService {
                 row.put("name", rs.getString("name"));
                 row.put("position", rs.getInt("position"));
                 row.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
+                row.put("testCaseCount", rs.getInt("test_case_count"));
                 rows.add(row);
             }
         } catch (SQLException e) {

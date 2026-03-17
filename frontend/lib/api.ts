@@ -326,6 +326,7 @@ export interface SuiteNode {
   name: string;
   position: number;
   createdAt: string;
+  testCaseCount: number;
 }
 
 export async function listSuites(projectId: string): Promise<SuiteNode[]> {

@@ -652,7 +652,7 @@ export default function TestCasesPage() {
           <section className="mt-2">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div className="flex items-center gap-3">
-                {viewMode === "bySuites" && selectedSuite ? (
+                {viewMode === "bySuites" && selectedSuite && (
                   <>
                     <Link
                       href={`/projects/${projectId}/testcases`}
@@ -664,8 +664,6 @@ export default function TestCasesPage() {
                       {selectedSuite.name} test cases
                     </h2>
                   </>
-                ) : (
-                  <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">All test cases</h2>
                 )}
               </div>
               <div className="flex items-center gap-2">
@@ -692,13 +690,6 @@ export default function TestCasesPage() {
                     </button>
                   </>
                 )}
-                <button
-                  type="button"
-                  onClick={() => void openCreatePanel()}
-                  className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
-                >
-                  Add test case
-                </button>
               </div>
             </div>
             <div className="space-y-3">
@@ -950,7 +941,7 @@ export default function TestCasesPage() {
                   {suite.name}
                 </button>
                 <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
-                  Open suite to browse test cases
+                  {suite.testCaseCount} {suite.testCaseCount === 1 ? "test case" : "test cases"}
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2 text-xs">
                   <button
