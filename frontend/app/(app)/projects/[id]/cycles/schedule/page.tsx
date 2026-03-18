@@ -13,6 +13,8 @@ import {
   type TestRunListItem,
   type TestRunSchedule,
 } from "@/lib/api";
+import { Button, Input, Card, Field, FieldLabel, Select } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function ScheduleRunsPage() {
   const params = useParams();
@@ -106,47 +108,45 @@ export default function ScheduleRunsPage() {
   }
 
   return (
-    <main className="max-w-5xl mx-auto px-4 py-8">
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">Schedule Test Run</h1>
-          <p className="mt-1 text-sm text-zinc-500">
-            Schedule automated execution for runs that contain automated test cases only.
-          </p>
-        </div>
-        <Link
-          href={`/projects/${projectId}/cycles`}
-          className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
-        >
-          Back to Runs
-        </Link>
-      </div>
-
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Schedule Test Run"
+          subtitle="Schedule automated execution for runs that contain automated test cases only."
+          actions={
+            <Link
+              href={`/projects/${projectId}/cycles`}
+              className="inline-flex items-center justify-center h-10 rounded-xl px-4 text-sm font-medium border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors"
+            >
+              Back to Runs
+            </Link>
+          }
+        />
+      }
+    >
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-700 dark:text-red-300">
+        <div className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2 text-sm text-[var(--error)]">
           {error}
         </div>
       )}
 
-      <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5 mb-6">
-        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">New Schedule</h2>
+      <Card className="p-5">
+        <h2 className="text-lg font-semibold text-[var(--foreground)] mb-4">New Schedule</h2>
         <form onSubmit={onCreate} className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Schedule Name</label>
-            <input
+          <Field>
+            <FieldLabel>Schedule Name</FieldLabel>
+            <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Nightly Smoke"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               required
             />
-          </div>
-          <div>
-            <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Test Run</label>
-            <select
+          </Field>
+          <Field>
+            <FieldLabel>Test Run</FieldLabel>
+            <Select
               value={cycleId}
               onChange={(e) => setCycleId(e.target.value)}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               required
             >
               <option value="">Select a run</option>
@@ -155,76 +155,72 @@ export default function ScheduleRunsPage() {
                   {r.name}
                 </option>
               ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Schedule Type</label>
-            <select
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel>Schedule Type</FieldLabel>
+            <Select
               value={scheduleType}
               onChange={(e) => setScheduleType(e.target.value as "one_time" | "recurring")}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             >
               <option value="one_time">One-time</option>
               <option value="recurring">Recurring</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Timezone</label>
-            <input
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel>Timezone</FieldLabel>
+            <Input
               value={timezone}
               onChange={(e) => setTimezone(e.target.value)}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
-          </div>
+          </Field>
           {scheduleType === "one_time" ? (
             <div className="md:col-span-2">
-              <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Run At</label>
-              <input
-                type="datetime-local"
-                value={runAt}
-                onChange={(e) => setRunAt(e.target.value)}
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
-                required
-              />
+              <Field>
+                <FieldLabel>Run At</FieldLabel>
+                <Input
+                  type="datetime-local"
+                  value={runAt}
+                  onChange={(e) => setRunAt(e.target.value)}
+                  required
+                />
+              </Field>
             </div>
           ) : (
             <div className="md:col-span-2">
-              <label className="block text-sm mb-1 text-zinc-700 dark:text-zinc-300">Interval Minutes</label>
-              <input
-                type="number"
-                min={1}
-                value={intervalMinutes}
-                onChange={(e) => setIntervalMinutes(Number(e.target.value))}
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
-                required
-              />
+              <Field>
+                <FieldLabel>Interval Minutes</FieldLabel>
+                <Input
+                  type="number"
+                  min={1}
+                  value={intervalMinutes}
+                  onChange={(e) => setIntervalMinutes(Number(e.target.value))}
+                  required
+                />
+              </Field>
             </div>
           )}
           <div className="md:col-span-2 flex justify-end">
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
-            >
+            <Button type="submit" disabled={saving}>
               {saving ? "Saving..." : "Create Schedule"}
-            </button>
+            </Button>
           </div>
         </form>
-      </div>
+      </Card>
 
-      <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 overflow-hidden">
-        <div className="px-5 py-3 border-b border-zinc-200 dark:border-zinc-700">
-          <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">Existing Schedules</h2>
+      <Card className="overflow-hidden p-0">
+        <div className="px-5 py-3 border-b border-[var(--border-subtle)]">
+          <h2 className="font-semibold text-[var(--foreground)]">Existing Schedules</h2>
         </div>
         {loading ? (
-          <div className="p-5 text-sm text-zinc-500">Loading...</div>
+          <div className="p-5 text-sm text-[var(--muted)]">Loading...</div>
         ) : schedules.length === 0 ? (
-          <div className="p-5 text-sm text-zinc-500">No schedules created yet.</div>
+          <div className="p-5 text-sm text-[var(--muted)]">No schedules created yet.</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="tesbo-table">
               <thead>
-                <tr className="text-left border-b border-zinc-200 dark:border-zinc-700">
+                <tr>
                   <th className="px-4 py-3">Name</th>
                   <th className="px-4 py-3">Run</th>
                   <th className="px-4 py-3">Type</th>
@@ -237,7 +233,7 @@ export default function ScheduleRunsPage() {
                 {schedules.map((s) => {
                   const run = runs.find((r) => r.id === s.cycleId);
                   return (
-                    <tr key={s.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                    <tr key={s.id}>
                       <td className="px-4 py-3">{s.name}</td>
                       <td className="px-4 py-3">{run?.name ?? s.cycleId}</td>
                       <td className="px-4 py-3">
@@ -247,20 +243,22 @@ export default function ScheduleRunsPage() {
                       <td className="px-4 py-3">{s.lastStatus ?? "—"}</td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
-                          <button
+                          <Button
+                            variant="secondary"
+                            size="sm"
                             onClick={() => toggleEnabled(s)}
-                            className="rounded-md border border-zinc-300 dark:border-zinc-600 px-2 py-1"
                           >
                             {s.enabled ? "Disable" : "Enable"}
-                          </button>
-                          <button
+                          </Button>
+                          <Button
+                            variant="destructive"
+                            size="sm"
                             onClick={() => removeSchedule(s.id)}
-                            className="rounded-md border border-red-300 text-red-700 dark:border-red-700 dark:text-red-300 px-2 py-1"
                           >
                             Delete
-                          </button>
+                          </Button>
                         </div>
-                        {s.lastError && <p className="text-xs text-red-600 mt-1">{s.lastError}</p>}
+                        {s.lastError && <p className="text-xs text-[var(--error)] mt-1">{s.lastError}</p>}
                       </td>
                     </tr>
                   );
@@ -269,7 +267,7 @@ export default function ScheduleRunsPage() {
             </table>
           </div>
         )}
-      </div>
-    </main>
+      </Card>
+    </StandardPageLayout>
   );
 }

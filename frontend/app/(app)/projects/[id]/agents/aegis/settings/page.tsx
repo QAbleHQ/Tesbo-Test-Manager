@@ -10,6 +10,8 @@ import {
   saveAgentSettings,
   type TestEnvironmentSetting,
 } from "@/lib/api";
+import { Button, Card } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 function ShieldIcon({ className = "h-6 w-6" }: { className?: string }) {
   return (
@@ -90,38 +92,36 @@ export default function AegisSettingsPage() {
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center p-10">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent" />
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
       </div>
     );
   }
 
+  const breadcrumb = (
+    <Link href={`/projects/${projectId}/agents/aegis`} className="inline-flex items-center gap-1 text-[var(--muted)] hover:text-[var(--brand-primary)]">
+      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+      </svg>
+      Back to Aegis
+    </Link>
+  );
+
   return (
-    <div className="flex-1 p-6 md:p-10 max-w-3xl mx-auto w-full">
-      <Link
-        href={`/projects/${projectId}/agents/aegis`}
-        className="text-sm text-[var(--muted)] hover:text-[var(--primary)] mb-4 inline-flex items-center gap-1"
-      >
-        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-        </svg>
-        Back to Aegis
-      </Link>
-
-      <div className="flex items-center gap-3 mb-8">
-        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)]">
-          <ShieldIcon className="h-6 w-6" />
-        </div>
-        <div>
-          <h1 className="text-xl font-bold text-[var(--foreground)]">Aegis Settings</h1>
-          <p className="text-sm text-[var(--muted)]">Configure default behavior for the Aegis agent</p>
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Aegis Settings"
+          subtitle="Configure default behavior for the Aegis agent"
+          breadcrumb={breadcrumb}
+        />
+      }
+      className="flex-1 p-6 md:p-10 max-w-3xl mx-auto w-full"
+    >
+      <Card className="p-6">
         <h2 className="text-base font-semibold text-[var(--foreground)] mb-1">Default Environment</h2>
         <p className="text-sm text-[var(--muted)] mb-5">
           Aegis will automatically use this environment when launching runs. Environments are configured in{" "}
-          <Link href={`/projects/${projectId}/settings`} className="text-[var(--primary)] hover:underline">
+          <Link href={`/projects/${projectId}/settings`} className="text-[var(--brand-primary)] hover:underline">
             Project Settings
           </Link>.
         </p>
@@ -131,7 +131,7 @@ export default function AegisSettingsPage() {
             <p className="text-sm text-[var(--muted)] mb-2">No environments configured yet.</p>
             <Link
               href={`/projects/${projectId}/settings`}
-              className="text-sm font-medium text-[var(--primary)] hover:underline"
+              className="text-sm font-medium text-[var(--brand-primary)] hover:underline"
             >
               Configure environments in Project Settings
             </Link>
@@ -143,8 +143,8 @@ export default function AegisSettingsPage() {
                 key={env.url}
                 className={`flex items-center gap-3 rounded-lg border p-4 cursor-pointer transition-colors ${
                   selectedUrl === env.url
-                    ? "border-[var(--primary)] bg-[#e8f5eb]/50 dark:bg-zinc-800"
-                    : "border-[var(--border)] hover:border-[var(--primary)]/50"
+                    ? "border-[var(--brand-primary)] bg-[var(--brand-soft)]/50"
+                    : "border-[var(--border)] hover:border-[var(--brand-primary)]/50"
                 }`}
               >
                 <input
@@ -153,14 +153,14 @@ export default function AegisSettingsPage() {
                   value={env.url}
                   checked={selectedUrl === env.url}
                   onChange={() => { setSelectedUrl(env.url); setSelectedName(env.name); }}
-                  className="text-[var(--primary)] focus:ring-[var(--primary)]"
+                  className="text-[var(--brand-primary)] focus:ring-[var(--brand-primary)]"
                 />
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium text-[var(--foreground)]">{env.name}</div>
                   <div className="text-xs text-[var(--muted)] truncate">{env.url}</div>
                 </div>
                 {selectedUrl === env.url && (
-                  <span className="shrink-0 inline-flex items-center rounded-full bg-[var(--primary)]/10 px-2.5 py-0.5 text-xs font-medium text-[var(--primary)]">
+                  <span className="shrink-0 inline-flex items-center rounded-full bg-[var(--brand-primary)]/10 px-2.5 py-0.5 text-xs font-medium text-[var(--brand-primary)]">
                     Default
                   </span>
                 )}
@@ -170,15 +170,11 @@ export default function AegisSettingsPage() {
         )}
 
         <div className="flex items-center gap-3 pt-4 border-t border-[var(--border)]">
-          <button
-            onClick={handleSave}
-            disabled={!selectedUrl}
-            className="rounded-lg bg-[var(--primary)] px-5 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity disabled:opacity-50"
-          >
+          <Button onClick={handleSave} disabled={!selectedUrl}>
             Save Settings
-          </button>
+          </Button>
           {saved && (
-            <span className="text-sm text-green-600 dark:text-green-400 flex items-center gap-1">
+            <span className="text-sm text-[var(--success)] flex items-center gap-1">
               <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
@@ -186,21 +182,21 @@ export default function AegisSettingsPage() {
             </span>
           )}
         </div>
-      </div>
+      </Card>
 
-      <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <Card className="p-6">
         <h2 className="text-base font-semibold text-[var(--foreground)] mb-1">Auto-Start Behavior</h2>
         <p className="text-sm text-[var(--muted)] mb-5">
           Control whether Aegis automatically starts when test cases are marked as &quot;Ready for Automation&quot;.
         </p>
 
-        <label className="flex items-start gap-3 rounded-lg border border-[var(--border)] p-4 cursor-pointer hover:border-[var(--primary)]/50 transition-colors">
+        <label className="flex items-start gap-3 rounded-lg border border-[var(--border)] p-4 cursor-pointer hover:border-[var(--brand-primary)]/50 transition-colors">
           <div className="pt-0.5">
             <input
               type="checkbox"
               checked={autoStartOnReady}
               onChange={(e) => setAutoStartOnReady(e.target.checked)}
-              className="rounded border-zinc-300 dark:border-zinc-600 text-[var(--primary)] focus:ring-[var(--primary)]"
+              className="rounded border-[var(--border)] text-[var(--brand-primary)] focus:ring-[var(--brand-primary)]"
             />
           </div>
           <div className="flex-1">
@@ -211,21 +207,18 @@ export default function AegisSettingsPage() {
             </div>
           </div>
           {autoStartOnReady && (
-            <span className="shrink-0 inline-flex items-center rounded-full bg-[var(--primary)]/10 px-2.5 py-0.5 text-xs font-medium text-[var(--primary)]">
+            <span className="shrink-0 inline-flex items-center rounded-full bg-[var(--brand-primary)]/10 px-2.5 py-0.5 text-xs font-medium text-[var(--brand-primary)]">
               Default
             </span>
           )}
         </label>
 
         <div className="flex items-center gap-3 pt-4 mt-4 border-t border-[var(--border)]">
-          <button
-            onClick={handleSave}
-            className="rounded-lg bg-[var(--primary)] px-5 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity"
-          >
+          <Button onClick={handleSave}>
             Save Settings
-          </button>
+          </Button>
           {saved && (
-            <span className="text-sm text-green-600 dark:text-green-400 flex items-center gap-1">
+            <span className="text-sm text-[var(--success)] flex items-center gap-1">
               <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
@@ -233,9 +226,9 @@ export default function AegisSettingsPage() {
             </span>
           )}
         </div>
-      </div>
+      </Card>
 
-      <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <Card className="p-6">
         <h2 className="text-base font-semibold text-[var(--foreground)] mb-1">About Aegis</h2>
         <p className="text-sm text-[var(--muted)] leading-relaxed">
           Aegis is a Test Automation Architect agent. It autonomously navigates your application,
@@ -243,24 +236,24 @@ export default function AegisSettingsPage() {
           sent to the review queue for your approval before being saved to the respective test case.
         </p>
         <div className="mt-4 grid grid-cols-2 gap-4">
-          <div className="rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3">
+          <div className="rounded-lg bg-[var(--surface-secondary)] p-3">
             <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)] mb-1">Agent Type</div>
             <div className="text-sm font-medium text-[var(--foreground)]">Test Automation Architect</div>
           </div>
-          <div className="rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3">
+          <div className="rounded-lg bg-[var(--surface-secondary)] p-3">
             <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)] mb-1">Output</div>
             <div className="text-sm font-medium text-[var(--foreground)]">Playwright Scripts</div>
           </div>
-          <div className="rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3">
+          <div className="rounded-lg bg-[var(--surface-secondary)] p-3">
             <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)] mb-1">Review</div>
             <div className="text-sm font-medium text-[var(--foreground)]">User Approval Required</div>
           </div>
-          <div className="rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3">
+          <div className="rounded-lg bg-[var(--surface-secondary)] p-3">
             <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)] mb-1">Feedback</div>
             <div className="text-sm font-medium text-[var(--foreground)]">Iterative Refinement</div>
           </div>
         </div>
-      </div>
-    </div>
+      </Card>
+    </StandardPageLayout>
   );
 }

@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { authMe } from "@/lib/api";
+import { StandardPageLayout, PageHeader } from "@/components/workflows";
 
 export default function WorkspaceSettingsPage() {
   const router = useRouter();
@@ -18,15 +19,19 @@ export default function WorkspaceSettingsPage() {
 
   if (!auth) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
+      <StandardPageLayout header={<PageHeader title="Settings" />}>
+        <div className="flex min-h-[200px] items-center justify-center">
+          <p className="text-[var(--muted)]">Loading…</p>
+        </div>
+      </StandardPageLayout>
     );
   }
 
   return (
-    <main className="max-w-4xl mx-auto px-4 py-8">
-      <p className="text-zinc-500">Redirecting to workspace members…</p>
-    </main>
+    <StandardPageLayout header={<PageHeader title="Settings" />}>
+      <div className="flex min-h-[200px] items-center justify-center">
+        <p className="text-[var(--muted)]">Redirecting to workspace members…</p>
+      </div>
+    </StandardPageLayout>
   );
 }

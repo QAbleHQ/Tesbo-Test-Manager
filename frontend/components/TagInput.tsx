@@ -56,20 +56,20 @@ export default function TagInput({
 
   return (
     <div>
-      <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">{label}</label>
-      <div className="rounded border border-zinc-300 bg-white px-2 py-2 dark:border-zinc-600 dark:bg-zinc-900">
+      <label className="mb-1 block text-sm font-medium text-[var(--muted)]">{label}</label>
+      <div className="rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-2">
         <div className="mb-2 flex flex-wrap gap-2">
           {selectedTags.map((tag) => (
             <span
               key={tag}
-              className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-1 text-xs text-blue-800 dark:bg-blue-950/40 dark:text-blue-300"
+              className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2 py-1 text-xs text-[var(--brand-primary)]"
             >
               {tag}
               <button
                 type="button"
                 onClick={() => removeTag(tag)}
                 aria-label={`Remove ${tag}`}
-                className="text-blue-700 hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-100"
+                className="text-[var(--brand-primary)] hover:opacity-80"
               >
                 x
               </button>
@@ -84,18 +84,18 @@ export default function TagInput({
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           placeholder={placeholder}
-          className="w-full bg-transparent text-sm outline-none placeholder:text-zinc-400"
+          className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--muted-soft)]"
         />
       </div>
       {focused && availableSuggestions.length > 0 && (
-        <div className="mt-1 rounded border border-zinc-200 bg-white p-1 shadow dark:border-zinc-700 dark:bg-zinc-900">
+        <div className="mt-1 rounded border border-[var(--border)] bg-[var(--surface)] p-1 shadow">
           {availableSuggestions.map((tag) => (
             <button
               key={tag}
               type="button"
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => addTag(tag)}
-              className="block w-full rounded px-2 py-1 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              className="block w-full rounded px-2 py-1 text-left text-sm hover:bg-[var(--surface-secondary)]"
             >
               {tag}
             </button>

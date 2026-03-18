@@ -40,48 +40,48 @@ function CallbackHandler() {
   }, [searchParams, router]);
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950">
+    <main className="min-h-screen flex items-center justify-center bg-[var(--background)]">
       <div className="max-w-md w-full mx-auto px-6 py-12 text-center">
         {status === "loading" && (
           <>
-            <div className="mx-auto w-10 h-10 rounded-full border-2 border-blue-600 border-t-transparent animate-spin" />
-            <h1 className="mt-4 text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+            <div className="mx-auto w-10 h-10 rounded-full border-2 border-[var(--brand-primary)] border-t-transparent animate-spin" />
+            <h1 className="mt-4 text-lg font-semibold text-[var(--foreground)]">
               Connecting to Jira…
             </h1>
-            <p className="mt-2 text-sm text-zinc-500">
+            <p className="mt-2 text-sm text-[var(--muted)]">
               Please wait while we complete the authentication.
             </p>
           </>
         )}
         {status === "success" && (
           <>
-            <div className="mx-auto w-10 h-10 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center">
-              <svg className="w-6 h-6 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="mx-auto w-10 h-10 rounded-full bg-green-100 flex items-center justify-center">
+              <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
             </div>
-            <h1 className="mt-4 text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+            <h1 className="mt-4 text-lg font-semibold text-[var(--foreground)]">
               Jira Connected!
             </h1>
-            <p className="mt-2 text-sm text-zinc-500">
+            <p className="mt-2 text-sm text-[var(--muted)]">
               Redirecting to project selection…
             </p>
           </>
         )}
         {status === "error" && (
           <>
-            <div className="mx-auto w-10 h-10 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
-              <svg className="w-6 h-6 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="mx-auto w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+              <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>
             </div>
-            <h1 className="mt-4 text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+            <h1 className="mt-4 text-lg font-semibold text-[var(--foreground)]">
               Connection Failed
             </h1>
-            <p className="mt-2 text-sm text-red-600 dark:text-red-400">{errorMsg}</p>
+            <p className="mt-2 text-sm text-red-600">{errorMsg}</p>
             <button
               onClick={() => router.back()}
-              className="mt-4 rounded-lg bg-zinc-200 dark:bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-300 dark:hover:bg-zinc-600"
+              className="mt-4 rounded-lg bg-[var(--surface-secondary)] px-4 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-tertiary)]"
             >
               Go Back
             </button>
@@ -97,7 +97,7 @@ export default function JiraCallbackPage() {
     <Suspense
       fallback={
         <main className="min-h-screen flex items-center justify-center">
-          <p className="text-zinc-500">Loading…</p>
+          <p className="text-[var(--muted)]">Loading…</p>
         </main>
       }
     >

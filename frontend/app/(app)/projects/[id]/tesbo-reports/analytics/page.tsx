@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getTesboAnalytics, type TesboAnalytics } from "@/lib/api";
+import { Card } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function TesboAnalyticsPage() {
   const params = useParams();
@@ -15,49 +17,48 @@ export default function TesboAnalyticsPage() {
   }, [projectId]);
 
   return (
-    <main className="max-w-6xl mx-auto px-6 py-8">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Tesbo Analytics</h1>
-          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-            Quality and execution analytics for Tesbo reporting.
-          </p>
+    <main className="tesbo-page max-w-6xl mx-auto">
+      <StandardPageLayout
+        header={
+          <PageHeader
+            title="Tesbo Analytics"
+            subtitle="Quality and execution analytics for Tesbo reporting."
+            actions={<Link href={`/projects/${projectId}/tesbo-reports`} className="text-sm hover:underline">Back to Tesbo Reports</Link>}
+          />
+        }
+      >
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Card className="p-4">
+            <p className="text-sm text-[var(--muted)]">Total Runs</p>
+            <p className="mt-2 text-2xl font-semibold text-[var(--foreground)]">
+              {analytics?.totalRuns ?? 0}
+            </p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-sm text-[var(--muted)]">Total Tests</p>
+            <p className="mt-2 text-2xl font-semibold text-[var(--foreground)]">
+              {analytics?.totalTests ?? 0}
+            </p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-sm text-[var(--muted)]">Pass Rate</p>
+            <p className="mt-2 text-2xl font-semibold text-[var(--foreground)]">
+              {analytics?.passRate ?? 0}%
+            </p>
+          </Card>
         </div>
-        <Link href={`/projects/${projectId}/tesbo-reports`} className="text-sm text-blue-600 hover:underline">
-          Back to Tesbo Reports
-        </Link>
-      </div>
-      <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">Total Runs</p>
-          <p className="mt-2 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-            {analytics?.totalRuns ?? 0}
-          </p>
-        </div>
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">Total Tests</p>
-          <p className="mt-2 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-            {analytics?.totalTests ?? 0}
-          </p>
-        </div>
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">Pass Rate</p>
-          <p className="mt-2 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-            {analytics?.passRate ?? 0}%
-          </p>
-        </div>
-      </div>
-      <div className="mt-4 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-        <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Status breakdown</p>
-        <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3">
-          {Object.entries(analytics?.byStatus ?? {}).map(([status, count]) => (
-            <div key={status} className="rounded border border-zinc-200 dark:border-zinc-700 px-3 py-2">
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">{status}</p>
-              <p className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">{count}</p>
-            </div>
-          ))}
-        </div>
-      </div>
+        <Card className="p-4">
+          <p className="text-sm font-medium text-[var(--foreground)]">Status breakdown</p>
+          <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3">
+            {Object.entries(analytics?.byStatus ?? {}).map(([status, count]) => (
+              <div key={status} className="rounded border border-[var(--border-subtle)] px-3 py-2">
+                <p className="text-xs text-[var(--muted)]">{status}</p>
+                <p className="text-lg font-semibold text-[var(--foreground)]">{count}</p>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </StandardPageLayout>
     </main>
   );
 }

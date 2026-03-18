@@ -2,6 +2,7 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function ProjectMembersPage() {
   const params = useParams();
@@ -13,8 +14,12 @@ export default function ProjectMembersPage() {
   }, [projectId, router]);
 
   return (
-    <div className="min-h-screen flex items-center justify-center">
-      <p className="text-zinc-500">Redirecting to project settings…</p>
-    </div>
+    <StandardPageLayout
+      header={<PageHeader title="Members" subtitle="Redirecting to project settings…" />}
+    >
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <p className="text-[var(--muted)]">Redirecting to project settings…</p>
+      </div>
+    </StandardPageLayout>
   );
 }

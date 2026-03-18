@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listTesboSpecs, type TesboSpecSummary } from "@/lib/api";
+import { Button, Input, Card } from "@/components/ui";
+import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
 
 export default function TesboSpecsPage() {
   const params = useParams();
@@ -43,99 +45,79 @@ export default function TesboSpecsPage() {
     setPage(1);
   }, [search, specs.length]);
 
-  return (
-    <main className="max-w-6xl mx-auto px-6 py-8">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Tesbo Specs</h1>
-          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-            Browse specification-level reports and trends.
-          </p>
+  const filterBar = (
+    <Card className="p-4">
+      <div className="grid gap-3 md:grid-cols-12">
+        <div className="md:col-span-8">
+          <Input type="text" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search spec name" />
         </div>
-        <Link href={`/projects/${projectId}/tesbo-reports`} className="text-sm text-blue-600 hover:underline">
-          Back to Tesbo Reports
-        </Link>
+        <div className="md:col-span-4 flex justify-end">
+          <Button type="button" variant="secondary" onClick={() => loadSpecs().catch(() => {})}>
+            Refresh
+          </Button>
+        </div>
       </div>
-      <div className="mt-6 space-y-4">
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-          <div className="grid gap-3 md:grid-cols-12">
-            <div className="md:col-span-8">
-              <input
-                type="text"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search spec name"
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
-              />
-            </div>
-            <div className="md:col-span-4 flex justify-end">
-              <button
-                type="button"
-                onClick={() => loadSpecs().catch(() => {})}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-2 text-sm"
-              >
-                Refresh
-              </button>
-            </div>
-          </div>
-          <div className="mt-3 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
-            <span>Showing {paginatedSpecs.length} of {filteredSpecs.length} specs ({specs.length} total)</span>
-            <span>Page {page} / {totalPages}</span>
-          </div>
-        </div>
+      <div className="mt-3 flex items-center justify-between text-xs text-[var(--muted)]">
+        <span>Showing {paginatedSpecs.length} of {filteredSpecs.length} specs ({specs.length} total)</span>
+        <span>Page {page} / {totalPages}</span>
+      </div>
+    </Card>
+  );
 
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-white dark:bg-zinc-900">
-          <p className="text-sm text-zinc-600 dark:text-zinc-300 mb-3">Specs</p>
+  return (
+    <main className="tesbo-page max-w-6xl mx-auto">
+      <ListWorkspaceLayout
+        header={
+          <PageHeader
+            title="Tesbo Specs"
+            subtitle="Browse specification-level reports and trends."
+            actions={<Link href={`/projects/${projectId}/tesbo-reports`} className="text-sm hover:underline">Back to Tesbo Reports</Link>}
+          />
+        }
+        filterBar={filterBar}
+      >
+        <Card className="p-4">
+          <p className="text-sm text-[var(--muted)] mb-3">Specs</p>
           {loading ? (
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading specs...</p>
+            <p className="text-sm text-[var(--muted)]">Loading specs...</p>
           ) : error ? (
-            <p className="text-sm text-red-600">{error}</p>
+            <p className="text-sm text-[var(--error)]">{error}</p>
           ) : (
             <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
               {paginatedSpecs.map((spec) => (
                 <Link
                   key={spec.specName}
                   href={`/projects/${projectId}/tesbo-reports/specs/${encodeURIComponent(spec.specName)}`}
-                  className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 p-3 text-left hover:border-blue-400 block"
+                  className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3 text-left hover:border-[var(--brand-primary)] block"
                 >
-                  <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 break-all">{spec.specName}</p>
-                  <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{spec.totalRuns} runs</p>
+                  <p className="text-sm font-semibold text-[var(--foreground)] break-all">{spec.specName}</p>
+                  <p className="mt-1 text-xs text-[var(--muted)]">{spec.totalRuns} runs</p>
                   <div className="mt-2 flex gap-2 text-xs">
-                    <span className="rounded-full bg-emerald-500 text-white px-2 py-0.5">{spec.passed}</span>
-                    <span className="rounded-full bg-rose-500 text-white px-2 py-0.5">{spec.failed}</span>
-                    <span className="rounded-full bg-amber-400 text-black px-2 py-0.5">{spec.skipped}</span>
+                    <span className="rounded-full bg-[var(--success)] text-white px-2 py-0.5">{spec.passed}</span>
+                    <span className="rounded-full bg-[var(--error)] text-white px-2 py-0.5">{spec.failed}</span>
+                    <span className="rounded-full bg-[var(--warning)] text-black px-2 py-0.5">{spec.skipped}</span>
                   </div>
-                  <span className="mt-3 inline-block text-xs text-blue-600 hover:underline">
+                  <span className="mt-3 inline-block text-xs text-[var(--brand-primary)] hover:underline">
                     Open spec page
                   </span>
                 </Link>
               ))}
               {paginatedSpecs.length === 0 && (
-                <p className="text-sm text-zinc-500 dark:text-zinc-400">No specs match current search.</p>
+                <p className="text-sm text-[var(--muted)]">No specs match current search.</p>
               )}
             </div>
           )}
           <div className="mt-4 flex items-center justify-end gap-2 text-sm">
-            <button
-              type="button"
-              className="rounded-full border border-zinc-300 dark:border-zinc-600 px-3 py-1 disabled:opacity-50"
-              onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-              disabled={page === 1}
-            >
+            <Button type="button" variant="secondary" size="sm" onClick={() => setPage((prev) => Math.max(1, prev - 1))} disabled={page === 1}>
               Prev
-            </button>
+            </Button>
             <span>Page {page} / {totalPages}</span>
-            <button
-              type="button"
-              className="rounded-full border border-zinc-300 dark:border-zinc-600 px-3 py-1 disabled:opacity-50"
-              onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-              disabled={page === totalPages}
-            >
+            <Button type="button" variant="secondary" size="sm" onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))} disabled={page === totalPages}>
               Next
-            </button>
+            </Button>
           </div>
-        </div>
-      </div>
+        </Card>
+      </ListWorkspaceLayout>
     </main>
   );
 }

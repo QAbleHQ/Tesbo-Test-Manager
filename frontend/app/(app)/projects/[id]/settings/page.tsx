@@ -21,6 +21,17 @@ import {
 } from "@/lib/api";
 import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
 import ThemeToggle from "@/components/ThemeToggle";
+import {
+  Button,
+  Input,
+  Card,
+  Modal,
+  Select,
+  Textarea,
+  Field,
+  FieldLabel,
+} from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 const OPENAI_MODELS = [
   "gpt-4o",
@@ -156,6 +167,8 @@ export default function ProjectSettingsPage() {
   const [changingRoleId, setChangingRoleId] = useState<string | null>(null);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [deletingProject, setDeletingProject] = useState(false);
+  const [deleteProjectModalOpen, setDeleteProjectModalOpen] = useState(false);
+  const [deleteProjectTypedName, setDeleteProjectTypedName] = useState("");
   const jiraTabEnabled = jiraStatus?.connected === true;
 
   const visibleTabs: Array<{ key: SettingsTab; label: string }> = [
@@ -426,13 +439,10 @@ export default function ProjectSettingsPage() {
       setMessage("Project name is unavailable. Refresh and try again.");
       return;
     }
-    const typedName = window.prompt(`Type "${projectName}" to confirm project deletion.`);
-    if (typedName === null) return;
-    if (typedName.trim() !== projectName) {
+    if (deleteProjectTypedName.trim() !== projectName) {
       setMessage("Project deletion cancelled. Entered name does not match.");
       return;
     }
-    if (!window.confirm("Delete this project permanently? This action cannot be undone.")) return;
 
     setDeletingProject(true);
     setMessage(null);
@@ -444,6 +454,8 @@ export default function ProjectSettingsPage() {
       setMessage(text);
     } finally {
       setDeletingProject(false);
+      setDeleteProjectModalOpen(false);
+      setDeleteProjectTypedName("");
     }
   }
 
@@ -542,23 +554,25 @@ export default function ProjectSettingsPage() {
 
   if (!project) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
+      <StandardPageLayout header={<PageHeader title="Project settings" />}>
+        <div className="flex min-h-[200px] items-center justify-center">
+          <p className="text-[var(--muted)]">Loading…</p>
+        </div>
+      </StandardPageLayout>
     );
   }
 
   return (
-    <main className="w-full max-w-none px-4 py-8">
-      <div className="flex items-start justify-between gap-3">
-        <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Project settings</h1>
-        <ThemeToggle />
-      </div>
-      <p className="mt-1 text-sm text-zinc-500">
-        Settings are grouped into tabs so you can edit one area at a time without long scrolling.
-      </p>
-
-      <div className="mt-6 border-b border-zinc-200 dark:border-zinc-700">
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Project settings"
+          subtitle="Settings are grouped into tabs so you can edit one area at a time without long scrolling."
+          actions={<ThemeToggle />}
+        />
+      }
+    >
+      <div className="border-b border-[var(--border)]">
         <div className="flex flex-wrap gap-0">
           {visibleTabs.map((tab) => (
             <button
@@ -567,8 +581,8 @@ export default function ProjectSettingsPage() {
               onClick={() => setActiveTab(tab.key as SettingsTab)}
               className={`px-3 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${
                 activeTab === tab.key
-                  ? "border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400"
-                  : "border-transparent text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
+                  ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
+                  : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
               }`}
             >
               {tab.label}
@@ -578,75 +592,73 @@ export default function ProjectSettingsPage() {
       </div>
 
       {(activeTab === "general" || activeTab === "testRuns" || activeTab === "ai" || activeTab === "jira" || activeTab === "tesbo") && (
-        <form onSubmit={handleSubmit} className="mt-6 space-y-5">
+        <form onSubmit={handleSubmit} className="space-y-5">
           {activeTab === "general" && (
             <>
-              <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+              <Card className="p-4 space-y-4">
                 <div>
-                  <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">General</h2>
-                  <p className="mt-1 text-sm text-zinc-500">
+                  <h2 className="text-base font-semibold text-[var(--foreground)]">General</h2>
+                  <p className="mt-1 text-sm text-[var(--muted)]">
                     Basic project details shown across the workspace.
                   </p>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Name</label>
-                  <input
+                <Field>
+                  <FieldLabel>Name</FieldLabel>
+                  <Input
                     type="text"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                   />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Description</label>
-                  <textarea
+                </Field>
+                <Field>
+                  <FieldLabel>Description</FieldLabel>
+                  <Textarea
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
                     rows={3}
-                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                   />
-                </div>
-                <button
-                  type="submit"
-                  disabled={saving}
-                  className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
-                >
+                </Field>
+                <Button type="submit" disabled={saving}>
                   {saving ? "Saving…" : "Save"}
-                </button>
-              </div>
-              <div className="rounded-xl border border-red-200 dark:border-red-800/70 bg-red-50/70 dark:bg-red-900/20 p-4 space-y-2">
-                <h3 className="text-sm font-semibold text-red-700 dark:text-red-300">Danger zone</h3>
-                <p className="text-sm text-red-700/90 dark:text-red-200/90">
+                </Button>
+              </Card>
+              <div className="rounded-xl border border-[var(--error)]/30 bg-[color-mix(in_oklab,var(--error)_8%,white)] p-4 space-y-2">
+                <h3 className="text-sm font-semibold text-[var(--error)]">Danger zone</h3>
+                <p className="text-sm text-[var(--error)]/90">
                   Deleting a project permanently removes its test cases, runs, reports, and integrations.
                 </p>
-                <button
+                <Button
                   type="button"
-                  onClick={() => handleDeleteProject().catch(() => {})}
+                  variant="destructive"
+                  onClick={() => {
+                    setDeleteProjectTypedName("");
+                    setDeleteProjectModalOpen(true);
+                  }}
                   disabled={deletingProject}
-                  className="rounded-lg bg-red-600 text-white py-2 px-4 text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+                  size="sm"
                 >
                   {deletingProject ? "Deleting project…" : "Delete project"}
-                </button>
+                </Button>
               </div>
             </>
           )}
 
           {activeTab === "testRuns" && (
-            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+            <Card className="p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Test Run Environments</h2>
-                <p className="mt-1 text-sm text-zinc-500">
+                <h2 className="text-base font-semibold text-[var(--foreground)]">Test Run Environments</h2>
+                <p className="mt-1 text-sm text-[var(--muted)]">
                   Add environment name and URL. Test run creation will require selecting one.
                 </p>
               </div>
               <div className="space-y-2">
                 {testRunEnvironments.length === 0 ? (
-                  <p className="text-sm text-zinc-500">No environments added yet.</p>
+                  <p className="text-sm text-[var(--muted)]">No environments added yet.</p>
                 ) : (
-                  <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
-                    <table className="min-w-full text-sm">
-                      <thead className="bg-zinc-50 dark:bg-zinc-800/60">
-                        <tr className="text-left text-zinc-600 dark:text-zinc-300">
+                  <div className="overflow-x-auto rounded-lg border border-[var(--border)]">
+                    <table className="tesbo-table min-w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-[var(--muted)]">
                           <th className="px-3 py-2.5 font-medium">Environment</th>
                           <th className="px-3 py-2.5 font-medium">URL</th>
                           <th className="px-3 py-2.5 font-medium text-right">Action</th>
@@ -654,20 +666,19 @@ export default function ProjectSettingsPage() {
                       </thead>
                       <tbody>
                         {testRunEnvironments.map((env, index) => (
-                          <tr
-                            key={`${env.name}-${index}`}
-                            className="border-t border-zinc-200 dark:border-zinc-700"
-                          >
-                            <td className="px-3 py-2.5 text-zinc-900 dark:text-zinc-100">{env.name}</td>
-                            <td className="px-3 py-2.5 text-zinc-600 dark:text-zinc-300 break-all">{env.url}</td>
+                          <tr key={`${env.name}-${index}`}>
+                            <td className="px-3 py-2.5 text-[var(--foreground)]">{env.name}</td>
+                            <td className="px-3 py-2.5 text-[var(--muted)] break-all">{env.url}</td>
                             <td className="px-3 py-2.5 text-right">
-                              <button
+                              <Button
                                 type="button"
+                                variant="secondary"
+                                size="sm"
                                 onClick={() => handleRemoveEnvironment(index)}
-                                className="rounded-md border border-red-200 dark:border-red-800 px-2 py-1 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
+                                className="text-[var(--error)] text-xs"
                               >
                                 Remove
-                              </button>
+                              </Button>
                             </td>
                           </tr>
                         ))}
@@ -677,125 +688,171 @@ export default function ProjectSettingsPage() {
                 )}
               </div>
               <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
-                <input
+                <Input
                   type="text"
                   value={newEnvironmentName}
                   onChange={(e) => setNewEnvironmentName(e.target.value)}
                   placeholder="Environment name"
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                 />
-                <input
+                <Input
                   type="url"
                   value={newEnvironmentUrl}
                   onChange={(e) => setNewEnvironmentUrl(e.target.value)}
                   placeholder="https://staging.example.com"
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
                   onClick={handleAddEnvironment}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
                 >
                   Add
-                </button>
+                </Button>
               </div>
-              <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 space-y-3">
+              <div className="rounded-lg border border-[var(--border)] p-3 space-y-3">
                 <div>
-                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Execution</h3>
-                  <p className="mt-1 text-xs text-zinc-500">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">Browser Agent</h3>
+                  <p className="mt-1 text-xs text-[var(--muted)]">
+                    Choose whose Browserbase account powers AI-powered browser automation. Default uses platform env vars (BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID).
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="browserAgent"
+                      checked={browserAgent === "default"}
+                      onChange={() => setBrowserAgent("default")}
+                    />
+                    <span className="text-sm text-[var(--foreground)]">Default (platform account)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="browserAgent"
+                      checked={browserAgent === "custom"}
+                      onChange={() => setBrowserAgent("custom")}
+                    />
+                    <span className="text-sm text-[var(--foreground)]">Add your keys (project settings)</span>
+                  </label>
+                  {browserAgent === "custom" && (
+                    <div className="ml-5 mt-2 space-y-2">
+                      <Input
+                        type="password"
+                        value={browserbaseApiKey}
+                        onChange={(e) => setBrowserbaseApiKey(e.target.value)}
+                        placeholder="Browserbase API Key"
+                      />
+                      <Input
+                        type="text"
+                        value={browserbaseProjectId}
+                        onChange={(e) => setBrowserbaseProjectId(e.target.value)}
+                        placeholder="Browserbase Project ID"
+                      />
+                      <p className="text-xs text-[var(--muted)]">
+                        Create a project at{" "}
+                        <a
+                          href="https://www.browserbase.com/settings"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[var(--brand-primary)] hover:underline"
+                        >
+                          browserbase.com/settings
+                        </a>{" "}
+                        and paste your API key and Project ID here.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-lg border border-[var(--border)] p-3 space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">Automation Execution</h3>
+                  <p className="mt-1 text-xs text-[var(--muted)]">
                     Configure how automated test cases execute in parallel and which provider is used.
                   </p>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="text-sm text-zinc-700 dark:text-zinc-300">
-                    Execution provider
-                    <select
+                  <Field>
+                    <FieldLabel>Execution provider</FieldLabel>
+                    <Select
                       value={executionProvider}
                       onChange={(e) => setExecutionProvider(e.target.value as "default" | "lambdatest" | "browserstack")}
-                      className="mt-1 w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                     >
                       <option value="default">Default</option>
                       <option value="lambdatest">LambdaTest</option>
                       <option value="browserstack">BrowserStack</option>
-                    </select>
-                  </label>
-                  <label className="text-sm text-zinc-700 dark:text-zinc-300">
-                    Max parallel jobs
-                    <input
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Max parallel jobs</FieldLabel>
+                    <Input
                       type="number"
                       min={1}
                       max={50}
                       value={maxParallel}
                       onChange={(e) => setMaxParallel(Number(e.target.value || 1))}
-                      className="mt-1 w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                     />
-                  </label>
+                  </Field>
                 </div>
                 {executionProvider === "lambdatest" && (
                   <div className="grid gap-2 sm:grid-cols-3">
-                    <input
+                    <Input
                       type="url"
                       value={lambdaTestEndpoint}
                       onChange={(e) => setLambdaTestEndpoint(e.target.value)}
                       placeholder="LambdaTest endpoint"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
-                    <input
+                    <Input
                       type="text"
                       value={lambdaTestUsername}
                       onChange={(e) => setLambdaTestUsername(e.target.value)}
                       placeholder="LambdaTest username"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
-                    <input
+                    <Input
                       type="password"
                       value={lambdaTestAccessKey}
                       onChange={(e) => setLambdaTestAccessKey(e.target.value)}
                       placeholder="LambdaTest access key"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
                   </div>
                 )}
                 {executionProvider === "browserstack" && (
                   <div className="grid gap-2 sm:grid-cols-3">
-                    <input
+                    <Input
                       type="url"
                       value={browserStackEndpoint}
                       onChange={(e) => setBrowserStackEndpoint(e.target.value)}
                       placeholder="BrowserStack endpoint"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
-                    <input
+                    <Input
                       type="text"
                       value={browserStackUsername}
                       onChange={(e) => setBrowserStackUsername(e.target.value)}
                       placeholder="BrowserStack username"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
-                    <input
+                    <Input
                       type="password"
                       value={browserStackAccessKey}
                       onChange={(e) => setBrowserStackAccessKey(e.target.value)}
                       placeholder="BrowserStack access key"
-                      className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
                     />
                   </div>
                 )}
               </div>
-            </div>
+            </Card>
           )}
 
           {activeTab === "ai" && (
-            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+            <Card className="p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">AI Test Case Generation</h2>
-                <p className="mt-1 text-sm text-zinc-500">
+                <h2 className="text-base font-semibold text-[var(--foreground)]">AI Test Case Generation</h2>
+                <p className="mt-1 text-sm text-[var(--muted)]">
                   Select provider and API key to enable test script generation for this project.
                 </p>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Provider</label>
-                <select
+              <Field>
+                <FieldLabel>Provider</FieldLabel>
+                <Select
                   value={provider}
                   onChange={(e) => {
                     const nextProvider = e.target.value as "openai" | "anthropic";
@@ -803,31 +860,29 @@ export default function ProjectSettingsPage() {
                     const options = modelOptionsFor(nextProvider);
                     setModel(options[0]);
                   }}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                 >
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Anthropic</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Model</label>
-                <select
+                </Select>
+              </Field>
+              <Field>
+                <FieldLabel>Model</FieldLabel>
+                <Select
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                 >
                   {modelOptionsFor(provider).map((option) => (
                     <option key={option} value={option}>
                       {option}
                     </option>
                   ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                </Select>
+              </Field>
+              <Field>
+                <FieldLabel>
                   {provider === "openai" ? "OpenAI API Key" : "Anthropic API Key"}
-                </label>
-                <input
+                </FieldLabel>
+                <Input
                   type="password"
                   value={provider === "openai" ? openAiApiKey : anthropicApiKey}
                   onChange={(e) => {
@@ -838,9 +893,8 @@ export default function ProjectSettingsPage() {
                     setAnthropicApiKey(e.target.value);
                   }}
                   placeholder={provider === "openai" ? "sk-..." : "sk-ant-..."}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                 />
-              </div>
+              </Field>
               <label className="flex items-start gap-3 cursor-pointer">
                 <input
                   type="checkbox"
@@ -849,23 +903,23 @@ export default function ProjectSettingsPage() {
                   className="mt-0.5"
                 />
                 <div>
-                  <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  <span className="text-sm font-medium text-[var(--foreground)]">
                     Auto-generate Test Steps from Automate
                   </span>
-                  <p className="text-xs text-zinc-500 mt-0.5">
+                  <p className="text-xs text-[var(--muted)] mt-0.5">
                     When enabled, saving an Automate session updates both Playwright script and Test Steps. When
                     disabled, only the Playwright script is updated.
                   </p>
                 </div>
               </label>
-            </div>
+            </Card>
           )}
 
           {activeTab === "jira" && (
-            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+            <Card className="p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Jira + AI Generation</h2>
-                <p className="mt-1 text-sm text-zinc-500">
+                <h2 className="text-base font-semibold text-[var(--foreground)]">Jira + AI Generation</h2>
+                <p className="mt-1 text-sm text-[var(--muted)]">
                   Control how Jira tickets interact with AI test generation.
                 </p>
               </div>
@@ -877,8 +931,8 @@ export default function ProjectSettingsPage() {
                   className="mt-0.5"
                 />
                 <div>
-                  <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Auto-comment on Jira ticket</span>
-                  <p className="text-xs text-zinc-500 mt-0.5">
+                  <span className="text-sm font-medium text-[var(--foreground)]">Auto-comment on Jira ticket</span>
+                  <p className="text-xs text-[var(--muted)] mt-0.5">
                     When test cases are generated from a Jira ticket and saved, automatically add a comment to the Jira ticket listing the created test cases.
                   </p>
                 </div>
@@ -891,20 +945,20 @@ export default function ProjectSettingsPage() {
                   className="mt-0.5"
                 />
                 <div>
-                  <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Jira ticket selector on AI Generation</span>
-                  <p className="text-xs text-zinc-500 mt-0.5">
+                  <span className="text-sm font-medium text-[var(--foreground)]">Jira ticket selector on AI Generation</span>
+                  <p className="text-xs text-[var(--muted)] mt-0.5">
                     Show a Jira ticket search dropdown on the AI Test Generation page so users can pick a ticket directly without going through the Knowledge Base.
                   </p>
                 </div>
               </label>
-            </div>
+            </Card>
           )}
 
           {activeTab === "tesbo" && (
-            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+            <Card className="p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Automation Reports</h2>
-                <p className="mt-1 text-sm text-zinc-500">
+                <h2 className="text-base font-semibold text-[var(--foreground)]">Automation Reports</h2>
+                <p className="mt-1 text-sm text-[var(--muted)]">
                   Controls for embedded Automation Reports features in this project.
                 </p>
               </div>
@@ -914,37 +968,38 @@ export default function ProjectSettingsPage() {
                   checked={tesboKeepTrace}
                   onChange={(e) => setTesboKeepTrace(e.target.checked)}
                 />
-                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Keep trace artifacts</span>
+                <span className="text-sm font-medium text-[var(--foreground)]">Keep trace artifacts</span>
               </label>
               <div>
-                <h3 className="text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Project access key</h3>
-                <div className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-800 px-3 py-2 font-mono text-sm break-all">
+                <h3 className="text-sm font-medium text-[var(--foreground)] mb-1">Project access key</h3>
+                <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 font-mono text-sm break-all">
                   {tesboIngestionApiKey || "No key generated yet."}
                 </div>
                 <div className="mt-2 flex gap-2">
-                  <button
+                  <Button
                     type="button"
+                    variant="secondary"
+                    size="sm"
                     onClick={() => navigator.clipboard.writeText(tesboIngestionApiKey || "")}
-                    className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs font-medium"
                   >
                     Copy
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="button"
+                    variant="secondary"
+                    size="sm"
                     onClick={() => handleRotateTesboKey().catch(() => {})}
                     disabled={rotatingTesboKey}
-                    className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs font-medium disabled:opacity-50"
                   >
                     {rotatingTesboKey ? "Rotating…" : "Rotate key"}
-                  </button>
+                  </Button>
                 </div>
               </div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                Trace retention
-                <select
+              <Field>
+                <FieldLabel>Trace retention</FieldLabel>
+                <Select
                   value={tesboTraceRetentionDays}
                   onChange={(e) => setTesboTraceRetentionDays(Number(e.target.value || 14))}
-                  className="mt-1 w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
                   disabled={!tesboKeepTrace}
                 >
                   <option value={2}>2 days</option>
@@ -952,15 +1007,15 @@ export default function ProjectSettingsPage() {
                   <option value={30}>1 month</option>
                   <option value={180}>6 months</option>
                   <option value={365}>12 months</option>
-                </select>
-              </label>
+                </Select>
+              </Field>
               <label className="flex items-center gap-3 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={tesboAlertsEnabled}
                   onChange={(e) => setTesboAlertsEnabled(e.target.checked)}
                 />
-                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Enable Automation Reports alerts</span>
+                <span className="text-sm font-medium text-[var(--foreground)]">Enable Automation Reports alerts</span>
               </label>
               <label className="flex items-center gap-3 cursor-pointer">
                 <input
@@ -968,102 +1023,94 @@ export default function ProjectSettingsPage() {
                   checked={tesboShareByDefault}
                   onChange={(e) => setTesboShareByDefault(e.target.checked)}
                 />
-                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Share runs by default</span>
+                <span className="text-sm font-medium text-[var(--foreground)]">Share runs by default</span>
               </label>
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-[var(--muted)]">
                 Automation Reports alert rules are managed in the Alerts tab.
               </p>
-            </div>
+            </Card>
           )}
 
           {message && (
-            <p className="rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/30 px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300">
+            <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
               {message}
             </p>
           )}
           {activeTab !== "general" && (
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
-            >
+            <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save"}
-            </button>
+            </Button>
           )}
         </form>
       )}
 
       {activeTab === "members" && (
-        <section className="mt-6 space-y-5">
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
-            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Project members</h2>
-            <p className="mt-1 text-sm text-zinc-500">
+        <section className="space-y-5">
+          <Card className="p-4">
+            <h2 className="text-base font-semibold text-[var(--foreground)]">Project members</h2>
+            <p className="mt-1 text-sm text-[var(--muted)]">
               Members added here can perform actions inside this project based on their project role.
             </p>
-            <div className="mt-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3 text-xs text-zinc-600 dark:text-zinc-300 space-y-1">
+            <div className="mt-3 rounded-lg bg-[var(--surface-secondary)] p-3 text-xs text-[var(--muted)] space-y-1">
               <p><strong>Owner:</strong> Full access to all features and can add admins.</p>
               <p><strong>Admin:</strong> Similar to owner, but cannot add or remove owners/admins.</p>
               <p><strong>Manager:</strong> Can invite members and manage project operations.</p>
               <p><strong>Member:</strong> Can work inside assigned projects, but cannot invite or create projects.</p>
             </div>
-          </div>
+          </Card>
 
           {availableToAdd.length > 0 && canManageMembers && (
-            <form onSubmit={handleAddMember} className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
-              <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
-                <div>
-                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                    Add workspace member
-                  </label>
-                  <select
-                    value={addUserId}
-                    onChange={(e) => setAddUserId(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
-                    disabled={addingMember || membersLoading}
+            <form onSubmit={handleAddMember}>
+              <Card className="p-4">
+                <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+                  <Field>
+                    <FieldLabel>Add workspace member</FieldLabel>
+                    <Select
+                      value={addUserId}
+                      onChange={(e) => setAddUserId(e.target.value)}
+                      disabled={addingMember || membersLoading}
+                    >
+                      <option value="">Select member…</option>
+                      {availableToAdd.map((member) => (
+                        <option key={member.userId} value={member.userId}>
+                          {member.name || member.email} ({member.email})
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Role</FieldLabel>
+                    <Select
+                      value={addRole}
+                      onChange={(e) => setAddRole(e.target.value)}
+                      disabled={addingMember || membersLoading}
+                    >
+                      {assignableRoles().map((r) => (
+                        <option key={r.value} value={r.value}>{r.label}</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Button
+                    type="submit"
+                    disabled={addingMember || !addUserId || membersLoading}
+                    size="sm"
                   >
-                    <option value="">Select member…</option>
-                    {availableToAdd.map((member) => (
-                      <option key={member.userId} value={member.userId}>
-                        {member.name || member.email} ({member.email})
-                      </option>
-                    ))}
-                  </select>
+                    {addingMember ? "Adding…" : "Add member"}
+                  </Button>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                    Role
-                  </label>
-                  <select
-                    value={addRole}
-                    onChange={(e) => setAddRole(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
-                    disabled={addingMember || membersLoading}
-                  >
-                    {assignableRoles().map((r) => (
-                      <option key={r.value} value={r.value}>{r.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <button
-                  type="submit"
-                  disabled={addingMember || !addUserId || membersLoading}
-                  className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {addingMember ? "Adding…" : "Add member"}
-                </button>
-              </div>
+              </Card>
             </form>
           )}
 
           {memberError && (
-            <p className="text-sm text-red-600 dark:text-red-400">{memberError}</p>
+            <p className="text-sm text-[var(--error)]">{memberError}</p>
           )}
 
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+          <Card className="overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead className="bg-zinc-50 dark:bg-zinc-800/60">
-                  <tr className="text-left text-zinc-600 dark:text-zinc-300">
+              <table className="tesbo-table min-w-full text-sm">
+                <thead>
+                  <tr className="text-left text-[var(--muted)]">
                     <th className="px-4 py-3 font-medium">Name</th>
                     <th className="px-4 py-3 font-medium">Email</th>
                     <th className="px-4 py-3 font-medium">Role</th>
@@ -1074,28 +1121,28 @@ export default function ProjectSettingsPage() {
                   {projectMembers.map((member) => {
                     const editable = canChangeRole(member);
                     return (
-                    <tr key={member.userId} className="border-t border-zinc-200 dark:border-zinc-700">
-                      <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">
+                    <tr key={member.userId}>
+                      <td className="px-4 py-3 text-[var(--foreground)]">
                         {member.name || "—"}
                         {member.userId === currentUserId && (
-                          <span className="ml-1.5 text-xs text-zinc-400">(you)</span>
+                          <span className="ml-1.5 text-xs text-[var(--muted-soft)]">(you)</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">{member.email}</td>
-                      <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">
+                      <td className="px-4 py-3 text-[var(--muted)]">{member.email}</td>
+                      <td className="px-4 py-3 text-[var(--muted)]">
                         {editable ? (
-                          <select
+                          <Select
                             value={normalizeRole(member.role)}
                             onChange={(e) => handleChangeRole(member.userId, e.target.value)}
                             disabled={changingRoleId === member.userId}
-                            className="rounded-md border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm text-zinc-900 dark:text-zinc-100 disabled:opacity-50"
+                            className="h-8 w-auto min-w-[100px] px-2 py-1 text-sm"
                           >
                             {assignableRoles().map((r) => (
                               <option key={r.value} value={r.value}>{r.label}</option>
                             ))}
-                          </select>
+                          </Select>
                         ) : (
-                          <span className="inline-flex items-center rounded-md bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                          <span className="inline-flex items-center rounded-md bg-[var(--surface-secondary)] px-2 py-0.5 text-xs font-medium text-[var(--foreground)]">
                             {roleLabel(member.role)}
                           </span>
                         )}
@@ -1106,7 +1153,7 @@ export default function ProjectSettingsPage() {
                             type="button"
                             onClick={() => handleRemoveMember(member.userId)}
                             disabled={removingMemberId === member.userId}
-                            className="text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                            className="text-[var(--error)] hover:underline disabled:opacity-50"
                           >
                             {removingMemberId === member.userId ? "Removing…" : "Remove"}
                           </button>
@@ -1116,15 +1163,15 @@ export default function ProjectSettingsPage() {
                     );
                   })}
                   {!membersLoading && projectMembers.length === 0 && (
-                    <tr className="border-t border-zinc-200 dark:border-zinc-700">
-                      <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                    <tr>
+                      <td colSpan={4} className="px-4 py-6 text-center text-[var(--muted)]">
                         No members are assigned to this project yet.
                       </td>
                     </tr>
                   )}
                   {membersLoading && (
-                    <tr className="border-t border-zinc-200 dark:border-zinc-700">
-                      <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                    <tr>
+                      <td colSpan={4} className="px-4 py-6 text-center text-[var(--muted)]">
                         Loading members…
                       </td>
                     </tr>
@@ -1132,55 +1179,54 @@ export default function ProjectSettingsPage() {
                 </tbody>
               </table>
             </div>
-          </div>
+          </Card>
         </section>
       )}
 
       {activeTab === "alerts" && (
-        <div className="mt-6">
+        <div>
           <TesboAlertSettings projectId={projectId} />
         </div>
       )}
 
       {activeTab === "integrations" && (
-        <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-4">
+        <Card className="p-4 space-y-4">
           <div>
-            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">App Integrations</h2>
-            <p className="mt-1 text-sm text-zinc-500">
+            <h2 className="text-base font-semibold text-[var(--foreground)]">App Integrations</h2>
+            <p className="mt-1 text-sm text-[var(--muted)]">
               Connect external tools and services to enrich your project.
             </p>
           </div>
 
           {/* Jira Card */}
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 flex items-start gap-4">
-            {/* Jira icon */}
-            <div className="shrink-0 w-10 h-10 rounded-lg bg-blue-600 flex items-center justify-center">
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
               <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="currentColor">
                 <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
               </svg>
             </div>
             <div className="flex-1 min-w-0">
-              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Jira</h3>
-              <p className="text-xs text-zinc-500 mt-0.5">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">Jira</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
                 Import tickets from Jira to use as knowledge base for test generation.
               </p>
               {jiraStatus?.connected && (
                 <div className="mt-2 space-y-1">
                   <div className="flex items-center gap-2">
-                    <span className="inline-block w-2 h-2 rounded-full bg-green-500" />
-                    <span className="text-xs text-green-700 dark:text-green-400 font-medium">Connected</span>
-                    <span className="text-xs text-zinc-400">·</span>
+                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                    <span className="text-xs text-[var(--success)] font-medium">Connected</span>
+                    <span className="text-xs text-[var(--muted-soft)]">·</span>
                     <a
                       href={jiraStatus.siteUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-xs text-blue-600 dark:text-blue-400 hover:underline truncate"
+                      className="text-xs text-[var(--brand-primary)] hover:underline truncate"
                     >
                       {jiraStatus.siteUrl}
                     </a>
                   </div>
                   {jiraStatus.connectedProjects && jiraStatus.connectedProjects.length > 0 && (
-                    <p className="text-xs text-zinc-500">
+                    <p className="text-xs text-[var(--muted)]">
                       {jiraStatus.connectedProjects.length} project{jiraStatus.connectedProjects.length > 1 ? "s" : ""} linked:{" "}
                       {jiraStatus.connectedProjects.map((p) => p.jiraProjectKey).join(", ")}
                     </p>
@@ -1193,50 +1239,99 @@ export default function ProjectSettingsPage() {
                 <>
                   <Link
                     href={`/projects/${projectId}/settings/integrations/jira`}
-                    className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                    className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors"
                   >
                     Manage
                   </Link>
-                  <button
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
                     onClick={handleDisconnectJira}
                     disabled={jiraLoading}
-                    className="rounded-lg border border-red-300 dark:border-red-700 px-3 py-1.5 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-50"
+                    className="border-[var(--error)]/50 text-[var(--error)] hover:bg-[color-mix(in_oklab,var(--error)_8%,white)]"
                   >
                     Disconnect
-                  </button>
+                  </Button>
                 </>
               ) : (
-                <button
+                <Button
+                  type="button"
+                  size="sm"
                   onClick={handleConnectJira}
                   disabled={jiraLoading}
-                  className="rounded-lg bg-blue-600 text-white px-4 py-1.5 text-xs font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
                 >
                   {jiraLoading ? "Connecting…" : "Connect"}
-                </button>
+                </Button>
               )}
             </div>
           </div>
 
           {/* Placeholder for future integrations */}
-          <div className="rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 p-4 flex items-center gap-4 opacity-60">
-            <div className="shrink-0 w-10 h-10 rounded-lg bg-zinc-200 dark:bg-zinc-700 flex items-center justify-center">
-              <svg className="w-5 h-5 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="rounded-lg border border-dashed border-[var(--border)] p-4 flex items-center gap-4 opacity-60">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--surface-tertiary)] flex items-center justify-center">
+              <svg className="w-5 h-5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
               </svg>
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500">More integrations coming soon</h3>
-              <p className="text-xs text-zinc-400 mt-0.5">Slack, GitHub, Azure DevOps and more.</p>
+              <h3 className="text-sm font-medium text-[var(--muted)]">More integrations coming soon</h3>
+              <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub, Azure DevOps and more.</p>
             </div>
           </div>
-        </div>
+        </Card>
       )}
 
       {(activeTab === "alerts" || activeTab === "integrations") && message && (
-        <p className="mt-4 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/30 px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300">
+        <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
           {message}
         </p>
       )}
-    </main>
+      <Modal
+        open={deleteProjectModalOpen}
+        onClose={() => {
+          if (deletingProject) return;
+          setDeleteProjectModalOpen(false);
+        }}
+        title="Confirm project deletion"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-[var(--muted)]">
+            This action permanently deletes the project and all related test cases, runs, reports, and integrations.
+          </p>
+          <Field>
+            <FieldLabel>Type project name to confirm</FieldLabel>
+            <Input
+              type="text"
+              value={deleteProjectTypedName}
+              onChange={(event) => setDeleteProjectTypedName(event.target.value)}
+              placeholder={String(project?.name ?? "")}
+              disabled={deletingProject}
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                setDeleteProjectModalOpen(false);
+                setDeleteProjectTypedName("");
+              }}
+              disabled={deletingProject}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => handleDeleteProject().catch(() => {})}
+              disabled={deletingProject}
+            >
+              {deletingProject ? "Deleting project…" : "Delete project permanently"}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+    </StandardPageLayout>
   );
 }

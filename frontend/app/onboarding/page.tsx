@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { addWorkspaceMember, authMe, createWorkspace, getWorkspace } from "@/lib/api";
+import { Button, Field, FieldError, FieldHint, FieldLabel, Input, Textarea } from "@/components/ui";
 
 export default function OnboardingPage() {
   const router = useRouter();
@@ -91,17 +92,17 @@ export default function OnboardingPage() {
 
   if (checking) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950">
-        <p className="text-zinc-500">Loading…</p>
+      <div className="min-h-screen flex items-center justify-center bg-[var(--background)]">
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-[var(--background)] px-4">
       <div className="w-full max-w-md space-y-8">
         <div className="text-center">
-          <h1 className="text-2xl font-semibold text-[var(--foreground)] dark:text-zinc-100">
+          <h1 className="text-2xl font-semibold text-[var(--foreground)]">
             {step === "workspace" ? "Create your workspace" : "Invite your team (optional)"}
           </h1>
           <p className="mt-1 text-sm text-[var(--muted)]">
@@ -112,67 +113,50 @@ export default function OnboardingPage() {
         </div>
         {step === "workspace" ? (
           <form onSubmit={handleCreateWorkspace} className="space-y-4">
-            <div>
-              <label htmlFor="orgName" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
-                Organization / workspace name
-              </label>
-              <input
+            <Field>
+              <FieldLabel htmlFor="orgName">Organization / workspace name</FieldLabel>
+              <Input
                 id="orgName"
                 type="text"
                 value={orgName}
                 onChange={(e) => setOrgName(e.target.value)}
                 placeholder="My Team"
-                className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
                 disabled={loading}
               />
-            </div>
-            {error && (
-              <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
-            )}
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded-lg bg-[var(--primary)] text-white py-2 px-4 font-medium hover:opacity-90 disabled:opacity-50"
-            >
+            </Field>
+            {error && <FieldError>{error}</FieldError>}
+            <Button type="submit" disabled={loading} fullWidth>
               {loading ? "Creating…" : "Continue"}
-            </button>
+            </Button>
           </form>
         ) : (
           <form onSubmit={handleTeamStep} className="space-y-4">
-            <div>
-              <label htmlFor="teamEmails" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
-                Team member emails
-              </label>
-              <textarea
+            <Field>
+              <FieldLabel htmlFor="teamEmails">Team member emails</FieldLabel>
+              <Textarea
                 id="teamEmails"
                 value={teamEmails}
                 onChange={(e) => setTeamEmails(e.target.value)}
                 rows={5}
                 placeholder={"alice@company.com\nbob@company.com"}
-                className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100"
                 disabled={loading}
               />
-              <p className="mt-1 text-xs text-[var(--muted)]">One email per line (or comma separated).</p>
-            </div>
-            {error && (
-              <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
-            )}
+              <FieldHint>One email per line (or comma separated).</FieldHint>
+            </Field>
+            {error && <FieldError>{error}</FieldError>}
             <div className="flex gap-2">
-              <button
+              <Button
                 type="button"
+                variant="secondary"
                 onClick={skipTeamStep}
                 disabled={loading}
-                className="w-1/2 rounded-lg border border-[var(--border)] dark:border-zinc-600 py-2 px-4 font-medium text-[var(--foreground)] dark:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-900 disabled:opacity-50"
+                className="flex-1"
               >
                 Skip for now
-              </button>
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-1/2 rounded-lg bg-[var(--primary)] text-white py-2 px-4 font-medium hover:opacity-90 disabled:opacity-50"
-              >
+              </Button>
+              <Button type="submit" disabled={loading} className="flex-1">
                 {loading ? "Adding…" : "Continue"}
-              </button>
+              </Button>
             </div>
           </form>
         )}

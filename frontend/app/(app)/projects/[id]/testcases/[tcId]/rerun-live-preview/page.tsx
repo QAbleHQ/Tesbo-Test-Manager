@@ -378,28 +378,28 @@ export default function RerunLivePreviewPage() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center gap-4">
-        <Link href={`/projects/${projectId}/dashboard`} className="text-zinc-700 dark:text-zinc-300">Project</Link>
-        <span className="text-zinc-500">/</span>
-        <Link href={`/projects/${projectId}/testcases/${testcaseId}`} className="text-zinc-700 dark:text-zinc-300">Test case</Link>
-        <span className="text-zinc-500">/</span>
-        <span className="text-zinc-700 dark:text-zinc-300">Re Run Last Test</span>
+    <div className="min-h-screen bg-[var(--background)]">
+      <header className="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3 flex items-center gap-4">
+        <Link href={`/projects/${projectId}/dashboard`} className="text-[var(--muted)]">Project</Link>
+        <span className="text-[var(--muted-soft)]">/</span>
+        <Link href={`/projects/${projectId}/testcases/${testcaseId}`} className="text-[var(--muted)]">Test case</Link>
+        <span className="text-[var(--muted-soft)]">/</span>
+        <span className="text-[var(--foreground)]">Re Run Last Test</span>
       </header>
 
       <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-6 lg:grid-cols-[380px_1fr]">
-        <section className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-          <h1 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Re Run Last Test (Live Preview)</h1>
-          <p className="mt-1 text-xs text-zinc-500">
+        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+          <h1 className="text-sm font-semibold text-[var(--foreground)]">Re Run Last Test (Live Preview)</h1>
+          <p className="mt-1 text-xs text-[var(--muted)]">
             Run Test will ask for environment, start a fresh browser session, execute the script, and capture artifacts.
           </p>
 
           <div className="mt-4 space-y-2">
-            <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Environment</label>
+            <label className="block text-xs font-medium text-[var(--muted)]">Environment</label>
             <select
               value={selectedEnvironmentUrl}
               onChange={(e) => setSelectedEnvironmentUrl(e.target.value)}
-              className="w-full rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+              className="w-full rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs"
             >
               {testRunEnvironments.length === 0 && <option value="">No saved environments</option>}
               {testRunEnvironments.map((env) => (
@@ -412,16 +412,16 @@ export default function RerunLivePreviewPage() {
               value={customEnvironmentUrl}
               onChange={(e) => setCustomEnvironmentUrl(e.target.value)}
               placeholder="Or enter custom start URL"
-              className="w-full rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+              className="w-full rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs"
             />
           </div>
 
           <div className="mt-4 space-y-2">
-            <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Script Version</label>
+            <label className="block text-xs font-medium text-[var(--muted)]">Script Version</label>
             <select
               value={selectedVersionKey}
               onChange={(e) => setSelectedVersionKey(e.target.value)}
-              className="w-full rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+              className="w-full rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs"
               disabled={scriptVersionOptions.length === 0}
             >
               {scriptVersionOptions.length === 0 && <option value="">No saved script found</option>}
@@ -435,25 +435,25 @@ export default function RerunLivePreviewPage() {
               type="button"
               onClick={() => void onRunSelectedVersion()}
               disabled={runBusy}
-              className="w-full rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+              className="w-full rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
             >
               {runBusy ? "Running test..." : "Run Test"}
             </button>
           </div>
 
-          <div className="mt-4 space-y-2 text-xs text-zinc-600 dark:text-zinc-300">
+          <div className="mt-4 space-y-2 text-xs text-[var(--muted)]">
             <p><span className="font-medium">Test case:</span> {testcaseTitle}</p>
             <p><span className="font-medium">Stream:</span> {streamState}</p>
             <p><span className="font-medium">URL:</span> {session?.currentUrl || "-"}</p>
-            {sessionStartupError && <p className="text-red-600 dark:text-red-300">{sessionStartupError}</p>}
-            {runStatusMessage && <p className="text-zinc-700 dark:text-zinc-100">{runStatusMessage}</p>}
+            {sessionStartupError && <p className="text-[var(--error)]">{sessionStartupError}</p>}
+            {runStatusMessage && <p className="text-[var(--foreground)]">{runStatusMessage}</p>}
             {lastRunTraceAvailable && sessionId && (
               <div className="pt-1">
                 <a
                   href={getAutomationSessionTraceUrl(projectId, sessionId)}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                  className="inline-flex items-center rounded border border-[var(--border)] px-2 py-1 text-xs text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
                 >
                   Download Latest Trace (.zip)
                 </a>
@@ -462,8 +462,8 @@ export default function RerunLivePreviewPage() {
           </div>
 
           {lastRunFailed && (
-            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30">
-              <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
+              <p className="text-xs font-semibold text-amber-800">
                 Test failed. Send this script to Aegis to fix it.
               </p>
               <textarea
@@ -471,26 +471,26 @@ export default function RerunLivePreviewPage() {
                 onChange={(e) => setAegisInstruction(e.target.value)}
                 rows={3}
                 placeholder="Add customer instruction for Aegis (optional)"
-                className="mt-2 w-full rounded border border-amber-300 bg-white px-2 py-1.5 text-xs text-zinc-900 dark:border-amber-800 dark:bg-zinc-900 dark:text-zinc-100"
+                className="mt-2 w-full rounded border border-amber-300 bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--foreground)]"
               />
               <div className="mt-2 flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => void onSendFailedScriptToAegis()}
                   disabled={sendToAegisBusy}
-                  className="rounded border border-amber-400 bg-amber-100 px-2 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-60 dark:border-amber-700 dark:bg-amber-900/40 dark:text-amber-200 dark:hover:bg-amber-900/60"
+                  className="rounded border border-amber-400 bg-amber-100 px-2 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-60"
                 >
                   {sendToAegisBusy ? "Sending..." : "Send to Aegis Fix"}
                 </button>
                 <Link
                   href={`/projects/${projectId}/agents/aegis/reviews`}
-                  className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+                  className="text-xs text-[var(--brand-primary)] hover:underline"
                 >
                   Open Aegis Reviews
                 </Link>
               </div>
               {sendToAegisMessage && (
-                <p className="mt-2 text-xs text-amber-900 dark:text-amber-200">{sendToAegisMessage}</p>
+                <p className="mt-2 text-xs text-amber-900">{sendToAegisMessage}</p>
               )}
             </div>
           )}
@@ -498,15 +498,15 @@ export default function RerunLivePreviewPage() {
           <button
             type="button"
             onClick={() => void onEndSession()}
-            className="mt-4 w-full rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-700"
+            className="mt-4 w-full rounded border border-[var(--border)] px-2 py-1.5 text-xs"
           >
             Back to Test Case
           </button>
         </section>
 
-        <section className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-          <h2 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Live Preview</h2>
-          <div className="relative flex h-[72vh] items-center justify-center rounded border border-zinc-200 bg-black dark:border-zinc-700">
+        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+          <h2 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Live Preview</h2>
+          <div className="relative flex h-[72vh] items-center justify-center rounded border border-[var(--border)] bg-black">
             {screenshotDataUrl ? (
               <img
                 src={screenshotDataUrl}
@@ -525,7 +525,7 @@ export default function RerunLivePreviewPage() {
             ) : liveStreamFailed ? (
               <p className="text-sm text-red-400">Live stream unavailable. Retrying...</p>
             ) : (
-              <p className="text-sm text-zinc-500">Start a session to view live preview.</p>
+              <p className="text-sm text-[var(--muted)]">Start a session to view live preview.</p>
             )}
           </div>
         </section>

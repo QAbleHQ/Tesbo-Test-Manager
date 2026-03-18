@@ -12,6 +12,18 @@ import {
   revokeWorkspaceInvitation,
 } from "@/lib/api";
 import type { WorkspaceInvitation, WorkspaceMember as WorkspaceMemberType } from "@/lib/api";
+import {
+  Button,
+  Input,
+  Select,
+  Field,
+  FieldLabel,
+  FieldHint,
+  FieldError,
+  Card,
+  StatusChip,
+} from "@/components/ui";
+import { StandardPageLayout, PageHeader } from "@/components/workflows";
 
 const PLATFORM_ROLES = [
   { value: "owner", label: "Owner" },
@@ -167,168 +179,163 @@ export default function WorkspaceMembersPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
+      <StandardPageLayout header={<PageHeader title="Workspace members" />}>
+        <div className="flex min-h-[200px] items-center justify-center">
+          <p className="text-[var(--muted)]">Loading…</p>
+        </div>
+      </StandardPageLayout>
     );
   }
 
   return (
-    <main className="max-w-2xl mx-auto px-4 py-8">
-      <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-        Workspace members
-      </h1>
-      <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-        {workspace?.name
-          ? `Team members in ${workspace.name}. Only workspace members can be allocated to projects.`
-          : "Manage who has access to your workspace."}
-      </p>
-      <div className="mt-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 p-3 text-xs text-zinc-600 dark:text-zinc-300 space-y-1">
-        <p><strong>Owner:</strong> Full workspace access and can add admins.</p>
-        <p><strong>Admin:</strong> Similar to owner, but cannot add/remove owners or admins.</p>
-        <p><strong>Manager:</strong> Can create projects and invite members.</p>
-        <p><strong>Member:</strong> Cannot invite or create projects, but can work inside assigned projects.</p>
-      </div>
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Workspace members"
+          subtitle={
+            workspace?.name
+              ? `Team members in ${workspace.name}. Only workspace members can be allocated to projects.`
+              : "Manage who has access to your workspace."
+          }
+        />
+      }
+    >
+      <Card className="p-4">
+        <div className="space-y-1 text-xs text-[var(--muted)]">
+          <p><strong>Owner:</strong> Full workspace access and can add admins.</p>
+          <p><strong>Admin:</strong> Similar to owner, but cannot add/remove owners or admins.</p>
+          <p><strong>Manager:</strong> Can create projects and invite members.</p>
+          <p><strong>Member:</strong> Cannot invite or create projects, but can work inside assigned projects.</p>
+        </div>
+      </Card>
 
-      <form onSubmit={handleAdd} className="mt-6 flex flex-wrap items-end gap-3">
-        <div className="flex-1 min-w-[200px]">
-          <label htmlFor="email" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-            Add by email
-          </label>
-          <input
+      <form onSubmit={handleAdd} className="flex flex-wrap items-end gap-3">
+        <Field className="min-w-[200px] flex-1">
+          <FieldLabel htmlFor="email">Add by email</FieldLabel>
+          <Input
             id="email"
             type="email"
             value={newEmail}
             onChange={(e) => setNewEmail(e.target.value)}
             placeholder="teammate@example.com"
-            className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
             disabled={adding}
           />
-        </div>
-        <div className="w-32">
-          <label htmlFor="role" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-            Role
-          </label>
-          <select
+        </Field>
+        <Field className="w-32">
+          <FieldLabel htmlFor="role">Role</FieldLabel>
+          <Select
             id="role"
             value={newRole}
             onChange={(e) => setNewRole(e.target.value)}
-            className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
             disabled={adding}
           >
             <option value="member">Member</option>
             <option value="manager">Manager</option>
             <option value="admin">Admin</option>
             <option value="owner">Owner</option>
-          </select>
-        </div>
-        <button
-          type="submit"
-          disabled={adding}
-          className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-        >
+          </Select>
+        </Field>
+        <Button type="submit" disabled={adding}>
           {adding ? "Sending…" : "Add member / Send invite"}
-        </button>
+        </Button>
       </form>
-      <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+      <FieldHint>
         Existing users are added immediately. New emails receive an invite link to join this workspace.
-      </p>
+      </FieldHint>
 
       {message && (
-        <p className="mt-3 text-sm text-emerald-600 dark:text-emerald-400">{message}</p>
+        <p className="text-sm text-[var(--success)]">{message}</p>
       )}
-      {error && (
-        <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>
-      )}
+      {error && <FieldError>{error}</FieldError>}
 
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Pending invitations</h2>
+      <section>
+        <h2 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Pending invitations</h2>
         {invitations.length === 0 ? (
-          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">No pending invitations.</p>
+          <p className="text-sm text-[var(--muted)]">No pending invitations.</p>
         ) : (
-          <ul className="mt-3 divide-y divide-zinc-200 dark:divide-zinc-700">
+          <ul className="divide-y divide-[var(--border)]">
             {invitations.map((inv) => (
-              <li key={inv.id} className="py-3 flex items-center justify-between gap-4">
+              <li key={inv.id} className="flex items-center justify-between gap-4 py-3">
                 <div>
-                  <span className="font-medium text-zinc-900 dark:text-zinc-100">{inv.email}</span>
-                  <span className="ml-2 text-sm text-zinc-500 dark:text-zinc-400">{roleLabel(inv.role)}</span>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  <span className="font-medium text-[var(--foreground)]">{inv.email}</span>
+                  <span className="ml-2 text-sm text-[var(--muted)]">{roleLabel(inv.role)}</span>
+                  <p className="text-xs text-[var(--muted)]">
                     Expires {new Date(inv.expiresAt).toLocaleDateString()}
                   </p>
                 </div>
-                <button
+                <Button
                   type="button"
+                  variant="destructive"
+                  size="sm"
                   onClick={() => handleRevokeInvitation(inv.id)}
                   disabled={revokingInviteId === inv.id}
-                  className="text-sm text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
                 >
                   {revokingInviteId === inv.id ? "Revoking…" : "Revoke"}
-                </button>
+                </Button>
               </li>
             ))}
           </ul>
         )}
       </section>
 
-      <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+      <Card className="overflow-hidden p-0">
         <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-zinc-50 dark:bg-zinc-800/60">
-              <tr className="text-left text-zinc-600 dark:text-zinc-300">
-                <th className="px-4 py-3 font-medium">Name</th>
-                <th className="px-4 py-3 font-medium">Email</th>
-                <th className="px-4 py-3 font-medium">Role</th>
-                <th className="px-4 py-3 font-medium text-right">Action</th>
+          <table className="tesbo-table min-w-full text-sm">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th className="text-right">Action</th>
               </tr>
             </thead>
             <tbody>
               {members.map((m) => {
                 const editable = canChangeWsRole(m);
                 return (
-                  <tr key={m.userId} className="border-t border-zinc-200 dark:border-zinc-700">
-                    <td className="px-4 py-3 text-zinc-900 dark:text-zinc-100">
+                  <tr key={m.userId}>
+                    <td>
                       {m.name || "—"}
                       {m.userId === currentUserId && (
-                        <span className="ml-1.5 text-xs text-zinc-400">(you)</span>
+                        <span className="ml-1.5 text-xs text-[var(--muted-soft)]">(you)</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">{m.email}</td>
-                    <td className="px-4 py-3 text-zinc-600 dark:text-zinc-300">
+                    <td className="text-[var(--muted)]">{m.email}</td>
+                    <td>
                       {editable ? (
-                        <select
+                        <Select
                           value={normalizeWsRole(m.role)}
                           onChange={(e) => handleChangeWsRole(m.userId, e.target.value)}
                           disabled={changingRoleId === m.userId}
-                          className="rounded-md border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm text-zinc-900 dark:text-zinc-100 disabled:opacity-50"
+                          className="h-8 w-24 min-w-0 py-1 text-sm"
                         >
                           {wsAssignableRoles().map((r) => (
                             <option key={r.value} value={r.value}>{r.label}</option>
                           ))}
-                        </select>
+                        </Select>
                       ) : (
-                        <span className="inline-flex items-center rounded-md bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                          {roleLabel(m.role)}
-                        </span>
+                        <StatusChip tone="neutral">{roleLabel(m.role)}</StatusChip>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="text-right">
                       {canManage && m.userId !== currentUserId && normalizeWsRole(m.role) !== "owner" && (
-                        <button
+                        <Button
                           type="button"
+                          variant="destructive"
+                          size="sm"
                           onClick={() => handleRemove(m.userId)}
                           disabled={removingId === m.userId}
-                          className="text-sm text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
                         >
                           {removingId === m.userId ? "Removing…" : "Remove"}
-                        </button>
+                        </Button>
                       )}
                     </td>
                   </tr>
                 );
               })}
               {members.length === 0 && !loading && (
-                <tr className="border-t border-zinc-200 dark:border-zinc-700">
-                  <td colSpan={4} className="px-4 py-6 text-center text-zinc-500 dark:text-zinc-400">
+                <tr>
+                  <td colSpan={4} className="py-6 text-center text-[var(--muted)]">
                     No members in this workspace yet.
                   </td>
                 </tr>
@@ -336,7 +343,7 @@ export default function WorkspaceMembersPage() {
             </tbody>
           </table>
         </div>
-      </div>
-    </main>
+      </Card>
+    </StandardPageLayout>
   );
 }

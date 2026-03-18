@@ -151,18 +151,18 @@ export default function TesboSpecDetailPage() {
     <main className="max-w-7xl mx-auto px-6 py-8">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Tesbo Spec</p>
-          <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100 break-all">{specName}</h1>
-          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+          <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Tesbo Spec</p>
+          <h1 className="text-2xl font-semibold text-[var(--foreground)] break-all">{specName}</h1>
+          <p className="mt-1 text-sm text-[var(--muted)]">
             Dedicated spec details with run quality, flakiness, and test history.
           </p>
         </div>
-        <Link href={`/projects/${projectId}/tesbo-reports/specs`} className="text-sm text-blue-600 hover:underline">
+        <Link href={`/projects/${projectId}/tesbo-reports/specs`} className="text-sm text-[var(--brand-primary)] hover:underline">
           Back to Specs
         </Link>
       </div>
 
-      <section className="mt-6 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
+      <section className="mt-6 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
         <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
           <StatCard label="Total tests" value={detail?.tests.length ?? 0} />
           <StatCard label="Total runs" value={totals.runs} />
@@ -173,10 +173,10 @@ export default function TesboSpecDetailPage() {
       </section>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
-        <section className="rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-          <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Pass/fail by test</h2>
+        <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">Pass/fail by test</h2>
           {loading ? (
-            <p className="mt-3 text-sm text-zinc-500">Loading tests...</p>
+            <p className="mt-3 text-sm text-[var(--muted)]">Loading tests...</p>
           ) : detail && detail.tests.length > 0 ? (
             <div className="mt-4 space-y-3 max-h-[350px] overflow-auto pr-1">
               {detail.tests.slice(0, 20).map((test) => {
@@ -187,12 +187,12 @@ export default function TesboSpecDetailPage() {
                 return (
                   <div key={test.testName}>
                     <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-                      <p className="font-medium text-zinc-700 dark:text-zinc-300 truncate">{test.testName}</p>
-                      <p className="text-zinc-500">
+                      <p className="font-medium text-[var(--muted)] truncate">{test.testName}</p>
+                      <p className="text-[var(--muted)]">
                         {test.passed} / {test.failed} / {test.skipped}
                       </p>
                     </div>
-                    <div className="h-3 w-full overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700">
+                    <div className="h-3 w-full overflow-hidden rounded-full bg-[var(--surface-secondary)] border border-[var(--border)]">
                       <div className="h-full bg-emerald-500 float-left" style={{ width: `${pass}%` }} />
                       <div className="h-full bg-rose-500 float-left" style={{ width: `${fail}%` }} />
                       <div className="h-full bg-amber-400 float-left" style={{ width: `${skip}%` }} />
@@ -202,22 +202,22 @@ export default function TesboSpecDetailPage() {
               })}
             </div>
           ) : (
-            <p className="mt-3 text-sm text-zinc-500">No tests found for this spec.</p>
+            <p className="mt-3 text-sm text-[var(--muted)]">No tests found for this spec.</p>
           )}
         </section>
 
-        <section className="rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-          <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Most flaky tests</h2>
+        <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">Most flaky tests</h2>
           {loading ? (
-            <p className="mt-3 text-sm text-zinc-500">Loading flaky list...</p>
+            <p className="mt-3 text-sm text-[var(--muted)]">Loading flaky list...</p>
           ) : topFlakyTests.length === 0 ? (
-            <p className="mt-3 text-sm text-zinc-500">No flaky tests detected.</p>
+            <p className="mt-3 text-sm text-[var(--muted)]">No flaky tests detected.</p>
           ) : (
             <div className="mt-3 space-y-2">
               {topFlakyTests.map((test) => (
                 <div
                   key={test.testName}
-                  className="rounded-lg border border-zinc-200 dark:border-zinc-700 px-3 py-2 text-sm flex items-center justify-between gap-2"
+                  className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm flex items-center justify-between gap-2"
                 >
                   <p className="truncate">{test.testName}</p>
                   <span className="text-xs text-rose-600">{test.flakiness}% flaky</span>
@@ -228,11 +228,11 @@ export default function TesboSpecDetailPage() {
         </section>
       </div>
 
-      <section className="mt-4 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
+      <section className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div>
-            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Tests in this spec</h2>
-            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">Open any test to inspect run-by-run history.</p>
+            <h2 className="text-sm font-semibold text-[var(--foreground)]">Tests in this spec</h2>
+            <p className="mt-1 text-xs text-[var(--muted)]">Open any test to inspect run-by-run history.</p>
           </div>
           <button
             type="button"
@@ -244,7 +244,7 @@ export default function TesboSpecDetailPage() {
                 .catch(() => setError("Unable to refresh this spec."))
                 .finally(() => setLoading(false));
             }}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs"
+            className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs"
           >
             Refresh
           </button>
@@ -257,14 +257,14 @@ export default function TesboSpecDetailPage() {
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search tests in this spec"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
             />
           </div>
           <div className="md:col-span-4 flex justify-end">
             <select
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value as "ALL" | "PASSED" | "FAILED" | "SKIPPED")}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
+              className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
             >
               <option value="ALL">All status</option>
               <option value="PASSED">Passed</option>
@@ -274,9 +274,9 @@ export default function TesboSpecDetailPage() {
           </div>
         </div>
 
-        <div className="mt-3 rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-x-auto">
+        <div className="mt-3 rounded-xl border border-[var(--border)] overflow-x-auto">
           <table className="min-w-[900px] w-full text-sm">
-            <thead className="bg-zinc-50 dark:bg-zinc-800/50 text-zinc-500 dark:text-zinc-400">
+            <thead className="bg-[var(--surface-secondary)] text-[var(--muted)]">
               <tr>
                 <th className="text-left px-4 py-3 font-medium">Test</th>
                 <th className="text-right px-4 py-3 font-medium">Runs</th>
@@ -291,7 +291,7 @@ export default function TesboSpecDetailPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-zinc-500">Loading tests...</td>
+                  <td colSpan={8} className="px-4 py-8 text-center text-[var(--muted)]">Loading tests...</td>
                 </tr>
               ) : error ? (
                 <tr>
@@ -299,13 +299,13 @@ export default function TesboSpecDetailPage() {
                 </tr>
               ) : paginatedTests.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-zinc-500">No tests match the current filters.</td>
+                  <td colSpan={8} className="px-4 py-8 text-center text-[var(--muted)]">No tests match the current filters.</td>
                 </tr>
               ) : (
                 paginatedTests.map((test) => {
                   const flakiness = test.totalRuns > 0 ? Math.round((test.failed / test.totalRuns) * 1000) / 10 : 0;
                   return (
-                    <tr key={test.testName} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <tr key={test.testName} className="border-t border-[var(--border-subtle)]">
                       <td className="px-4 py-3 max-w-[320px]">
                         <p className="break-all">{test.testName}</p>
                       </td>
@@ -321,7 +321,7 @@ export default function TesboSpecDetailPage() {
                         <button
                           type="button"
                           onClick={() => openHistory(test.testName).catch(() => {})}
-                          className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs"
+                          className="rounded border border-[var(--border)] px-2 py-1 text-xs"
                         >
                           View history
                         </button>
@@ -337,7 +337,7 @@ export default function TesboSpecDetailPage() {
         <div className="mt-3 flex items-center justify-end gap-2 text-sm">
           <button
             type="button"
-            className="rounded-full border border-zinc-300 dark:border-zinc-600 px-3 py-1 disabled:opacity-50"
+            className="rounded-full border border-[var(--border)] px-3 py-1 disabled:opacity-50"
             onClick={() => setPage((prev) => Math.max(1, prev - 1))}
             disabled={page === 1}
           >
@@ -346,7 +346,7 @@ export default function TesboSpecDetailPage() {
           <span>Page {page} / {totalPages}</span>
           <button
             type="button"
-            className="rounded-full border border-zinc-300 dark:border-zinc-600 px-3 py-1 disabled:opacity-50"
+            className="rounded-full border border-[var(--border)] px-3 py-1 disabled:opacity-50"
             onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
             disabled={page === totalPages}
           >
@@ -358,27 +358,27 @@ export default function TesboSpecDetailPage() {
       {history && (
         <div className="fixed inset-0 z-50 bg-black/55">
           <div className="h-full w-full overflow-y-auto p-2 md:p-4">
-            <div className="h-full w-full rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4 md:p-6">
+            <div className="h-full w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 md:p-6">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Test history</p>
-                  <h3 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100 break-all">{history.testName}</h3>
-                  <p className="text-sm text-zinc-500 break-all">{history.specName}</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Test history</p>
+                  <h3 className="text-xl font-semibold text-[var(--foreground)] break-all">{history.testName}</h3>
+                  <p className="text-sm text-[var(--muted)] break-all">{history.specName}</p>
                 </div>
                 <button
                   type="button"
                   onClick={closeModal}
-                  className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs"
+                  className="rounded border border-[var(--border)] px-2 py-1 text-xs"
                 >
                   Close
                 </button>
               </div>
 
               <div className="mt-4 grid gap-4 lg:grid-cols-2">
-                <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Run history</p>
+                <div className="rounded-lg border border-[var(--border)] p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Run history</p>
                   {historyLoading ? (
-                    <p className="mt-3 text-sm text-zinc-500">Loading history...</p>
+                    <p className="mt-3 text-sm text-[var(--muted)]">Loading history...</p>
                   ) : (
                     <ul className="mt-3 space-y-2 max-h-[70vh] overflow-auto pr-1">
                       {history.runs.map((run) => (
@@ -386,8 +386,8 @@ export default function TesboSpecDetailPage() {
                           <div
                             className={`w-full rounded border px-3 py-2 text-left text-sm ${
                               activeRunId === run.runId
-                                ? "border-blue-400 bg-blue-50 dark:bg-blue-900/20"
-                                : "border-zinc-200 dark:border-zinc-700"
+                                ? "border-blue-400 bg-blue-50"
+                                : "border-[var(--border)]"
                             }`}
                           >
                             <button type="button" onClick={() => setActiveRunId(run.runId)} className="w-full text-left">
@@ -395,56 +395,56 @@ export default function TesboSpecDetailPage() {
                                 <span className="truncate">{run.runName}</span>
                                 <span>{run.status}</span>
                               </div>
-                              <p className="mt-1 text-xs text-zinc-500">
+                              <p className="mt-1 text-xs text-[var(--muted)]">
                                 {run.executedAt ? new Date(run.executedAt).toLocaleString() : "No timestamp"}
                               </p>
                             </button>
                             <Link
                               href={`/projects/${projectId}/tesbo-reports/runs/${run.runId}`}
-                              className="mt-2 inline-block text-xs text-blue-600 hover:underline"
+                              className="mt-2 inline-block text-xs text-[var(--brand-primary)] hover:underline"
                             >
                               Open run details
                             </Link>
                           </div>
                         </li>
                       ))}
-                      {history.runs.length === 0 && <li className="text-sm text-zinc-500">No history entries.</li>}
+                      {history.runs.length === 0 && <li className="text-sm text-[var(--muted)]">No history entries.</li>}
                     </ul>
                   )}
                 </div>
 
-                <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Selected run details</p>
+                <div className="rounded-lg border border-[var(--border)] p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Selected run details</p>
                   {runLoading ? (
-                    <p className="mt-3 text-sm text-zinc-500">Loading run details...</p>
+                    <p className="mt-3 text-sm text-[var(--muted)]">Loading run details...</p>
                   ) : !activeRun ? (
-                    <p className="mt-3 text-sm text-zinc-500">Select a run from history.</p>
+                    <p className="mt-3 text-sm text-[var(--muted)]">Select a run from history.</p>
                   ) : (
                     <div className="mt-3 space-y-3 text-sm">
-                      <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
-                        <p><span className="text-zinc-500">Run:</span> {activeRun.name}</p>
-                        <p><span className="text-zinc-500">Status:</span> {activeRun.status}</p>
-                        <p><span className="text-zinc-500">Started:</span> {activeRun.startedAt ? new Date(activeRun.startedAt).toLocaleString() : "-"}</p>
+                      <div className="rounded border border-[var(--border)] p-2">
+                        <p><span className="text-[var(--muted)]">Run:</span> {activeRun.name}</p>
+                        <p><span className="text-[var(--muted)]">Status:</span> {activeRun.status}</p>
+                        <p><span className="text-[var(--muted)]">Started:</span> {activeRun.startedAt ? new Date(activeRun.startedAt).toLocaleString() : "-"}</p>
                       </div>
                       {activeCase ? (
                         <>
-                          <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
-                            <p><span className="text-zinc-500">Test:</span> {activeCase.title}</p>
-                            <p><span className="text-zinc-500">Duration:</span> {((activeCase.durationMs || 0) / 1000).toFixed(2)}s</p>
-                            <p><span className="text-zinc-500">Attempt:</span> {activeCase.attempt != null ? activeCase.attempt + 1 : "-"}</p>
+                          <div className="rounded border border-[var(--border)] p-2">
+                            <p><span className="text-[var(--muted)]">Test:</span> {activeCase.title}</p>
+                            <p><span className="text-[var(--muted)]">Duration:</span> {((activeCase.durationMs || 0) / 1000).toFixed(2)}s</p>
+                            <p><span className="text-[var(--muted)]">Attempt:</span> {activeCase.attempt != null ? activeCase.attempt + 1 : "-"}</p>
                           </div>
                           {(activeCase.traceUrl || activeCase.screenshotUrl || activeCase.videoUrl) && (
-                            <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
-                              <p className="text-zinc-500 text-xs uppercase tracking-[0.2em]">Artifacts</p>
+                            <div className="rounded border border-[var(--border)] p-2">
+                              <p className="text-[var(--muted)] text-xs uppercase tracking-[0.2em]">Artifacts</p>
                               <div className="mt-2 flex gap-3">
-                                {activeCase.traceUrl && <a className="text-blue-600 hover:underline" href={activeCase.traceUrl} target="_blank" rel="noreferrer">Trace</a>}
-                                {activeCase.screenshotUrl && <a className="text-blue-600 hover:underline" href={activeCase.screenshotUrl} target="_blank" rel="noreferrer">Screenshot</a>}
-                                {activeCase.videoUrl && <a className="text-blue-600 hover:underline" href={activeCase.videoUrl} target="_blank" rel="noreferrer">Video</a>}
+                                {activeCase.traceUrl && <a className="text-[var(--brand-primary)] hover:underline" href={activeCase.traceUrl} target="_blank" rel="noreferrer">Trace</a>}
+                                {activeCase.screenshotUrl && <a className="text-[var(--brand-primary)] hover:underline" href={activeCase.screenshotUrl} target="_blank" rel="noreferrer">Screenshot</a>}
+                                {activeCase.videoUrl && <a className="text-[var(--brand-primary)] hover:underline" href={activeCase.videoUrl} target="_blank" rel="noreferrer">Video</a>}
                               </div>
                             </div>
                           )}
                           {(activeCase.errorMessage || activeCase.errorStack) && (
-                            <div className="rounded border border-rose-300 bg-rose-50 dark:bg-rose-900/20 p-2">
+                            <div className="rounded border border-rose-300 bg-rose-50 p-2">
                               {activeCase.errorMessage && <p className="text-rose-700">{activeCase.errorMessage}</p>}
                               {activeCase.errorStack && (
                                 <pre className="mt-2 text-xs whitespace-pre-wrap max-h-[35vh] overflow-y-auto">{activeCase.errorStack}</pre>
@@ -453,7 +453,7 @@ export default function TesboSpecDetailPage() {
                           )}
                         </>
                       ) : (
-                        <p className="text-zinc-500">Case-level details unavailable in this run.</p>
+                        <p className="text-[var(--muted)]">Case-level details unavailable in this run.</p>
                       )}
                     </div>
                   )}
@@ -469,9 +469,9 @@ export default function TesboSpecDetailPage() {
 
 function StatCard({ label, value, tone }: { label: string; value: string | number; tone?: string }) {
   return (
-    <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 bg-white dark:bg-zinc-900">
-      <p className="text-xs text-zinc-500">{label}</p>
-      <p className={`mt-1 text-sm font-semibold ${tone || "text-zinc-900 dark:text-zinc-100"}`}>{value}</p>
+    <div className="rounded-lg border border-[var(--border)] p-3 bg-[var(--surface)]">
+      <p className="text-xs text-[var(--muted)]">{label}</p>
+      <p className={`mt-1 text-sm font-semibold ${tone || "text-[var(--foreground)]"}`}>{value}</p>
     </div>
   );
 }
@@ -484,6 +484,6 @@ function StatusPill({ status }: { status: string | null }) {
     ? "bg-rose-100 text-rose-700"
     : normalized.includes("SKIP")
     ? "bg-amber-100 text-amber-700"
-    : "bg-zinc-100 text-zinc-700";
+    : "bg-[var(--surface-secondary)] text-[var(--muted)]";
   return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${classes}`}>{status || "Unknown"}</span>;
 }
