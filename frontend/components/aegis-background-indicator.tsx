@@ -18,14 +18,11 @@ function parseProjectSettings(raw: unknown): Record<string, unknown> {
 export function AegisBackgroundIndicator() {
   const params = useParams();
   const projectId = typeof params?.id === "string" ? params.id : "";
-  const [runs, setRuns] = useState<AegisBackgroundRun[]>([]);
+  const [runs, setRuns] = useState<AegisBackgroundRun[]>(() => getActiveRuns());
   const [agentsEnabled, setAgentsEnabled] = useState(true);
 
   useEffect(() => {
-    if (!projectId) {
-      setAgentsEnabled(true);
-      return;
-    }
+    if (!projectId) return;
     const refreshAgentAvailability = () => {
       getProject(projectId)
         .then((project) => {
@@ -42,11 +39,7 @@ export function AegisBackgroundIndicator() {
   }, [projectId]);
 
   useEffect(() => {
-    if (!agentsEnabled) {
-      setRuns([]);
-      return;
-    }
-    setRuns(getActiveRuns());
+    if (!agentsEnabled) return;
     return onRunsChanged(() => setRuns(getActiveRuns()));
   }, [agentsEnabled]);
 

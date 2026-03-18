@@ -672,11 +672,7 @@ export default function AegisAgentPage() {
   }, [projectId, router]);
 
   useEffect(() => {
-    if (!agentsEnabled) {
-      setPastTasks([]);
-      setBackgroundRuns([]);
-      return;
-    }
+    if (!agentsEnabled) return;
     const stored = getStoredAgentTasks(projectId, "aegis");
     setPastTasks(stored);
     setBackgroundRuns(getActiveRuns());
