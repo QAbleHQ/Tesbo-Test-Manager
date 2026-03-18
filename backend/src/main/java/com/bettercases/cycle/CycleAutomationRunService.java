@@ -31,6 +31,11 @@ public final class CycleAutomationRunService {
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
         }
+        String cycleStatus = getCycleStatusForAutomation(cycleId);
+        if ("Completed".equals(cycleStatus)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot run automated tests");
+        }
         return executeAutomatedInternal(cycleId, strictAutomatedOnly);
     }
 
@@ -39,6 +44,11 @@ public final class CycleAutomationRunService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
+        }
+        String cycleStatus = getCycleStatusForAutomation(cycleId);
+        if ("Completed".equals(cycleStatus)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot run automated tests");
         }
         return executeAutomatedAsyncInternal(cycleId, strictAutomatedOnly);
     }
@@ -502,6 +512,18 @@ public final class CycleAutomationRunService {
             String browserbaseApiKey,
             String browserbaseProjectId
     ) {}
+
+    private static String getCycleStatusForAutomation(UUID cycleId) {
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT status FROM cycles WHERE id = ?")) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString("status");
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        throw new io.javalin.http.NotFoundResponse();
+    }
 
     private CycleAutomationRunService() {
     }

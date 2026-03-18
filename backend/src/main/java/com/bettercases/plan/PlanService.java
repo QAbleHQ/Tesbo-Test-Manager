@@ -11,10 +11,36 @@ import java.util.Optional;
 import java.util.UUID;
 
 public final class PlanService {
+    public static String nextPlanExternalId(UUID projectId) {
+        String keyPrefix;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT key FROM projects WHERE id = ?")) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) throw new IllegalArgumentException("Project not found");
+            keyPrefix = rs.getString("key");
+            if (keyPrefix.length() > 3) keyPrefix = keyPrefix.substring(0, 3);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        String likePattern = keyPrefix + "-TP-%";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT COALESCE(MAX(CAST(SUBSTRING(external_id FROM '[0-9]+$') AS INTEGER)), 0) + 1 AS n FROM plans WHERE project_id = ? AND external_id LIKE ?")) {
+            ps.setObject(1, projectId);
+            ps.setString(2, likePattern);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            int n = rs.getInt("n");
+            return keyPrefix + "-TP-" + String.format("%02d", n);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     public static List<Map<String, Object>> list(UUID projectId, UUID userId) {
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
-            SELECT p.id, p.name, p.description, p.target_release, p.owner_id, p.created_at,
+            SELECT p.id, p.external_id, p.name, p.description, p.target_release, p.owner_id, p.created_at,
                    (SELECT COUNT(*) FROM cycles cy WHERE cy.plan_id = p.id) AS run_count,
                    COALESCE((SELECT SUM(sub.total) FROM cycles cy
                      LEFT JOIN LATERAL (
@@ -43,6 +69,7 @@ public final class PlanService {
                 Object ownerId = rs.getObject("owner_id");
                 Map<String, Object> m = new java.util.LinkedHashMap<>();
                 m.put("id", rs.getObject("id").toString());
+                m.put("externalId", rs.getString("external_id") != null ? rs.getString("external_id") : "");
                 m.put("name", rs.getString("name"));
                 m.put("description", rs.getString("description") != null ? rs.getString("description") : "");
                 m.put("targetRelease", rs.getString("target_release") != null ? rs.getString("target_release") : "");
@@ -67,23 +94,24 @@ public final class PlanService {
     public static Optional<Map<String, Object>> get(UUID planId, UUID userId) {
         UUID projectId = getProjectId(planId);
         RbacService.requireProjectRole(userId, projectId);
-        String sql = "SELECT id, project_id, name, description, target_release, owner_id, created_at, updated_at FROM plans WHERE id = ?";
+        String sql = "SELECT id, project_id, external_id, name, description, target_release, owner_id, created_at, updated_at FROM plans WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, planId);
             ResultSet rs = ps.executeQuery();
             if (rs.next()) {
                 Object ownerId = rs.getObject("owner_id");
-                return Optional.of(Map.of(
-                        "id", rs.getObject("id").toString(),
-                        "projectId", rs.getObject("project_id").toString(),
-                        "name", rs.getString("name"),
-                        "description", rs.getString("description") != null ? rs.getString("description") : "",
-                        "targetRelease", rs.getString("target_release") != null ? rs.getString("target_release") : "",
-                        "ownerId", ownerId != null ? ownerId.toString() : null,
-                        "createdAt", rs.getTimestamp("created_at").toInstant().toString(),
-                        "updatedAt", rs.getTimestamp("updated_at").toInstant().toString()
-                ));
+                Map<String, Object> m = new java.util.LinkedHashMap<>();
+                m.put("id", rs.getObject("id").toString());
+                m.put("projectId", rs.getObject("project_id").toString());
+                m.put("externalId", rs.getString("external_id") != null ? rs.getString("external_id") : "");
+                m.put("name", rs.getString("name"));
+                m.put("description", rs.getString("description") != null ? rs.getString("description") : "");
+                m.put("targetRelease", rs.getString("target_release") != null ? rs.getString("target_release") : "");
+                m.put("ownerId", ownerId != null ? ownerId.toString() : null);
+                m.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
+                m.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());
+                return Optional.of(m);
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -95,18 +123,21 @@ public final class PlanService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot create plans");
-        String sql = "INSERT INTO plans (project_id, name, description, target_release, owner_id) VALUES (?, ?, ?, ?, ?) RETURNING id, name, created_at";
+        String externalId = nextPlanExternalId(projectId);
+        String sql = "INSERT INTO plans (project_id, external_id, name, description, target_release, owner_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, external_id, name, created_at";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
-            ps.setString(2, name);
-            ps.setString(3, description != null ? description : "");
-            ps.setString(4, targetRelease);
-            ps.setObject(5, userId);
+            ps.setString(2, externalId);
+            ps.setString(3, name);
+            ps.setString(4, description != null ? description : "");
+            ps.setString(5, targetRelease);
+            ps.setObject(6, userId);
             ResultSet rs = ps.executeQuery();
             rs.next();
             return Map.of(
                     "id", rs.getObject("id").toString(),
+                    "externalId", rs.getString("external_id"),
                     "name", rs.getString("name"),
                     "createdAt", rs.getTimestamp("created_at").toInstant().toString()
             );
@@ -247,7 +278,7 @@ public final class PlanService {
         UUID projectId = getProjectId(planId);
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
-            SELECT c.id, c.name, c.description, c.status, c.environment, c.build_version,
+            SELECT c.id, c.external_id, c.name, c.description, c.status, c.environment, c.build_version,
                    c.release_name, c.started_at, c.ended_at, c.owner_id, c.created_at,
                    (SELECT COUNT(*) FROM cycle_items ci WHERE ci.cycle_id = c.id) AS total_cases,
                    (SELECT COUNT(*) FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
@@ -270,6 +301,7 @@ public final class PlanService {
             while (rs.next()) {
                 Map<String, Object> m = new java.util.LinkedHashMap<>();
                 m.put("id", rs.getObject("id").toString());
+                m.put("externalId", rs.getString("external_id") != null ? rs.getString("external_id") : "");
                 m.put("name", rs.getString("name"));
                 m.put("description", rs.getString("description") != null ? rs.getString("description") : "");
                 m.put("status", rs.getString("status") != null ? rs.getString("status") : "Planning");

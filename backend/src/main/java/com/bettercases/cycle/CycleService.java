@@ -15,11 +15,68 @@ import java.util.UUID;
 
 public final class CycleService {
 
+    private static final java.util.Set<String> VALID_STATUSES =
+            java.util.Set.of("Planning", "In Progress", "Hold", "Completed");
+
+    private static String getCycleStatus(UUID cycleId) {
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT status FROM cycles WHERE id = ?")) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString("status");
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        throw new io.javalin.http.NotFoundResponse();
+    }
+
+    private static void requireNotCompleted(UUID cycleId) {
+        String status = getCycleStatus(cycleId);
+        if ("Completed".equals(status)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot be modified");
+        }
+    }
+
+    private static void requireEditableStatus(UUID cycleId) {
+        String status = getCycleStatus(cycleId);
+        if (!"Planning".equals(status) && !"In Progress".equals(status)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run must be in Planning or In Progress status to perform this action");
+        }
+    }
+
+    public static String nextCycleExternalId(UUID projectId) {
+        String keyPrefix;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT key FROM projects WHERE id = ?")) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) throw new IllegalArgumentException("Project not found");
+            keyPrefix = rs.getString("key");
+            if (keyPrefix.length() > 3) keyPrefix = keyPrefix.substring(0, 3);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        String likePattern = keyPrefix + "-TR-%";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT COALESCE(MAX(CAST(SUBSTRING(external_id FROM '[0-9]+$') AS INTEGER)), 0) + 1 AS n FROM cycles WHERE project_id = ? AND external_id LIKE ?")) {
+            ps.setObject(1, projectId);
+            ps.setString(2, likePattern);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            int n = rs.getInt("n");
+            return keyPrefix + "-TR-" + String.format("%02d", n);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     /* ───── LIST all cycles in a project ───── */
     public static List<Map<String, Object>> list(UUID projectId, UUID userId) {
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
-            SELECT c.id, c.plan_id, c.name, c.description, c.status, c.environment, c.build_version,
+            SELECT c.id, c.external_id, c.plan_id, c.name, c.description, c.status, c.environment, c.build_version,
                    c.release_name, c.started_at, c.ended_at, c.owner_id, c.created_at,
                    (SELECT COUNT(*) FROM cycle_items ci WHERE ci.cycle_id = c.id) AS total_cases,
                    (SELECT COUNT(*) FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
@@ -36,6 +93,7 @@ public final class CycleService {
             while (rs.next()) {
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("id", rs.getObject("id").toString());
+                m.put("externalId", rs.getString("external_id") != null ? rs.getString("external_id") : "");
                 Object planIdObj = rs.getObject("plan_id");
                 m.put("planId", planIdObj != null ? planIdObj.toString() : null);
                 m.put("name", rs.getString("name"));
@@ -67,7 +125,7 @@ public final class CycleService {
         UUID projectId = getProjectId(cycleId);
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
-            SELECT id, project_id, plan_id, name, description, status, environment,
+            SELECT id, external_id, project_id, plan_id, name, description, status, environment,
                    build_version, release_name, started_at, ended_at, owner_id,
                    share_token, share_enabled,
                    created_at, updated_at
@@ -90,6 +148,7 @@ public final class CycleService {
     private static Map<String, Object> mapCycleRow(ResultSet rs) throws SQLException {
         Map<String, Object> m = new HashMap<>();
         m.put("id", rs.getObject("id").toString());
+        m.put("externalId", rs.getString("external_id") != null ? rs.getString("external_id") : "");
         m.put("projectId", rs.getObject("project_id").toString());
         Object planId = rs.getObject("plan_id");
         m.put("planId", planId != null ? planId.toString() : null);
@@ -118,20 +177,23 @@ public final class CycleService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot create test run");
-        String sql = "INSERT INTO cycles (project_id, name, description, environment, build_version, status, owner_id) " +
-                     "VALUES (?, ?, ?, ?, ?, 'Planning', ?) RETURNING id, created_at";
+        String externalId = nextCycleExternalId(projectId);
+        String sql = "INSERT INTO cycles (project_id, external_id, name, description, environment, build_version, status, owner_id) " +
+                     "VALUES (?, ?, ?, ?, ?, ?, 'Planning', ?) RETURNING id, external_id, created_at";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
-            ps.setString(2, name);
-            ps.setString(3, description != null ? description : "");
-            ps.setString(4, environment != null ? environment : "");
-            ps.setString(5, buildVersion != null ? buildVersion : "");
-            ps.setObject(6, userId);
+            ps.setString(2, externalId);
+            ps.setString(3, name);
+            ps.setString(4, description != null ? description : "");
+            ps.setString(5, environment != null ? environment : "");
+            ps.setString(6, buildVersion != null ? buildVersion : "");
+            ps.setObject(7, userId);
             ResultSet rs = ps.executeQuery();
             rs.next();
             return Map.of(
                 "id", rs.getObject("id").toString(),
+                "externalId", rs.getString("external_id"),
                 "name", name,
                 "status", "Planning",
                 "createdAt", rs.getTimestamp("created_at").toInstant().toString()
@@ -149,6 +211,18 @@ public final class CycleService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot update test run");
+
+        String currentStatus = getCycleStatus(cycleId);
+
+        if ("Completed".equals(currentStatus)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot be modified");
+        }
+
+        if (status != null && !VALID_STATUSES.contains(status)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Invalid status: " + status + ". Valid statuses are: Planning, In Progress, Hold, Completed");
+        }
 
         try (Connection c = Database.getDataSource().getConnection()) {
             // Update plan_id separately if requested, to keep the main query simple
@@ -214,6 +288,7 @@ public final class CycleService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot modify test run");
+        requireEditableStatus(cycleId);
 
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
@@ -262,6 +337,7 @@ public final class CycleService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot modify test run");
+        requireEditableStatus(cycleId);
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement("DELETE FROM cycle_items WHERE cycle_id = ? AND testcase_id = ?")) {
             ps.setObject(1, cycleId);
@@ -290,16 +366,18 @@ public final class CycleService {
     }
 
     private static Map<String, Object> createCycleWithCases(UUID projectId, UUID userId, UUID planId, String name, String environment, String buildVersion, List<UUID> testcaseIds) {
+        String externalId = nextCycleExternalId(projectId);
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
             UUID cycleId;
-            try (PreparedStatement ps = c.prepareStatement("INSERT INTO cycles (project_id, plan_id, name, environment, build_version, status, owner_id) VALUES (?, ?, ?, ?, ?, 'Planning', ?) RETURNING id")) {
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO cycles (project_id, external_id, plan_id, name, environment, build_version, status, owner_id) VALUES (?, ?, ?, ?, ?, ?, 'Planning', ?) RETURNING id")) {
                 ps.setObject(1, projectId);
-                ps.setObject(2, planId);
-                ps.setString(3, name);
-                ps.setString(4, environment != null ? environment : "");
-                ps.setString(5, buildVersion != null ? buildVersion : "");
-                ps.setObject(6, userId);
+                ps.setString(2, externalId);
+                ps.setObject(3, planId);
+                ps.setString(4, name);
+                ps.setString(5, environment != null ? environment : "");
+                ps.setString(6, buildVersion != null ? buildVersion : "");
+                ps.setObject(7, userId);
                 ResultSet rs = ps.executeQuery();
                 rs.next();
                 cycleId = (UUID) rs.getObject("id");
@@ -323,7 +401,7 @@ public final class CycleService {
                 }
             }
             c.commit();
-            return Map.of("id", cycleId.toString(), "name", name, "status", "Planning");
+            return Map.of("id", cycleId.toString(), "externalId", externalId, "name", name, "status", "Planning");
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -350,9 +428,16 @@ public final class CycleService {
         UUID cycleId = getCycleIdByExecution(executionId);
         UUID projectId = getProjectId(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        requireEditableStatus(cycleId);
         com.bettercases.rbac.Role r = RbacService.getProjectRole(userId, projectId).get();
         if (!r.canExecute() && !r.canEditOthersExecutions())
             throw new io.javalin.http.ForbiddenResponse("Cannot update execution");
+
+        UUID effectiveAssignee = assigneeId;
+        if (effectiveAssignee == null && status != null) {
+            effectiveAssignee = resolveAssigneeIfUnset(executionId, userId);
+        }
+
         String sql = """
             UPDATE executions SET
               status = COALESCE(?, status),
@@ -367,7 +452,7 @@ public final class CycleService {
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, status);
-            ps.setObject(2, assigneeId);
+            ps.setObject(2, effectiveAssignee);
             ps.setString(3, actualResult);
             ps.setString(4, defectKey);
             ps.setString(5, defectUrl);
@@ -385,6 +470,7 @@ public final class CycleService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).get().canManagePlansCycles())
             throw new io.javalin.http.ForbiddenResponse("Cannot assign");
+        requireEditableStatus(cycleId);
         try (Connection c = Database.getDataSource().getConnection()) {
             for (UUID execId : executionIds) {
                 try (PreparedStatement ps = c.prepareStatement("UPDATE executions SET assignee_id = ? WHERE id = ?")) {
@@ -405,11 +491,14 @@ public final class CycleService {
         com.bettercases.rbac.Role r = RbacService.getProjectRole(userId, projectId).get();
         if (!r.canExecute() && !r.canEditOthersExecutions())
             throw new io.javalin.http.ForbiddenResponse("Cannot update status");
+        requireEditableStatus(cycleId);
         try (Connection c = Database.getDataSource().getConnection()) {
             for (UUID execId : executionIds) {
-                try (PreparedStatement ps = c.prepareStatement("UPDATE executions SET status = ?, executed_at = now(), updated_at = now() WHERE id = ?")) {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE executions SET status = ?, assignee_id = COALESCE(assignee_id, ?), executed_at = now(), updated_at = now() WHERE id = ?")) {
                     ps.setString(1, status);
-                    ps.setObject(2, execId);
+                    ps.setObject(2, userId);
+                    ps.setObject(3, execId);
                     ps.executeUpdate();
                 }
             }
@@ -553,6 +642,21 @@ public final class CycleService {
         byte[] bytes = new byte[32];
         new java.security.SecureRandom().nextBytes(bytes);
         return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Returns userId if the execution currently has no assignee, otherwise null (letting COALESCE keep the existing value). */
+    private static UUID resolveAssigneeIfUnset(UUID executionId, UUID userId) {
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT assignee_id FROM executions WHERE id = ?")) {
+            ps.setObject(1, executionId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next() && rs.getObject("assignee_id") == null) {
+                return userId;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return null;
     }
 
     /* ───── helpers ───── */
