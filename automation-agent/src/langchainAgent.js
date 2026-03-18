@@ -246,6 +246,9 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
     session.currentUrl = session.page.url();
     session.updatedAt = nowIso();
 
+    // Allow BrowserRecorder's pending input flush (600ms timer) to complete
+    await new Promise((r) => setTimeout(r, 800));
+
     let screenshotPath = session.lastScreenshotPath;
     try {
       screenshotPath = await takeScreenshot(session.page, session.id);
@@ -585,6 +588,9 @@ export async function executeAgentObjective(session, commandId, objective) {
 
     session.currentUrl = page.url();
     session.updatedAt = nowIso();
+
+    // Allow BrowserRecorder's pending input flush (600ms timer) to complete
+    await new Promise((r) => setTimeout(r, 800));
 
     let screenshotPath = null;
     try {

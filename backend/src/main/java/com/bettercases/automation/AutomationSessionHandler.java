@@ -398,6 +398,9 @@ public final class AutomationSessionHandler {
         executionPayload.put("telemetryEvents", executeResponse.telemetryEvents == null ? List.of() : executeResponse.telemetryEvents);
         executionPayload.put("telemetryPlan", executeResponse.telemetryPlan == null ? List.of() : executeResponse.telemetryPlan);
         executionPayload.put("cancelled", false);
+        if (executeResponse.recordedScript != null && !executeResponse.recordedScript.isBlank()) {
+            executionPayload.put("recordedScript", executeResponse.recordedScript);
+        }
         appendAgentTelemetryEvents(envelope, executeResponse, screenshotPath);
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",

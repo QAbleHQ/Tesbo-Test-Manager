@@ -384,6 +384,7 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
     if (sawSuccessfulAction) return "passed";
     return "passed";
   };
+  let agentRecordedScript: string | null = null;
   for (const event of session.events) {
     const parsed = asRecord(event.parsedAction);
     const execution = asRecord(event.executionResult);
@@ -401,6 +402,10 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
         }
       }
     } else if (event.eventType === "command_executed") {
+      const candidateScript = asText(execution.recordedScript);
+      if (candidateScript && /await\s+/.test(candidateScript)) {
+        agentRecordedScript = candidateScript;
+      }
       const captureCountBefore = captures.length;
       const agentActions = Array.isArray(execution.agentActions) ? execution.agentActions : [];
       if (agentActions.length > 0) {
@@ -474,7 +479,9 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       }
     }
   }
-  if (captures.length === 0) return null;
+  if (captures.length === 0) {
+    return agentRecordedScript || null;
+  }
   const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const compactStep = (step: Record<string, unknown>): string => {
     const action = asText(step.action) || "unknown_action";
@@ -548,6 +555,8 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
   }
   if (executableCount > 0) {
     lines.push("  await expect(page).toHaveURL(/.*/);");
+  } else if (agentRecordedScript) {
+    return agentRecordedScript;
   } else {
     lines.push("  // No deterministic Playwright actions could be emitted from captured steps.");
   }
@@ -1829,7 +1838,19 @@ async function executeAegisRun(
         if (!runtime?.isRunning && (runtime?.queuedCount ?? 0) === 0) {
           finished = true;
           const executionDuration = Date.now() - executionStartTime;
-          const script = extractGeneratedScript(session);
+          const rawScript = extractGeneratedScript(session);
+          const hasExecutableCode = rawScript ? /await\s+/.test(rawScript) : false;
+          const script = hasExecutableCode ? rawScript : null;
+
+          if (!script && attempt < MAX_RETRIES) {
+            addRunLog(testcaseId, "Execution completed but no executable script was generated — retrying", "error", {
+              durationMs: executionDuration,
+              category: "agent",
+            });
+            await retryOrFail("No executable script generated");
+            return;
+          }
+
           if (script) {
             try { await finalizeAutomationSession(projectId, sessionId, { script }); } catch {}
             const lineCount = script.split("\n").length;
@@ -1838,7 +1859,7 @@ async function executeAegisRun(
               category: "agent",
             });
           } else {
-            addRunLog(testcaseId, "Execution completed but no script actions were captured", "error", {
+            addRunLog(testcaseId, "Execution completed but no executable script actions were captured", "error", {
               durationMs: executionDuration,
               category: "agent",
             });

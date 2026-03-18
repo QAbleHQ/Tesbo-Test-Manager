@@ -450,10 +450,6 @@ export class BrowserRecorder {
       // page may not be ready yet — script will run on next navigation via addInitScript
     }
 
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'browserRecorder.js:attach',message:'attach_result',data:{initScriptOk,evalOk,pageHasAddInitScript:typeof page.addInitScript==='function',pageHasEvaluate:typeof page.evaluate==='function',pageHasOn:typeof page.on==='function'},timestamp:Date.now(),hypothesisId:'BROWSER_ATTACH'})}).catch(()=>{});
-    // #endregion
-
     logInfo("browser_recorder_attached", {
       sessionId: this.sessionId,
       initScriptOk,
@@ -483,12 +479,6 @@ export class BrowserRecorder {
     const type = event.eventType;
     const d = event.detail || {};
     const url = event.url || "";
-
-    // #region agent log
-    if (type === "click" || type === "fill" || type === "navigate" || type === "press" || type === "select" || type === "check") {
-      fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'browserRecorder.js:_onBrowserEvent',message:'browser_event_received',data:{type,url:url?.slice(0,100),elementSelector:d.element?.selector?.slice(0,120),elementName:d.element?.name?.slice(0,60),value:d.value?.slice?.(0,50),totalRawEvents:this._rawEvents.length,totalActions:this._actions.length},timestamp:Date.now(),hypothesisId:'BROWSER_EVENTS'})}).catch(()=>{});
-    }
-    // #endregion
 
     if (type === "click") this._handleClick(d, url);
     else if (type === "fill") this._handleFill(d, url);
