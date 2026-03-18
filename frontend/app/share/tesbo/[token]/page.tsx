@@ -25,9 +25,9 @@ export default function PublicTesboRunPage() {
   }, [token]);
 
   return (
-    <main className="min-h-screen bg-zinc-50 dark:bg-zinc-950 px-6 py-10">
-      <div className="max-w-3xl mx-auto rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-6">
-        <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Tesbo Shared Run</h1>
+    <main className="min-h-screen bg-[var(--background)] px-6 py-10">
+      <div className="max-w-3xl mx-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
+        <h1 className="text-2xl font-semibold text-[var(--foreground)]">Tesbo Shared Run</h1>
         {error && <p className="mt-4 text-sm text-red-600">{error}</p>}
         {run && (
           <div className="mt-4 space-y-4 text-sm">
@@ -39,9 +39,9 @@ export default function PublicTesboRunPage() {
               <Metric label="Failed" value={String(run.failed)} />
             </div>
 
-            <div className="overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-700">
+            <div className="overflow-x-auto rounded-xl border border-[var(--border)]">
               <table className="min-w-[840px] w-full text-sm">
-                <thead className="bg-zinc-50 dark:bg-zinc-800/50 text-zinc-500 dark:text-zinc-400">
+                <thead className="bg-[var(--surface-secondary)] text-[var(--muted)]">
                   <tr>
                     <th className="text-left px-4 py-3 font-medium">Test</th>
                     <th className="text-left px-4 py-3 font-medium">Status</th>
@@ -51,24 +51,24 @@ export default function PublicTesboRunPage() {
                 </thead>
                 <tbody>
                   {run.cases.map((item) => (
-                    <tr key={item.caseId} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <tr key={item.caseId} className="border-t border-[var(--border-subtle)]">
                       <td className="px-4 py-3 break-all">{item.title}</td>
                       <td className="px-4 py-3">{item.status}</td>
                       <td className="px-4 py-3 text-right">{item.durationMs ?? "-"}</td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap gap-3">
                           {item.traceUrl && (
-                            <a className="text-blue-600 hover:underline" href={toAbsoluteArtifactUrl(item.traceUrl)} target="_blank" rel="noreferrer">
+                            <a className="text-[var(--brand-primary)] hover:underline" href={toAbsoluteArtifactUrl(item.traceUrl)} target="_blank" rel="noreferrer">
                               Trace
                             </a>
                           )}
                           {item.screenshotUrl && (
-                            <a className="text-blue-600 hover:underline" href={toAbsoluteArtifactUrl(item.screenshotUrl)} target="_blank" rel="noreferrer">
+                            <a className="text-[var(--brand-primary)] hover:underline" href={toAbsoluteArtifactUrl(item.screenshotUrl)} target="_blank" rel="noreferrer">
                               Screenshot
                             </a>
                           )}
                           {item.videoUrl && (
-                            <a className="text-blue-600 hover:underline" href={toAbsoluteArtifactUrl(item.videoUrl)} target="_blank" rel="noreferrer">
+                            <a className="text-[var(--brand-primary)] hover:underline" href={toAbsoluteArtifactUrl(item.videoUrl)} target="_blank" rel="noreferrer">
                               Video
                             </a>
                           )}
@@ -78,7 +78,7 @@ export default function PublicTesboRunPage() {
                   ))}
                   {run.cases.length === 0 && (
                     <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-zinc-500 dark:text-zinc-400">
+                      <td colSpan={4} className="px-4 py-8 text-center text-[var(--muted)]">
                         No tests found in this shared run.
                       </td>
                     </tr>
@@ -95,9 +95,9 @@ export default function PublicTesboRunPage() {
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 bg-white dark:bg-zinc-900">
-      <p className="text-xs text-zinc-500 dark:text-zinc-400">{label}</p>
-      <p className="mt-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">{value}</p>
+    <div className="rounded-lg border border-[var(--border)] p-3 bg-[var(--surface)]">
+      <p className="text-xs text-[var(--muted)]">{label}</p>
+      <p className="mt-1 text-sm font-semibold text-[var(--foreground)]">{value}</p>
     </div>
   );
 }

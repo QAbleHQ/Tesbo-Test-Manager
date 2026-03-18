@@ -16,7 +16,7 @@ export default function ProjectRootRedirect() {
 
   return (
     <div className="min-h-screen flex items-center justify-center">
-      <p className="text-zinc-500">Opening project…</p>
+      <p className="text-[var(--muted)]">Opening project…</p>
     </div>
   );
 }

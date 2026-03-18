@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { requestOtp } from "@/lib/api";
+import { Button, Field, FieldError, FieldHint, FieldLabel, Input } from "@/components/ui";
 
 function LoginForm() {
   const router = useRouter();
@@ -42,7 +43,7 @@ function LoginForm() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[var(--background)] dark:bg-zinc-950 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-[var(--background)] px-4">
       <div className="w-full max-w-sm space-y-8">
         <div className="text-center">
           <Image
@@ -56,41 +57,36 @@ function LoginForm() {
           <p className="mt-1 text-sm text-[var(--muted)]">Sign in with your email</p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label htmlFor="email" className="block text-sm font-medium text-[var(--muted)] dark:text-zinc-300 mb-1">
-              Email
-            </label>
-            <input
+          <Field>
+            <FieldLabel htmlFor="email">Email</FieldLabel>
+            <Input
               id="email"
               type="email"
               autoComplete="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
-              className="w-full rounded-lg border border-[var(--border)] dark:border-zinc-600 bg-[var(--surface)] dark:bg-zinc-900 px-3 py-2 text-[var(--foreground)] dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
               disabled={loading || isInviteEmailLocked}
             />
             {isInviteEmailLocked && (
-              <p className="mt-1 text-xs text-zinc-500">
+              <FieldHint>
                 This invitation can only be accepted with this email address.
-              </p>
+              </FieldHint>
             )}
-          </div>
-          {error && (
-            <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
-          )}
-          <button
+          </Field>
+          {error && <FieldError>{error}</FieldError>}
+          <Button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-[var(--primary)] text-white py-2 px-4 font-medium hover:opacity-90 disabled:opacity-50"
+            fullWidth
           >
             {loading ? "Sending…" : "Send login code"}
-          </button>
+          </Button>
         </form>
         <p className="text-center text-sm text-[var(--muted)]">
           We’ll send a one-time code to your email. No password needed.
         </p>
-        <p className="text-center text-xs text-[var(--muted)] dark:text-zinc-400">
+        <p className="text-center text-xs text-[var(--muted-soft)]">
           <Link href="/privacy-policy" className="hover:underline">
             Privacy Policy
           </Link>{" "}

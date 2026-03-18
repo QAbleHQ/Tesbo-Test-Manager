@@ -17,6 +17,8 @@ import {
   type RepositorySummary,
   type SuiteNode,
 } from "@/lib/api";
+import { Button, Input, Select, StatusChip, Card } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 /* ═══════════════════ CONSTANTS ═══════════════════ */
 const TABS = ["Execution Report", "Requirement Matrix", "Repository Summary"] as const;
@@ -65,7 +67,7 @@ function DonutChart({
     return (
       <svg width={size} height={size} viewBox="0 0 36 36">
         <circle cx="18" cy="18" r="15.915" fill="none" stroke="#e4e4e7" strokeWidth="3" />
-        <text x="18" y="19.5" textAnchor="middle" className="text-[3.5px] fill-zinc-400 font-medium">
+        <text x="18" y="19.5" textAnchor="middle" className="text-[3.5px] fill-[var(--muted-soft)] font-medium">
           No data
         </text>
       </svg>
@@ -98,10 +100,10 @@ function DonutChart({
           />
         );
       })}
-      <text x="18" y="17" textAnchor="middle" className="text-[5px] font-bold fill-zinc-900 dark:fill-zinc-100">
+      <text x="18" y="17" textAnchor="middle" className="text-[5px] font-bold fill-[var(--foreground)]">
         {total}
       </text>
-      <text x="18" y="21" textAnchor="middle" className="text-[2.5px] fill-zinc-400 font-medium">
+      <text x="18" y="21" textAnchor="middle" className="text-[2.5px] fill-[var(--muted-soft)] font-medium">
         {label || "Total"}
       </text>
     </svg>
@@ -119,14 +121,14 @@ function HorizontalBarChart({
     <div className="space-y-2">
       {data.map((d) => (
         <div key={d.label} className="flex items-center gap-3">
-          <span className="w-24 text-xs text-zinc-500 dark:text-zinc-400 text-right truncate">{d.label}</span>
-          <div className="flex-1 h-6 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
+          <span className="w-24 text-xs text-[var(--muted)] text-right truncate">{d.label}</span>
+          <div className="flex-1 h-6 bg-[var(--surface-tertiary)] rounded-full overflow-hidden">
             <div
               className="h-full rounded-full transition-all duration-500"
               style={{ width: `${(d.value / max) * 100}%`, backgroundColor: d.color, minWidth: d.value > 0 ? "8px" : "0px" }}
             />
           </div>
-          <span className="w-10 text-xs font-medium text-zinc-700 dark:text-zinc-300">{d.value}</span>
+          <span className="w-10 text-xs font-medium text-[var(--muted)]">{d.value}</span>
         </div>
       ))}
     </div>
@@ -135,17 +137,17 @@ function HorizontalBarChart({
 
 /* ═══════════════════ STACKED BAR CHART ═══════════════════ */
 function StackedBarChart({ rows }: { rows: ExecutionReportRow[] }) {
-  if (rows.length === 0) return <p className="text-sm text-zinc-400 text-center py-8">No data available</p>;
+  if (rows.length === 0) return <p className="text-sm text-[var(--muted-soft)] text-center py-8">No data available</p>;
   const maxTotal = Math.max(...rows.map((r) => r.total), 1);
 
   return (
     <div className="space-y-3">
       {rows.map((row) => (
         <div key={row.groupId} className="flex items-center gap-3">
-          <span className="w-36 text-xs text-zinc-600 dark:text-zinc-400 text-right truncate" title={row.groupName}>
+          <span className="w-36 text-xs text-[var(--muted)] text-right truncate" title={row.groupName}>
             {row.groupName}
           </span>
-          <div className="flex-1 h-7 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden flex">
+          <div className="flex-1 h-7 bg-[var(--surface-tertiary)] rounded-full overflow-hidden flex">
             {STATUS_KEYS.map((status) => {
               const val = row[status] || 0;
               if (val === 0) return null;
@@ -160,7 +162,7 @@ function StackedBarChart({ rows }: { rows: ExecutionReportRow[] }) {
               );
             })}
           </div>
-          <span className="w-10 text-xs font-medium text-zinc-700 dark:text-zinc-300">{row.total}</span>
+          <span className="w-10 text-xs font-medium text-[var(--muted)]">{row.total}</span>
         </div>
       ))}
     </div>
@@ -177,7 +179,7 @@ function AreaSparkline({
   width?: number;
   height?: number;
 }) {
-  if (data.length === 0) return <p className="text-sm text-zinc-400 text-center py-8">No data in last 30 days</p>;
+  if (data.length === 0) return <p className="text-sm text-[var(--muted-soft)] text-center py-8">No data in last 30 days</p>;
   const max = Math.max(...data.map((d) => d.count), 1);
   const padX = 40;
   const padY = 20;
@@ -213,7 +215,7 @@ function AreaSparkline({
             x={padX - 6}
             y={padY + h - pct * h + 3}
             textAnchor="end"
-            className="text-[9px] fill-zinc-400"
+            className="text-[9px] fill-[var(--muted-soft)]"
           >
             {Math.round(pct * max)}
           </text>
@@ -225,7 +227,7 @@ function AreaSparkline({
         <g key={i}>
           <circle cx={p.x} cy={p.y} r="3" fill="#3b82f6" />
           {data.length <= 15 && (
-            <text x={p.x} y={padY + h + 14} textAnchor="middle" className="text-[7px] fill-zinc-400">
+            <text x={p.x} y={padY + h + 14} textAnchor="middle" className="text-[7px] fill-[var(--muted-soft)]">
               {data[i].date.slice(5)}
             </text>
           )}
@@ -235,42 +237,25 @@ function AreaSparkline({
   );
 }
 
-/* ═══════════════════ STATUS BADGE ═══════════════════ */
-function StatusBadge({ status, type }: { status: string | null; type?: "exec" | "bug" | "tc" | "run" }) {
-  if (!status) return <span className="text-xs text-zinc-300">—</span>;
-  const colorMap: Record<string, string> = {
-    Passed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    Failed: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
-    Skipped: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300",
-    Blocked: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
-    Retest: "bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300",
-    Untested: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
-    Open: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
-    Closed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    "In Progress": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
-    Planning: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
-    Completed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    Draft: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
-    Approved: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    "In Review": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
-    Deprecated: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-500",
+/* ───── Status badge tone mapping ───── */
+function statusTone(s: string | null): "neutral" | "brand" | "ai" | "success" | "warning" | "error" | "info" {
+  if (!s) return "neutral";
+  const map: Record<string, "success" | "error" | "warning" | "info" | "neutral"> = {
+    Passed: "success", Failed: "error", Skipped: "warning", Blocked: "warning", Retest: "info",
+    Untested: "neutral", Open: "error", Closed: "success", "In Progress": "info", Planning: "warning",
+    Completed: "success", Draft: "neutral", Approved: "success", "In Review": "info", Deprecated: "neutral",
   };
-  const cls = colorMap[status] || "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400";
-  return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${cls}`}>
-      {status}
-    </span>
-  );
+  return (map[s] ?? "neutral") as "neutral" | "success" | "warning" | "error" | "info";
 }
 
-/* ═══════════════════ METRIC CARD ═══════════════════ */
+/* ───── Metric Card ───── */
 function MetricCard({ label, value, sub, color }: { label: string; value: number | string; sub?: string; color: string }) {
   return (
-    <div className={`rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5`}>
-      <p className="text-sm text-zinc-500 dark:text-zinc-400">{label}</p>
+    <Card className="p-5">
+      <p className="text-sm text-[var(--muted)]">{label}</p>
       <p className={`text-3xl font-bold mt-1 ${color}`}>{value}</p>
-      {sub && <p className="text-xs text-zinc-400 mt-1">{sub}</p>}
-    </div>
+      {sub && <p className="text-xs text-[var(--muted-soft)] mt-1">{sub}</p>}
+    </Card>
   );
 }
 
@@ -471,40 +456,43 @@ export default function ReportsPage() {
   if (!auth) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
-  return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      {/* Header */}
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-6 py-3">
-        <div className="flex items-center gap-2 text-sm">
-          <Link href={`/projects/${projectId}/dashboard`} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300">
-            Project
-          </Link>
-          <span className="text-zinc-300 dark:text-zinc-600">/</span>
-          <span className="text-zinc-900 dark:text-zinc-100 font-medium">Reports</span>
-        </div>
-      </header>
+  const breadcrumb = (
+    <>
+      <Link href={`/projects/${projectId}/dashboard`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
+        Project
+      </Link>
+      <span className="text-[var(--muted-soft)]">/</span>
+      <span className="text-[var(--foreground)] font-medium">Reports</span>
+    </>
+  );
 
-      <main className="max-w-7xl mx-auto px-6 py-6">
-        <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100 mb-1">Reports</h1>
-        <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">
-          Test execution reports, requirement traceability, and repository analytics.
-        </p>
+  return (
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Reports"
+          subtitle="Test execution reports, requirement traceability, and repository analytics."
+          breadcrumb={breadcrumb}
+        />
+      }
+    >
+      <main className="space-y-6">
 
         {/* Tab Navigation */}
-        <div className="flex gap-1 mb-6 border-b border-zinc-200 dark:border-zinc-700">
+        <div className="flex gap-1 mb-6 border-b border-[var(--border)]">
           {TABS.map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
               className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
                 activeTab === tab
-                  ? "border-blue-600 text-blue-600 dark:text-blue-400 dark:border-blue-400"
-                  : "border-transparent text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
+                  ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
+                  : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
               }`}
             >
               {tab}
@@ -518,89 +506,89 @@ export default function ReportsPage() {
             {/* Filter Bar */}
             <div className="flex flex-wrap items-center gap-3 mb-6">
               <div className="flex items-center gap-2">
-                <label className="text-sm text-zinc-500 dark:text-zinc-400 font-medium">Group By:</label>
-                <select
+                <label className="text-sm text-[var(--muted)] font-medium">Group By:</label>
+                <Select
                   value={execFilterBy}
                   onChange={(e) => { setExecFilterBy(e.target.value); setExecFilterValue(""); }}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300"
+                  className="w-auto min-w-[140px]"
                 >
                   {FILTER_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>
                   ))}
-                </select>
+                </Select>
               </div>
 
               {/* Specific filter value selector */}
               {execFilterBy === "plan" && plans.length > 0 && (
-                <select
+                <Select
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                  className="min-w-[140px]"
                 >
                   <option value="">All Plans</option>
                   {plans.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
+                </Select>
               )}
               {execFilterBy === "run" && runs.length > 0 && (
-                <select
+                <Select
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                  className="min-w-[140px]"
                 >
                   <option value="">All Runs</option>
                   {runs.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
-                </select>
+                </Select>
               )}
               {execFilterBy === "suite" && suites.length > 0 && (
-                <select
+                <Select
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                  className="min-w-[140px]"
                 >
                   <option value="">All Suites</option>
                   {suites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
+                </Select>
               )}
               {execFilterBy === "person" && members.length > 0 && (
-                <select
+                <Select
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                  className="min-w-[140px]"
                 >
                   <option value="">All Members</option>
                   {members.map((m) => <option key={m.userId} value={m.userId}>{m.name || m.email}</option>)}
-                </select>
+                </Select>
               )}
               {execFilterBy === "priority" && (
-                <select
+                <Select
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+                  className="min-w-[140px]"
                 >
                   <option value="">All Priorities</option>
                   <option value="P0">P0 - Critical</option>
                   <option value="P1">P1 - High</option>
                   <option value="P2">P2 - Medium</option>
                   <option value="P3">P3 - Low</option>
-                </select>
+                </Select>
               )}
               {execFilterBy === "tags" && (
-                <input
+                <Input
                   type="text"
                   value={execFilterValue}
                   onChange={(e) => setExecFilterValue(e.target.value)}
                   placeholder="Enter tag to filter…"
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm w-48"
+                  className="w-48"
                 />
               )}
 
-              <div className="ml-auto flex items-center rounded-lg border border-zinc-300 dark:border-zinc-600 overflow-hidden">
+              <div className="ml-auto flex items-center rounded-lg border border-[var(--border)] overflow-hidden">
                 <button
                   onClick={() => setExecView("chart")}
                   className={`px-3 py-2 text-sm font-medium flex items-center gap-1.5 ${
                     execView === "chart"
-                      ? "bg-blue-600 text-white"
-                      : "bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700"
+                      ? "bg-[var(--brand-primary)] text-white"
+                      : "bg-[var(--surface)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                   }`}
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -612,8 +600,8 @@ export default function ReportsPage() {
                   onClick={() => setExecView("table")}
                   className={`px-3 py-2 text-sm font-medium flex items-center gap-1.5 ${
                     execView === "table"
-                      ? "bg-blue-600 text-white"
-                      : "bg-white dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-700"
+                      ? "bg-[var(--brand-primary)] text-white"
+                      : "bg-[var(--surface)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                   }`}
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -626,25 +614,25 @@ export default function ReportsPage() {
 
             {execLoading ? (
               <div className="flex items-center justify-center py-16">
-                <p className="text-zinc-400 text-sm">Loading report…</p>
+                <p className="text-[var(--muted-soft)] text-sm">Loading report…</p>
               </div>
             ) : (
               <>
                 {/* Summary Cards */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-6">
-                  <MetricCard label="Total" value={execTotals.total} color="text-zinc-900 dark:text-zinc-100" />
+                  <MetricCard label="Total" value={execTotals.total} color="text-[var(--foreground)]" />
                   {STATUS_KEYS.map((s) => (
                     <MetricCard
                       key={s}
                       label={s}
                       value={execTotals[s]}
                       color={
-                        s === "Passed" ? "text-green-600" :
-                        s === "Failed" ? "text-red-600" :
-                        s === "Blocked" ? "text-orange-600" :
-                        s === "Skipped" ? "text-yellow-600" :
-                        s === "Retest" ? "text-purple-600" :
-                        "text-zinc-500"
+                        s === "Passed" ? "text-[var(--success)]" :
+                        s === "Failed" ? "text-[var(--error)]" :
+                        s === "Blocked" ? "text-[var(--warning)]" :
+                        s === "Skipped" ? "text-[var(--warning)]" :
+                        s === "Retest" ? "text-[var(--info)]" :
+                        "text-[var(--muted)]"
                       }
                     />
                   ))}
@@ -654,25 +642,25 @@ export default function ReportsPage() {
                 {execView === "chart" ? (
                   <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     {/* Stacked bar chart */}
-                    <div className="lg:col-span-2 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-                      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+                    <div className="lg:col-span-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+                      <h3 className="text-sm font-semibold text-[var(--foreground)] mb-4">
                         Execution Status by {FILTER_OPTIONS.find((o) => o.value === execFilterBy)?.label.replace("By ", "").replace("Overall (by Test Run)", "Test Run")}
                       </h3>
                       <StackedBarChart rows={execRows} />
                       {/* Legend */}
-                      <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800">
+                      <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-[var(--border-subtle)]">
                         {STATUS_KEYS.map((s) => (
                           <div key={s} className="flex items-center gap-1.5 text-xs">
                             <span className="w-3 h-3 rounded" style={{ backgroundColor: STATUS_COLORS[s] }} />
-                            <span className="text-zinc-500 dark:text-zinc-400">{s}</span>
+                            <span className="text-[var(--muted)]">{s}</span>
                           </div>
                         ))}
                       </div>
                     </div>
 
                     {/* Donut summary */}
-                    <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5 flex flex-col items-center justify-center">
-                      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-4">Overall Distribution</h3>
+                    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 flex flex-col items-center justify-center">
+                      <h3 className="text-sm font-semibold text-[var(--foreground)] mb-4">Overall Distribution</h3>
                       <DonutChart
                         data={STATUS_KEYS.map((s) => ({
                           label: s,
@@ -685,7 +673,7 @@ export default function ReportsPage() {
                         {STATUS_KEYS.filter((s) => execTotals[s] > 0).map((s) => (
                           <div key={s} className="flex items-center gap-1.5 text-xs">
                             <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: STATUS_COLORS[s] }} />
-                            <span className="text-zinc-600 dark:text-zinc-400">{s} ({execTotals[s]})</span>
+                            <span className="text-[var(--muted)]">{s} ({execTotals[s]})</span>
                           </div>
                         ))}
                       </div>
@@ -693,11 +681,11 @@ export default function ReportsPage() {
                   </div>
                 ) : (
                   /* Table View */
-                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden bg-white dark:bg-zinc-900">
+                  <div className="rounded-xl border border-[var(--border)] overflow-hidden bg-[var(--surface)]">
                     <div className="overflow-x-auto">
                       <table className="w-full">
                         <thead>
-                          <tr className="border-b border-zinc-200 dark:border-zinc-700 text-left text-xs text-zinc-500 uppercase tracking-wider">
+                          <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted)] uppercase tracking-wider">
                             <th className="px-5 py-3 font-medium">Group</th>
                             {STATUS_KEYS.map((s) => (
                               <th key={s} className="px-4 py-3 font-medium text-center">{s}</th>
@@ -706,37 +694,37 @@ export default function ReportsPage() {
                             <th className="px-4 py-3 font-medium text-center">Pass Rate</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                        <tbody className="divide-y divide-[var(--border-subtle)]">
                           {execRows.length === 0 ? (
                             <tr>
-                              <td colSpan={9} className="px-5 py-8 text-center text-sm text-zinc-400">No data available</td>
+                              <td colSpan={9} className="px-5 py-8 text-center text-sm text-[var(--muted-soft)]">No data available</td>
                             </tr>
                           ) : (
                             <>
                               {execRows.map((row) => {
                                 const passRate = row.total > 0 ? ((row.Passed / row.total) * 100).toFixed(1) : "0.0";
                                 return (
-                                  <tr key={row.groupId} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
-                                    <td className="px-5 py-3 text-sm text-zinc-900 dark:text-zinc-100 font-medium">
+                                  <tr key={row.groupId} className="hover:bg-[var(--surface-secondary)]">
+                                    <td className="px-5 py-3 text-sm text-[var(--foreground)] font-medium">
                                       {row.groupName}
                                     </td>
                                     {STATUS_KEYS.map((s) => (
                                       <td key={s} className="px-4 py-3 text-center text-sm">
                                         <span className={`inline-flex items-center justify-center w-8 h-8 rounded-lg text-xs font-semibold ${
                                           (row[s] || 0) > 0
-                                            ? s === "Passed" ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300"
-                                              : s === "Failed" ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
-                                              : s === "Blocked" ? "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300"
-                                              : s === "Skipped" ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300"
-                                              : s === "Retest" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300"
-                                              : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
-                                            : "text-zinc-300 dark:text-zinc-600"
+                                            ? s === "Passed" ? "bg-[var(--success-soft)] text-[var(--success)]"
+                                              : s === "Failed" ? "bg-[var(--error-soft)] text-[var(--error)]"
+                                              : s === "Blocked" ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                                              : s === "Skipped" ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                                              : s === "Retest" ? "bg-[var(--info-soft)] text-[var(--info)]"
+                                              : "bg-[var(--surface-tertiary)] text-[var(--muted)]"
+                                            : "text-[var(--muted-soft)]"
                                         }`}>
                                           {row[s] || 0}
                                         </span>
                                       </td>
                                     ))}
-                                    <td className="px-4 py-3 text-center text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                                    <td className="px-4 py-3 text-center text-sm font-semibold text-[var(--foreground)]">
                                       {row.total}
                                     </td>
                                     <td className="px-4 py-3 text-center">
@@ -752,14 +740,14 @@ export default function ReportsPage() {
                                 );
                               })}
                               {/* Totals row */}
-                              <tr className="bg-zinc-50 dark:bg-zinc-800/50 font-semibold">
-                                <td className="px-5 py-3 text-sm text-zinc-900 dark:text-zinc-100">Total</td>
+                              <tr className="bg-[var(--surface-secondary)] font-semibold">
+                                <td className="px-5 py-3 text-sm text-[var(--foreground)]">Total</td>
                                 {STATUS_KEYS.map((s) => (
-                                  <td key={s} className="px-4 py-3 text-center text-sm text-zinc-700 dark:text-zinc-300">
+                                  <td key={s} className="px-4 py-3 text-center text-sm text-[var(--muted)]">
                                     {execTotals[s]}
                                   </td>
                                 ))}
-                                <td className="px-4 py-3 text-center text-sm text-zinc-900 dark:text-zinc-100">{execTotals.total}</td>
+                                <td className="px-4 py-3 text-center text-sm text-[var(--foreground)]">{execTotals.total}</td>
                                 <td className="px-4 py-3 text-center text-sm">
                                   {execTotals.total > 0
                                     ? `${((execTotals.Passed / execTotals.total) * 100).toFixed(1)}%`
@@ -782,24 +770,24 @@ export default function ReportsPage() {
         {activeTab === "Requirement Matrix" && (
           <div>
             <div className="flex items-center justify-between mb-4">
-              <p className="text-sm text-zinc-500 dark:text-zinc-400">
+              <p className="text-sm text-[var(--muted)]">
                 Traceability matrix linking test cases to test runs, execution results, and bugs.
               </p>
-              <input
+              <Input
                 type="text"
                 value={matrixSearch}
                 onChange={(e) => setMatrixSearch(e.target.value)}
                 placeholder="Search by ID, title, run, or bug…"
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm w-64"
+                className="w-64"
               />
             </div>
 
             {matrixLoading ? (
               <div className="flex items-center justify-center py-16">
-                <p className="text-zinc-400 text-sm">Loading matrix…</p>
+                <p className="text-[var(--muted-soft)] text-sm">Loading matrix…</p>
               </div>
             ) : (
-              <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden bg-white dark:bg-zinc-900">
+              <div className="rounded-xl border border-[var(--border)] overflow-hidden bg-[var(--surface)]">
                 <div className="overflow-x-auto">
                   <table className="border-collapse" style={{ minWidth: "100%", tableLayout: "fixed", width: Object.values(matrixColWidths).reduce((a, b) => a + b, 0) }}>
                     <colgroup>
@@ -808,7 +796,7 @@ export default function ReportsPage() {
                       ))}
                     </colgroup>
                     <thead>
-                      <tr className="border-b border-zinc-200 dark:border-zinc-700 text-left text-xs text-zinc-500 uppercase tracking-wider">
+                      <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted)] uppercase tracking-wider">
                         {MATRIX_COLUMNS.map((col) => (
                           <th
                             key={col.key}
@@ -829,7 +817,7 @@ export default function ReportsPage() {
                     <tbody>
                       {groupedMatrixRows.length === 0 ? (
                         <tr>
-                          <td colSpan={11} className="px-4 py-8 text-center text-sm text-zinc-400">
+                          <td colSpan={11} className="px-4 py-8 text-center text-sm text-[var(--muted-soft)]">
                             {matrixSearch ? "No matching rows found." : "No test case data available."}
                           </td>
                         </tr>
@@ -839,10 +827,10 @@ export default function ReportsPage() {
                           return group.runs.map((row, ri) => (
                             <tr
                               key={`${row.testcaseId}-${row.runId}-${row.bugId}-${ri}`}
-                              className={`hover:bg-zinc-50 dark:hover:bg-zinc-800/50 ${
+                              className={`hover:bg-[var(--surface-secondary)] ${
                                 ri < rowCount - 1
                                   ? ""
-                                  : "border-b border-zinc-200 dark:border-zinc-700"
+                                  : "border-b border-[var(--border)]"
                               }`}
                             >
                               {/* Merged test case columns — only render on the first row of each group */}
@@ -850,19 +838,19 @@ export default function ReportsPage() {
                                 <>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 text-xs text-zinc-500 font-mono whitespace-nowrap align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 text-xs text-[var(--muted)] font-mono whitespace-nowrap align-top border-b border-[var(--border)] bg-[var(--surface)]"
                                   >
                                     {group.externalId}
                                   </td>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 text-sm text-zinc-900 dark:text-zinc-100 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 text-sm text-[var(--foreground)] align-top border-b border-[var(--border)] bg-[var(--surface)]"
                                   >
                                     <span className="whitespace-normal break-words">{group.testcaseTitle}</span>
                                   </td>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 align-top border-b border-[var(--border)] bg-[var(--surface)]"
                                   >
                                     <span className="text-xs font-medium" style={{ color: PRIORITY_COLORS[group.priority] || "#71717a" }}>
                                       {group.priority}
@@ -870,46 +858,46 @@ export default function ReportsPage() {
                                   </td>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 align-top border-b border-[var(--border)] bg-[var(--surface)]"
                                   >
-                                    <StatusBadge status={group.testcaseStatus} type="tc" />
+                                    <StatusChip tone={statusTone(group.testcaseStatus)}>{group.testcaseStatus || "—"}</StatusChip>
                                   </td>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 text-xs text-zinc-500 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 text-xs text-[var(--muted)] align-top border-b border-[var(--border)] bg-[var(--surface)]"
                                   >
                                     <span className="whitespace-normal break-words">{group.suiteName || "—"}</span>
                                   </td>
                                 </>
                               )}
                               {/* Run / execution / bug columns — rendered for every row */}
-                              <td className={`px-4 py-2.5 text-sm text-zinc-700 dark:text-zinc-300 ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
+                              <td className={`px-4 py-2.5 text-sm text-[var(--muted)] ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
                                 <span className="whitespace-normal break-words">{row.runName || "—"}</span>
                               </td>
-                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
-                                <StatusBadge status={row.runStatus} type="run" />
+                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
+                                <StatusChip tone={statusTone(row.runStatus)}>{row.runStatus || "—"}</StatusChip>
                               </td>
-                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
-                                <StatusBadge status={row.executionStatus} type="exec" />
+                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
+                                <StatusChip tone={statusTone(row.executionStatus)}>{row.executionStatus || "—"}</StatusChip>
                               </td>
-                              <td className={`px-4 py-2.5 text-xs text-zinc-400 whitespace-nowrap ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
+                              <td className={`px-4 py-2.5 text-xs text-[var(--muted-soft)] whitespace-nowrap ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
                                 {row.executedAt ? new Date(row.executedAt).toLocaleDateString() : "—"}
                               </td>
-                              <td className={`px-4 py-2.5 text-sm ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
+                              <td className={`px-4 py-2.5 text-sm ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
                                 {row.bugTitle ? (
                                   row.bugUrl ? (
                                     <a href={row.bugUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline text-xs break-words">
                                       {row.bugTitle}
                                     </a>
                                   ) : (
-                                    <span className="text-xs text-zinc-700 dark:text-zinc-300 break-words">{row.bugTitle}</span>
+                                    <span className="text-xs text-[var(--muted)] break-words">{row.bugTitle}</span>
                                   )
                                 ) : (
-                                  <span className="text-xs text-zinc-300 dark:text-zinc-600">—</span>
+                                  <span className="text-xs text-[var(--muted-soft)]">—</span>
                                 )}
                               </td>
-                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-zinc-100 dark:border-zinc-800" : ""}`}>
-                                <StatusBadge status={row.bugStatus} type="bug" />
+                              <td className={`px-4 py-2.5 ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
+                                <StatusChip tone={statusTone(row.bugStatus)}>{row.bugStatus || "—"}</StatusChip>
                               </td>
                             </tr>
                           ));
@@ -919,7 +907,7 @@ export default function ReportsPage() {
                   </table>
                 </div>
                 {groupedMatrixRows.length > 0 && (
-                  <div className="px-4 py-3 border-t border-zinc-200 dark:border-zinc-700 text-xs text-zinc-400">
+                  <div className="px-4 py-3 border-t border-[var(--border)] text-xs text-[var(--muted-soft)]">
                     {groupedMatrixRows.length} test case{groupedMatrixRows.length !== 1 ? "s" : ""} across {filteredMatrixRows.length} row{filteredMatrixRows.length !== 1 ? "s" : ""}
                   </div>
                 )}
@@ -933,7 +921,7 @@ export default function ReportsPage() {
           <div>
             {repoLoading ? (
               <div className="flex items-center justify-center py-16">
-                <p className="text-zinc-400 text-sm">Loading summary…</p>
+                <p className="text-[var(--muted-soft)] text-sm">Loading summary…</p>
               </div>
             ) : repoSummary ? (
               <>
@@ -966,8 +954,8 @@ export default function ReportsPage() {
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
                   {/* Test cases by suite */}
-                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-                    <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+                    <h3 className="text-sm font-semibold text-[var(--foreground)] mb-4">
                       Test Cases by Suite
                     </h3>
                     <HorizontalBarChart
@@ -980,9 +968,9 @@ export default function ReportsPage() {
                   </div>
 
                   {/* Test cases by status */}
-                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
                     <div className="flex items-start justify-between mb-4">
-                      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                      <h3 className="text-sm font-semibold text-[var(--foreground)]">
                         Test Cases by Status
                       </h3>
                     </div>
@@ -1011,7 +999,7 @@ export default function ReportsPage() {
                               : s.name === "Deprecated" ? "#71717a"
                               : "#6366f1",
                           }} />
-                          <span className="text-zinc-600 dark:text-zinc-400">{s.name} ({s.count})</span>
+                          <span className="text-[var(--muted)]">{s.name} ({s.count})</span>
                         </div>
                       ))}
                     </div>
@@ -1019,23 +1007,23 @@ export default function ReportsPage() {
                 </div>
 
                 {/* Test cases added by date (area chart) */}
-                <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5 mb-8">
-                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 mb-8">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)] mb-4">
                     Test Cases Added (Last 30 Days)
                   </h3>
                   <AreaSparkline data={repoSummary.addedByDate} />
                 </div>
 
                 {/* Test cases by priority */}
-                <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)] mb-4">
                     Test Cases by Priority
                   </h3>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                     {repoSummary.byPriority.map((p) => (
                       <div
                         key={p.name}
-                        className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 text-center"
+                        className="rounded-lg border border-[var(--border)] p-4 text-center"
                       >
                         <p
                           className="text-2xl font-bold"
@@ -1043,7 +1031,7 @@ export default function ReportsPage() {
                         >
                           {p.count}
                         </p>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 font-medium">
+                        <p className="text-xs text-[var(--muted)] mt-1 font-medium">
                           {p.name === "P0" ? "P0 - Critical" :
                            p.name === "P1" ? "P1 - High" :
                            p.name === "P2" ? "P2 - Medium" :
@@ -1057,12 +1045,12 @@ export default function ReportsPage() {
               </>
             ) : (
               <div className="flex items-center justify-center py-16">
-                <p className="text-zinc-400 text-sm">No data available.</p>
+                <p className="text-[var(--muted-soft)] text-sm">No data available.</p>
               </div>
             )}
           </div>
         )}
       </main>
-    </div>
+    </StandardPageLayout>
   );
 }

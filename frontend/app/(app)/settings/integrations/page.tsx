@@ -3,6 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { authMe } from "@/lib/api";
+import { EmptyStateBlock } from "@/components/ui";
+import { StandardPageLayout, PageHeader } from "@/components/workflows";
 
 export default function WorkspaceIntegrationsPage() {
   const router = useRouter();
@@ -17,16 +19,27 @@ export default function WorkspaceIntegrationsPage() {
 
   if (!auth) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
+      <StandardPageLayout header={<PageHeader title="Integrations" />}>
+        <div className="flex min-h-[200px] items-center justify-center">
+          <p className="text-[var(--muted)]">Loading…</p>
+        </div>
+      </StandardPageLayout>
     );
   }
 
   return (
-    <main className="max-w-4xl mx-auto px-4 py-8">
-      <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Integrations</h1>
-      <p className="mt-2 text-zinc-500">Connect external tools and services to your workspace.</p>
-    </main>
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Integrations"
+          subtitle="Connect external tools and services to your workspace."
+        />
+      }
+    >
+      <EmptyStateBlock
+        title="No integrations yet"
+        description="Connect external tools and services when they become available."
+      />
+    </StandardPageLayout>
   );
 }

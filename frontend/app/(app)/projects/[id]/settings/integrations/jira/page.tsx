@@ -12,6 +12,8 @@ import {
   type JiraProject,
   type JiraConnection,
 } from "@/lib/api";
+import { Button, Card, EmptyStateBlock } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function JiraIntegrationPage() {
   const params = useParams();
@@ -103,61 +105,69 @@ export default function JiraIntegrationPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
-      </div>
+      <StandardPageLayout header={<PageHeader title="Jira Integration" />}>
+        <div className="flex min-h-[200px] items-center justify-center">
+          <p className="text-[var(--muted)]">Loading…</p>
+        </div>
+      </StandardPageLayout>
     );
   }
 
   if (!jiraStatus?.connected) {
     return (
-      <main className="max-w-xl mx-auto px-4 py-8">
-        <Link
-          href={`/projects/${projectId}/settings`}
-          className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
-        >
-          &larr; Back to Project Settings
-        </Link>
-        <h1 className="mt-4 text-xl font-semibold text-zinc-900 dark:text-zinc-100">Jira Integration</h1>
-        <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 p-6 text-center">
-          <p className="text-sm text-zinc-500">
-            Jira is not connected for this project. Go back to project settings and click &quot;Connect&quot; to start.
-          </p>
-          <Link
-            href={`/projects/${projectId}/settings`}
-            className="mt-4 inline-block rounded-lg bg-blue-600 text-white px-4 py-2 text-sm font-medium hover:bg-blue-700"
-          >
-            Go to Settings
-          </Link>
-        </div>
-      </main>
+      <StandardPageLayout
+        header={
+          <PageHeader
+            title="Jira Integration"
+            breadcrumb={
+              <Link href={`/projects/${projectId}/settings`} className="text-[var(--brand-primary)] hover:underline">
+                &larr; Back to Project Settings
+              </Link>
+            }
+          />
+        }
+      >
+        <EmptyStateBlock
+          title="Jira not connected"
+          description="Jira is not connected for this project. Go back to project settings and click Connect to start."
+          action={
+            <Link href={`/projects/${projectId}/settings`}>
+              <Button>Go to Settings</Button>
+            </Link>
+          }
+        />
+      </StandardPageLayout>
     );
   }
 
   return (
-    <main className="max-w-2xl mx-auto px-4 py-8">
-      <Link
-        href={`/projects/${projectId}/settings`}
-        className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
-      >
-        &larr; Back to Project Settings
-      </Link>
-
-      <h1 className="mt-4 text-xl font-semibold text-zinc-900 dark:text-zinc-100">Jira Integration</h1>
-      <p className="mt-1 text-sm text-zinc-500">
-        Connected to{" "}
-        <a href={jiraStatus.siteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 dark:text-blue-400 hover:underline">
-          {jiraStatus.siteUrl}
-        </a>
-      </p>
-
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Jira Integration"
+          subtitle={
+            <>
+              Connected to{" "}
+              <a href={jiraStatus.siteUrl} target="_blank" rel="noopener noreferrer" className="text-[var(--brand-primary)] hover:underline">
+                {jiraStatus.siteUrl}
+              </a>
+            </>
+          }
+          breadcrumb={
+            <Link href={`/projects/${projectId}/settings`} className="text-[var(--brand-primary)] hover:underline">
+              &larr; Back to Project Settings
+            </Link>
+          }
+        />
+      }
+    >
       {/* Message */}
       {message && (
         <div
-          className={`mt-4 rounded-lg border px-3 py-2 text-sm ${
+          className={`rounded-lg border px-3 py-2 text-sm ${
             message.type === "success"
-              ? "border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400"
-              : "border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400"
+              ? "border-[var(--success)]/30 bg-[color-mix(in_oklab,var(--success)_8%,white)] text-[var(--success)]"
+              : "border-[var(--error)]/30 bg-[color-mix(in_oklab,var(--error)_8%,white)] text-[var(--error)]"
           }`}
         >
           {message.text}
@@ -165,19 +175,19 @@ export default function JiraIntegrationPage() {
       )}
 
       {/* Project selection */}
-      <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
-        <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Select Jira Projects</h2>
-        <p className="mt-1 text-sm text-zinc-500">
+      <Card className="p-4">
+        <h2 className="text-base font-semibold text-[var(--foreground)]">Select Jira Projects</h2>
+        <p className="mt-1 text-sm text-[var(--muted)]">
           Choose which Jira projects to link. Tickets from selected projects will be available in the Knowledge Base.
         </p>
 
         {projectsLoading ? (
-          <div className="mt-4 flex items-center gap-2 text-sm text-zinc-500">
-            <div className="w-4 h-4 rounded-full border-2 border-blue-600 border-t-transparent animate-spin" />
+          <div className="mt-4 flex items-center gap-2 text-sm text-[var(--muted)]">
+            <div className="w-4 h-4 rounded-full border-2 border-[var(--brand-primary)] border-t-transparent animate-spin" />
             Loading Jira projects…
           </div>
         ) : jiraProjects.length === 0 ? (
-          <p className="mt-4 text-sm text-zinc-500">No projects found in your Jira site.</p>
+          <p className="mt-4 text-sm text-[var(--muted)]">No projects found in your Jira site.</p>
         ) : (
           <div className="mt-4 space-y-2 max-h-80 overflow-y-auto">
             {jiraProjects.map((jp) => (
@@ -185,19 +195,19 @@ export default function JiraIntegrationPage() {
                 key={jp.id}
                 className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 cursor-pointer transition-colors ${
                   selected.has(jp.id)
-                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20 dark:border-blue-600"
-                    : "border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    ? "border-[var(--brand-primary)] bg-[var(--brand-soft)]"
+                    : "border-[var(--border)] hover:bg-[var(--surface-secondary)]"
                 }`}
               >
                 <input
                   type="checkbox"
                   checked={selected.has(jp.id)}
                   onChange={() => toggleProject(jp.id)}
-                  className="rounded border-zinc-300 dark:border-zinc-600 text-blue-600 focus:ring-blue-500"
+                  className="rounded border-[var(--border)] text-[var(--brand-primary)] focus:ring-[var(--brand-soft)]"
                 />
                 <div className="min-w-0 flex-1">
-                  <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{jp.name}</span>
-                  <span className="ml-2 text-xs text-zinc-500 font-mono">{jp.key}</span>
+                  <span className="text-sm font-medium text-[var(--foreground)]">{jp.name}</span>
+                  <span className="ml-2 text-xs text-[var(--muted)] font-mono">{jp.key}</span>
                 </div>
               </label>
             ))}
@@ -205,43 +215,42 @@ export default function JiraIntegrationPage() {
         )}
 
         <div className="mt-4 flex items-center gap-3">
-          <button
+          <Button
             onClick={handleSaveProjects}
             disabled={saving || selected.size === 0}
-            className="rounded-lg bg-blue-600 text-white px-4 py-2 text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
           >
             {saving ? "Saving…" : `Link ${selected.size} Project${selected.size !== 1 ? "s" : ""}`}
-          </button>
-          <span className="text-xs text-zinc-400">
+          </Button>
+          <span className="text-xs text-[var(--muted-soft)]">
             {selected.size} selected
           </span>
         </div>
-      </div>
+      </Card>
 
       {/* Sync section */}
       {jiraStatus.connectedProjects && jiraStatus.connectedProjects.length > 0 && (
-        <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4">
-          <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Sync Tickets</h2>
-          <p className="mt-1 text-sm text-zinc-500">
+        <Card className="p-4">
+          <h2 className="text-base font-semibold text-[var(--foreground)]">Sync Tickets</h2>
+          <p className="mt-1 text-sm text-[var(--muted)]">
             Pull the latest tickets from your linked Jira projects into the Knowledge Base.
           </p>
           <div className="mt-3 flex items-center gap-3">
-            <button
+            <Button
+              variant="secondary"
               onClick={handleSync}
               disabled={syncing}
-              className="rounded-lg bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 px-4 py-2 text-sm font-medium hover:bg-zinc-800 dark:hover:bg-zinc-200 disabled:opacity-50 transition-colors"
             >
               {syncing ? "Syncing…" : "Sync Now"}
-            </button>
+            </Button>
             <Link
               href={`/projects/${projectId}/knowledge-base`}
-              className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+              className="text-sm text-[var(--brand-primary)] hover:underline"
             >
               View Knowledge Base →
             </Link>
           </div>
-        </div>
+        </Card>
       )}
-    </main>
+    </StandardPageLayout>
   );
 }

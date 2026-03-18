@@ -21,6 +21,8 @@ import {
 import { getRunByTaskId, onRunsChanged, type AegisRunLogEntry, type AegisBackgroundRun } from "@/lib/aegis-runner";
 import { runAegisInBackground } from "@/lib/aegis-runner";
 import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
+import { Button, Card, StatusChip, Modal, Textarea } from "@/components/ui";
+import { PageHeader } from "@/components/workflows";
 
 function ShieldIcon({ className = "h-6 w-6" }: { className?: string }) {
   return (
@@ -32,21 +34,17 @@ function ShieldIcon({ className = "h-6 w-6" }: { className?: string }) {
 }
 
 function StatusBadge({ status }: { status: AgentTaskStatus }) {
-  const config: Record<AgentTaskStatus, { label: string; cls: string }> = {
-    pending_review: { label: "Pending Review", cls: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" },
-    approved: { label: "Approved", cls: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" },
-    rejected: { label: "Rejected", cls: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" },
-    needs_revision: { label: "Needs Revision", cls: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" },
-    in_progress: { label: "In Progress", cls: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" },
-    bot_reviewing: { label: "Bot Reviewing", cls: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" },
-    queued: { label: "Re-queued", cls: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" },
+  const config: Record<AgentTaskStatus, { label: string; tone: "warning" | "success" | "error" | "info" | "ai" | "neutral" }> = {
+    pending_review: { label: "Pending Review", tone: "warning" },
+    approved: { label: "Approved", tone: "success" },
+    rejected: { label: "Rejected", tone: "error" },
+    needs_revision: { label: "Needs Revision", tone: "warning" },
+    in_progress: { label: "In Progress", tone: "info" },
+    bot_reviewing: { label: "Bot Reviewing", tone: "ai" },
+    queued: { label: "Re-queued", tone: "neutral" },
   };
   const c = config[status];
-  return (
-    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${c.cls}`}>
-      {c.label}
-    </span>
-  );
+  return <StatusChip tone={c.tone}>{c.label}</StatusChip>;
 }
 
 function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
@@ -555,7 +553,7 @@ export default function ReviewDetailPage() {
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center p-10">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent" />
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
       </div>
     );
   }
@@ -565,7 +563,7 @@ export default function ReviewDetailPage() {
       <div className="flex-1 p-6 md:p-10 max-w-4xl mx-auto w-full">
         <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
           <p className="text-sm text-[var(--muted)] mb-2">Review task not found.</p>
-          <Link href={`/projects/${projectId}/agents/aegis/reviews`} className="text-sm font-medium text-[var(--primary)] hover:underline">
+          <Link href={`/projects/${projectId}/agents/aegis/reviews`} className="text-sm font-medium text-[var(--brand-primary)] hover:underline">
             Back to Reviews
           </Link>
         </div>
@@ -595,50 +593,50 @@ export default function ReviewDetailPage() {
 
     const logTypeConfig: Record<string, { bg: string; icon: React.ReactNode; label: string; textColor: string }> = {
       thinking: {
-        bg: "bg-gradient-to-r from-blue-50 to-violet-50 dark:from-blue-900/15 dark:to-violet-900/15 border border-blue-200/60 dark:border-blue-800/40",
+        bg: "bg-gradient-to-r from-blue-50 to-violet-50 border border-blue-200/60",
         icon: <svg className="h-3.5 w-3.5 text-blue-500 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>,
         label: "REASONING",
-        textColor: "text-blue-800 dark:text-blue-200",
+        textColor: "text-blue-800",
       },
       action: {
-        bg: "bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-100 dark:border-emerald-900/30",
+        bg: "bg-emerald-50 border border-emerald-100",
         icon: <svg className="h-3.5 w-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>,
         label: "ACTION",
-        textColor: "text-emerald-700 dark:text-emerald-300",
+        textColor: "text-emerald-700",
       },
       navigation: {
-        bg: "bg-indigo-50 dark:bg-indigo-900/10 border border-indigo-100 dark:border-indigo-900/30",
+        bg: "bg-indigo-50 border border-indigo-100",
         icon: <svg className="h-3.5 w-3.5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>,
         label: "NAVIGATION",
-        textColor: "text-indigo-700 dark:text-indigo-300",
+        textColor: "text-indigo-700",
       },
       milestone: {
-        bg: "bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/30",
+        bg: "bg-amber-50 border border-amber-200",
         icon: <svg className="h-3.5 w-3.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>,
         label: "MILESTONE",
-        textColor: "text-amber-700 dark:text-amber-300",
+        textColor: "text-amber-700",
       },
       bot_review: {
-        bg: "bg-purple-50 dark:bg-purple-900/10 border border-purple-100 dark:border-purple-900/30",
+        bg: "bg-purple-50 border border-purple-100",
         icon: <svg className="h-3.5 w-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
         label: "REVIEW",
-        textColor: "text-purple-700 dark:text-purple-300",
+        textColor: "text-purple-700",
       },
       success: {
-        bg: "bg-green-50 dark:bg-green-900/10 border border-green-100 dark:border-green-900/30",
+        bg: "bg-green-50 border border-green-100",
         icon: <svg className="h-3.5 w-3.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>,
         label: "SUCCESS",
-        textColor: "text-green-700 dark:text-green-300",
+        textColor: "text-green-700",
       },
       error: {
-        bg: "bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/30",
+        bg: "bg-red-50 border border-red-100",
         icon: <svg className="h-3.5 w-3.5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>,
         label: "ERROR",
-        textColor: "text-red-700 dark:text-red-300",
+        textColor: "text-red-700",
       },
       info: {
-        bg: "bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-800",
-        icon: <svg className="h-3.5 w-3.5 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
+        bg: "bg-[var(--background)] border border-[var(--border-subtle)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
         label: "INFO",
         textColor: "text-[var(--foreground)]",
       },
@@ -649,13 +647,13 @@ export default function ReviewDetailPage() {
         {/* Top Bar */}
         <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 shrink-0">
           <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)]">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--brand-soft)] text-[var(--brand-primary)]">
               <ShieldIcon className="h-5 w-5" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-sm font-bold text-[var(--foreground)]">Aegis — Observing</h1>
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 dark:bg-blue-900/30 px-2 py-0.5 text-[10px] font-bold text-blue-700 dark:text-blue-400 uppercase tracking-wider">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700 uppercase tracking-wider">
                   <span className="relative flex h-1.5 w-1.5">
                     <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
                     <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-500" />
@@ -673,7 +671,7 @@ export default function ReviewDetailPage() {
           </div>
           <Link
             href={`/projects/${projectId}/agents/aegis`}
-            className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm text-[var(--muted)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+            className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
           >
             Back to Aegis
           </Link>
@@ -688,10 +686,10 @@ export default function ReviewDetailPage() {
               <div key={phase} className="flex items-center gap-2 flex-1">
                 <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold shrink-0 ${
                   isCurrent
-                    ? "bg-blue-500 text-white"
+                    ? "bg-[var(--brand-primary)] text-white"
                     : isPast
-                      ? "bg-green-500 text-white"
-                      : "bg-zinc-200 dark:bg-zinc-700 text-zinc-500"
+                      ? "bg-[var(--success)] text-white"
+                      : "bg-[var(--surface-tertiary)] text-[var(--muted)]"
                 }`}>
                   {isPast && !isCurrent ? (
                     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
@@ -701,10 +699,10 @@ export default function ReviewDetailPage() {
                     i + 1
                   )}
                 </div>
-                <span className={`text-xs font-medium capitalize ${isCurrent ? "text-blue-600 dark:text-blue-400" : isPast ? "text-green-600 dark:text-green-400" : "text-[var(--muted)]"}`}>
+                <span className={`text-xs font-medium capitalize ${isCurrent ? "text-blue-600" : isPast ? "text-green-600" : "text-[var(--muted)]"}`}>
                   {phase === "bot_reviewing" ? "Bot Review" : phase}
                 </span>
-                {i < 3 && <div className={`flex-1 h-px ${isPast ? "bg-green-400" : "bg-zinc-200 dark:bg-zinc-700"}`} />}
+                {i < 3 && <div className={`flex-1 h-px ${isPast ? "bg-green-400" : "bg-[var(--border)]"}`} />}
               </div>
             );
           })}
@@ -712,13 +710,13 @@ export default function ReviewDetailPage() {
 
         {/* Current Status Banner */}
         {(observeCurrentAction || observeCurrentUrl) && (
-          <div className="flex items-center gap-3 border-b border-[var(--border)] bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-900/10 dark:to-indigo-900/10 px-4 py-2 shrink-0">
+          <div className="flex items-center gap-3 border-b border-[var(--border)] bg-gradient-to-r from-blue-50 to-indigo-50 px-4 py-2 shrink-0">
             <div className="flex items-center gap-2 flex-1 min-w-0">
               <div className="flex h-5 w-5 items-center justify-center shrink-0">
                 <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
               </div>
               {observeCurrentAction && (
-                <span className="text-xs font-medium text-blue-700 dark:text-blue-300 truncate">
+                <span className="text-xs font-medium text-blue-700 truncate">
                   {observeCurrentAction}
                 </span>
               )}
@@ -728,20 +726,20 @@ export default function ReviewDetailPage() {
                 <svg className="h-3 w-3 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
                 </svg>
-                <span className="text-[10px] text-indigo-600 dark:text-indigo-400 truncate font-mono">
+                <span className="text-[10px] text-indigo-600 truncate font-mono">
                   {observeCurrentUrl}
                 </span>
               </div>
             )}
             {observeStepsTotal > 0 && (
               <div className="flex items-center gap-1.5 shrink-0">
-                <div className="h-1.5 w-16 rounded-full bg-blue-200 dark:bg-blue-800 overflow-hidden">
+                <div className="h-1.5 w-16 rounded-full bg-blue-200 overflow-hidden">
                   <div
                     className="h-full rounded-full bg-blue-500 transition-all duration-500"
                     style={{ width: `${Math.round((observeStepsCompleted / observeStepsTotal) * 100)}%` }}
                   />
                 </div>
-                <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 tabular-nums">
+                <span className="text-[10px] font-medium text-blue-600 tabular-nums">
                   {observeStepsCompleted}/{observeStepsTotal}
                 </span>
               </div>
@@ -774,7 +772,7 @@ export default function ReviewDetailPage() {
                 const isThinking = entry.type === "thinking";
                 const isLongReasoning = isThinking && entry.message.length > 180;
                 return (
-                  <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${isMilestone ? "ring-1 ring-amber-300 dark:ring-amber-700 " : ""}${isThinking ? "border-l-[3px] border-l-blue-400 dark:border-l-blue-500 " : ""}${config.bg}`}>
+                  <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${isMilestone ? "ring-1 ring-amber-300 " : ""}${isThinking ? "border-l-[3px] border-l-blue-400 " : ""}${config.bg}`}>
                     <div className="flex items-center gap-1.5 mb-0.5">
                       {config.icon}
                       {relTime && (
@@ -788,7 +786,7 @@ export default function ReviewDetailPage() {
                         entry.type === "bot_review" ? "text-purple-500" :
                         entry.type === "success" ? "text-green-500" :
                         entry.type === "error" ? "text-red-500" :
-                        "text-zinc-400"
+                        "text-[var(--muted-soft)]"
                       }`}>{config.label}</span>
                       {isThinking && (
                         <span className="inline-flex items-center gap-0.5 ml-1">
@@ -835,7 +833,7 @@ export default function ReviewDetailPage() {
                         <svg className="h-2.5 w-2.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
                         </svg>
-                        <span className="text-[10px] font-mono text-indigo-500 dark:text-indigo-400 truncate">{entry.url}</span>
+                        <span className="text-[10px] font-mono text-indigo-500 truncate">{entry.url}</span>
                       </div>
                     )}
                   </div>
@@ -843,7 +841,7 @@ export default function ReviewDetailPage() {
               })}
               {observeLogs.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
-                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent mb-3" />
+                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent mb-3" />
                   <p className="text-xs text-[var(--muted)]">Waiting for bot activity...</p>
                   <p className="text-[10px] text-[var(--muted)] mt-1">The bot is initializing. Activity will appear here in real time.</p>
                 </div>
@@ -854,7 +852,7 @@ export default function ReviewDetailPage() {
               <div className="border-t border-[var(--border)] p-3 shrink-0">
                 <button
                   onClick={() => setShowObserveScript((prev) => !prev)}
-                  className="w-full flex items-center justify-between rounded-md border border-[var(--border)] bg-zinc-50 dark:bg-zinc-900/50 px-2.5 py-2 text-left"
+                  className="w-full flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--background)] px-2.5 py-2 text-left"
                 >
                   <div>
                     <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
@@ -872,7 +870,7 @@ export default function ReviewDetailPage() {
                   </svg>
                 </button>
                 {showObserveScript && (
-                  <pre className="mt-2 max-h-56 overflow-y-auto rounded-md border border-[var(--border)] bg-zinc-50 dark:bg-zinc-900 p-2 text-[10px] leading-relaxed overflow-x-auto">
+                  <pre className="mt-2 max-h-56 overflow-y-auto rounded-md border border-[var(--border)] bg-[var(--background)] p-2 text-[10px] leading-relaxed overflow-x-auto">
                     {task.script}
                   </pre>
                 )}
@@ -884,8 +882,8 @@ export default function ReviewDetailPage() {
               <div className="border-t border-[var(--border)] p-3 shrink-0">
                 <div className={`rounded-lg p-3 ${
                   task.botReview.status === "passed"
-                    ? "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
-                    : "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
+                    ? "bg-green-50 border border-green-200"
+                    : "bg-red-50 border border-red-200"
                 }`}>
                   <button
                     onClick={() => setShowObserveBotReview((prev) => !prev)}
@@ -896,7 +894,7 @@ export default function ReviewDetailPage() {
                     ) : (
                       <svg className="h-4 w-4 text-red-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                     )}
-                    <span className={`text-xs font-bold ${task.botReview.status === "passed" ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                    <span className={`text-xs font-bold ${task.botReview.status === "passed" ? "text-green-700" : "text-red-700"}`}>
                       Bot Review: {task.botReview.status === "passed" ? "PASSED" : "NEEDS IMPROVEMENT"}
                     </span>
                     {typeof task.botReview.reviewCycle === "number" && typeof task.botReview.maxReviewCycles === "number" && (
@@ -916,7 +914,7 @@ export default function ReviewDetailPage() {
                   {showObserveBotReview && (
                     <>
                       {task.botReview.categories && task.botReview.categories.length > 0 && (
-                        <div className="mt-2 rounded-md border border-[var(--border)] bg-white/60 dark:bg-zinc-900/30 p-2 space-y-1">
+                        <div className="mt-2 rounded-md border border-[var(--border)] bg-[var(--surface)]/60 p-2 space-y-1">
                           {task.botReview.categories.map((category, idx) => (
                             <div key={idx} className="flex items-start gap-1.5 text-[10px]">
                               {category.passed ? (
@@ -925,7 +923,7 @@ export default function ReviewDetailPage() {
                                 <svg className="h-3 w-3 text-red-500 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" /></svg>
                               )}
                               <div className="min-w-0">
-                                <span className={`font-semibold ${category.passed ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                                <span className={`font-semibold ${category.passed ? "text-green-700" : "text-red-700"}`}>
                                   {reviewCategoryLabel(category.key)}
                                 </span>
                                 <p className="text-[var(--foreground)]">{category.detail}</p>
@@ -937,7 +935,7 @@ export default function ReviewDetailPage() {
                       {task.botReview.feedback.length > 0 && (
                         <div className="mt-2 text-[10px] space-y-0.5">
                           {task.botReview.feedback.slice(0, 3).map((fb, i) => (
-                            <p key={i} className="text-red-700 dark:text-red-300">- {fb}</p>
+                            <p key={i} className="text-red-700">- {fb}</p>
                           ))}
                         </div>
                       )}
@@ -954,10 +952,10 @@ export default function ReviewDetailPage() {
                         ))}
                       </div>
                       {task.botReview.assertionSuggestions && task.botReview.assertionSuggestions.length > 0 && (
-                        <div className="mt-2 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-900/20 p-2 space-y-1">
-                          <p className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">Assertion Suggestions</p>
+                        <div className="mt-2 rounded-md border border-amber-200 bg-amber-50/70 p-2 space-y-1">
+                          <p className="text-[10px] font-semibold text-amber-700">Assertion Suggestions</p>
                           {task.botReview.assertionSuggestions.slice(0, 2).map((s, idx) => (
-                            <div key={idx} className="text-[10px] text-amber-800 dark:text-amber-300">
+                            <div key={idx} className="text-[10px] text-amber-800">
                               <p className="font-medium">{s.step}</p>
                               <p>{s.suggestion}</p>
                             </div>
@@ -974,11 +972,11 @@ export default function ReviewDetailPage() {
           {/* Resize Handle */}
           <div
             onMouseDown={handleSplitMouseDown}
-            className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--primary)]/40 transition-colors shrink-0"
+            className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--brand-primary)]/40 transition-colors shrink-0"
           />
 
           {/* Right Panel — Live Browser Preview */}
-          <div className="flex-1 flex flex-col bg-zinc-100 dark:bg-zinc-900 min-w-0">
+          <div className="flex-1 flex flex-col bg-[var(--background)] min-w-0">
             {observeLiveStreamUrl && !observeStreamFailed ? (
               <div className="relative flex-1 flex items-center justify-center p-2 overflow-hidden">
                 <img
@@ -1003,7 +1001,7 @@ export default function ReviewDetailPage() {
             ) : observeStreamFailed ? (
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-center">
-                  <svg className="h-10 w-10 text-zinc-500 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="h-10 w-10 text-[var(--muted)] mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                   </svg>
                   <p className="text-sm text-[var(--muted)]">Browser preview unavailable</p>
@@ -1013,7 +1011,7 @@ export default function ReviewDetailPage() {
             ) : (
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-center">
-                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent mx-auto mb-3" />
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent mx-auto mb-3" />
                   <p className="text-sm text-[var(--muted)]">Connecting to browser session...</p>
                   <p className="text-xs text-[var(--muted)] mt-1">The live preview will appear once the bot starts the browser.</p>
                 </div>
@@ -1042,70 +1040,60 @@ export default function ReviewDetailPage() {
   return (
     <div className="flex-1 p-6 md:p-10 max-w-5xl mx-auto w-full">
       <AegisBackgroundIndicator />
-      {/* Breadcrumb */}
-      <Link
-        href={`/projects/${projectId}/agents/aegis`}
-        className="text-sm text-[var(--muted)] hover:text-[var(--primary)] mb-4 inline-flex items-center gap-1"
-      >
-        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-        </svg>
-        Back to Aegis
-      </Link>
-
-      {/* Header */}
-      <div className="flex items-start justify-between mb-6">
-        <div className="flex items-start gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)] mt-0.5">
-            <ShieldIcon className="h-6 w-6" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="font-mono text-xs text-[var(--muted)]">{task.testcaseExternalId}</span>
-              <StatusBadge status={task.status} />
-              {task.botReview && (
-                <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
-                  task.botReview.status === "passed"
-                    ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-                    : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
-                }`}>
-                  Bot Review: {task.botReview.status}
-                </span>
-              )}
-            </div>
-            <h1 className="text-lg font-bold text-[var(--foreground)]">{task.testcaseTitle}</h1>
-            <p className="text-xs text-[var(--muted)] mt-0.5">
+      <PageHeader
+        title={task.testcaseTitle}
+        breadcrumb={
+          <Link
+            href={`/projects/${projectId}/agents/aegis`}
+            className="inline-flex items-center gap-1 hover:text-[var(--brand-primary)]"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+            Back to Aegis
+          </Link>
+        }
+        subtitle={
+          <span className="flex flex-wrap items-center gap-2 mt-1">
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--brand-soft)] text-[var(--brand-primary)]">
+              <ShieldIcon className="h-5 w-5" />
+            </span>
+            <span className="font-mono text-xs text-[var(--muted)]">{task.testcaseExternalId}</span>
+            <StatusBadge status={task.status} />
+            {task.botReview && (
+              <StatusChip tone={task.botReview.status === "passed" ? "success" : "error"}>
+                Bot Review: {task.botReview.status}
+              </StatusChip>
+            )}
+            <span className="text-xs text-[var(--muted)]">
               Created {new Date(task.createdAt).toLocaleString()}
               {task.duration ? ` · Duration: ${(task.duration / 1000).toFixed(1)}s` : ""}
               {task.feedback.length > 0 ? ` · ${task.feedback.length} revision${task.feedback.length > 1 ? "s" : ""}` : ""}
-            </p>
-          </div>
-        </div>
-        {/* Run Preview button in header */}
-        {task.status === "pending_review" && previewStatus === "idle" && (
-          <button
-            onClick={handleRunPreview}
-            className="rounded-lg bg-[var(--primary)] px-4 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity flex items-center gap-2"
-          >
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            Run & Preview
-          </button>
-        )}
-        {previewStatus === "running" && (
-          <button
-            onClick={handleStopPreview}
-            className="rounded-lg border border-red-300 dark:border-red-700 px-4 py-2 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center gap-2"
-          >
-            <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
-              <rect x="6" y="6" width="12" height="12" rx="1" />
-            </svg>
-            Stop Preview
-          </button>
-        )}
-      </div>
+            </span>
+          </span>
+        }
+        actions={
+          <>
+            {task.status === "pending_review" && previewStatus === "idle" && (
+              <Button onClick={handleRunPreview} variant="primary" size="sm">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Run & Preview
+              </Button>
+            )}
+            {previewStatus === "running" && (
+              <Button onClick={handleStopPreview} variant="destructive" size="sm">
+                <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
+                  <rect x="6" y="6" width="12" height="12" rx="1" />
+                </svg>
+                Stop Preview
+              </Button>
+            )}
+          </>
+        }
+      />
 
       {/* Tabs */}
       <div className="flex gap-1 mb-5 border-b border-[var(--border)]">
@@ -1116,71 +1104,53 @@ export default function ReviewDetailPage() {
             disabled={!tab.available}
             className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors flex items-center gap-1.5 ${
               activeTab === tab.id
-                ? "border-[var(--primary)] text-[var(--primary)]"
+                ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
                 : tab.available
-                  ? "border-transparent text-[var(--muted)] hover:text-[var(--foreground)] hover:border-zinc-300"
-                  : "border-transparent text-zinc-300 dark:text-zinc-700 cursor-not-allowed"
+                  ? "border-transparent text-[var(--muted)] hover:text-[var(--foreground)] hover:border-[var(--border)]"
+                  : "border-transparent text-[var(--muted-soft)] cursor-not-allowed"
             }`}
           >
             {tab.label}
             {tab.badge && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-red-100 dark:bg-red-900/40 px-2 py-0.5 text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-wider">
-                <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-                {tab.badge}
-              </span>
+              <StatusChip tone="error" live>{tab.badge}</StatusChip>
             )}
           </button>
         ))}
       </div>
 
       {/* Tab Content */}
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+      <Card className="overflow-hidden">
         {activeTab === "script" && (
           <div>
             <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-2.5">
               <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Playwright Script</span>
               <div className="flex items-center gap-2">
                 {task.status === "pending_review" && previewStatus === "idle" && (
-                  <button
-                    onClick={handleRunPreview}
-                    className="rounded-lg border border-[var(--primary)] px-3 py-1 text-xs font-medium text-[var(--primary)] hover:bg-[#e8f5eb] dark:hover:bg-zinc-800 flex items-center gap-1.5"
-                  >
+                  <Button onClick={handleRunPreview} variant="secondary" size="sm" className="border-[var(--brand-primary)] text-[var(--brand-primary)]">
                     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     </svg>
                     Run & Preview
-                  </button>
+                  </Button>
                 )}
                 {task.status === "pending_review" && task.script && !isEditingScript && (
-                  <button
-                    onClick={handleStartEditScript}
-                    className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                  >
+                  <Button onClick={handleStartEditScript} variant="secondary" size="sm">
                     Edit Script
-                  </button>
+                  </Button>
                 )}
                 {task.status === "pending_review" && task.script && isEditingScript && (
                   <>
-                    <button
-                      onClick={handleCancelEditScript}
-                      className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                    >
+                    <Button onClick={handleCancelEditScript} variant="secondary" size="sm">
                       Cancel
-                    </button>
-                    <button
-                      onClick={handleSaveScript}
-                      className="rounded-lg bg-[var(--primary)] px-3 py-1 text-xs font-medium text-white hover:opacity-90"
-                    >
+                    </Button>
+                    <Button onClick={handleSaveScript} variant="primary" size="sm">
                       Save Script
-                    </button>
+                    </Button>
                   </>
                 )}
-                <button
-                  onClick={handleCopyScript}
-                  className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--primary)] hover:bg-[#e8f5eb] dark:hover:bg-zinc-800"
-                >
+                <Button onClick={handleCopyScript} variant="secondary" size="sm" className="text-[var(--brand-primary)]">
                   {copied ? "Copied!" : "Copy Script"}
-                </button>
+                </Button>
               </div>
             </div>
             {task.script ? (
@@ -1189,10 +1159,10 @@ export default function ReviewDetailPage() {
                   value={editableScript}
                   onChange={(e) => setEditableScript(e.target.value)}
                   spellCheck={false}
-                  className="w-full min-h-[500px] p-4 text-sm text-[var(--foreground)] leading-relaxed font-mono bg-zinc-50 dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/40 resize-y"
+                  className="w-full min-h-[500px] p-4 text-sm text-[var(--foreground)] leading-relaxed font-mono bg-[var(--background)] focus:outline-none focus:ring-2 focus:ring-[var(--brand-soft)] resize-y"
                 />
               ) : (
-                <pre className="p-4 text-sm text-[var(--foreground)] overflow-x-auto leading-relaxed font-mono bg-zinc-50 dark:bg-zinc-900 max-h-[500px] overflow-y-auto">
+                <pre className="p-4 text-sm text-[var(--foreground)] overflow-x-auto leading-relaxed font-mono bg-[var(--background)] max-h-[500px] overflow-y-auto">
                   {task.script}
                 </pre>
               )
@@ -1208,39 +1178,28 @@ export default function ReviewDetailPage() {
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Live Preview</span>
                 {previewStatus === "running" && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-red-100 dark:bg-red-900/40 px-2 py-0.5 text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-wider">
-                    <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-                    LIVE
-                  </span>
+                  <StatusChip tone="error" live>LIVE</StatusChip>
                 )}
                 {previewStatus === "completed" && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-green-100 dark:bg-green-900/40 px-2 py-0.5 text-[10px] font-bold text-green-600 dark:text-green-400 uppercase tracking-wider">
-                    DONE
-                  </span>
+                  <StatusChip tone="success">DONE</StatusChip>
                 )}
               </div>
               <div className="flex items-center gap-2">
                 {previewStatus === "idle" && task.status === "pending_review" && (
-                  <button
-                    onClick={handleRunPreview}
-                    className="rounded-lg bg-[var(--primary)] px-3 py-1 text-xs font-medium text-white hover:opacity-90 flex items-center gap-1.5"
-                  >
+                  <Button onClick={handleRunPreview} variant="primary" size="sm">
                     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     </svg>
                     Start Run
-                  </button>
+                  </Button>
                 )}
                 {previewStatus === "running" && (
-                  <button
-                    onClick={handleStopPreview}
-                    className="rounded-lg border border-red-300 dark:border-red-700 px-3 py-1 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
-                  >
+                  <Button onClick={handleStopPreview} variant="destructive" size="sm">
                     Stop
-                  </button>
+                  </Button>
                 )}
                 {(previewStatus === "completed" || previewStatus === "failed") && task.status === "pending_review" && (
-                  <button
+                  <Button
                     onClick={() => {
                       if (previewHighlightTimeoutRef.current) {
                         clearTimeout(previewHighlightTimeoutRef.current);
@@ -1251,20 +1210,21 @@ export default function ReviewDetailPage() {
                       setPreviewSessionId(null);
                       setPreviewLogs([]);
                     }}
-                    className="rounded-lg border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    variant="secondary"
+                    size="sm"
                   >
                     Reset
-                  </button>
+                  </Button>
                 )}
               </div>
             </div>
 
             {/* Browser viewport */}
-            <div className="bg-zinc-100 dark:bg-zinc-900 min-h-[400px] flex flex-col">
+            <div className="bg-[var(--background)] min-h-[400px] flex flex-col">
               {previewStatus === "idle" && (
                 <div className="flex-1 flex items-center justify-center p-12 min-h-[400px]">
                   <div className="text-center max-w-md">
-                    <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)] mx-auto mb-4">
+                    <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[var(--brand-soft)] text-[var(--brand-primary)] mx-auto mb-4">
                       <svg className="h-7 w-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -1276,15 +1236,12 @@ export default function ReviewDetailPage() {
                       Verify that the correct actions are being performed before approving the script.
                     </p>
                     {task.status === "pending_review" && (
-                      <button
-                        onClick={handleRunPreview}
-                        className="rounded-lg bg-[var(--primary)] px-5 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity inline-flex items-center gap-2"
-                      >
+                      <Button onClick={handleRunPreview} variant="primary">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                         </svg>
                         Run & Preview
-                      </button>
+                      </Button>
                     )}
                   </div>
                 </div>
@@ -1293,7 +1250,7 @@ export default function ReviewDetailPage() {
               {previewStatus === "starting" && (
                 <div className="flex-1 flex items-center justify-center p-12 min-h-[400px]">
                   <div className="text-center">
-                    <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent mx-auto mb-3" />
+                    <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent mx-auto mb-3" />
                     <p className="text-sm text-[var(--muted)]">Starting browser session...</p>
                   </div>
                 </div>
@@ -1302,26 +1259,26 @@ export default function ReviewDetailPage() {
               {(previewStatus === "running" || previewStatus === "completed") && (
                 <div className="flex flex-col">
                   {/* Live browser image */}
-                  <div className="relative flex items-center justify-center p-3 min-h-[350px] bg-zinc-900">
+                  <div className="relative flex items-center justify-center p-3 min-h-[350px] bg-[var(--surface-tertiary)]">
                     {liveStreamUrl && !previewStreamFailed ? (
                       <img
                         src={liveStreamUrl}
                         alt="Live browser preview"
-                        className="max-w-full max-h-[450px] object-contain rounded-lg shadow-lg border border-zinc-700"
+                        className="max-w-full max-h-[450px] object-contain rounded-lg shadow-lg border border-[var(--border)]"
                         onError={() => setPreviewStreamFailed(true)}
                       />
                     ) : previewStreamFailed ? (
                       <div className="text-center">
-                        <svg className="h-10 w-10 text-zinc-500 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="h-10 w-10 text-[var(--muted)] mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                         </svg>
-                        <p className="text-sm text-zinc-400">Browser preview unavailable</p>
-                        <p className="text-xs text-zinc-500 mt-1">The execution is still running. Check the logs below.</p>
+                        <p className="text-sm text-[var(--muted)]">Browser preview unavailable</p>
+                        <p className="text-xs text-[var(--muted)] mt-1">The execution is still running. Check the logs below.</p>
                       </div>
                     ) : (
                       <div className="text-center">
-                        <div className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent mx-auto mb-2" />
-                        <p className="text-sm text-zinc-400">Connecting to browser...</p>
+                        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--muted-soft)] border-t-transparent mx-auto mb-2" />
+                        <p className="text-sm text-[var(--muted)]">Connecting to browser...</p>
                       </div>
                     )}
                     {previewHighlight && (
@@ -1349,9 +1306,9 @@ export default function ReviewDetailPage() {
                         <div key={i} className="text-xs leading-relaxed font-mono">
                           <span className="text-[var(--muted)]">{new Date(entry.ts).toLocaleTimeString()} </span>
                           <span className={
-                            entry.type === "success" ? "text-green-600 dark:text-green-400" :
-                            entry.type === "error" ? "text-red-600 dark:text-red-400" :
-                            entry.type === "action" ? "text-[var(--primary)]" :
+                            entry.type === "success" ? "text-green-600" :
+                            entry.type === "error" ? "text-red-600" :
+                            entry.type === "action" ? "text-[var(--brand-primary)]" :
                             "text-[var(--foreground)]"
                           }>
                             {entry.message}
@@ -1372,14 +1329,14 @@ export default function ReviewDetailPage() {
                     <svg className="h-10 w-10 text-red-500 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
                     </svg>
-                    <p className="text-sm font-medium text-red-600 dark:text-red-400 mb-1">Preview run failed</p>
+                    <p className="text-sm font-medium text-[var(--error)] mb-1">Preview run failed</p>
                     {previewLogs.length > 0 && (
                       <p className="text-xs text-[var(--muted)]">
                         {previewLogs[previewLogs.length - 1].message}
                       </p>
                     )}
                     {task.status === "pending_review" && (
-                      <button
+                      <Button
                         onClick={() => {
                           if (previewHighlightTimeoutRef.current) {
                             clearTimeout(previewHighlightTimeoutRef.current);
@@ -1390,10 +1347,11 @@ export default function ReviewDetailPage() {
                           setPreviewSessionId(null);
                           setPreviewLogs([]);
                         }}
-                        className="mt-4 rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                        variant="secondary"
+                        className="mt-4"
                       >
                         Try Again
-                      </button>
+                      </Button>
                     )}
                   </div>
                 </div>
@@ -1417,27 +1375,27 @@ export default function ReviewDetailPage() {
                   const firstTs = Date.parse(task.logs[0].ts);
                   const relTime = !Number.isNaN(entryTs) && !Number.isNaN(firstTs) ? formatRelativeTime(entryTs, firstTs) : null;
                   const typeColor =
-                    entry.type === "success" ? "text-green-600 dark:text-green-400" :
-                    entry.type === "error" ? "text-red-600 dark:text-red-400" :
-                    entry.type === "action" ? "text-emerald-600 dark:text-emerald-400" :
-                    entry.type === "thinking" ? "text-blue-600 dark:text-blue-400" :
-                    entry.type === "navigation" ? "text-indigo-600 dark:text-indigo-400" :
-                    entry.type === "milestone" ? "text-amber-600 dark:text-amber-400" :
-                    entry.type === "bot_review" ? "text-purple-600 dark:text-purple-400" :
+                    entry.type === "success" ? "text-green-600" :
+                    entry.type === "error" ? "text-red-600" :
+                    entry.type === "action" ? "text-emerald-600" :
+                    entry.type === "thinking" ? "text-blue-600" :
+                    entry.type === "navigation" ? "text-indigo-600" :
+                    entry.type === "milestone" ? "text-amber-600" :
+                    entry.type === "bot_review" ? "text-purple-600" :
                     "text-[var(--foreground)]";
                   const typeBadge =
-                    entry.type === "success" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" :
-                    entry.type === "error" ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" :
-                    entry.type === "action" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" :
-                    entry.type === "thinking" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" :
-                    entry.type === "navigation" ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400" :
-                    entry.type === "milestone" ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" :
-                    entry.type === "bot_review" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
-                    "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400";
+                    entry.type === "success" ? "bg-green-100 text-green-700" :
+                    entry.type === "error" ? "bg-red-100 text-red-700" :
+                    entry.type === "action" ? "bg-emerald-100 text-emerald-700" :
+                    entry.type === "thinking" ? "bg-blue-100 text-blue-700" :
+                    entry.type === "navigation" ? "bg-indigo-100 text-indigo-700" :
+                    entry.type === "milestone" ? "bg-amber-100 text-amber-700" :
+                    entry.type === "bot_review" ? "bg-purple-100 text-purple-700" :
+                    "bg-[var(--surface-tertiary)] text-[var(--muted)]";
                   const isThinkingEntry = entry.type === "thinking";
                   const isLong = isThinkingEntry && entry.message.length > 200;
                   return (
-                    <div key={i} className={`flex items-start gap-2 text-xs leading-relaxed py-1 ${isThinkingEntry ? "border-l-2 border-l-blue-300 dark:border-l-blue-600 pl-2 bg-blue-50/40 dark:bg-blue-900/10 rounded-r-md -ml-1" : ""}`}>
+                    <div key={i} className={`flex items-start gap-2 text-xs leading-relaxed py-1 ${isThinkingEntry ? "border-l-2 border-l-blue-300 pl-2 bg-blue-50/40 rounded-r-md -ml-1" : ""}`}>
                       {relTime && (
                         <span className="text-[10px] font-mono text-[var(--muted)] w-10 text-right shrink-0 tabular-nums pt-0.5">{relTime}</span>
                       )}
@@ -1477,8 +1435,8 @@ export default function ReviewDetailPage() {
               <div className="p-4 border-b border-[var(--border)]">
                 <div className={`rounded-lg p-4 ${
                   task.botReview.status === "passed"
-                    ? "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
-                    : "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
+                    ? "bg-green-50 border border-green-200"
+                    : "bg-red-50 border border-red-200"
                 }`}>
                   <div className="flex items-center gap-2 mb-2">
                     {task.botReview.status === "passed" ? (
@@ -1486,24 +1444,24 @@ export default function ReviewDetailPage() {
                     ) : (
                       <svg className="h-5 w-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                     )}
-                    <span className={`text-sm font-bold ${task.botReview.status === "passed" ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                    <span className={`text-sm font-bold ${task.botReview.status === "passed" ? "text-green-700" : "text-red-700"}`}>
                       Bot Review: {task.botReview.status === "passed" ? "PASSED" : "NEEDS IMPROVEMENT"}
                     </span>
                     <span className="text-xs text-[var(--muted)] ml-auto">{new Date(task.botReview.reviewedAt).toLocaleString()}</span>
                   </div>
                   <div className="flex items-center gap-2 mb-3 text-xs text-[var(--muted)]">
                     <span>Script execution: {task.botReview.scriptRanSuccessfully ? "Passed" : "Failed"}</span>
-                    <span className="text-zinc-300 dark:text-zinc-600">|</span>
+                    <span className="text-[var(--border)]">|</span>
                     <span>Steps validated: {task.botReview.validatedSteps.filter(s => s.passed).length}/{task.botReview.validatedSteps.length}</span>
                     {typeof task.botReview.reviewCycle === "number" && typeof task.botReview.maxReviewCycles === "number" && (
                       <>
-                        <span className="text-zinc-300 dark:text-zinc-600">|</span>
+                        <span className="text-[var(--border)]">|</span>
                         <span>Cycle: {task.botReview.reviewCycle}/{task.botReview.maxReviewCycles}</span>
                       </>
                     )}
                   </div>
                   {task.botReview.categories && task.botReview.categories.length > 0 && (
-                    <div className="mb-3 rounded-lg border border-[var(--border)] bg-white/60 dark:bg-zinc-900/30 p-3 space-y-2">
+                    <div className="mb-3 rounded-lg border border-[var(--border)] bg-[var(--surface)]/60 p-3 space-y-2">
                       <span className="text-xs font-semibold text-[var(--muted)]">Review Categories</span>
                       {task.botReview.categories.map((category, idx) => (
                         <div key={idx} className="flex items-start gap-2 text-xs">
@@ -1513,7 +1471,7 @@ export default function ReviewDetailPage() {
                             <svg className="h-4 w-4 text-red-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                           )}
                           <div className="min-w-0">
-                            <span className={`font-semibold ${category.passed ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                            <span className={`font-semibold ${category.passed ? "text-green-700" : "text-red-700"}`}>
                               {reviewCategoryLabel(category.key)}
                             </span>
                             <p className="text-[var(--foreground)]">{category.detail}</p>
@@ -1535,7 +1493,7 @@ export default function ReviewDetailPage() {
                     ))}
                   </div>
                   {task.botReview.feedback.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-zinc-200 dark:border-zinc-700 space-y-1">
+                    <div className="mt-3 pt-3 border-t border-[var(--border)] space-y-1">
                       <span className="text-xs font-semibold text-[var(--muted)]">Bot Feedback:</span>
                       {task.botReview.feedback.map((fb, i) => (
                         <p key={i} className="text-xs text-[var(--foreground)]">{fb}</p>
@@ -1543,10 +1501,10 @@ export default function ReviewDetailPage() {
                     </div>
                   )}
                   {task.botReview.assertionSuggestions && task.botReview.assertionSuggestions.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-amber-200 dark:border-amber-800 space-y-1">
-                      <span className="text-xs font-semibold text-amber-700 dark:text-amber-400">Assertion Suggestions:</span>
+                    <div className="mt-3 pt-3 border-t border-amber-200 space-y-1">
+                      <span className="text-xs font-semibold text-amber-700">Assertion Suggestions:</span>
                       {task.botReview.assertionSuggestions.map((suggestion, idx) => (
-                        <div key={idx} className="text-xs text-[var(--foreground)] rounded border border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-900/20 p-2">
+                        <div key={idx} className="text-xs text-[var(--foreground)] rounded border border-amber-200 bg-amber-50/60 p-2">
                           <p><span className="font-semibold">Step:</span> {suggestion.step}</p>
                           <p><span className="font-semibold">Suggestion:</span> {suggestion.suggestion}</p>
                           <p className="text-[var(--muted)]"><span className="font-semibold">Why:</span> {suggestion.reason}</p>
@@ -1564,7 +1522,7 @@ export default function ReviewDetailPage() {
                 {task.feedback.map((fb) => (
                   <div key={fb.id} className="rounded-lg border border-[var(--border)] p-3">
                     <div className="flex items-center gap-2 mb-1.5">
-                      <div className="h-6 w-6 rounded-full bg-zinc-200 dark:bg-zinc-700 flex items-center justify-center">
+                      <div className="h-6 w-6 rounded-full bg-[var(--surface-tertiary)] flex items-center justify-center">
                         <svg className="h-3.5 w-3.5 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                         </svg>
@@ -1583,19 +1541,19 @@ export default function ReviewDetailPage() {
             )}
           </div>
         )}
-      </div>
+      </Card>
 
       {/* Action Bar */}
-      <div className="mt-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <Card className="mt-6 p-5">
         {actionDone && (
           <div className={`mb-4 rounded-lg p-3 text-sm font-medium ${
             actionDone === "approved"
-              ? "bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400"
+              ? "bg-green-50 text-green-700"
               : actionDone === "rejected"
-                ? "bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400"
+                ? "bg-red-50 text-red-700"
                 : actionDone === "feedback_sent"
-                  ? "bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400"
-                  : "bg-blue-50 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400"
+                  ? "bg-amber-50 text-amber-700"
+                  : "bg-blue-50 text-blue-700"
           }`}>
             {actionDone === "approved" && "Script approved and saved to the test case."}
             {actionDone === "rejected" && "Script has been rejected. The generated changes have been discarded."}
@@ -1610,31 +1568,33 @@ export default function ReviewDetailPage() {
             <h3 className="text-sm font-semibold text-[var(--foreground)] mb-3">Review Actions</h3>
             <div className="flex flex-col gap-4">
               <div className="flex gap-3 flex-wrap">
-                <button
+                <Button
                   onClick={handleApprove}
-                  className="rounded-lg bg-green-600 px-5 py-2 text-sm font-medium text-white hover:bg-green-700 transition-colors"
+                  className="bg-green-600 hover:bg-green-700"
                 >
                   Approve Script
-                </button>
-                <button
+                </Button>
+                <Button
                   onClick={() => setShowRejectConfirm(true)}
-                  className="rounded-lg border border-red-300 dark:border-red-700 px-5 py-2 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                  variant="secondary"
+                  className="border-red-300 text-red-600 hover:bg-red-50"
                 >
                   Reject Script
-                </button>
+                </Button>
                 {previewStatus === "idle" && (
-                  <button
+                  <Button
                     onClick={handleRunPreview}
-                    className="rounded-lg border border-[var(--primary)] px-4 py-2 text-sm font-medium text-[var(--primary)] hover:bg-[#e8f5eb] dark:hover:bg-zinc-800 transition-colors flex items-center gap-1.5"
+                    variant="secondary"
+                    className="border-[var(--brand-primary)] text-[var(--brand-primary)] hover:bg-[var(--brand-soft)]"
                   >
                     <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     </svg>
                     Run & Validate
-                  </button>
+                  </Button>
                 )}
                 {previewStatus === "running" && (
-                  <span className="inline-flex items-center gap-2 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-4 py-2 text-sm text-blue-700 dark:text-blue-400">
+                  <span className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm text-blue-700">
                     <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue-400 border-t-transparent" />
                     Preview running...
                   </span>
@@ -1642,38 +1602,36 @@ export default function ReviewDetailPage() {
               </div>
 
               {showRejectConfirm && (
-                <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/10 p-4">
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4">
                   <div className="flex items-start gap-3">
-                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30 shrink-0 mt-0.5">
-                      <svg className="h-4 w-4 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-red-100 shrink-0 mt-0.5">
+                      <svg className="h-4 w-4 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                       </svg>
                     </div>
                     <div className="flex-1">
-                      <h4 className="text-sm font-semibold text-red-700 dark:text-red-400 mb-1">Reject this script?</h4>
-                      <p className="text-xs text-red-600/80 dark:text-red-400/70 mb-3">
+                      <h4 className="text-sm font-semibold text-red-700 mb-1">Reject this script?</h4>
+                      <p className="text-xs text-red-600/80 mb-3">
                         The generated script will be discarded and the task will be marked as rejected. This will not trigger a re-run.
                       </p>
-                      <textarea
+                      <Textarea
                         value={rejectReason}
                         onChange={(e) => setRejectReason(e.target.value)}
                         placeholder="Reason for rejection (optional)..."
                         rows={2}
-                        className="w-full rounded-lg border border-red-200 dark:border-red-800 bg-white dark:bg-zinc-900 px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted)] focus:outline-none focus:ring-2 focus:ring-red-400/40 resize-none mb-3"
+                        className="border-red-200 bg-[var(--surface)] focus:ring-red-400/40 resize-none mb-3"
                       />
                       <div className="flex gap-2">
-                        <button
-                          onClick={handleRejectChanges}
-                          className="rounded-lg bg-red-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-red-700 transition-colors"
-                        >
+                        <Button onClick={handleRejectChanges} variant="destructive" size="sm">
                           Confirm Reject
-                        </button>
-                        <button
+                        </Button>
+                        <Button
                           onClick={() => { setShowRejectConfirm(false); setRejectReason(""); }}
-                          className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                          variant="secondary"
+                          size="sm"
                         >
                           Cancel
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   </div>
@@ -1684,44 +1642,44 @@ export default function ReviewDetailPage() {
                 <label className="text-sm font-medium text-[var(--foreground)] mb-1.5 block">
                   Provide feedback to improve
                 </label>
-                <textarea
+                <Textarea
                   value={feedbackText}
                   onChange={(e) => setFeedbackText(e.target.value)}
                   placeholder="Describe what needs to change (e.g., 'Add assertion for the success message', 'Navigate to settings page instead of dashboard')..."
                   rows={3}
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/40 resize-none"
+                  className="resize-none"
                 />
-                <button
+                <Button
                   onClick={handleReject}
                   disabled={!feedbackText.trim()}
-                  className="mt-2 rounded-lg bg-amber-600 px-5 py-2 text-sm font-medium text-white hover:bg-amber-700 transition-colors disabled:opacity-50"
+                  className="mt-2 bg-amber-600 hover:bg-amber-700"
                 >
                   Send Feedback & Re-run Aegis
-                </button>
+                </Button>
               </div>
 
-              <div className="rounded-lg border border-[var(--border)] bg-zinc-50 p-4 dark:bg-zinc-900/40">
+              <Card className="bg-[var(--background)] p-4">
                 <h4 className="text-sm font-semibold text-[var(--foreground)]">Automate by Self</h4>
                 <p className="mt-1 text-xs text-[var(--muted)]">
                   If you are not satisfied with the autonomous result, continue in AI Assisted or Manual Live mode and automate the flow yourself.
                 </p>
                 <Link
                   href={`/projects/${projectId}/testcases/${task.testcaseId}/automate`}
-                  className="mt-3 inline-flex rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                  className="mt-3 inline-flex rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors"
                 >
                   Open Automate by Self
                 </Link>
-              </div>
+              </Card>
             </div>
           </>
         )}
 
         {task.status === "approved" && (
           <div className="flex items-center gap-3">
-            <svg className="h-5 w-5 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg className="h-5 w-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            <span className="text-sm font-medium text-green-700 dark:text-green-400">
+            <span className="text-sm font-medium text-green-700">
               This script has been approved and saved to the test case.
             </span>
           </div>
@@ -1730,10 +1688,10 @@ export default function ReviewDetailPage() {
         {task.status === "rejected" && (
           <div>
             <div className="flex items-center gap-3 mb-3">
-              <svg className="h-5 w-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="h-5 w-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
-              <span className="text-sm font-medium text-red-700 dark:text-red-400">
+              <span className="text-sm font-medium text-red-700">
                 This script has been rejected. The generated changes were discarded.
               </span>
             </div>
@@ -1742,38 +1700,32 @@ export default function ReviewDetailPage() {
                 Reason: {task.feedback[task.feedback.length - 1].message}
               </p>
             )}
-            <button
-              onClick={handleRequeue}
-              className="rounded-lg bg-[var(--primary)] px-5 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity"
-            >
+            <Button onClick={handleRequeue} variant="primary">
               Re-run Aegis
-            </button>
+            </Button>
           </div>
         )}
 
         {task.status === "needs_revision" && (
           <div>
             <div className="flex items-center gap-3 mb-3">
-              <svg className="h-5 w-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="h-5 w-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
               </svg>
-              <span className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              <span className="text-sm font-medium text-amber-700">
                 Revision requested. Aegis will re-run this task automatically.
               </span>
             </div>
-            <button
-              onClick={handleRequeue}
-              className="rounded-lg bg-[var(--primary)] px-5 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity"
-            >
+            <Button onClick={handleRequeue} variant="primary">
               Re-run Now
-            </button>
+            </Button>
           </div>
         )}
 
         {(task.status === "queued" || task.status === "in_progress") && (
           <div className="flex items-center gap-3">
             <span className="h-5 w-5 flex items-center justify-center">
-              <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent" />
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
             </span>
             <span className="text-sm font-medium text-[var(--foreground)]">
               {task.status === "queued" ? "This task is queued for the agent to process." : "Aegis is working on this task in the background."}
@@ -1781,19 +1733,21 @@ export default function ReviewDetailPage() {
           </div>
         )}
 
-        <div className="mt-6 rounded-lg border border-red-200 bg-red-50/70 p-4 dark:border-red-800 dark:bg-red-900/10">
-          <h4 className="text-sm font-semibold text-red-700 dark:text-red-400">Danger Zone</h4>
-          <p className="mt-1 text-xs text-red-700/80 dark:text-red-300/80">
+        <div className="mt-6 rounded-lg border border-red-200 bg-red-50/70 p-4">
+          <h4 className="text-sm font-semibold text-red-700">Danger Zone</h4>
+          <p className="mt-1 text-xs text-red-700/80">
             Delete this review task permanently. This action cannot be undone.
           </p>
-          <button
+          <Button
             onClick={handleDeleteTask}
-            className="mt-3 rounded-lg border border-red-300 bg-white px-4 py-2 text-xs font-medium text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-zinc-900 dark:text-red-400 dark:hover:bg-red-900/20 transition-colors"
+            variant="secondary"
+            size="sm"
+            className="mt-3 border-red-300 text-red-600 hover:bg-red-100"
           >
             Delete Task
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
     </div>
   );
 }

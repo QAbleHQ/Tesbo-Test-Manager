@@ -11,6 +11,8 @@ import {
   listPlans,
   listCycles,
 } from "@/lib/api";
+import { Card } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function ProjectDashboardPage() {
   const params = useParams();
@@ -57,7 +59,7 @@ export default function ProjectDashboardPage() {
   if (loading || !project) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
@@ -67,57 +69,43 @@ export default function ProjectDashboardPage() {
   const description = (project.description as string) ?? "";
 
   return (
-    <main className="max-w-3xl mx-auto px-4 py-8">
-      <div className="mb-6">
-        <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
-          <Link href="/projects" className="hover:text-zinc-700 dark:hover:text-zinc-300">
-            Projects
-          </Link>
-          <span>/</span>
-          <span className="text-zinc-900 dark:text-zinc-100">{name}</span>
-        </div>
-        <h1 className="mt-1 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-          Dashboard
-        </h1>
-        <p className="mt-1 font-mono text-sm text-zinc-500 dark:text-zinc-400">
-          {key}
-        </p>
-      </div>
-
-      {description ? (
-        <p className="mb-8 text-zinc-600 dark:text-zinc-300">{description}</p>
-      ) : null}
+    <StandardPageLayout
+      header={(
+        <PageHeader
+          title="Dashboard"
+          subtitle={description || undefined}
+          breadcrumb={(
+            <div className="flex items-center gap-2">
+              <Link href="/projects" className="hover:text-[var(--foreground)]">Projects</Link>
+              <span>/</span>
+              <span className="text-[var(--foreground)]">{name}</span>
+            </div>
+          )}
+        />
+      )}
+    >
+      <p className="mb-4 font-mono text-sm text-[var(--muted)]">{key}</p>
 
       {stats ? (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {stats.testCaseCount}
-            </p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              Test cases
-            </p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {stats.suiteCount}
-            </p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Suites</p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {stats.planCount}
-            </p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Plans</p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-              {stats.cycleCount}
-            </p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Cycles</p>
-          </div>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{stats.testCaseCount}</p>
+            <p className="text-sm text-[var(--muted)]">Test cases</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{stats.suiteCount}</p>
+            <p className="text-sm text-[var(--muted)]">Suites</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{stats.planCount}</p>
+            <p className="text-sm text-[var(--muted)]">Plans</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{stats.cycleCount}</p>
+            <p className="text-sm text-[var(--muted)]">Cycles</p>
+          </Card>
         </div>
       ) : null}
-    </main>
+    </StandardPageLayout>
   );
 }

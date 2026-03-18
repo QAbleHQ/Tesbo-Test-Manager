@@ -60,29 +60,29 @@ function StatusIcon({ status }: { status: QueueItemStatus }) {
   switch (status) {
     case "pending":
       return (
-        <span className="flex h-5 w-5 items-center justify-center rounded-full border-2 border-zinc-300 dark:border-zinc-600" />
+        <span className="flex h-5 w-5 items-center justify-center rounded-full border-2 border-[var(--border)]" />
       );
     case "in_progress":
       return (
         <span className="flex h-5 w-5 items-center justify-center">
-          <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent" />
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
         </span>
       );
     case "completed":
       return (
-        <svg className="h-5 w-5 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="h-5 w-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
       );
     case "failed":
       return (
-        <svg className="h-5 w-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="h-5 w-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
       );
     case "cancelled":
       return (
-        <svg className="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="h-5 w-5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728L5.636 5.636" />
         </svg>
       );
@@ -909,13 +909,13 @@ export default function AegisAgentPage() {
         <AegisBackgroundIndicator />
         {/* Header */}
         <div className="mb-6">
-          <Link href={`/projects/${projectId}/agents`} className="text-sm text-[var(--muted)] hover:text-[var(--primary)] mb-2 inline-flex items-center gap-1">
+          <Link href={`/projects/${projectId}/agents`} className="text-sm text-[var(--muted)] hover:text-[var(--brand-primary)] mb-2 inline-flex items-center gap-1">
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
             Agents
           </Link>
           <div className="flex items-center justify-between mt-1">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)]">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[var(--brand-soft)] text-[var(--brand-primary)]">
                 <ShieldIcon className="h-6 w-6" />
               </div>
               <div>
@@ -925,7 +925,7 @@ export default function AegisAgentPage() {
             </div>
             <Link
               href={`/projects/${projectId}/agents/aegis/settings`}
-              className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors flex items-center gap-1.5"
+              className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors flex items-center gap-1.5"
             >
               <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -944,8 +944,8 @@ export default function AegisAgentPage() {
               onClick={() => setActiveTab(tab.id)}
               className={`relative px-4 py-2.5 text-sm font-medium border-b-2 transition-colors flex items-center gap-1.5 ${
                 activeTab === tab.id
-                  ? "border-[var(--primary)] text-[var(--primary)]"
-                  : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)] hover:border-zinc-300"
+                  ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
+                  : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)] hover:border-[var(--border)]"
               }`}
             >
               {tab.id === "in_progress" && tab.pulse && (
@@ -958,12 +958,12 @@ export default function AegisAgentPage() {
               {tab.count > 0 && (
                 <span className={`ml-1 inline-flex items-center justify-center rounded-full px-1.5 py-0.5 text-xs ${
                   activeTab === tab.id
-                    ? "bg-[var(--primary)]/10 text-[var(--primary)]"
+                    ? "bg-[var(--brand-primary)]/10 text-[var(--brand-primary)]"
                     : tab.id === "in_progress" && tab.count > 0
-                      ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
+                      ? "bg-blue-100 text-blue-700"
                       : tab.id === "in_review" && tab.count > 0
-                        ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                        : "bg-zinc-100 dark:bg-zinc-800 text-[var(--muted)]"
+                        ? "bg-amber-100 text-amber-700"
+                        : "bg-[var(--surface-secondary)] text-[var(--muted)]"
                 }`}>
                   {tab.count}
                 </span>
@@ -976,14 +976,14 @@ export default function AegisAgentPage() {
         {activeTab === "queue" && (
           <>
             {noEnvConfigured && (
-              <div className="mb-4 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-3">
+              <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
                 <div className="flex items-start gap-2">
-                  <svg className="h-5 w-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="h-5 w-5 text-amber-600 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
                   </svg>
                   <div>
-                    <p className="text-sm font-medium text-amber-800 dark:text-amber-300">No default environment configured</p>
-                    <p className="text-xs text-amber-700 dark:text-amber-400 mt-0.5">
+                    <p className="text-sm font-medium text-amber-800">No default environment configured</p>
+                    <p className="text-xs text-amber-700 mt-0.5">
                       Configure an environment in{" "}
                       <Link href={`/projects/${projectId}/agents/aegis/settings`} className="underline font-medium">
                         Aegis Settings
@@ -1001,7 +1001,7 @@ export default function AegisAgentPage() {
 
             {queuedTasks.length === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
-                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800 mx-auto mb-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--surface-secondary)] mx-auto mb-3">
                   <svg className="h-6 w-6 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                   </svg>
@@ -1016,10 +1016,10 @@ export default function AegisAgentPage() {
               <div className="space-y-2">
                 {queuedTasks.map((task) => {
                   const sourceConfig: Record<string, { label: string; cls: string; icon: string }> = {
-                    ready_for_automation: { label: "Ready for Automation", cls: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400", icon: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" },
-                    revision: { label: "Revision", cls: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400", icon: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" },
-                    manual: { label: "Manually Queued", cls: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400", icon: "M12 6v6m0 0v6m0-6h6m-6 0H6" },
-                    failed_fix: { label: "Failed — Fix Script", cls: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400", icon: "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" },
+                    ready_for_automation: { label: "Ready for Automation", cls: "bg-green-100 text-green-700", icon: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" },
+                    revision: { label: "Revision", cls: "bg-amber-100 text-amber-700", icon: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" },
+                    manual: { label: "Manually Queued", cls: "bg-blue-100 text-blue-700", icon: "M12 6v6m0 0v6m0-6h6m-6 0H6" },
+                    failed_fix: { label: "Failed — Fix Script", cls: "bg-red-100 text-red-700", icon: "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" },
                   };
                   const source = sourceConfig[task.queueSource || "manual"] || sourceConfig.manual;
                   return (
@@ -1028,8 +1028,8 @@ export default function AegisAgentPage() {
                       className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4"
                     >
                       <div className="shrink-0">
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800">
-                          <svg className="h-5 w-5 text-zinc-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-[var(--surface-secondary)]">
+                          <svg className="h-5 w-5 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                         </div>
@@ -1065,7 +1065,7 @@ export default function AegisAgentPage() {
           <>
             {inProgressCount === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
-                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800 mx-auto mb-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--surface-secondary)] mx-auto mb-3">
                   <svg className="h-6 w-6 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                   </svg>
@@ -1082,10 +1082,10 @@ export default function AegisAgentPage() {
                   <Link
                     key={`bg-${run.testcaseId}`}
                     href={`/projects/${projectId}/agents/aegis/reviews/${run.taskId}`}
-                    className="flex items-center gap-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-900/10 p-4 transition-all hover:border-blue-400 hover:shadow-sm group cursor-pointer"
+                    className="flex items-center gap-4 rounded-xl border border-blue-200 bg-blue-50/50 p-4 transition-all hover:border-blue-400 hover:shadow-sm group cursor-pointer"
                   >
                     <div className="shrink-0">
-                      <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-100 dark:bg-blue-900/30">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-100">
                         <span className="h-5 w-5 flex items-center justify-center">
                           <span className="h-4 w-4 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
                         </span>
@@ -1093,7 +1093,7 @@ export default function AegisAgentPage() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-0.5">
-                        <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 dark:bg-blue-900/30 px-2 py-0.5 text-xs font-medium text-blue-700 dark:text-blue-400">
+                        <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
                           <span className="relative flex h-1.5 w-1.5">
                             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
                             <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-500" />
@@ -1101,22 +1101,22 @@ export default function AegisAgentPage() {
                           {run.phase === "bot_reviewing" ? "Bot Reviewing" : "Running"}
                         </span>
                       </div>
-                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--primary)] truncate">
+                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--brand-primary)] truncate">
                         {run.title}
                       </div>
-                      <div className="text-xs text-blue-600 dark:text-blue-400 mt-0.5">
+                      <div className="text-xs text-blue-600 mt-0.5">
                         Click to observe bot activity and live preview
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 dark:bg-blue-900/30 px-2.5 py-1 text-xs text-blue-600 dark:text-blue-400 font-medium">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2.5 py-1 text-xs text-blue-600 font-medium">
                         <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
                         </svg>
                         Observe
                       </span>
-                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--brand-primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                       </svg>
                     </div>
@@ -1130,11 +1130,11 @@ export default function AegisAgentPage() {
                     <Link
                       key={task.id}
                       href={`/projects/${projectId}/agents/aegis/reviews/${task.id}`}
-                      className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--primary)] hover:shadow-sm group"
+                      className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--brand-primary)] hover:shadow-sm group"
                     >
                       <div className="shrink-0">
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-100 dark:bg-blue-900/30">
-                          <svg className="h-5 w-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-100">
+                          <svg className="h-5 w-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                         </div>
@@ -1142,7 +1142,7 @@ export default function AegisAgentPage() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-0.5">
                           <span className="font-mono text-xs text-[var(--muted)]">{task.testcaseExternalId}</span>
-                          <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                          <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-700">
                             {task.status === "queued" ? "Queued" : task.status === "bot_reviewing" ? "Bot Reviewing" : "In Progress"}
                           </span>
                           {task.feedback.length > 0 && (
@@ -1151,14 +1151,14 @@ export default function AegisAgentPage() {
                             </span>
                           )}
                         </div>
-                        <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--primary)] truncate">
+                        <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--brand-primary)] truncate">
                           {task.testcaseTitle}
                         </div>
                         <div className="text-xs text-[var(--muted)] mt-0.5">
                           Started {new Date(task.updatedAt || task.createdAt).toLocaleString()}
                         </div>
                       </div>
-                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--primary)] transition-colors shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--brand-primary)] transition-colors shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                       </svg>
                     </Link>
@@ -1173,7 +1173,7 @@ export default function AegisAgentPage() {
           <>
             {inReviewTasks.length === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
-                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800 mx-auto mb-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--surface-secondary)] mx-auto mb-3">
                   <svg className="h-6 w-6 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                   </svg>
@@ -1189,18 +1189,18 @@ export default function AegisAgentPage() {
                   <Link
                     key={task.id}
                     href={`/projects/${projectId}/agents/aegis/reviews/${task.id}`}
-                    className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--primary)] hover:shadow-sm group"
+                    className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--brand-primary)] hover:shadow-sm group"
                   >
                     <div className="shrink-0">
                       {task.status === "pending_review" ? (
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-900/30">
-                          <svg className="h-5 w-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-amber-100">
+                          <svg className="h-5 w-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                         </div>
                       ) : (
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
-                          <svg className="h-5 w-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-red-100">
+                          <svg className="h-5 w-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
                           </svg>
                         </div>
@@ -1211,8 +1211,8 @@ export default function AegisAgentPage() {
                         <span className="font-mono text-xs text-[var(--muted)]">{task.testcaseExternalId}</span>
                         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
                           task.status === "pending_review"
-                            ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                            : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                            ? "bg-amber-100 text-amber-700"
+                            : "bg-red-100 text-red-700"
                         }`}>
                           {task.status === "pending_review" ? "Pending Review" : "Needs Revision"}
                         </span>
@@ -1222,7 +1222,7 @@ export default function AegisAgentPage() {
                           </span>
                         )}
                       </div>
-                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--primary)] truncate">
+                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--brand-primary)] truncate">
                         {task.testcaseTitle}
                       </div>
                       <div className="text-xs text-[var(--muted)] mt-0.5">
@@ -1234,14 +1234,14 @@ export default function AegisAgentPage() {
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       {task.script && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 dark:bg-zinc-800 px-2.5 py-1 text-xs text-[var(--muted)]">
+                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--surface-secondary)] px-2.5 py-1 text-xs text-[var(--muted)]">
                           <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                           </svg>
                           Script
                         </span>
                       )}
-                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--brand-primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                       </svg>
                     </div>
@@ -1257,7 +1257,7 @@ export default function AegisAgentPage() {
           <>
             {completedTasks.length === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
-                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800 mx-auto mb-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--surface-secondary)] mx-auto mb-3">
                   <svg className="h-6 w-6 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
@@ -1273,18 +1273,18 @@ export default function AegisAgentPage() {
                   <Link
                     key={task.id}
                     href={`/projects/${projectId}/agents/aegis/reviews/${task.id}`}
-                    className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--primary)] hover:shadow-sm group"
+                    className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 transition-all hover:border-[var(--brand-primary)] hover:shadow-sm group"
                   >
                     <div className="shrink-0">
                       {task.status === "approved" ? (
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-green-100 dark:bg-green-900/30">
-                          <svg className="h-5 w-5 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-green-100">
+                          <svg className="h-5 w-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                         </div>
                       ) : (
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
-                          <svg className="h-5 w-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-red-100">
+                          <svg className="h-5 w-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                         </div>
@@ -1295,13 +1295,13 @@ export default function AegisAgentPage() {
                         <span className="font-mono text-xs text-[var(--muted)]">{task.testcaseExternalId}</span>
                         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
                           task.status === "approved"
-                            ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-                            : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                            ? "bg-green-100 text-green-700"
+                            : "bg-red-100 text-red-700"
                         }`}>
                           {task.status === "approved" ? "Approved" : "Rejected"}
                         </span>
                       </div>
-                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--primary)] truncate">
+                      <div className="text-sm font-medium text-[var(--foreground)] group-hover:text-[var(--brand-primary)] truncate">
                         {task.testcaseTitle}
                       </div>
                       <div className="text-xs text-[var(--muted)] mt-0.5">
@@ -1313,7 +1313,7 @@ export default function AegisAgentPage() {
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       {task.status === "approved" && task.script && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-green-50 dark:bg-green-900/20 px-2.5 py-1 text-xs text-green-700 dark:text-green-400">
+                        <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2.5 py-1 text-xs text-green-700">
                           <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                           </svg>
@@ -1321,14 +1321,14 @@ export default function AegisAgentPage() {
                         </span>
                       )}
                       {task.status === "rejected" && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-red-50 dark:bg-red-900/20 px-2.5 py-1 text-xs text-red-700 dark:text-red-400">
+                        <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2.5 py-1 text-xs text-red-700">
                           <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                           </svg>
                           Discarded
                         </span>
                       )}
-                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5 text-[var(--muted)] group-hover:text-[var(--brand-primary)] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                       </svg>
                     </div>
@@ -1352,7 +1352,7 @@ export default function AegisAgentPage() {
       {/* Top Bar */}
       <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 shrink-0">
         <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)]">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--brand-soft)] text-[var(--brand-primary)]">
             <ShieldIcon className="h-5 w-5" />
           </div>
           <div>
@@ -1371,7 +1371,7 @@ export default function AegisAgentPage() {
             <button
               onClick={handleStop}
               disabled={stopping}
-              className="rounded-lg border border-red-300 dark:border-red-700 px-4 py-1.5 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+              className="rounded-lg border border-red-300 px-4 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
             >
               {stopping ? "Stopping..." : "Stop Agent"}
             </button>
@@ -1380,13 +1380,13 @@ export default function AegisAgentPage() {
             <>
               <button
                 onClick={() => { setPhase("select"); setQueue([]); setLog([]); setActiveTab("in_review"); setPastTasks(getStoredAgentTasks(projectId, "aegis")); }}
-                className="rounded-lg bg-[var(--primary)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
+                className="rounded-lg bg-[var(--brand-primary)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
               >
                 Review Tasks ({inReviewCount})
               </button>
               <button
                 onClick={() => { setPhase("select"); setQueue([]); setLog([]); setActiveTab("queue"); }}
-                className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
               >
                 New Run
               </button>
@@ -1394,7 +1394,7 @@ export default function AegisAgentPage() {
           )}
           <Link
             href={`/projects/${projectId}/agents`}
-            className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm text-[var(--muted)] hover:bg-zinc-50 dark:hover:bg-zinc-800"
+            className="rounded-lg border border-[var(--border)] px-4 py-1.5 text-sm text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
           >
             Close
           </Link>
@@ -1402,9 +1402,9 @@ export default function AegisAgentPage() {
       </div>
 
       {/* Progress Bar */}
-      <div className="h-1 bg-zinc-100 dark:bg-zinc-800 shrink-0">
+      <div className="h-1 bg-[var(--surface-secondary)] shrink-0">
         <div
-          className={`h-full transition-all duration-500 ${failedCount > 0 && completedCount === 0 ? "bg-red-500" : "bg-[var(--primary)]"}`}
+          className={`h-full transition-all duration-500 ${failedCount > 0 && completedCount === 0 ? "bg-red-500" : "bg-[var(--brand-primary)]"}`}
           style={{ width: `${progressPercent}%` }}
         />
       </div>
@@ -1423,8 +1423,8 @@ export default function AegisAgentPage() {
                 key={item.testcaseId}
                 className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors ${
                   item.testcaseId === activeTestcaseId
-                    ? "bg-[#e8f5eb] dark:bg-zinc-800 ring-1 ring-[var(--primary)]/30"
-                    : "hover:bg-zinc-50 dark:hover:bg-zinc-800/30"
+                    ? "bg-[var(--brand-soft)] ring-1 ring-[var(--brand-primary)]/30"
+                    : "hover:bg-[var(--surface-secondary)]"
                 }`}
               >
                 <StatusIcon status={item.status} />
@@ -1453,9 +1453,9 @@ export default function AegisAgentPage() {
                 <div key={i} className="text-xs leading-relaxed">
                   <span className="text-[var(--muted)]">{new Date(entry.ts).toLocaleTimeString()} </span>
                   <span className={
-                    entry.type === "success" ? "text-green-600 dark:text-green-400" :
-                    entry.type === "error" ? "text-red-600 dark:text-red-400" :
-                    entry.type === "action" ? "text-[var(--primary)]" :
+                    entry.type === "success" ? "text-green-600" :
+                    entry.type === "error" ? "text-red-600" :
+                    entry.type === "action" ? "text-[var(--brand-primary)]" :
                     "text-[var(--foreground)]"
                   }>
                     {entry.message}
@@ -1472,15 +1472,15 @@ export default function AegisAgentPage() {
         {/* Resize Handle */}
         <div
           onMouseDown={handleSplitMouseDown}
-          className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--primary)]/40 transition-colors shrink-0"
+          className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--brand-primary)]/40 transition-colors shrink-0"
         />
 
         {/* Right Panel - Browser Preview */}
-        <div className="flex-1 flex flex-col bg-zinc-100 dark:bg-zinc-900 min-w-0">
+        <div className="flex-1 flex flex-col bg-[var(--surface-secondary)] min-w-0">
           {phase === "results" ? (
             <div className="flex-1 flex items-center justify-center p-8">
               <div className="max-w-lg w-full text-center">
-                <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)] mx-auto mb-4">
+                <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[var(--brand-soft)] text-[var(--brand-primary)] mx-auto mb-4">
                   <ShieldIcon className="h-9 w-9" />
                 </div>
                 <h2 className="text-xl font-bold text-[var(--foreground)] mb-1">Run Complete</h2>
@@ -1488,7 +1488,7 @@ export default function AegisAgentPage() {
                   {completedCount} of {queue.length} test case{queue.length > 1 ? "s" : ""} automated
                   {failedCount > 0 ? ` (${failedCount} failed)` : ""}.
                 </p>
-                <p className="text-sm text-amber-600 dark:text-amber-400 font-medium mb-6">
+                <p className="text-sm text-amber-600 font-medium mb-6">
                   {completedCount > 0 ? `${completedCount} review task${completedCount > 1 ? "s" : ""} created. Please review the generated scripts.` : ""}
                 </p>
                 <div className="space-y-2 text-left mb-6">
@@ -1502,10 +1502,10 @@ export default function AegisAgentPage() {
                           {item.endedAt && item.startedAt ? ` · ${((item.endedAt - item.startedAt) / 1000).toFixed(1)}s` : ""}
                         </div>
                         {item.status === "failed" && item.error && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">{item.error}</div>
+                          <div className="text-xs text-red-600 mt-1">{item.error}</div>
                         )}
                         {item.status === "completed" && (
-                          <div className="text-xs text-amber-600 dark:text-amber-400 mt-1">Pending review</div>
+                          <div className="text-xs text-amber-600 mt-1">Pending review</div>
                         )}
                       </div>
                     </div>
@@ -1513,7 +1513,7 @@ export default function AegisAgentPage() {
                 </div>
                 <button
                   onClick={() => { setPhase("select"); setQueue([]); setLog([]); setActiveTab("in_review"); setPastTasks(getStoredAgentTasks(projectId, "aegis")); }}
-                  className="inline-flex items-center gap-2 rounded-lg bg-[var(--primary)] px-5 py-2.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
+                  className="inline-flex items-center gap-2 rounded-lg bg-[var(--brand-primary)] px-5 py-2.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
                 >
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
@@ -1534,7 +1534,7 @@ export default function AegisAgentPage() {
           ) : (
             <div className="flex-1 flex items-center justify-center">
               <div className="text-center">
-                <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent mx-auto mb-3" />
+                <div className="h-10 w-10 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent mx-auto mb-3" />
                 <p className="text-sm text-[var(--muted)]">
                   {liveStreamFailed ? "Browser preview unavailable" : "Connecting to browser..."}
                 </p>

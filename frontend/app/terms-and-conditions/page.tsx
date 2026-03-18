@@ -8,14 +8,14 @@ export const metadata: Metadata = {
 
 export default function TermsAndConditionsPage() {
   return (
-    <main className="min-h-screen bg-[var(--background)] dark:bg-zinc-950 text-[var(--foreground)] dark:text-zinc-100">
+    <main className="min-h-screen bg-[var(--background)] text-[var(--foreground)]">
       <div className="mx-auto max-w-3xl px-6 py-10">
         <h1 className="text-3xl font-semibold">Terms and Conditions</h1>
-        <p className="mt-2 text-sm text-[var(--muted)] dark:text-zinc-400">Last updated: February 23, 2026</p>
+        <p className="mt-2 text-sm text-[var(--muted)]">Last updated: February 23, 2026</p>
 
-        <div className="mt-8 space-y-6 text-sm leading-7 text-zinc-700 dark:text-zinc-300">
+        <div className="mt-8 space-y-6 text-sm leading-7 text-[var(--muted)]">
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">1. Acceptance</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">1. Acceptance</h2>
             <p className="mt-2">
               By using TesboX, you agree to these Terms and Conditions. If you do not agree, do not use the
               service.
@@ -23,7 +23,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">2. Service Overview</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">2. Service Overview</h2>
             <p className="mt-2">
               TesboX is a test management and collaboration platform that includes project workspaces, test case
               management, planning and execution workflows, reporting, optional AI-assisted features, and Jira
@@ -32,7 +32,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">3. Accounts</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">3. Accounts</h2>
             <p className="mt-2">
               You are responsible for maintaining the confidentiality of your account access and for all activity under
               your account. You must provide accurate information and use the service in compliance with applicable
@@ -41,7 +41,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               4. Customer Data and Ownership
             </h2>
             <p className="mt-2">
@@ -52,7 +52,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">5. Jira Integration</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">5. Jira Integration</h2>
             <p className="mt-2">
               If you connect Jira, you authorize TesboX to access and process Jira data that you permit through
               Atlassian OAuth. You are responsible for ensuring your use of integration features complies with your
@@ -61,7 +61,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">6. Acceptable Use</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">6. Acceptable Use</h2>
             <ul className="mt-2 list-disc pl-5 space-y-1">
               <li>Do not use the service for unlawful, harmful, or abusive activities.</li>
               <li>Do not attempt to disrupt, probe, or bypass service security controls.</li>
@@ -71,7 +71,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               7. Availability and Changes
             </h2>
             <p className="mt-2">
@@ -81,7 +81,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">8. Disclaimers</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">8. Disclaimers</h2>
             <p className="mt-2">
               TesboX is provided on an &quot;as is&quot; and &quot;as available&quot; basis to the fullest extent permitted by
               law. We disclaim all implied warranties, including merchantability, fitness for a particular purpose, and
@@ -90,7 +90,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               9. Limitation of Liability
             </h2>
             <p className="mt-2">
@@ -100,7 +100,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">10. Termination</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">10. Termination</h2>
             <p className="mt-2">
               We may suspend or terminate access for violations of these terms or security concerns. You may stop using
               the service at any time.
@@ -108,7 +108,7 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">11. Updates to Terms</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">11. Updates to Terms</h2>
             <p className="mt-2">
               We may update these terms periodically. Continued use of TesboX after updates means you accept the
               revised terms.
@@ -116,10 +116,10 @@ export default function TermsAndConditionsPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">12. Contact</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">12. Contact</h2>
             <p className="mt-2">
               For legal or terms-related questions, contact{" "}
-              <a href="mailto:support@bettercases.ai" className="text-blue-600 dark:text-blue-400 hover:underline">
+              <a href="mailto:support@bettercases.ai" className="text-[var(--brand-primary)] hover:underline">
                 support@bettercases.ai
               </a>
               .
@@ -128,7 +128,7 @@ export default function TermsAndConditionsPage() {
         </div>
 
         <div className="mt-10 text-sm">
-          <Link href="/privacy-policy" className="text-blue-600 dark:text-blue-400 hover:underline">
+          <Link href="/privacy-policy" className="text-[var(--brand-primary)] hover:underline">
             View Privacy Policy
           </Link>
         </div>

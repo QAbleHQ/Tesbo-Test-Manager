@@ -8,7 +8,9 @@ export default function AppLayout({
   return (
     <div className="flex min-h-screen bg-[var(--background)]">
       <Sidebar />
-      <div className="flex-1 min-w-0">{children}</div>
+      <main className="flex-1 min-w-0 overflow-y-auto">
+        <div className="tesbo-page">{children}</div>
+      </main>
     </div>
   );
 }

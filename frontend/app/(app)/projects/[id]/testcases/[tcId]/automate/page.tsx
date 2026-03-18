@@ -23,6 +23,7 @@ import {
   type RecordingSummary,
   type ReasoningEntry,
 } from "@/lib/api";
+import { Button, Input, Select, Modal, Field, FieldLabel } from "@/components/ui";
 
 type ChatMessage = {
   role: "user" | "assistant" | "recording" | "reasoning";
@@ -1983,19 +1984,19 @@ Stop when pass/fail outcome is clear and summarize results.`;
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center justify-between">
+    <div className="min-h-screen bg-[var(--background)]">
+      <header className="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Link href={`/projects/${projectId}/testcases/${testcaseId}`} className="text-sm text-blue-600 hover:underline">
+          <Link href={`/projects/${projectId}/testcases/${testcaseId}`} className="text-sm text-[var(--brand-primary)] hover:underline">
             Back to Test Case
           </Link>
-          <span className="text-zinc-400">/</span>
-          <h1 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automate: {testcaseTitle}</h1>
+          <span className="text-[var(--muted-soft)]">/</span>
+          <h1 className="text-sm font-semibold text-[var(--foreground)]">Automate: {testcaseTitle}</h1>
         </div>
         <div className="flex items-center gap-2">
-          <span className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700">{streamState}</span>
+          <span className="rounded-[10px] border border-[var(--border)] px-2 py-1 text-xs text-[var(--foreground)]">{streamState}</span>
           {recordingSummary && recordingSummary.state === "recording" && (
-            <span className="flex items-center gap-1.5 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs font-medium text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-300">
+            <span className="flex items-center gap-1.5 rounded-[10px] border border-[var(--error)]/30 bg-red-50 px-2 py-1 text-xs font-medium text-[var(--error)]">
               <span className="relative flex h-2 w-2">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-500 opacity-75" />
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-red-600" />
@@ -2004,55 +2005,55 @@ Stop when pass/fail outcome is clear and summarize results.`;
             </span>
           )}
           {recordingSummary && recordingSummary.state === "stopped" && (
-            <span className="rounded border border-zinc-400 bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+            <span className="rounded-[10px] border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-xs font-medium text-[var(--muted)]">
               REC Done ({recordingSummary.compiledActionCount})
             </span>
           )}
-          <div className="flex items-center rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300">
+          <div className="flex items-center rounded-[10px] border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">
             AI Assisted Chat
           </div>
-          <button
-            type="button"
+          <Button
+            variant="primary"
+            size="sm"
             onClick={onOpenFinalizeReview}
             disabled={!sessionId || finalizing || streamState === "Disconnected"}
-            className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
           >
             {finalizing ? "Saving..." : "Save Script"}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={onCancelSession}
-            className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-700"
           >
             Cancel
-          </button>
+          </Button>
         </div>
       </header>
 
       <main className="p-3 lg:p-2">
         <div
           ref={splitPaneRef}
-          className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white lg:h-[calc(100vh-96px)] lg:flex-row-reverse lg:[direction:ltr] dark:border-zinc-700 dark:bg-zinc-900"
+          className="flex flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] lg:h-[calc(100vh-96px)] lg:flex-row-reverse lg:[direction:ltr]"
         >
         <section
           className="flex min-h-[320px] flex-col p-2.5"
           style={desktopSplitEnabled ? { width: `${chatPaneRatio}%` } : undefined}
         >
           <div className="mb-2 flex items-center justify-between gap-2 px-1">
-            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Automation Assistant</h2>
+            <h2 className="text-sm font-semibold text-[var(--foreground)]">Automation Assistant</h2>
           </div>
           {!aiConfigured && (
-            <p className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
+            <p className="mb-2 rounded-lg border border-[var(--warning)]/30 bg-amber-50 px-2 py-1 text-xs text-amber-800">
               {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable chat-driven AI commands.`}
             </p>
           )}
           <div
             ref={chatLogRef}
-            className="mb-2 h-[420px] min-h-[220px] overflow-auto rounded-xl border border-zinc-200 bg-zinc-50/80 p-2 dark:border-zinc-700 dark:bg-zinc-950/60 lg:h-auto lg:flex-1"
+            className="mb-2 h-[420px] min-h-[220px] overflow-auto rounded-xl border border-[var(--border)] bg-[var(--background)] p-2 lg:h-auto lg:flex-1"
           >
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
               {messages.length === 0 && (
-                <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--muted)]">
                   Start by sending a goal. Example: run login flow and verify dashboard is visible.
                 </div>
               )}
@@ -2064,19 +2065,19 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 if (isReasoning) {
                   return (
                     <div key={idx} className="flex justify-start">
-                      <div className="max-w-[92%] rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950/30">
+                      <div className="max-w-[92%] rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm">
                         <div className="flex items-center gap-1.5 mb-1">
                           <span className="text-xs">🧠</span>
-                          <span className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-amber-700">
                             Bot Reasoning
                           </span>
                           {message.reasoningMeta?.url && (
-                            <span className="ml-auto text-[10px] text-amber-500 dark:text-amber-500 truncate max-w-[200px]" title={message.reasoningMeta.url}>
+                            <span className="ml-auto text-[10px] text-amber-500 truncate max-w-[200px]" title={message.reasoningMeta.url}>
                               {message.reasoningMeta.url.replace(/^https?:\/\//, "").split("/").slice(0, 2).join("/")}
                             </span>
                           )}
                         </div>
-                        <p className="text-xs leading-relaxed text-amber-900 dark:text-amber-100 whitespace-pre-wrap">
+                        <p className="text-xs leading-relaxed text-amber-900 whitespace-pre-wrap">
                           {message.content}
                         </p>
                       </div>
@@ -2096,22 +2097,22 @@ Stop when pass/fail outcome is clear and summarize results.`;
                     meta.action.startsWith("assert") ? "✓" : "●";
                   const borderColor =
                     meta.status === "assertion"
-                      ? "border-purple-300 dark:border-purple-700"
+                      ? "border-purple-300"
                       : meta.status === "failed"
-                        ? "border-red-300 dark:border-red-700"
-                        : "border-emerald-300 dark:border-emerald-700";
+                        ? "border-red-300"
+                        : "border-emerald-300";
                   const bgColor =
                     meta.status === "assertion"
-                      ? "bg-purple-50 dark:bg-purple-950/30"
+                      ? "bg-purple-50"
                       : meta.status === "failed"
-                        ? "bg-red-50 dark:bg-red-950/30"
-                        : "bg-emerald-50 dark:bg-emerald-950/30";
+                        ? "bg-red-50"
+                        : "bg-emerald-50";
                   const labelColor =
                     meta.status === "assertion"
-                      ? "text-purple-700 dark:text-purple-300"
+                      ? "text-purple-700"
                       : meta.status === "failed"
-                        ? "text-red-700 dark:text-red-300"
-                        : "text-emerald-700 dark:text-emerald-300";
+                        ? "text-red-700"
+                        : "text-emerald-700";
                   return (
                     <div key={idx} className="flex justify-start">
                       <div className={`max-w-[92%] rounded-xl border ${borderColor} ${bgColor} px-3 py-2 text-sm`}>
@@ -2124,7 +2125,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                             {message.content}
                           </span>
                         </div>
-                        <div className="mt-1 rounded-md bg-zinc-900 px-2.5 py-1.5 font-mono text-xs text-emerald-400 dark:bg-zinc-950">
+                        <div className="mt-1 rounded-md bg-[var(--surface-tertiary)] px-2.5 py-1.5 font-mono text-xs text-emerald-600">
                           {meta.playwright}
                         </div>
                       </div>
@@ -2136,8 +2137,8 @@ Stop when pass/fail outcome is clear and summarize results.`;
                     <div
                       className={`max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-relaxed ${
                         isUser
-                          ? "bg-blue-600 text-white"
-                          : "border border-zinc-200 bg-white text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                          ? "bg-[var(--brand-primary)] text-white"
+                          : "border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"
                       }`}
                     >
                       {message.content}
@@ -2147,7 +2148,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               })}
             </div>
           </div>
-          <div className="rounded-xl border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900">
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2">
             <div className="relative">
               <textarea
                 value={command}
@@ -2165,7 +2166,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                     ? "Add AI API key in Project Settings to use this mode"
                     : "Tell the agent exactly what to do. Example: Click the Log in button."
                 }
-                className="w-full resize-none rounded-2xl border border-zinc-300 px-3 py-2 pr-12 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                className="w-full resize-none rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-12 text-sm text-[var(--foreground)] placeholder:text-[var(--muted-soft)]"
               />
               <button
                 type="button"
@@ -2181,9 +2182,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                     ? "Queueing command"
                     : "Send"
                 }
-                className={`absolute right-2 bottom-2 flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold text-white disabled:opacity-50 ${
-                  "bg-blue-600 hover:bg-blue-700"
-                }`}
+                className="absolute right-2 bottom-2 flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold text-white disabled:opacity-50 bg-[var(--brand-primary)] hover:bg-[var(--brand-hover)]"
               >
                 {sending ? "…" : "↑"}
               </button>
@@ -2194,7 +2193,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                   type="button"
                   onClick={() => void onStopCurrentCommand()}
                   disabled={stoppingCommand || !sessionId || !startupReady}
-                  className="rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-800 dark:bg-red-950/20 dark:text-red-300 disabled:opacity-50"
+                  className="rounded-[10px] border border-[var(--error)]/30 bg-red-50 px-2 py-1 text-xs text-[var(--error)] disabled:opacity-50"
                 >
                   {stoppingCommand ? "Stopping..." : "Stop Current Command"}
                 </button>
@@ -2206,7 +2205,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               type="button"
               onClick={() => void onRunIndividualTest()}
               disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured}
-              className="rounded-full border border-blue-300 bg-blue-50 px-2.5 py-1 text-[11px] text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300 disabled:opacity-50"
+              className="rounded-full border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] px-2.5 py-1 text-[11px] text-[var(--brand-primary)] disabled:opacity-50"
             >
               {quickActionBusy === "run" ? "Running test..." : "Run Current Test"}
             </button>
@@ -2214,7 +2213,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               type="button"
               onClick={onOpenReviewCurrentScript}
               disabled={!sessionId}
-              className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 disabled:opacity-50"
+              className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700 disabled:opacity-50"
             >
               Review Current Script
             </button>
@@ -2227,18 +2226,18 @@ Stop when pass/fail outcome is clear and summarize results.`;
           aria-label="Resize chat and browser panels"
           onMouseDown={() => setResizingPanes(true)}
         >
-          <div className={`h-16 w-1 rounded ${resizingPanes ? "bg-blue-500" : "bg-zinc-300 dark:bg-zinc-700"}`} />
+          <div className={`h-16 w-1 rounded ${resizingPanes ? "bg-[var(--brand-primary)]" : "bg-[var(--border)]"}`} />
         </div>
         <section
-          className="flex min-h-[320px] flex-col border-t border-zinc-200 p-3 dark:border-zinc-700 lg:border-t-0"
+          className="flex min-h-[320px] flex-col border-t border-[var(--border)] p-3 lg:border-t-0"
           style={desktopSplitEnabled ? { width: `${100 - chatPaneRatio}%` } : undefined}
         >
-          <h2 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Live Browser</h2>
+          <h2 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Live Browser</h2>
           <div
             ref={liveViewportRef}
             tabIndex={0}
             onKeyDown={onLiveViewportKeyDown}
-            className={`mb-2 relative flex items-center justify-center rounded border border-zinc-200 bg-black outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 ${isLiveMode ? "h-[84vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
+            className={`mb-2 relative flex items-center justify-center rounded-xl border border-[var(--border)] bg-black outline-none focus:ring-2 focus:ring-[var(--brand-soft)] ${isLiveMode ? "h-[84vh] lg:h-auto lg:flex-1" : "h-[320px] lg:h-auto lg:flex-1"}`}
           >
             {shouldShowLiveStream && !liveStreamFailed ? (
               <img
@@ -2261,7 +2260,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 className="h-full w-full object-fill"
               />
             ) : (
-              <p className="text-sm text-zinc-500">Waiting for browser stream...</p>
+              <p className="text-sm text-[var(--muted)]">Waiting for browser stream...</p>
             )}
             {isLiveMode && lastClickTarget && (
               <div
@@ -2285,173 +2284,158 @@ Stop when pass/fail outcome is clear and summarize results.`;
               />
             )}
           </div>
-          <p className="mb-1 text-xs text-zinc-500">
+          <p className="mb-1 text-xs text-[var(--muted)]">
             Current URL: {session?.currentUrl || "-"}
           </p>
         </section>
         </div>
       </main>
-      {confirmFinalizeOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-6xl rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
-            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-              Review Steps and Script Before Saving
-            </h3>
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Validate plain-English steps and Playwright script side by side. Delete any step you do not want to save;
-              the related Playwright action is removed automatically.
-            </p>
-            <div className="mt-4 grid gap-4 md:grid-cols-2">
-              <div className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
-                <h4 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Script Steps (Simple English)</h4>
-                <div className="max-h-[360px] space-y-2 overflow-auto pr-1">
-                  {reviewSteps.length === 0 ? (
-                    <p className="text-xs text-zinc-500">No generated steps available for this session yet.</p>
-                  ) : (
-                    reviewSteps.map((step, index) => (
-                      <div key={step.id} className="rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-800/40">
-                        <div className="mb-1 flex items-start justify-between gap-2">
-                          <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">Step {index + 1}</p>
-                          <button
-                            type="button"
-                            onClick={() => onDeleteReviewStep(step.id)}
-                            className="rounded border border-red-300 px-2 py-0.5 text-[11px] text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-900/20"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                        <p className="text-sm text-zinc-800 dark:text-zinc-100">{step.action}</p>
-                        <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{step.expectedResult}</p>
-                        <pre className="mt-2 overflow-auto rounded bg-zinc-950 p-2 text-[11px] text-zinc-100">
-                          {step.playwright}
-                        </pre>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-              <div className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
-                <h4 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Playwright Script</h4>
-                <pre className="max-h-[360px] overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-100">
-                  {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
-                </pre>
-              </div>
-            </div>
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmFinalizeOpen(false)}
-                disabled={finalizing}
-                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700 disabled:opacity-50"
-              >
-                Keep Session Open
-              </button>
-              <button
-                type="button"
-                onClick={() => void onFinalize()}
-                disabled={finalizing}
-                className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-              >
-                {finalizing ? "Saving..." : "Confirm and Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {reviewScriptOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-4xl rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
-            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Current Script Preview</h3>
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              This script includes actions captured so far from both chat-guided AI steps and manual live interactions.
-            </p>
-            {reviewSteps.length > 0 && (
-              <div className="mt-3 max-h-[180px] space-y-2 overflow-auto rounded border border-zinc-200 p-2 dark:border-zinc-700">
-                {reviewSteps.map((step, index) => (
-                  <div key={`${step.id}-preview`} className="rounded bg-zinc-50 p-2 dark:bg-zinc-800/40">
-                    <p className="text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">Step {index + 1}</p>
-                    <pre className="mt-1 overflow-auto rounded bg-zinc-950 p-2 text-[11px] text-zinc-100">
+      <Modal
+        open={confirmFinalizeOpen}
+        onClose={() => setConfirmFinalizeOpen(false)}
+        title="Review Steps and Script Before Saving"
+        className="max-w-6xl"
+      >
+        <p className="mt-2 text-sm text-[var(--muted)]">
+          Validate plain-English steps and Playwright script side by side. Delete any step you do not want to save;
+          the related Playwright action is removed automatically.
+        </p>
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="rounded-xl border border-[var(--border)] p-3">
+            <h4 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Script Steps (Simple English)</h4>
+            <div className="max-h-[360px] space-y-2 overflow-auto pr-1">
+              {reviewSteps.length === 0 ? (
+                <p className="text-xs text-[var(--muted)]">No generated steps available for this session yet.</p>
+              ) : (
+                reviewSteps.map((step, index) => (
+                  <div key={step.id} className="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2">
+                    <div className="mb-1 flex items-start justify-between gap-2">
+                      <p className="text-xs font-semibold text-[var(--foreground)]">Step {index + 1}</p>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={() => onDeleteReviewStep(step.id)}
+                        className="h-auto px-2 py-0.5 text-[11px]"
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                    <p className="text-sm text-[var(--foreground)]">{step.action}</p>
+                    <p className="mt-1 text-xs text-[var(--muted)]">{step.expectedResult}</p>
+                    <pre className="mt-2 overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-2 text-[11px] text-[var(--foreground)]">
                       {step.playwright}
                     </pre>
                   </div>
-                ))}
-              </div>
-            )}
-            <pre className="mt-4 max-h-[460px] overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-100">
+                ))
+              )}
+            </div>
+          </div>
+          <div className="rounded-xl border border-[var(--border)] p-3">
+            <h4 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Playwright Script</h4>
+            <pre className="max-h-[360px] overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-3 text-xs text-[var(--foreground)]">
               {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
             </pre>
-            <div className="mt-4 flex justify-end">
-              <button
-                type="button"
-                onClick={() => setReviewScriptOpen(false)}
-                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
-              >
-                Close
-              </button>
-            </div>
           </div>
         </div>
-      )}
-      {!bootstrapSessionId && sessionStartupState === "select-environment" && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-5 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
-            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Choose Environment</h3>
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Select a test environment URL to start browser automation.
-            </p>
-            {testRunEnvironments.length > 0 ? (
-              <div className="mt-4">
-                <label className="mb-1 block text-xs font-medium text-zinc-600 dark:text-zinc-300">Environment</label>
-                <select
-                  value={selectedEnvironmentUrl}
-                  onChange={(event) => setSelectedEnvironmentUrl(event.target.value)}
-                  className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-                >
-                  {testRunEnvironments.map((env) => (
-                    <option key={`${env.name}-${env.url}`} value={env.url}>
-                      {env.name} - {env.url}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : (
-              <div className="mt-4">
-                <label className="mb-1 block text-xs font-medium text-zinc-600 dark:text-zinc-300">Environment URL</label>
-                <input
-                  value={customEnvironmentUrl}
-                  onChange={(event) => setCustomEnvironmentUrl(event.target.value)}
-                  placeholder="https://staging.example.com"
-                  className="w-full rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-                />
-                <p className="mt-1 text-[11px] text-zinc-500">No saved environments found in project settings.</p>
-              </div>
-            )}
-            {sessionStartupError && <p className="mt-3 text-xs text-red-600 dark:text-red-400">{sessionStartupError}</p>}
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={onCancelSession}
-                className="rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void onStartSessionWithEnvironment()}
-                disabled={testRunEnvironments.length === 0 && !customEnvironmentUrl.trim()}
-                className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-              >
-                Start Automate
-              </button>
-            </div>
-          </div>
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => setConfirmFinalizeOpen(false)}
+            disabled={finalizing}
+          >
+            Keep Session Open
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => void onFinalize()}
+            disabled={finalizing}
+          >
+            {finalizing ? "Saving..." : "Confirm and Save"}
+          </Button>
         </div>
-      )}
+      </Modal>
+      <Modal
+        open={reviewScriptOpen}
+        onClose={() => setReviewScriptOpen(false)}
+        title="Current Script Preview"
+        className="max-w-4xl"
+      >
+        <p className="mt-2 text-sm text-[var(--muted)]">
+          This script includes actions captured so far from both chat-guided AI steps and manual live interactions.
+        </p>
+        {reviewSteps.length > 0 && (
+          <div className="mt-3 max-h-[180px] space-y-2 overflow-auto rounded-xl border border-[var(--border)] p-2">
+            {reviewSteps.map((step, index) => (
+              <div key={`${step.id}-preview`} className="rounded-lg bg-[var(--background)] p-2">
+                <p className="text-[11px] font-semibold text-[var(--foreground)]">Step {index + 1}</p>
+                <pre className="mt-1 overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-2 text-[11px] text-[var(--foreground)]">
+                  {step.playwright}
+                </pre>
+              </div>
+            ))}
+          </div>
+        )}
+        <pre className="mt-4 max-h-[460px] overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-3 text-xs text-[var(--foreground)]">
+          {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
+        </pre>
+        <div className="mt-4 flex justify-end">
+          <Button variant="secondary" onClick={() => setReviewScriptOpen(false)}>
+            Close
+          </Button>
+        </div>
+      </Modal>
+      <Modal
+        open={!bootstrapSessionId && sessionStartupState === "select-environment"}
+        onClose={onCancelSession}
+        title="Choose Environment"
+      >
+        <p className="mt-2 text-sm text-[var(--muted)]">
+          Select a test environment URL to start browser automation.
+        </p>
+        {testRunEnvironments.length > 0 ? (
+          <Field className="mt-4">
+            <FieldLabel className="text-xs">Environment</FieldLabel>
+            <Select
+              value={selectedEnvironmentUrl}
+              onChange={(event) => setSelectedEnvironmentUrl(event.target.value)}
+            >
+              {testRunEnvironments.map((env) => (
+                <option key={`${env.name}-${env.url}`} value={env.url}>
+                  {env.name} - {env.url}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        ) : (
+          <Field className="mt-4">
+            <FieldLabel className="text-xs">Environment URL</FieldLabel>
+            <Input
+              value={customEnvironmentUrl}
+              onChange={(event) => setCustomEnvironmentUrl(event.target.value)}
+              placeholder="https://staging.example.com"
+            />
+            <p className="mt-1 text-[11px] text-[var(--muted)]">No saved environments found in project settings.</p>
+          </Field>
+        )}
+        {sessionStartupError && <p className="mt-3 text-xs text-[var(--error)]">{sessionStartupError}</p>}
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <Button variant="secondary" onClick={onCancelSession}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => void onStartSessionWithEnvironment()}
+            disabled={testRunEnvironments.length === 0 && !customEnvironmentUrl.trim()}
+          >
+            Start Automate
+          </Button>
+        </div>
+      </Modal>
       {(sessionStartupState === "starting" || sessionStartupState === "waiting-stream") && (
-        <div className="fixed bottom-4 right-4 z-40 max-w-sm rounded-lg border border-zinc-200 bg-white p-3 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-          {sessionStartupState === "starting" && <p className="text-zinc-700 dark:text-zinc-200">Starting automation environment...</p>}
+        <div className="fixed bottom-4 right-4 z-40 max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3 text-xs shadow-[var(--shadow-elevated)]">
+          {sessionStartupState === "starting" && <p className="text-[var(--foreground)]">Starting automation environment...</p>}
           {sessionStartupState === "waiting-stream" && (
-            <p className="text-zinc-700 dark:text-zinc-200">
+            <p className="text-[var(--foreground)]">
               Browser is spinning up and opening environment URL. Please wait for live stream before interaction.
             </p>
           )}

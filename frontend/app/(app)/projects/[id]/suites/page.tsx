@@ -2,6 +2,7 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
 
 export default function SuitesPage() {
   const params = useParams();
@@ -14,8 +15,17 @@ export default function SuitesPage() {
   }, [projectId, router]);
 
   return (
-    <main className="max-w-2xl mx-auto px-4 py-8">
-      <p className="text-zinc-500">Redirecting to Test case repository...</p>
+    <main className="tesbo-page max-w-2xl mx-auto">
+      <ListWorkspaceLayout
+        header={
+          <PageHeader
+            title="Suites"
+            subtitle="Redirecting to Test case repository..."
+          />
+        }
+      >
+        <p className="text-[var(--muted)]">Redirecting to Test case repository...</p>
+      </ListWorkspaceLayout>
     </main>
   );
 }

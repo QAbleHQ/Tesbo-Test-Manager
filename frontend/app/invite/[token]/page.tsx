@@ -9,6 +9,7 @@ import {
   getInvitationByToken,
   type InviteDetails,
 } from "@/lib/api";
+import { Button, Card, CardBody, CardHeader, CardTitle, StatusChip } from "@/components/ui";
 
 export default function InviteAcceptancePage() {
   const params = useParams();
@@ -63,7 +64,7 @@ export default function InviteAcceptancePage() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading invitation…</p>
+        <p className="text-[var(--muted)]">Loading invitation…</p>
       </div>
     );
   }
@@ -71,10 +72,14 @@ export default function InviteAcceptancePage() {
   if (error && !invite) {
     return (
       <div className="min-h-screen flex items-center justify-center px-4">
-        <div className="w-full max-w-md rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Invitation unavailable</h1>
-          <p className="mt-2 text-sm text-red-600 dark:text-red-400">{error}</p>
-        </div>
+        <Card className="w-full max-w-md p-6">
+          <CardHeader>
+            <CardTitle>Invitation unavailable</CardTitle>
+          </CardHeader>
+          <CardBody>
+            <p className="text-sm text-[var(--error)]">{error}</p>
+          </CardBody>
+        </Card>
       </div>
     );
   }
@@ -87,49 +92,53 @@ export default function InviteAcceptancePage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4">
-      <div className="w-full max-w-md rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-        <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Workspace invitation</h1>
-        <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-          {invite?.email} is invited to join{" "}
-          <span className="font-medium">{invite?.organizationName ?? "this workspace"}</span>.
-        </p>
-        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400 capitalize">
-          Role: {invite?.role} · Status: {invite?.status}
-        </p>
-
-        {error && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
-
-        {!isPending && (
-          <p className="mt-4 text-sm text-zinc-600 dark:text-zinc-300">
-            This invitation can no longer be accepted.
+      <Card className="w-full max-w-md p-6">
+        <CardHeader>
+          <CardTitle>Workspace invitation</CardTitle>
+        </CardHeader>
+        <CardBody className="space-y-1">
+          <p className="text-sm text-[var(--muted)]">
+            {invite?.email} is invited to join{" "}
+            <span className="font-medium text-[var(--foreground)]">{invite?.organizationName ?? "this workspace"}</span>.
           </p>
-        )}
+          <p className="flex items-center gap-2 text-sm capitalize">
+            <span className="text-[var(--muted)]">Role:</span> {invite?.role}
+            <span className="text-[var(--muted)]">·</span>
+            <span className="text-[var(--muted)]">Status:</span>
+            <StatusChip tone={isPending ? "brand" : "neutral"}>{invite?.status}</StatusChip>
+          </p>
 
-        {isPending && !auth && (
-          <div className="mt-5">
-            <p className="text-sm text-zinc-600 dark:text-zinc-300">
-              Sign in with the invited email address to accept.
+          {error && <p className="mt-3 text-sm text-[var(--error)]">{error}</p>}
+
+          {!isPending && (
+            <p className="mt-4 text-sm text-[var(--muted)]">
+              This invitation can no longer be accepted.
             </p>
-            <Link
-              href={loginUrl}
-              className="mt-3 inline-block rounded-lg bg-zinc-900 text-white py-2 px-4 text-sm font-semibold hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 dark:focus:ring-offset-zinc-900"
-            >
-              Continue to sign in
-            </Link>
-          </div>
-        )}
+          )}
 
-        {isPending && auth && (
-          <button
-            type="button"
-            onClick={onAccept}
-            disabled={accepting}
-            className="mt-5 rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-          >
-            {accepting ? "Joining…" : "Accept and join workspace"}
-          </button>
-        )}
-      </div>
+          {isPending && !auth && (
+            <div className="mt-5">
+              <p className="text-sm text-[var(--muted)]">
+                Sign in with the invited email address to accept.
+              </p>
+              <Link href={loginUrl} className="mt-3 inline-block">
+                <Button>Continue to sign in</Button>
+              </Link>
+            </div>
+          )}
+
+          {isPending && auth && (
+            <Button
+              type="button"
+              onClick={onAccept}
+              disabled={accepting}
+              className="mt-5"
+            >
+              {accepting ? "Joining…" : "Accept and join workspace"}
+            </Button>
+          )}
+        </CardBody>
+      </Card>
     </div>
   );
 }

@@ -17,6 +17,8 @@ import {
 } from "@/lib/api";
 import { runAegisInBackground } from "@/lib/aegis-runner";
 import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
+import { Button, Input, Select, Textarea, Modal, Field, FieldLabel } from "@/components/ui";
+import { PageHeader } from "@/components/workflows";
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type ScriptHistoryEntry = {
@@ -324,7 +326,7 @@ export default function TestCaseDetailPage() {
   if (tc === null && !isNew) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
@@ -340,34 +342,37 @@ export default function TestCaseDetailPage() {
     : "Not versioned yet";
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 flex items-center gap-4">
-        <Link href={`/projects/${projectId}/dashboard`} className="text-zinc-700 dark:text-zinc-300">Project</Link>
-        <span className="text-zinc-500">/</span>
-        <Link href={`/projects/${projectId}/testcases`} className="text-zinc-700 dark:text-zinc-300">Test cases</Link>
-        <span className="text-zinc-500">/</span>
-        <span className="text-zinc-700 dark:text-zinc-300">{isNew ? "New" : (tc as Record<string, string>)?.externalId}</span>
-      </header>
+    <div className="min-h-screen bg-[var(--background)]">
       <main className="max-w-3xl mx-auto px-4 py-8">
+        <PageHeader
+          title={isNew ? "New Test Case" : (tc as Record<string, string>)?.externalId ?? "Test Case"}
+          breadcrumb={
+            <nav className="flex items-center gap-1 text-sm">
+              <Link href={`/projects/${projectId}/dashboard`} className="text-[var(--muted)] hover:text-[var(--foreground)]">Project</Link>
+              <span className="text-[var(--muted-soft)]">/</span>
+              <Link href={`/projects/${projectId}/testcases`} className="text-[var(--muted)] hover:text-[var(--foreground)]">Test cases</Link>
+            </nav>
+          }
+        />
         <AegisBackgroundIndicator />
         {saveNotification && (
           <div className={`mb-6 flex items-center justify-between rounded-lg border px-4 py-3 ${
             saveNotification.type === "success"
-              ? "border-[#2e7d32]/30 bg-[#e8f5eb] dark:border-green-700/40 dark:bg-green-900/20"
-              : "border-red-300 bg-red-50 dark:border-red-700/40 dark:bg-red-900/20"
+              ? "border-[var(--success)]/30 bg-[var(--brand-soft)]"
+              : "border-[var(--error)]/30 bg-red-50"
           }`}>
             <p className={`text-sm ${
               saveNotification.type === "success"
-                ? "text-[#2e7d32] dark:text-green-300"
-                : "text-red-700 dark:text-red-300"
+                ? "text-[var(--success)]"
+                : "text-[var(--error)]"
             }`}>{saveNotification.message}</p>
             <button
               type="button"
               onClick={() => setSaveNotification(null)}
               className={`ml-4 text-sm ${
                 saveNotification.type === "success"
-                  ? "text-[#2e7d32] hover:text-[#1b5e20] dark:text-green-300"
-                  : "text-red-600 hover:text-red-800 dark:text-red-300"
+                  ? "text-[var(--success)] hover:opacity-80"
+                  : "text-[var(--error)] hover:opacity-80"
               }`}
             >
               Dismiss
@@ -375,81 +380,76 @@ export default function TestCaseDetailPage() {
           </div>
         )}
         <form onSubmit={handleSubmit} className="space-y-6">
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Title</label>
-            <input
+          <Field>
+            <FieldLabel>Title</FieldLabel>
+            <Input
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               required
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Description</label>
-            <textarea
+          </Field>
+          <Field>
+            <FieldLabel>Description</FieldLabel>
+            <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={4}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Preconditions</label>
-            <textarea
+          </Field>
+          <Field>
+            <FieldLabel>Preconditions</FieldLabel>
+            <Textarea
               value={preconditions}
               onChange={(e) => setPreconditions(e.target.value)}
               rows={2}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Test Data</label>
-            <textarea
+          </Field>
+          <Field>
+            <FieldLabel>Test Data</FieldLabel>
+            <Textarea
               value={testData}
               onChange={(e) => setTestData(e.target.value)}
               rows={3}
               placeholder="Input data, sample values, or setup-specific data"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
             />
-          </div>
+          </Field>
           <div>
             <div className="flex items-center justify-between mb-2">
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Steps</label>
-              <button type="button" onClick={addStep} className="text-sm text-blue-600 hover:underline">Add step</button>
+              <FieldLabel>Steps</FieldLabel>
+              <button type="button" onClick={addStep} className="text-sm text-[var(--brand-primary)] hover:underline">Add step</button>
             </div>
             <div className="space-y-3">
               {steps.map((step, i) => (
-                <div key={i} className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 flex gap-2">
-                  <span className="text-zinc-500 font-mono text-sm w-8">{i + 1}.</span>
+                <div key={i} className="rounded-lg border border-[var(--border)] p-3 flex gap-2">
+                  <span className="text-[var(--muted)] font-mono text-sm w-8">{i + 1}.</span>
                   <div className="flex-1 grid gap-2">
-                    <input
+                    <Input
                       placeholder="Action"
                       value={step.action ?? ""}
                       onChange={(e) => updateStep(i, "action", e.target.value)}
-                      className="w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm"
+                      className="text-sm"
                     />
-                    <input
+                    <Input
                       placeholder="Expected result"
                       value={step.expectedResult ?? ""}
                       onChange={(e) => updateStep(i, "expectedResult", e.target.value)}
-                      className="w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-sm"
+                      className="text-sm"
                     />
                   </div>
                   {steps.length > 1 && (
-                    <button type="button" onClick={() => removeStep(i)} className="text-red-600 text-sm">Remove</button>
+                    <button type="button" onClick={() => removeStep(i)} className="text-[var(--error)] text-sm">Remove</button>
                   )}
                 </div>
               ))}
             </div>
           </div>
           <div className="flex gap-4">
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Suite</label>
-              <select
+            <Field>
+              <FieldLabel>Suite</FieldLabel>
+              <Select
                 value={suiteId}
                 onChange={(e) => setSuiteId(e.target.value)}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
                 <option value="">No suite</option>
                 {suites.map((suite) => (
@@ -457,14 +457,13 @@ export default function TestCaseDetailPage() {
                     {suite.name}
                   </option>
                 ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Test case type</label>
-              <select
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Test case type</FieldLabel>
+              <Select
                 value={type}
                 onChange={(e) => setType(e.target.value)}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
                 <option value="Functional">Functional</option>
                 <option value="Regression">Regression</option>
@@ -475,60 +474,56 @@ export default function TestCaseDetailPage() {
                 <option value="UI">UI</option>
                 <option value="Performance">Performance</option>
                 <option value="Security">Security</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Automation Feasibility</label>
-              <select
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Automation Feasibility</FieldLabel>
+              <Select
                 value={automationStatus}
                 onChange={(e) => setAutomationStatus(e.target.value)}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
                 <option value="In Planning">In Planning</option>
                 <option value="Not able to Automate">Not able to Automate</option>
                 <option value="Ready for the Automation">Ready for the Automation</option>
                 <option value="Automated">Automated</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Priority</label>
-              <select
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Priority</FieldLabel>
+              <Select
                 value={priority}
                 onChange={(e) => setPriority(e.target.value)}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
                 <option value="P0">P0</option>
                 <option value="P1">P1</option>
                 <option value="P2">P2</option>
                 <option value="P3">P3</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Status</label>
-              <select
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Status</FieldLabel>
+              <Select
                 value={status}
                 onChange={(e) => setStatus(e.target.value)}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               >
                 <option value="Draft">Draft</option>
                 <option value="In Review">In Review</option>
                 <option value="Approved">Approved</option>
                 <option value="Deprecated">Deprecated</option>
                 <option value="Archived">Archived</option>
-              </select>
-            </div>
+              </Select>
+            </Field>
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Estimated Duration</label>
-              <input
+            <Field>
+              <FieldLabel>Estimated Duration</FieldLabel>
+              <Input
                 type="text"
                 value={estimatedDuration}
                 onChange={(e) => setEstimatedDuration(e.target.value)}
                 placeholder="e.g. 10 min"
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
               />
-            </div>
+            </Field>
             <TagInput
               label="Tags / Labels"
               selectedTags={automationTags}
@@ -539,23 +534,25 @@ export default function TestCaseDetailPage() {
           </div>
           <div>
             <div className="mb-1 flex items-center justify-between">
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">Playwright Script</label>
+              <FieldLabel>Playwright Script</FieldLabel>
               {!isNew && (
                 <div className="flex items-center gap-2">
-                  <button
+                  <Button
                     type="button"
+                    variant="secondary"
+                    size="sm"
                     onClick={onOpenLivePreviewRerun}
-                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                    className="border-emerald-300 text-emerald-700 hover:bg-emerald-50"
                   >
                     Re Run Last Test (Live Preview)
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
-            <p className="mb-2 text-xs text-zinc-500">
+            <p className="mb-2 text-xs text-[var(--muted)]">
               You can edit the script manually here and use the run action to validate the latest flow.
             </p>
-            <p className="mb-2 text-xs text-zinc-500">
+            <p className="mb-2 text-xs text-[var(--muted)]">
               Current script version: <span className="font-medium">{currentScriptVersionLabel}</span>
               {previousScriptHistory.length > 0
                 ? ` • ${previousScriptHistory.length} previous version${previousScriptHistory.length === 1 ? "" : "s"}`
@@ -565,66 +562,65 @@ export default function TestCaseDetailPage() {
               type="button"
               onClick={() => setVersionHistoryOpen(true)}
               disabled={scriptVersionHistory.length === 0}
-              className="mb-2 text-xs text-blue-600 hover:underline disabled:text-zinc-400 disabled:no-underline"
+              className="mb-2 text-xs text-[var(--brand-primary)] hover:underline disabled:text-[var(--muted-soft)] disabled:no-underline"
             >
               View Version History
             </button>
-            <textarea
+            <Textarea
               value={automationScript}
               onChange={(e) => setAutomationScript(e.target.value)}
               rows={14}
               placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
-              className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-900"
+              className="font-mono text-xs"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Attachments</label>
-            <textarea
+          <Field>
+            <FieldLabel>Attachments</FieldLabel>
+            <Textarea
               value={attachments}
               onChange={(e) => setAttachments(e.target.value)}
               rows={2}
               placeholder="Links/paths to screenshots, logs, or reference docs"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2"
             />
-          </div>
+          </Field>
           <div className="flex gap-2">
             {!isNew && (
-              <button
+              <Button
                 type="button"
+                variant="ai"
                 onClick={() => void onAssignToAegisQueue()}
                 disabled={assigningToAegis || saving}
-                className="rounded-lg border border-amber-300 bg-amber-50 py-2 px-4 text-sm font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200 dark:hover:bg-amber-900/40"
               >
                 {assigningToAegis ? "Assigning..." : "Assign to Aegis"}
-              </button>
+              </Button>
             )}
             {!isNew && (
-              <span className="rounded-lg border border-blue-200 bg-blue-50 py-2 px-4 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-300">
+              <span className="rounded-xl border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] py-2 px-4 text-sm text-[var(--brand-primary)]">
                 Update script and use the run action from the script section to validate changes.
               </span>
             )}
-            <button
+            <Button
               type="submit"
               value="create"
+              variant="primary"
               disabled={saving}
-              className="rounded-lg bg-blue-600 text-white py-2 px-4 font-medium hover:bg-blue-700 disabled:opacity-50"
             >
               {saving ? "Saving…" : isNew ? "Create" : "Save"}
-            </button>
+            </Button>
             {isNew && (
-              <button
+              <Button
                 type="submit"
                 value="create-next"
+                variant="secondary"
                 disabled={saving}
-                className="rounded-lg border border-blue-300 bg-white text-blue-700 py-2 px-4 font-medium hover:bg-blue-50 disabled:opacity-50 dark:border-blue-800 dark:bg-zinc-900 dark:text-blue-300 dark:hover:bg-blue-950/30"
               >
                 {saving ? "Saving…" : "Create and Add Next"}
-              </button>
+              </Button>
             )}
             {!isNew && (
               <Link
                 href={`/projects/${projectId}/testcases`}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 py-2 px-4 font-medium"
+                className="inline-flex items-center justify-center h-10 rounded-xl border border-[var(--border)] px-4 font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
               >
                 Cancel
               </Link>
@@ -632,69 +628,60 @@ export default function TestCaseDetailPage() {
           </div>
         </form>
       </main>
-      {versionHistoryOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-5xl rounded-xl border border-zinc-200 bg-white p-4 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Script Version History</h3>
+      <Modal
+        open={versionHistoryOpen}
+        onClose={() => setVersionHistoryOpen(false)}
+        title="Script Version History"
+        className="max-w-5xl"
+      >
+        <div className="grid gap-3 md:grid-cols-[220px_1fr]">
+          <div className="max-h-[60vh] overflow-auto rounded-xl border border-[var(--border)] p-2">
+            <div className="space-y-1">
               <button
                 type="button"
-                onClick={() => setVersionHistoryOpen(false)}
-                className="rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-700"
+                onClick={() => setSelectedScriptHistoryKey("current")}
+                className={`w-full rounded-lg px-2 py-1 text-left text-xs ${
+                  selectedScriptHistoryKey === "current"
+                    ? "bg-[var(--brand-primary)] text-white"
+                    : "bg-[var(--background)] text-[var(--foreground)]"
+                }`}
               >
-                Close
+                {`v${Math.max(1, automationScriptVersion)} (Latest)`}
               </button>
-            </div>
-            <div className="grid gap-3 md:grid-cols-[220px_1fr]">
-              <div className="max-h-[60vh] overflow-auto rounded border border-zinc-200 p-2 dark:border-zinc-700">
-                <div className="space-y-1">
+              {previousScriptHistory.map((entry, idx) => {
+                const itemKey = `history-${idx}`;
+                return (
                   <button
+                    key={`${entry.scriptVersion}-${idx}`}
                     type="button"
-                    onClick={() => setSelectedScriptHistoryKey("current")}
-                    className={`w-full rounded px-2 py-1 text-left text-xs ${
-                      selectedScriptHistoryKey === "current"
-                        ? "bg-blue-600 text-white"
-                        : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                    onClick={() => setSelectedScriptHistoryKey(itemKey)}
+                    className={`w-full rounded-lg px-2 py-1 text-left text-xs ${
+                      selectedScriptHistoryKey === itemKey
+                        ? "bg-[var(--brand-primary)] text-white"
+                        : "bg-[var(--background)] text-[var(--foreground)]"
                     }`}
                   >
-                    {`v${Math.max(1, automationScriptVersion)} (Latest)`}
+                    {`v${entry.scriptVersion}`}
                   </button>
-                  {previousScriptHistory.map((entry, idx) => {
-                    const itemKey = `history-${idx}`;
-                    return (
-                      <button
-                        key={`${entry.scriptVersion}-${idx}`}
-                        type="button"
-                        onClick={() => setSelectedScriptHistoryKey(itemKey)}
-                        className={`w-full rounded px-2 py-1 text-left text-xs ${
-                          selectedScriptHistoryKey === itemKey
-                            ? "bg-blue-600 text-white"
-                            : "bg-zinc-50 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
-                        }`}
-                      >
-                        {`v${entry.scriptVersion}`}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="rounded border border-zinc-200 p-2 dark:border-zinc-700">
-                <textarea
-                  value={displayedScript}
-                  readOnly
-                  rows={24}
-                  className="h-[60vh] w-full rounded border border-zinc-300 bg-zinc-50 px-3 py-2 font-mono text-xs dark:border-zinc-600 dark:bg-zinc-950"
-                />
-                {selectedHistoryEntry?.testcaseVersion != null && (
-                  <p className="mt-2 text-[11px] text-zinc-500">
-                    Snapshot from testcase version {selectedHistoryEntry.testcaseVersion}.
-                  </p>
-                )}
-              </div>
+                );
+              })}
             </div>
           </div>
+          <div className="rounded-xl border border-[var(--border)] p-2">
+            <textarea
+              value={displayedScript}
+              readOnly
+              rows={24}
+              className="h-[60vh] w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 font-mono text-xs text-[var(--foreground)]"
+            />
+            {selectedHistoryEntry?.testcaseVersion != null && (
+              <p className="mt-2 text-[11px] text-[var(--muted)]">
+                Snapshot from testcase version {selectedHistoryEntry.testcaseVersion}.
+              </p>
+            )}
+          </div>
         </div>
-      )}
+      </Modal>
     </div>
   );
 }

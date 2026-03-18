@@ -19,6 +19,8 @@ import {
   upsertAgentTask,
 } from "@/lib/api";
 import { runAegisInBackground } from "@/lib/aegis-runner";
+import { Button, Card, StatusChip } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 type Tab = "queue" | "in_progress" | "needs_approval" | "completed";
 
@@ -409,37 +411,41 @@ export default function SentinelPage() {
   const completed = tasks.filter((t) => t.status === "approved" || t.status === "rejected");
   const rows = tab === "queue" ? queued : tab === "in_progress" ? inProgress : tab === "needs_approval" ? needsApproval : completed;
 
+  const breadcrumb = (
+    <Link href={`/projects/${projectId}/agents`} className="inline-flex items-center gap-1 text-[var(--muted)] hover:text-[var(--brand-primary)]">
+      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+      Agents
+    </Link>
+  );
+
   return (
-    <div className="flex-1 p-6 md:p-10 max-w-6xl mx-auto w-full">
-      <div className="mb-6">
-        <Link href={`/projects/${projectId}/agents`} className="text-sm text-[var(--muted)] hover:text-[var(--primary)] mb-2 inline-flex items-center gap-1">
-          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-          Agents
-        </Link>
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#e8f5eb] dark:bg-zinc-800 text-[var(--primary)]">
-              <EyeIcon />
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Sentinel"
+          subtitle="Review Bot for generated scripts"
+          breadcrumb={breadcrumb}
+          actions={
+            <div className="flex items-center gap-2">
+              <Button variant="secondary" size="sm" onClick={queueFromAegis}>
+                Queue from Aegis
+              </Button>
+              <Button size="sm" onClick={runReviewBot} disabled={busy}>
+                {busy ? "Reviewing..." : "Run Review Bot"}
+              </Button>
+              <Link
+                href={`/projects/${projectId}/agents/sentinel/settings`}
+                className="inline-flex items-center justify-center gap-2 h-9 rounded-[10px] px-3 text-xs font-semibold border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+              >
+                Settings
+              </Link>
             </div>
-            <div>
-              <h1 className="text-xl font-bold text-[var(--foreground)]">Sentinel</h1>
-              <p className="text-sm text-[var(--muted)]">Review Bot for generated scripts</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button onClick={queueFromAegis} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800">
-              Queue from Aegis
-            </button>
-            <button onClick={runReviewBot} disabled={busy} className="rounded-lg bg-[var(--primary)] px-3 py-1.5 text-sm text-white hover:opacity-90 disabled:opacity-50">
-              {busy ? "Reviewing..." : "Run Review Bot"}
-            </button>
-            <Link href={`/projects/${projectId}/agents/sentinel/settings`} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800">
-              Settings
-            </Link>
-          </div>
-        </div>
-        {autoTick && <p className="mt-2 text-xs text-blue-600 dark:text-blue-400">Auto-review is enabled. Sentinel checks for new scripts every 5s.</p>}
-      </div>
+          }
+        />
+      }
+      className="flex-1 p-6 md:p-10 max-w-6xl mx-auto w-full"
+    >
+      {autoTick && <p className="mb-5 text-xs text-[var(--brand-primary)]">Auto-review is enabled. Sentinel checks for new scripts every 5s.</p>}
 
       <div className="flex gap-1 mb-5 border-b border-[var(--border)]">
         {[
@@ -451,7 +457,7 @@ export default function SentinelPage() {
           <button
             key={t.key}
             onClick={() => setTab(t.key as Tab)}
-            className={`px-4 py-2.5 text-sm font-medium border-b-2 ${tab === t.key ? "border-[var(--primary)] text-[var(--primary)]" : "border-transparent text-[var(--muted)]"}`}
+            className={`px-4 py-2.5 text-sm font-medium border-b-2 ${tab === t.key ? "border-[var(--brand-primary)] text-[var(--brand-primary)]" : "border-transparent text-[var(--muted)]"}`}
           >
             {t.label} {t.count > 0 ? `(${t.count})` : ""}
           </button>
@@ -465,41 +471,41 @@ export default function SentinelPage() {
           </div>
         ) : (
           rows.map((task) => (
-            <div key={task.id} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <Card key={task.id} className="p-4">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-semibold text-[var(--foreground)]">{task.testcaseTitle}</div>
                   <div className="text-xs text-[var(--muted)]">{task.testcaseExternalId}</div>
                 </div>
-                <span className="text-xs rounded-full px-2 py-0.5 bg-zinc-100 dark:bg-zinc-800 text-[var(--muted)]">{task.status}</span>
+                <StatusChip tone="neutral">{task.status}</StatusChip>
               </div>
               {task.botReview && (
                 <div className="mt-2 text-xs text-[var(--foreground)]">
-                  Review result: <span className={task.botReview.status === "passed" ? "text-green-600" : "text-red-600"}>{task.botReview.status}</span>
+                  Review result: <span className={task.botReview.status === "passed" ? "text-[var(--success)]" : "text-[var(--error)]"}>{task.botReview.status}</span>
                 </div>
               )}
               {task.botReview?.categories && task.botReview.categories.length > 0 && (
                 <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-1">
                   {task.botReview.categories.map((c, idx) => (
-                    <div key={idx} className={`text-[11px] rounded border px-2 py-1 ${c.passed ? "border-green-200 text-green-700 dark:border-green-800 dark:text-green-400" : "border-red-200 text-red-700 dark:border-red-800 dark:text-red-400"}`}>
+                    <div key={idx} className={`text-[11px] rounded border px-2 py-1 ${c.passed ? "border-[var(--success)]/30 text-[var(--success)]" : "border-[var(--error)]/30 text-[var(--error)]"}`}>
                       {c.key}: {c.passed ? "PASS" : "FAIL"}
                     </div>
                   ))}
                 </div>
               )}
               {task.status === "pending_review" && task.feedback.length > 0 && (
-                <div className="mt-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-3">
-                  <p className="text-xs font-semibold text-amber-700 dark:text-amber-400 mb-1">Improvement suggestions</p>
+                <div className="mt-3 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning-soft)] p-3">
+                  <p className="text-xs font-semibold text-[var(--warning)] mb-1">Improvement suggestions</p>
                   <ul className="text-xs text-[var(--foreground)] space-y-1">
                     {task.feedback.map((f) => <li key={f.id}>- {f.message}</li>)}
                   </ul>
                   <div className="mt-3 flex gap-2">
-                    <button onClick={() => approveImprovements(task)} className="rounded bg-[var(--primary)] px-3 py-1.5 text-xs text-white hover:opacity-90">
+                    <Button size="sm" onClick={() => approveImprovements(task)}>
                       Approve & Send to Aegis
-                    </button>
-                    <button onClick={() => dismissImprovements(task)} className="rounded border border-[var(--border)] px-3 py-1.5 text-xs hover:bg-zinc-50 dark:hover:bg-zinc-800">
+                    </Button>
+                    <Button variant="secondary" size="sm" onClick={() => dismissImprovements(task)}>
                       Approve Without Re-run
-                    </button>
+                    </Button>
                   </div>
                 </div>
               )}
@@ -509,7 +515,7 @@ export default function SentinelPage() {
               <div className="mt-3">
                 <button
                   onClick={() => setExpandedTaskId((prev) => (prev === task.id ? null : task.id))}
-                  className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--primary)] hover:underline"
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--brand-primary)] hover:underline"
                 >
                   <svg
                     className={`h-3.5 w-3.5 transition-transform ${expandedTaskId === task.id ? "rotate-180" : ""}`}
@@ -523,7 +529,7 @@ export default function SentinelPage() {
                 </button>
               </div>
               {expandedTaskId === task.id && (
-                <div className="mt-3 rounded-lg border border-[var(--border)] bg-zinc-50 dark:bg-zinc-900/40 p-3 space-y-3">
+                <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 space-y-3">
                   <div>
                     <p className="text-xs font-semibold text-[var(--muted)] mb-1">Decision Summary</p>
                     <p className="text-xs text-[var(--foreground)]">
@@ -539,7 +545,7 @@ export default function SentinelPage() {
                       <div className="space-y-1">
                         {task.botReview.categories.map((c, idx) => (
                           <div key={idx} className="text-xs">
-                            <span className={c.passed ? "text-green-600" : "text-red-600"}>{c.passed ? "PASS" : "FAIL"}</span>
+                            <span className={c.passed ? "text-[var(--success)]" : "text-[var(--error)]"}>{c.passed ? "PASS" : "FAIL"}</span>
                             <span className="ml-1 font-medium text-[var(--foreground)]">{c.key}</span>
                             <span className="text-[var(--muted)]"> — {c.detail}</span>
                           </div>
@@ -554,7 +560,7 @@ export default function SentinelPage() {
                       <div className="space-y-1">
                         {task.botReview.validatedSteps.map((s, idx) => (
                           <div key={idx} className="text-xs">
-                            <span className={s.passed ? "text-green-600" : "text-red-600"}>{s.passed ? "PASS" : "FAIL"}</span>
+                            <span className={s.passed ? "text-[var(--success)]" : "text-[var(--error)]"}>{s.passed ? "PASS" : "FAIL"}</span>
                             <span className="ml-1 text-[var(--foreground)]">{s.step}</span>
                             {s.detail ? <span className="text-[var(--muted)]"> — {s.detail}</span> : null}
                           </div>
@@ -594,9 +600,9 @@ export default function SentinelPage() {
                         <div key={idx} className="text-[11px]">
                           <span className="text-[var(--muted)]">{new Date(entry.ts).toLocaleTimeString()} </span>
                           <span className={
-                            entry.type === "success" ? "text-green-600 dark:text-green-400" :
-                            entry.type === "error" ? "text-red-600 dark:text-red-400" :
-                            entry.type === "action" ? "text-[var(--primary)]" :
+                            entry.type === "success" ? "text-[var(--success)]" :
+                            entry.type === "error" ? "text-[var(--error)]" :
+                            entry.type === "action" ? "text-[var(--brand-primary)]" :
                             "text-[var(--foreground)]"
                           }>
                             {entry.message}
@@ -607,11 +613,10 @@ export default function SentinelPage() {
                   </div>
                 </div>
               )}
-            </div>
+            </Card>
           ))
         )}
       </div>
-    </div>
+    </StandardPageLayout>
   );
 }
-

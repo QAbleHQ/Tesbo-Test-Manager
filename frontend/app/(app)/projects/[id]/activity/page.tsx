@@ -4,6 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { authMe, getProject, listActivity, type ActivityLogItem } from "@/lib/api";
+import { Button, EmptyStateBlock, StatusChip } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 const ENTITY_FILTERS = [
   { value: "", label: "All" },
@@ -35,16 +37,16 @@ const ENTITY_LABELS: Record<string, string> = {
   bug: "Bug",
 };
 
-const ACTION_COLORS: Record<string, string> = {
-  created: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400",
-  updated: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400",
-  deleted: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400",
-  bulk_updated: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400",
-  bulk_deleted: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400",
-  ai_generated: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-400",
-  synced: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400",
-  connected: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400",
-  disconnected: "bg-zinc-100 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-300",
+const ACTION_TONES: Record<string, "success" | "info" | "error" | "ai" | "warning" | "neutral"> = {
+  created: "success",
+  updated: "info",
+  deleted: "error",
+  bulk_updated: "info",
+  bulk_deleted: "error",
+  ai_generated: "ai",
+  synced: "warning",
+  connected: "success",
+  disconnected: "neutral",
 };
 
 const ENTITY_ICONS: Record<string, string> = {
@@ -178,107 +180,75 @@ export default function ActivityPage() {
   if (loading && !project) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
-  return (
-    <main className="max-w-4xl mx-auto px-4 py-8">
-      {/* Header */}
-      <div className="mb-6">
-        <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
-          <Link href="/projects" className="hover:text-zinc-700 dark:hover:text-zinc-300">
-            Projects
-          </Link>
-          <span>/</span>
-          <Link
-            href={`/projects/${projectId}/dashboard`}
-            className="hover:text-zinc-700 dark:hover:text-zinc-300"
-          >
-            {projectName}
-          </Link>
-          <span>/</span>
-          <span className="text-zinc-900 dark:text-zinc-100">Activity</span>
-        </div>
-        <h1 className="mt-2 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
-          Activity
-        </h1>
-        <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Track all actions performed in this project with timestamps.
-        </p>
-      </div>
+  const breadcrumb = (
+    <>
+      <Link href="/projects" className="hover:text-[var(--foreground)]">
+        Projects
+      </Link>
+      <span>/</span>
+      <Link href={`/projects/${projectId}/dashboard`} className="hover:text-[var(--foreground)]">
+        {projectName}
+      </Link>
+      <span>/</span>
+      <span>Activity</span>
+    </>
+  );
 
+  return (
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Activity"
+          subtitle="Track all actions performed in this project with timestamps."
+          breadcrumb={breadcrumb}
+        />
+      }
+    >
       {/* Filters */}
       <div className="flex items-center gap-2 mb-6">
         {ENTITY_FILTERS.map((f) => (
-          <button
+          <Button
             key={f.value}
+            variant={entityFilter === f.value ? "primary" : "secondary"}
+            size="sm"
             onClick={() => setEntityFilter(f.value)}
-            className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors ${
-              entityFilter === f.value
-                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700"
-            }`}
           >
             {f.label}
-          </button>
+          </Button>
         ))}
       </div>
 
       {/* Activity Timeline */}
       {loading ? (
         <div className="flex items-center justify-center py-16">
-          <svg
-            className="animate-spin h-6 w-6 text-zinc-400"
-            fill="none"
-            viewBox="0 0 24 24"
-          >
-            <circle
-              className="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              strokeWidth="4"
-            />
-            <path
-              className="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-            />
+          <svg className="animate-spin h-6 w-6 text-[var(--muted)]" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
         </div>
       ) : activities.length === 0 ? (
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-12 text-center">
-          <svg
-            className="mx-auto h-12 w-12 text-zinc-300 dark:text-zinc-600"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={1.5}
-              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-            />
-          </svg>
-          <p className="mt-4 text-zinc-500 dark:text-zinc-400 font-medium">
-            No activity yet
-          </p>
-          <p className="mt-1 text-sm text-zinc-400 dark:text-zinc-500">
-            Actions like creating test cases, updating suites, and syncing Jira will appear here.
-          </p>
-        </div>
+        <EmptyStateBlock
+          title="No activity yet"
+          description="Actions like creating test cases, updating suites, and syncing Jira will appear here."
+          icon={
+            <svg className="h-12 w-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          }
+        />
       ) : (
         <div className="space-y-8">
           {groups.map((group) => (
             <div key={group.date}>
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-3 sticky top-0 bg-zinc-50 dark:bg-zinc-950 py-1 z-10">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)] mb-3 sticky top-0 bg-[var(--background)] py-1 z-10">
                 {group.date}
               </h3>
-              <div className="relative pl-6 border-l-2 border-zinc-200 dark:border-zinc-700 space-y-0">
+              <div className="relative pl-6 border-l-2 border-[var(--border)] space-y-0">
                 {group.items.map((item) => (
                   <ActivityRow key={item.id} item={item} />
                 ))}
@@ -288,39 +258,40 @@ export default function ActivityPage() {
 
           {hasMore && (
             <div className="flex justify-center pt-4">
-              <button
+              <Button
+                variant="secondary"
+                size="md"
                 onClick={() => fetchActivities(false, entityFilter)}
                 disabled={loadingMore}
-                className="px-4 py-2 text-sm font-medium rounded-lg bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors disabled:opacity-50"
               >
                 {loadingMore ? "Loading…" : "Load more"}
-              </button>
+              </Button>
             </div>
           )}
         </div>
       )}
-    </main>
+    </StandardPageLayout>
   );
 }
 
 function ActivityRow({ item }: { item: ActivityLogItem }) {
   const actionLabel = ACTION_LABELS[item.action] || item.action;
   const entityLabel = ENTITY_LABELS[item.entityType] || item.entityType;
-  const colorClass = ACTION_COLORS[item.action] || "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300";
+  const tone = ACTION_TONES[item.action] || "neutral";
   const iconPath = ENTITY_ICONS[item.entityType] || ENTITY_ICONS.testcase;
   const actorDisplay = item.actorName || item.actorEmail || "System";
 
   return (
     <div className="relative pb-5 group">
       {/* Timeline dot */}
-      <div className="absolute -left-[25px] top-1 w-3 h-3 rounded-full border-2 border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 group-hover:border-blue-400 dark:group-hover:border-blue-500 transition-colors" />
+      <div className="absolute -left-[25px] top-1 w-3 h-3 rounded-full border-2 border-[var(--border)] bg-[var(--surface)] group-hover:border-[var(--brand-primary)] transition-colors" />
 
-      <div className="rounded-lg border border-zinc-100 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4 hover:border-zinc-200 dark:hover:border-zinc-700 transition-colors">
+      <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] p-4 hover:border-[var(--border)] transition-colors">
         <div className="flex items-start gap-3">
           {/* Icon */}
-          <div className="mt-0.5 p-1.5 rounded-lg bg-zinc-50 dark:bg-zinc-800">
+          <div className="mt-0.5 p-1.5 rounded-lg bg-[var(--surface-secondary)]">
             <svg
-              className="w-4 h-4 text-zinc-500 dark:text-zinc-400"
+              className="w-4 h-4 text-[var(--muted)]"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -333,27 +304,17 @@ function ActivityRow({ item }: { item: ActivityLogItem }) {
           {/* Content */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                {actorDisplay}
-              </span>
-              <span
-                className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${colorClass}`}
-              >
-                {actionLabel}
-              </span>
-              <span className="text-sm text-zinc-500 dark:text-zinc-400">
-                {entityLabel}
-              </span>
+              <span className="text-sm font-medium text-[var(--foreground)]">{actorDisplay}</span>
+              <StatusChip tone={tone}>{actionLabel}</StatusChip>
+              <span className="text-sm text-[var(--muted)]">{entityLabel}</span>
             </div>
 
             {item.entityName && (
-              <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300 truncate">
-                {item.entityName}
-              </p>
+              <p className="mt-1 text-sm text-[var(--muted-soft)] truncate">{item.entityName}</p>
             )}
 
             <p
-              className="mt-1 text-xs text-zinc-400 dark:text-zinc-500"
+              className="mt-1 text-xs text-[var(--muted-soft)]"
               title={formatFullTimestamp(item.createdAt)}
             >
               {formatTimestamp(item.createdAt)} · {formatFullTimestamp(item.createdAt)}

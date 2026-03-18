@@ -24,6 +24,8 @@ import {
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
+import { Button, StatusChip, Input, Select, Textarea } from "@/components/ui";
+import Modal from "@/components/ui/Modal";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 const MANUAL_REQUIRED_NOTE = "Manual execution required (no linked automation script).";
@@ -39,6 +41,28 @@ const LIVE_STATUS_TO_EXEC_STATUS: Record<string, string> = {
   cancelled: "Skipped",
 };
 
+/* ───── Status tone helpers ───── */
+function statusToTone(status: string) {
+  const map: Record<string, "success" | "error" | "warning" | "info" | "neutral"> = {
+    Passed: "success",
+    Failed: "error",
+    Skipped: "warning",
+    Blocked: "warning",
+    Retest: "info",
+    Untested: "neutral",
+  };
+  return map[status] ?? "neutral";
+}
+
+function runStatusToTone(status: string) {
+  const map: Record<string, "success" | "info" | "warning" | "neutral"> = {
+    Completed: "success",
+    "In Progress": "info",
+    Planning: "warning",
+  };
+  return map[status] ?? "neutral";
+}
+
 /* ───── Donut chart (pure SVG) ───── */
 function DonutChart({
   data,
@@ -52,7 +76,7 @@ function DonutChart({
     return (
       <svg width={size} height={size} viewBox="0 0 36 36">
         <circle cx="18" cy="18" r="15.915" fill="none" stroke="#e4e4e7" strokeWidth="3" />
-        <text x="18" y="19.5" textAnchor="middle" className="text-[3.5px] fill-zinc-400 font-medium">
+        <text x="18" y="19.5" textAnchor="middle" className="text-[3.5px] fill-[var(--muted-soft)] font-medium">
           No data
         </text>
       </svg>
@@ -86,43 +110,13 @@ function DonutChart({
           />
         );
       })}
-      <text x="18" y="17" textAnchor="middle" className="text-[5px] font-bold fill-zinc-900 dark:fill-zinc-100">
+      <text x="18" y="17" textAnchor="middle" className="text-[5px] font-bold fill-[var(--foreground)]">
         {total}
       </text>
-      <text x="18" y="21" textAnchor="middle" className="text-[2.5px] fill-zinc-400 font-medium">
+      <text x="18" y="21" textAnchor="middle" className="text-[2.5px] fill-[var(--muted-soft)] font-medium">
         Total
       </text>
     </svg>
-  );
-}
-
-/* ───── Status badge ───── */
-function StatusBadge({ status }: { status: string }) {
-  const cls: Record<string, string> = {
-    Passed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    Failed: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
-    Skipped: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300",
-    Blocked: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
-    Retest: "bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300",
-    Untested: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
-  };
-  return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${cls[status] || cls.Untested}`}>
-      {status}
-    </span>
-  );
-}
-
-function RunStatusBadge({ status }: { status: string }) {
-  const cls: Record<string, string> = {
-    Planning: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
-    "In Progress": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
-    Completed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-  };
-  return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls[status] || cls.Planning}`}>
-      {status}
-    </span>
   );
 }
 
@@ -139,46 +133,13 @@ function MetricCard({
   icon: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4 flex items-center gap-3">
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 flex items-center gap-3">
       <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${color}`}>
         {icon}
       </div>
       <div>
-        <p className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">{value}</p>
-        <p className="text-xs text-zinc-500">{label}</p>
-      </div>
-    </div>
-  );
-}
-
-/* ───── Modal ───── */
-function Modal({
-  open,
-  onClose,
-  title,
-  children,
-  wide,
-}: {
-  open: boolean;
-  onClose: () => void;
-  title: string;
-  children: React.ReactNode;
-  wide?: boolean;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-16 overflow-y-auto">
-      <div className="fixed inset-0 bg-black/40" onClick={onClose} />
-      <div className={`relative bg-white dark:bg-zinc-900 rounded-xl shadow-2xl mx-4 p-6 mb-8 ${wide ? "w-full max-w-4xl" : "w-full max-w-lg"}`}>
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">{title}</h2>
-          <button onClick={onClose} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-        {children}
+        <p className="text-2xl font-bold text-[var(--foreground)]">{value}</p>
+        <p className="text-xs text-[var(--muted)]">{label}</p>
       </div>
     </div>
   );
@@ -512,7 +473,6 @@ export default function TestRunDetailPage() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // fallback
       const ta = document.createElement("textarea");
       ta.value = url;
       document.body.appendChild(ta);
@@ -573,7 +533,7 @@ export default function TestRunDetailPage() {
   if (loading || !run) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
@@ -583,15 +543,15 @@ export default function TestRunDetailPage() {
   const isCompleted = run.status === "Completed";
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
+    <div className="min-h-screen bg-[var(--background)]">
       {/* ───── Breadcrumb ───── */}
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-6 py-3">
+      <header className="border-b border-[var(--border)] bg-[var(--surface)] px-6 py-3">
         <div className="flex items-center gap-2 text-sm">
-          <Link href={`/projects/${projectId}/cycles`} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300">
+          <Link href={`/projects/${projectId}/cycles`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
             Test Runs
           </Link>
-          <span className="text-zinc-300 dark:text-zinc-600">/</span>
-          <span className="text-zinc-900 dark:text-zinc-100 font-medium">{run.name}</span>
+          <span className="text-[var(--muted-soft)]">/</span>
+          <span className="text-[var(--foreground)] font-medium">{run.name}</span>
         </div>
       </header>
 
@@ -600,74 +560,60 @@ export default function TestRunDetailPage() {
         <div className="flex items-start justify-between mb-6">
           <div>
             <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">
+              <h1 className="text-2xl font-bold text-[var(--foreground)]">
                 {run.name}
               </h1>
-              <RunStatusBadge status={run.status} />
+              <StatusChip tone={runStatusToTone(run.status)}>{run.status}</StatusChip>
             </div>
             {run.description && (
-              <p className="mt-1 text-sm text-zinc-500">{run.description}</p>
+              <p className="mt-1 text-sm text-[var(--muted)]">{run.description}</p>
             )}
-            <div className="flex items-center gap-4 mt-2 text-xs text-zinc-400">
+            <div className="flex items-center gap-4 mt-2 text-xs text-[var(--muted-soft)]">
               {run.environment && <span>Env: {run.environment}</span>}
               {run.buildVersion && <span>Build: {run.buildVersion}</span>}
               <span>Created {new Date(run.createdAt).toLocaleDateString()}</span>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {/* Status transition buttons */}
             {isPlanning && (
-              <button
-                onClick={() => handleRunStatusChange("In Progress")}
-                className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium"
-              >
+              <Button onClick={() => handleRunStatusChange("In Progress")}>
                 Start Execution
-              </button>
+              </Button>
             )}
             {isInProgress && (
-              <button
-                onClick={() => handleRunStatusChange("Completed")}
-                className="rounded-lg bg-green-600 hover:bg-green-700 text-white px-4 py-2 text-sm font-medium"
-              >
+              <Button variant="primary" onClick={() => handleRunStatusChange("Completed")}>
                 Mark Completed
-              </button>
+              </Button>
             )}
             {isCompleted && (
-              <button
-                onClick={() => handleRunStatusChange("In Progress")}
-                className="rounded-lg border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-400 px-4 py-2 text-sm font-medium hover:bg-blue-50 dark:hover:bg-blue-900/20"
-              >
+              <Button variant="secondary" onClick={() => handleRunStatusChange("In Progress")}>
                 Reopen
-              </button>
+              </Button>
             )}
-            {/* Add test cases (Planning or In Progress) */}
             {!isCompleted && (
-              <button
-                onClick={openPicker}
-                className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
-              >
+              <Button variant="secondary" onClick={openPicker}>
                 + Add Test Cases
-              </button>
+              </Button>
             )}
-            <button
+            <Button
+              variant="ai"
               onClick={handleRunAutomated}
               disabled={automatedRunId !== null || executions.length === 0 || automatedStarting}
-              className="rounded-lg bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               {automatedStarting ? "Starting..." : automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="secondary"
               onClick={() => setShowShare(true)}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800 flex items-center gap-1.5"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
               </svg>
               Share
-            </button>
+            </Button>
             <a
               href={`${API_BASE}/api/cycles/${cycleId}/export/csv`}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              className="rounded-lg border border-[var(--border)] text-[var(--foreground)] px-4 py-2 text-sm font-medium hover:bg-[var(--surface-secondary)]"
               target="_blank"
               rel="noreferrer"
             >
@@ -678,7 +624,7 @@ export default function TestRunDetailPage() {
 
         {/* ───── Dashboard: Metric Cards + Donut Chart ───── */}
         {automatedLiveStatus && automatedRunId && (
-          <div className="mb-4 rounded-lg border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 px-4 py-2 text-sm text-violet-800 dark:text-violet-300">
+          <div className="mb-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-2 text-sm text-violet-800">
             Live automation: {automatedLiveStatus.completed}/{automatedLiveStatus.totalCases} completed • Passed {automatedLiveStatus.passed}, Failed {automatedLiveStatus.failed}
             {runningLiveItems.length > 0 && (
               <div className="mt-1 text-xs">
@@ -709,7 +655,7 @@ export default function TestRunDetailPage() {
           </div>
         )}
         {automatedSummary && (
-          <div className="mb-4 rounded-lg border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 px-4 py-2 text-sm text-violet-800 dark:text-violet-300">
+          <div className="mb-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-2 text-sm text-violet-800">
             {automatedSummary}
           </div>
         )}
@@ -719,7 +665,7 @@ export default function TestRunDetailPage() {
             <MetricCard
               label="Total Cases"
               value={stats.total}
-              color="bg-blue-50 dark:bg-blue-900/30 text-blue-600"
+              color="bg-blue-50 text-blue-600"
               icon={
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
@@ -729,7 +675,7 @@ export default function TestRunDetailPage() {
             <MetricCard
               label="Passed"
               value={stats.passed}
-              color="bg-green-50 dark:bg-green-900/30 text-green-600"
+              color="bg-green-50 text-green-600"
               icon={
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
@@ -739,7 +685,7 @@ export default function TestRunDetailPage() {
             <MetricCard
               label="Failed"
               value={stats.failed}
-              color="bg-red-50 dark:bg-red-900/30 text-red-600"
+              color="bg-red-50 text-red-600"
               icon={
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -749,7 +695,7 @@ export default function TestRunDetailPage() {
             <MetricCard
               label="Skipped"
               value={stats.skipped}
-              color="bg-yellow-50 dark:bg-yellow-900/30 text-yellow-600"
+              color="bg-yellow-50 text-yellow-600"
               icon={
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
@@ -759,7 +705,7 @@ export default function TestRunDetailPage() {
             <MetricCard
               label="Pending"
               value={stats.pending}
-              color="bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+              color="bg-[var(--surface-secondary)] text-[var(--muted)]"
               icon={
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -769,7 +715,7 @@ export default function TestRunDetailPage() {
           </div>
 
           {/* Donut chart (right col) */}
-          <div className="flex flex-col items-center justify-center rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
+          <div className="flex flex-col items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
             <DonutChart data={chartData} size={160} />
             <div className="flex flex-wrap justify-center gap-3 mt-3">
               {chartData
@@ -777,7 +723,7 @@ export default function TestRunDetailPage() {
                 .map((d) => (
                   <div key={d.label} className="flex items-center gap-1.5 text-xs">
                     <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: d.color }} />
-                    <span className="text-zinc-600 dark:text-zinc-400">
+                    <span className="text-[var(--muted)]">
                       {d.label} ({d.value})
                     </span>
                   </div>
@@ -787,21 +733,21 @@ export default function TestRunDetailPage() {
         </div>
 
         {/* ───── Executions Table ───── */}
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden bg-white dark:bg-zinc-900">
-          <div className="px-5 py-3 border-b border-zinc-200 dark:border-zinc-700 flex items-center justify-between">
-            <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">
+        <div className="rounded-xl border border-[var(--border)] overflow-hidden bg-[var(--surface)]">
+          <div className="px-5 py-3 border-b border-[var(--border)] flex items-center justify-between">
+            <h2 className="font-semibold text-[var(--foreground)]">
               Test Cases ({executions.length})
             </h2>
           </div>
           {executions.length === 0 ? (
-            <div className="text-center py-12 text-zinc-400 text-sm">
+            <div className="text-center py-12 text-[var(--muted-soft)] text-sm">
               No test cases added yet. Click &quot;+ Add Test Cases&quot; to get started.
             </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full">
                 <thead>
-                  <tr className="border-b border-zinc-200 dark:border-zinc-700 text-left text-xs text-zinc-500 uppercase tracking-wider">
+                  <tr className="border-b border-[var(--border)] text-left text-xs text-[var(--muted)] uppercase tracking-wider">
                     <th className="px-5 py-3 font-medium">ID</th>
                     <th className="px-5 py-3 font-medium">Test Case</th>
                     <th className="px-5 py-3 font-medium">Priority</th>
@@ -810,64 +756,62 @@ export default function TestRunDetailPage() {
                     {!isCompleted && <th className="px-5 py-3 font-medium w-8"></th>}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                <tbody className="divide-y divide-[var(--border-subtle)]">
                   {executions.map((e) => (
-                    <tr key={e.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
-                      <td className="px-5 py-3 text-xs text-zinc-400 font-mono whitespace-nowrap">
+                    <tr key={e.id} className="hover:bg-[var(--surface-secondary)]">
+                      <td className="px-5 py-3 text-xs text-[var(--muted-soft)] font-mono whitespace-nowrap">
                         {e.externalId || "—"}
                       </td>
                       <td className="px-5 py-3">
                         <div className="flex items-center gap-2">
                           <Link
                             href={`/projects/${projectId}/cycles/${cycleId}/execute/${e.id}`}
-                            className="text-sm text-blue-600 hover:text-blue-700 dark:text-blue-400 hover:underline"
+                            className="text-sm text-[var(--brand-primary)] hover:text-[var(--brand-hover)] hover:underline"
                           >
                             {e.title}
                           </Link>
                           {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "running" && (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
+                            <StatusChip tone="info" live className="text-[10px] uppercase tracking-wide">
                               Running
-                            </span>
+                            </StatusChip>
                           )}
                           {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "queued" && (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                            <StatusChip tone="warning" className="text-[10px] uppercase tracking-wide">
                               In Queue
-                            </span>
+                            </StatusChip>
                           )}
                           {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "manual" && (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-500" />
+                            <StatusChip tone="neutral" className="text-[10px] uppercase tracking-wide">
                               Manual
-                            </span>
+                            </StatusChip>
                           )}
                           {e.status === "Untested" && e.actualResult === MANUAL_REQUIRED_NOTE && (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-500" />
+                            <StatusChip tone="neutral" className="text-[10px] uppercase tracking-wide">
                               Manual
-                            </span>
+                            </StatusChip>
                           )}
                         </div>
                       </td>
                       <td className="px-5 py-3">
-                        <span className="text-xs text-zinc-500">{e.priority || "—"}</span>
+                        <span className="text-xs text-[var(--muted)]">{e.priority || "—"}</span>
                       </td>
                       <td className="px-5 py-3">
-                        <span className="text-xs text-zinc-500">{e.type || "—"}</span>
+                        <span className="text-xs text-[var(--muted)]">{e.type || "—"}</span>
                       </td>
                       <td className="px-5 py-3">
                         {automatedRunId && liveStatusByExecutionId.has(e.id) ? (
                           <div className="flex items-center gap-2">
-                            <StatusBadge status={LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested"} />
+                            <StatusChip tone={statusToTone(LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested")}>
+                              {LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested"}
+                            </StatusChip>
                             {liveStatusByExecutionId.get(e.id)?.status === "running" && (
-                              <span className="text-xs text-blue-600 dark:text-blue-400">Running...</span>
+                              <span className="text-xs text-blue-600">Running...</span>
                             )}
                             {liveStatusByExecutionId.get(e.id)?.status === "queued" && (
-                              <span className="text-xs text-amber-600 dark:text-amber-400">Queued</span>
+                              <span className="text-xs text-amber-600">Queued</span>
                             )}
                             {liveStatusByExecutionId.get(e.id)?.status === "manual" && (
-                              <span className="text-xs text-zinc-600 dark:text-zinc-400">Manual run required</span>
+                              <span className="text-xs text-[var(--muted)]">Manual run required</span>
                             )}
                           </div>
                         ) : isInProgress ? (
@@ -877,12 +821,12 @@ export default function TestRunDetailPage() {
                             disabled={statusSaving === e.id}
                             className={`text-xs font-medium rounded-lg border px-2 py-1 cursor-pointer ${
                               e.status === "Passed"
-                                ? "border-green-200 bg-green-50 text-green-800 dark:border-green-800 dark:bg-green-900/30 dark:text-green-300"
+                                ? "border-green-200 bg-green-50 text-green-800"
                                 : e.status === "Failed"
-                                ? "border-red-200 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-300"
+                                ? "border-red-200 bg-red-50 text-red-800"
                                 : e.status === "Skipped"
-                                ? "border-yellow-200 bg-yellow-50 text-yellow-800 dark:border-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300"
-                                : "border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-400"
+                                ? "border-yellow-200 bg-yellow-50 text-yellow-800"
+                                : "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]"
                             }`}
                           >
                             {EXEC_STATUSES.map((s) => (
@@ -892,14 +836,14 @@ export default function TestRunDetailPage() {
                             ))}
                           </select>
                         ) : (
-                          <StatusBadge status={e.status} />
+                          <StatusChip tone={statusToTone(e.status)}>{e.status}</StatusChip>
                         )}
                       </td>
                       {!isCompleted && (
                         <td className="px-5 py-3">
                           <button
                             onClick={() => handleRemoveCase(e.testcaseId)}
-                            className="text-zinc-300 hover:text-red-500 dark:text-zinc-600 dark:hover:text-red-400"
+                            className="text-[var(--muted-soft)] hover:text-[var(--error)]"
                             title="Remove from test run"
                           >
                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -922,32 +866,30 @@ export default function TestRunDetailPage() {
         open={showPicker}
         onClose={() => setShowPicker(false)}
         title="Add Test Cases to Run"
-        wide
+        className="!max-w-4xl"
       >
         {/* Filters */}
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
-          <input
+          <Input
             type="text"
             placeholder="Search by title or ID…"
             value={filterSearch}
             onChange={(e) => setFilterSearch(e.target.value)}
-            className="col-span-2 sm:col-span-2 rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
+            className="col-span-2 sm:col-span-2"
           />
-          <select
+          <Select
             value={filterPriority}
             onChange={(e) => setFilterPriority(e.target.value)}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-2 py-2 text-sm"
           >
             <option value="">All Priorities</option>
             <option value="P0">P0 - Critical</option>
             <option value="P1">P1 - High</option>
             <option value="P2">P2 - Medium</option>
             <option value="P3">P3 - Low</option>
-          </select>
-          <select
+          </Select>
+          <Select
             value={filterType}
             onChange={(e) => setFilterType(e.target.value)}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-2 py-2 text-sm"
           >
             <option value="">All Types</option>
             <option value="Functional">Functional</option>
@@ -958,11 +900,10 @@ export default function TestRunDetailPage() {
             <option value="Security">Security</option>
             <option value="Usability">Usability</option>
             <option value="Other">Other</option>
-          </select>
-          <select
+          </Select>
+          <Select
             value={filterSuiteId}
             onChange={(e) => setFilterSuiteId(e.target.value)}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-2 py-2 text-sm"
           >
             <option value="">All Suites</option>
             {suites.map((s) => (
@@ -970,44 +911,43 @@ export default function TestRunDetailPage() {
                 {s.name}
               </option>
             ))}
-          </select>
-          <select
+          </Select>
+          <Select
             value={filterStatus}
             onChange={(e) => setFilterStatus(e.target.value)}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-2 py-2 text-sm"
           >
             <option value="">All Statuses</option>
             <option value="Approved">Approved</option>
             <option value="Draft">Draft</option>
             <option value="In Review">In Review</option>
-          </select>
+          </Select>
         </div>
 
         {/* Info note */}
-        <div className="flex items-center gap-2 mb-4 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 px-3 py-2">
-          <svg className="w-4 h-4 text-blue-500 dark:text-blue-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div className="flex items-center gap-2 mb-4 rounded-lg bg-blue-50 border border-blue-200 px-3 py-2">
+          <svg className="w-4 h-4 text-blue-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
-          <p className="text-xs text-blue-700 dark:text-blue-300">
+          <p className="text-xs text-blue-700">
             Only <span className="font-semibold">Approved</span> test cases can be added to a test run. Draft, In Review, or other status cases are shown but cannot be selected.
           </p>
         </div>
 
         {/* Case list */}
         {casesLoading ? (
-          <div className="text-center py-8 text-zinc-400 text-sm">Loading test cases…</div>
+          <div className="text-center py-8 text-[var(--muted-soft)] text-sm">Loading test cases…</div>
         ) : filteredCases.length === 0 ? (
-          <div className="text-center py-8 text-zinc-400 text-sm">
+          <div className="text-center py-8 text-[var(--muted-soft)] text-sm">
             {allCases.length === 0
               ? "No test cases in this project."
               : "No matching test cases found (all may already be added)."}
           </div>
         ) : (
           <>
-            <div className="max-h-80 overflow-y-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
+            <div className="max-h-80 overflow-y-auto rounded-lg border border-[var(--border)]">
               <table className="w-full">
-                <thead className="sticky top-0 bg-zinc-50 dark:bg-zinc-800">
-                  <tr className="text-left text-xs text-zinc-500 uppercase tracking-wider">
+                <thead className="sticky top-0 bg-[var(--surface-secondary)]">
+                  <tr className="text-left text-xs text-[var(--muted)] uppercase tracking-wider">
                     <th className="px-3 py-2 w-8">
                       <input
                         type="checkbox"
@@ -1024,7 +964,7 @@ export default function TestRunDetailPage() {
                     <th className="px-3 py-2 font-medium">Status</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                <tbody className="divide-y divide-[var(--border-subtle)]">
                   {filteredCases.map((tc) => {
                     const isApproved = tc.status === "Approved";
                     return (
@@ -1032,8 +972,8 @@ export default function TestRunDetailPage() {
                         key={tc.id}
                         className={`${
                           isApproved
-                            ? `cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50 ${
-                                selectedCases.has(tc.id) ? "bg-blue-50/50 dark:bg-blue-900/10" : ""
+                            ? `cursor-pointer hover:bg-[var(--surface-secondary)] ${
+                                selectedCases.has(tc.id) ? "bg-blue-50/50" : ""
                               }`
                             : "opacity-50 cursor-not-allowed"
                         }`}
@@ -1051,19 +991,19 @@ export default function TestRunDetailPage() {
                             title={!isApproved ? `Only Approved test cases can be added. This case is "${tc.status}".` : undefined}
                           />
                         </td>
-                        <td className="px-3 py-2 text-xs text-zinc-400 font-mono whitespace-nowrap">
+                        <td className="px-3 py-2 text-xs text-[var(--muted-soft)] font-mono whitespace-nowrap">
                           {tc.externalId}
                         </td>
-                        <td className="px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 truncate max-w-xs">
+                        <td className="px-3 py-2 text-sm text-[var(--foreground)] truncate max-w-xs">
                           {tc.title}
                         </td>
-                        <td className="px-3 py-2 text-xs text-zinc-500">{tc.priority}</td>
-                        <td className="px-3 py-2 text-xs text-zinc-500">{tc.type}</td>
+                        <td className="px-3 py-2 text-xs text-[var(--muted)]">{tc.priority}</td>
+                        <td className="px-3 py-2 text-xs text-[var(--muted)]">{tc.type}</td>
                         <td className="px-3 py-2">
                           <span className={`text-xs ${
                             isApproved
-                              ? "text-green-600 dark:text-green-400 font-medium"
-                              : "text-zinc-500"
+                              ? "text-[var(--success)] font-medium"
+                              : "text-[var(--muted)]"
                           }`}>
                             {tc.status}
                           </span>
@@ -1075,28 +1015,24 @@ export default function TestRunDetailPage() {
               </table>
             </div>
             <div className="flex items-center justify-between mt-4">
-              <p className="text-sm text-zinc-500">
+              <p className="text-sm text-[var(--muted)]">
                 {selectedCases.size} of {selectableCases.length} selectable selected
                 {selectableCases.length < filteredCases.length && (
-                  <span className="text-zinc-400 ml-1">
+                  <span className="text-[var(--muted-soft)] ml-1">
                     ({filteredCases.length - selectableCases.length} non-approved)
                   </span>
                 )}
               </p>
               <div className="flex gap-2">
-                <button
-                  onClick={() => setShowPicker(false)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                >
+                <Button variant="secondary" onClick={() => setShowPicker(false)}>
                   Cancel
-                </button>
-                <button
+                </Button>
+                <Button
                   onClick={handleAddCases}
                   disabled={adding || selectedCases.size === 0}
-                  className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
                 >
                   {adding ? "Adding…" : `Add ${selectedCases.size} Case${selectedCases.size !== 1 ? "s" : ""}`}
-                </button>
+                </Button>
               </div>
             </div>
           </>
@@ -1110,68 +1046,62 @@ export default function TestRunDetailPage() {
         title="Report a Bug"
       >
         <div className="space-y-4">
-          <div className="flex items-start gap-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3">
-            <svg className="w-5 h-5 text-red-500 dark:text-red-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-200 p-3">
+            <svg className="w-5 h-5 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
             </svg>
             <div>
-              <p className="text-sm font-medium text-red-800 dark:text-red-300">Test case marked as Failed</p>
-              <p className="text-xs text-red-600 dark:text-red-400 mt-0.5">
+              <p className="text-sm font-medium text-red-800">Test case marked as Failed</p>
+              <p className="text-xs text-red-600 mt-0.5">
                 {bugExecution?.externalId && <span className="font-mono mr-1">{bugExecution.externalId}</span>}
                 {bugExecution?.title}
               </p>
             </div>
           </div>
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          <p className="text-sm text-[var(--muted)]">
             Would you like to file a bug report? You can add details now or skip and report later from the Bugs section.
           </p>
           <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Bug Title <span className="text-red-500">*</span>
+            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
+              Bug Title <span className="text-[var(--error)]">*</span>
             </label>
-            <input
+            <Input
               type="text"
               value={bugTitle}
               onChange={(e) => setBugTitle(e.target.value)}
               placeholder="Brief summary of the bug…"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
               Description
             </label>
-            <textarea
+            <Textarea
               value={bugDesc}
               onChange={(e) => setBugDesc(e.target.value)}
               rows={3}
               placeholder="Steps to reproduce, expected vs actual behavior…"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
               Bug Link (external tracker URL)
             </label>
-            <input
+            <Input
               type="url"
               value={bugUrl}
               onChange={(e) => setBugUrl(e.target.value)}
               placeholder="https://jira.example.com/browse/BUG-123"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
           </div>
           <div className="flex justify-end gap-2 pt-2">
-            <button
-              onClick={handleBugSkip}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-            >
+            <Button variant="secondary" onClick={handleBugSkip}>
               Skip
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="destructive"
               onClick={handleBugSubmit}
               disabled={bugSaving || !bugTitle.trim()}
-              className="rounded-lg bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50 flex items-center gap-1.5"
             >
               {bugSaving ? (
                 "Filing…"
@@ -1183,7 +1113,7 @@ export default function TestRunDetailPage() {
                   File Bug
                 </>
               )}
-            </button>
+            </Button>
           </div>
         </div>
       </Modal>
@@ -1195,17 +1125,17 @@ export default function TestRunDetailPage() {
         title="Share Test Run"
       >
         <div className="space-y-5">
-          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          <p className="text-sm text-[var(--muted)]">
             Create a public link to share this test run&apos;s results with anyone &mdash; no login required.
           </p>
 
           {/* Toggle */}
-          <div className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-700 p-4">
+          <div className="flex items-center justify-between rounded-lg border border-[var(--border)] p-4">
             <div>
-              <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+              <p className="text-sm font-medium text-[var(--foreground)]">
                 Public sharing
               </p>
-              <p className="text-xs text-zinc-500 mt-0.5">
+              <p className="text-xs text-[var(--muted)] mt-0.5">
                 {shareEnabled
                   ? "Anyone with the link can view this test run"
                   : "Sharing is currently disabled"}
@@ -1214,10 +1144,10 @@ export default function TestRunDetailPage() {
             <button
               onClick={() => handleShareToggle(!shareEnabled)}
               disabled={shareToggling}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--brand-primary)] focus:ring-offset-2 ${
                 shareEnabled
-                  ? "bg-blue-600"
-                  : "bg-zinc-300 dark:bg-zinc-600"
+                  ? "bg-[var(--brand-primary)]"
+                  : "bg-[var(--surface-tertiary)]"
               } ${shareToggling ? "opacity-50" : ""}`}
             >
               <span
@@ -1232,20 +1162,16 @@ export default function TestRunDetailPage() {
           {shareEnabled && shareToken && (
             <div className="space-y-3">
               <div className="flex items-center gap-2">
-                <input
+                <Input
                   type="text"
                   readOnly
                   value={getShareUrl()}
-                  className="flex-1 rounded-lg border border-zinc-300 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300 font-mono truncate"
+                  className="flex-1 bg-[var(--surface-secondary)] font-mono truncate"
                   onClick={(e) => (e.target as HTMLInputElement).select()}
                 />
-                <button
+                <Button
                   onClick={copyShareLink}
-                  className={`shrink-0 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
-                    copied
-                      ? "bg-green-600 text-white"
-                      : "bg-blue-600 hover:bg-blue-700 text-white"
-                  }`}
+                  className={copied ? "!bg-green-600" : ""}
                 >
                   {copied ? (
                     <span className="flex items-center gap-1">
@@ -1262,13 +1188,13 @@ export default function TestRunDetailPage() {
                       Copy Link
                     </span>
                   )}
-                </button>
+                </Button>
               </div>
-              <div className="flex items-start gap-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 p-3">
-                <svg className="w-4 h-4 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div className="flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 p-3">
+                <svg className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
                 </svg>
-                <p className="text-xs text-amber-800 dark:text-amber-300">
+                <p className="text-xs text-amber-800">
                   This link is publicly accessible. Anyone with it can view the test run results, execution statuses, and test case details. You can disable sharing at any time.
                 </p>
               </div>
@@ -1276,12 +1202,9 @@ export default function TestRunDetailPage() {
           )}
 
           <div className="flex justify-end pt-2">
-            <button
-              onClick={() => setShowShare(false)}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-            >
+            <Button variant="secondary" onClick={() => setShowShare(false)}>
               Done
-            </button>
+            </Button>
           </div>
         </div>
       </Modal>

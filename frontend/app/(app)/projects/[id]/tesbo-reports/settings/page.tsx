@@ -2,6 +2,7 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function TesboSettingsPage() {
   const params = useParams();
@@ -15,8 +16,12 @@ export default function TesboSettingsPage() {
   }, [projectId, router]);
 
   return (
-    <main className="max-w-3xl mx-auto px-6 py-8">
-      <p className="text-sm text-zinc-500 dark:text-zinc-400">Opening project settings…</p>
+    <main className="tesbo-page max-w-3xl mx-auto">
+      <StandardPageLayout
+        header={<PageHeader title="Tesbo Settings" subtitle="Opening project settings…" />}
+      >
+        <p className="text-sm text-[var(--muted)]">Opening project settings…</p>
+      </StandardPageLayout>
     </main>
   );
 }

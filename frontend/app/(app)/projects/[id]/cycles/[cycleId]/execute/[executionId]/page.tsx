@@ -14,23 +14,20 @@ import {
   type ExecutionAutomationReport,
   type ExecutionItem,
 } from "@/lib/api";
+import { Button, StatusChip, Input, Textarea } from "@/components/ui";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
-function StatusBadge({ status }: { status: string }) {
-  const cls: Record<string, string> = {
-    Passed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
-    Failed: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
-    Skipped: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300",
-    Blocked: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
-    Retest: "bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300",
-    Untested: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
+function statusToTone(status: string) {
+  const map: Record<string, "success" | "error" | "warning" | "info" | "neutral"> = {
+    Passed: "success",
+    Failed: "error",
+    Skipped: "warning",
+    Blocked: "warning",
+    Retest: "info",
+    Untested: "neutral",
   };
-  return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${cls[status] || cls.Untested}`}>
-      {status}
-    </span>
-  );
+  return map[status] ?? "neutral";
 }
 
 export default function ExecutionDetailPage() {
@@ -143,55 +140,55 @@ export default function ExecutionDetailPage() {
   if (!execution) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-6 py-3">
+    <div className="min-h-screen bg-[var(--background)]">
+      <header className="border-b border-[var(--border)] bg-[var(--surface)] px-6 py-3">
         <div className="flex items-center gap-2 text-sm">
-          <Link href={`/projects/${projectId}/cycles`} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300">
+          <Link href={`/projects/${projectId}/cycles`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
             Test Runs
           </Link>
-          <span className="text-zinc-300 dark:text-zinc-600">/</span>
-          <Link href={`/projects/${projectId}/cycles/${cycleId}`} className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300">
+          <span className="text-[var(--muted-soft)]">/</span>
+          <Link href={`/projects/${projectId}/cycles/${cycleId}`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
             Run Detail
           </Link>
-          <span className="text-zinc-300 dark:text-zinc-600">/</span>
-          <span className="text-zinc-900 dark:text-zinc-100 font-medium">Execute</span>
+          <span className="text-[var(--muted-soft)]">/</span>
+          <span className="text-[var(--foreground)] font-medium">Execute</span>
         </div>
       </header>
 
       <main className="max-w-2xl mx-auto px-6 py-8">
         <div className="flex items-center gap-3 mb-6">
-          <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100">
+          <h1 className="text-xl font-bold text-[var(--foreground)]">
             {execution.title}
           </h1>
-          <StatusBadge status={status} />
+          <StatusChip tone={statusToTone(status)}>{status}</StatusChip>
         </div>
 
         {execution.externalId && (
-          <p className="text-xs text-zinc-400 font-mono mb-4">{execution.externalId}</p>
+          <p className="text-xs text-[var(--muted-soft)] font-mono mb-4">{execution.externalId}</p>
         )}
 
         <form onSubmit={handleSave} className="space-y-5">
           {/* Status buttons */}
           <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-2">
+            <label className="block text-sm font-medium text-[var(--muted)] mb-2">
               Status
             </label>
             <div className="flex flex-wrap gap-2">
               {STATUSES.map((s) => {
                 const active = status === s;
                 const colors: Record<string, string> = {
-                  Passed: active ? "bg-green-600 text-white" : "border-green-200 text-green-700 hover:bg-green-50 dark:border-green-800 dark:text-green-400 dark:hover:bg-green-900/20",
-                  Failed: active ? "bg-red-600 text-white" : "border-red-200 text-red-700 hover:bg-red-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-900/20",
-                  Skipped: active ? "bg-yellow-500 text-white" : "border-yellow-200 text-yellow-700 hover:bg-yellow-50 dark:border-yellow-800 dark:text-yellow-400 dark:hover:bg-yellow-900/20",
-                  Blocked: active ? "bg-orange-500 text-white" : "border-orange-200 text-orange-700 hover:bg-orange-50 dark:border-orange-800 dark:text-orange-400 dark:hover:bg-orange-900/20",
-                  Retest: active ? "bg-purple-600 text-white" : "border-purple-200 text-purple-700 hover:bg-purple-50 dark:border-purple-800 dark:text-purple-400 dark:hover:bg-purple-900/20",
-                  Untested: active ? "bg-zinc-600 text-white" : "border-zinc-200 text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800",
+                  Passed: active ? "bg-[var(--success)] text-white" : "border-[var(--success)]/30 text-[var(--success)] hover:bg-[var(--success-soft)]",
+                  Failed: active ? "bg-[var(--error)] text-white" : "border-[var(--error)]/30 text-[var(--error)] hover:bg-[var(--error-soft)]",
+                  Skipped: active ? "bg-[var(--warning)] text-white" : "border-[var(--warning)]/30 text-[var(--warning)] hover:bg-[var(--warning-soft)]",
+                  Blocked: active ? "bg-[var(--warning)] text-white" : "border-[var(--warning)]/30 text-[var(--warning)] hover:bg-[var(--warning-soft)]",
+                  Retest: active ? "bg-[var(--info)] text-white" : "border-[var(--info)]/30 text-[var(--info)] hover:bg-[var(--info-soft)]",
+                  Untested: active ? "bg-[var(--muted)] text-white" : "border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]",
                 };
                 return (
                   <button
@@ -208,50 +205,49 @@ export default function ExecutionDetailPage() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
               Actual Result / Notes
             </label>
-            <textarea
+            <Textarea
               value={actualResult}
               onChange={(e) => setActualResult(e.target.value)}
               rows={4}
               placeholder="Describe what actually happened…"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
           </div>
 
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 bg-zinc-50 dark:bg-zinc-900/40">
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
+          <div className="rounded-xl border border-[var(--border)] p-4 bg-[var(--surface-secondary)]">
+            <h3 className="text-sm font-semibold text-[var(--foreground)] mb-2">
               Automated Run Artifacts
             </h3>
             {liveRunState && (
-              <div className="mb-3 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-3 py-2 text-xs text-blue-800 dark:text-blue-300">
+              <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
                 {liveRunState === "running"
                   ? "Live preview is active. This page refreshes automation artifacts every few seconds."
                   : "This testcase is queued for automation. Live preview will start when execution begins."}
               </div>
             )}
             {reportLoading ? (
-              <p className="text-sm text-zinc-500">Loading run logs...</p>
+              <p className="text-sm text-[var(--muted)]">Loading run logs...</p>
             ) : !automationReport || automationReport.status === "not_available" ? (
-              <p className="text-sm text-zinc-500">
+              <p className="text-sm text-[var(--muted)]">
                 No automated run artifacts found for this execution yet.
               </p>
             ) : (
               <div className="space-y-4">
                 {latestScreenshotUrl && (
                   <div>
-                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Live Preview</p>
+                    <p className="text-xs font-medium text-[var(--muted)] mb-2">Live Preview</p>
                     <a href={latestScreenshotUrl} target="_blank" rel="noreferrer" className="block">
                       <img
                         src={latestScreenshotUrl}
                         alt="Latest automation screenshot"
-                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 object-contain max-h-96"
+                        className="w-full rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] object-contain max-h-96"
                       />
                     </a>
                   </div>
                 )}
-                <div className="text-xs text-zinc-500">
+                <div className="text-xs text-[var(--muted)]">
                   <p>Status: <span className="font-medium">{automationReport.status}</span></p>
                   {automationReport.startedAt && (
                     <p>Started: {new Date(automationReport.startedAt).toLocaleString()}</p>
@@ -260,36 +256,36 @@ export default function ExecutionDetailPage() {
                     <p>Ended: {new Date(automationReport.endedAt).toLocaleString()}</p>
                   )}
                   {automationReport.errorMessage && (
-                    <p className="text-red-600 dark:text-red-400">Error: {automationReport.errorMessage}</p>
+                    <p className="text-[var(--error)]">Error: {automationReport.errorMessage}</p>
                   )}
                 </div>
 
                 {automationReport.videoAvailable ? (
                   <div>
-                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Run Video</p>
+                    <p className="text-xs font-medium text-[var(--muted)] mb-2">Run Video</p>
                     {automationReport.videoUrl || automationReport.videoAvailable ? (
                       <video
                         controls
-                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-black"
+                        className="w-full rounded-lg border border-[var(--border)] bg-black"
                         src={automationReport.videoUrl || getExecutionAutomationVideoUrl(cycleId, executionId)}
                       />
                     ) : (
-                      <p className="text-xs text-zinc-500">Generating secure video URL...</p>
+                      <p className="text-xs text-[var(--muted)]">Generating secure video URL...</p>
                     )}
                   </div>
                 ) : (
-                  <p className="text-xs text-zinc-500">Video is not available for this run.</p>
+                  <p className="text-xs text-[var(--muted)]">Video is not available for this run.</p>
                 )}
 
                 {(automationReport.traceAvailable || automationReport.tracePath) ? (
                   <div>
-                    <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Trace Artifact</p>
+                    <p className="text-xs font-medium text-[var(--muted)] mb-2">Trace Artifact</p>
                     <div className="flex flex-wrap items-center gap-2">
                       <a
                         href={automationReport.traceUrl || getExecutionAutomationTraceUrl(cycleId, executionId)}
                         target="_blank"
                         rel="noreferrer"
-                        className="inline-flex items-center rounded-md border border-zinc-300 dark:border-zinc-700 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                        className="inline-flex items-center rounded-md border border-[var(--border)] px-2 py-1 text-xs text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
                       >
                         Download Trace (.zip)
                       </a>
@@ -298,30 +294,30 @@ export default function ExecutionDetailPage() {
                           href={`https://trace.playwright.dev/?trace=${encodeURIComponent(automationReport.traceUrl)}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-flex items-center rounded-md border border-emerald-800 bg-emerald-700 px-2.5 py-1.5 text-sm font-semibold !text-white visited:!text-white shadow-sm transition-colors hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-1 dark:border-emerald-300 dark:bg-emerald-500 dark:!text-zinc-950 dark:hover:bg-emerald-400"
+                          className="inline-flex items-center rounded-md border border-emerald-800 bg-emerald-700 px-2.5 py-1.5 text-sm font-semibold !text-white visited:!text-white shadow-sm transition-colors hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-1"
                         >
                           Open in Trace Viewer
                         </a>
                       )}
                     </div>
                     {!automationReport.traceUrl && (
-                      <p className="mt-1 text-[11px] text-zinc-500">
+                      <p className="mt-1 text-[11px] text-[var(--muted)]">
                         Trace Viewer needs a direct trace URL. Download the trace zip if direct URL is unavailable.
                       </p>
                     )}
                   </div>
                 ) : (
-                  <p className="text-xs text-zinc-500">Trace is not available for this run.</p>
+                  <p className="text-xs text-[var(--muted)]">Trace is not available for this run.</p>
                 )}
 
                 <div>
-                  <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-2">Step Logs</p>
+                  <p className="text-xs font-medium text-[var(--muted)] mb-2">Step Logs</p>
                   {executedSteps.length === 0 ? (
-                    <p className="text-xs text-zinc-500">No step logs recorded.</p>
+                    <p className="text-xs text-[var(--muted)]">No step logs recorded.</p>
                   ) : (
-                    <div className="max-h-64 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900">
+                    <div className="max-h-64 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)]">
                       <table className="w-full text-xs">
-                        <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+                        <thead className="sticky top-0 bg-[var(--surface-secondary)]">
                           <tr>
                             <th className="text-left px-2 py-1">Step</th>
                             <th className="text-left px-2 py-1">Action</th>
@@ -332,7 +328,7 @@ export default function ExecutionDetailPage() {
                         </thead>
                         <tbody>
                           {executedSteps.map((log, idx) => (
-                            <tr key={`${log.stepId ?? "step"}-${idx}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                            <tr key={`${log.stepId ?? "step"}-${idx}`} className="border-t border-[var(--border-subtle)]">
                               <td className="px-2 py-1 font-mono">{log.stepId ?? idx + 1}</td>
                               <td className="px-2 py-1">{log.action ?? "-"}</td>
                               <td className="px-2 py-1">{log.status ?? "-"}</td>
@@ -343,7 +339,7 @@ export default function ExecutionDetailPage() {
                                     href={log.screenshotUrl}
                                     target="_blank"
                                     rel="noreferrer"
-                                    className="text-blue-600 hover:underline"
+                                    className="text-[var(--brand-primary)] hover:underline"
                                   >
                                     View
                                   </a>
@@ -364,42 +360,36 @@ export default function ExecutionDetailPage() {
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+              <label className="block text-sm font-medium text-[var(--muted)] mb-1">
                 Defect Key
               </label>
-              <input
+              <Input
                 type="text"
                 value={defectKey}
                 onChange={(e) => setDefectKey(e.target.value)}
                 placeholder="e.g. PROJ-123"
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+              <label className="block text-sm font-medium text-[var(--muted)] mb-1">
                 Defect URL
               </label>
-              <input
+              <Input
                 type="url"
                 value={defectUrl}
                 onChange={(e) => setDefectUrl(e.target.value)}
                 placeholder="https://…"
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               />
             </div>
           </div>
 
           <div className="flex gap-2 pt-2">
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white py-2 px-5 text-sm font-medium disabled:opacity-50"
-            >
+            <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save"}
-            </button>
+            </Button>
             <Link
               href={`/projects/${projectId}/cycles/${cycleId}`}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 py-2 px-5 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              className="rounded-lg border border-[var(--border)] py-2 px-5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
             >
               Cancel
             </Link>

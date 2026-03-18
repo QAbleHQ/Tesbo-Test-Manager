@@ -8,14 +8,14 @@ export const metadata: Metadata = {
 
 export default function PrivacyPolicyPage() {
   return (
-    <main className="min-h-screen bg-[var(--background)] dark:bg-zinc-950 text-[var(--foreground)] dark:text-zinc-100">
+    <main className="min-h-screen bg-[var(--background)] text-[var(--foreground)]">
       <div className="mx-auto max-w-3xl px-6 py-10">
         <h1 className="text-3xl font-semibold">Privacy Policy</h1>
-        <p className="mt-2 text-sm text-[var(--muted)] dark:text-zinc-400">Last updated: February 23, 2026</p>
+        <p className="mt-2 text-sm text-[var(--muted)]">Last updated: February 23, 2026</p>
 
-        <div className="mt-8 space-y-6 text-sm leading-7 text-zinc-700 dark:text-zinc-300">
+        <div className="mt-8 space-y-6 text-sm leading-7 text-[var(--muted)]">
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">1. Scope</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">1. Scope</h2>
             <p className="mt-2">
               This Privacy Policy explains how TesboX collects, uses, stores, and shares information when you use
               the TesboX web application, including Jira integration features made available through Atlassian.
@@ -23,7 +23,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               2. Information We Collect
             </h2>
             <ul className="mt-2 list-disc pl-5 space-y-1">
@@ -42,7 +42,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">3. How We Use Data</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">3. How We Use Data</h2>
             <ul className="mt-2 list-disc pl-5 space-y-1">
               <li>To provide account access, maintain sessions, and secure authentication.</li>
               <li>To operate core test management workflows and collaboration features.</li>
@@ -55,7 +55,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               4. Jira and Atlassian Data Handling
             </h2>
             <p className="mt-2">
@@ -66,7 +66,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">
               5. Third-Party Processors
             </h2>
             <p className="mt-2">Depending on configuration, TesboX may use third-party providers for:</p>
@@ -79,7 +79,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">6. Data Sharing</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">6. Data Sharing</h2>
             <p className="mt-2">
               We do not sell personal information. We share data only with service providers as required to operate
               TesboX, to comply with legal obligations, or based on your workspace configuration and user actions.
@@ -87,7 +87,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">7. Retention</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">7. Retention</h2>
             <p className="mt-2">
               We retain data while your workspace remains active and as needed for security, legal compliance, and
               legitimate business purposes. You may request deletion of workspace data by contacting us.
@@ -95,7 +95,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">8. Security</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">8. Security</h2>
             <p className="mt-2">
               TesboX applies technical and organizational controls designed to protect stored information. No
               method of transmission or storage is completely secure, and absolute security cannot be guaranteed.
@@ -103,7 +103,7 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">9. Your Choices</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">9. Your Choices</h2>
             <p className="mt-2">
               You may update account information through the product and request access, correction, or deletion of
               personal data where applicable by contacting us.
@@ -111,10 +111,10 @@ export default function PrivacyPolicyPage() {
           </section>
 
           <section>
-            <h2 className="text-lg font-semibold text-[var(--foreground)] dark:text-zinc-100">10. Contact</h2>
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">10. Contact</h2>
             <p className="mt-2">
               For privacy requests or questions, contact us at{" "}
-              <a href="mailto:support@bettercases.ai" className="text-blue-600 dark:text-blue-400 hover:underline">
+              <a href="mailto:support@bettercases.ai" className="text-[var(--brand-primary)] hover:underline">
                 support@bettercases.ai
               </a>
               .
@@ -123,7 +123,7 @@ export default function PrivacyPolicyPage() {
         </div>
 
         <div className="mt-10 text-sm">
-          <Link href="/terms-and-conditions" className="text-blue-600 dark:text-blue-400 hover:underline">
+          <Link href="/terms-and-conditions" className="text-[var(--brand-primary)] hover:underline">
             View Terms and Conditions
           </Link>
         </div>

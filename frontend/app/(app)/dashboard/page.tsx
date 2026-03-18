@@ -4,16 +4,18 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { authMe, getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
+import { Card } from "@/components/ui";
+import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 const STATUS_COLORS: Record<string, { bg: string; text: string; label: string }> = {
-  Passed: { bg: "bg-emerald-100 dark:bg-emerald-900/40", text: "text-emerald-800 dark:text-emerald-200", label: "Passed" },
-  Failed: { bg: "bg-red-100 dark:bg-red-900/40", text: "text-red-800 dark:text-red-200", label: "Failed" },
-  Blocked: { bg: "bg-amber-100 dark:bg-amber-900/40", text: "text-amber-800 dark:text-amber-200", label: "Blocked" },
-  Untested: { bg: "bg-zinc-100 dark:bg-zinc-700/50", text: "text-zinc-600 dark:text-zinc-300", label: "Untested" },
+  Passed: { bg: "bg-emerald-100", text: "text-emerald-800", label: "Passed" },
+  Failed: { bg: "bg-red-100", text: "text-red-800", label: "Failed" },
+  Blocked: { bg: "bg-amber-100", text: "text-amber-800", label: "Blocked" },
+  Untested: { bg: "bg-[var(--surface-secondary)]", text: "text-[var(--muted)]", label: "Untested" },
 };
 
 function statusStyle(status: string) {
-  return STATUS_COLORS[status] ?? { bg: "bg-zinc-100 dark:bg-zinc-700/50", text: "text-zinc-700 dark:text-zinc-300", label: status };
+  return STATUS_COLORS[status] ?? { bg: "bg-[var(--surface-secondary)]", text: "text-[var(--muted)]", label: status };
 }
 
 export default function DashboardPage() {
@@ -44,7 +46,7 @@ export default function DashboardPage() {
   if (!auth) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
@@ -52,16 +54,16 @@ export default function DashboardPage() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading analytics…</p>
+        <p className="text-[var(--muted)]">Loading analytics…</p>
       </div>
     );
   }
 
   if (error || !analytics) {
     return (
-      <main className="max-w-4xl mx-auto px-4 py-8">
-        <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Dashboard</h1>
-        <p className="mt-2 text-red-600 dark:text-red-400">{error ?? "Unable to load analytics."}</p>
+      <main>
+        <h1 className="text-xl font-semibold text-[var(--foreground)]">Dashboard</h1>
+        <p className="mt-2 text-red-600">{error ?? "Unable to load analytics."}</p>
       </main>
     );
   }
@@ -70,58 +72,59 @@ export default function DashboardPage() {
   const totalExec = analytics.executionTotal;
 
   return (
-    <main className="max-w-4xl mx-auto px-4 py-8">
-      <div className="mb-6">
-        <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
-          <span className="text-zinc-900 dark:text-zinc-100">{workspaceName}</span>
-          <span>/</span>
-          <span className="text-zinc-900 dark:text-zinc-100">Dashboard</span>
-        </div>
-        <h1 className="mt-1 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Dashboard</h1>
-        <p className="mt-1 text-zinc-500 dark:text-zinc-400">Workspace-level analytics across all projects</p>
-      </div>
-
-      {/* Metric cards */}
-      <section className="mb-8">
-        <h2 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-3">Overview</h2>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
-          <Link
-            href="/projects"
-            className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4 hover:border-zinc-300 dark:hover:border-zinc-600 transition-colors"
-          >
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">{analytics.projectCount}</p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Projects</p>
+    <StandardPageLayout
+      header={(
+        <PageHeader
+          title="Dashboard"
+          subtitle="Workspace-level analytics across all projects"
+          breadcrumb={(
+            <div className="flex items-center gap-2">
+              <span className="text-[var(--foreground)]">{workspaceName}</span>
+              <span>/</span>
+              <span className="text-[var(--foreground)]">Dashboard</span>
+            </div>
+          )}
+        />
+      )}
+    >
+      <section className="tesbo-section">
+        <h2 className="mb-3 text-sm font-medium text-[var(--muted)]">Overview</h2>
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
+          <Link href="/projects" className="block">
+            <Card className="p-4 transition hover:border-[var(--border-strong)]">
+              <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.projectCount}</p>
+              <p className="text-sm text-[var(--muted)]">Projects</p>
+            </Card>
           </Link>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">{analytics.testCaseCount}</p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Test cases</p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">{analytics.suiteCount}</p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Suites</p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">{analytics.planCount}</p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Plans</p>
-          </div>
-          <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-4">
-            <p className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">{analytics.cycleCount}</p>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Cycles</p>
-          </div>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.testCaseCount}</p>
+            <p className="text-sm text-[var(--muted)]">Test cases</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.suiteCount}</p>
+            <p className="text-sm text-[var(--muted)]">Suites</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.planCount}</p>
+            <p className="text-sm text-[var(--muted)]">Plans</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.cycleCount}</p>
+            <p className="text-sm text-[var(--muted)]">Cycles</p>
+          </Card>
         </div>
       </section>
 
-      {/* Execution status breakdown */}
       <section>
-        <h2 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-3">Execution status (all projects)</h2>
-        <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 overflow-hidden">
+        <h2 className="mb-3 text-sm font-medium text-[var(--muted)]">Execution status</h2>
+        <Card className="overflow-hidden">
           {totalExec === 0 ? (
-            <div className="px-4 py-8 text-center text-zinc-500 dark:text-zinc-400">
+            <div className="px-4 py-8 text-center text-[var(--muted)]">
               No executions yet. Run a test cycle in any project to see status breakdown.
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 border-b border-zinc-200 dark:border-zinc-700">
+              <div className="grid grid-cols-2 gap-3 border-b border-[var(--border-subtle)] p-4 sm:grid-cols-4">
                 {statusEntries.map(([status, count]) => {
                   const style = statusStyle(status);
                   const pct = totalExec > 0 ? Math.round((count / totalExec) * 100) : 0;
@@ -131,34 +134,28 @@ export default function DashboardPage() {
                         <span className={`text-sm font-medium rounded-full px-2 py-0.5 ${style.bg} ${style.text}`}>
                           {style.label}
                         </span>
-                        <span className="text-sm text-zinc-500 dark:text-zinc-400">{pct}%</span>
+                        <span className="text-sm text-[var(--muted)]">{pct}%</span>
                       </div>
-                      <div className="h-2 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
-                        <div
-                          className={`h-full rounded-full ${style.bg} ${style.text}`}
-                          style={{ width: `${pct}%` }}
-                        />
+                      <div className="h-2 overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
+                        <div className={`h-full rounded-full ${style.bg} ${style.text}`} style={{ width: `${pct}%` }} />
                       </div>
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400">{count} of {totalExec}</p>
+                      <p className="text-xs text-[var(--muted)]">{count} of {totalExec}</p>
                     </div>
                   );
                 })}
               </div>
-              <div className="px-4 py-3 bg-zinc-50 dark:bg-zinc-800/50 border-t border-zinc-200 dark:border-zinc-700">
-                <p className="text-sm text-zinc-600 dark:text-zinc-300">
+              <div className="border-t border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-4 py-3">
+                <p className="text-sm text-[var(--muted)]">
                   Total executions across all projects: <strong>{totalExec}</strong>
                 </p>
-                <Link
-                  href="/projects"
-                  className="text-sm text-blue-600 dark:text-blue-400 hover:underline mt-1 inline-block"
-                >
+                <Link href="/projects" className="mt-1 inline-block text-sm text-[var(--brand-primary)] hover:underline">
                   View projects →
                 </Link>
               </div>
             </>
           )}
-        </div>
+        </Card>
       </section>
-    </main>
+    </StandardPageLayout>
   );
 }

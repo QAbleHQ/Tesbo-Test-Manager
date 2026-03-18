@@ -13,50 +13,37 @@ import {
   type TestRunListItem,
   type TestEnvironmentSetting,
 } from "@/lib/api";
+import {
+  Button,
+  Input,
+  Card,
+  StatusChip,
+  Select,
+  EmptyStateBlock,
+  Modal,
+  Field,
+  FieldLabel,
+  Textarea,
+} from "@/components/ui";
+import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
 
-/* ───── Status badge colors ───── */
-function statusColor(status: string) {
+/* ───── Status badge tone mapping ───── */
+function statusTone(status: string): "neutral" | "brand" | "ai" | "success" | "warning" | "error" | "info" {
   switch (status) {
     case "Planning":
-      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
+      return "warning";
     case "In Progress":
-      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+      return "info";
     case "Completed":
-      return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
+      return "success";
     default:
-      return "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300";
+      return "neutral";
   }
 }
 
 type ProjectSettingsPayload = {
   testRunEnvironments?: Array<{ name?: string; url?: string }>;
 };
-
-/* ───── Modal wrapper ───── */
-function Modal({
-  open,
-  onClose,
-  title,
-  children,
-}: {
-  open: boolean;
-  onClose: () => void;
-  title: string;
-  children: React.ReactNode;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white dark:bg-zinc-900 rounded-xl shadow-2xl w-full max-w-lg mx-4 p-6">
-        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
-          {title}
-        </h2>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 export default function TestRunsPage() {
   const params = useParams();
@@ -197,57 +184,59 @@ export default function TestRunsPage() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
-  return (
-    <main className="max-w-5xl mx-auto px-4 py-8">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">
-            Test Runs
-          </h1>
-          <p className="mt-1 text-zinc-500 text-sm">
-            Create and manage test runs to track execution progress.
-          </p>
-        </div>
-        {canManageRuns && (
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => {
-                resetForm();
-                setFormError(null);
-                setShowCreate(true);
-              }}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium transition-colors"
-            >
-              + New Test Run
-            </button>
-            <Link
-              href={`/projects/${projectId}/cycles/schedule`}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
-            >
-              Schedule Run
-            </Link>
-          </div>
-        )}
-      </div>
+  const emptyIcon = (
+    <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+    </svg>
+  );
 
+  return (
+    <ListWorkspaceLayout
+      header={
+        <PageHeader
+          title="Test Runs"
+          subtitle="Create and manage test runs to track execution progress."
+          actions={
+            canManageRuns ? (
+              <div className="flex items-center gap-2">
+                <Button
+                  onClick={() => {
+                    resetForm();
+                    setFormError(null);
+                    setShowCreate(true);
+                  }}
+                >
+                  + New Test Run
+                </Button>
+                <Link
+                  href={`/projects/${projectId}/cycles/schedule`}
+                  className="inline-flex items-center justify-center h-10 rounded-xl px-4 text-sm font-medium border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors"
+                >
+                  Schedule Run
+                </Link>
+              </div>
+            ) : undefined
+          }
+        />
+      }
+    >
       {/* Empty state */}
       {runs.length === 0 && (
-        <div className="text-center py-20 text-zinc-400">
-          <svg className="mx-auto w-12 h-12 mb-3 text-zinc-300 dark:text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-          </svg>
-          <p className="text-sm">
-            {canManageRuns
-              ? "No test runs yet. Create one to get started."
-              : "No test runs have been created for this project yet."}
-          </p>
-        </div>
+        <EmptyStateBlock
+          title={canManageRuns ? "No test runs yet" : "No test runs have been created"}
+          description={canManageRuns ? "Create one to get started." : "No test runs have been created for this project yet."}
+          icon={emptyIcon}
+          action={canManageRuns ? (
+            <Button onClick={() => { resetForm(); setFormError(null); setShowCreate(true); }}>
+              + New Test Run
+            </Button>
+          ) : undefined}
+        />
       )}
 
       {/* Cards list */}
@@ -256,33 +245,24 @@ export default function TestRunsPage() {
           const total = r.totalCases;
           const passRate = total > 0 ? Math.round((r.passed / total) * 100) : 0;
           return (
-            <div
-              key={r.id}
-              className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5 hover:shadow-md transition-shadow"
-            >
+            <Card key={r.id} className="p-5 hover:shadow-md transition-shadow">
               <div className="flex items-start justify-between">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-3 mb-1">
                     <Link
                       href={`/projects/${projectId}/cycles/${r.id}`}
-                      className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 hover:text-blue-600 dark:hover:text-blue-400 truncate"
+                      className="text-lg font-semibold text-[var(--foreground)] hover:text-[var(--brand-primary)] truncate"
                     >
                       {r.name}
                     </Link>
-                    <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColor(
-                        r.status
-                      )}`}
-                    >
-                      {r.status}
-                    </span>
+                    <StatusChip tone={statusTone(r.status)}>{r.status}</StatusChip>
                   </div>
                   {r.description && (
-                    <p className="text-sm text-zinc-500 dark:text-zinc-400 truncate mb-2">
+                    <p className="text-sm text-[var(--muted)] truncate mb-2">
                       {r.description}
                     </p>
                   )}
-                  <div className="flex items-center gap-4 text-xs text-zinc-400">
+                  <div className="flex items-center gap-4 text-xs text-[var(--muted-soft)]">
                     {r.environment && <span>Env: {r.environment}</span>}
                     {r.buildVersion && <span>Build: {r.buildVersion}</span>}
                     <span>{new Date(r.createdAt).toLocaleDateString()}</span>
@@ -292,15 +272,15 @@ export default function TestRunsPage() {
                 {/* Quick stats */}
                 <div className="flex items-center gap-4 ml-4 shrink-0">
                   <div className="text-center">
-                    <p className="text-lg font-bold text-zinc-900 dark:text-zinc-100">
+                    <p className="text-lg font-bold text-[var(--foreground)]">
                       {total}
                     </p>
-                    <p className="text-xs text-zinc-400">Cases</p>
+                    <p className="text-xs text-[var(--muted-soft)]">Cases</p>
                   </div>
                   {total > 0 && (
                     <div className="text-center">
-                      <p className="text-lg font-bold text-green-600">{passRate}%</p>
-                      <p className="text-xs text-zinc-400">Pass</p>
+                      <p className="text-lg font-bold text-[var(--success)]">{passRate}%</p>
+                      <p className="text-xs text-[var(--muted-soft)]">Pass</p>
                     </div>
                   )}
 
@@ -313,7 +293,7 @@ export default function TestRunsPage() {
                           setFormError(null);
                           openEdit(r);
                         }}
-                        className="p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
+                        className="p-1.5 rounded-lg hover:bg-[var(--surface-secondary)] text-[var(--muted-soft)] hover:text-[var(--muted)]"
                         title="Edit"
                       >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -326,7 +306,7 @@ export default function TestRunsPage() {
                           setFormError(null);
                           setDeleteTarget(r);
                         }}
-                        className="p-1.5 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-zinc-400 hover:text-red-600"
+                        className="p-1.5 rounded-lg hover:bg-red-50 text-[var(--muted-soft)] hover:text-[var(--error)]"
                         title="Delete"
                       >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -337,7 +317,7 @@ export default function TestRunsPage() {
                   )}
                 </div>
               </div>
-            </div>
+            </Card>
           );
         })}
       </div>
@@ -349,40 +329,35 @@ export default function TestRunsPage() {
         title="Create Test Run"
       >
         <form onSubmit={handleCreate} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Name <span className="text-red-500">*</span>
-            </label>
-            <input
+          <Field>
+            <FieldLabel>
+              Name <span className="text-[var(--error)]">*</span>
+            </FieldLabel>
+            <Input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. Sprint 42 Regression"
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               autoFocus
               required
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Description
-            </label>
-            <textarea
+          </Field>
+          <Field>
+            <FieldLabel>Description</FieldLabel>
+            <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={2}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
-          </div>
+          </Field>
           <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Environment <span className="text-red-500">*</span>
-              </label>
-              <select
+            <Field>
+              <FieldLabel>
+                Environment <span className="text-[var(--error)]">*</span>
+              </FieldLabel>
+              <Select
                 value={environment}
                 onChange={(e) => setEnvironment(e.target.value)}
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
                 required
               >
                 <option value="">Select environment</option>
@@ -391,14 +366,14 @@ export default function TestRunsPage() {
                     {env.name}
                   </option>
                 ))}
-              </select>
+              </Select>
               {environment && (
-                <p className="mt-1 text-xs text-zinc-500">
+                <p className="mt-1 text-xs text-[var(--muted)]">
                   URL: {environmentOptions.find((item) => item.name === environment)?.url ?? "Not available"}
                 </p>
               )}
               {environmentOptions.length === 0 && (
-                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                <p className="mt-1 text-xs text-[var(--warning)]">
                   No environments configured. Add one in{" "}
                   <Link href={`/projects/${projectId}/settings?tab=general`} className="underline">
                     Project settings
@@ -406,40 +381,36 @@ export default function TestRunsPage() {
                   .
                 </p>
               )}
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Build Version
-              </label>
-              <input
+            </Field>
+            <Field>
+              <FieldLabel>Build Version</FieldLabel>
+              <Input
                 type="text"
                 value={buildVersion}
                 onChange={(e) => setBuildVersion(e.target.value)}
                 placeholder="e.g. v2.4.1"
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               />
-            </div>
+            </Field>
           </div>
           {formError && (
-            <p className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+            <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">
               {formError}
             </p>
           )}
           <div className="flex justify-end gap-2 pt-2">
-            <button
+            <Button
               type="button"
+              variant="secondary"
               onClick={() => { setShowCreate(false); setFormError(null); }}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
               disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               {saving ? "Creating…" : "Create"}
-            </button>
+            </Button>
           </div>
         </form>
       </Modal>
@@ -454,39 +425,32 @@ export default function TestRunsPage() {
         title="Edit Test Run"
       >
         <form onSubmit={handleEdit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Name
-            </label>
-            <input
+          <Field>
+            <FieldLabel>Name</FieldLabel>
+            <Input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               autoFocus
               required
             />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-              Description
-            </label>
-            <textarea
+          </Field>
+          <Field>
+            <FieldLabel>Description</FieldLabel>
+            <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={2}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
             />
-          </div>
+          </Field>
           <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Environment <span className="text-red-500">*</span>
-              </label>
-              <select
+            <Field>
+              <FieldLabel>
+                Environment <span className="text-[var(--error)]">*</span>
+              </FieldLabel>
+              <Select
                 value={environment}
                 onChange={(e) => setEnvironment(e.target.value)}
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
                 required
               >
                 <option value="">Select environment</option>
@@ -499,44 +463,40 @@ export default function TestRunsPage() {
                     {env.name}
                   </option>
                 ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                Build Version
-              </label>
-              <input
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Build Version</FieldLabel>
+              <Input
                 type="text"
                 value={buildVersion}
                 onChange={(e) => setBuildVersion(e.target.value)}
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 text-sm"
               />
-            </div>
+            </Field>
           </div>
           {formError && (
-            <p className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+            <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">
               {formError}
             </p>
           )}
           <div className="flex justify-end gap-2 pt-2">
-            <button
+            <Button
               type="button"
+              variant="secondary"
               onClick={() => {
                 setEditRun(null);
                 resetForm();
                 setFormError(null);
               }}
-              className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
               disabled={saving || !environment.trim()}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               {saving ? "Saving…" : "Save Changes"}
-            </button>
+            </Button>
           </div>
         </form>
       </Modal>
@@ -547,35 +507,35 @@ export default function TestRunsPage() {
         onClose={() => setDeleteTarget(null)}
         title="Delete Test Run"
       >
-        <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-6">
+        <p className="text-sm text-[var(--muted)] mb-6">
           Are you sure you want to delete{" "}
-          <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+          <span className="font-semibold text-[var(--foreground)]">
             {deleteTarget?.name}
           </span>
           ? This will remove all associated test case executions. This action
           cannot be undone.
         </p>
         {formError && (
-          <p className="mb-4 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+          <p className="mb-4 rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">
             {formError}
           </p>
         )}
         <div className="flex justify-end gap-2">
-          <button
+          <Button
+            variant="secondary"
             onClick={() => { setDeleteTarget(null); setFormError(null); }}
-            className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
           >
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="destructive"
             onClick={handleDelete}
             disabled={saving}
-            className="rounded-lg bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
           >
             {saving ? "Deleting…" : "Delete"}
-          </button>
+          </Button>
         </div>
       </Modal>
-    </main>
+    </ListWorkspaceLayout>
   );
 }

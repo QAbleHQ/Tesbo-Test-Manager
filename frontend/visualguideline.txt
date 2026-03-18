@@ -1,0 +1,721 @@
+# Tesbo-X Visual Language Spec
+
+## Product Positioning
+
+Tesbo-X is not a QA admin dashboard. It is a control plane for autonomous testing operations.
+
+The interface must communicate three things at all times:
+
+1. The system is active
+2. The agents are progressing work
+3. The human is reviewing, directing, and approving high-value outcomes
+
+The design language should feel:
+
+* Strong
+* Modern
+* Agentic
+* Clean
+* Bold
+* Operational
+* High-trust
+
+Avoid anything playful, soft-SaaS, generic enterprise, glassy sci-fi, or chatbot-first.
+
+---
+
+## Core Theme Name
+
+**Tesbo Command Light**
+
+A light-theme visual system with strong type, structured surfaces, visible operational state, and a dedicated AI accent layer.
+
+---
+
+## Design Principles
+
+### 1. State over decoration
+
+Every major object should communicate status clearly. The product should feel active because work is visible, not because effects are flashy.
+
+### 2. Intent-first, form-second
+
+AI workflows should begin with user intent and agent interpretation, then move into structured inputs only where necessary.
+
+### 3. Strong hierarchy
+
+Page titles, section headings, controls, status chips, and data blocks must feel clearly ranked. No flat visual rhythm.
+
+### 4. Human + agent collaboration
+
+Every major screen should show what the agent did, what it suggests, and what the human can approve or modify.
+
+### 5. Operational density without clutter
+
+The UI should feel productive and decisive, not empty. Use structure, grouping, and information blocks instead of excessive white space.
+
+---
+
+## Color System
+
+### Foundations
+
+* Background Canvas: `#F4F7F8`
+* App Shell Surface: `#EFF3F5`
+* Primary Surface: `#FFFFFF`
+* Secondary Surface: `#F7FAFB`
+* Tertiary Surface: `#EDF2F4`
+
+### Text
+
+* Primary Text: `#0F1720`
+* Secondary Text: `#52606D`
+* Muted Text: `#74808B`
+* Disabled Text: `#98A2AE`
+* Inverse Text: `#FFFFFF`
+
+### Borders
+
+* Border Subtle: `#E3E8EE`
+* Border Default: `#D6DEE6`
+* Border Strong: `#C2CCD6`
+
+### Brand Accent
+
+* Brand Primary: `#0F766E`
+* Brand Hover: `#0B5F59`
+* Brand Pressed: `#084B47`
+* Brand Soft: `#D8F2EE`
+* Brand Surface: `#ECFAF7`
+
+### AI Accent Layer
+
+Use this color only for agent actions, AI summaries, suggested actions, orchestration signals, and active intelligence.
+
+* AI Primary: `#4F46E5`
+* AI Hover: `#4338CA`
+* AI Pressed: `#3730A3`
+* AI Soft: `#E8E7FF`
+* AI Surface: `#F4F3FF`
+
+### Semantic Colors
+
+* Success Primary: `#15803D`
+* Success Soft: `#DCFCE7`
+* Warning Primary: `#B7791F`
+* Warning Soft: `#FEF3C7`
+* Error Primary: `#C0392B`
+* Error Soft: `#FDE8E8`
+* Info Primary: `#2563EB`
+* Info Soft: `#DBEAFE`
+
+### Neutral Dark for high emphasis controls
+
+* Ink Strong: `#111827`
+* Ink Soft: `#1F2937`
+
+---
+
+## Color Usage Rules
+
+* Use teal as product brand and default primary interaction color.
+* Use indigo only when something is AI-driven, agent-generated, or suggested by the system.
+* Never mix teal and indigo on the same button.
+* Warning and error colors must remain reserved for operational states, not decorative accents.
+* The main application must stay light and neutral. Accent colors should punctuate, not flood.
+
+---
+
+## Typography
+
+### Recommended Font
+
+* Primary: Inter
+* Alternate: Geist
+
+### Type Scale
+
+* Display Large: 40 / 48 / 700
+* Display Medium: 32 / 40 / 650
+* Page Title: 28 / 36 / 650
+* Section Title: 22 / 30 / 650
+* Card Title: 18 / 26 / 600
+* Body Large: 16 / 24 / 450
+* Body Default: 14 / 22 / 450
+* Body Small: 13 / 20 / 450
+* Label: 12 / 16 / 600
+* Micro: 11 / 14 / 600
+
+### Typography Rules
+
+* Page titles should feel authoritative, not polite.
+* Section subtitles should be concise and low-noise.
+* Metadata should use smaller size with stronger weight for readability.
+* Avoid excessive text grayness. Most primary content should use high contrast.
+
+---
+
+## Layout System
+
+### Grid
+
+* Desktop grid: 12 columns
+* Max content width: 1440px
+* Comfortable working width: 1280px to 1360px
+* Gutter: 24px
+* Major section gap: 24px to 32px
+
+### Spacing Scale
+
+Use 4px base.
+
+* 4, 8, 12, 16, 20, 24, 32, 40, 48, 64
+
+### Radius
+
+* App shell blocks: 20px
+* Cards: 16px
+* Inputs: 12px
+* Buttons: 10px to 12px
+* Chips: 999px rounded
+
+### Shadows
+
+Keep restrained.
+
+* Card shadow resting: `0 1px 2px rgba(16,24,40,0.04), 0 6px 18px rgba(16,24,40,0.04)`
+* Elevated panel: `0 8px 28px rgba(16,24,40,0.08)`
+* Drawer: `-8px 0 32px rgba(16,24,40,0.10)`
+
+---
+
+## Surface Model
+
+### Layer 0
+
+Application background
+
+### Layer 1
+
+Primary page surfaces, cards, content containers
+
+### Layer 2
+
+Raised panels, agent sidebars, command surfaces
+
+### Layer 3
+
+Overlays, drawers, dialogs
+
+Use surface contrast to define structure. Do not over-outline everything.
+
+---
+
+## App Shell
+
+### Sidebar
+
+The sidebar must feel premium, compact, and structured.
+
+#### Sidebar behavior
+
+* Fixed on desktop
+* Width: 248px expanded
+* Collapsed mode optional later
+* Section labels in micro uppercase or small semibold
+* Active item gets a filled light surface plus a 3px accent indicator
+
+#### Sidebar visual treatment
+
+* Background: app shell surface
+* Divider lines: subtle
+* Active nav item: white or brand-surface block with dark text
+* Hover item: slightly darker neutral surface
+* Icons: 18px stroke icons
+
+### Top Bar
+
+Replace empty page space with a strong top utility rail.
+
+Must include:
+
+* Project switcher
+* Global command bar
+* Notifications or activity entry point
+* User/account area
+
+Command bar placeholder:
+`Ask Tesbo or run a command`
+
+Examples:
+
+* Generate tests for checkout flow
+* Show blocked agent tasks
+* Review failed scenarios from latest run
+* Send selected cases to Aegis
+
+---
+
+## Core Navigation Model
+
+### Global navigation
+
+* Command Center
+* Scenarios
+* Runs
+* Reviews
+* Defects
+* Agents
+* Assets
+* Insights
+* Settings
+
+### Inside Agents
+
+* Aegis
+* Sentinel
+* Future agents expandable under same pattern
+
+### Inside Assets
+
+* Suites
+* Plans
+* Knowledge
+* Environments
+
+This navigation is workflow-led, not database-led.
+
+---
+
+## Core Components
+
+## 1. Buttons
+
+### Primary Button
+
+* Background: Brand Primary
+* Text: White
+* Medium weight
+* Height: 40 or 44
+* Radius: 10 to 12
+
+### AI Action Button
+
+* Background: AI Soft
+* Text: AI Primary
+* Border optional with AI Primary 20% opacity
+* Use only for AI-specific actions
+
+### Secondary Button
+
+* White surface, subtle border, dark text
+
+### Destructive Button
+
+* White or error soft background with error text depending on emphasis
+
+### Rules
+
+* Max two strong buttons per zone
+* Avoid crowded action bars
+
+## 2. Inputs
+
+### Standard Input
+
+* Height: 40 to 44
+* Background: white
+* Border: default border
+* Focus: 2px ring using teal at 20% opacity and border teal
+* Placeholder text: muted text
+
+### AI Composer Input
+
+For command bars and intent entry.
+
+* Height: 48 to 56
+* Slightly elevated surface
+* Optional leading sparkle or command icon
+* Suggested action chips below
+
+## 3. Cards
+
+### Operational Card
+
+Used for projects, agents, run summaries, and queue items.
+
+Contains:
+
+* Title
+* State chip
+* Supporting metrics
+* One primary action
+* One secondary action
+
+Cards should feel substantial, not decorative.
+
+## 4. Status Chips
+
+Use aggressively across the product.
+
+### Examples
+
+* Queued
+* Analyzing
+* Generating
+* In review
+* Blocked
+* Ready to run
+* Passed
+* Failed
+* Flaky
+* Requires approval
+
+### Visual Rules
+
+* Use soft backgrounds
+* Small-medium weight text
+* Optional icon or pulse dot for active states
+
+## 5. Agent Activity Rail
+
+A reusable right-side panel or section that shows system activity.
+
+Each activity item should include:
+
+* Time
+* Agent name
+* Action summary
+* Object reference
+* Outcome or next action
+
+Example:
+
+* Aegis generated Playwright script for Checkout refund flow
+* Sentinel flagged 2 flaky selectors in Login scenario
+* Aegis paused due to missing default environment
+
+## 6. Approval Cards
+
+Every AI-generated artifact should be reviewable through a standardized approval card.
+
+Each card includes:
+
+* Object title
+* What changed
+* Why the agent recommends it
+* Confidence level
+* Risks or warnings
+* Actions: Approve, Edit, Reject
+
+## 7. Empty States
+
+Empty states must feel operational, not dead.
+
+Structure:
+
+* Strong icon or glyph
+* One-line state summary
+* One-line supporting explanation
+* Primary action
+* Optional “ask Tesbo” action
+
+Example:
+`No tasks in queue`
+`Queue scenarios for automation or ask Tesbo to identify high-value candidates.`
+
+---
+
+## Signature Tesbo Patterns
+
+## 1. Agent Accent Edge
+
+Whenever a card, panel, or item is agent-active, use a thin left edge or top edge accent in AI Primary or a teal-to-indigo gradient.
+
+This should appear on:
+
+* Agent-generated scenario cards
+* In-review artifacts
+* Active queue items
+* Command Center highlights
+
+## 2. Pulse State Dot
+
+Use a subtle animated dot for active live statuses such as:
+
+* Running
+* Generating
+* Reviewing
+* Streaming
+
+Animation should be soft and low-amplitude.
+
+## 3. Split Workspaces
+
+High-value workflows should use split layout instead of drawers.
+
+Use split workspaces for:
+
+* Scenario detail + agent output
+* Script review + agent feedback
+* Run analysis + defect suggestion
+* Agent queue + environment state
+
+## 4. Intent Composer
+
+AI-first screens should begin with a large intent input, not a long form.
+
+Pattern:
+
+* Intent prompt
+* Context fields
+* Live agent interpretation panel
+* Suggested next actions
+
+---
+
+## Page-Level Visual Language
+
+## 1. Command Center
+
+Purpose: a mission-control overview for the project.
+
+Should show:
+
+* Active runs
+* Blocked work
+* Agent activity
+* Pending approvals
+* Coverage gaps
+* Environment health
+* Suggested next actions
+
+Visual style:
+
+* Bento-style grouped cards
+* Strong top header
+* One right-side activity stream
+
+## 2. Scenarios Repository
+
+Purpose: operational scenario workspace, not raw table management.
+
+Default modes:
+
+* Scenarios
+* Suites
+* Coverage view
+
+Preferred default view:
+
+* Modern list or dense cards with visible status and inline actions
+
+Must show per item:
+
+* Priority
+* Automation readiness
+* Agent status
+* Review status
+* Linked run or defect references
+
+## 3. Scenario Creation
+
+Purpose: intent-driven AI-assisted creation.
+
+Layout:
+
+* Left: scenario intent + structured metadata
+* Right: live AI interpretation and suggestions
+
+Avoid long blank forms as the default experience.
+
+## 4. Scenario Detail + Automation
+
+Purpose: artifact review and generation workflow.
+
+Layout:
+
+* Left: scenario details and steps
+* Center: generated script or artifact
+* Right: agent panel with reasoning summary, warnings, actions, and version info
+
+## 5. Agents Overview
+
+Purpose: show agents as active specialists.
+
+Agent cards should show:
+
+* Name
+* Role
+* Status
+* Queue count
+* Throughput
+* Last activity
+* Open console action
+
+## 6. Agent Detail Console
+
+Purpose: operating desk for one autonomous agent.
+
+Layout:
+
+* Main area: queue, active, in review, completed
+* Right panel: settings, environment readiness, performance, recent decisions
+
+Must not feel like a generic tab page.
+
+---
+
+## Motion Guidelines
+
+Motion should communicate state change only.
+
+Use motion for:
+
+* Panel transitions
+* Chip status changes
+* Queue progression
+* Agent activity arrival
+* Tab underline movement
+* Loading skeleton transitions
+
+Do not use motion for decoration.
+Do not use floating UI, unnecessary parallax, or large-scale ambient animation.
+
+Recommended duration:
+
+* Fast micro interaction: 120ms to 160ms
+* Standard transition: 180ms to 240ms
+* Panel open or layout shift: 220ms to 280ms
+
+Easing:
+
+* Standard ease-out for entry
+* Ease-in-out for component transitions
+
+Respect reduced motion.
+
+---
+
+## Iconography
+
+Use crisp outline icons, preferably 18px or 20px.
+
+Style rules:
+
+* Consistent stroke width
+* Minimal ornamentation
+* Technical, not playful
+
+Suggested icon tone:
+
+* Neutral by default
+* Teal when active product state
+* Indigo when AI-specific
+* Semantic colors for alerts
+
+---
+
+## Data Visualization
+
+Charts and dashboards should be sparse, clear, and operational.
+
+Use charts for:
+
+* Pass/fail trend
+* Flakiness trend
+* Agent throughput
+* Review backlog
+* Environment stability
+* Coverage progression
+
+Rules:
+
+* No rainbow charts
+* No heavy gridlines
+* Use simple legends and direct labels
+* Prefer bars, area charts, and compact trend lines
+
+---
+
+## Writing Style Inside UI
+
+The UI copy should sound precise and operational.
+
+Use:
+
+* `Generate script`
+* `Queue for review`
+* `Blocked by missing environment`
+* `Sentinel flagged unstable selectors`
+* `Approve automation patch`
+
+Avoid vague language like:
+
+* `Proceed`
+* `Continue`
+* `Open`
+* `Submit`
+* `Manage`
+
+Buttons and states should always say what will happen.
+
+---
+
+## Do Not Do
+
+* Do not make the UI look like a generic Tailwind SaaS template
+* Do not overuse pale green backgrounds everywhere
+* Do not rely on empty whitespace for modernity
+* Do not put core workflows inside oversized drawers
+* Do not make AI a separate feature island
+* Do not use chat bubbles as the primary AI metaphor
+* Do not use too many small text links for major actions
+* Do not make tables the default representation of everything
+
+---
+
+## Cursor Build Instructions
+
+Implement the frontend using reusable design tokens and shared primitives.
+
+### Build system requirements
+
+1. Create a token file for colors, spacing, radius, shadows, typography
+2. Separate product accent tokens from AI accent tokens
+3. Build a core component library before screen implementation
+4. Use the same shell across all product pages
+5. Introduce a reusable right rail for agent activity and review contexts
+6. Create reusable page header, filter bar, status chip, approval card, and split workspace components
+
+### Priority components to build first
+
+* AppShell
+* SidebarNav
+* TopCommandBar
+* PageHeader
+* StatusChip
+* MetricCard
+* AgentActivityRail
+* ApprovalCard
+* SplitWorkspace
+* IntentComposer
+* ScenarioListItem
+* AgentCard
+* EmptyStateBlock
+* ScriptReviewPanel
+
+### First screens to redesign with this system
+
+1. Project / Command Center
+2. Scenarios Repository
+3. Scenario Creation Workspace
+4. Scenario Detail + Automation Review
+5. Agents Overview
+6. Agent Detail Console
+
+---
+
+## One-Line North Star
+
+Tesbo-X should feel like a precision control plane for autonomous testing systems, where agents execute, humans approve, and every screen makes operational progress visible.

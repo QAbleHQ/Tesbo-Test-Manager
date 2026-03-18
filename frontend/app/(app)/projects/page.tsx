@@ -3,14 +3,50 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { authMe, listProjects, listTestCases, listSuites, createProject, getWorkspace } from "@/lib/api";
+import { authMe, listProjects, listTestCases, listSuites, createProject, getWorkspace, listActivity, listProjectMembers } from "@/lib/api";
 import type { ProjectSummary } from "@/lib/api";
 import type { SuiteNode } from "@/lib/api";
+import {
+  Button,
+  Card,
+  EmptyStateBlock,
+  Field,
+  FieldHint,
+  FieldLabel,
+  Input,
+  Modal,
+  StatusChip,
+  Textarea,
+} from "@/components/ui";
+import { ListWorkspaceLayout, PageHeader } from "@/components/workflows";
 
 type ProjectWithStats = ProjectSummary & {
   testCaseCount: number;
   suites: SuiteNode[];
+  teamMembers: { userId: string; name: string }[];
+  lastActivityAt: string | null;
+  status: "active" | "configured" | "setup_required";
 };
+
+function formatRelativeTime(iso: string): string {
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return "just now";
+  const diffMs = Date.now() - ts;
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (diffMs < minute) return "just now";
+  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m ago`;
+  if (diffMs < day) return `${Math.floor(diffMs / hour)}h ago`;
+  return `${Math.floor(diffMs / day)}d ago`;
+}
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
+}
 
 function ProjectsPageContent() {
   const router = useRouter();
@@ -43,14 +79,22 @@ function ProjectsPageContent() {
           setWorkspaceRole((workspace.role || "").toLowerCase());
           const withStats = await Promise.all(
             list.map(async (p) => {
-              const [tcRes, suites] = await Promise.all([
+              const [tcRes, suites, activity, members] = await Promise.all([
                 listTestCases(p.id, { limit: 1 }),
                 listSuites(p.id),
+                listActivity(p.id, { limit: 1 }),
+                listProjectMembers(p.id),
               ]);
+              const lastActivityAt = activity.list[0]?.createdAt ?? null;
+              const status: ProjectWithStats["status"] =
+                tcRes.total === 0 ? "setup_required" : (lastActivityAt ? "active" : "configured");
               return {
                 ...p,
                 testCaseCount: tcRes.total,
                 suites,
+                teamMembers: members.map((m) => ({ userId: m.userId, name: m.name || m.email || "Unknown User" })),
+                lastActivityAt,
+                status,
               };
             })
           );
@@ -93,109 +137,85 @@ function ProjectsPageContent() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-zinc-500">Loading…</p>
+        <p className="text-[var(--muted)]">Loading…</p>
       </div>
     );
   }
 
   return (
-    <main className="max-w-5xl mx-auto px-4 py-8">
-      <div className="flex items-center justify-between gap-4 flex-wrap">
-        <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
-          Projects
-        </h1>
-        {canCreateProject ? (
-          <button
-            type="button"
-            onClick={() => setCreateOpen(true)}
-            className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
-          >
-            {projects.length === 0 ? "Create your first project" : "Create project"}
-          </button>
-        ) : null}
-      </div>
-      {projects.length === 0 ? (
-        <div className="mt-6 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/30 p-8 text-center">
-          <p className="text-zinc-500">
-            {canCreateProject
-              ? "No projects yet. Create your first project to complete onboarding."
-              : "You do not have any project access yet. Your project manager will assign a project to you."}
-          </p>
-          {canCreateProject ? (
-            <button
-              type="button"
-              onClick={() => setCreateOpen(true)}
-              className="mt-4 inline-block rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700"
-            >
-              Create first project
-            </button>
+    <ListWorkspaceLayout
+      header={(
+        <PageHeader
+          title="Projects"
+          subtitle="Workspaces and projects organized for test operations."
+          actions={canCreateProject ? (
+            <Button onClick={() => setCreateOpen(true)}>
+              {projects.length === 0 ? "Create your first project" : "Create project"}
+            </Button>
           ) : null}
-        </div>
+        />
+      )}
+    >
+      {projects.length === 0 ? (
+        <EmptyStateBlock
+          title="No projects yet"
+          description={
+            canCreateProject
+              ? "Create your first project to start organizing scenarios, runs, and reviews."
+              : "You do not have project access yet. Ask your manager to grant access."
+          }
+          action={canCreateProject ? <Button onClick={() => setCreateOpen(true)}>Create first project</Button> : null}
+        />
       ) : null}
 
-      {createOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" onClick={() => !createLoading && setCreateOpen(false)}>
-          <div className="bg-white dark:bg-zinc-900 rounded-xl shadow-xl max-w-md w-full p-6" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Create project</h2>
-            <form onSubmit={handleCreate} className="mt-4 space-y-4">
-              <div>
-                <label htmlFor="create-name" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Name *</label>
-                <input
+      <Modal open={createOpen} onClose={() => !createLoading && setCreateOpen(false)} title="Create project">
+        <form onSubmit={handleCreate} className="space-y-4">
+          <Field>
+            <FieldLabel htmlFor="create-name">Name *</FieldLabel>
+            <Input
                   id="create-name"
                   type="text"
                   value={createName}
                   onChange={(e) => setCreateName(e.target.value)}
                   placeholder="My Project"
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
                   disabled={createLoading}
                   autoFocus
                 />
-              </div>
-              <div>
-                <label htmlFor="create-key" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Key (optional)</label>
-                <input
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="create-key">Key (optional)</FieldLabel>
+            <Input
                   id="create-key"
                   type="text"
                   value={createKey}
                   onChange={(e) => setCreateKey(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
                   placeholder="PROJ"
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 font-mono text-zinc-900 dark:text-zinc-100"
+                  className="font-mono"
                   disabled={createLoading}
                 />
-                <p className="mt-1 text-xs text-zinc-500">Short code; derived from name if blank.</p>
-              </div>
-              <div>
-                <label htmlFor="create-desc" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Description (optional)</label>
-                <textarea
+            <FieldHint>Short code; derived from name if blank.</FieldHint>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="create-desc">Description (optional)</FieldLabel>
+            <Textarea
                   id="create-desc"
                   value={createDescription}
                   onChange={(e) => setCreateDescription(e.target.value)}
                   rows={2}
-                  className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-zinc-900 dark:text-zinc-100"
                   disabled={createLoading}
                 />
-              </div>
-              {createError && <p className="text-sm text-red-600 dark:text-red-400">{createError}</p>}
-              <div className="flex gap-2 justify-end">
-                <button
-                  type="button"
-                  onClick={() => !createLoading && setCreateOpen(false)}
-                  className="rounded-lg border border-zinc-300 dark:border-zinc-600 py-2 px-4 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={createLoading}
-                  className="rounded-lg bg-blue-600 text-white py-2 px-4 text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {createLoading ? "Creating…" : "Create"}
-                </button>
-              </div>
-            </form>
+          </Field>
+          {createError && <p className="text-sm text-red-600">{createError}</p>}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={() => !createLoading && setCreateOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={createLoading}>
+              {createLoading ? "Creating…" : "Create"}
+            </Button>
           </div>
-        </div>
-      )}
+        </form>
+      </Modal>
 
       {projects.length > 0 ? (
         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -203,58 +223,79 @@ function ProjectsPageContent() {
             <Link
               key={p.id}
               href={`/projects/${p.id}/dashboard`}
-              className="group flex flex-col rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5 shadow-sm transition-all hover:border-zinc-300 dark:hover:border-zinc-600 hover:shadow-md"
+              className="group block"
             >
-              <div className="flex items-start justify-between gap-2">
-                <h2 className="font-semibold text-zinc-900 dark:text-zinc-100 group-hover:text-blue-600 dark:group-hover:text-blue-400">
+              <Card className="flex h-full flex-col p-5 transition hover:border-[var(--border-strong)]">
+              <div className="flex items-start justify-between gap-3">
+                <h2 className="line-clamp-2 text-xl font-semibold leading-7 text-[var(--foreground)] group-hover:text-[var(--brand-primary)]">
                   {p.name}
                 </h2>
-                <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                  {p.key}
-                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <span className="rounded bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-xs text-[var(--muted)]">
+                    {p.key}
+                  </span>
+                  <StatusChip
+                    tone={p.status === "active" ? "brand" : p.status === "configured" ? "neutral" : "warning"}
+                    live={p.status === "active"}
+                    className="px-2.5 py-0.5 text-xs"
+                  >
+                    {p.status === "active" ? "Active" : p.status === "configured" ? "Configured" : "Setup required"}
+                  </StatusChip>
+                </div>
               </div>
               {p.description ? (
-                <p className="mt-1 line-clamp-2 text-sm text-zinc-500 dark:text-zinc-400">
+                <p className="mt-2 line-clamp-2 text-sm text-[var(--muted)]">
                   {p.description}
                 </p>
-              ) : null}
-              <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-zinc-600 dark:text-zinc-400">
-                <span className="flex items-center gap-1">
-                  <span className="font-medium text-zinc-900 dark:text-zinc-200">
-                    {p.testCaseCount}
-                  </span>
-                  <span>test cases</span>
-                </span>
-                <span className="text-zinc-300 dark:text-zinc-600">·</span>
-                <span className="flex items-center gap-1">
-                  <span className="font-medium text-zinc-900 dark:text-zinc-200">
-                    {p.suites.length}
-                  </span>
-                  <span>suites</span>
-                </span>
-              </div>
-              {p.suites.length > 0 ? (
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {p.suites.slice(0, 4).map((s) => (
-                    <span
-                      key={s.id}
-                      className="rounded-md bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-xs text-zinc-600 dark:text-zinc-400"
-                    >
-                      {s.name}
-                    </span>
-                  ))}
-                  {p.suites.length > 4 ? (
-                    <span className="text-xs text-zinc-400 dark:text-zinc-500">
-                      +{p.suites.length - 4} more
-                    </span>
-                  ) : null}
+              ) : (
+                <p className="mt-2 text-sm text-[var(--muted-soft)]">
+                  Add project context to guide agent execution and reviews.
+                </p>
+              )}
+              <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Test cases</p>
+                  <p className="mt-1 text-base font-semibold text-[var(--foreground)]">{p.testCaseCount}</p>
                 </div>
-              ) : null}
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Suites</p>
+                  <p className="mt-1 text-base font-semibold text-[var(--foreground)]">{p.suites.length}</p>
+                </div>
+              </div>
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Team</p>
+                {p.teamMembers.length > 0 ? (
+                  <div className="flex items-center">
+                    {p.teamMembers.slice(0, 4).map((member, idx) => (
+                      <span
+                        key={member.userId}
+                        className={`inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--surface-primary)] bg-[var(--brand-soft)] text-[11px] font-semibold text-[var(--brand-primary)] ${idx > 0 ? "-ml-2" : ""}`}
+                        title={member.name}
+                      >
+                        {getInitials(member.name)}
+                      </span>
+                    ))}
+                    {p.teamMembers.length > 4 ? (
+                      <span className="-ml-2 inline-flex h-7 min-w-7 items-center justify-center rounded-full border border-[var(--surface-primary)] bg-[var(--surface-tertiary)] px-2 text-[11px] font-semibold text-[var(--foreground)]">
+                        +{p.teamMembers.length - 4}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : (
+                  <span className="text-xs text-[var(--muted)]">No members assigned</span>
+                )}
+              </div>
+              <div className="mt-3 border-t border-[var(--border-subtle)] pt-3 text-sm text-[var(--muted)]">
+                {p.lastActivityAt
+                  ? `Last updated ${formatRelativeTime(p.lastActivityAt)} · Agent and team activity available`
+                  : `Created ${formatRelativeTime(p.createdAt)} · No activity events yet`}
+              </div>
+              </Card>
             </Link>
           ))}
         </div>
       ) : null}
-    </main>
+    </ListWorkspaceLayout>
   );
 }
 
@@ -263,7 +304,7 @@ export default function ProjectsPage() {
     <Suspense
       fallback={
         <div className="min-h-screen flex items-center justify-center">
-          <p className="text-zinc-500">Loading…</p>
+          <p className="text-[var(--muted)]">Loading…</p>
         </div>
       }
     >
