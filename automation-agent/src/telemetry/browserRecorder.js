@@ -2,14 +2,14 @@
  * BrowserRecorder – actor-agnostic page-level recording layer.
  *
  * Injects a capture-phase event listener script into the page and bridges
- * events back to Node.js via console.log (compatible with Stagehand's page
+ * events back to Node.js via console.log (compatible with Playwright's page
  * proxy which supports page.on("console") but NOT exposeBinding/exposeFunction).
  *
  * Coalesces raw DOM events into high-level Playwright action lines
  * (click, fill, press, navigate, select, scroll, etc.).
  *
  * Captures everything regardless of who is driving the browser (user,
- * Stagehand, or any other automation tool).
+ * or any other automation tool).
  */
 
 const CONSOLE_PREFIX = "__BC_REC__:";
@@ -398,8 +398,8 @@ export class BrowserRecorder {
   get actionCount() { return this._actions.length; }
 
   /**
-   * Attach to a Stagehand/Playwright Page.
-   * Uses console.log as the communication bridge (works with Stagehand).
+   * Attach to a Playwright Page.
+   * Uses console.log as the communication bridge.
    * @param {import('playwright').Page} page
    */
   async attach(page) {
@@ -432,7 +432,7 @@ export class BrowserRecorder {
       await page.addInitScript({ content: script });
       initScriptOk = true;
     } catch {
-      // Stagehand may use addInitScript with different signature
+      // Some page proxies may use addInitScript with different signature
       try {
         await page.addInitScript(script);
         initScriptOk = true;
@@ -449,10 +449,6 @@ export class BrowserRecorder {
     } catch {
       // page may not be ready yet — script will run on next navigation via addInitScript
     }
-
-    // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'browserRecorder.js:attach',message:'attach_result',data:{initScriptOk,evalOk,pageHasAddInitScript:typeof page.addInitScript==='function',pageHasEvaluate:typeof page.evaluate==='function',pageHasOn:typeof page.on==='function'},timestamp:Date.now(),hypothesisId:'BROWSER_ATTACH'})}).catch(()=>{});
-    // #endregion
 
     logInfo("browser_recorder_attached", {
       sessionId: this.sessionId,
@@ -483,12 +479,6 @@ export class BrowserRecorder {
     const type = event.eventType;
     const d = event.detail || {};
     const url = event.url || "";
-
-    // #region agent log
-    if (type === "click" || type === "fill" || type === "navigate" || type === "press" || type === "select" || type === "check") {
-      fetch('http://127.0.0.1:7243/ingest/9f1cf82a-d9d3-4642-adad-ef6b5f27edfa',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d01865'},body:JSON.stringify({sessionId:'d01865',location:'browserRecorder.js:_onBrowserEvent',message:'browser_event_received',data:{type,url:url?.slice(0,100),elementSelector:d.element?.selector?.slice(0,120),elementName:d.element?.name?.slice(0,60),value:d.value?.slice?.(0,50),totalRawEvents:this._rawEvents.length,totalActions:this._actions.length},timestamp:Date.now(),hypothesisId:'BROWSER_EVENTS'})}).catch(()=>{});
-    }
-    // #endregion
 
     if (type === "click") this._handleClick(d, url);
     else if (type === "fill") this._handleFill(d, url);

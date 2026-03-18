@@ -65,7 +65,7 @@ public final class AutomationContracts {
         public String commandId;
         public String currentUrl;
         public List<StepResult> results;
-        public java.util.List<java.util.Map<String, Object>> stagehandActions;
+        public java.util.List<java.util.Map<String, Object>> agentActions;
         public java.util.List<java.util.Map<String, Object>> telemetryEvents;
         public java.util.List<java.util.Map<String, Object>> telemetryPlan;
         public java.util.Map<String, Object> recording;

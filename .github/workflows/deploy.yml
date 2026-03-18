@@ -168,8 +168,6 @@ jobs:
           AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS }}
           AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER }}
           AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS=${{ secrets.AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS }}
-          BROWSERBASE_API_KEY=${{ secrets.BROWSERBASE_API_KEY }}
-          BROWSERBASE_PROJECT_ID=${{ secrets.BROWSERBASE_PROJECT_ID }}
           EOF"
 
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
@@ -209,8 +207,9 @@ jobs:
           START_URL_TIMEOUT_MS=60000
           SCREENSHOT_DIR=/app/artifacts/screenshots
           TRACE_DIR=/app/artifacts/traces
-          STAGEHAND_CACHE_DIR=/app/artifacts/stagehand-cache
           USE_TELEMETRY=true
+          LANGCHAIN_MAX_STEPS=30
+          DOM_SNAPSHOT_MAX_ELEMENTS=120
           AUTOMATION_QUEUE_ENABLED=true
           REDIS_URL=${{ secrets.REDIS_URL }}
           AUTOMATION_QUEUE_PREFIX=${{ secrets.AUTOMATION_QUEUE_PREFIX }}

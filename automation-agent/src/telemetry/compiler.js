@@ -169,7 +169,7 @@ function waitToPlaywright(ms) {
 }
 
 /**
- * Compile telemetry events to stagehandActions (for frontend compatibility).
+ * Compile telemetry events to agentActions (for frontend compatibility).
  * @param {object[]} events - Telemetry events from executor
  * @returns {object[]} Array of { type, action, playwright, targetDescription, value, ... }
  */
@@ -266,10 +266,10 @@ test('${esc(scenario)}', async ({ page }) => {
 }
 
 /**
- * Convert stagehand actions (from agent or executor) to telemetry-like format
+ * Convert agent actions to telemetry-like format
  * for the compiler when full telemetry is not available.
  */
-export function stagehandActionsToTelemetryLike(actions) {
+export function agentActionsToTelemetryLike(actions) {
   const events = [];
 
   for (let i = 0; i < actions.length; i++) {

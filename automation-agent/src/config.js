@@ -48,10 +48,10 @@ export const config = {
   screenshotDir: path.resolve(env("SCREENSHOT_DIR", "./artifacts/screenshots")),
   videoDir: path.resolve(env("VIDEO_DIR", "./artifacts/videos")),
   traceDir: path.resolve(env("TRACE_DIR", "./artifacts/traces")),
-  stagehandCacheDir: path.resolve(env("STAGEHAND_CACHE_DIR", "./artifacts/stagehand-cache")),
-  stagehandAgentMode: env("STAGEHAND_AGENT_MODE", "hybrid"),
-  /** Use telemetry (observe→act per step) vs full agent mode. Telemetry produces better Playwright scripts from successful acts. */
+  /** Use telemetry (step-by-step with LLM) vs full autonomous agent mode. */
   useTelemetry: env("USE_TELEMETRY", "true") === "true",
+  langchainMaxSteps: Number(env("LANGCHAIN_MAX_STEPS", "30")),
+  domSnapshotMaxElements: Number(env("DOM_SNAPSHOT_MAX_ELEMENTS", "120")),
   recordVideo: env("RECORD_VIDEO", "true") !== "false",
   sharedToken: env("AGENT_SHARED_TOKEN", ""),
   workerId: env("WORKER_ID", `worker-${Math.random().toString(36).slice(2, 10)}`),

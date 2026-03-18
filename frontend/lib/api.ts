@@ -427,6 +427,53 @@ export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: str
   return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
 }
 
+// Test case import/export
+export function getExportUrl(projectId: string, format: "csv" | "xlsx"): string {
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}`;
+}
+
+export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {
+  return `${API_BASE}/api/projects/${projectId}/testcases/import/template?format=${format}`;
+}
+
+export interface ImportPreviewResult {
+  uploadId: string;
+  headers: string[];
+  previewRows: string[][];
+  totalRows: number;
+}
+
+export async function previewImport(projectId: string, file: File): Promise<ImportPreviewResult> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}/testcases/import/preview`, {
+    method: "POST",
+    credentials: "include",
+    body: fd,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || String(res.status));
+  }
+  return res.json() as Promise<ImportPreviewResult>;
+}
+
+export interface ImportResult {
+  imported: number;
+  errors: { row: number; message: string }[];
+  total: number;
+}
+
+export async function executeImport(
+  projectId: string,
+  body: { uploadId: string; columnMapping: Record<string, number> }
+): Promise<ImportResult> {
+  return api<ImportResult>(`/api/projects/${projectId}/testcases/import`, {
+    method: "POST",
+    body,
+  });
+}
+
 export interface AutomationSession {
   id: string;
   projectId: string;

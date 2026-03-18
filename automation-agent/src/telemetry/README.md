@@ -5,10 +5,10 @@ Agis uses a telemetry-driven architecture to produce reliable Playwright scripts
 ## Flow
 
 1. **Planner** (`planScenario`) – Parses scenario text into atomic steps
-2. **Executor** (`executeScenarioWithTelemetry`) – For each step:
-   - `observe(instruction)` → get candidates
-   - `act(candidate | instruction)` → execute
-   - `extract(instruction)` → for assertions
+2. **Executor** (`executeAgentWithTelemetry` in langchainAgent.js) – For each step:
+   - DOM snapshot via `getInteractiveDOM()` → simplified page view for LLM
+   - LLM reasoning → identify element and action
+   - Playwright action → execute directly via page API
 3. **Compiler** (`compileTelemetryToActions`) – Converts telemetry events to Playwright with locator priority:
    - data-testid > role+name > label > placeholder > text > css > xpath
 4. **Validator** – Replay generated script via `runPlaywrightScript`
@@ -17,7 +17,6 @@ Agis uses a telemetry-driven architecture to produce reliable Playwright scripts
 
 All events include: `runId`, `stepId`, `timestamp`, `url`, `eventType`.
 
-- `observe` – candidates, chosenIndex, chosenReason
 - `act` – success, actions[], screenshots, elapsedMs
 - `extract` – result, usage (assertion | dynamic_test_data)
 - `browser_context` – navigation, dialogs, console errors
@@ -25,14 +24,16 @@ All events include: `runId`, `stepId`, `timestamp`, `url`, `eventType`.
 ## Usage
 
 ```javascript
-import { executeScenarioWithTelemetry, planScenario } from "./telemetry/executor.js";
+import { planScenario } from "./telemetry/executor.js";
 import { compileTelemetryToPlaywright } from "./telemetry/compiler.js";
+import { createAgentSession, executeAgentWithTelemetry } from "./langchainAgent.js";
 
-const { events, stagehandActions } = await executeScenarioWithTelemetry(session, scenario);
-const script = compileTelemetryToPlaywright(events, { scenario: "My test" });
+const session = await createAgentSession(sessionId, startUrl, modelConfig);
+const result = await executeAgentWithTelemetry(session, commandId, objective);
+const script = compileTelemetryToPlaywright(result.telemetryEvents, { scenario: "My test" });
 ```
 
 ## Integration
 
-- `executeStagehandWithTelemetry` in stagehandSession.js is the default path for autonomous runs
-- Falls back to `executeStagehandObjective` (agent mode) when plan is empty or telemetry fails
+- `executeAgentWithTelemetry` in langchainAgent.js is the default path for autonomous runs
+- Falls back to `executeAgentObjective` (LangGraph ReAct agent mode) when plan is empty or telemetry fails

@@ -52,8 +52,6 @@ const ANTHROPIC_MODELS = [
 type ProjectSettingsPayload = {
   automation?: {
     browserAgent?: "default" | "custom";
-    browserbaseApiKey?: string;
-    browserbaseProjectId?: string;
     executionProvider?: "default" | "lambdatest" | "browserstack";
     maxParallel?: number;
     providers?: {
@@ -150,8 +148,6 @@ export default function ProjectSettingsPage() {
   const [browserStackUsername, setBrowserStackUsername] = useState("");
   const [browserStackAccessKey, setBrowserStackAccessKey] = useState("");
   const [browserAgent, setBrowserAgent] = useState<"default" | "custom">("default");
-  const [browserbaseApiKey, setBrowserbaseApiKey] = useState("");
-  const [browserbaseProjectId, setBrowserbaseProjectId] = useState("");
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
   const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
   const [rotatingTesboKey, setRotatingTesboKey] = useState(false);
@@ -301,8 +297,6 @@ export default function ProjectSettingsPage() {
         setBrowserStackUsername(automation?.providers?.browserstack?.username ?? "");
         setBrowserStackAccessKey(automation?.providers?.browserstack?.accessKey ?? "");
         setBrowserAgent(automation?.browserAgent === "custom" ? "custom" : "default");
-        setBrowserbaseApiKey(automation?.browserbaseApiKey ?? "");
-        setBrowserbaseProjectId(automation?.browserbaseProjectId ?? "");
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       loadMembers().catch(() => {});
@@ -361,8 +355,6 @@ export default function ProjectSettingsPage() {
         },
         automation: {
           browserAgent,
-          browserbaseApiKey: browserAgent === "custom" ? browserbaseApiKey.trim() : undefined,
-          browserbaseProjectId: browserAgent === "custom" ? browserbaseProjectId.trim() : undefined,
           executionProvider,
           maxParallel: Math.max(1, Math.min(50, Math.floor(maxParallel || 1))),
           providers: {

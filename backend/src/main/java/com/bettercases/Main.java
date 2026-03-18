@@ -170,6 +170,10 @@ public final class Main {
         app.delete("/api/bugs/{bugId}", com.bettercases.bug.BugHandler::delete);
 
         app.get("/api/projects/{projectId}/testcases/export/csv", com.bettercases.export.ExportHandler::exportCasesCsv);
+        app.get("/api/projects/{projectId}/testcases/export/xlsx", com.bettercases.export.ExportHandler::exportCasesXlsx);
+        app.get("/api/projects/{projectId}/testcases/import/template", com.bettercases.export.ImportHandler::downloadTemplate);
+        app.post("/api/projects/{projectId}/testcases/import/preview", com.bettercases.export.ImportHandler::preview);
+        app.post("/api/projects/{projectId}/testcases/import", com.bettercases.export.ImportHandler::execute);
         app.get("/api/cycles/{cycleId}/export/csv", com.bettercases.export.ExportHandler::exportCycleCsv);
 
         app.get("/api/projects/{projectId}/analytics", com.bettercases.reporting.ReportingHandler::projectAnalytics);
