@@ -232,13 +232,13 @@ public final class AiHandler {
         if (provider.equals("openai")) {
             String key = aiConfig.getOrDefault("openAiApiKey", "");
             if (key.isBlank()) {
-                throw new io.javalin.http.BadRequestResponse("OpenAI API key is missing in project settings");
+                throw new io.javalin.http.BadRequestResponse("OpenAI API key is missing. Workspace owner must allocate an AI key to this project.");
             }
             return key;
         }
         String key = aiConfig.getOrDefault("anthropicApiKey", "");
         if (key.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Anthropic API key is missing in project settings");
+            throw new io.javalin.http.BadRequestResponse("Anthropic API key is missing. Workspace owner must allocate an AI key to this project.");
         }
         return key;
     }
@@ -266,7 +266,19 @@ public final class AiHandler {
     }
 
     public static Map<String, String> readAiConfig(UUID projectId) {
-        String sql = "SELECT settings FROM projects WHERE id = ?";
+        String sql = """
+                SELECT p.settings,
+                       wak.provider AS workspace_provider,
+                       wak.api_key AS workspace_api_key,
+                       wak.default_model AS workspace_default_model
+                FROM projects p
+                LEFT JOIN project_ai_key_allocations alloc ON alloc.project_id = p.id
+                LEFT JOIN workspace_ai_keys wak
+                  ON wak.id = alloc.workspace_ai_key_id
+                 AND wak.organization_id = p.organization_id
+                 AND wak.is_active = true
+                WHERE p.id = ?
+                """;
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
@@ -275,18 +287,65 @@ public final class AiHandler {
                 throw new io.javalin.http.NotFoundResponse("Project not found");
             }
             String settingsJson = rs.getString("settings");
-            if (settingsJson == null || settingsJson.isBlank()) return Map.of();
-            Map<String, Object> parsed = mapper.readValue(settingsJson, new TypeReference<>() {});
-            Object aiSettings = parsed.get("ai");
-            if (!(aiSettings instanceof Map<?, ?> aiMap)) return Map.of();
             Map<String, String> out = new HashMap<>();
-            aiMap.forEach((key, value) -> {
-                if (key != null && value instanceof String strValue) {
-                    out.put(String.valueOf(key), strValue);
+            if (settingsJson != null && !settingsJson.isBlank()) {
+                Map<String, Object> parsed = mapper.readValue(settingsJson, new TypeReference<>() {});
+                Object aiSettings = parsed.get("ai");
+                if (aiSettings instanceof Map<?, ?> aiMap) {
+                    aiMap.forEach((key, value) -> {
+                        if (key != null && value instanceof String strValue) {
+                            out.put(String.valueOf(key), strValue);
+                        }
+                    });
                 }
-            });
+            }
+
+            String workspaceProvider = rs.getString("workspace_provider");
+            String workspaceApiKey = rs.getString("workspace_api_key");
+            String workspaceDefaultModel = rs.getString("workspace_default_model");
+            if (workspaceProvider != null && workspaceApiKey != null && !workspaceApiKey.isBlank()) {
+                String provider = workspaceProvider.trim().toLowerCase();
+                out.put("provider", provider);
+                if ("anthropic".equals(provider)) {
+                    out.put("anthropicApiKey", workspaceApiKey);
+                    out.remove("openAiApiKey");
+                } else {
+                    out.put("openAiApiKey", workspaceApiKey);
+                    out.remove("anthropicApiKey");
+                }
+                String configuredModel = out.getOrDefault("model", "").trim();
+                if (configuredModel.isBlank() && workspaceDefaultModel != null && !workspaceDefaultModel.isBlank()) {
+                    out.put("model", workspaceDefaultModel.trim());
+                }
+            } else {
+                // Keys are now workspace-level. Ignore any legacy project-level keys.
+                out.remove("openAiApiKey");
+                out.remove("anthropicApiKey");
+            }
             return out;
         } catch (SQLException | JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static boolean hasAssignedWorkspaceAiKey(UUID projectId) {
+        String sql = """
+                SELECT 1
+                FROM projects p
+                JOIN project_ai_key_allocations alloc ON alloc.project_id = p.id
+                JOIN workspace_ai_keys wak ON wak.id = alloc.workspace_ai_key_id
+                WHERE p.id = ?
+                  AND wak.organization_id = p.organization_id
+                  AND wak.is_active = true
+                  AND wak.api_key IS NOT NULL
+                  AND btrim(wak.api_key) <> ''
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            return rs.next();
+        } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }

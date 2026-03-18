@@ -56,7 +56,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
+            throw new io.javalin.http.BadRequestResponse("Set up a workspace AI key and allocate it to this project before running Autonomous mode.");
         }
     }
 
@@ -75,7 +75,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
+            throw new io.javalin.http.BadRequestResponse("Set up a workspace AI key and allocate it to this project before running Autonomous mode.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
 
@@ -118,7 +118,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
+            throw new io.javalin.http.BadRequestResponse("Set up a workspace AI key and allocate it to this project before running Autonomous mode.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
         List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;
@@ -166,7 +166,7 @@ public final class AutomationIntentParserService {
         String provider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveApiKey(provider, aiConfig);
         if (apiKey.isBlank()) {
-            throw new io.javalin.http.BadRequestResponse("Set AI API key in project settings to use Autonomous mode commands.");
+            throw new io.javalin.http.BadRequestResponse("Set up a workspace AI key and allocate it to this project before running Autonomous mode.");
         }
         String model = resolveModel(provider, aiConfig.getOrDefault("model", ""));
         List<String> history = executionHistory == null ? Collections.emptyList() : executionHistory;

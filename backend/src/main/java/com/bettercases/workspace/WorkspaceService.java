@@ -278,6 +278,188 @@ public final class WorkspaceService {
         }
     }
 
+    public static Map<String, Object> listWorkspaceAiKeys(UUID orgId, UUID actorId) {
+        requireOrgMember(orgId, actorId);
+        List<Map<String, Object>> keys = new ArrayList<>();
+        String keysSql = """
+                SELECT id, name, provider, default_model, is_active, created_at, updated_at, api_key
+                FROM workspace_ai_keys
+                WHERE organization_id = ?
+                ORDER BY created_at DESC
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(keysSql)) {
+            ps.setObject(1, orgId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                String rawKey = rs.getString("api_key");
+                keys.add(Map.of(
+                        "id", rs.getObject("id").toString(),
+                        "name", rs.getString("name"),
+                        "provider", rs.getString("provider"),
+                        "defaultModel", rs.getString("default_model") == null ? "" : rs.getString("default_model"),
+                        "active", rs.getBoolean("is_active"),
+                        "maskedKey", maskApiKey(rawKey),
+                        "createdAt", rs.getTimestamp("created_at").toInstant().toString(),
+                        "updatedAt", rs.getTimestamp("updated_at").toInstant().toString()
+                ));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+
+        List<Map<String, Object>> projects = new ArrayList<>();
+        String projectsSql = """
+                SELECT p.id, p.key, p.name, a.workspace_ai_key_id
+                FROM projects p
+                LEFT JOIN project_ai_key_allocations a ON a.project_id = p.id
+                WHERE p.organization_id = ? AND p.archived_at IS NULL
+                ORDER BY p.created_at
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(projectsSql)) {
+            ps.setObject(1, orgId);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                Object allocated = rs.getObject("workspace_ai_key_id");
+                projects.add(Map.of(
+                        "projectId", rs.getObject("id").toString(),
+                        "projectKey", rs.getString("key"),
+                        "projectName", rs.getString("name"),
+                        "workspaceAiKeyId", allocated == null ? "" : allocated.toString()
+                ));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return Map.of("keys", keys, "projects", projects);
+    }
+
+    public static Map<String, Object> createWorkspaceAiKey(
+            UUID orgId,
+            UUID actorId,
+            String name,
+            String provider,
+            String apiKey,
+            String defaultModel
+    ) {
+        requireOrgRole(orgId, actorId, "owner");
+        String normalizedName = name == null ? "" : name.trim();
+        String normalizedProvider = normalizeAiProvider(provider);
+        String normalizedKey = apiKey == null ? "" : apiKey.trim();
+        String normalizedModel = defaultModel == null ? "" : defaultModel.trim();
+        if (normalizedName.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("Key name is required.");
+        }
+        if (normalizedKey.isBlank()) {
+            throw new io.javalin.http.BadRequestResponse("API key is required.");
+        }
+
+        String sql = """
+                INSERT INTO workspace_ai_keys (organization_id, name, provider, api_key, default_model, is_active, created_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, true, ?, now())
+                RETURNING id, name, provider, default_model, is_active, created_at, updated_at, api_key
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, orgId);
+            ps.setString(2, normalizedName);
+            ps.setString(3, normalizedProvider);
+            ps.setString(4, normalizedKey);
+            ps.setString(5, normalizedModel.isBlank() ? null : normalizedModel);
+            ps.setObject(6, actorId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) throw new RuntimeException("Failed to create workspace AI key");
+            return Map.of(
+                    "id", rs.getObject("id").toString(),
+                    "name", rs.getString("name"),
+                    "provider", rs.getString("provider"),
+                    "defaultModel", rs.getString("default_model") == null ? "" : rs.getString("default_model"),
+                    "active", rs.getBoolean("is_active"),
+                    "maskedKey", maskApiKey(rs.getString("api_key")),
+                    "createdAt", rs.getTimestamp("created_at").toInstant().toString(),
+                    "updatedAt", rs.getTimestamp("updated_at").toInstant().toString()
+            );
+        } catch (SQLException e) {
+            if ("23505".equals(e.getSQLState())) {
+                throw new io.javalin.http.BadRequestResponse("A key with this name already exists in your workspace.");
+            }
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void deleteWorkspaceAiKey(UUID orgId, UUID actorId, UUID keyId) {
+        requireOrgRole(orgId, actorId, "owner");
+        String sql = "DELETE FROM workspace_ai_keys WHERE id = ? AND organization_id = ?";
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, keyId);
+            ps.setObject(2, orgId);
+            int affected = ps.executeUpdate();
+            if (affected == 0) {
+                throw new io.javalin.http.NotFoundResponse("Workspace AI key not found.");
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void allocateWorkspaceAiKeyToProject(
+            UUID orgId,
+            UUID actorId,
+            UUID projectId,
+            UUID keyId
+    ) {
+        requireOrgRole(orgId, actorId, "owner");
+        requireProjectInOrganization(projectId, orgId);
+        if (keyId != null) {
+            String keySql = "SELECT 1 FROM workspace_ai_keys WHERE id = ? AND organization_id = ? AND is_active = true";
+            try (Connection c = Database.getDataSource().getConnection();
+                 PreparedStatement ps = c.prepareStatement(keySql)) {
+                ps.setObject(1, keyId);
+                ps.setObject(2, orgId);
+                ResultSet rs = ps.executeQuery();
+                if (!rs.next()) {
+                    throw new io.javalin.http.BadRequestResponse("Selected AI key does not belong to this workspace.");
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        String sql = """
+                INSERT INTO project_ai_key_allocations (project_id, workspace_ai_key_id, allocated_by, updated_at)
+                VALUES (?, ?, ?, now())
+                ON CONFLICT (project_id) DO UPDATE
+                SET workspace_ai_key_id = EXCLUDED.workspace_ai_key_id,
+                    allocated_by = EXCLUDED.allocated_by,
+                    updated_at = now()
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ps.setObject(2, keyId);
+            ps.setObject(3, actorId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String normalizeAiProvider(String provider) {
+        String normalized = provider == null ? "" : provider.trim().toLowerCase();
+        if (!"openai".equals(normalized) && !"anthropic".equals(normalized)) {
+            throw new io.javalin.http.BadRequestResponse("provider must be openai or anthropic");
+        }
+        return normalized;
+    }
+
+    private static String maskApiKey(String apiKey) {
+        if (apiKey == null || apiKey.isBlank()) return "";
+        String trimmed = apiKey.trim();
+        if (trimmed.length() <= 8) return "********";
+        return trimmed.substring(0, 4) + "..." + trimmed.substring(trimmed.length() - 4);
+    }
+
     private static Optional<UUID> findUserIdByEmail(String email) {
         if (email == null || (email = email.trim().toLowerCase()).isEmpty()) return Optional.empty();
         String sql = "SELECT id FROM users WHERE email = ?";

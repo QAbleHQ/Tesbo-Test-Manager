@@ -70,6 +70,10 @@ public final class Main {
         app.get("/api/workspace/project-access", WorkspaceHandler::getProjectAccess);
         app.put("/api/workspace/project-access", WorkspaceHandler::upsertProjectAccess);
         app.delete("/api/workspace/project-access", WorkspaceHandler::removeProjectAccess);
+        app.get("/api/workspace/ai-keys", WorkspaceHandler::listAiKeys);
+        app.post("/api/workspace/ai-keys", WorkspaceHandler::createAiKey);
+        app.delete("/api/workspace/ai-keys/{keyId}", WorkspaceHandler::deleteAiKey);
+        app.post("/api/workspace/ai-keys/allocations", WorkspaceHandler::allocateAiKeyToProject);
         app.get("/api/workspace/invitations", InvitationHandler::listWorkspaceInvitations);
         app.post("/api/workspace/invitations", InvitationHandler::createWorkspaceInvitation);
         app.delete("/api/workspace/invitations/{id}", InvitationHandler::revokeWorkspaceInvitation);

@@ -97,6 +97,59 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
   return api<WorkspaceInfo>("/api/workspace");
 }
 
+export interface WorkspaceAiKey {
+  id: string;
+  name: string;
+  provider: "openai" | "anthropic";
+  defaultModel?: string;
+  active: boolean;
+  maskedKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceAiProjectAllocation {
+  projectId: string;
+  projectKey: string;
+  projectName: string;
+  workspaceAiKeyId: string;
+}
+
+export interface WorkspaceAiKeysResponse {
+  keys: WorkspaceAiKey[];
+  projects: WorkspaceAiProjectAllocation[];
+}
+
+export async function listWorkspaceAiKeys(): Promise<WorkspaceAiKeysResponse> {
+  return api<WorkspaceAiKeysResponse>("/api/workspace/ai-keys");
+}
+
+export async function createWorkspaceAiKey(data: {
+  name: string;
+  provider: "openai" | "anthropic";
+  apiKey: string;
+  defaultModel?: string;
+}): Promise<WorkspaceAiKey> {
+  return api<WorkspaceAiKey>("/api/workspace/ai-keys", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function deleteWorkspaceAiKey(keyId: string): Promise<void> {
+  await api(`/api/workspace/ai-keys/${keyId}`, { method: "DELETE" });
+}
+
+export async function allocateWorkspaceAiKeyToProject(data: {
+  projectId: string;
+  workspaceAiKeyId?: string;
+}): Promise<void> {
+  await api("/api/workspace/ai-keys/allocations", {
+    method: "POST",
+    body: data,
+  });
+}
+
 export async function listWorkspaceMembers(): Promise<WorkspaceMember[]> {
   return api<WorkspaceMember[]>("/api/workspace/members");
 }

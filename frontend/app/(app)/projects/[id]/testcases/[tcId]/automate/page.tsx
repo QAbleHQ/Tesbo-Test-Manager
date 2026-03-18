@@ -61,6 +61,7 @@ type ReviewStep = {
 };
 
 type SessionStartupState = "select-environment" | "starting" | "waiting-stream" | "ready";
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 type BotHighlight = {
   xRatio: number;
   yRatio: number;
@@ -139,7 +140,7 @@ export default function AutomateTestCasePage() {
   const [quickActionBusy, setQuickActionBusy] = useState<"run" | null>(null);
   const [reviewScriptOpen, setReviewScriptOpen] = useState(false);
   const [aiConfigured, setAiConfigured] = useState(true);
-  const [aiProvider, setAiProvider] = useState<"openai" | "anthropic">("openai");
+  const [aiEnabled, setAiEnabled] = useState(true);
   const [lastClickTarget, setLastClickTarget] = useState<{ xRatio: number; yRatio: number } | null>(null);
   const [cursorPulse, setCursorPulse] = useState(false);
   const [botHighlight, setBotHighlight] = useState<BotHighlight | null>(null);
@@ -300,16 +301,17 @@ export default function AutomateTestCasePage() {
       .filter((item): item is TestEnvironmentSetting => item !== null);
   }
 
-  function resolveAiConfiguration(parsedSettings: Record<string, unknown>): {
+  function resolveAiConfiguration(
+    parsedSettings: Record<string, unknown>,
+    projectRecord?: Record<string, unknown>
+  ): {
     configured: boolean;
-    provider: "openai" | "anthropic";
+    enabled: boolean;
   } {
     const aiRaw = parsedSettings.ai as Record<string, unknown> | undefined;
-    const provider = aiRaw?.provider === "anthropic" ? "anthropic" : "openai";
-    const openAiApiKey = typeof aiRaw?.openAiApiKey === "string" ? aiRaw.openAiApiKey.trim() : "";
-    const anthropicApiKey = typeof aiRaw?.anthropicApiKey === "string" ? aiRaw.anthropicApiKey.trim() : "";
-    const configured = provider === "anthropic" ? anthropicApiKey.length > 0 : openAiApiKey.length > 0;
-    return { configured, provider };
+    const configured = projectRecord?.aiConfigured === true;
+    const enabled = aiRaw?.enabled !== false;
+    return { configured, enabled };
   }
 
   function buildPlaywrightScriptFromReviewSteps(testName: string, steps: ReviewStep[]): string {
@@ -996,10 +998,10 @@ export default function AutomateTestCasePage() {
         .then((project) => {
           const parsedSettings = parseProjectSettings(project.settings);
           const environments = normalizeTestRunEnvironments(parsedSettings.testRunEnvironments);
-          const aiState = resolveAiConfiguration(parsedSettings);
+          const aiState = resolveAiConfiguration(parsedSettings, project);
           setTestRunEnvironments(environments);
           setAiConfigured(aiState.configured);
-          setAiProvider(aiState.provider);
+          setAiEnabled(aiState.enabled);
           if (environments.length > 0) {
             setSelectedEnvironmentUrl(environments[0].url);
           }
@@ -1625,13 +1627,12 @@ export default function AutomateTestCasePage() {
   ) {
     if (!sessionId || !startupReady || !input.trim() || sending) return;
     const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
-    if (shouldUseAutonomousMode && !aiConfigured) {
+    if (shouldUseAutonomousMode && (!aiConfigured || !aiEnabled)) {
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content:
-            "Add your AI API key in Project Settings to use Autonomous mode commands. Live mode works without AI for recording.",
+          content: AGENT_ALLOCATION_ERROR,
         },
       ]);
       return;
@@ -2042,9 +2043,9 @@ Stop when pass/fail outcome is clear and summarize results.`;
           <div className="mb-2 flex items-center justify-between gap-2 px-1">
             <h2 className="text-sm font-semibold text-[var(--foreground)]">Automation Assistant</h2>
           </div>
-          {!aiConfigured && (
+          {(!aiConfigured || !aiEnabled) && (
             <p className="mb-2 rounded-lg border border-[var(--warning)]/30 bg-amber-50 px-2 py-1 text-xs text-amber-800">
-              {`AI key missing for ${aiProvider === "anthropic" ? "Anthropic" : "OpenAI"} provider. Configure it in Project Settings to enable chat-driven AI commands.`}
+              {AGENT_ALLOCATION_ERROR}
             </p>
           )}
           <div
@@ -2152,7 +2153,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
             <div className="relative">
               <textarea
                 value={command}
-                disabled={!startupReady || !aiConfigured}
+                disabled={!startupReady || !aiConfigured || !aiEnabled}
                 rows={2}
                 onChange={(e) => setCommand(e.target.value)}
                 onKeyDown={(event) => {
@@ -2162,8 +2163,8 @@ Stop when pass/fail outcome is clear and summarize results.`;
                   }
                 }}
                 placeholder={
-                  !aiConfigured
-                    ? "Add AI API key in Project Settings to use this mode"
+                  (!aiConfigured || !aiEnabled)
+                    ? AGENT_ALLOCATION_ERROR
                     : "Tell the agent exactly what to do. Example: Click the Log in button."
                 }
                 className="w-full resize-none rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-12 text-sm text-[var(--foreground)] placeholder:text-[var(--muted-soft)]"
@@ -2171,7 +2172,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               <button
                 type="button"
                 onClick={() => void onSendCommand()}
-                disabled={sending || !sessionId || !startupReady || !aiConfigured || !command.trim()}
+                disabled={sending || !sessionId || !startupReady || !aiConfigured || !aiEnabled || !command.trim()}
                 title={
                   sending
                     ? "Queueing command"
@@ -2204,7 +2205,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
             <button
               type="button"
               onClick={() => void onRunIndividualTest()}
-              disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured}
+              disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured || !aiEnabled}
               className="rounded-full border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] px-2.5 py-1 text-[11px] text-[var(--brand-primary)] disabled:opacity-50"
             >
               {quickActionBusy === "run" ? "Running test..." : "Run Current Test"}

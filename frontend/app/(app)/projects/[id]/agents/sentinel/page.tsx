@@ -23,6 +23,7 @@ import { Button, Card, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 type Tab = "queue" | "in_progress" | "needs_approval" | "completed";
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 function EyeIcon({ className = "h-6 w-6" }: { className?: string }) {
   return (
@@ -83,12 +84,21 @@ export default function SentinelPage() {
   const [busy, setBusy] = useState(false);
   const [autoTick, setAutoTick] = useState(false);
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  const [agentsEnabled, setAgentsEnabled] = useState(true);
   const processingRef = useRef(false);
 
   const load = () => setTasks(getStoredAgentTasks(projectId, "sentinel"));
 
   useEffect(() => {
     load();
+    getProject(projectId)
+      .then((project) => {
+        const parsed = parseProjectSettings(project.settings);
+        const aiRaw = (parsed.ai ?? {}) as Record<string, unknown>;
+        const aiEnabled = aiRaw.enabled !== false;
+        setAgentsEnabled(project.aiConfigured === true && aiEnabled);
+      })
+      .catch(() => setAgentsEnabled(false));
     const t = setInterval(load, 1000);
     return () => clearInterval(t);
   }, [projectId]);
@@ -417,6 +427,25 @@ export default function SentinelPage() {
       Agents
     </Link>
   );
+
+  if (!agentsEnabled) {
+    return (
+      <StandardPageLayout
+        header={
+          <PageHeader
+            title="Sentinel"
+            subtitle="Disabled for this project"
+            breadcrumb={breadcrumb}
+          />
+        }
+        className="flex-1 p-6 md:p-10 max-w-6xl mx-auto w-full"
+      >
+        <Card className="p-4">
+          <p className="text-sm text-[var(--muted)]">{AGENT_ALLOCATION_ERROR}</p>
+        </Card>
+      </StandardPageLayout>
+    );
+  }
 
   return (
     <StandardPageLayout

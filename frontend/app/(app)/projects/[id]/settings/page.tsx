@@ -68,6 +68,7 @@ type ProjectSettingsPayload = {
     };
   };
   ai?: {
+    enabled?: boolean;
     provider?: "openai" | "anthropic";
     model?: string;
     openAiApiKey?: string;
@@ -128,8 +129,8 @@ export default function ProjectSettingsPage() {
   const [description, setDescription] = useState("");
   const [provider, setProvider] = useState<"openai" | "anthropic">("openai");
   const [model, setModel] = useState("");
-  const [openAiApiKey, setOpenAiApiKey] = useState("");
-  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [aiConfigured, setAiConfigured] = useState(false);
   const [autoGenerateTestSteps, setAutoGenerateTestSteps] = useState(true);
   const [jiraAutoComment, setJiraAutoComment] = useState(false);
   const [jiraTicketSelector, setJiraTicketSelector] = useState(false);
@@ -263,8 +264,8 @@ export default function ProjectSettingsPage() {
             : optionList[0] ?? "";
         setProvider(aiProvider);
         setModel(resolvedModel);
-        setOpenAiApiKey(ai?.openAiApiKey ?? "");
-        setAnthropicApiKey(ai?.anthropicApiKey ?? "");
+        setAiEnabled(ai?.enabled !== false);
+        setAiConfigured(p.aiConfigured === true);
         setAutoGenerateTestSteps(ai?.autoGenerateTestSteps !== false);
         setJiraAutoComment(parsedSettings.jiraAutoComment === true);
         setJiraTicketSelector(parsedSettings.jiraTicketSelector === true);
@@ -305,15 +306,6 @@ export default function ProjectSettingsPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const shouldValidateAiCredentials = activeTab === "ai";
-    if (shouldValidateAiCredentials && provider === "openai" && !openAiApiKey.trim()) {
-      setMessage("OpenAI API key is required for OpenAI provider.");
-      return;
-    }
-    if (shouldValidateAiCredentials && provider === "anthropic" && !anthropicApiKey.trim()) {
-      setMessage("Anthropic API key is required for Anthropic provider.");
-      return;
-    }
     setSaving(true);
     setMessage(null);
     try {
@@ -338,10 +330,9 @@ export default function ProjectSettingsPage() {
       const nextSettings: ProjectSettingsPayload = {
         ...currentSettings,
         ai: {
+          enabled: aiEnabled,
           provider,
           model: model.trim() || undefined,
-          openAiApiKey: openAiApiKey.trim(),
-          anthropicApiKey: anthropicApiKey.trim(),
           autoGenerateTestSteps,
         },
         jiraAutoComment,
@@ -383,6 +374,8 @@ export default function ProjectSettingsPage() {
       const refreshed = await getProject(projectId);
       setProject(refreshed);
       const refreshedSettings = parseProjectSettings(refreshed.settings);
+      setAiEnabled(refreshedSettings.ai?.enabled !== false);
+      setAiConfigured(refreshed.aiConfigured === true);
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
       setNewEnvironmentName("");
       setNewEnvironmentUrl("");
@@ -847,7 +840,7 @@ export default function ProjectSettingsPage() {
               <div>
                 <h2 className="text-base font-semibold text-[var(--foreground)]">AI Test Case Generation</h2>
                 <p className="mt-1 text-sm text-[var(--muted)]">
-                  Select provider and API key to enable test script generation for this project.
+                  Configure provider/model for this project. API keys are managed at workspace level.
                 </p>
               </div>
               <Field>
@@ -879,21 +872,29 @@ export default function ProjectSettingsPage() {
                 </Select>
               </Field>
               <Field>
-                <FieldLabel>
-                  {provider === "openai" ? "OpenAI API Key" : "Anthropic API Key"}
-                </FieldLabel>
-                <Input
-                  type="password"
-                  value={provider === "openai" ? openAiApiKey : anthropicApiKey}
-                  onChange={(e) => {
-                    if (provider === "openai") {
-                      setOpenAiApiKey(e.target.value);
-                      return;
-                    }
-                    setAnthropicApiKey(e.target.value);
-                  }}
-                  placeholder={provider === "openai" ? "sk-..." : "sk-ant-..."}
-                />
+                <FieldLabel>AI settings enabled</FieldLabel>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={aiEnabled}
+                    onChange={(e) => setAiEnabled(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span className="text-sm text-[var(--foreground)]">
+                    {aiEnabled ? "Enabled" : "Disabled"}
+                  </span>
+                </label>
+              </Field>
+              <Field>
+                <FieldLabel>AI key allocation status</FieldLabel>
+                <p className="text-sm text-[var(--muted)]">
+                  {aiConfigured ? "Allocated" : "Not allocated"}
+                </p>
+                <p className="text-xs text-[var(--muted-soft)]">
+                  {aiConfigured
+                    ? "Workspace AI key is allocated to this project."
+                    : "Manage keys and allocations in Workspace Settings -> Integrations."}
+                </p>
               </Field>
               <label className="flex items-start gap-3 cursor-pointer">
                 <input

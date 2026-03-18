@@ -1,17 +1,56 @@
 "use client";
 
+import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
+import { getProject } from "@/lib/api";
 import { getActiveRuns, onRunsChanged, type AegisBackgroundRun } from "@/lib/aegis-runner";
 
+function parseProjectSettings(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 export function AegisBackgroundIndicator() {
+  const params = useParams();
+  const projectId = typeof params?.id === "string" ? params.id : "";
   const [runs, setRuns] = useState<AegisBackgroundRun[]>([]);
+  const [agentsEnabled, setAgentsEnabled] = useState(true);
 
   useEffect(() => {
+    if (!projectId) {
+      setAgentsEnabled(true);
+      return;
+    }
+    const refreshAgentAvailability = () => {
+      getProject(projectId)
+        .then((project) => {
+          const parsedSettings = parseProjectSettings(project.settings);
+          const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
+          const aiEnabled = aiRaw.enabled !== false;
+          setAgentsEnabled(project.aiConfigured === true && aiEnabled);
+        })
+        .catch(() => setAgentsEnabled(false));
+    };
+    refreshAgentAvailability();
+    const id = setInterval(refreshAgentAvailability, 5000);
+    return () => clearInterval(id);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!agentsEnabled) {
+      setRuns([]);
+      return;
+    }
     setRuns(getActiveRuns());
     return onRunsChanged(() => setRuns(getActiveRuns()));
-  }, []);
+  }, [agentsEnabled]);
 
-  if (runs.length === 0) return null;
+  if (!agentsEnabled || runs.length === 0) return null;
 
   const running = runs.filter((r) => r.status === "running");
   const completed = runs.filter((r) => r.status === "completed");

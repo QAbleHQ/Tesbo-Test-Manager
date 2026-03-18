@@ -578,6 +578,27 @@ async function resolveEnvironmentUrl(projectId: string): Promise<string | null> 
   }
 }
 
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
+
+type ProjectAiAgentAvailability = {
+  keyAllocated: boolean;
+  aiEnabled: boolean;
+};
+
+async function getProjectAiAgentAvailability(projectId: string): Promise<ProjectAiAgentAvailability> {
+  try {
+    const project = await getProject(projectId);
+    const settings = parseProjectSettings(typeof project.settings === "string" ? project.settings : "");
+    const aiRaw = (settings.ai ?? {}) as Record<string, unknown>;
+    return {
+      keyAllocated: project.aiConfigured === true,
+      aiEnabled: aiRaw.enabled !== false,
+    };
+  } catch {
+    return { keyAllocated: false, aiEnabled: false };
+  }
+}
+
 export type AegisBackgroundStatus = "running" | "completed" | "failed";
 export type AegisRunPhase = "queued" | "building" | "bot_reviewing" | "completed" | "failed";
 
@@ -1397,6 +1418,10 @@ export async function runAegisInBackground(
     previousScript?: string | null;
   },
 ): Promise<void> {
+  const aiAvailability = await getProjectAiAgentAvailability(projectId);
+  if (!aiAvailability.keyAllocated || !aiAvailability.aiEnabled) {
+    throw new Error(AGENT_ALLOCATION_ERROR);
+  }
   if (activeRuns.has(testcaseId)) return;
   if (pendingQueue.some((q) => q.testcaseId === testcaseId)) return;
 
@@ -1550,6 +1575,32 @@ async function executeAegisRun(
       return;
     }
 
+    const aiAvailability = await getProjectAiAgentAvailability(projectId);
+    if (!aiAvailability.keyAllocated || !aiAvailability.aiEnabled) {
+      addRunLog(
+        testcaseId,
+        AGENT_ALLOCATION_ERROR,
+        "error",
+        { category: "system" }
+      );
+      upsertAgentTask(projectId, "aegis", {
+        ...queuedTask,
+        status: "pending_review",
+        script: null,
+        logs: [{
+          ts: new Date().toISOString(),
+          message: AGENT_ALLOCATION_ERROR,
+          type: "error",
+        }],
+        updatedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      activeRuns.set(testcaseId, { ...activeRuns.get(testcaseId)!, status: "failed" });
+      notifyListeners();
+      setTimeout(() => { activeRuns.delete(testcaseId); notifyListeners(); }, 5000);
+      return;
+    }
+
     addRunLog(testcaseId, `Environment resolved: ${envUrl}`, "milestone", { url: envUrl, category: "system" });
     updateRunCurrentAction(testcaseId, "Resolving environment");
 
@@ -1642,6 +1693,7 @@ async function executeAegisRun(
     let consecutivePollErrors = 0;
     let lastTrackedUrl = envUrl;
     let actionCount = 0;
+    let lastExecutionFailureReason: string | null = null;
     const executionStartTime = Date.now();
     const processedAgentEventKeys = new Set<string>();
 
@@ -1771,6 +1823,12 @@ async function executeAegisRun(
             if (event.eventType === "autonomous_step_evaluating") {
               addRunLog(testcaseId, "Analyzing current page and deciding next action...", "thinking", { category: "agent" });
               updateRunCurrentAction(testcaseId, "Analyzing page state");
+            } else if (event.eventType === "command_failed") {
+              const errorMessage = asText(executionResult?.error || parsed?.error || executionResult?.message || parsed?.message);
+              const reason = errorMessage || "Automation command failed before any executable actions were produced.";
+              lastExecutionFailureReason = reason;
+              addRunLog(testcaseId, `Execution failed: ${reason}`, "error", { category: "agent" });
+              updateRunCurrentAction(testcaseId, "Execution failed");
             } else if (event.eventType === "autonomous_step_executed" || event.eventType === "autonomous_turn_executed") {
               const status = parsed ? asText(parsed.status) : "";
               const stepData = parsed?.step as Record<string, unknown> | undefined;
@@ -1841,13 +1899,18 @@ async function executeAegisRun(
           const rawScript = extractGeneratedScript(session);
           const hasExecutableCode = rawScript ? /await\s+/.test(rawScript) : false;
           const script = hasExecutableCode ? rawScript : null;
+          const noActionsCaptured = actionCount <= 0;
 
-          if (!script && attempt < MAX_RETRIES) {
-            addRunLog(testcaseId, "Execution completed but no executable script was generated — retrying", "error", {
+          if (!script) {
+            const failureReason = lastExecutionFailureReason
+              || (noActionsCaptured
+                ? "No browser actions were executed."
+                : "Execution completed but no executable script was generated.");
+            addRunLog(testcaseId, `${failureReason} Retrying...`, "error", {
               durationMs: executionDuration,
               category: "agent",
             });
-            await retryOrFail("No executable script generated");
+            await retryOrFail(failureReason);
             return;
           }
 
@@ -1855,11 +1918,6 @@ async function executeAegisRun(
             try { await finalizeAutomationSession(projectId, sessionId, { script }); } catch {}
             const lineCount = script.split("\n").length;
             addRunLog(testcaseId, `Script generated successfully (${lineCount} lines, ${actionCount} actions captured)`, "success", {
-              durationMs: executionDuration,
-              category: "agent",
-            });
-          } else {
-            addRunLog(testcaseId, "Execution completed but no executable script actions were captured", "error", {
               durationMs: executionDuration,
               category: "agent",
             });

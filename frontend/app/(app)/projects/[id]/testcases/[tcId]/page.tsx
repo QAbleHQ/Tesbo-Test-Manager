@@ -12,6 +12,7 @@ import {
   listSuites,
   listTestCases,
   getAgentSettings,
+  getProject,
   type SuiteNode,
   type TestCaseListItem,
 } from "@/lib/api";
@@ -31,12 +32,23 @@ type ScriptHistoryEntry = {
 };
 
 const FETCH_LIMIT = 100;
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 function parseTagString(raw: string): string[] {
   return raw
     .split(",")
     .map((tag) => tag.trim())
     .filter(Boolean);
+}
+
+function parseProjectSettings(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 export default function TestCaseDetailPage() {
@@ -71,6 +83,7 @@ export default function TestCaseDetailPage() {
   const [saving, setSaving] = useState(false);
   const [assigningToAegis, setAssigningToAegis] = useState(false);
   const [saveNotification, setSaveNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [canUseAgents, setCanUseAgents] = useState(false);
   
 
   async function loadAllCases(): Promise<TestCaseListItem[]> {
@@ -100,6 +113,14 @@ export default function TestCaseDetailPage() {
         router.replace("/login");
         return;
       }
+      getProject(projectId)
+        .then((project) => {
+          const parsedSettings = parseProjectSettings(project.settings);
+          const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
+          const aiEnabled = aiRaw.enabled !== false;
+          setCanUseAgents(project.aiConfigured === true && aiEnabled);
+        })
+        .catch(() => setCanUseAgents(false));
       if (isNew) {
         setTc({});
         listSuites(projectId).then((items) => {
@@ -214,7 +235,12 @@ export default function TestCaseDetailPage() {
         if (effectiveAutomationStatus === "Ready for the Automation") {
           const settings = getAgentSettings(projectId, "aegis");
           if (settings.autoStartOnReady) {
-            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+            if (canUseAgents) {
+              await runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+            } else {
+              setSaveNotification({ type: "error", message: AGENT_ALLOCATION_ERROR });
+              setTimeout(() => setSaveNotification(null), 6000);
+            }
           }
         }
         if (action === "create-next") {
@@ -266,7 +292,12 @@ export default function TestCaseDetailPage() {
         if (effectiveAutomationStatus === "Ready for the Automation") {
           const settings = getAgentSettings(projectId, "aegis");
           if (settings.autoStartOnReady) {
-            runAegisInBackground(projectId, testcaseId, title, "", "ready_for_automation");
+            if (canUseAgents) {
+              await runAegisInBackground(projectId, testcaseId, title, "", "ready_for_automation");
+            } else {
+              setSaveNotification({ type: "error", message: AGENT_ALLOCATION_ERROR });
+              setTimeout(() => setSaveNotification(null), 6000);
+            }
           }
         }
         setSaveNotification({ type: "success", message: "Test case updated successfully." });
@@ -303,6 +334,9 @@ export default function TestCaseDetailPage() {
     if (isNew || assigningToAegis) return;
     setAssigningToAegis(true);
     try {
+      if (!canUseAgents) {
+        throw new Error(AGENT_ALLOCATION_ERROR);
+      }
       const currentExternalId = String((tc as Record<string, unknown> | null)?.externalId ?? "");
       const currentTitle = String((tc as Record<string, unknown> | null)?.title ?? "");
       await runAegisInBackground(
@@ -590,6 +624,7 @@ export default function TestCaseDetailPage() {
                 variant="ai"
                 onClick={() => void onAssignToAegisQueue()}
                 disabled={assigningToAegis || saving}
+                title={!canUseAgents ? AGENT_ALLOCATION_ERROR : "Assign to Aegis"}
               >
                 {assigningToAegis ? "Assigning..." : "Assign to Aegis"}
               </Button>

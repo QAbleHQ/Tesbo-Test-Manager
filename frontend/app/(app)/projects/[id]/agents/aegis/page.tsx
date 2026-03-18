@@ -25,6 +25,7 @@ import { AegisBackgroundIndicator } from "@/components/aegis-background-indicato
 import { onRunsChanged, getActiveRuns, runAegisInBackground, recoverOrphanedTasks, type AegisBackgroundRun } from "@/lib/aegis-runner";
 
 type PagePhase = "select" | "running" | "results";
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 type QueueItemStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
 
@@ -540,6 +541,8 @@ export default function AegisAgentPage() {
   const [pastTasks, setPastTasks] = useState<AgentTask[]>([]);
   const [backgroundRuns, setBackgroundRuns] = useState<AegisBackgroundRun[]>([]);
   const [activeTab, setActiveTab] = useState<"queue" | "in_progress" | "in_review" | "completed">("queue");
+  const [agentsEnabled, setAgentsEnabled] = useState(true);
+  const [agentGateLoading, setAgentGateLoading] = useState(true);
   const autoStartTriggered = useRef(false);
 
   const cancelledRef = useRef(false);
@@ -643,6 +646,12 @@ export default function AegisAgentPage() {
   useEffect(() => {
     authMe().then((me) => {
       if (!me) { router.replace("/login"); return; }
+      getProject(projectId).then((p) => {
+        const parsed = parseProjectSettings(asText(p.settings));
+        const aiRaw = (parsed.ai ?? {}) as Record<string, unknown>;
+        const aiEnabled = aiRaw.enabled !== false;
+        setAgentsEnabled(p.aiConfigured === true && aiEnabled);
+      }).finally(() => setAgentGateLoading(false));
       const settings = getAgentSettings(projectId, "aegis");
       if (settings.defaultEnvironmentUrl) {
         setDefaultEnvUrl(settings.defaultEnvironmentUrl);
@@ -663,6 +672,11 @@ export default function AegisAgentPage() {
   }, [projectId, router]);
 
   useEffect(() => {
+    if (!agentsEnabled) {
+      setPastTasks([]);
+      setBackgroundRuns([]);
+      return;
+    }
     const stored = getStoredAgentTasks(projectId, "aegis");
     setPastTasks(stored);
     setBackgroundRuns(getActiveRuns());
@@ -678,9 +692,10 @@ export default function AegisAgentPage() {
       setPastTasks(getStoredAgentTasks(projectId, "aegis"));
       setBackgroundRuns(getActiveRuns());
     });
-  }, [projectId]);
+  }, [agentsEnabled, projectId]);
 
   useEffect(() => {
+    if (!agentsEnabled) return;
     if (autoStartTriggered.current) return;
     const queued = getAegisAutoQueue(projectId);
     if (queued.length > 0) {
@@ -698,7 +713,7 @@ export default function AegisAgentPage() {
       })();
       setActiveTab("in_progress");
     }
-  }, [projectId]);
+  }, [agentsEnabled, projectId]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -895,6 +910,32 @@ export default function AegisAgentPage() {
   };
 
   // --- RENDER ---
+
+  if (!agentGateLoading && !agentsEnabled) {
+    return (
+      <div className="flex-1 p-6 md:p-10 max-w-6xl mx-auto w-full">
+        <AegisBackgroundIndicator />
+        <div className="mb-6">
+          <Link href={`/projects/${projectId}/agents`} className="text-sm text-[var(--muted)] hover:text-[var(--brand-primary)] mb-2 inline-flex items-center gap-1">
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+            Agents
+          </Link>
+          <div className="mt-1 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[var(--surface-secondary)] text-[var(--muted)]">
+              <ShieldIcon className="h-6 w-6" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-[var(--foreground)]">Aegis</h1>
+              <p className="text-sm text-[var(--muted)]">Disabled for this project</p>
+            </div>
+          </div>
+        </div>
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+          <p className="text-sm text-[var(--muted)]">{AGENT_ALLOCATION_ERROR}</p>
+        </div>
+      </div>
+    );
+  }
 
   if (phase === "select") {
     const tabs = [

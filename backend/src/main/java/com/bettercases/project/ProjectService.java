@@ -1,6 +1,7 @@
 package com.bettercases.project;
 
 import com.bettercases.Database;
+import com.bettercases.ai.AiHandler;
 import com.bettercases.rbac.Role;
 import com.bettercases.rbac.RbacService;
 import com.bettercases.suite.SuiteService;
@@ -98,6 +99,7 @@ public final class ProjectService {
                 result.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
                 result.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());
                 result.put("myRole", roleOpt.get().name().toLowerCase());
+                result.put("aiConfigured", AiHandler.hasAssignedWorkspaceAiKey(projectId));
                 return Optional.of(result);
             }
         } catch (SQLException e) {

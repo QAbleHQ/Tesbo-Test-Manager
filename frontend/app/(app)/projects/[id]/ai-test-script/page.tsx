@@ -115,11 +115,7 @@ export default function AiTestScriptGenerationPage() {
           const provider = settings.ai?.provider === "anthropic" ? "anthropic" : "openai";
           setProjectProvider(provider);
           setProjectModel(settings.ai?.model ?? "");
-          const hasConfiguredKey =
-            provider === "openai"
-              ? Boolean(settings.ai?.openAiApiKey?.trim())
-              : Boolean(settings.ai?.anthropicApiKey?.trim());
-          setHasLlmKey(hasConfiguredKey);
+          setHasLlmKey(project.aiConfigured === true);
           setSuites(suiteList);
 
           const autoComment = settings.jiraAutoComment === true;
@@ -159,7 +155,7 @@ export default function AiTestScriptGenerationPage() {
 
   async function handleGenerate() {
     if (!hasLlmKey) {
-      setError("Add your LLM API key in Project Settings before using AI generation.");
+      setError("Workspace AI key is not configured for this project. Ask workspace owner to allocate one in Workspace Settings -> Integrations.");
       return;
     }
     if (!storyDetails.trim()) {
@@ -285,7 +281,7 @@ export default function AiTestScriptGenerationPage() {
       )}
       {!hasLlmKey && (
         <p className="mb-4 rounded-lg border border-[var(--warning)]/50 bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]">
-          Add your LLM API key in Project Settings {"->"} AI first to use AI generation.
+          Workspace AI key is not configured for this project. Ask workspace owner to allocate one in Workspace Settings {"->"} Integrations.
         </p>
       )}
 

@@ -18,6 +18,7 @@ import {
   bulkUpdateTestCases,
   bulkDeleteTestCases,
   getAgentSettings,
+  getProject,
   getExportUrl,
   getTemplateUrl,
   type TestCaseListItem,
@@ -83,6 +84,18 @@ function priorityTone(p: string) {
   return "neutral" as const;
 }
 
+function parseProjectSettings(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
+
 export default function TestCasesPage() {
   const params = useParams();
   const router = useRouter();
@@ -144,10 +157,14 @@ export default function TestCasesPage() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isImportExportMenuOpen, setIsImportExportMenuOpen] = useState(false);
   const importExportMenuRef = useRef<HTMLDivElement>(null);
-  
+  const [canUseAgents, setCanUseAgents] = useState(false);
 
   const loadData = useCallback(async () => {
-    const suiteList = await listSuites(projectId);
+    const [suiteList, project] = await Promise.all([listSuites(projectId), getProject(projectId)]);
+    const parsedSettings = parseProjectSettings(project.settings);
+    const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
+    const aiEnabled = aiRaw.enabled !== false;
+    setCanUseAgents(project.aiConfigured === true && aiEnabled);
     setSuites(suiteList);
   }, [projectId]);
 
@@ -563,7 +580,11 @@ export default function TestCasesPage() {
         if (effectiveAutomationStatus === "Ready for the Automation") {
           const settings = getAgentSettings(projectId, "aegis");
           if (settings.autoStartOnReady) {
-            runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+            if (canUseAgents) {
+              await runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
+            } else {
+              setPanelError(AGENT_ALLOCATION_ERROR);
+            }
           }
         }
         setSuiteCasesPage(1);
@@ -603,7 +624,11 @@ export default function TestCasesPage() {
         if (effectiveAutomationStatus === "Ready for the Automation") {
           const settings = getAgentSettings(projectId, "aegis");
           if (settings.autoStartOnReady) {
-            runAegisInBackground(projectId, panelTestcaseId, title, "", "ready_for_automation");
+            if (canUseAgents) {
+              await runAegisInBackground(projectId, panelTestcaseId, title, "", "ready_for_automation");
+            } else {
+              setPanelError(AGENT_ALLOCATION_ERROR);
+            }
           }
         }
         setPanelSuccess("Test case updated successfully.");
@@ -1381,10 +1406,20 @@ export default function TestCasesPage() {
                                           variant="ai"
                                           size="sm"
                                           onClick={() => {
-                                            runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
-                                            setPanelSuccess("Added to Aegis queue.");
-                                            setTimeout(() => setPanelSuccess(null), 4000);
+                                            void (async () => {
+                                              try {
+                                                await runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
+                                                setPanelSuccess("Added to Aegis queue.");
+                                                setPanelError(null);
+                                                setTimeout(() => setPanelSuccess(null), 4000);
+                                              } catch (err) {
+                                                const message =
+                                                  err instanceof Error ? err.message : AGENT_ALLOCATION_ERROR;
+                                                setPanelError(message);
+                                              }
+                                            })();
                                           }}
+                                          title={!canUseAgents ? AGENT_ALLOCATION_ERROR : "Send to Aegis"}
                                         >
                                           Send to Aegis
                                         </Button>

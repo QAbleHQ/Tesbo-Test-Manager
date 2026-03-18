@@ -94,6 +94,62 @@ public final class WorkspaceHandler {
         ctx.status(204);
     }
 
+    public static void listAiKeys(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID orgId = WorkspaceService.getCurrentUserOrganizationId(userId)
+                .orElseThrow(() -> new io.javalin.http.NotFoundResponse("No workspace found."));
+        ctx.json(WorkspaceService.listWorkspaceAiKeys(orgId, userId));
+    }
+
+    public static void createAiKey(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID orgId = WorkspaceService.getCurrentUserOrganizationId(userId)
+                .orElseThrow(() -> new io.javalin.http.NotFoundResponse("No workspace found."));
+        CreateAiKeyBody body = ctx.bodyAsClass(CreateAiKeyBody.class);
+        if (body == null || body.name == null || body.provider == null || body.apiKey == null) {
+            ctx.status(400).json(Map.of("error", "name, provider and apiKey are required"));
+            return;
+        }
+        ctx.status(201).json(WorkspaceService.createWorkspaceAiKey(
+                orgId,
+                userId,
+                body.name,
+                body.provider,
+                body.apiKey,
+                body.defaultModel
+        ));
+    }
+
+    public static void deleteAiKey(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID orgId = WorkspaceService.getCurrentUserOrganizationId(userId)
+                .orElseThrow(() -> new io.javalin.http.NotFoundResponse("No workspace found."));
+        UUID keyId = UUID.fromString(ctx.pathParam("keyId"));
+        WorkspaceService.deleteWorkspaceAiKey(orgId, userId, keyId);
+        ctx.status(204);
+    }
+
+    public static void allocateAiKeyToProject(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID orgId = WorkspaceService.getCurrentUserOrganizationId(userId)
+                .orElseThrow(() -> new io.javalin.http.NotFoundResponse("No workspace found."));
+        AllocateAiKeyBody body = ctx.bodyAsClass(AllocateAiKeyBody.class);
+        if (body == null || body.projectId == null || body.projectId.isBlank()) {
+            ctx.status(400).json(Map.of("error", "projectId is required"));
+            return;
+        }
+        UUID keyId = (body.workspaceAiKeyId == null || body.workspaceAiKeyId.isBlank())
+                ? null
+                : UUID.fromString(body.workspaceAiKeyId);
+        WorkspaceService.allocateWorkspaceAiKeyToProject(
+                orgId,
+                userId,
+                UUID.fromString(body.projectId),
+                keyId
+        );
+        ctx.status(204);
+    }
+
     public static class AddMemberBody {
         public String email;
         public String userId;
@@ -104,5 +160,17 @@ public final class WorkspaceHandler {
         public String projectId;
         public String userId;
         public String role;
+    }
+
+    public static class CreateAiKeyBody {
+        public String name;
+        public String provider;
+        public String apiKey;
+        public String defaultModel;
+    }
+
+    public static class AllocateAiKeyBody {
+        public String projectId;
+        public String workspaceAiKeyId;
     }
 }
