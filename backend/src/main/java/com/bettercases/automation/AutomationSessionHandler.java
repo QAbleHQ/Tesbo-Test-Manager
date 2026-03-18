@@ -77,7 +77,6 @@ public final class AutomationSessionHandler {
         Map<String, Object> session = AutomationSessionService.startSession(projectId, testcaseId, userId, startUrl);
         UUID sessionId = UUID.fromString(String.valueOf(session.get("id")));
         try {
-            BrowserbaseCredentialsService.Credentials browserbase = BrowserbaseCredentialsService.resolve(projectId);
             Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
             String provider = String.valueOf(aiConfig.getOrDefault("provider", "openai")).trim().toLowerCase();
             if (!"anthropic".equals(provider)) provider = "openai";
@@ -91,8 +90,6 @@ public final class AutomationSessionHandler {
                     startUrl,
                     projectId,
                     testcaseId,
-                    browserbase.apiKey(),
-                    browserbase.projectId(),
                     provider,
                     modelApiKey,
                     model
@@ -100,9 +97,6 @@ public final class AutomationSessionHandler {
             String sessionType = String.valueOf(agentSession.getOrDefault("sessionType", "playwright"));
             Map<String, Object> browserMeta = new HashMap<>();
             browserMeta.put("sessionType", sessionType);
-            if (browserbase.projectId() != null && !browserbase.projectId().isBlank()) {
-                browserMeta.put("browserbaseProjectId", browserbase.projectId());
-            }
             AutomationSessionService.touchState(sessionId, startUrl == null ? "" : startUrl, null, browserMeta);
         } catch (Exception e) {
             AutomationSessionService.markSessionStartFailed(sessionId, "Session start failed: " + e.getMessage());
@@ -247,8 +241,8 @@ public final class AutomationSessionHandler {
             domPlanningContext = buildDomPlanningContext(liveState);
         } catch (Exception ignored) {}
 
-        if ("stagehand".equals(sessionType)) {
-            executeStagehandCommand(envelope, cancelSignal, currentUrl);
+        if ("agent".equals(sessionType)) {
+            executeAgentCommand(envelope, cancelSignal, currentUrl);
             return;
         }
 
@@ -326,17 +320,17 @@ public final class AutomationSessionHandler {
     }
 
     /**
-     * Execute command using Stagehand agent.
+     * Execute command using the automation agent.
      * Chat mode should follow the latest user instruction exactly.
      * Autonomous mode can expand into richer end-to-end execution.
      */
-    private static void executeStagehandCommand(
+    private static void executeAgentCommand(
             CommandEnvelope envelope,
             AtomicBoolean cancelSignal,
             String currentUrl
     ) {
         if (cancelSignal.get()) {
-            appendCancelledEvent(envelope, "Command was stopped before Stagehand execution started.");
+            appendCancelledEvent(envelope, "Command was stopped before agent execution started.");
             return;
         }
 
@@ -344,51 +338,51 @@ public final class AutomationSessionHandler {
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_received",
                 envelope.rawCommand,
                 Map.of(
-                        "mode", "stagehand",
+                        "mode", "agent",
                         "objective", envelope.objective
                 ),
                 null,
                 null
         );
 
-        String stagehandObjective = envelope.autonomousMode
-                ? buildStagehandExecutionObjective(envelope)
-                : buildStagehandChatObjective(envelope);
-        List<Map<String, Object>> stagehandPlanPreview = extractStagehandPlanPreview(stagehandObjective);
+        String agentObjective = envelope.autonomousMode
+                ? buildAgentExecutionObjective(envelope)
+                : buildAgentChatObjective(envelope);
+        List<Map<String, Object>> agentPlanPreview = extractAgentPlanPreview(agentObjective);
         AutomationSessionService.addEvent(
-                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_plan_sent",
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "agent_plan_sent",
                 envelope.rawCommand,
                 Map.of(
-                        "mode", "stagehand",
+                        "mode", "agent",
                         "objective", envelope.objective,
-                        "stagehandObjective", stagehandObjective,
-                        "stagehandPlan", stagehandPlanPreview
+                        "agentObjective", agentObjective,
+                        "agentPlan", agentPlanPreview
                 ),
                 null,
                 null
         );
         AutomationSessionService.addEvent(
-                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_execution_started",
+                envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "agent_execution_started",
                 envelope.rawCommand,
                 Map.of(
-                        "mode", "stagehand",
+                        "mode", "agent",
                         "stage", "running",
-                        "plannedStepCount", stagehandPlanPreview.size()
+                        "plannedStepCount", agentPlanPreview.size()
                 ),
                 null,
                 null
         );
-        AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeStagehand(
+        AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeAgent(
                 envelope.sessionId,
                 envelope.commandId.toString(),
-                stagehandObjective
+                agentObjective
         );
         String screenshotPath = null;
         if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
             screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
         }
         Map<String, Object> browserMeta = new HashMap<>();
-        browserMeta.put("sessionType", "stagehand");
+        browserMeta.put("sessionType", "agent");
         browserMeta.put("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size());
         AutomationSessionService.touchState(
                 envelope.sessionId,
@@ -397,22 +391,22 @@ public final class AutomationSessionHandler {
                 browserMeta
         );
         Map<String, Object> executionPayload = new HashMap<>();
-        executionPayload.put("mode", "stagehand");
+        executionPayload.put("mode", "agent");
         executionPayload.put("currentUrl", executeResponse.currentUrl);
         executionPayload.put("results", executeResponse.results);
-        executionPayload.put("stagehandActions", executeResponse.stagehandActions == null ? List.of() : executeResponse.stagehandActions);
+        executionPayload.put("agentActions", executeResponse.agentActions == null ? List.of() : executeResponse.agentActions);
         executionPayload.put("telemetryEvents", executeResponse.telemetryEvents == null ? List.of() : executeResponse.telemetryEvents);
         executionPayload.put("telemetryPlan", executeResponse.telemetryPlan == null ? List.of() : executeResponse.telemetryPlan);
         executionPayload.put("cancelled", false);
-        appendStagehandTelemetryEvents(envelope, executeResponse, screenshotPath);
+        appendAgentTelemetryEvents(envelope, executeResponse, screenshotPath);
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
                 envelope.rawCommand,
                 Map.of(
-                        "mode", "stagehand",
+                        "mode", "agent",
                         "objective", envelope.objective,
-                        "stagehandObjective", stagehandObjective,
-                        "steps", buildStagehandReplaySteps(executeResponse.results)
+                        "agentObjective", agentObjective,
+                        "steps", buildAgentReplaySteps(executeResponse.results)
                 ),
                 executionPayload,
                 screenshotPath
@@ -423,7 +417,7 @@ public final class AutomationSessionHandler {
         persistRecordingSnapshot(envelope, inlineRecording, inlineScript);
     }
 
-    private static void appendStagehandTelemetryEvents(
+    private static void appendAgentTelemetryEvents(
             CommandEnvelope envelope,
             AutomationContracts.AgentExecuteResponse executeResponse,
             String defaultScreenshotPath
@@ -431,11 +425,11 @@ public final class AutomationSessionHandler {
         List<Map<String, Object>> plan = executeResponse.telemetryPlan == null ? List.of() : executeResponse.telemetryPlan;
         if (!plan.isEmpty()) {
             AutomationSessionService.addEvent(
-                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "stagehand_plan_compiled",
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "agent_plan_compiled",
                     envelope.rawCommand,
                     Map.of(
-                            "mode", "stagehand",
-                            "stagehandPlan", plan,
+                            "mode", "agent",
+                            "agentPlan", plan,
                             "plannedStepCount", plan.size()
                     ),
                     null,
@@ -448,13 +442,13 @@ public final class AutomationSessionHandler {
             if (telemetry == null || telemetry.isEmpty()) continue;
             String eventType = String.valueOf(telemetry.getOrDefault("eventType", "")).trim().toLowerCase();
             String mappedType = switch (eventType) {
-                case "observe" -> "stagehand_step_observed";
-                case "act" -> "stagehand_step_acted";
-                case "extract" -> "stagehand_step_extracted";
-                default -> "stagehand_step_event";
+                case "observe" -> "agent_step_observed";
+                case "act" -> "agent_step_acted";
+                case "extract" -> "agent_step_extracted";
+                default -> "agent_step_event";
             };
             Map<String, Object> parsedAction = new HashMap<>();
-            parsedAction.put("mode", "stagehand");
+            parsedAction.put("mode", "agent");
             parsedAction.put("stage", eventType.isBlank() ? "unknown" : eventType);
             parsedAction.put("stepId", String.valueOf(telemetry.getOrDefault("stepId", "")));
             parsedAction.put("instruction", String.valueOf(telemetry.getOrDefault("instruction", "")));
@@ -483,7 +477,7 @@ public final class AutomationSessionHandler {
         }
     }
 
-    private static String buildStagehandExecutionObjective(CommandEnvelope envelope) {
+    private static String buildAgentExecutionObjective(CommandEnvelope envelope) {
         String goal = envelope.objective == null ? "" : envelope.objective.trim();
         if (goal.isBlank()) {
             goal = envelope.rawCommand == null ? "" : envelope.rawCommand.trim();
@@ -500,17 +494,26 @@ public final class AutomationSessionHandler {
         List<Map<String, Object>> events = AutomationSessionService.listEvents(envelope.sessionId, 200);
         List<String> feedbackSignals = extractRecentFeedbackSignals(events, envelope.rawCommand);
 
+        boolean goalAlreadyHasSteps = goal.contains("### Steps to Execute") || goal.contains("Steps to Execute");
+
         StringBuilder objective = new StringBuilder();
         objective.append("Primary Goal:\n").append(goal).append("\n\n");
-        if (!title.isBlank()) objective.append("Test Case Title:\n").append(title).append("\n\n");
-        if (!description.isBlank()) objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
+        if (!title.isBlank() && !goal.contains(title)) objective.append("Test Case Title:\n").append(title).append("\n\n");
+        if (!description.isBlank() && !goal.contains(description.substring(0, Math.min(description.length(), 60))))
+            objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
         if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
-        if (!steps.isBlank()) objective.append("Expected Steps:\n").append(limitBlock(steps, 3000)).append("\n\n");
+        if (!steps.isBlank() && !goalAlreadyHasSteps) {
+            String formattedSteps = formatStepsAsNumberedList(steps);
+            objective.append("Expected Steps:\n").append(limitBlock(formattedSteps, 3000)).append("\n\n");
+        }
         if (!testData.isBlank()) {
-            objective.append("Test Data (use exact values):\n").append(limitBlock(testData, 1500)).append("\n\n");
+            boolean goalAlreadyHasTestData = goal.contains("### Test Data") || goal.contains("### Credentials");
+            if (!goalAlreadyHasTestData) {
+                objective.append("Test Data (use exact values):\n").append(limitBlock(testData, 1500)).append("\n\n");
+            }
             String credentialsBlock = formatLoginCredentials(testData);
-            if (!credentialsBlock.isBlank()) {
-                objective.append("CRITICAL - Login credentials (use EXACTLY; never use user@example.com or password123):\n")
+            if (!credentialsBlock.isBlank() && !goal.contains("Credentials")) {
+                objective.append("Credentials (use exact values):\n")
                         .append(credentialsBlock).append("\n\n");
             }
         }
@@ -524,16 +527,16 @@ public final class AutomationSessionHandler {
         }
 
         objective.append("Execution Requirements:\n")
-                .append("1) Perform MULTI-STEP browser actions to satisfy the full test goal, not a single action.\n")
-                .append("2) Complete login FIRST with the exact credentials from Test Data above. Only after login succeeds, proceed to post-login steps (e.g. program tabs, create program).\n")
-                .append("3) Use provided test data values exactly where applicable. For login forms: fill Email and Password with the exact values from Test Data / Login credentials. Never use placeholder values.\n")
-                .append("4) Validate outcomes with assertions: prefer Stagehand extraction/assertion checks.\n")
-                .append("5) If a strict Stagehand assertion is not reliable for a specific check, still verify via deterministic page evidence before finishing.\n")
-                .append("6) Avoid unnecessary exploration once required goals are satisfied.\n");
+                .append("1) Follow the steps exactly as written above. Execute each step in order.\n")
+                .append("2) Use exact values from Test Data when filling any form fields. Never substitute with placeholders.\n")
+                .append("3) Navigate and interact with the page naturally — read visible labels, buttons, and links to find the right elements.\n")
+                .append("4) If an element is not immediately visible, look around the page: scroll, check navigation menus, or explore alternative paths.\n")
+                .append("5) After each step, observe the result before moving to the next step.\n")
+                .append("6) Only declare goal achieved when ALL listed steps have been executed.\n");
         return objective.toString().trim();
     }
 
-    private static String buildStagehandChatObjective(CommandEnvelope envelope) {
+    private static String buildAgentChatObjective(CommandEnvelope envelope) {
         String instruction = envelope.objective == null ? "" : envelope.objective.trim();
         if (instruction.isBlank()) {
             instruction = envelope.rawCommand == null ? "" : envelope.rawCommand.trim();
@@ -550,7 +553,7 @@ public final class AutomationSessionHandler {
                 + "5) If the target is ambiguous, choose the closest visible match by label/text and execute once.");
     }
 
-    private static List<Map<String, Object>> extractStagehandPlanPreview(String objective) {
+    private static List<Map<String, Object>> extractAgentPlanPreview(String objective) {
         if (objective == null || objective.isBlank()) return List.of();
         String[] lines = objective.replace("\r", "").split("\n");
         java.util.ArrayList<Map<String, Object>> out = new java.util.ArrayList<>();
@@ -604,22 +607,102 @@ public final class AutomationSessionHandler {
         return normalized.substring(0, Math.max(0, maxChars)) + "...";
     }
 
-    /** Parse login credentials from test data (e.g. "Credentials : email/password" or "email / password"). */
+    /**
+     * Convert JSON step arrays from the DB into human-readable numbered lists.
+     * Input like: [{"action":"Enter email","expectedResult":"Email entered"}]
+     * Output like: 1. Enter email -> Expect: Email entered
+     */
+    private static String formatStepsAsNumberedList(String steps) {
+        if (steps == null || steps.isBlank()) return steps;
+        String trimmed = steps.trim();
+        if (!trimmed.startsWith("[")) return trimmed;
+        try {
+            com.fasterxml.jackson.databind.JsonNode arr = mapper.readTree(trimmed);
+            if (!arr.isArray() || arr.isEmpty()) return trimmed;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < arr.size(); i++) {
+                com.fasterxml.jackson.databind.JsonNode step = arr.get(i);
+                String action = step.path("action").asText("").trim();
+                String expected = step.path("expectedResult").asText("").trim();
+                if (action.isBlank() && expected.isBlank()) continue;
+                sb.append(i + 1).append(". ");
+                if (!action.isBlank()) sb.append(action);
+                if (!expected.isBlank()) {
+                    if (!action.isBlank()) sb.append(" -> Expect: ");
+                    sb.append(expected);
+                }
+                sb.append("\n");
+            }
+            String result = sb.toString().trim();
+            return result.isBlank() ? trimmed : result;
+        } catch (Exception e) {
+            return trimmed;
+        }
+    }
+
+    /** Parse login credentials from test data in various formats (JSON, key=value, slash-separated). */
     private static String formatLoginCredentials(String testData) {
         if (testData == null || testData.isBlank()) return "";
         String s = testData.replace("\r", "").trim();
-        // Match patterns like "Credentials : email@domain.com/ password" or "email@domain.com / password"
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "(?i)(?:credentials?\\s*[:=]?\\s*)?([^\\s/]+@[^\\s/]+)\\s*/\\s*([^\\s]+)"
-        ).matcher(s);
-        if (m.find()) {
-            String email = m.group(1).trim();
-            String password = m.group(2).trim();
-            if (!email.isBlank() && !password.isBlank()) {
-                return "Email: " + email + ", Password: " + password;
+        String email = "";
+        String password = "";
+        String username = "";
+
+        // 1) Try JSON: {"email": "x", "password": "y"}
+        if (s.contains("{")) {
+            try {
+                Map<String, Object> parsed = mapper.readValue(s, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+                for (Map.Entry<String, Object> entry : parsed.entrySet()) {
+                    String key = entry.getKey() == null ? "" : entry.getKey().trim().toLowerCase();
+                    String value = entry.getValue() == null ? "" : String.valueOf(entry.getValue()).trim();
+                    if (value.isBlank() || "null".equalsIgnoreCase(value)) continue;
+                    if (key.contains("password") || key.equals("pass")) password = value;
+                    else if (key.contains("email") || key.equals("login")) email = value;
+                    else if (key.contains("username") || key.equals("user")) username = value;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 2) Try key=value / key: value lines
+        if (email.isBlank() && password.isBlank()) {
+            for (String lineRaw : s.split("\n")) {
+                String line = lineRaw.trim();
+                if (line.isBlank() || line.startsWith("#")) continue;
+                java.util.regex.Matcher kvMatcher = java.util.regex.Pattern.compile(
+                        "^\\s*-?\\s*(\\w[\\w\\s]*)\\s*[:=]\\s*(.+)$"
+                ).matcher(line);
+                if (!kvMatcher.find()) continue;
+                String key = kvMatcher.group(1).trim().toLowerCase();
+                String value = kvMatcher.group(2).trim().replaceAll("^[\"']|[\"']$", "").trim();
+                if (value.isBlank() || "null".equalsIgnoreCase(value) || "none".equalsIgnoreCase(value)) continue;
+                if (key.matches(".*(?:password|pass(?:word)?|otp|pin).*")) password = value;
+                else if (key.matches(".*(?:email|e-mail|login).*")) email = value;
+                else if (key.matches(".*(?:user(?:name)?).*") && username.isBlank()) username = value;
             }
         }
-        return "";
+
+        // 3) Fallback: slash-separated (email@domain / password)
+        if (email.isBlank() && password.isBlank()) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                    "(?i)(?:credentials?\\s*[:=]?\\s*)?([^\\s/]+@[^\\s/]+)\\s*/\\s*([^\\s]+)"
+            ).matcher(s);
+            if (m.find()) {
+                email = m.group(1).trim();
+                password = m.group(2).trim();
+            }
+        }
+
+        if (email.isBlank() && username.isBlank()) return "";
+        if (password.isBlank()) return "";
+
+        StringBuilder out = new StringBuilder();
+        if (!email.isBlank()) out.append("Email: ").append(email);
+        if (!username.isBlank()) {
+            if (out.length() > 0) out.append(", ");
+            out.append("Username: ").append(username);
+        }
+        out.append(", Password: ").append(password);
+        return out.toString();
     }
 
     private static Map<String, Object> loadTestcaseContext(UUID projectId, UUID testcaseId) {
@@ -647,7 +730,7 @@ public final class AutomationSessionHandler {
         }
     }
 
-    private static List<Map<String, Object>> buildStagehandReplaySteps(List<AutomationContracts.StepResult> results) {
+    private static List<Map<String, Object>> buildAgentReplaySteps(List<AutomationContracts.StepResult> results) {
         if (results == null || results.isEmpty()) return List.of();
         List<Map<String, Object>> out = new java.util.ArrayList<>();
         for (AutomationContracts.StepResult result : results) {

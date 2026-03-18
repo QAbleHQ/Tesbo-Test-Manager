@@ -301,10 +301,9 @@ public final class AutomationIntentParserService {
                 d) **What do I expect to happen?** — Anticipate the result to validate progress.
 
                 ## CRITICAL: Goal Completion Rules
-                - The objective contains a list of test case steps. You MUST complete ALL of them.
+                - The objective contains a list of steps. You MUST complete ALL of them.
                 - Review the execution history and cross-reference it against the objective steps.
-                - Login/authentication is NEVER the final goal — it is only a prerequisite.
-                - Do NOT set goalAchieved=true after only completing login or the first step.
+                - Do NOT set goalAchieved=true after only completing the first step or a subset of steps.
                 - Only set goalAchieved=true when you have executed actions for EVERY step in the objective.
                 - If the objective has a "Completion Checklist", ALL items must be addressed.
                 - Count the steps in the objective and count how many you've completed in the history.

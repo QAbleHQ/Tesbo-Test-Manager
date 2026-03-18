@@ -162,10 +162,9 @@ export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedba
   }
 
   lines.push("### Objective");
-  lines.push("You are a senior test automation engineer. Your goal is to understand the user's testing intent,");
-  lines.push("explore the application like a real human would, and execute this test case end-to-end.");
-  lines.push("You MUST complete ALL steps listed below — not just the first step (e.g., login).");
-  lines.push("Login or authentication is only a prerequisite. The real test begins AFTER login.");
+  lines.push("You are a browser automation agent. Follow the steps below exactly as written, in order.");
+  lines.push("Execute each step faithfully — read the page, find the right elements, and perform the action described.");
+  lines.push("You MUST complete ALL steps listed below, not just the first one.");
   if (isRevision) {
     lines.push("Pay special attention to the reviewer feedback above and make sure each point is addressed.");
   }
@@ -214,21 +213,16 @@ export function buildIntentObjective(tc: Record<string, unknown>, reviewerFeedba
   }
 
   lines.push("### Execution Guidelines");
-  lines.push("- Complete login FIRST with the exact credentials from Test Data. Only after login succeeds, proceed to post-login steps.");
-  lines.push("- First, observe and understand the current page layout, navigation, and available controls.");
-  lines.push("- Navigate the application naturally as a real user would — read labels, understand context, find the right elements.");
-  lines.push("- If a step mentions a feature or page, explore the UI to locate it rather than guessing selectors.");
-  lines.push("- Adapt to the actual DOM structure — if expected elements are not where anticipated, look for alternative paths.");
-  lines.push("- Generate meaningful assertions that verify business outcomes, not just element presence.");
-  lines.push("- When entering test data, use the EXACT values from the Test Data section above. Do NOT invent or substitute values.");
-  lines.push("- Handle loading states, transitions, and dynamic content gracefully.");
+  lines.push("- Execute each step in the exact order listed above.");
+  lines.push("- Read the page before acting — find the right elements by their visible labels, text, or placeholders.");
+  lines.push("- When a step says to enter/type/fill something, use the exact values from Test Data if available.");
+  lines.push("- If an element is not immediately visible, look around: scroll, check menus, try alternative navigation paths.");
+  lines.push("- After each action, observe the result to confirm it worked before moving to the next step.");
+  lines.push("- Handle loading states and page transitions gracefully.");
   lines.push("");
-  lines.push("### CRITICAL: Goal Completion Rules");
-  lines.push("- Do NOT declare goalAchieved=true after only performing login/authentication.");
-  lines.push("- Login is a prerequisite, NOT the objective. Continue with the remaining steps after login.");
+  lines.push("### Goal Completion");
+  lines.push("- Only set goalAchieved=true when ALL listed steps have been executed.");
   lines.push("- Cross-reference your execution history against the Steps list above.");
-  lines.push("- Only set goalAchieved=true when you have evidence that ALL listed steps have been executed.");
-  lines.push("- If the test case has N steps, you should have performed actions corresponding to all N steps.");
   if (steps.length > 0) {
     lines.push(`- This test case has ${steps.length} steps. All ${steps.length} must be completed.`);
   }
@@ -258,7 +252,7 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
     if (selector.startsWith("xpath:")) return `xpath=${selector.slice("xpath:".length)}`;
     return selector;
   };
-  const pushStagehandCapture = (entryRaw: unknown, status: unknown, source: string) => {
+  const pushAgentCapture = (entryRaw: unknown, status: unknown, source: string) => {
     const entry = asRecord(entryRaw);
     if (Object.keys(entry).length === 0) return;
     const type = asText(entry.type).toLowerCase();
@@ -368,7 +362,7 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       }
     }
   };
-  const inferStagehandStatus = (parsed: Record<string, unknown>, execution: Record<string, unknown>): string => {
+  const inferAgentStatus = (parsed: Record<string, unknown>, execution: Record<string, unknown>): string => {
     const explicit = [parsed.status, execution.status].map((v) => asText(v).toLowerCase()).find(Boolean);
     if (explicit === "passed" || explicit === "success") return "passed";
     if (explicit === "failed" || explicit === "error") return "failed";
@@ -380,9 +374,9 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       if (status === "passed" || status === "success") sawPassedResult = true;
     }
     if (sawPassedResult) return "passed";
-    const stagehandActions = Array.isArray(execution.stagehandActions) ? execution.stagehandActions : [];
+    const agentActions = Array.isArray(execution.agentActions) ? execution.agentActions : [];
     let sawSuccessfulAction = false;
-    for (const actionRaw of stagehandActions) {
+    for (const actionRaw of agentActions) {
       const action = asRecord(actionRaw);
       if (action.success === false) return "failed";
       if (action.success === true) sawSuccessfulAction = true;
@@ -408,11 +402,11 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
       }
     } else if (event.eventType === "command_executed") {
       const captureCountBefore = captures.length;
-      const stagehandActions = Array.isArray(execution.stagehandActions) ? execution.stagehandActions : [];
-      if (stagehandActions.length > 0) {
-        const status = inferStagehandStatus(parsed, execution);
-        for (const stagehandAction of stagehandActions) {
-          pushStagehandCapture(stagehandAction, status, "command_executed_stagehand");
+      const agentActions = Array.isArray(execution.agentActions) ? execution.agentActions : [];
+      if (agentActions.length > 0) {
+        const status = inferAgentStatus(parsed, execution);
+        for (const agentAction of agentActions) {
+          pushAgentCapture(agentAction, status, "command_executed_agent");
         }
         continue;
       }
@@ -427,7 +421,7 @@ export function extractGeneratedScript(session: AutomationSession): string | nul
         }
       }
       if (captures.length === captureCountBefore) {
-        // Fallback path: when Stagehand returns no normalized actions/replay steps,
+        // Fallback path: when agent returns no normalized actions/replay steps,
         // derive coarse captures from raw result entries so script preview is still generated.
         const results = Array.isArray(execution.results) ? execution.results : [];
         const overallStatus = normalizeStatus(parsed.status || execution.status);
@@ -724,7 +718,7 @@ function friendlyToolName(tool: string): string {
   return map[tool.toLowerCase()] || `Using tool: ${tool}`;
 }
 
-function logStagehandActionEntry(
+function logAgentActionEntry(
   testcaseId: string,
   action: Record<string, unknown>,
   index: number,
@@ -1658,12 +1652,12 @@ async function executeAegisRun(
           for (let ai = lastAgentEventCount; ai < agentEvents.length; ai++) {
             const agentEvent = agentEvents[ai];
             const agentType = asText(agentEvent.type);
-            if (agentType !== "stagehand_agent_reasoning" && agentType !== "stagehand_agent_action") continue;
+            if (agentType !== "agent_reasoning" && agentType !== "agent_action") continue;
             const dedupeKey = `${agentType}:${agentEvent.createdAt}:${ai}`;
             if (processedAgentEventKeys.has(dedupeKey)) continue;
             processedAgentEventKeys.add(dedupeKey);
 
-            if (agentType === "stagehand_agent_reasoning") {
+            if (agentType === "agent_reasoning") {
               const reasoning = asText(agentEvent.reasoning);
               const agentUrl = asText(agentEvent.url);
               const plan = agentEvent.plan as Array<{ index: number; instruction: string }> | undefined;
@@ -1690,7 +1684,7 @@ async function executeAegisRun(
                   );
                 }
               }
-            } else if (agentType === "stagehand_agent_action") {
+            } else if (agentType === "agent_action") {
               const toolName = asText(agentEvent.toolName);
               const reasoning = asText(agentEvent.reasoning);
               const agentUrl = asText(agentEvent.url);
@@ -1729,7 +1723,7 @@ async function executeAegisRun(
           lastAgentEventCount = agentEvents.length;
         }
 
-        const sdkLogs = (streamState?.stagehandLogs ?? []) as Array<Record<string, unknown>>;
+        const sdkLogs = (streamState?.agentLogs ?? []) as Array<Record<string, unknown>>;
         if (sdkLogs.length > lastSdkLogCount) {
           for (let si = lastSdkLogCount; si < sdkLogs.length; si++) {
             const log = sdkLogs[si];
@@ -1743,7 +1737,7 @@ async function executeAegisRun(
             const isReasoning = cat === "agent" || /reason|think|plan|decid|analyz/i.test(msg);
             addRunLog(
               testcaseId,
-              `[Stagehand${cat ? ` · ${cat}` : ""}] ${msg}`,
+              `[Agent${cat ? ` · ${cat}` : ""}] ${msg}`,
               isReasoning ? "thinking" : "info",
               { category: "agent" }
             );
@@ -1794,15 +1788,15 @@ async function executeAegisRun(
                 addRunLog(testcaseId, `Action did not succeed as expected (status: ${status || "unknown"})`, "error", { category: "agent" });
               }
             } else if (event.eventType === "command_executed") {
-              const stagehandActionsRaw = executionResult?.stagehandActions;
-              const stagehandActions = Array.isArray(stagehandActionsRaw)
-                ? (stagehandActionsRaw as Array<Record<string, unknown>>)
+              const agentActionsRaw = executionResult?.agentActions;
+              const agentActions = Array.isArray(agentActionsRaw)
+                ? (agentActionsRaw as Array<Record<string, unknown>>)
                 : [];
-              if (stagehandActions.length > 0) {
-                addRunLog(testcaseId, `Processing batch of ${stagehandActions.length} action${stagehandActions.length > 1 ? "s" : ""}...`, "info", { category: "agent" });
-                for (let j = 0; j < stagehandActions.length; j += 1) {
-                  const action = stagehandActions[j] || {};
-                  logStagehandActionEntry(testcaseId, action, j, stagehandActions.length);
+              if (agentActions.length > 0) {
+                addRunLog(testcaseId, `Processing batch of ${agentActions.length} action${agentActions.length > 1 ? "s" : ""}...`, "info", { category: "agent" });
+                for (let j = 0; j < agentActions.length; j += 1) {
+                  const action = agentActions[j] || {};
+                  logAgentActionEntry(testcaseId, action, j, agentActions.length);
                   actionCount++;
                 }
               } else {

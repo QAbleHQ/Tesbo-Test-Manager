@@ -6,7 +6,7 @@ import {
   createSession,
   resetSession,
   executeSteps,
-  executeStagehand,
+  executeAgent,
   manualAction,
   runPlaywrightScript,
   runPlaywrightScriptInSession,
@@ -60,10 +60,6 @@ app.post("/internal/sessions", async (req, res) => {
   const {
     sessionId,
     startUrl,
-    projectId,
-    testcaseId,
-    browserbaseApiKey,
-    browserbaseProjectId,
     modelProvider,
     modelApiKey,
     model,
@@ -74,24 +70,15 @@ app.post("/internal/sessions", async (req, res) => {
   }
   const options = {};
   if (modelApiKey) {
-    options.browserbaseApiKey = browserbaseApiKey;
-    options.browserbaseProjectId = browserbaseProjectId;
     options.modelProvider = modelProvider || "openai";
     options.modelApiKey = modelApiKey;
     options.model = model;
-    const scopeProject = typeof projectId === "string" ? projectId.trim() : "";
-    const scopeTestcase = typeof testcaseId === "string" ? testcaseId.trim() : "";
-    if (scopeProject && scopeTestcase) {
-      options.cacheScope = `${scopeProject}/${scopeTestcase}`;
-    } else if (scopeProject) {
-      options.cacheScope = `${scopeProject}/${sessionId}`;
-    }
   }
   try {
     const state = await createSession(sessionId, typeof startUrl === "string" ? startUrl : null, options);
     res.status(201).json({
       sessionId,
-      sessionType: state?.type === "stagehand" ? "stagehand" : "playwright",
+      sessionType: state?.type === "agent" ? "agent" : "playwright",
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -131,7 +118,7 @@ app.post("/internal/sessions/:sessionId/execute", async (req, res) => {
   }
 });
 
-app.post("/internal/sessions/:sessionId/execute-stagehand", async (req, res) => {
+app.post("/internal/sessions/:sessionId/execute-agent", async (req, res) => {
   const { sessionId } = req.params;
   const { commandId, objective, useTelemetry } = req.body || {};
   if (!commandId || !objective || typeof objective !== "string") {
@@ -139,12 +126,12 @@ app.post("/internal/sessions/:sessionId/execute-stagehand", async (req, res) => 
     return;
   }
   try {
-    const result = await executeStagehand(sessionId, commandId, objective.trim(), {
+    const result = await executeAgent(sessionId, commandId, objective.trim(), {
       useTelemetry: typeof useTelemetry === "boolean" ? useTelemetry : undefined,
     });
     res.json(result);
   } catch (err) {
-    res.status(404).json({ error: err instanceof Error ? err.message : "Stagehand execution failed" });
+    res.status(404).json({ error: err instanceof Error ? err.message : "Agent execution failed" });
   }
 });
 
@@ -153,26 +140,13 @@ app.post("/internal/playwright/run", async (req, res) => {
     executionId,
     script,
     startUrl,
-    modelProvider,
-    modelApiKey,
-    model,
-    browserbaseApiKey,
-    browserbaseProjectId,
-    cacheScope,
   } = req.body || {};
   if (!executionId || !script) {
     res.status(400).json({ error: "executionId and script are required" });
     return;
   }
   try {
-    const result = await runPlaywrightScript(String(executionId), String(script), typeof startUrl === "string" ? startUrl : null, {
-      modelProvider: typeof modelProvider === "string" ? modelProvider : "openai",
-      modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
-      model: typeof model === "string" ? model : "",
-      browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
-      browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
-      cacheScope: typeof cacheScope === "string" ? cacheScope : "",
-    });
+    const result = await runPlaywrightScript(String(executionId), String(script), typeof startUrl === "string" ? startUrl : null);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Playwright run failed" });
@@ -186,12 +160,6 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
     script,
     startUrl,
     actionDelayMs,
-    modelProvider,
-    modelApiKey,
-    model,
-    browserbaseApiKey,
-    browserbaseProjectId,
-    cacheScope,
   } = req.body || {};
   if (!executionId || !script) {
     res.status(400).json({ error: "executionId and script are required" });
@@ -203,15 +171,7 @@ app.post("/internal/sessions/:sessionId/run-script", async (req, res) => {
       String(executionId),
       String(script),
       typeof startUrl === "string" ? startUrl : null,
-      Number.isFinite(Number(actionDelayMs)) ? Number(actionDelayMs) : 0,
-      {
-        modelProvider: typeof modelProvider === "string" ? modelProvider : "openai",
-        modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
-        model: typeof model === "string" ? model : "",
-        browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
-        browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
-        cacheScope: typeof cacheScope === "string" ? cacheScope : "",
-      }
+      Number.isFinite(Number(actionDelayMs)) ? Number(actionDelayMs) : 0
     );
     res.json(result);
   } catch (err) {
@@ -239,9 +199,6 @@ app.post("/internal/queue/jobs", async (req, res) => {
     modelProvider,
     modelApiKey,
     model,
-    browserbaseApiKey,
-    browserbaseProjectId,
-    cacheScope,
   } = req.body || {};
   if (!jobId || !runId || !cycleId || !executionId || !script) {
     res.status(400).json({ error: "jobId, runId, cycleId, executionId, and script are required" });
@@ -263,9 +220,6 @@ app.post("/internal/queue/jobs", async (req, res) => {
       modelProvider: typeof modelProvider === "string" ? modelProvider : "",
       modelApiKey: typeof modelApiKey === "string" ? modelApiKey : "",
       model: typeof model === "string" ? model : "",
-      browserbaseApiKey: typeof browserbaseApiKey === "string" ? browserbaseApiKey : "",
-      browserbaseProjectId: typeof browserbaseProjectId === "string" ? browserbaseProjectId : "",
-      cacheScope: typeof cacheScope === "string" ? cacheScope : "",
     });
     res.status(202).json(queued);
   } catch (err) {
@@ -423,9 +377,8 @@ app.get("/internal/sessions/:sessionId/recording", async (req, res) => {
     response.partialScript = browserRecorder.toPlaywrightScript();
   }
 
-  // ActionRecorder (Stagehand) data is exposed separately as debug metadata
   if (recorder) {
-    response.stagehandMetadata = {
+    response.agentMetadata = {
       summary: recorder.getSummary(),
       actions: recorder.getActions(),
       reasoningLog: recorder.getReasoningLog(),

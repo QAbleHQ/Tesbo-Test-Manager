@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import TagInput from "@/components/TagInput";
 import {
@@ -18,11 +18,14 @@ import {
   bulkUpdateTestCases,
   bulkDeleteTestCases,
   getAgentSettings,
+  getExportUrl,
+  getTemplateUrl,
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
 import { runAegisInBackground, recoverOrphanedTasks } from "@/lib/aegis-runner";
 import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
+import ImportTestCasesModal from "@/components/ImportTestCasesModal";
 
 const PAGE_SIZE = 100;
 const TESTCASE_STATUSES = ["Draft", "In Review", "Approved", "Deprecated", "Archived"];
@@ -113,6 +116,9 @@ export default function TestCasesPage() {
   const [allCasesSuiteFilter, setAllCasesSuiteFilter] = useState("all");
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("bySuites");
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isImportExportMenuOpen, setIsImportExportMenuOpen] = useState(false);
+  const importExportMenuRef = useRef<HTMLDivElement>(null);
   
 
   const loadData = useCallback(async () => {
@@ -154,6 +160,17 @@ export default function TestCasesPage() {
     }, 250);
     return () => clearTimeout(timeout);
   }, [suiteSearch]);
+
+  useEffect(() => {
+    if (!isImportExportMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (importExportMenuRef.current && !importExportMenuRef.current.contains(e.target as Node)) {
+        setIsImportExportMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [isImportExportMenuOpen]);
 
   useEffect(() => {
     setSuiteCasesPage(1);
@@ -617,6 +634,71 @@ export default function TestCasesPage() {
             >
               All Test Cases
             </button>
+          </div>
+          <div ref={importExportMenuRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setIsImportExportMenuOpen((v) => !v)}
+              className="flex items-center gap-1.5 rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+              Import / Export
+              <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+            </button>
+            {isImportExportMenuOpen && (
+              <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-xl border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <button
+                  type="button"
+                  onClick={() => { setIsImportModalOpen(true); setIsImportExportMenuOpen(false); }}
+                  className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <svg className="h-4 w-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                  Import Test Cases
+                </button>
+                <div className="my-1 border-t border-zinc-100 dark:border-zinc-800" />
+                <a
+                  href={getExportUrl(projectId, "csv")}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setIsImportExportMenuOpen(false)}
+                  className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <svg className="h-4 w-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                  Export as CSV
+                </a>
+                <a
+                  href={getExportUrl(projectId, "xlsx")}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setIsImportExportMenuOpen(false)}
+                  className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <svg className="h-4 w-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                  Export as Excel
+                </a>
+                <div className="my-1 border-t border-zinc-100 dark:border-zinc-800" />
+                <a
+                  href={getTemplateUrl(projectId, "csv")}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setIsImportExportMenuOpen(false)}
+                  className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <svg className="h-4 w-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                  Download CSV Template
+                </a>
+                <a
+                  href={getTemplateUrl(projectId, "xlsx")}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => setIsImportExportMenuOpen(false)}
+                  className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <svg className="h-4 w-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                  Download Excel Template
+                </a>
+              </div>
+            )}
           </div>
           <button
             type="button"
@@ -1656,6 +1738,15 @@ export default function TestCasesPage() {
           </aside>
         </div>
       )}
+      <ImportTestCasesModal
+        projectId={projectId}
+        open={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        onImported={() => {
+          void loadData();
+          void loadSelectedSuiteCases();
+        }}
+      />
     </main>
   );
 }

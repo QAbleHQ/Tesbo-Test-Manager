@@ -28,8 +28,6 @@ public final class AutomationAgentClient {
             String startUrl,
             UUID projectId,
             UUID testcaseId,
-            String browserbaseApiKey,
-            String browserbaseProjectId,
             String modelProvider,
             String modelApiKey,
             String model
@@ -39,8 +37,6 @@ public final class AutomationAgentClient {
         payload.put("startUrl", startUrl == null ? "" : startUrl);
         if (projectId != null) payload.put("projectId", projectId.toString());
         if (testcaseId != null) payload.put("testcaseId", testcaseId.toString());
-        if (browserbaseApiKey != null && !browserbaseApiKey.isBlank()) payload.put("browserbaseApiKey", browserbaseApiKey);
-        if (browserbaseProjectId != null && !browserbaseProjectId.isBlank()) payload.put("browserbaseProjectId", browserbaseProjectId);
         if (modelProvider != null && !modelProvider.isBlank()) payload.put("modelProvider", modelProvider);
         if (modelApiKey != null && !modelApiKey.isBlank()) payload.put("modelApiKey", modelApiKey);
         if (model != null && !model.isBlank()) payload.put("model", model);
@@ -64,15 +60,15 @@ public final class AutomationAgentClient {
         }
     }
 
-    public static AutomationContracts.AgentExecuteResponse executeStagehand(UUID sessionId, String commandId, String objective) {
-        String body = send("/internal/sessions/" + sessionId + "/execute-stagehand", "POST", Map.of(
+    public static AutomationContracts.AgentExecuteResponse executeAgent(UUID sessionId, String commandId, String objective) {
+        String body = send("/internal/sessions/" + sessionId + "/execute-agent", "POST", Map.of(
                 "commandId", commandId,
                 "objective", objective == null ? "" : objective
         ), Duration.ofSeconds(240));
         try {
             return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to parse stagehand execute response", e);
+            throw new RuntimeException("Failed to parse agent execute response", e);
         }
     }
 
@@ -121,8 +117,6 @@ public final class AutomationAgentClient {
             String modelProvider,
             String modelApiKey,
             String model,
-            String browserbaseApiKey,
-            String browserbaseProjectId,
             String cacheScope
     ) {
         Map<String, Object> payload = new HashMap<>();
@@ -132,8 +126,6 @@ public final class AutomationAgentClient {
         if (modelProvider != null && !modelProvider.isBlank()) payload.put("modelProvider", modelProvider);
         if (modelApiKey != null && !modelApiKey.isBlank()) payload.put("modelApiKey", modelApiKey);
         if (model != null && !model.isBlank()) payload.put("model", model);
-        if (browserbaseApiKey != null && !browserbaseApiKey.isBlank()) payload.put("browserbaseApiKey", browserbaseApiKey);
-        if (browserbaseProjectId != null && !browserbaseProjectId.isBlank()) payload.put("browserbaseProjectId", browserbaseProjectId);
         if (cacheScope != null && !cacheScope.isBlank()) payload.put("cacheScope", cacheScope);
         String body = send("/internal/playwright/run", "POST", payload, Duration.ofSeconds(180));
         try {

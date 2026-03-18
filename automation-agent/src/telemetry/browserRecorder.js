@@ -2,14 +2,14 @@
  * BrowserRecorder – actor-agnostic page-level recording layer.
  *
  * Injects a capture-phase event listener script into the page and bridges
- * events back to Node.js via console.log (compatible with Stagehand's page
+ * events back to Node.js via console.log (compatible with Playwright's page
  * proxy which supports page.on("console") but NOT exposeBinding/exposeFunction).
  *
  * Coalesces raw DOM events into high-level Playwright action lines
  * (click, fill, press, navigate, select, scroll, etc.).
  *
  * Captures everything regardless of who is driving the browser (user,
- * Stagehand, or any other automation tool).
+ * or any other automation tool).
  */
 
 const CONSOLE_PREFIX = "__BC_REC__:";
@@ -398,8 +398,8 @@ export class BrowserRecorder {
   get actionCount() { return this._actions.length; }
 
   /**
-   * Attach to a Stagehand/Playwright Page.
-   * Uses console.log as the communication bridge (works with Stagehand).
+   * Attach to a Playwright Page.
+   * Uses console.log as the communication bridge.
    * @param {import('playwright').Page} page
    */
   async attach(page) {
@@ -432,7 +432,7 @@ export class BrowserRecorder {
       await page.addInitScript({ content: script });
       initScriptOk = true;
     } catch {
-      // Stagehand may use addInitScript with different signature
+      // Some page proxies may use addInitScript with different signature
       try {
         await page.addInitScript(script);
         initScriptOk = true;

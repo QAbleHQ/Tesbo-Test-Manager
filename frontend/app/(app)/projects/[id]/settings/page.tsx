@@ -41,8 +41,6 @@ const ANTHROPIC_MODELS = [
 type ProjectSettingsPayload = {
   automation?: {
     browserAgent?: "default" | "custom";
-    browserbaseApiKey?: string;
-    browserbaseProjectId?: string;
     executionProvider?: "default" | "lambdatest" | "browserstack";
     maxParallel?: number;
     providers?: {
@@ -139,8 +137,6 @@ export default function ProjectSettingsPage() {
   const [browserStackUsername, setBrowserStackUsername] = useState("");
   const [browserStackAccessKey, setBrowserStackAccessKey] = useState("");
   const [browserAgent, setBrowserAgent] = useState<"default" | "custom">("default");
-  const [browserbaseApiKey, setBrowserbaseApiKey] = useState("");
-  const [browserbaseProjectId, setBrowserbaseProjectId] = useState("");
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
   const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
   const [rotatingTesboKey, setRotatingTesboKey] = useState(false);
@@ -288,8 +284,6 @@ export default function ProjectSettingsPage() {
         setBrowserStackUsername(automation?.providers?.browserstack?.username ?? "");
         setBrowserStackAccessKey(automation?.providers?.browserstack?.accessKey ?? "");
         setBrowserAgent(automation?.browserAgent === "custom" ? "custom" : "default");
-        setBrowserbaseApiKey(automation?.browserbaseApiKey ?? "");
-        setBrowserbaseProjectId(automation?.browserbaseProjectId ?? "");
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       loadMembers().catch(() => {});
@@ -348,8 +342,6 @@ export default function ProjectSettingsPage() {
         },
         automation: {
           browserAgent,
-          browserbaseApiKey: browserAgent === "custom" ? browserbaseApiKey.trim() : undefined,
-          browserbaseProjectId: browserAgent === "custom" ? browserbaseProjectId.trim() : undefined,
           executionProvider,
           maxParallel: Math.max(1, Math.min(50, Math.floor(maxParallel || 1))),
           providers: {
@@ -706,64 +698,6 @@ export default function ProjectSettingsPage() {
                 >
                   Add
                 </button>
-              </div>
-              <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 space-y-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Browser Agent</h3>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    Choose whose Browserbase account powers AI-powered browser automation. Default uses platform env vars (BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID).
-                  </p>
-                </div>
-                <div className="space-y-2">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="browserAgent"
-                      checked={browserAgent === "default"}
-                      onChange={() => setBrowserAgent("default")}
-                    />
-                    <span className="text-sm text-zinc-700 dark:text-zinc-300">Default (platform account)</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="browserAgent"
-                      checked={browserAgent === "custom"}
-                      onChange={() => setBrowserAgent("custom")}
-                    />
-                    <span className="text-sm text-zinc-700 dark:text-zinc-300">Add your keys (project settings)</span>
-                  </label>
-                  {browserAgent === "custom" && (
-                    <div className="ml-5 mt-2 space-y-2">
-                      <input
-                        type="password"
-                        value={browserbaseApiKey}
-                        onChange={(e) => setBrowserbaseApiKey(e.target.value)}
-                        placeholder="Browserbase API Key"
-                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
-                      />
-                      <input
-                        type="text"
-                        value={browserbaseProjectId}
-                        onChange={(e) => setBrowserbaseProjectId(e.target.value)}
-                        placeholder="Browserbase Project ID"
-                        className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-3 py-2 text-sm"
-                      />
-                      <p className="text-xs text-zinc-500">
-                        Create a project at{" "}
-                        <a
-                          href="https://www.browserbase.com/settings"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 dark:text-blue-400 hover:underline"
-                        >
-                          browserbase.com/settings
-                        </a>{" "}
-                        and paste your API key and Project ID here.
-                      </p>
-                    </div>
-                  )}
-                </div>
               </div>
               <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 space-y-3">
                 <div>

@@ -1,7 +1,9 @@
 /**
- * Stagehand executor wrapper.
- * For each step: observe() → act() or extract()
- * Records structured telemetry for every decision and action.
+ * Telemetry executor.
+ * Provides scenario planning and step execution utilities.
+ * The LLM-based execution (DOM snapshot + LLM reasoning + Playwright action)
+ * is handled by langchainAgent.js; this module provides planScenario() and
+ * supporting helpers.
  */
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -50,14 +52,14 @@ function extractCredentialsFromScenario(scenario) {
   };
 
   out.email =
-    byLabel(/(?:^|\n)\s*email\s*[:=]\s*([^\n,]+)/i) ||
-    byLabel(/(?:^|\n)\s*(?:login\s*email|user\s*email)\s*[:=]\s*([^\n,]+)/i);
+    byLabel(/(?:^|\n)\s*-?\s*email\s*[:=]\s*([^\n,]+)/i) ||
+    byLabel(/(?:^|\n)\s*-?\s*(?:login\s*email|user\s*email)\s*[:=]\s*([^\n,]+)/i);
   out.password =
-    byLabel(/(?:^|\n)\s*password\s*[:=]\s*([^\n,]+)/i) ||
-    byLabel(/(?:^|\n)\s*pass(?:word)?\s*[:=]\s*([^\n,]+)/i);
+    byLabel(/(?:^|\n)\s*-?\s*password\s*[:=]\s*([^\n,]+)/i) ||
+    byLabel(/(?:^|\n)\s*-?\s*pass(?:word)?\s*[:=]\s*([^\n,]+)/i);
   out.username =
-    byLabel(/(?:^|\n)\s*username\s*[:=]\s*([^\n,]+)/i) ||
-    byLabel(/(?:^|\n)\s*user\s*name\s*[:=]\s*([^\n,]+)/i);
+    byLabel(/(?:^|\n)\s*-?\s*username\s*[:=]\s*([^\n,]+)/i) ||
+    byLabel(/(?:^|\n)\s*-?\s*user\s*name\s*[:=]\s*([^\n,]+)/i);
 
   // Parse inline credential block such as: "Email: a@b.com, Password: secret"
   if (!out.email || !out.password) {
@@ -65,6 +67,35 @@ function extractCredentialsFromScenario(scenario) {
     if (inline) {
       if (!out.email) out.email = normalizeCredentialValue(inline[1]);
       if (!out.password) out.password = normalizeCredentialValue(inline[2]);
+    }
+  }
+
+  // Try JSON blocks in the text: {"email": "x", "password": "y"}
+  if (!out.email && !out.password) {
+    const jsonMatch = text.match(/\{[^{}]*"(?:email|password|username)"[^{}]*\}/i);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        for (const [key, value] of Object.entries(parsed)) {
+          const k = String(key).toLowerCase();
+          const v = normalizeCredentialValue(value);
+          if (!v) continue;
+          if (k.includes("password") || k === "pass") { if (!out.password) out.password = v; }
+          else if (k.includes("email") || k === "login") { if (!out.email) out.email = v; }
+          else if (k.includes("username") || k === "user") { if (!out.username) out.username = v; }
+        }
+      } catch {
+        // not valid JSON
+      }
+    }
+  }
+
+  // Slash-separated fallback: email@domain / password
+  if (!out.email && !out.password) {
+    const slashMatch = text.match(/([^\s/]+@[^\s/]+)\s*\/\s*([^\s\n]+)/);
+    if (slashMatch) {
+      out.email = normalizeCredentialValue(slashMatch[1]);
+      out.password = normalizeCredentialValue(slashMatch[2]);
     }
   }
 
@@ -152,7 +183,7 @@ function scoreCandidateForInstruction(candidate, instruction) {
 
 /**
  * Pick the best observe() candidate for the current instruction.
- * Returns { index: -1 } when direct stagehand.act(instruction) is safer.
+ * Returns { index: -1 } when direct LLM-driven action is more appropriate.
  */
 export function selectObservedCandidate(candidates, instruction) {
   if (!Array.isArray(candidates) || candidates.length === 0) {
@@ -193,272 +224,9 @@ async function takeScreenshot(page, runId, prefix) {
   }
 }
 
-/**
- * Execute a single atomic step using observe → act or extract.
- * @param {object} ctx - { stagehand, page, runId, modelConfig }
- * @param {string} stepId - Step identifier
- * @param {string} instruction - Atomic instruction
- * @param {object} events - Array to push telemetry events
- * @returns {Promise<{ success: boolean, result?: object, error?: string }>}
- */
-export async function executeStep(ctx, stepId, instruction, events) {
-  const { stagehand, page, runId, modelConfig, credentials, recorder } = ctx;
-  const effectiveInstruction = enrichInstructionWithCredentials(instruction, credentials);
-  const url = page.url();
-  const modelOpt = modelConfig?.apiKey
-    ? { model: { modelName: modelConfig.model || "openai/gpt-4o", apiKey: modelConfig.apiKey } }
-    : {};
-
-  if (isAssertionStep(effectiveInstruction)) {
-    return executeExtractStep(ctx, stepId, effectiveInstruction, events);
-  }
-
-  // Action step: observe first, then act
-  const observeStart = Date.now();
-  let candidates = [];
-  try {
-    candidates = await stagehand.observe(effectiveInstruction, { ...modelOpt, timeout: 15000 });
-  } catch (err) {
-    logError("telemetry_observe_failed", { runId, stepId, instruction: effectiveInstruction, error: String(err) });
-    const observeFailEvent = {
-      runId,
-      stepId,
-      timestamp: nowIso(),
-      url,
-      eventType: "observe",
-      instruction: effectiveInstruction,
-      candidates: [],
-      chosenIndex: -1,
-      chosenReason: "observe_failed",
-      elapsedMs: Date.now() - observeStart,
-    };
-    events.push(observeFailEvent);
-    recorder?.record(observeFailEvent);
-    // Fallback: try act directly
-  }
-
-  const candidateChoice = selectObservedCandidate(candidates, effectiveInstruction);
-  const chosenIndex = candidateChoice.index;
-  const chosenReason = candidateChoice.reason;
-
-  const observeEvent = {
-    runId,
-    stepId,
-    timestamp: nowIso(),
-    url,
-    eventType: "observe",
-    instruction: effectiveInstruction,
-    candidates: candidates.map((c) => ({
-      selector: c.selector || "",
-      description: c.description || "",
-      method: c.method,
-      arguments: c.arguments || [],
-    })),
-    chosenIndex,
-    chosenReason,
-    elapsedMs: Date.now() - observeStart,
-  };
-  events.push(observeEvent);
-  recorder?.record(observeEvent);
-
-  const screenshotBefore = await takeScreenshot(page, runId, `step-${stepId}-before`);
-  const urlBefore = page.url();
-  const titleBefore = await page.title().catch(() => "");
-
-  let actResult;
-  let retryCount = 0;
-  const maxRetries = 2;
-  const actAttempts = [];
-
-  while (retryCount <= maxRetries) {
-    try {
-      if (candidates.length > 0 && chosenIndex >= 0) {
-        const chosen = sanitizeCandidateForAct(candidates[chosenIndex], credentials);
-        actAttempts.push({
-          attempt: retryCount + 1,
-          inputType: "candidate",
-          input: {
-            selector: chosen?.selector || "",
-            description: chosen?.description || "",
-            method: chosen?.method || "",
-            arguments: Array.isArray(chosen?.arguments) ? chosen.arguments : [],
-          },
-        });
-        actResult = await stagehand.act(chosen, { ...modelOpt, timeout: 20000 });
-      } else {
-        actAttempts.push({
-          attempt: retryCount + 1,
-          inputType: "instruction",
-          input: String(effectiveInstruction || ""),
-        });
-        actResult = await stagehand.act(effectiveInstruction, { ...modelOpt, timeout: 20000 });
-      }
-      break;
-    } catch (err) {
-      retryCount++;
-      const isSchemaErr = isSchemaValidationError(err);
-      if (isSchemaErr || retryCount > maxRetries) {
-        if (isSchemaErr) {
-          logInfo("telemetry_act_schema_validation_skip", {
-            runId,
-            stepId,
-            instruction: effectiveInstruction,
-            reason: "element not found or invalid format; skipping retries",
-          });
-        }
-        const elapsedMs = Date.now() - observeStart;
-        const actFailEvent = {
-          runId,
-          stepId,
-          timestamp: nowIso(),
-          url,
-          eventType: "act",
-          instruction: effectiveInstruction,
-          success: false,
-          message: err instanceof Error ? err.message : String(err),
-          actions: [],
-          urlBefore,
-          urlAfter: page.url(),
-          titleBefore,
-          titleAfter: await page.title().catch(() => ""),
-          screenshotBefore,
-          screenshotAfter: await takeScreenshot(page, runId, `step-${stepId}-after-fail`),
-          elapsedMs,
-          retryCount,
-          failureReason: err instanceof Error ? err.message : String(err),
-          actAttempts,
-        };
-        events.push(actFailEvent);
-        recorder?.record(actFailEvent);
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
-      }
-      await new Promise((r) => setTimeout(r, 1000 * retryCount));
-    }
-  }
-
-  // Brief pause after act to let the page settle (especially after form submissions / navigation).
-  await new Promise((r) => setTimeout(r, 600));
-
-  const screenshotAfter = await takeScreenshot(page, runId, `step-${stepId}-after`);
-  const urlAfter = page.url();
-  const titleAfter = await page.title().catch(() => "");
-
-  const actions = Array.isArray(actResult?.actions)
-    ? actResult.actions.map((a) => ({
-        selector: a.selector || "",
-        description: a.description || "",
-        method: a.method,
-        arguments: a.arguments || [],
-      }))
-    : [];
-
-  // Post-login guard: only trigger when this step is a complete login submission
-  // (fill credentials + click submit). Filling a single field like "enter password"
-  // does not navigate and must NOT be treated as a login failure.
-  const isLoginStep = isLoginSubmitStep(effectiveInstruction);
-  if (isLoginStep && urlAfter === urlBefore) {
-    const loginFailMsg = "Login step did not navigate away from login page — credentials may not have been applied correctly.";
-    logError("telemetry_login_no_navigation", { runId, stepId, url: urlBefore, instruction: effectiveInstruction });
-    const loginFailEvent = {
-      runId,
-      stepId,
-      timestamp: nowIso(),
-      url,
-      eventType: "act",
-      instruction: effectiveInstruction,
-      success: false,
-      message: loginFailMsg,
-      actionDescription: loginFailMsg,
-      actions,
-      urlBefore,
-      urlAfter,
-      titleBefore,
-      titleAfter,
-      screenshotBefore,
-      screenshotAfter,
-      elapsedMs: Date.now() - observeStart,
-      cacheStatus: actResult?.cacheStatus,
-      retryCount,
-      actAttempts,
-    };
-    events.push(loginFailEvent);
-    recorder?.record(loginFailEvent);
-    return { success: false, error: loginFailMsg };
-  }
-
-  const actEvent = {
-    runId,
-    stepId,
-    timestamp: nowIso(),
-    url,
-    eventType: "act",
-    instruction: effectiveInstruction,
-    success: Boolean(actResult?.success),
-    message: actResult?.message,
-    actionDescription: actResult?.actionDescription,
-    actions,
-    urlBefore,
-    urlAfter,
-    titleBefore,
-    titleAfter,
-    screenshotBefore,
-    screenshotAfter,
-    elapsedMs: Date.now() - observeStart,
-    cacheStatus: actResult?.cacheStatus,
-    retryCount,
-    actAttempts,
-  };
-  events.push(actEvent);
-  recorder?.record(actEvent);
-
-  return {
-    success: Boolean(actResult?.success),
-    result: actResult,
-    actions,
-  };
-}
-
-/**
- * Execute an assertion/verification step using extract.
- */
-async function executeExtractStep(ctx, stepId, instruction, events) {
-  const { stagehand, page, runId, modelConfig, recorder } = ctx;
-  const url = page.url();
-  const modelOpt = modelConfig?.apiKey
-    ? { model: { modelName: modelConfig.model || "openai/gpt-4o", apiKey: modelConfig.apiKey } }
-    : {};
-
-  const start = Date.now();
-  let result = {};
-  let success = false;
-
-  try {
-    const extracted = await stagehand.extract(instruction, { ...modelOpt, timeout: 15000 });
-    result = typeof extracted === "object" && extracted !== null ? extracted : { extraction: String(extracted) };
-    success = true;
-  } catch (err) {
-    logError("telemetry_extract_failed", { runId, stepId, instruction, error: String(err) });
-  }
-
-  const extractEvent = {
-    runId,
-    stepId,
-    timestamp: nowIso(),
-    url,
-    eventType: "extract",
-    instruction,
-    result,
-    usage: "assertion",
-    elapsedMs: Date.now() - start,
-  };
-  events.push(extractEvent);
-  recorder?.record(extractEvent);
-
-  return {
-    success,
-    result,
-  };
-}
+// Note: Step execution (observe → act → extract) is now handled by langchainAgent.js
+// using DOM snapshots + LLM reasoning + direct Playwright actions.
+// The executeStep / executeExtractStep functions have been removed.
 
 /**
  * Break a scenario into atomic steps.
@@ -536,9 +304,27 @@ export function planScenario(scenario) {
     }
   }
 
-  // Only fall back to a single-step plan when there is no explicit step section.
-  // If there was a "### Steps to Execute" section but it yielded 0 steps, return
-  // empty so the caller can fall back to agent.execute() with the full objective.
+  // If an explicit step section was found but yielded 0 steps, try parsing
+  // JSON arrays that might be inline (e.g., [{"action":"Enter email",...}])
+  if (steps.length === 0 && hasExplicitStepSection) {
+    const jsonMatch = text.match(/\[\s*\{[\s\S]*?\}\s*\]/);
+    if (jsonMatch) {
+      try {
+        const arr = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(arr)) {
+          for (const item of arr) {
+            const action = String(item?.action || item?.instruction || item?.step || "").trim();
+            if (action && action.length > 3) {
+              steps.push({ stepId: `step-${steps.length + 1}`, instruction: action });
+            }
+          }
+        }
+      } catch {
+        // not valid JSON, ignore
+      }
+    }
+  }
+
   if (steps.length === 0 && !hasExplicitStepSection && text.length > 15) {
     steps.push({ stepId: "step-1", instruction: text.slice(0, 500) });
   }
@@ -546,74 +332,5 @@ export function planScenario(scenario) {
   return steps;
 }
 
-/**
- * Execute a full scenario using observe → act → extract per step.
- * @param {object} session - Stagehand session from createStagehandSession
- * @param {string} scenario - Natural language scenario
- * @param {object} options - { runId, usePlanner }
- * @returns {Promise<{ success: boolean, events: object[], results: object[], stagehandActions: object[] }>}
- */
-export async function executeScenarioWithTelemetry(session, scenario, options = {}) {
-  const runId = options.runId || randomUUID();
-  const { stagehand, page, modelConfig } = session;
-  const credentials = extractCredentialsFromScenario(scenario);
-  const recorder = options.recorder || null;
-
-  const plan = options.plan || planScenario(scenario);
-  const events = [];
-  const results = [];
-  const stagehandActions = [];
-
-  logInfo("telemetry_executor_start", { runId, stepCount: plan.length });
-
-  for (let idx = 0; idx < plan.length; idx++) {
-    const { stepId, instruction } = plan[idx];
-    if (typeof options.onStepStart === "function") {
-      try { options.onStepStart(stepId, instruction, idx); } catch { /* non-fatal */ }
-    }
-
-    const stepResult = await executeStep(
-      { stagehand, page, runId, modelConfig, credentials, recorder },
-      stepId,
-      instruction,
-      events
-    );
-
-    results.push({ stepId, instruction, ...stepResult });
-
-    if (typeof options.onStepComplete === "function") {
-      try { options.onStepComplete(stepId, instruction, idx, stepResult); } catch { /* non-fatal */ }
-    }
-
-    if (stepResult.actions?.length) {
-      for (const a of stepResult.actions) {
-        stagehandActions.push({
-          type: "act",
-          action: (a.method || "click").toLowerCase(),
-          selector: a.selector,
-          targetDescription: a.description,
-          description: a.description,
-          playwright: null,
-        });
-      }
-    }
-
-    if (!stepResult.success && !options.continueOnFailure) {
-      break;
-    }
-  }
-
-  logInfo("telemetry_executor_complete", {
-    runId,
-    eventCount: events.length,
-    actionCount: stagehandActions.length,
-  });
-
-  return {
-    success: results.every((r) => r.success),
-    events,
-    results,
-    stagehandActions,
-    runId,
-  };
-}
+// Note: executeScenarioWithTelemetry has been replaced by
+// executeAgentWithTelemetry in langchainAgent.js.
