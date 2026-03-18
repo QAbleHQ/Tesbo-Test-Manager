@@ -9,7 +9,10 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@browserbasehq/stagehand": "^3.1.0",
+    "@langchain/anthropic": "^0.3",
+    "@langchain/core": "^0.3",
+    "@langchain/langgraph": "^0.2",
+    "@langchain/openai": "^0.4",
     "bullmq": "^5.58.5",
     "express": "^4.21.2",
     "ioredis": "^5.8.1",

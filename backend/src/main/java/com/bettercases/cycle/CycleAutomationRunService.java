@@ -4,7 +4,6 @@ import com.bettercases.Database;
 import com.bettercases.Config;
 import com.bettercases.ai.AiHandler;
 import com.bettercases.automation.AutomationAgentClient;
-import com.bettercases.automation.BrowserbaseCredentialsService;
 import com.bettercases.rbac.RbacService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -31,6 +30,11 @@ public final class CycleAutomationRunService {
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
         }
+        String cycleStatus = getCycleStatusForAutomation(cycleId);
+        if ("Completed".equals(cycleStatus)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot run automated tests");
+        }
         return executeAutomatedInternal(cycleId, strictAutomatedOnly);
     }
 
@@ -39,6 +43,11 @@ public final class CycleAutomationRunService {
         RbacService.requireProjectRole(userId, projectId);
         if (!RbacService.getProjectRole(userId, projectId).orElseThrow().canExecute()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot execute automated test run");
+        }
+        String cycleStatus = getCycleStatusForAutomation(cycleId);
+        if ("Completed".equals(cycleStatus)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Test run is completed and cannot run automated tests");
         }
         return executeAutomatedAsyncInternal(cycleId, strictAutomatedOnly);
     }
@@ -176,8 +185,6 @@ public final class CycleAutomationRunService {
                         automationConfig.modelProvider(),
                         automationConfig.modelApiKey(),
                         automationConfig.model(),
-                        automationConfig.browserbaseApiKey(),
-                        automationConfig.browserbaseProjectId(),
                         cycleId + "/" + row.executionId()
                 );
                 @SuppressWarnings("unchecked")
@@ -298,7 +305,6 @@ public final class CycleAutomationRunService {
                     ? String.valueOf(aiConfig.getOrDefault("anthropicApiKey", "")).trim()
                     : String.valueOf(aiConfig.getOrDefault("openAiApiKey", "")).trim();
             String model = String.valueOf(aiConfig.getOrDefault("model", "")).trim();
-            BrowserbaseCredentialsService.Credentials browserbase = BrowserbaseCredentialsService.resolve(projectId);
             return new CycleAutomationConfig(
                     startUrl,
                     executionProvider,
@@ -306,9 +312,7 @@ public final class CycleAutomationRunService {
                     providerConfig,
                     provider,
                     modelApiKey,
-                    model,
-                    browserbase.apiKey(),
-                    browserbase.projectId()
+                    model
             );
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -498,10 +502,20 @@ public final class CycleAutomationRunService {
             Map<String, Object> providerConfig,
             String modelProvider,
             String modelApiKey,
-            String model,
-            String browserbaseApiKey,
-            String browserbaseProjectId
+            String model
     ) {}
+
+    private static String getCycleStatusForAutomation(UUID cycleId) {
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT status FROM cycles WHERE id = ?")) {
+            ps.setObject(1, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString("status");
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        throw new io.javalin.http.NotFoundResponse();
+    }
 
     private CycleAutomationRunService() {
     }

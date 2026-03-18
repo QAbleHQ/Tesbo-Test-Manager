@@ -33,7 +33,6 @@ Backend runtime secrets:
 - `AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS`
 - `AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER`
 - `AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS`
-- `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`
 
 Automation runtime secrets:
 - `REDIS_URL`
@@ -72,14 +71,9 @@ On each droplet set `IMAGE_TAG=<tag>` in `/opt/bettercases/<service>/.env`, then
 - `docker compose pull`
 - `docker compose up -d --remove-orphans`
 
-### Stagehand cache note (DigitalOcean)
-- You asked to store Stagehand cache in DB.
-- Current Stagehand SDK cache is file/server-oriented; we now persist file cache locally + store action trace in DB.
-
-DigitalOcean guidance:
-- For `automation-agent`, keep `STAGEHAND_CACHE_DIR` on persistent disk (or a mounted volume) so cache survives container restarts.
-- Keep DB persistence enabled for Stagehand action trace/events (this is already handled by backend automation session events).
-- If you rotate droplets without persistent volumes, Stagehand file cache is rebuilt, but DB action trace remains available.
+### Agent cache note (DigitalOcean)
+- DB persistence is enabled for automation agent action trace/events (handled by backend automation session events).
+- If you rotate droplets without persistent volumes, DB action trace remains available.
 
 ### Queue execution split services (recommended)
 

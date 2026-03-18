@@ -555,7 +555,7 @@ export default function AutomateTestCasePage() {
         const escaped = label.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         return `await page.getByText('${escaped}', { exact: false }).first().click();`;
       }
-      return "// unsupported stagehand act: missing target details";
+      return "// unsupported agent act: missing target details";
     }
     return `// unsupported action: ${action || "unknown"}`;
   }
@@ -630,12 +630,12 @@ export default function AutomateTestCasePage() {
     };
   }
 
-  function parseStagehandActionsForReplay(
+  function parseAgentActionsForReplay(
     execution: Record<string, unknown>,
     rawCommand: string
   ): Record<string, unknown>[] {
-    const actions = Array.isArray(execution.stagehandActions)
-      ? (execution.stagehandActions as Array<Record<string, unknown>>)
+    const actions = Array.isArray(execution.agentActions)
+      ? (execution.agentActions as Array<Record<string, unknown>>)
       : [];
     const mapped: Record<string, unknown>[] = [];
     const mapMethodAction = (methodRaw: unknown, selectorRaw: unknown, firstArgRaw: unknown): boolean => {
@@ -918,10 +918,10 @@ export default function AutomateTestCasePage() {
         const parsedMode = asText(parsed.mode).toLowerCase();
         const executionMode = asText(execution.mode).toLowerCase();
         if (parsedMode === "autonomous" || executionMode === "autonomous") continue;
-        if (executionMode === "stagehand" || parsedMode === "stagehand") {
-          const stagehandMapped = parseStagehandActionsForReplay(execution, asText(event.rawCommand));
-          if (stagehandMapped.length > 0) {
-            for (const item of stagehandMapped) actions.push(asRecord(item));
+        if (executionMode === "agent" || parsedMode === "agent") {
+          const agentMapped = parseAgentActionsForReplay(execution, asText(event.rawCommand));
+          if (agentMapped.length > 0) {
+            for (const item of agentMapped) actions.push(asRecord(item));
             continue;
           }
         }
@@ -1147,10 +1147,10 @@ export default function AutomateTestCasePage() {
       }
 
       if (event.eventType === "command_executed") {
-        const stagehandActions = Array.isArray(execution.stagehandActions)
-          ? (execution.stagehandActions as Array<Record<string, unknown>>)
+        const agentActions = Array.isArray(execution.agentActions)
+          ? (execution.agentActions as Array<Record<string, unknown>>)
           : [];
-        for (const action of stagehandActions) {
+        for (const action of agentActions) {
           const reasoning = toText(action.reasoning);
           const instruction = toText(action.instruction);
           const message = toText(action.message || action.description);

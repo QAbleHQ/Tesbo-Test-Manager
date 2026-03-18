@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { compileTelemetryToActions, compileTelemetryToPlaywright, stagehandActionsToTelemetryLike } from "../src/telemetry/compiler.js";
+import { compileTelemetryToActions, compileTelemetryToPlaywright, agentActionsToTelemetryLike } from "../src/telemetry/compiler.js";
 
 describe("compileTelemetryToActions", () => {
   it("converts act events with click to getByRole", () => {
@@ -126,13 +126,13 @@ describe("compileTelemetryToPlaywright", () => {
   });
 });
 
-describe("stagehandActionsToTelemetryLike", () => {
+describe("agentActionsToTelemetryLike", () => {
   it("converts normalized actions to telemetry-like events", () => {
     const actions = [
       { type: "wait", action: "wait", timeMs: 2000 },
       { type: "act", action: "click", targetDescription: "Button" },
     ];
-    const events = stagehandActionsToTelemetryLike(actions);
+    const events = agentActionsToTelemetryLike(actions);
     assert.ok(events.length >= 1);
   });
 });

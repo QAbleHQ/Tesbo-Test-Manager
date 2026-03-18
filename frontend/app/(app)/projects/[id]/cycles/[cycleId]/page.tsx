@@ -117,6 +117,7 @@ function RunStatusBadge({ status }: { status: string }) {
   const cls: Record<string, string> = {
     Planning: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
     "In Progress": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
+    Hold: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
     Completed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
   };
   return (
@@ -581,6 +582,8 @@ export default function TestRunDetailPage() {
   const isInProgress = run.status === "In Progress";
   const isPlanning = run.status === "Planning";
   const isCompleted = run.status === "Completed";
+  const isHold = run.status === "Hold";
+  const isEditable = isPlanning || isInProgress;
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -600,6 +603,11 @@ export default function TestRunDetailPage() {
         <div className="flex items-start justify-between mb-6">
           <div>
             <div className="flex items-center gap-3">
+              {run.externalId && (
+                <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2.5 py-1 font-mono text-sm font-medium text-zinc-600 dark:text-zinc-400">
+                  {run.externalId}
+                </span>
+              )}
               <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">
                 {run.name}
               </h1>
@@ -625,23 +633,31 @@ export default function TestRunDetailPage() {
               </button>
             )}
             {isInProgress && (
-              <button
-                onClick={() => handleRunStatusChange("Completed")}
-                className="rounded-lg bg-green-600 hover:bg-green-700 text-white px-4 py-2 text-sm font-medium"
-              >
-                Mark Completed
-              </button>
+              <>
+                <button
+                  onClick={() => handleRunStatusChange("Hold")}
+                  className="rounded-lg border border-orange-300 dark:border-orange-700 text-orange-600 dark:text-orange-400 px-4 py-2 text-sm font-medium hover:bg-orange-50 dark:hover:bg-orange-900/20"
+                >
+                  Put on Hold
+                </button>
+                <button
+                  onClick={() => handleRunStatusChange("Completed")}
+                  className="rounded-lg bg-green-600 hover:bg-green-700 text-white px-4 py-2 text-sm font-medium"
+                >
+                  Mark Completed
+                </button>
+              </>
             )}
-            {isCompleted && (
+            {isHold && (
               <button
                 onClick={() => handleRunStatusChange("In Progress")}
-                className="rounded-lg border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-400 px-4 py-2 text-sm font-medium hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-sm font-medium"
               >
-                Reopen
+                Resume Execution
               </button>
             )}
-            {/* Add test cases (Planning or In Progress) */}
-            {!isCompleted && (
+            {/* Add test cases (Planning or In Progress only) */}
+            {isEditable && (
               <button
                 onClick={openPicker}
                 className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800"
@@ -649,13 +665,15 @@ export default function TestRunDetailPage() {
                 + Add Test Cases
               </button>
             )}
-            <button
-              onClick={handleRunAutomated}
-              disabled={automatedRunId !== null || executions.length === 0 || automatedStarting}
-              className="rounded-lg bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
-            >
-              {automatedStarting ? "Starting..." : automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
-            </button>
+            {!isCompleted && (
+              <button
+                onClick={handleRunAutomated}
+                disabled={automatedRunId !== null || executions.length === 0 || automatedStarting || isHold}
+                className="rounded-lg bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
+              >
+                {automatedStarting ? "Starting..." : automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
+              </button>
+            )}
             <button
               onClick={() => setShowShare(true)}
               className="rounded-lg border border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 px-4 py-2 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800 flex items-center gap-1.5"
@@ -675,6 +693,30 @@ export default function TestRunDetailPage() {
             </a>
           </div>
         </div>
+
+        {/* ───── Status Banners ───── */}
+        {isCompleted && (
+          <div className="mb-4 rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 px-4 py-3 flex items-center gap-2">
+            <svg className="w-5 h-5 text-green-600 dark:text-green-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div>
+              <p className="text-sm font-medium text-green-800 dark:text-green-300">This test run is completed and frozen</p>
+              <p className="text-xs text-green-600 dark:text-green-400">No further modifications, test case additions, or automated runs can be performed.</p>
+            </div>
+          </div>
+        )}
+        {isHold && (
+          <div className="mb-4 rounded-lg border border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/20 px-4 py-3 flex items-center gap-2">
+            <svg className="w-5 h-5 text-orange-600 dark:text-orange-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div>
+              <p className="text-sm font-medium text-orange-800 dark:text-orange-300">This test run is on hold</p>
+              <p className="text-xs text-orange-600 dark:text-orange-400">Resume execution to continue modifying test cases and updating results.</p>
+            </div>
+          </div>
+        )}
 
         {/* ───── Dashboard: Metric Cards + Donut Chart ───── */}
         {automatedLiveStatus && automatedRunId && (
@@ -807,7 +849,7 @@ export default function TestRunDetailPage() {
                     <th className="px-5 py-3 font-medium">Priority</th>
                     <th className="px-5 py-3 font-medium">Type</th>
                     <th className="px-5 py-3 font-medium">Status</th>
-                    {!isCompleted && <th className="px-5 py-3 font-medium w-8"></th>}
+                    {isEditable && <th className="px-5 py-3 font-medium w-8"></th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
@@ -870,7 +912,7 @@ export default function TestRunDetailPage() {
                               <span className="text-xs text-zinc-600 dark:text-zinc-400">Manual run required</span>
                             )}
                           </div>
-                        ) : isInProgress ? (
+                        ) : isEditable ? (
                           <select
                             value={e.status}
                             onChange={(ev) => handleStatusChange(e.id, ev.target.value)}
@@ -895,7 +937,7 @@ export default function TestRunDetailPage() {
                           <StatusBadge status={e.status} />
                         )}
                       </td>
-                      {!isCompleted && (
+                      {isEditable && (
                         <td className="px-5 py-3">
                           <button
                             onClick={() => handleRemoveCase(e.testcaseId)}

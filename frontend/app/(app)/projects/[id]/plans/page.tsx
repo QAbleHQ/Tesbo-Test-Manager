@@ -204,6 +204,11 @@ export default function PlansPage() {
                 <div className="flex items-start justify-between">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-3">
+                      {plan.externalId && (
+                        <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 font-mono text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                          {plan.externalId}
+                        </span>
+                      )}
                       <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
                         {plan.name}
                       </h3>

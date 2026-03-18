@@ -249,6 +249,7 @@ function StatusBadge({ status, type }: { status: string | null; type?: "exec" | 
     Closed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
     "In Progress": "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
     Planning: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300",
+    Hold: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300",
     Completed: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
     Draft: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400",
     Approved: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",
@@ -276,7 +277,7 @@ function MetricCard({ label, value, sub, color }: { label: string; value: number
 
 /* ═══════════════════ RESIZABLE TABLE HEADER ═══════════════════ */
 const MATRIX_COLUMNS = [
-  { key: "tcId", label: "Test Case ID", defaultWidth: 120, minWidth: 80 },
+  { key: "tcId", label: "Test Case ID", defaultWidth: 200, minWidth: 120 },
   { key: "title", label: "Title", defaultWidth: 280, minWidth: 140 },
   { key: "priority", label: "Priority", defaultWidth: 80, minWidth: 60 },
   { key: "tcStatus", label: "TC Status", defaultWidth: 100, minWidth: 70 },
@@ -850,15 +851,17 @@ export default function ReportsPage() {
                                 <>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 text-xs text-zinc-500 font-mono whitespace-nowrap align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 text-xs text-zinc-500 font-mono align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 overflow-hidden"
+                                    title={group.externalId}
                                   >
-                                    {group.externalId}
+                                    <span className="block overflow-hidden text-ellipsis whitespace-nowrap">{group.externalId}</span>
                                   </td>
                                   <td
                                     rowSpan={rowCount}
-                                    className="px-4 py-3 text-sm text-zinc-900 dark:text-zinc-100 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+                                    className="px-4 py-3 text-sm text-zinc-900 dark:text-zinc-100 align-top border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 overflow-hidden"
+                                    title={group.testcaseTitle}
                                   >
-                                    <span className="whitespace-normal break-words">{group.testcaseTitle}</span>
+                                    <span className="block whitespace-normal break-words overflow-hidden">{group.testcaseTitle}</span>
                                   </td>
                                   <td
                                     rowSpan={rowCount}

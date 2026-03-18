@@ -180,6 +180,7 @@ public final class TestCaseService {
             ResultSet rs = ps.executeQuery();
             if (!rs.next()) throw new IllegalArgumentException("Project not found");
             keyPrefix = rs.getString("key");
+            if (keyPrefix.length() > 3) keyPrefix = keyPrefix.substring(0, 3);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -191,7 +192,7 @@ public final class TestCaseService {
             ResultSet rs = ps.executeQuery();
             rs.next();
             int n = rs.getInt("n");
-            return keyPrefix + "-TC-" + String.format("%06d", n);
+            return keyPrefix + "-TC-" + String.format("%02d", n);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }

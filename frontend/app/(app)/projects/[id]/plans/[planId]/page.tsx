@@ -279,6 +279,11 @@ export default function PlanDetailPage() {
               ) : (
                 <>
                   <div className="flex items-center gap-3">
+                    {plan.externalId && (
+                      <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2.5 py-1 font-mono text-sm font-medium text-zinc-600 dark:text-zinc-400">
+                        {plan.externalId}
+                      </span>
+                    )}
                     <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">{planName}</h1>
                     {planTargetRelease && (
                       <span className="inline-flex items-center rounded-full bg-violet-100 dark:bg-violet-900/30 text-violet-700 dark:text-violet-300 px-3 py-0.5 text-xs font-medium">
@@ -501,7 +506,14 @@ export default function PlanDetailPage() {
                         {allRuns.map((run) => (
                           <li key={run.id} className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-700 p-3 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors">
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">{run.name}</p>
+                              <div className="flex items-center gap-2">
+                                {run.externalId && (
+                                  <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 font-mono text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                                    {run.externalId}
+                                  </span>
+                                )}
+                                <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">{run.name}</p>
+                              </div>
                               <div className="flex items-center gap-2 mt-0.5">
                                 <RunStatusBadge status={run.status} />
                                 <span className="text-xs text-zinc-500">{run.totalCases} cases</span>
@@ -539,6 +551,11 @@ export default function PlanDetailPage() {
                       <div className="flex items-start justify-between">
                         <Link href={`/projects/${projectId}/cycles/${run.id}`} className="flex-1 min-w-0 group">
                           <div className="flex items-center gap-3">
+                            {run.externalId && (
+                              <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 font-mono text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                                {run.externalId}
+                              </span>
+                            )}
                             <h4 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
                               {run.name}
                             </h4>

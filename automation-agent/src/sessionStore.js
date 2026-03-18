@@ -4,13 +4,12 @@ import { chromium } from "playwright";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
 import {
-  createStagehandSession,
-  executeStagehandObjective,
-  executeStagehandWithTelemetry,
-  getStagehandSessionState,
-  closeStagehandSession,
-  runStagehandScript,
-} from "./stagehandSession.js";
+  createAgentSession,
+  executeAgentObjective,
+  executeAgentWithTelemetry,
+  getAgentSessionState,
+  closeAgentSession,
+} from "./langchainAgent.js";
 
 const sessions = new Map();
 let sessionCreateInFlight = 0;
@@ -133,11 +132,11 @@ function getSession(sessionId) {
 }
 
 /**
- * Create a session. When model config is provided, uses Stagehand (LOCAL or BROWSERBASE).
+ * Create a session. When model config is provided, uses LangChain agent.
  * @param {string} sessionId
  * @param {string|null} startUrl
  * @param {object} [options] - Optional:
- *   { browserbaseApiKey, browserbaseProjectId, modelProvider, modelApiKey, model, cacheScope }
+ *   { modelProvider, modelApiKey, model }
  */
 async function createSession(sessionId, startUrl, options = {}) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
@@ -150,23 +149,18 @@ async function createSession(sessionId, startUrl, options = {}) {
   sessionCreateInFlight += 1;
   try {
     const {
-      browserbaseApiKey,
-      browserbaseProjectId,
       modelProvider,
       modelApiKey,
       model,
-      cacheScope,
     } = options;
 
-    const useStagehand = Boolean(modelApiKey);
+    const useAgent = Boolean(modelApiKey);
 
-    if (useStagehand) {
-      const state = await createStagehandSession(
+    if (useAgent) {
+      const state = await createAgentSession(
         sessionId,
         startUrl,
-        { apiKey: browserbaseApiKey, projectId: browserbaseProjectId },
-        { provider: modelProvider, apiKey: modelApiKey, model },
-        { cacheScope }
+        { provider: modelProvider, apiKey: modelApiKey, model }
       );
       sessions.set(sessionId, state);
       return state;
@@ -420,19 +414,7 @@ function extractPlaywrightTestBody(script) {
   throw new Error("Invalid script format: unterminated test body");
 }
 
-function isStagehandScript(script) {
-  if (!script || typeof script !== "string") return false;
-  return (
-    /@automation-language:\s*stagehand-ts/i.test(script) ||
-    /(^|\W)stagehand\.(act|extract|agent|observe)\s*\(/i.test(script) ||
-    /new\s+Stagehand\s*\(/i.test(script)
-  );
-}
-
 async function runPlaywrightScript(executionId, script, startUrl = null, options = {}) {
-  if (isStagehandScript(script)) {
-    return runStagehandScript(executionId, script, startUrl, options);
-  }
   await ensureScreenshotDir();
   await ensureVideoDir();
   await ensureTraceDir();
@@ -563,9 +545,6 @@ async function runPlaywrightScript(executionId, script, startUrl = null, options
 }
 
 async function runPlaywrightScriptInSession(sessionId, executionId, script, startUrl = null, actionDelayMs = 0, options = {}) {
-  if (isStagehandScript(script)) {
-    return runStagehandScript(executionId, script, startUrl, options);
-  }
   await ensureScreenshotDir();
   await ensureTraceDir();
   const session = getSession(sessionId);
@@ -1490,17 +1469,17 @@ async function executeSteps(sessionId, commandId, steps) {
   };
 }
 
-async function executeStagehand(sessionId, commandId, objective, options = {}) {
+async function executeAgent(sessionId, commandId, objective, options = {}) {
   const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
-  if (session.type !== "stagehand") {
-    throw new Error("Session is not a Stagehand session. Use execute with steps for Playwright sessions.");
+  if (session.type !== "agent") {
+    throw new Error("Session is not an agent session. Use execute with steps for Playwright sessions.");
   }
   const useTelemetry = options.useTelemetry ?? config.useTelemetry;
   if (useTelemetry) {
-    return executeStagehandWithTelemetry(session, commandId, objective);
+    return executeAgentWithTelemetry(session, commandId, objective);
   }
-  return executeStagehandObjective(session, commandId, objective);
+  return executeAgentObjective(session, commandId, objective);
 }
 
 async function manualAction(sessionId, action) {
@@ -1531,13 +1510,10 @@ async function manualAction(sessionId, action) {
       targetHtml = info?.html ?? null;
       logInfo("manual_click_target", { sessionId, targetSelector, targetText: targetText?.slice(0, 60) });
       const urlBefore = page.url();
-      const isStagehandPage = session.type === "stagehand";
-      if (isStagehandPage && typeof page.click === "function") {
-        await page.click(x, y);
-      } else if (page.mouse && typeof page.mouse.click === "function") {
+      if (page.mouse && typeof page.mouse.click === "function") {
         await page.mouse.click(x, y);
       } else {
-        logError("manual_click_no_method", { sessionId, hasClick: typeof page.click, hasMouse: !!page.mouse });
+        logError("manual_click_no_method", { sessionId, hasMouse: !!page.mouse });
       }
       const waitFn = typeof page.waitForTimeout === "function" ? (ms) => page.waitForTimeout(ms) : (ms) => new Promise((r) => setTimeout(r, ms));
       await waitFn(100).catch(() => {});
@@ -1575,9 +1551,7 @@ async function manualAction(sessionId, action) {
       const toY = Math.max(1, Math.min(viewport.height - 1, Math.round(toYRatio * viewport.height)));
       startSelector = await selectorAtPoint(page, x, y).catch(() => null);
       endSelector = await selectorAtPoint(page, toX, toY).catch(() => null);
-      if (session.type === "stagehand" && typeof page.dragAndDrop === "function") {
-        await page.dragAndDrop(x, y, toX, toY);
-      } else if (page.mouse) {
+      if (page.mouse) {
         await page.mouse.move(x, y);
         await page.mouse.down();
         await page.mouse.move(toX, toY, { steps: 12 });
@@ -1607,7 +1581,6 @@ async function manualAction(sessionId, action) {
         deltaY,
       });
     } else if (action.actionType === "type") {
-      const isStagehandPage = session.type === "stagehand";
       const text = action.text || "";
       if (typeof action.xRatio === "number" && typeof action.yRatio === "number") {
         const x = Math.max(1, Math.min(viewport.width - 1, Math.round(action.xRatio * viewport.width)));
@@ -1616,9 +1589,7 @@ async function manualAction(sessionId, action) {
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
-        if (isStagehandPage && typeof page.click === "function") {
-          await page.click(x, y);
-        } else if (page.mouse && typeof page.mouse.click === "function") {
+        if (page.mouse && typeof page.mouse.click === "function") {
           await page.mouse.click(x, y);
         }
         await page.evaluate(({ px, py }) => {
@@ -1687,7 +1658,6 @@ async function manualAction(sessionId, action) {
         value: text,
       });
     } else if (action.actionType === "press") {
-      const isStagehandPage = session.type === "stagehand";
       const key = action.key || "Enter";
       if (typeof action.xRatio === "number" && typeof action.yRatio === "number") {
         const x = Math.max(1, Math.min(viewport.width - 1, Math.round(action.xRatio * viewport.width)));
@@ -1696,9 +1666,7 @@ async function manualAction(sessionId, action) {
         targetSelector = info?.selector ?? null;
         targetText = info?.text ?? null;
         targetHtml = info?.html ?? null;
-        if (isStagehandPage && typeof page.click === "function") {
-          await page.click(x, y);
-        } else if (page.mouse && typeof page.mouse.click === "function") {
+        if (page.mouse && typeof page.mouse.click === "function") {
           await page.mouse.click(x, y);
         }
       }
@@ -1759,8 +1727,8 @@ async function closeSession(sessionId) {
   if (!session) return { videoPath: null };
   sessions.delete(sessionId);
   let videoPath = null;
-  if (session.type === "stagehand") {
-    await closeStagehandSession(session);
+  if (session.type === "agent") {
+    await closeAgentSession(session);
   } else {
     try {
       const video = session.page?.video?.();
@@ -1782,8 +1750,8 @@ async function closeSession(sessionId) {
 async function sessionState(sessionId) {
   const session = getSession(sessionId);
   if (!session) return null;
-  if (session.type === "stagehand") {
-    const { currentUrl, pageText, domSummary } = await getStagehandSessionState(session);
+  if (session.type === "agent") {
+    const { currentUrl, pageText, domSummary } = await getAgentSessionState(session);
     let domSummaryObj = null;
     try {
       domSummaryObj = domSummary ? JSON.parse(domSummary) : null;
@@ -1802,7 +1770,7 @@ async function sessionState(sessionId) {
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       events: session.events?.slice?.(-100) ?? [],
-      stagehandLogs: session.stagehandLogs?.slice?.(-50) ?? [],
+      agentLogs: session.agentLogs?.slice?.(-50) ?? [],
     };
   }
   const pageTitlePromise = session.page.title().catch(() => "");
@@ -1888,7 +1856,7 @@ export {
   SessionCreationError,
   resetSession,
   executeSteps,
-  executeStagehand,
+  executeAgent,
   manualAction,
   runPlaywrightScript,
   runPlaywrightScriptInSession,

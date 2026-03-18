@@ -263,7 +263,7 @@ function extractGeneratedScript(session: AutomationSession): string | null {
     if (selector.startsWith("xpath:")) return `xpath=${selector.slice("xpath:".length)}`;
     return selector;
   };
-  const pushStagehandCapture = (entryRaw: unknown, status: unknown, source: string) => {
+  const pushAgentCapture = (entryRaw: unknown, status: unknown, source: string) => {
     const entry = asRecord(entryRaw);
     if (Object.keys(entry).length === 0) return;
     const type = asText(entry.type).toLowerCase();
@@ -385,7 +385,7 @@ function extractGeneratedScript(session: AutomationSession): string | null {
       }
     }
   };
-  const inferStagehandStatus = (parsed: Record<string, unknown>, execution: Record<string, unknown>): string => {
+  const inferAgentStatus = (parsed: Record<string, unknown>, execution: Record<string, unknown>): string => {
     const explicit = [parsed.status, execution.status].map((v) => asText(v).toLowerCase()).find(Boolean);
     if (explicit === "passed" || explicit === "success") return "passed";
     if (explicit === "failed" || explicit === "error") return "failed";
@@ -397,9 +397,9 @@ function extractGeneratedScript(session: AutomationSession): string | null {
       if (status === "passed" || status === "success") sawPassedResult = true;
     }
     if (sawPassedResult) return "passed";
-    const stagehandActions = Array.isArray(execution.stagehandActions) ? execution.stagehandActions : [];
+    const agentActions = Array.isArray(execution.agentActions) ? execution.agentActions : [];
     let sawSuccessfulAction = false;
-    for (const actionRaw of stagehandActions) {
+    for (const actionRaw of agentActions) {
       const action = asRecord(actionRaw);
       if (action.success === false) return "failed";
       if (action.success === true) sawSuccessfulAction = true;
@@ -424,11 +424,11 @@ function extractGeneratedScript(session: AutomationSession): string | null {
         }
       }
     } else if (event.eventType === "command_executed") {
-      const stagehandActions = Array.isArray(execution.stagehandActions) ? execution.stagehandActions : [];
-      if (stagehandActions.length > 0) {
-        const status = inferStagehandStatus(parsed, execution);
-        for (const stagehandAction of stagehandActions) {
-          pushStagehandCapture(stagehandAction, status, "command_executed_stagehand");
+      const agentActions = Array.isArray(execution.agentActions) ? execution.agentActions : [];
+      if (agentActions.length > 0) {
+        const status = inferAgentStatus(parsed, execution);
+        for (const agentAction of agentActions) {
+          pushAgentCapture(agentAction, status, "command_executed_agent");
         }
         continue;
       }
@@ -567,73 +567,73 @@ export default function AegisAgentPage() {
     setLog((prev) => [...prev, entry]);
   }, []);
 
-  const logStagehandSessionEvent = useCallback(
+  const logAgentSessionEvent = useCallback(
     (testcaseId: string, event: AutomationSession["events"][number]) => {
       const parsed = asRecord(event?.parsedAction);
       const execution = asRecord(event?.executionResult);
       const eventType = asText(event?.eventType);
 
-      if (eventType === "stagehand_plan_sent" || eventType === "stagehand_plan_compiled") {
-        const plan = asRecordArray(parsed.stagehandPlan);
+      if (eventType === "agent_plan_sent" || eventType === "agent_plan_compiled") {
+        const plan = asRecordArray(parsed.agentPlan);
         if (plan.length > 0) {
           addLog(testcaseId, `Plan sent to Aegis (${plan.length} steps).`, "info");
           for (let i = 0; i < Math.min(plan.length, 10); i += 1) {
             const instruction = asText(plan[i].instruction);
             if (instruction) addLog(testcaseId, `Plan ${i + 1}: ${instruction}`, "info");
           }
-        } else if (eventType === "stagehand_plan_sent") {
+        } else if (eventType === "agent_plan_sent") {
           addLog(testcaseId, "Plan sent to Aegis.", "info");
         }
         return;
       }
 
-      if (eventType === "stagehand_execution_started") {
-        addLog(testcaseId, "Aegis started Stagehand execution.", "action");
+      if (eventType === "agent_execution_started") {
+        addLog(testcaseId, "Aegis started agent execution.", "action");
         return;
       }
 
-      if (eventType === "stagehand_step_observed") {
+      if (eventType === "agent_step_observed") {
         const stepId = asText(parsed.stepId) || "step";
         const instruction = asText(parsed.instruction);
         const chosenReason = asText(parsed.chosenReason);
         const message = instruction
-          ? `Stagehand observing ${stepId}: ${instruction}`
-          : `Stagehand observing ${stepId}.`;
+          ? `Agent observing ${stepId}: ${instruction}`
+          : `Agent observing ${stepId}.`;
         addLog(testcaseId, chosenReason ? `${message} (${chosenReason})` : message, "action");
         return;
       }
 
-      if (eventType === "stagehand_step_acted") {
+      if (eventType === "agent_step_acted") {
         const stepId = asText(parsed.stepId) || "step";
         const instruction = asText(parsed.instruction);
         const success = parsed.success === true;
         const cacheStatus = asText(parsed.cacheStatus);
         const message = asText(parsed.message);
         let text = instruction
-          ? `Stagehand acting ${stepId}: ${instruction}`
-          : `Stagehand acting ${stepId}.`;
+          ? `Agent acting ${stepId}: ${instruction}`
+          : `Agent acting ${stepId}.`;
         if (message) text += ` (${message})`;
         if (cacheStatus) text += ` [cache: ${cacheStatus}]`;
         addLog(testcaseId, text, success ? "success" : "error");
         return;
       }
 
-      if (eventType === "stagehand_step_extracted") {
+      if (eventType === "agent_step_extracted") {
         const stepId = asText(parsed.stepId) || "step";
         const instruction = asText(parsed.instruction);
         const text = instruction
-          ? `Stagehand verifying ${stepId}: ${instruction}`
-          : `Stagehand verifying ${stepId}.`;
+          ? `Agent verifying ${stepId}: ${instruction}`
+          : `Agent verifying ${stepId}.`;
         addLog(testcaseId, text, "action");
         return;
       }
 
       if (eventType === "command_executed") {
         const mode = asText(parsed.mode);
-        if (mode !== "stagehand") return;
+        if (mode !== "agent") return;
         const telemetryEvents = asRecordArray(execution.telemetryEvents);
         if (telemetryEvents.length > 0) {
-          addLog(testcaseId, `Stagehand logs captured: ${telemetryEvents.length} events.`, "info");
+          addLog(testcaseId, `Agent logs captured: ${telemetryEvents.length} events.`, "info");
         }
       }
     },
@@ -810,7 +810,7 @@ export default function AegisAgentPage() {
                 const eventId = asText(event?.id);
                 if (!eventId || handledEventIds.has(eventId)) continue;
                 handledEventIds.add(eventId);
-                logStagehandSessionEvent(item.testcaseId, event);
+                logAgentSessionEvent(item.testcaseId, event);
               }
             }
             const runtime = session.runtime;

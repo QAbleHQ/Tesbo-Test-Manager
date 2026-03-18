@@ -326,6 +326,7 @@ export interface SuiteNode {
   name: string;
   position: number;
   createdAt: string;
+  testCaseCount: number;
 }
 
 export async function listSuites(projectId: string): Promise<SuiteNode[]> {
@@ -424,6 +425,53 @@ export async function bulkDeleteTestCases(projectId: string, data: { testcaseIds
 
 export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
   return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+}
+
+// Test case import/export
+export function getExportUrl(projectId: string, format: "csv" | "xlsx"): string {
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}`;
+}
+
+export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {
+  return `${API_BASE}/api/projects/${projectId}/testcases/import/template?format=${format}`;
+}
+
+export interface ImportPreviewResult {
+  uploadId: string;
+  headers: string[];
+  previewRows: string[][];
+  totalRows: number;
+}
+
+export async function previewImport(projectId: string, file: File): Promise<ImportPreviewResult> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}/testcases/import/preview`, {
+    method: "POST",
+    credentials: "include",
+    body: fd,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || String(res.status));
+  }
+  return res.json() as Promise<ImportPreviewResult>;
+}
+
+export interface ImportResult {
+  imported: number;
+  errors: { row: number; message: string }[];
+  total: number;
+}
+
+export async function executeImport(
+  projectId: string,
+  body: { uploadId: string; columnMapping: Record<string, number> }
+): Promise<ImportResult> {
+  return api<ImportResult>(`/api/projects/${projectId}/testcases/import`, {
+    method: "POST",
+    body,
+  });
 }
 
 export interface AutomationSession {
@@ -1057,6 +1105,7 @@ export async function addPlanItem(planId: string, data: { suiteId?: string; test
 // Plan Runs & Progress
 export interface PlanRunItem {
   id: string;
+  externalId: string;
   name: string;
   description: string;
   status: string;
@@ -1089,6 +1138,7 @@ export interface PlanProgress {
 
 export interface PlanListItem {
   id: string;
+  externalId: string;
   name: string;
   description: string;
   targetRelease: string;
@@ -1121,6 +1171,7 @@ export async function dissociateRunFromPlan(cycleId: string): Promise<void> {
 // Test Runs (Cycles)
 export interface TestRunListItem {
   id: string;
+  externalId: string;
   planId: string | null;
   name: string;
   description: string;
@@ -1139,6 +1190,7 @@ export interface TestRunListItem {
 
 export interface TestRunDetail {
   id: string;
+  externalId: string;
   projectId: string;
   planId: string | null;
   name: string;

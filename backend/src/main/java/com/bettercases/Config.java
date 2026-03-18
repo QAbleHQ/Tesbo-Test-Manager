@@ -72,10 +72,6 @@ public final class Config {
     public static final int AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS =
             Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS", "0"));
 
-    // Browserbase platform account (env vars) — used when project uses "default" browser agent
-    public static final String BROWSERBASE_API_KEY = getEnv("BROWSERBASE_API_KEY", "").trim();
-    public static final String BROWSERBASE_PROJECT_ID = getEnv("BROWSERBASE_PROJECT_ID", "").trim();
-
     private static Map<String, String> loadDotEnv() {
         Map<String, String> map = new HashMap<>();
         for (Path dir : new Path[]{

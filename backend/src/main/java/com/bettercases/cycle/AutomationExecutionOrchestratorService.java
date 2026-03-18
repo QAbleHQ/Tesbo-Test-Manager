@@ -64,8 +64,6 @@ public final class AutomationExecutionOrchestratorService {
                 payload.put("modelProvider", automationConfig.modelProvider());
                 payload.put("modelApiKey", automationConfig.modelApiKey());
                 payload.put("model", automationConfig.model());
-                payload.put("browserbaseApiKey", automationConfig.browserbaseApiKey());
-                payload.put("browserbaseProjectId", automationConfig.browserbaseProjectId());
                 payload.put("cacheScope", String.valueOf(cycleId) + "/" + String.valueOf(job.get("executionId")));
                 Map<String, Object> queued = AutomationAgentClient.enqueueAutomationJob(payload);
                 String queueJobId = queued.get("queueJobId") instanceof String s ? s : String.valueOf(job.get("jobId"));

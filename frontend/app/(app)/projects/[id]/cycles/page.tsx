@@ -21,6 +21,8 @@ function statusColor(status: string) {
       return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
     case "In Progress":
       return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+    case "Hold":
+      return "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300";
     case "Completed":
       return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
     default:
@@ -263,6 +265,11 @@ export default function TestRunsPage() {
               <div className="flex items-start justify-between">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-3 mb-1">
+                    {r.externalId && (
+                      <span className="shrink-0 rounded bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 font-mono text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        {r.externalId}
+                      </span>
+                    )}
                     <Link
                       href={`/projects/${projectId}/cycles/${r.id}`}
                       className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 hover:text-blue-600 dark:hover:text-blue-400 truncate"
