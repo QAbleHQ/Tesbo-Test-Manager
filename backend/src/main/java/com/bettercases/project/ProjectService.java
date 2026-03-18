@@ -90,6 +90,7 @@ public final class ProjectService {
             ps.setObject(1, projectId);
             ResultSet rs = ps.executeQuery();
             if (rs.next()) {
+                Map<String, String> aiConfig = AiHandler.readAiConfig(projectId);
                 Map<String, Object> result = new java.util.LinkedHashMap<>();
                 result.put("id", rs.getObject("id").toString());
                 result.put("key", rs.getString("key"));
@@ -100,6 +101,8 @@ public final class ProjectService {
                 result.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());
                 result.put("myRole", roleOpt.get().name().toLowerCase());
                 result.put("aiConfigured", AiHandler.hasAssignedWorkspaceAiKey(projectId));
+                result.put("aiProvider", aiConfig.getOrDefault("provider", ""));
+                result.put("aiModel", aiConfig.getOrDefault("model", ""));
                 return Optional.of(result);
             }
         } catch (SQLException e) {

@@ -5,16 +5,6 @@ import { useEffect, useState } from "react";
 import { getProject } from "@/lib/api";
 import { getActiveRuns, onRunsChanged, type AegisBackgroundRun } from "@/lib/aegis-runner";
 
-function parseProjectSettings(raw: unknown): Record<string, unknown> {
-  if (typeof raw !== "string" || !raw.trim()) return {};
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 export function AegisBackgroundIndicator() {
   const params = useParams();
   const projectId = typeof params?.id === "string" ? params.id : "";
@@ -26,10 +16,7 @@ export function AegisBackgroundIndicator() {
     const refreshAgentAvailability = () => {
       getProject(projectId)
         .then((project) => {
-          const parsedSettings = parseProjectSettings(project.settings);
-          const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
-          const aiEnabled = aiRaw.enabled !== false;
-          setAgentsEnabled(project.aiConfigured === true && aiEnabled);
+          setAgentsEnabled(project.aiConfigured === true);
         })
         .catch(() => setAgentsEnabled(false));
     };

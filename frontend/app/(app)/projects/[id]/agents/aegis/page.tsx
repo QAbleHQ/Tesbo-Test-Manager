@@ -647,10 +647,7 @@ export default function AegisAgentPage() {
     authMe().then((me) => {
       if (!me) { router.replace("/login"); return; }
       getProject(projectId).then((p) => {
-        const parsed = parseProjectSettings(asText(p.settings));
-        const aiRaw = (parsed.ai ?? {}) as Record<string, unknown>;
-        const aiEnabled = aiRaw.enabled !== false;
-        setAgentsEnabled(p.aiConfigured === true && aiEnabled);
+        setAgentsEnabled(p.aiConfigured === true);
       }).finally(() => setAgentGateLoading(false));
       const settings = getAgentSettings(projectId, "aegis");
       if (settings.defaultEnvironmentUrl) {

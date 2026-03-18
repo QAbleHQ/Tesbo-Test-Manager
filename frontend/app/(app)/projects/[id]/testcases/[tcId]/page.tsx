@@ -41,16 +41,6 @@ function parseTagString(raw: string): string[] {
     .filter(Boolean);
 }
 
-function parseProjectSettings(raw: unknown): Record<string, unknown> {
-  if (typeof raw !== "string" || !raw.trim()) return {};
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 export default function TestCaseDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -115,10 +105,7 @@ export default function TestCaseDetailPage() {
       }
       getProject(projectId)
         .then((project) => {
-          const parsedSettings = parseProjectSettings(project.settings);
-          const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
-          const aiEnabled = aiRaw.enabled !== false;
-          setCanUseAgents(project.aiConfigured === true && aiEnabled);
+          setCanUseAgents(project.aiConfigured === true);
         })
         .catch(() => setCanUseAgents(false));
       if (isNew) {

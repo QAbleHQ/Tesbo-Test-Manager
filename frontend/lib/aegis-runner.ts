@@ -582,20 +582,16 @@ const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not
 
 type ProjectAiAgentAvailability = {
   keyAllocated: boolean;
-  aiEnabled: boolean;
 };
 
 async function getProjectAiAgentAvailability(projectId: string): Promise<ProjectAiAgentAvailability> {
   try {
     const project = await getProject(projectId);
-    const settings = parseProjectSettings(typeof project.settings === "string" ? project.settings : "");
-    const aiRaw = (settings.ai ?? {}) as Record<string, unknown>;
     return {
       keyAllocated: project.aiConfigured === true,
-      aiEnabled: aiRaw.enabled !== false,
     };
   } catch {
-    return { keyAllocated: false, aiEnabled: false };
+    return { keyAllocated: false };
   }
 }
 
@@ -1419,7 +1415,7 @@ export async function runAegisInBackground(
   },
 ): Promise<void> {
   const aiAvailability = await getProjectAiAgentAvailability(projectId);
-  if (!aiAvailability.keyAllocated || !aiAvailability.aiEnabled) {
+  if (!aiAvailability.keyAllocated) {
     throw new Error(AGENT_ALLOCATION_ERROR);
   }
   if (activeRuns.has(testcaseId)) return;
@@ -1576,7 +1572,7 @@ async function executeAegisRun(
     }
 
     const aiAvailability = await getProjectAiAgentAvailability(projectId);
-    if (!aiAvailability.keyAllocated || !aiAvailability.aiEnabled) {
+    if (!aiAvailability.keyAllocated) {
       addRunLog(
         testcaseId,
         AGENT_ALLOCATION_ERROR,

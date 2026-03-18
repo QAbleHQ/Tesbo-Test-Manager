@@ -93,10 +93,7 @@ export default function SentinelPage() {
     load();
     getProject(projectId)
       .then((project) => {
-        const parsed = parseProjectSettings(project.settings);
-        const aiRaw = (parsed.ai ?? {}) as Record<string, unknown>;
-        const aiEnabled = aiRaw.enabled !== false;
-        setAgentsEnabled(project.aiConfigured === true && aiEnabled);
+        setAgentsEnabled(project.aiConfigured === true);
       })
       .catch(() => setAgentsEnabled(false));
     const t = setInterval(load, 1000);

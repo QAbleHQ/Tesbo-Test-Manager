@@ -140,7 +140,6 @@ export default function AutomateTestCasePage() {
   const [quickActionBusy, setQuickActionBusy] = useState<"run" | null>(null);
   const [reviewScriptOpen, setReviewScriptOpen] = useState(false);
   const [aiConfigured, setAiConfigured] = useState(true);
-  const [aiEnabled, setAiEnabled] = useState(true);
   const [lastClickTarget, setLastClickTarget] = useState<{ xRatio: number; yRatio: number } | null>(null);
   const [cursorPulse, setCursorPulse] = useState(false);
   const [botHighlight, setBotHighlight] = useState<BotHighlight | null>(null);
@@ -301,17 +300,11 @@ export default function AutomateTestCasePage() {
       .filter((item): item is TestEnvironmentSetting => item !== null);
   }
 
-  function resolveAiConfiguration(
-    parsedSettings: Record<string, unknown>,
-    projectRecord?: Record<string, unknown>
-  ): {
+  function resolveAiConfiguration(projectRecord?: Record<string, unknown>): {
     configured: boolean;
-    enabled: boolean;
   } {
-    const aiRaw = parsedSettings.ai as Record<string, unknown> | undefined;
     const configured = projectRecord?.aiConfigured === true;
-    const enabled = aiRaw?.enabled !== false;
-    return { configured, enabled };
+    return { configured };
   }
 
   function buildPlaywrightScriptFromReviewSteps(testName: string, steps: ReviewStep[]): string {
@@ -998,10 +991,9 @@ export default function AutomateTestCasePage() {
         .then((project) => {
           const parsedSettings = parseProjectSettings(project.settings);
           const environments = normalizeTestRunEnvironments(parsedSettings.testRunEnvironments);
-          const aiState = resolveAiConfiguration(parsedSettings, project);
+          const aiState = resolveAiConfiguration(project);
           setTestRunEnvironments(environments);
           setAiConfigured(aiState.configured);
-          setAiEnabled(aiState.enabled);
           if (environments.length > 0) {
             setSelectedEnvironmentUrl(environments[0].url);
           }
@@ -1627,7 +1619,7 @@ export default function AutomateTestCasePage() {
   ) {
     if (!sessionId || !startupReady || !input.trim() || sending) return;
     const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
-    if (shouldUseAutonomousMode && (!aiConfigured || !aiEnabled)) {
+    if (shouldUseAutonomousMode && !aiConfigured) {
       setMessages((prev) => [
         ...prev,
         {
@@ -2043,7 +2035,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           <div className="mb-2 flex items-center justify-between gap-2 px-1">
             <h2 className="text-sm font-semibold text-[var(--foreground)]">Automation Assistant</h2>
           </div>
-          {(!aiConfigured || !aiEnabled) && (
+          {!aiConfigured && (
             <p className="mb-2 rounded-lg border border-[var(--warning)]/30 bg-amber-50 px-2 py-1 text-xs text-amber-800">
               {AGENT_ALLOCATION_ERROR}
             </p>
@@ -2153,7 +2145,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
             <div className="relative">
               <textarea
                 value={command}
-                disabled={!startupReady || !aiConfigured || !aiEnabled}
+                disabled={!startupReady || !aiConfigured}
                 rows={2}
                 onChange={(e) => setCommand(e.target.value)}
                 onKeyDown={(event) => {
@@ -2163,7 +2155,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                   }
                 }}
                 placeholder={
-                  (!aiConfigured || !aiEnabled)
+                  !aiConfigured
                     ? AGENT_ALLOCATION_ERROR
                     : "Tell the agent exactly what to do. Example: Click the Log in button."
                 }
@@ -2172,7 +2164,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
               <button
                 type="button"
                 onClick={() => void onSendCommand()}
-                disabled={sending || !sessionId || !startupReady || !aiConfigured || !aiEnabled || !command.trim()}
+                disabled={sending || !sessionId || !startupReady || !aiConfigured || !command.trim()}
                 title={
                   sending
                     ? "Queueing command"
@@ -2205,7 +2197,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
             <button
               type="button"
               onClick={() => void onRunIndividualTest()}
-              disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured || !aiEnabled}
+              disabled={!startupReady || sending || Boolean(quickActionBusy) || !aiConfigured}
               className="rounded-full border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] px-2.5 py-1 text-[11px] text-[var(--brand-primary)] disabled:opacity-50"
             >
               {quickActionBusy === "run" ? "Running test..." : "Run Current Test"}

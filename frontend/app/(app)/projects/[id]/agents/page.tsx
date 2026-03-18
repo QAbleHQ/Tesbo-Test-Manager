@@ -26,16 +26,6 @@ const agents = [
 
 const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
-function parseProjectSettings(raw: unknown): Record<string, unknown> {
-  if (typeof raw !== "string" || !raw.trim()) return {};
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 function ShieldIcon({ className = "h-8 w-8" }: { className?: string }) {
   return (
     <svg
@@ -70,10 +60,7 @@ export default function AgentsPage() {
   useEffect(() => {
     getProject(projectId)
       .then((project) => {
-        const parsedSettings = parseProjectSettings(project.settings);
-        const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
-        const aiEnabled = aiRaw.enabled !== false;
-        const enabled = project.aiConfigured === true && aiEnabled;
+        const enabled = project.aiConfigured === true;
         setAgentsEnabled(enabled);
         if (!enabled) {
           setPendingReviewCount(0);

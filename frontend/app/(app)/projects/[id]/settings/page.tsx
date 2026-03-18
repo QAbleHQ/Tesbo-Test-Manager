@@ -33,22 +33,6 @@ import {
 } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
-const OPENAI_MODELS = [
-  "gpt-4o",
-  "gpt-4o-mini",
-  "gpt-4.1",
-  "gpt-4.1-mini",
-  "gpt-4.1-nano",
-] as const;
-
-const ANTHROPIC_MODELS = [
-  "claude-sonnet-4-5-20250929",
-  "claude-sonnet-4-5",
-  "claude-sonnet-4-0",
-  "claude-opus-4-6",
-  "claude-3-7-sonnet-latest",
-] as const;
-
 type ProjectSettingsPayload = {
   automation?: {
     browserAgent?: "default" | "custom";
@@ -69,11 +53,6 @@ type ProjectSettingsPayload = {
   };
   ai?: {
     enabled?: boolean;
-    provider?: "openai" | "anthropic";
-    model?: string;
-    openAiApiKey?: string;
-    anthropicApiKey?: string;
-    autoGenerateTestSteps?: boolean;
   };
   jiraAutoComment?: boolean;
   jiraTicketSelector?: boolean;
@@ -91,7 +70,7 @@ type ProjectSettingsPayload = {
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "testRuns" | "members" | "ai" | "jira" | "tesbo" | "alerts" | "integrations";
+type SettingsTab = "general" | "testRuns" | "members" | "jira" | "tesbo" | "alerts" | "integrations";
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
@@ -127,11 +106,6 @@ export default function ProjectSettingsPage() {
   const [project, setProject] = useState<Record<string, unknown> | null>(null);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [provider, setProvider] = useState<"openai" | "anthropic">("openai");
-  const [model, setModel] = useState("");
-  const [aiEnabled, setAiEnabled] = useState(true);
-  const [aiConfigured, setAiConfigured] = useState(false);
-  const [autoGenerateTestSteps, setAutoGenerateTestSteps] = useState(true);
   const [jiraAutoComment, setJiraAutoComment] = useState(false);
   const [jiraTicketSelector, setJiraTicketSelector] = useState(false);
   const [tesboKeepTrace, setTesboKeepTrace] = useState(true);
@@ -176,7 +150,6 @@ export default function ProjectSettingsPage() {
     { key: "general", label: "General" },
     { key: "testRuns", label: "Test Environments" },
     { key: "members", label: "Members" },
-    { key: "ai", label: "AI" },
     ...(jiraTabEnabled ? [{ key: "jira" as const, label: "Jira" }] : []),
     { key: "tesbo", label: "Automation Reports" },
     { key: "alerts", label: "Alerts" },
@@ -197,10 +170,6 @@ export default function ProjectSettingsPage() {
       setActiveTab("integrations");
     }
   }, [activeTab, jiraTabEnabled]);
-
-  function modelOptionsFor(activeProvider: "openai" | "anthropic") {
-    return activeProvider === "openai" ? OPENAI_MODELS : ANTHROPIC_MODELS;
-  }
 
   function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
     if (typeof raw !== "string" || !raw.trim()) return {};
@@ -253,20 +222,6 @@ export default function ProjectSettingsPage() {
         setName((p.name as string) ?? "");
         setDescription((p.description as string) ?? "");
         const parsedSettings = parseProjectSettings(p.settings);
-        const ai = parsedSettings.ai;
-        const aiProvider = ai?.provider === "anthropic" ? "anthropic" : "openai";
-        const options = modelOptionsFor(aiProvider);
-        const optionList: readonly string[] = options;
-        const aiModel = typeof ai?.model === "string" ? ai.model : "";
-        const resolvedModel =
-          aiModel && optionList.includes(aiModel)
-            ? aiModel
-            : optionList[0] ?? "";
-        setProvider(aiProvider);
-        setModel(resolvedModel);
-        setAiEnabled(ai?.enabled !== false);
-        setAiConfigured(p.aiConfigured === true);
-        setAutoGenerateTestSteps(ai?.autoGenerateTestSteps !== false);
         setJiraAutoComment(parsedSettings.jiraAutoComment === true);
         setJiraTicketSelector(parsedSettings.jiraTicketSelector === true);
         const tesbo = parsedSettings.tesboReports;
@@ -329,12 +284,6 @@ export default function ProjectSettingsPage() {
       const currentSettings = parseProjectSettings(project?.settings);
       const nextSettings: ProjectSettingsPayload = {
         ...currentSettings,
-        ai: {
-          enabled: aiEnabled,
-          provider,
-          model: model.trim() || undefined,
-          autoGenerateTestSteps,
-        },
         jiraAutoComment,
         jiraTicketSelector,
         tesboReports: {
@@ -374,8 +323,6 @@ export default function ProjectSettingsPage() {
       const refreshed = await getProject(projectId);
       setProject(refreshed);
       const refreshedSettings = parseProjectSettings(refreshed.settings);
-      setAiEnabled(refreshedSettings.ai?.enabled !== false);
-      setAiConfigured(refreshed.aiConfigured === true);
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
       setNewEnvironmentName("");
       setNewEnvironmentUrl("");
@@ -584,7 +531,7 @@ export default function ProjectSettingsPage() {
         </div>
       </div>
 
-      {(activeTab === "general" || activeTab === "testRuns" || activeTab === "ai" || activeTab === "jira" || activeTab === "tesbo") && (
+      {(activeTab === "general" || activeTab === "testRuns" || activeTab === "jira" || activeTab === "tesbo") && (
         <form onSubmit={handleSubmit} className="space-y-5">
           {activeTab === "general" && (
             <>
@@ -832,87 +779,6 @@ export default function ProjectSettingsPage() {
                   </div>
                 )}
               </div>
-            </Card>
-          )}
-
-          {activeTab === "ai" && (
-            <Card className="p-4 space-y-4">
-              <div>
-                <h2 className="text-base font-semibold text-[var(--foreground)]">AI Test Case Generation</h2>
-                <p className="mt-1 text-sm text-[var(--muted)]">
-                  Configure provider/model for this project. API keys are managed at workspace level.
-                </p>
-              </div>
-              <Field>
-                <FieldLabel>Provider</FieldLabel>
-                <Select
-                  value={provider}
-                  onChange={(e) => {
-                    const nextProvider = e.target.value as "openai" | "anthropic";
-                    setProvider(nextProvider);
-                    const options = modelOptionsFor(nextProvider);
-                    setModel(options[0]);
-                  }}
-                >
-                  <option value="openai">OpenAI</option>
-                  <option value="anthropic">Anthropic</option>
-                </Select>
-              </Field>
-              <Field>
-                <FieldLabel>Model</FieldLabel>
-                <Select
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                >
-                  {modelOptionsFor(provider).map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-              <Field>
-                <FieldLabel>AI settings enabled</FieldLabel>
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={aiEnabled}
-                    onChange={(e) => setAiEnabled(e.target.checked)}
-                    className="mt-0.5"
-                  />
-                  <span className="text-sm text-[var(--foreground)]">
-                    {aiEnabled ? "Enabled" : "Disabled"}
-                  </span>
-                </label>
-              </Field>
-              <Field>
-                <FieldLabel>AI key allocation status</FieldLabel>
-                <p className="text-sm text-[var(--muted)]">
-                  {aiConfigured ? "Allocated" : "Not allocated"}
-                </p>
-                <p className="text-xs text-[var(--muted-soft)]">
-                  {aiConfigured
-                    ? "Workspace AI key is allocated to this project."
-                    : "Manage keys and allocations in Workspace Settings -> Integrations."}
-                </p>
-              </Field>
-              <label className="flex items-start gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={autoGenerateTestSteps}
-                  onChange={(e) => setAutoGenerateTestSteps(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <div>
-                  <span className="text-sm font-medium text-[var(--foreground)]">
-                    Auto-generate Test Steps from Automate
-                  </span>
-                  <p className="text-xs text-[var(--muted)] mt-0.5">
-                    When enabled, saving an Automate session updates both Playwright script and Test Steps. When
-                    disabled, only the Playwright script is updated.
-                  </p>
-                </div>
-              </label>
             </Card>
           )}
 

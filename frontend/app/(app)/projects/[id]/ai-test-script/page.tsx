@@ -112,9 +112,13 @@ export default function AiTestScriptGenerationPage() {
           } catch {
             settings = {};
           }
-          const provider = settings.ai?.provider === "anthropic" ? "anthropic" : "openai";
+          const provider = project.aiProvider === "anthropic"
+            ? "anthropic"
+            : settings.ai?.provider === "anthropic"
+              ? "anthropic"
+              : "openai";
           setProjectProvider(provider);
-          setProjectModel(settings.ai?.model ?? "");
+          setProjectModel((typeof project.aiModel === "string" && project.aiModel) ? project.aiModel : (settings.ai?.model ?? ""));
           setHasLlmKey(project.aiConfigured === true);
           setSuites(suiteList);
 

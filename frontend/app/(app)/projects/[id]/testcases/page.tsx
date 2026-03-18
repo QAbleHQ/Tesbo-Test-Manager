@@ -84,16 +84,6 @@ function priorityTone(p: string) {
   return "neutral" as const;
 }
 
-function parseProjectSettings(raw: unknown): Record<string, unknown> {
-  if (typeof raw !== "string" || !raw.trim()) return {};
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 export default function TestCasesPage() {
@@ -161,10 +151,7 @@ export default function TestCasesPage() {
 
   const loadData = useCallback(async () => {
     const [suiteList, project] = await Promise.all([listSuites(projectId), getProject(projectId)]);
-    const parsedSettings = parseProjectSettings(project.settings);
-    const aiRaw = (parsedSettings.ai ?? {}) as Record<string, unknown>;
-    const aiEnabled = aiRaw.enabled !== false;
-    setCanUseAgents(project.aiConfigured === true && aiEnabled);
+    setCanUseAgents(project.aiConfigured === true);
     setSuites(suiteList);
   }, [projectId]);
 
