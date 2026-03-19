@@ -21,6 +21,13 @@ All events include: `runId`, `stepId`, `timestamp`, `url`, `eventType`.
 - `extract` – result, usage (assertion | dynamic_test_data)
 - `browser_context` – navigation, dialogs, console errors
 
+Additional AgiS workflow schemas:
+
+- `agisRunContext` – run metadata (intent, expected outcomes, plan steps)
+- `agisActionRecord` – per-action evidence with screenshots + key DOM snapshots
+- `agisPageKnowledgeEntry` – UI knowledgebase entry with editable page description
+- `agisActionEvaluation` – goal progress/confidence/risk and next decision
+
 ## Usage
 
 ```javascript
@@ -37,3 +44,9 @@ const script = compileTelemetryToPlaywright(result.telemetryEvents, { scenario: 
 
 - `executeAgentWithTelemetry` in langchainAgent.js is the default path for autonomous runs
 - Falls back to `executeAgentObjective` (LangGraph ReAct agent mode) when plan is empty or telemetry fails
+- Execution now follows Observe -> Plan -> Act -> Evaluate -> Recover and emits:
+  - `agisWorkflow.runContext`
+  - `agisWorkflow.stateTransitions`
+  - `agisWorkflow.actionRecords`
+  - `agisWorkflow.pageKnowledgeBase`
+  - `agisWorkflow.qualityGates`

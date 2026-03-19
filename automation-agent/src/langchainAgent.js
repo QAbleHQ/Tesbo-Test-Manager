@@ -15,6 +15,15 @@ import { logError, logInfo } from "./logger.js";
 import { planScenario } from "./telemetry/executor.js";
 import { compileTelemetryToActions } from "./telemetry/compiler.js";
 import { BrowserRecorder } from "./telemetry/browserRecorder.js";
+import {
+  buildAgisRunContext,
+  evaluateActionImpact,
+  createActionRecord,
+  createPageKnowledgeEntry,
+  mergePageKnowledgeEntries,
+  validateExecutionArtifacts,
+  buildExecutionWalkthrough,
+} from "./telemetry/workflow.js";
 import { buildPlaywrightTools } from "./playwrightTools.js";
 import { getInteractiveDOM, getPageText, getDomSummary } from "./domSnapshot.js";
 
@@ -49,8 +58,11 @@ async function ensureVideoDir() {
   await fs.mkdir(config.videoDir, { recursive: true });
 }
 
-async function takeScreenshot(page, sessionId) {
-  const fileName = `${sessionId}-${Date.now()}.png`;
+async function takeScreenshot(page, sessionId, prefix = "") {
+  const normalizedPrefix = String(prefix || "").trim();
+  const fileName = normalizedPrefix
+    ? `${sessionId}-${normalizedPrefix}-${Date.now()}.png`
+    : `${sessionId}-${Date.now()}.png`;
   const outputPath = path.join(config.screenshotDir, fileName);
   await page.screenshot({ path: outputPath, fullPage: true });
   return outputPath;
@@ -199,6 +211,19 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
     return executeAgentObjective(session, commandId, objective);
   }
 
+  const runContext = buildAgisRunContext({
+    sessionId: session.id,
+    commandId,
+    objective,
+    currentUrl: session.page.url(),
+    plan,
+    status: "running",
+  });
+  const workflowStates = ["InitSession", "OpenBrowserWithGivenURL", "ObservePageAndIntent"];
+  const actionRecords = [];
+  let pageKnowledgeBase = [];
+  let screenCounter = 1;
+
   pushSessionEvent({
     type: "agent_reasoning",
     commandId,
@@ -215,6 +240,22 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
   try {
     for (let idx = 0; idx < plan.length; idx++) {
       const { stepId, instruction } = plan[idx];
+      const preUrl = session.page.url();
+      const beforeSnapshot = await getInteractiveDOM(session.page);
+      const beforeScreenshot = await takeScreenshot(session.page, session.id, `before-${idx + 1}`);
+      const screenId = `screen-${screenCounter}`;
+      workflowStates.push("PlanStepsOnCurrentScreen", "InspectDOMForTargets", "PerformUIAction");
+
+      pageKnowledgeBase = mergePageKnowledgeEntries(
+        pageKnowledgeBase,
+        createPageKnowledgeEntry({
+          pageId: screenId,
+          url: preUrl,
+          title: beforeSnapshot.title,
+          snapshot: beforeSnapshot,
+          screenshotPath: beforeScreenshot,
+        })
+      );
 
       pushSessionEvent({
         type: "agent_reasoning",
@@ -224,7 +265,97 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
         url: session.page.url(),
       });
 
-      const stepResult = await executeStepWithLLM(session, stepId, instruction, events);
+      let stepResult = null;
+      let finalInstruction = instruction;
+      let finalError = null;
+      let attempt = 0;
+      const maxAttempts = 2;
+      let postUrl = preUrl;
+      let afterSnapshot = beforeSnapshot;
+      let afterScreenshot = null;
+      let evaluation = null;
+      let nextDecision = "continue";
+
+      while (attempt < maxAttempts) {
+        attempt += 1;
+        stepResult = await executeStepWithLLM(session, stepId, finalInstruction, events);
+        postUrl = session.page.url();
+        afterSnapshot = await getInteractiveDOM(session.page);
+        afterScreenshot = await takeScreenshot(session.page, session.id, `after-${idx + 1}-attempt-${attempt}`);
+        workflowStates.push("RecordActionDOMScreenshot", "EvaluateActionImpactAgainstGoal");
+
+        evaluation = evaluateActionImpact({
+          instruction: finalInstruction,
+          objective,
+          beforeUrl: preUrl,
+          afterUrl: postUrl,
+          beforeSnapshot,
+          afterSnapshot,
+          success: stepResult.success,
+          error: stepResult.error,
+        });
+        nextDecision = evaluation.nextStepDecision;
+
+        const primaryAction = Array.isArray(stepResult.actions) ? stepResult.actions[0] : null;
+        actionRecords.push(
+          createActionRecord({
+            runId: session.id,
+            stepId,
+            screenId,
+            actionType: primaryAction?.method || (stepResult.success ? "act" : "act_failed"),
+            instruction: finalInstruction,
+            targetElement: primaryAction?.description || finalInstruction,
+            locatorUsed: primaryAction?.selector || "",
+            inputValue: Array.isArray(primaryAction?.arguments) ? String(primaryAction.arguments[0] || "") : "",
+            beforeScreenshot,
+            afterScreenshot,
+            beforeSnapshot,
+            afterSnapshot,
+            result: stepResult.success ? "passed" : "failed",
+            urlBefore: preUrl,
+            urlAfter: postUrl,
+            evaluation,
+          })
+        );
+
+        pageKnowledgeBase = mergePageKnowledgeEntries(
+          pageKnowledgeBase,
+          createPageKnowledgeEntry({
+            pageId: `screen-${screenCounter}`,
+            url: postUrl,
+            title: afterSnapshot.title,
+            snapshot: afterSnapshot,
+            screenshotPath: afterScreenshot,
+          })
+        );
+
+        if (preUrl !== postUrl) {
+          screenCounter += 1;
+          workflowStates.push("DefineNextStep");
+        }
+
+        if (stepResult.success && nextDecision !== "recover") {
+          break;
+        }
+
+        finalError = stepResult.error || "Action did not achieve expected outcome";
+        if (attempt < maxAttempts) {
+          workflowStates.push("BacktrackAndTryNewApproach");
+          finalInstruction = `${instruction}. Alternative approach: inspect nearby controls, then retry with a different actionable element.`;
+          pushSessionEvent({
+            type: "agent_reasoning",
+            commandId,
+            stepIndex: idx + 1,
+            reasoning: `Recovery attempt ${attempt + 1}/${maxAttempts} for step ${stepId}: ${instruction}`,
+            url: session.page.url(),
+          });
+        }
+      }
+
+      if (!stepResult) {
+        stepResult = { success: false, error: "Step was not executed", actions: [] };
+      }
+
       results.push({ stepId, instruction, ...stepResult });
 
       pushSessionEvent({
@@ -233,7 +364,9 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
         stepIndex: idx + 1,
         toolName: stepResult.success ? "act" : "act_failed",
         args: { instruction },
-        reasoning: stepResult.success ? `Completed: ${instruction}` : `Failed: ${stepResult.error || instruction}`,
+        reasoning: stepResult.success
+          ? `Completed: ${instruction}`
+          : `Failed: ${finalError || stepResult.error || instruction}`,
         url: session.page.url(),
         success: stepResult.success,
       });
@@ -289,6 +422,19 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
 
     const browserPlaywrightActions = browserRec ? browserRec.getPlaywrightActions() : [];
 
+    const qualityGates = validateExecutionArtifacts({
+      actionRecords,
+      recordedScript: browserRec ? browserRec.toPlaywrightScript() : "",
+    });
+    const walkthrough = buildExecutionWalkthrough({ actionRecords });
+    const runContextStatus = allSuccess
+      ? "completed"
+      : actionRecords.length > 0
+        ? "partial"
+        : "failed";
+    runContext.status = runContextStatus;
+    workflowStates.push("CompleteRunAndExportTrace");
+
     const returnTelemetry = {
       commandId,
       currentUrl: session.currentUrl,
@@ -312,6 +458,20 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
       recordedScript: browserRec
         ? browserRec.toPlaywrightScript()
         : "// No browser recording available",
+      agisWorkflow: {
+        runContext,
+        stateTransitions: workflowStates,
+        actionRecords,
+        pageKnowledgeBase: {
+          pages: pageKnowledgeBase,
+          editablePageDescriptions: pageKnowledgeBase.map((entry) => ({
+            pageId: entry.pageId,
+            pageDescriptionEditable: entry.pageDescriptionEditable,
+          })),
+        },
+        qualityGates,
+        walkthrough,
+      },
     };
     if (browserRec) {
       returnTelemetry.browserRecording = browserRec.toJSON();

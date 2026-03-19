@@ -110,10 +110,100 @@ export const runTelemetrySchema = z.object({
   environmentMetadata: z.record(z.unknown()).optional(),
 });
 
+/**
+ * AgiS workflow contracts (execution context + action impact + page knowledge).
+ * These are used by the execution orchestrator to keep deterministic traces.
+ */
+export const agisRunContextSchema = z.object({
+  runId: z.string(),
+  commandId: z.string(),
+  sessionId: z.string(),
+  testCaseTitle: z.string(),
+  intent: z.string(),
+  startUrl: z.string().optional(),
+  testData: z.string().optional(),
+  description: z.string().optional(),
+  expectedThings: z.array(z.string()).default([]),
+  planSteps: z.array(z.object({
+    stepId: z.string(),
+    instruction: z.string(),
+  })).default([]),
+  createdAt: z.string().datetime(),
+  status: z.enum(["running", "completed", "failed", "partial"]).default("running"),
+});
+
+export const agisActionEvaluationSchema = z.object({
+  goalMatchScore: z.number().min(0).max(1),
+  expectedOutcomeMatch: z.boolean(),
+  stateChangeDetected: z.boolean(),
+  confidence: z.enum(["high", "medium", "low"]),
+  risk: z.enum(["low", "medium", "high"]),
+  issues: z.array(z.string()).default([]),
+  nextStepDecision: z.enum(["continue", "replan", "recover", "fail"]),
+  recoveryPlan: z.string().optional(),
+});
+
+export const agisActionRecordSchema = z.object({
+  runId: z.string(),
+  stepId: z.string(),
+  screenId: z.string(),
+  actionType: z.string(),
+  instruction: z.string(),
+  targetElement: z.string().optional(),
+  locatorUsed: z.string().optional(),
+  inputValue: z.string().optional(),
+  beforeScreenshot: z.string().nullable().optional(),
+  afterScreenshot: z.string().nullable().optional(),
+  domBeforeKeyElements: z.array(z.object({
+    ref: z.number().int().optional(),
+    tag: z.string().optional(),
+    text: z.string().optional(),
+    selectorHint: z.string().nullable().optional(),
+  })).default([]),
+  domAfterKeyElements: z.array(z.object({
+    ref: z.number().int().optional(),
+    tag: z.string().optional(),
+    text: z.string().optional(),
+    selectorHint: z.string().nullable().optional(),
+  })).default([]),
+  result: z.enum(["passed", "failed"]),
+  urlBefore: z.string().optional(),
+  urlAfter: z.string().optional(),
+  attemptedAt: z.string().datetime(),
+  evaluation: agisActionEvaluationSchema,
+});
+
+export const agisPageKnowledgeEntrySchema = z.object({
+  pageId: z.string(),
+  pageUrlPattern: z.string(),
+  pageTitle: z.string().default(""),
+  pageDescriptionEditable: z.string().default(""),
+  importantElements: z.array(z.object({
+    semanticName: z.string(),
+    selectorHint: z.string().nullable().optional(),
+    elementType: z.string().optional(),
+    roleInFlow: z.string().optional(),
+  })).default([]),
+  representativeScreenshots: z.array(z.string()).default([]),
+  lastValidatedAt: z.string().datetime().optional(),
+});
+
 export function validateTelemetryEvent(data) {
   return telemetryEventSchema.safeParse(data);
 }
 
 export function validateRunTelemetry(data) {
   return runTelemetrySchema.safeParse(data);
+}
+
+export function validateAgisRunContext(data) {
+  return agisRunContextSchema.safeParse(data);
+}
+
+export function validateAgisActionRecord(data) {
+  return agisActionRecordSchema.safeParse(data);
+}
+
+export function validateAgisPageKnowledgeEntry(data) {
+  return agisPageKnowledgeEntrySchema.safeParse(data);
 }

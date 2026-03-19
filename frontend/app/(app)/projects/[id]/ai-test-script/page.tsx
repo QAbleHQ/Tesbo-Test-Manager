@@ -19,12 +19,6 @@ import { Button, Input, Card, StatusChip, Modal, Field, FieldLabel, Textarea, Se
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 type ProjectSettingsPayload = {
-  ai?: {
-    provider?: "openai" | "anthropic";
-    model?: string;
-    openAiApiKey?: string;
-    anthropicApiKey?: string;
-  };
   jiraAutoComment?: boolean;
   jiraTicketSelector?: boolean;
   [key: string]: unknown;
@@ -112,13 +106,9 @@ export default function AiTestScriptGenerationPage() {
           } catch {
             settings = {};
           }
-          const provider = project.aiProvider === "anthropic"
-            ? "anthropic"
-            : settings.ai?.provider === "anthropic"
-              ? "anthropic"
-              : "openai";
+          const provider = project.aiProvider === "anthropic" ? "anthropic" : "openai";
           setProjectProvider(provider);
-          setProjectModel((typeof project.aiModel === "string" && project.aiModel) ? project.aiModel : (settings.ai?.model ?? ""));
+          setProjectModel((typeof project.aiModel === "string" && project.aiModel) ? project.aiModel : "");
           setHasLlmKey(project.aiConfigured === true);
           setSuites(suiteList);
 

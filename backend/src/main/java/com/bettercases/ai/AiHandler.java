@@ -52,11 +52,10 @@ public final class AiHandler {
         }
         long startedAt = System.currentTimeMillis();
         Map<String, String> aiConfig = readAiConfig(projectId);
-        String selectedProvider = normalizeProvider(
-                body.provider != null ? body.provider : aiConfig.getOrDefault("provider", "openai")
-        );
+        // Provider/model are controlled by the allocated workspace AI key.
+        String selectedProvider = normalizeProvider(aiConfig.getOrDefault("provider", "openai"));
         String apiKey = resolveProviderApiKey(selectedProvider, aiConfig);
-        String model = resolveModel(selectedProvider, body.model, aiConfig);
+        String model = resolveModel(selectedProvider, null, aiConfig);
 
         int requestedCount = body.count != null && body.count > 0 ? Math.min(body.count, 20) : 5;
         boolean includeHappyFlow = body.includeHappyFlow == null || body.includeHappyFlow;
@@ -243,13 +242,8 @@ public final class AiHandler {
         return key;
     }
 
-    private static String resolveModel(String provider, String bodyModel, Map<String, String> aiConfig) {
+    private static String resolveModel(String provider, String ignoredBodyModel, Map<String, String> aiConfig) {
         Set<String> allowed = "anthropic".equals(provider) ? ANTHROPIC_MODEL_OPTIONS : OPENAI_MODEL_OPTIONS;
-        if (bodyModel != null && !bodyModel.isBlank()) {
-            String candidate = bodyModel.trim();
-            if (allowed.contains(candidate)) return candidate;
-            return allowed.iterator().next();
-        }
         String settingsModel = aiConfig.getOrDefault("model", "");
         if (!settingsModel.isBlank()) {
             String candidate = settingsModel.trim();
@@ -286,20 +280,7 @@ public final class AiHandler {
             if (!rs.next()) {
                 throw new io.javalin.http.NotFoundResponse("Project not found");
             }
-            String settingsJson = rs.getString("settings");
             Map<String, String> out = new HashMap<>();
-            if (settingsJson != null && !settingsJson.isBlank()) {
-                Map<String, Object> parsed = mapper.readValue(settingsJson, new TypeReference<>() {});
-                Object aiSettings = parsed.get("ai");
-                if (aiSettings instanceof Map<?, ?> aiMap) {
-                    aiMap.forEach((key, value) -> {
-                        if (key != null && value instanceof String strValue) {
-                            out.put(String.valueOf(key), strValue);
-                        }
-                    });
-                }
-            }
-
             String workspaceProvider = rs.getString("workspace_provider");
             String workspaceApiKey = rs.getString("workspace_api_key");
             String workspaceDefaultModel = rs.getString("workspace_default_model");
@@ -318,12 +299,14 @@ public final class AiHandler {
                     out.put("model", workspaceDefaultModel.trim());
                 }
             } else {
-                // Keys are now workspace-level. Ignore any legacy project-level keys.
+                // Keys are workspace-level. No allocation means no provider/key/model is exposed.
                 out.remove("openAiApiKey");
                 out.remove("anthropicApiKey");
+                out.remove("provider");
+                out.remove("model");
             }
             return out;
-        } catch (SQLException | JsonProcessingException e) {
+        } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }

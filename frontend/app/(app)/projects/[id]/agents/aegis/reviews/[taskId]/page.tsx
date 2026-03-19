@@ -152,7 +152,7 @@ export default function ReviewDetailPage() {
   const [observeHighlight, setObserveHighlight] = useState<BotHighlight | null>(null);
   const [showObserveScript, setShowObserveScript] = useState(false);
   const [showObserveBotReview, setShowObserveBotReview] = useState(false);
-  const [chatPaneRatio, setChatPaneRatio] = useState(35);
+  const [chatPaneRatio, setChatPaneRatio] = useState(30);
   const [resizingPanes, setResizingPanes] = useState(false);
   const [observeCurrentUrl, setObserveCurrentUrl] = useState<string | null>(null);
   const [observeCurrentAction, setObserveCurrentAction] = useState<string | null>(null);
@@ -348,7 +348,7 @@ export default function ReviewDetailPage() {
     const containerWidth = container.getBoundingClientRect().width;
     const onMove = (ev: MouseEvent) => {
       const delta = ev.clientX - startX;
-      const newRatio = Math.max(20, Math.min(60, startRatio + (delta / containerWidth) * 100));
+      const newRatio = Math.max(22, Math.min(55, startRatio + (delta / containerWidth) * 100));
       setChatPaneRatio(newRatio);
     };
     const onUp = () => {
@@ -591,54 +591,62 @@ export default function ReviewDetailPage() {
 
     const firstLogTs = observeLogs.length > 0 ? observeLogs[0].ts : null;
 
-    const logTypeConfig: Record<string, { bg: string; icon: React.ReactNode; label: string; textColor: string }> = {
+    const logTypeConfig: Record<string, { containerClass: string; badgeClass: string; icon: React.ReactNode; label: string; textClass: string }> = {
       thinking: {
-        bg: "bg-gradient-to-r from-blue-50 to-violet-50 border border-blue-200/60",
-        icon: <svg className="h-3.5 w-3.5 text-blue-500 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>,
+        containerClass: "bg-[var(--ai-surface)] border border-[var(--border)]",
+        badgeClass: "bg-[var(--ai-soft)] text-[var(--ai-primary)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--ai-primary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>,
         label: "REASONING",
-        textColor: "text-blue-800",
+        textClass: "text-[var(--foreground)]",
       },
       action: {
-        bg: "bg-emerald-50 border border-emerald-100",
-        icon: <svg className="h-3.5 w-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>,
+        containerClass: "bg-[var(--surface-secondary)] border border-[var(--border)]",
+        badgeClass: "bg-[var(--surface-tertiary)] text-[var(--foreground)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--foreground)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>,
         label: "ACTION",
-        textColor: "text-emerald-700",
+        textClass: "text-[var(--foreground)]",
       },
       navigation: {
-        bg: "bg-indigo-50 border border-indigo-100",
-        icon: <svg className="h-3.5 w-3.5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>,
+        containerClass: "bg-[var(--surface-secondary)] border border-[var(--border)]",
+        badgeClass: "bg-[var(--surface-tertiary)] text-[var(--foreground)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--foreground)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>,
         label: "NAVIGATION",
-        textColor: "text-indigo-700",
+        textClass: "text-[var(--foreground)]",
       },
       milestone: {
-        bg: "bg-amber-50 border border-amber-200",
-        icon: <svg className="h-3.5 w-3.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>,
+        containerClass: "bg-[var(--warning-soft)] border border-[var(--warning)]/30",
+        badgeClass: "bg-[var(--warning-soft)] text-[var(--warning)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--warning)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>,
         label: "MILESTONE",
-        textColor: "text-amber-700",
+        textClass: "text-[var(--foreground)]",
       },
       bot_review: {
-        bg: "bg-purple-50 border border-purple-100",
-        icon: <svg className="h-3.5 w-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
+        containerClass: "bg-[var(--ai-surface)] border border-[var(--border)]",
+        badgeClass: "bg-[var(--ai-soft)] text-[var(--ai-primary)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--ai-primary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
         label: "REVIEW",
-        textColor: "text-purple-700",
+        textClass: "text-[var(--foreground)]",
       },
       success: {
-        bg: "bg-green-50 border border-green-100",
-        icon: <svg className="h-3.5 w-3.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>,
+        containerClass: "bg-[var(--success-soft)] border border-[var(--success)]/30",
+        badgeClass: "bg-[var(--success-soft)] text-[var(--success)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--success)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>,
         label: "SUCCESS",
-        textColor: "text-green-700",
+        textClass: "text-[var(--foreground)]",
       },
       error: {
-        bg: "bg-red-50 border border-red-100",
-        icon: <svg className="h-3.5 w-3.5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>,
+        containerClass: "bg-[var(--error-soft)] border border-[var(--error)]/30",
+        badgeClass: "bg-[var(--error-soft)] text-[var(--error)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--error)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>,
         label: "ERROR",
-        textColor: "text-red-700",
+        textClass: "text-[var(--foreground)]",
       },
       info: {
-        bg: "bg-[var(--background)] border border-[var(--border-subtle)]",
-        icon: <svg className="h-3.5 w-3.5 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
+        containerClass: "bg-[var(--surface-secondary)] border border-[var(--border)]",
+        badgeClass: "bg-[var(--surface-tertiary)] text-[var(--muted)]",
+        icon: <svg className="h-3.5 w-3.5 text-[var(--muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>,
         label: "INFO",
-        textColor: "text-[var(--foreground)]",
+        textClass: "text-[var(--foreground)]",
       },
     };
 
@@ -653,10 +661,10 @@ export default function ReviewDetailPage() {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-sm font-bold text-[var(--foreground)]">Aegis — Observing</h1>
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700 uppercase tracking-wider">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--ai-soft)] px-2 py-0.5 text-[10px] font-bold text-[var(--ai-primary)] uppercase tracking-wider">
                   <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-500" />
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--ai-primary)] opacity-75" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--ai-primary)]" />
                   </span>
                   {phaseLabel}
                 </span>
@@ -686,7 +694,7 @@ export default function ReviewDetailPage() {
               <div key={phase} className="flex items-center gap-2 flex-1">
                 <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold shrink-0 ${
                   isCurrent
-                    ? "bg-[var(--brand-primary)] text-white"
+                    ? "bg-[var(--ai-primary)] text-white"
                     : isPast
                       ? "bg-[var(--success)] text-white"
                       : "bg-[var(--surface-tertiary)] text-[var(--muted)]"
@@ -699,7 +707,7 @@ export default function ReviewDetailPage() {
                     i + 1
                   )}
                 </div>
-                <span className={`text-xs font-medium capitalize ${isCurrent ? "text-blue-600" : isPast ? "text-green-600" : "text-[var(--muted)]"}`}>
+                <span className={`text-xs font-medium capitalize ${isCurrent ? "text-[var(--ai-primary)]" : isPast ? "text-[var(--success)]" : "text-[var(--muted)]"}`}>
                   {phase === "bot_reviewing" ? "Bot Review" : phase}
                 </span>
                 {i < 3 && <div className={`flex-1 h-px ${isPast ? "bg-green-400" : "bg-[var(--border)]"}`} />}
@@ -710,36 +718,36 @@ export default function ReviewDetailPage() {
 
         {/* Current Status Banner */}
         {(observeCurrentAction || observeCurrentUrl) && (
-          <div className="flex items-center gap-3 border-b border-[var(--border)] bg-gradient-to-r from-blue-50 to-indigo-50 px-4 py-2 shrink-0">
+          <div className="flex items-center gap-3 border-b border-[var(--border)] bg-[var(--ai-surface)] px-4 py-2 shrink-0">
             <div className="flex items-center gap-2 flex-1 min-w-0">
               <div className="flex h-5 w-5 items-center justify-center shrink-0">
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-[var(--ai-primary)] border-t-transparent" />
               </div>
               {observeCurrentAction && (
-                <span className="text-xs font-medium text-blue-700 truncate">
+                <span className="text-xs font-medium text-[var(--ai-primary)] truncate">
                   {observeCurrentAction}
                 </span>
               )}
             </div>
             {observeCurrentUrl && (
               <div className="flex items-center gap-1.5 shrink-0 max-w-[40%]">
-                <svg className="h-3 w-3 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg className="h-3 w-3 text-[var(--muted)] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
                 </svg>
-                <span className="text-[10px] text-indigo-600 truncate font-mono">
+                <span className="text-[10px] text-[var(--muted)] truncate font-mono">
                   {observeCurrentUrl}
                 </span>
               </div>
             )}
             {observeStepsTotal > 0 && (
               <div className="flex items-center gap-1.5 shrink-0">
-                <div className="h-1.5 w-16 rounded-full bg-blue-200 overflow-hidden">
+                <div className="h-1.5 w-16 rounded-full bg-[var(--surface-tertiary)] overflow-hidden">
                   <div
-                    className="h-full rounded-full bg-blue-500 transition-all duration-500"
+                    className="h-full rounded-full bg-[var(--ai-primary)] transition-all duration-500"
                     style={{ width: `${Math.round((observeStepsCompleted / observeStepsTotal) * 100)}%` }}
                   />
                 </div>
-                <span className="text-[10px] font-medium text-blue-600 tabular-nums">
+                <span className="text-[10px] font-medium text-[var(--ai-primary)] tabular-nums">
                   {observeStepsCompleted}/{observeStepsTotal}
                 </span>
               </div>
@@ -754,7 +762,7 @@ export default function ReviewDetailPage() {
             <div className="px-4 py-2.5 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Bot Activity</span>
+                  <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Bot Activity + Thinking</span>
                   <span className="text-xs text-[var(--muted)]">({observeLogs.length} events)</span>
                 </div>
                 {observeElapsed > 0 && (
@@ -772,27 +780,17 @@ export default function ReviewDetailPage() {
                 const isThinking = entry.type === "thinking";
                 const isLongReasoning = isThinking && entry.message.length > 180;
                 return (
-                  <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${isMilestone ? "ring-1 ring-amber-300 " : ""}${isThinking ? "border-l-[3px] border-l-blue-400 " : ""}${config.bg}`}>
+                  <div key={i} className={`rounded-lg px-3 py-2 text-xs leading-relaxed ${isMilestone ? "ring-1 ring-[var(--warning)]/40 " : ""}${isThinking ? "border-l-[3px] border-l-[var(--ai-primary)] " : ""}${config.containerClass}`}>
                     <div className="flex items-center gap-1.5 mb-0.5">
                       {config.icon}
                       {relTime && (
                         <span className="text-[10px] font-mono text-[var(--muted)] tabular-nums">{relTime}</span>
                       )}
-                      <span className={`text-[10px] font-semibold uppercase ${
-                        entry.type === "thinking" ? "text-blue-500" :
-                        entry.type === "action" ? "text-emerald-500" :
-                        entry.type === "navigation" ? "text-indigo-500" :
-                        entry.type === "milestone" ? "text-amber-500" :
-                        entry.type === "bot_review" ? "text-purple-500" :
-                        entry.type === "success" ? "text-green-500" :
-                        entry.type === "error" ? "text-red-500" :
-                        "text-[var(--muted-soft)]"
-                      }`}>{config.label}</span>
+                      <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase ${config.badgeClass}`}>{config.label}</span>
                       {isThinking && (
-                        <span className="inline-flex items-center gap-0.5 ml-1">
-                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "0ms" }} />
-                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "150ms" }} />
-                          <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: "300ms" }} />
+                        <span className="inline-flex items-center gap-1 ml-1 text-[9px] text-[var(--ai-primary)]">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[var(--ai-primary)] animate-pulse" />
+                          thinking
                         </span>
                       )}
                       {entry.stepProgress && (
@@ -807,18 +805,18 @@ export default function ReviewDetailPage() {
                       )}
                     </div>
                     {isThinking ? (
-                      <p className={`${config.textColor} italic whitespace-pre-wrap`}>
+                      <p className={`${config.textClass} italic whitespace-pre-wrap`}>
                         {isLongReasoning ? entry.message.slice(0, 180) + "…" : entry.message}
                       </p>
                     ) : (
-                      <p className={config.textColor}>{entry.message}</p>
+                      <p className={config.textClass}>{entry.message}</p>
                     )}
                     {isLongReasoning && (
                       <details className="mt-1">
-                        <summary className="text-[10px] text-blue-500 cursor-pointer hover:text-blue-600 select-none">
+                        <summary className="text-[10px] text-[var(--ai-primary)] cursor-pointer hover:opacity-85 select-none">
                           Show full reasoning
                         </summary>
-                        <p className={`${config.textColor} italic mt-1 whitespace-pre-wrap text-[11px] leading-relaxed`}>
+                        <p className={`${config.textClass} italic mt-1 whitespace-pre-wrap text-[11px] leading-relaxed`}>
                           {entry.message}
                         </p>
                       </details>
@@ -830,10 +828,10 @@ export default function ReviewDetailPage() {
                     )}
                     {entry.url && entry.type === "navigation" && (
                       <div className="mt-1 flex items-center gap-1">
-                        <svg className="h-2.5 w-2.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="h-2.5 w-2.5 text-[var(--muted)] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
                         </svg>
-                        <span className="text-[10px] font-mono text-indigo-500 truncate">{entry.url}</span>
+                        <span className="text-[10px] font-mono text-[var(--muted)] truncate">{entry.url}</span>
                       </div>
                     )}
                   </div>
@@ -841,7 +839,7 @@ export default function ReviewDetailPage() {
               })}
               {observeLogs.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
-                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent mb-3" />
+                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--ai-primary)] border-t-transparent mb-3" />
                   <p className="text-xs text-[var(--muted)]">Waiting for bot activity...</p>
                   <p className="text-[10px] text-[var(--muted)] mt-1">The bot is initializing. Activity will appear here in real time.</p>
                 </div>
@@ -972,17 +970,23 @@ export default function ReviewDetailPage() {
           {/* Resize Handle */}
           <div
             onMouseDown={handleSplitMouseDown}
-            className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--brand-primary)]/40 transition-colors shrink-0"
+            className="w-1.5 cursor-col-resize bg-[var(--border)] hover:bg-[var(--ai-primary)]/40 transition-colors shrink-0"
           />
 
           {/* Right Panel — Live Browser Preview */}
-          <div className="flex-1 flex flex-col bg-[var(--background)] min-w-0">
+          <div className="flex-1 flex flex-col bg-[var(--surface-secondary)] min-w-0">
+            <div className="px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Live Browser</span>
+                <span className="text-[10px] text-[var(--muted)]">Follow the bot's current interaction</span>
+              </div>
+            </div>
             {observeLiveStreamUrl && !observeStreamFailed ? (
-              <div className="relative flex-1 flex items-center justify-center p-2 overflow-hidden">
+              <div className="relative flex-1 overflow-hidden">
                 <img
                   src={observeLiveStreamUrl}
                   alt="Live browser preview"
-                  className="max-w-full max-h-full object-contain rounded-lg shadow-lg border border-[var(--border)]"
+                  className="h-full w-full object-contain"
                   onError={() => setObserveStreamFailed(true)}
                 />
                 {observeHighlight && (
