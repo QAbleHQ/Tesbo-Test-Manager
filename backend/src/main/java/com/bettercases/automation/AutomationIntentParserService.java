@@ -764,12 +764,15 @@ public final class AutomationIntentParserService {
             if ((value == null || value.isBlank()) && target == null) {
                 return clarificationPlan("What value should be entered, and into which field?");
             }
+            if (value == null || value.isBlank()) {
+                return clarificationPlan("Please provide the value to enter (or specify that I should generate realistic test data).");
+            }
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "type";
-            step.value = value == null ? "" : value;
+            step.value = value;
             step.targetDescription = target;
-            step.selector = target == null ? null : "text=" + target;
+            step.selector = null;
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
             plan.steps.add(step);
             return plan;
@@ -778,10 +781,13 @@ public final class AutomationIntentParserService {
         if (lower.contains("select ") || lower.contains("choose ") || lower.contains("pick ")) {
             String optionValue = extractQuotedValue(raw);
             String target = normalizeUiTargetPhrase(extractAfterKeywords(raw, List.of("from", "in", "on")));
+            if (optionValue == null || optionValue.isBlank()) {
+                return clarificationPlan("Which option value should be selected?");
+            }
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "type";
-            step.value = optionValue == null ? "" : optionValue;
+            step.value = optionValue;
             step.targetDescription = target == null ? "dropdown or selection control" : target;
             step.selector = null;
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;

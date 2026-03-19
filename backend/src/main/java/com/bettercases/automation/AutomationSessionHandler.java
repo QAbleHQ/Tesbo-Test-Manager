@@ -69,6 +69,8 @@ public final class AutomationSessionHandler {
         private final AtomicBoolean workerRunning = new AtomicBoolean(false);
         private volatile UUID activeCommandId = null;
         private volatile AtomicBoolean activeCancelSignal = null;
+        private volatile String pendingClarificationObjective = null;
+        private volatile String pendingClarificationQuestion = null;
     }
     public static void start(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
@@ -140,6 +142,17 @@ public final class AutomationSessionHandler {
 
         UUID commandId = UUID.randomUUID();
         SessionCommandState state = commandStates.computeIfAbsent(sessionId, ignored -> new SessionCommandState());
+
+        if (state.pendingClarificationObjective != null && !state.pendingClarificationObjective.isBlank()) {
+            String originalObjective = state.pendingClarificationObjective;
+            String clarificationQ = state.pendingClarificationQuestion;
+            state.pendingClarificationObjective = null;
+            state.pendingClarificationQuestion = null;
+            objective = originalObjective
+                    + "\n\nThe system asked: " + (clarificationQ == null ? "Please clarify." : clarificationQ)
+                    + "\nUser answered: " + objective;
+        }
+
         CommandEnvelope envelope = new CommandEnvelope(
                 sessionId,
                 projectId,
@@ -273,9 +286,10 @@ public final class AutomationSessionHandler {
             appendCancelledEvent(envelope, "Command was stopped before execution started.");
             return;
         }
+        String plannerObjective = enrichObjectiveWithRecentActionContext(envelope, envelope.objective);
         AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(
                 envelope.projectId,
-                envelope.objective,
+                plannerObjective,
                 currentUrl,
                 pageText,
                 domPlanningContext
@@ -293,6 +307,11 @@ public final class AutomationSessionHandler {
                 null
         );
         if (plan.requiresClarification) {
+            SessionCommandState scs = commandStates.get(envelope.sessionId);
+            if (scs != null) {
+                scs.pendingClarificationObjective = envelope.objective;
+                scs.pendingClarificationQuestion = plan.clarificationQuestion;
+            }
             return;
         }
         if (cancelSignal.get()) {
@@ -345,12 +364,90 @@ public final class AutomationSessionHandler {
             return;
         }
 
+        // Autonomous mode with a single-action objective should stay deterministic.
+        // Route these through structured planning + executeSteps to avoid agent over-expansion.
+        if (envelope.autonomousMode && isSingleActionObjective(envelope.objective)) {
+            String plannerObjective = enrichObjectiveWithRecentActionContext(envelope, envelope.objective);
+            AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(
+                    envelope.projectId,
+                    plannerObjective,
+                    currentUrl,
+                    pageText,
+                    domPlanningContext
+            );
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId,
+                    plan.requiresClarification ? "clarification_required" : "command_received",
+                    envelope.rawCommand,
+                    Map.of(
+                            "mode", "agent-autonomous-single",
+                            "checkpointMode", envelope.checkpointMode,
+                            "requiresClarification", plan.requiresClarification,
+                            "clarificationQuestion", plan.clarificationQuestion == null ? "" : plan.clarificationQuestion,
+                            "steps", plan.steps == null ? List.of() : plan.steps
+                    ),
+                    null,
+                    null
+            );
+            if (plan.requiresClarification) {
+                SessionCommandState scs = commandStates.get(envelope.sessionId);
+                if (scs != null) {
+                    scs.pendingClarificationObjective = envelope.objective;
+                    scs.pendingClarificationQuestion = plan.clarificationQuestion;
+                }
+                return;
+            }
+            if (cancelSignal.get()) {
+                appendCancelledEvent(envelope, "Command was stopped before step execution.");
+                return;
+            }
+            AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeSteps(
+                    envelope.sessionId,
+                    envelope.commandId.toString(),
+                    plan.steps
+            );
+            String screenshotPath = null;
+            if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
+                screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
+            }
+            Map<String, Object> browserMeta = new HashMap<>();
+            browserMeta.put("sessionType", "agent");
+            browserMeta.put("mode", "agent-autonomous-single");
+            browserMeta.put("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size());
+            browserMeta.put("checkpointMode", envelope.checkpointMode);
+            AutomationSessionService.touchState(
+                    envelope.sessionId,
+                    executeResponse.currentUrl == null || executeResponse.currentUrl.isBlank() ? currentUrl : executeResponse.currentUrl,
+                    screenshotPath,
+                    browserMeta
+            );
+            Map<String, Object> executionPayload = new HashMap<>();
+            executionPayload.put("mode", "agent-autonomous-single");
+            executionPayload.put("currentUrl", executeResponse.currentUrl);
+            executionPayload.put("results", executeResponse.results);
+            executionPayload.put("cancelled", false);
+            executionPayload.put("checkpointMode", envelope.checkpointMode);
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
+                    envelope.rawCommand,
+                    Map.of(
+                            "mode", "agent-autonomous-single",
+                            "checkpointMode", envelope.checkpointMode,
+                            "steps", plan.steps == null ? List.of() : plan.steps
+                    ),
+                    executionPayload,
+                    screenshotPath
+            );
+            return;
+        }
+
         // In AI-assisted chat mode we must follow only the latest user command.
         // Use deterministic planned steps instead of the autonomous agent loop.
         if (!envelope.autonomousMode) {
+            String plannerObjective = enrichObjectiveWithRecentActionContext(envelope, envelope.objective);
             AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(
                     envelope.projectId,
-                    envelope.objective,
+                    plannerObjective,
                     currentUrl,
                     pageText,
                     domPlanningContext
@@ -369,6 +466,11 @@ public final class AutomationSessionHandler {
                     null
             );
             if (plan.requiresClarification) {
+                SessionCommandState scs = commandStates.get(envelope.sessionId);
+                if (scs != null) {
+                    scs.pendingClarificationObjective = envelope.objective;
+                    scs.pendingClarificationQuestion = plan.clarificationQuestion;
+                }
                 return;
             }
             if (cancelSignal.get()) {
@@ -575,17 +677,19 @@ public final class AutomationSessionHandler {
         String testData = String.valueOf(testcase.getOrDefault("testData", "")).trim();
 
         List<Map<String, Object>> events = AutomationSessionService.listEvents(envelope.sessionId, 200);
-        List<String> feedbackSignals = extractRecentFeedbackSignals(events, envelope.rawCommand);
+        List<String> feedbackSignals = singleActionObjective ? List.of() : extractRecentFeedbackSignals(events, envelope.rawCommand);
 
         boolean goalAlreadyHasSteps = goal.contains("### Steps to Execute") || goal.contains("Steps to Execute");
         boolean includeExpectedSteps = !singleActionObjective && !goalAlreadyHasSteps;
 
         StringBuilder objective = new StringBuilder();
         objective.append("Primary Goal:\n").append(goal).append("\n\n");
-        if (!title.isBlank() && !goal.contains(title)) objective.append("Test Case Title:\n").append(title).append("\n\n");
-        if (!description.isBlank() && !goal.contains(description.substring(0, Math.min(description.length(), 60))))
-            objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
-        if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
+        if (!singleActionObjective) {
+            if (!title.isBlank() && !goal.contains(title)) objective.append("Test Case Title:\n").append(title).append("\n\n");
+            if (!description.isBlank() && !goal.contains(description.substring(0, Math.min(description.length(), 60))))
+                objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
+            if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
+        }
         if (!steps.isBlank() && includeExpectedSteps) {
             String formattedSteps = formatStepsAsNumberedList(steps);
             objective.append("Expected Steps:\n").append(limitBlock(formattedSteps, 3000)).append("\n\n");
@@ -601,7 +705,9 @@ public final class AutomationSessionHandler {
                         .append(credentialsBlock).append("\n\n");
             }
         }
-        if (!postconditions.isBlank()) objective.append("Expected Outcome:\n").append(limitBlock(postconditions, 1200)).append("\n\n");
+        if (!singleActionObjective && !postconditions.isBlank()) {
+            objective.append("Expected Outcome:\n").append(limitBlock(postconditions, 1200)).append("\n\n");
+        }
         if (!feedbackSignals.isEmpty()) {
             objective.append("User Feedback / Preferences (latest first):\n");
             for (String feedback : feedbackSignals) {
@@ -935,6 +1041,11 @@ public final class AutomationSessionHandler {
                         null,
                         null
                 );
+                SessionCommandState scs = commandStates.get(envelope.sessionId);
+                if (scs != null) {
+                    scs.pendingClarificationObjective = envelope.objective;
+                    scs.pendingClarificationQuestion = turnPlan.clarificationQuestion;
+                }
                 return;
             }
 
@@ -2111,6 +2222,89 @@ public final class AutomationSessionHandler {
             return stripped.length() > 80 ? stripped.substring(0, 80).trim() : stripped;
         }
         return "";
+    }
+
+    private static String enrichObjectiveWithRecentActionContext(CommandEnvelope envelope, String objective) {
+        String command = objective == null ? "" : objective.trim();
+        if (command.isBlank()) return command;
+        if (!isContextualCorrectionCommand(command)) return command;
+
+        Map<String, String> context = readRecentActionContext(envelope.sessionId, envelope.commandId);
+        if (context.isEmpty()) return command;
+
+        String action = context.getOrDefault("action", "");
+        String target = context.getOrDefault("target", "");
+        String value = context.getOrDefault("value", "");
+        if (target.isBlank() && value.isBlank()) return command;
+
+        StringBuilder enriched = new StringBuilder(command);
+        enriched.append("\n\nFollow-up context from previous user action:\n");
+        if (!action.isBlank()) enriched.append("- Previous action: ").append(action).append("\n");
+        if (!target.isBlank()) enriched.append("- Previous target: ").append(target).append("\n");
+        if (!value.isBlank()) enriched.append("- Previous value: ").append(value).append("\n");
+        enriched.append("- Interpret this command as a correction/update to the same target unless user explicitly names a different target.");
+        return enriched.toString();
+    }
+
+    private static boolean isContextualCorrectionCommand(String command) {
+        String lower = command == null ? "" : command.toLowerCase();
+        if (lower.isBlank()) return false;
+        return lower.startsWith("no ")
+                || lower.contains("change to")
+                || lower.contains("instead")
+                || lower.contains("update to")
+                || lower.contains("set to")
+                || lower.contains("make it ")
+                || lower.contains("replace with")
+                || lower.contains("not this");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> readRecentActionContext(UUID sessionId, UUID currentCommandId) {
+        List<Map<String, Object>> events = AutomationSessionService.listEvents(sessionId, 200);
+        for (int i = events.size() - 1; i >= 0; i--) {
+            Map<String, Object> event = events.get(i);
+            if (event == null) continue;
+            String eventCommandId = asSafeText(event.get("commandId"));
+            if (!eventCommandId.isBlank() && currentCommandId != null && eventCommandId.equals(currentCommandId.toString())) {
+                continue;
+            }
+            Object parsedRaw = event.get("parsedAction");
+            if (!(parsedRaw instanceof Map<?, ?> parsed)) continue;
+
+            Map<String, Object> parsedMap = (Map<String, Object>) parsed;
+            Object stepsRaw = parsedMap.get("steps");
+            if (stepsRaw instanceof List<?> steps && !steps.isEmpty()) {
+                for (int s = steps.size() - 1; s >= 0; s--) {
+                    Object stepRaw = steps.get(s);
+                    if (stepRaw instanceof Map<?, ?> step) {
+                        Map<String, String> ctx = extractActionContext((Map<String, Object>) step);
+                        if (!ctx.isEmpty()) return ctx;
+                    }
+                }
+            }
+
+            Map<String, String> direct = extractActionContext(parsedMap);
+            if (!direct.isEmpty()) return direct;
+        }
+        return Map.of();
+    }
+
+    private static Map<String, String> extractActionContext(Map<String, Object> action) {
+        if (action == null || action.isEmpty()) return Map.of();
+        String actionName = asSafeText(action.get("action"));
+        String target = asSafeText(action.get("targetDescription"));
+        if (target.isBlank()) target = asSafeText(action.get("targetText"));
+        if (target.isBlank()) target = asSafeText(action.get("selector"));
+        String value = asSafeText(action.get("value"));
+        if (value.isBlank()) value = asSafeText(action.get("text"));
+
+        if (actionName.isBlank() && target.isBlank() && value.isBlank()) return Map.of();
+        Map<String, String> out = new HashMap<>();
+        if (!actionName.isBlank()) out.put("action", actionName);
+        if (!target.isBlank()) out.put("target", target);
+        if (!value.isBlank()) out.put("value", value);
+        return out;
     }
 
     private static boolean isSingleActionObjective(String goal) {

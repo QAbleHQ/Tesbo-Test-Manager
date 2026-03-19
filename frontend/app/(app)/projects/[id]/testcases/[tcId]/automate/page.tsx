@@ -77,6 +77,70 @@ type TestCaseIntentDetails = {
   stepsSummary: string[];
 };
 
+function RecordingGroupBlock({ items }: { items: Array<{ message: ChatMessage; idx: number }> }) {
+  const [expanded, setExpanded] = useState(false);
+  const count = items.length;
+  const failedCount = items.filter((i) => i.message.recordingMeta?.status === "failed").length;
+
+  const actionIconFor = (action: string) =>
+    action === "click" ? "\u{1F5B1}" :
+    action === "type" || action === "fill" ? "\u2328" :
+    action === "navigate" ? "\u{1F517}" :
+    action === "press" ? "\u238B" :
+    action === "scroll" ? "\u2195" :
+    action === "hover" ? "\u{1F446}" :
+    action.startsWith("assert") ? "\u2713" : "\u25CF";
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[92%] w-full rounded-lg border border-[#D6DEE6] bg-white">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[#F7FAFB] rounded-lg transition-colors"
+        >
+          <span className="inline-flex h-[18px] items-center rounded-full bg-[#DCFCE7] px-2 text-[10px] font-semibold uppercase tracking-wider text-[#15803D]">
+            Executed
+          </span>
+          <span className="text-[13px] font-medium text-[#0F1720]">
+            {count} action{count === 1 ? "" : "s"} recorded
+            {failedCount > 0 && (
+              <span className="ml-1 text-[#C0392B]">({failedCount} failed)</span>
+            )}
+          </span>
+          <span className="ml-auto text-[11px] text-[#74808B]">
+            {expanded ? "\u25B2" : "\u25BC"}
+          </span>
+        </button>
+        {expanded && (
+          <div className="border-t border-[#E3E8EE] divide-y divide-[#E3E8EE]">
+            {items.map(({ message, idx }) => {
+              const meta = message.recordingMeta!;
+              const statusColor =
+                meta.status === "failed" ? "text-[#C0392B]" :
+                meta.status === "assertion" ? "text-[#4F46E5]" :
+                "text-[#15803D]";
+              return (
+                <div key={idx} className="px-3 py-1.5 flex flex-col gap-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs">{actionIconFor(meta.action)}</span>
+                    <span className={`text-[12px] font-medium ${statusColor}`}>
+                      {message.content}
+                    </span>
+                  </div>
+                  <code className="rounded bg-[#EDF2F4] px-2 py-1 text-[11px] font-mono text-[#52606D] break-all">
+                    {meta.playwright}
+                  </code>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function AutomateTestCasePage() {
   const params = useParams();
   const router = useRouter();
@@ -152,6 +216,7 @@ export default function AutomateTestCasePage() {
   const processingKeyQueueRef = useRef(false);
   const streamedAutonomousEventIdsRef = useRef<Set<string>>(new Set());
   const streamedTimelineEntriesRef = useRef<Set<string>>(new Set());
+  const streamedLifecycleEventIdsRef = useRef<Set<string>>(new Set());
   const lastRecordingActionCountRef = useRef(0);
   const lastReasoningCountRef = useRef(0);
   const [recordingSummary, setRecordingSummary] = useState<RecordingSummary | null>(null);
@@ -167,6 +232,24 @@ export default function AutomateTestCasePage() {
 
   function asText(value: unknown): string {
     return typeof value === "string" ? value : "";
+  }
+
+  function summarizeIntent(raw: string): string {
+    const value = raw.trim().toLowerCase();
+    if (!value) return "Got it. I will review the current screen and decide the safest next action.";
+    if (value.startsWith("enter ") || value.startsWith("type ") || value.startsWith("fill ") || value.startsWith("input ")) {
+      return "Got it. I will identify the best input field on the current screen and enter the value.";
+    }
+    if (value.startsWith("click ") || value.startsWith("tap ") || value.startsWith("press ")) {
+      return "Got it. I will locate the requested control on the current screen and perform that action.";
+    }
+    if (value.startsWith("verify ") || value.startsWith("assert ")) {
+      return "Got it. I will inspect the current UI and validate the requested outcome.";
+    }
+    if (value.includes("popup") || value.includes("modal") || value.includes("dialog")) {
+      return "Got it. I will focus inside the active popup/dialog before taking any action.";
+    }
+    return "Got it. I will analyze the UI context first, then execute the most relevant action for your command.";
   }
 
   function isDropdownStep(step: Record<string, unknown>): boolean {
@@ -1484,21 +1567,48 @@ export default function AutomateTestCasePage() {
   }, [isAutonomousMode, session?.events, showAutonomousDebugTrace]);
 
   useEffect(() => {
-    if (timeline.length === 0) return;
-    const fresh: ChatMessage[] = [];
-    for (const item of timeline) {
-      const key = `${item.timeLabel}|${item.actionLabel}|${item.primary || ""}|${item.secondary || ""}|${item.tertiary || ""}`;
-      if (streamedTimelineEntriesRef.current.has(key)) continue;
-      streamedTimelineEntriesRef.current.add(key);
-      const lines = [`[${item.timeLabel}] ${item.actionLabel}${item.primary ? ` - ${item.primary}` : ""}`];
-      if (item.secondary) lines.push(item.secondary);
-      if (item.tertiary) lines.push(item.tertiary);
-      fresh.push({ role: "assistant", content: lines.join("\n") });
+    if (!session?.events || session.events.length === 0) return;
+    const lifecycleMessages: ChatMessage[] = [];
+    for (const event of session.events) {
+      if (!event?.id || streamedLifecycleEventIdsRef.current.has(event.id)) continue;
+      streamedLifecycleEventIdsRef.current.add(event.id);
+      const parsed = (event.parsedAction || {}) as Record<string, unknown>;
+
+      if (event.eventType === "command_queued") {
+        const objective = asText(parsed.objective || event.rawCommand).trim();
+        lifecycleMessages.push({
+          role: "assistant",
+          content: `Thinking: I received your command and I am analyzing the current UI context.\nObjective: ${objective || "latest user command"}`,
+        });
+        continue;
+      }
+
+      if (event.eventType === "command_received") {
+        const modeLabel = asText(parsed.mode) || "automation";
+        const steps = Array.isArray(parsed.steps) ? (parsed.steps as Array<Record<string, unknown>>) : [];
+        const firstStep = steps.length > 0 ? asText(steps[0].action) : "";
+        lifecycleMessages.push({
+          role: "assistant",
+          content: `Thinking: analysis complete for ${modeLabel} mode.\nDecision: ${steps.length > 0 ? `I will execute ${steps.length} planned step${steps.length === 1 ? "" : "s"}${firstStep ? ` (starting with ${firstStep})` : ""}.` : "I am preparing execution."}`,
+        });
+        continue;
+      }
+
+      if (event.eventType === "clarification_required") {
+        const question = asText(parsed.clarificationQuestion).trim() || "Please confirm the exact target/action.";
+        lifecycleMessages.push({
+          role: "assistant",
+          content: `Need confirmation before I continue: ${question}`,
+        });
+        continue;
+      }
     }
-    if (fresh.length > 0) {
-      setMessages((prev) => [...prev, ...fresh]);
+    if (lifecycleMessages.length > 0) {
+      setMessages((prev) => [...prev, ...lifecycleMessages]);
     }
-  }, [timeline]);
+  }, [session?.events]);
+
+  // Timeline entries are no longer pushed to chat; lifecycle events + recordings cover the same info.
 
   const prevCommandInProgressRef = useRef(false);
 
@@ -1639,13 +1749,27 @@ export default function AutomateTestCasePage() {
     const value = input.trim();
     const checkpointToken = shouldUseAutonomousMode && checkpointModeEnabled ? "\n[[BC_CHECKPOINT_MODE]]" : "";
     const outboundCommand = shouldUseAutonomousMode
-      ? `Autonomous mode objective: ${value}${checkpointToken}. Before any action, analyze the current DOM and identify stable locator candidates (role/label/testid/text) for each target. Use concise DOM-grounded target descriptions, then execute the flow and include meaningful validation assertions in the plan.${checkpointModeEnabled ? " Stop after this autonomous turn and wait for the user's next instruction." : ""}`
+      ? `Autonomous mode objective: ${value}${checkpointToken}`
       : value;
     setSending(true);
-    lastRecordingActionCountRef.current = 0;
-    lastReasoningCountRef.current = 0;
     setRecordingSummary(null);
-    setMessages((prev) => [...prev, { role: "user", content: value }]);
+    const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
+    const isFollowUpToClarification =
+      lastAssistantMsg != null &&
+      (lastAssistantMsg.content.startsWith("Need confirmation") ||
+        lastAssistantMsg.content.includes("What value") ||
+        lastAssistantMsg.content.includes("Please clarify") ||
+        lastAssistantMsg.content.includes("which field") ||
+        lastAssistantMsg.content.includes("Please confirm") ||
+        lastAssistantMsg.content.includes("Please provide"));
+    const ackText = isFollowUpToClarification
+      ? `Thinking: received your answer. Resuming with the original command using your input.`
+      : `Thinking: command received. ${summarizeIntent(value)}`;
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: value },
+      { role: "assistant", content: ackText },
+    ]);
     try {
       const response = await sendAutomationCommand(projectId, sessionId, outboundCommand);
       if (response.requiresClarification) {
@@ -2064,110 +2188,136 @@ Stop when pass/fail outcome is clear and summarize results.`;
                   Goal AI mode: send an outcome-oriented objective. Example: complete login flow and verify dashboard is visible.
                 </div>
               )}
-              {messages.map((message, idx) => {
-                const isUser = message.role === "user";
-                const isRecording = message.role === "recording";
-                const isReasoning = message.role === "reasoning";
-                const isThinkingAssistantMessage =
-                  !isUser &&
-                  !isRecording &&
-                  !isReasoning &&
-                  (message.content.startsWith("Turn ") && message.content.includes("plan:") ||
-                    message.content.startsWith("Next turn plan:") ||
-                    message.content.startsWith("After turn") ||
-                    message.content.includes("] Plan -"));
+              {(() => {
+                type MessageGroup =
+                  | { kind: "single"; message: ChatMessage; idx: number }
+                  | { kind: "recordings"; items: Array<{ message: ChatMessage; idx: number }> };
 
-                if (isReasoning) {
-                  return (
-                    <div key={idx} className="flex justify-start">
-                      <div className="max-w-[92%] rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm">
-                        <div className="flex items-center gap-1.5 mb-1">
-                          <span className="text-xs">🧠</span>
-                          <span className="text-xs font-semibold uppercase tracking-wide text-amber-700">
-                            Bot Reasoning
-                          </span>
-                          {message.reasoningMeta?.url && (
-                            <span className="ml-auto text-[10px] text-amber-500 truncate max-w-[200px]" title={message.reasoningMeta.url}>
-                              {message.reasoningMeta.url.replace(/^https?:\/\//, "").split("/").slice(0, 2).join("/")}
+                const groups: MessageGroup[] = [];
+                for (let i = 0; i < messages.length; i++) {
+                  const msg = messages[i];
+                  if (msg.role === "recording" && msg.recordingMeta) {
+                    const last = groups[groups.length - 1];
+                    if (last && last.kind === "recordings") {
+                      last.items.push({ message: msg, idx: i });
+                    } else {
+                      groups.push({ kind: "recordings", items: [{ message: msg, idx: i }] });
+                    }
+                  } else {
+                    groups.push({ kind: "single", message: msg, idx: i });
+                  }
+                }
+
+                return groups.map((group, gIdx) => {
+                  if (group.kind === "recordings") {
+                    return (
+                      <RecordingGroupBlock key={`rg-${gIdx}`} items={group.items} />
+                    );
+                  }
+
+                  const message = group.message;
+                  const idx = group.idx;
+                  const isUser = message.role === "user";
+                  const isReasoning = message.role === "reasoning";
+
+                  const thinkingCategory = (() => {
+                    if (isUser || isReasoning) return null;
+                    const c = message.content;
+                    if (c.startsWith("Thinking:")) return "thinking" as const;
+                    if (c.startsWith("Decision:")) return "decision" as const;
+                    if (c.startsWith("Need confirmation")) return "confirmation" as const;
+                    if (
+                      (c.startsWith("Turn ") && c.includes("plan:")) ||
+                      c.startsWith("Next turn plan:") ||
+                      c.startsWith("After turn") ||
+                      c.includes("] Plan -")
+                    )
+                      return "thinking" as const;
+                    return null;
+                  })();
+
+                  if (isReasoning) {
+                    return (
+                      <div key={idx} className="flex justify-start">
+                        <div className="max-w-[92%] rounded-lg border border-amber-200/80 bg-amber-50/60 px-3 py-2">
+                          <div className="flex items-center gap-1.5 mb-1">
+                            <span className="inline-flex h-[18px] items-center rounded-full bg-amber-100 px-2 text-[10px] font-semibold uppercase tracking-wider text-amber-800">
+                              Reasoning
                             </span>
-                          )}
-                        </div>
-                        <p className="text-xs leading-relaxed text-amber-900 whitespace-pre-wrap">
-                          {message.content}
-                        </p>
-                      </div>
-                    </div>
-                  );
-                }
-
-                if (isRecording && message.recordingMeta) {
-                  const meta = message.recordingMeta;
-                  const actionIcon =
-                    meta.action === "click" ? "🖱" :
-                    meta.action === "type" || meta.action === "fill" ? "⌨" :
-                    meta.action === "navigate" ? "🔗" :
-                    meta.action === "press" ? "⎋" :
-                    meta.action === "scroll" ? "↕" :
-                    meta.action === "hover" ? "👆" :
-                    meta.action.startsWith("assert") ? "✓" : "●";
-                  const borderColor =
-                    meta.status === "assertion"
-                      ? "border-purple-300"
-                      : meta.status === "failed"
-                        ? "border-red-300"
-                        : "border-emerald-300";
-                  const bgColor =
-                    meta.status === "assertion"
-                      ? "bg-purple-50"
-                      : meta.status === "failed"
-                        ? "bg-red-50"
-                        : "bg-emerald-50";
-                  const labelColor =
-                    meta.status === "assertion"
-                      ? "text-purple-700"
-                      : meta.status === "failed"
-                        ? "text-red-700"
-                        : "text-emerald-700";
-                  return (
-                    <div key={idx} className="flex justify-start">
-                      <div className={`max-w-[92%] rounded-xl border ${borderColor} ${bgColor} px-3 py-2 text-sm`}>
-                        <div className="flex items-center gap-1.5 mb-1">
-                          <span className="text-xs">{actionIcon}</span>
-                          <span className={`text-xs font-semibold uppercase tracking-wide ${labelColor}`}>
-                            Recorded
-                          </span>
-                          <span className={`text-xs font-medium ${labelColor}`}>
+                            {message.reasoningMeta?.url && (
+                              <span className="ml-auto text-[10px] font-medium text-amber-500 truncate max-w-[200px]" title={message.reasoningMeta.url}>
+                                {message.reasoningMeta.url.replace(/^https?:\/\//, "").split("/").slice(0, 2).join("/")}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[13px] leading-relaxed text-amber-900/90 whitespace-pre-wrap">
                             {message.content}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (thinkingCategory) {
+                    const badgeConfig = {
+                      thinking: {
+                        badge: "Analyzing",
+                        badgeBg: "bg-[#E8E7FF]",
+                        badgeText: "text-[#4F46E5]",
+                        border: "border-[#E8E7FF]",
+                        bg: "bg-[#F4F3FF]",
+                        text: "text-[#312E81]",
+                      },
+                      decision: {
+                        badge: "Decision",
+                        badgeBg: "bg-[#DCFCE7]",
+                        badgeText: "text-[#15803D]",
+                        border: "border-[#DCFCE7]",
+                        bg: "bg-[#F0FDF4]",
+                        text: "text-[#14532D]",
+                      },
+                      confirmation: {
+                        badge: "Needs Input",
+                        badgeBg: "bg-[#FEF3C7]",
+                        badgeText: "text-[#B7791F]",
+                        border: "border-[#FDE68A]",
+                        bg: "bg-[#FFFBEB]",
+                        text: "text-[#78350F]",
+                      },
+                    }[thinkingCategory];
+
+                    const prefixRegex = /^(Thinking:|Decision:|Need confirmation[^:]*:)\s*/;
+                    const contentBody = message.content.replace(prefixRegex, "");
+
+                    return (
+                      <div key={idx} className="flex justify-start">
+                        <div className={`max-w-[92%] rounded-lg border ${badgeConfig.border} ${badgeConfig.bg} px-3 py-2`}>
+                          <span className={`mb-1 inline-flex h-[18px] items-center rounded-full ${badgeConfig.badgeBg} px-2 text-[10px] font-semibold uppercase tracking-wider ${badgeConfig.badgeText}`}>
+                            {badgeConfig.badge}
                           </span>
+                          <p className={`mt-1 text-[13px] leading-relaxed ${badgeConfig.text} whitespace-pre-wrap`}>
+                            {contentBody}
+                          </p>
                         </div>
-                        <div className="mt-1 rounded-md bg-[var(--surface-tertiary)] px-2.5 py-1.5 font-mono text-xs text-emerald-600">
-                          {meta.playwright}
-                        </div>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div key={idx} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                      <div
+                        className={`max-w-[88%] whitespace-pre-wrap rounded-xl px-3 py-2 text-[13px] leading-relaxed ${
+                          isUser
+                            ? "bg-[#0F766E] text-white font-medium"
+                            : "border border-[#D6DEE6] bg-white text-[#0F1720]"
+                        }`}
+                      >
+                        {message.content}
                       </div>
                     </div>
                   );
-                }
-                return (
-                  <div key={idx} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-                    <div
-                      className={`max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-relaxed ${
-                        isUser
-                          ? "bg-[var(--brand-primary)] text-white"
-                          : isThinkingAssistantMessage
-                            ? "border border-indigo-200 bg-indigo-50 text-indigo-900"
-                            : "border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"
-                      }`}
-                    >
-                      {isThinkingAssistantMessage && (
-                        <span className="mb-1 inline-flex items-center rounded-full border border-indigo-300 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
-                          Thinking
-                        </span>
-                      )}
-                      {message.content}
-                    </div>
-                  </div>
-                );
-              })}
+                });
+              })()}
             </div>
           </div>
           <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2">
