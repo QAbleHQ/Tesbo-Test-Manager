@@ -11,13 +11,9 @@ import {
   createTestCase,
   listSuites,
   listTestCases,
-  getAgentSettings,
-  getProject,
   type SuiteNode,
   type TestCaseListItem,
 } from "@/lib/api";
-import { runAegisInBackground } from "@/lib/aegis-runner";
-import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 import { Button, Input, Select, Textarea, Modal, Field, FieldLabel } from "@/components/ui";
 import { PageHeader } from "@/components/workflows";
 
@@ -32,7 +28,6 @@ type ScriptHistoryEntry = {
 };
 
 const FETCH_LIMIT = 100;
-const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 function parseTagString(raw: string): string[] {
   return raw
@@ -71,9 +66,7 @@ export default function TestCaseDetailPage() {
   const [status, setStatus] = useState("Draft");
   const [suiteId, setSuiteId] = useState("");
   const [saving, setSaving] = useState(false);
-  const [assigningToAegis, setAssigningToAegis] = useState(false);
   const [saveNotification, setSaveNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const [canUseAgents, setCanUseAgents] = useState(false);
   
 
   async function loadAllCases(): Promise<TestCaseListItem[]> {
@@ -103,11 +96,6 @@ export default function TestCaseDetailPage() {
         router.replace("/login");
         return;
       }
-      getProject(projectId)
-        .then((project) => {
-          setCanUseAgents(project.aiConfigured === true);
-        })
-        .catch(() => setCanUseAgents(false));
       if (isNew) {
         setTc({});
         listSuites(projectId).then((items) => {
@@ -219,17 +207,6 @@ export default function TestCaseDetailPage() {
           priority,
           status,
         });
-        if (effectiveAutomationStatus === "Ready for the Automation") {
-          const settings = getAgentSettings(projectId, "aegis");
-          if (settings.autoStartOnReady) {
-            if (canUseAgents) {
-              await runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
-            } else {
-              setSaveNotification({ type: "error", message: AGENT_ALLOCATION_ERROR });
-              setTimeout(() => setSaveNotification(null), 6000);
-            }
-          }
-        }
         if (action === "create-next") {
           setTitle("");
           setDescription("");
@@ -276,17 +253,6 @@ export default function TestCaseDetailPage() {
           priority,
           status,
         });
-        if (effectiveAutomationStatus === "Ready for the Automation") {
-          const settings = getAgentSettings(projectId, "aegis");
-          if (settings.autoStartOnReady) {
-            if (canUseAgents) {
-              await runAegisInBackground(projectId, testcaseId, title, "", "ready_for_automation");
-            } else {
-              setSaveNotification({ type: "error", message: AGENT_ALLOCATION_ERROR });
-              setTimeout(() => setSaveNotification(null), 6000);
-            }
-          }
-        }
         setSaveNotification({ type: "success", message: "Test case updated successfully." });
         setTimeout(() => setSaveNotification(null), 4000);
       }
@@ -315,33 +281,6 @@ export default function TestCaseDetailPage() {
     if (isNew) return;
     const rerunUrl = `/projects/${projectId}/testcases/${testcaseId}/rerun-live-preview`;
     window.open(rerunUrl, "_blank", "noopener,noreferrer");
-  }
-
-  async function onAssignToAegisQueue() {
-    if (isNew || assigningToAegis) return;
-    setAssigningToAegis(true);
-    try {
-      if (!canUseAgents) {
-        throw new Error(AGENT_ALLOCATION_ERROR);
-      }
-      const currentExternalId = String((tc as Record<string, unknown> | null)?.externalId ?? "");
-      const currentTitle = String((tc as Record<string, unknown> | null)?.title ?? "");
-      await runAegisInBackground(
-        projectId,
-        testcaseId,
-        title.trim() || currentTitle || "Untitled test case",
-        currentExternalId,
-        "manual"
-      );
-      setSaveNotification({ type: "success", message: "Assigned to Aegis. Task added to queue." });
-      setTimeout(() => setSaveNotification(null), 4000);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Failed to assign test case to Aegis queue.";
-      setSaveNotification({ type: "error", message });
-      setTimeout(() => setSaveNotification(null), 6000);
-    } finally {
-      setAssigningToAegis(false);
-    }
   }
 
   if (tc === null && !isNew) {
@@ -375,7 +314,6 @@ export default function TestCaseDetailPage() {
             </nav>
           }
         />
-        <AegisBackgroundIndicator />
         {saveNotification && (
           <div className={`mb-6 flex items-center justify-between rounded-lg border px-4 py-3 ${
             saveNotification.type === "success"
@@ -558,6 +496,15 @@ export default function TestCaseDetailPage() {
               <FieldLabel>Playwright Script</FieldLabel>
               {!isNew && (
                 <div className="flex items-center gap-2">
+                  <Link href={`/projects/${projectId}/testcases/${testcaseId}/automate`} target="_blank" rel="noopener noreferrer">
+                    <Button
+                      type="button"
+                      variant="primary"
+                      size="sm"
+                    >
+                      Automate
+                    </Button>
+                  </Link>
                   <Button
                     type="button"
                     variant="secondary"
@@ -606,19 +553,8 @@ export default function TestCaseDetailPage() {
           </Field>
           <div className="flex gap-2">
             {!isNew && (
-              <Button
-                type="button"
-                variant="ai"
-                onClick={() => void onAssignToAegisQueue()}
-                disabled={assigningToAegis || saving}
-                title={!canUseAgents ? AGENT_ALLOCATION_ERROR : "Assign to Aegis"}
-              >
-                {assigningToAegis ? "Assigning..." : "Assign to Aegis"}
-              </Button>
-            )}
-            {!isNew && (
               <span className="rounded-xl border border-[var(--brand-primary)]/20 bg-[var(--brand-soft)] py-2 px-4 text-sm text-[var(--brand-primary)]">
-                Update script and use the run action from the script section to validate changes.
+                Use Automate to guide AI in the browser and record the final script.
               </span>
             )}
             <Button

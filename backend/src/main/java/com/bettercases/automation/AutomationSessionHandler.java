@@ -33,6 +33,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AutomationSessionHandler {
+    private static final String CHECKPOINT_MODE_TOKEN = "[[BC_CHECKPOINT_MODE]]";
     private static final HttpClient streamClient = HttpClient.newBuilder().build();
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final ExecutorService commandWorkerPool = Executors.newCachedThreadPool();
@@ -47,9 +48,10 @@ public final class AutomationSessionHandler {
         private final String rawCommand;
         private final String objective;
         private final boolean autonomousMode;
+        private final boolean checkpointMode;
 
         private CommandEnvelope(UUID sessionId, UUID projectId, UUID testcaseId, UUID userId, UUID commandId,
-                                String rawCommand, String objective, boolean autonomousMode) {
+                                String rawCommand, String objective, boolean autonomousMode, boolean checkpointMode) {
             this.sessionId = sessionId;
             this.projectId = projectId;
             this.testcaseId = testcaseId;
@@ -58,6 +60,7 @@ public final class AutomationSessionHandler {
             this.rawCommand = rawCommand;
             this.objective = objective;
             this.autonomousMode = autonomousMode;
+            this.checkpointMode = checkpointMode;
         }
     }
 
@@ -123,9 +126,13 @@ public final class AutomationSessionHandler {
             return;
         }
         boolean autonomousMode = rawCommand.toLowerCase().startsWith("autonomous mode objective:");
-        String objective = autonomousMode
+        String objectiveRaw = autonomousMode
                 ? rawCommand.substring("Autonomous mode objective:".length()).trim()
                 : rawCommand;
+        boolean checkpointMode = autonomousMode && objectiveRaw.contains(CHECKPOINT_MODE_TOKEN);
+        String objective = checkpointMode
+                ? objectiveRaw.replace(CHECKPOINT_MODE_TOKEN, "").trim()
+                : objectiveRaw;
         if (objective.isBlank()) {
             ctx.status(400).json(Map.of("error", "command is required"));
             return;
@@ -141,13 +148,15 @@ public final class AutomationSessionHandler {
                 commandId,
                 rawCommand,
                 objective,
-                autonomousMode
+                autonomousMode,
+                checkpointMode
         );
         state.queue.add(envelope);
 
         Map<String, Object> queuedPayload = new HashMap<>();
         queuedPayload.put("mode", autonomousMode ? "autonomous" : "chat");
         queuedPayload.put("objective", objective);
+        queuedPayload.put("checkpointMode", checkpointMode);
         queuedPayload.put("queued", true);
         queuedPayload.put("queueDepth", state.queue.size());
         AutomationSessionService.addEvent(
@@ -242,7 +251,7 @@ public final class AutomationSessionHandler {
         } catch (Exception ignored) {}
 
         if ("agent".equals(sessionType)) {
-            executeAgentCommand(envelope, cancelSignal, currentUrl);
+            executeAgentCommand(envelope, cancelSignal, currentUrl, pageText, domPlanningContext);
             return;
         }
 
@@ -327,10 +336,80 @@ public final class AutomationSessionHandler {
     private static void executeAgentCommand(
             CommandEnvelope envelope,
             AtomicBoolean cancelSignal,
-            String currentUrl
+            String currentUrl,
+            String pageText,
+            String domPlanningContext
     ) {
         if (cancelSignal.get()) {
             appendCancelledEvent(envelope, "Command was stopped before agent execution started.");
+            return;
+        }
+
+        // In AI-assisted chat mode we must follow only the latest user command.
+        // Use deterministic planned steps instead of the autonomous agent loop.
+        if (!envelope.autonomousMode) {
+            AutomationContracts.ActionPlan plan = AutomationIntentParserService.plan(
+                    envelope.projectId,
+                    envelope.objective,
+                    currentUrl,
+                    pageText,
+                    domPlanningContext
+            );
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId,
+                    plan.requiresClarification ? "clarification_required" : "command_received",
+                    envelope.rawCommand,
+                    Map.of(
+                            "mode", "agent-chat",
+                            "requiresClarification", plan.requiresClarification,
+                            "clarificationQuestion", plan.clarificationQuestion == null ? "" : plan.clarificationQuestion,
+                            "steps", plan.steps == null ? List.of() : plan.steps
+                    ),
+                    null,
+                    null
+            );
+            if (plan.requiresClarification) {
+                return;
+            }
+            if (cancelSignal.get()) {
+                appendCancelledEvent(envelope, "Command was stopped before step execution.");
+                return;
+            }
+
+            AutomationContracts.AgentExecuteResponse executeResponse = AutomationAgentClient.executeSteps(
+                    envelope.sessionId,
+                    envelope.commandId.toString(),
+                    plan.steps
+            );
+            String screenshotPath = null;
+            if (executeResponse.results != null && !executeResponse.results.isEmpty()) {
+                screenshotPath = executeResponse.results.get(executeResponse.results.size() - 1).screenshotPath;
+            }
+            Map<String, Object> browserMeta = new HashMap<>();
+            browserMeta.put("sessionType", "agent");
+            browserMeta.put("mode", "agent-chat");
+            browserMeta.put("stepCount", executeResponse.results == null ? 0 : executeResponse.results.size());
+            AutomationSessionService.touchState(
+                    envelope.sessionId,
+                    executeResponse.currentUrl == null || executeResponse.currentUrl.isBlank() ? currentUrl : executeResponse.currentUrl,
+                    screenshotPath,
+                    browserMeta
+            );
+            Map<String, Object> executionPayload = new HashMap<>();
+            executionPayload.put("mode", "agent-chat");
+            executionPayload.put("currentUrl", executeResponse.currentUrl);
+            executionPayload.put("results", executeResponse.results);
+            executionPayload.put("cancelled", false);
+            AutomationSessionService.addEvent(
+                    envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
+                    envelope.rawCommand,
+                    Map.of(
+                            "mode", "agent-chat",
+                            "steps", plan.steps == null ? List.of() : plan.steps
+                    ),
+                    executionPayload,
+                    screenshotPath
+            );
             return;
         }
 
@@ -485,6 +564,7 @@ public final class AutomationSessionHandler {
         if (goal.isBlank()) {
             goal = envelope.rawCommand == null ? "" : envelope.rawCommand.trim();
         }
+        boolean singleActionObjective = isSingleActionObjective(goal);
 
         Map<String, Object> testcase = loadTestcaseContext(envelope.projectId, envelope.testcaseId);
         String title = String.valueOf(testcase.getOrDefault("title", "")).trim();
@@ -498,6 +578,7 @@ public final class AutomationSessionHandler {
         List<String> feedbackSignals = extractRecentFeedbackSignals(events, envelope.rawCommand);
 
         boolean goalAlreadyHasSteps = goal.contains("### Steps to Execute") || goal.contains("Steps to Execute");
+        boolean includeExpectedSteps = !singleActionObjective && !goalAlreadyHasSteps;
 
         StringBuilder objective = new StringBuilder();
         objective.append("Primary Goal:\n").append(goal).append("\n\n");
@@ -505,7 +586,7 @@ public final class AutomationSessionHandler {
         if (!description.isBlank() && !goal.contains(description.substring(0, Math.min(description.length(), 60))))
             objective.append("Description:\n").append(limitBlock(description, 1200)).append("\n\n");
         if (!preconditions.isBlank()) objective.append("Preconditions:\n").append(limitBlock(preconditions, 1000)).append("\n\n");
-        if (!steps.isBlank() && !goalAlreadyHasSteps) {
+        if (!steps.isBlank() && includeExpectedSteps) {
             String formattedSteps = formatStepsAsNumberedList(steps);
             objective.append("Expected Steps:\n").append(limitBlock(formattedSteps, 3000)).append("\n\n");
         }
@@ -530,12 +611,25 @@ public final class AutomationSessionHandler {
         }
 
         objective.append("Execution Requirements:\n")
-                .append("1) Follow the steps exactly as written above. Execute each step in order.\n")
-                .append("2) Use exact values from Test Data when filling any form fields. Never substitute with placeholders.\n")
-                .append("3) Navigate and interact with the page naturally — read visible labels, buttons, and links to find the right elements.\n")
-                .append("4) If an element is not immediately visible, look around the page: scroll, check navigation menus, or explore alternative paths.\n")
-                .append("5) After each step, observe the result before moving to the next step.\n")
-                .append("6) Only declare goal achieved when ALL listed steps have been executed.\n");
+                .append("1) Treat Primary Goal as strict scope. Do not execute unrelated default testcase steps.\n")
+                .append("2) Follow the explicit requested action(s) from Primary Goal before anything else.\n")
+                .append("3) Use exact values from Test Data when filling any form fields. Never substitute with placeholders.\n")
+                .append("4) Navigate and interact with the page naturally — read visible labels, buttons, and links to find the right elements.\n")
+                .append("5) If command asks to enter/type a value, perform a type/fill action on an input-like control.\n")
+                .append("   Never replace it with click/press unless the goal explicitly requests click/press.\n")
+                .append("6) If target control is ambiguous, pick the closest visible DOM-grounded field by label/placeholder semantics.\n")
+                .append("   If still unclear, stop and ask clarification instead of guessing a different action.\n")
+                .append("7) If command references popup/modal/dialog/overlay/sheet/drawer, keep scope inside that container.\n")
+                .append("8) After each step, observe result before proceeding.\n")
+                .append("9) Only declare goal achieved when all requested outcomes are complete.\n");
+        objective.append("10) Platform-agnostic execution: work for any website/app UI. Do not assume product-specific pages or flows.\n");
+        objective.append("11) Normalize intent verbs consistently: click/tap/press/select/choose/open/type/fill/enter/input/check/verify/assert.\n");
+        if (singleActionObjective) {
+            objective.append("12) This is a targeted command, not end-to-end flow. Execute only the minimum required action and stop.\n");
+        }
+        if (envelope.checkpointMode) {
+            objective.append("13) Checkpoint mode is enabled. Execute at most one meaningful turn and then stop for user guidance.\n");
+        }
         return objective.toString().trim();
     }
 
@@ -553,7 +647,9 @@ public final class AutomationSessionHandler {
                 + "2) Do only what is required for this instruction; do not expand scope.\n"
                 + "3) If the instruction is single-step (for example: click a button), perform that single step and stop.\n"
                 + "4) Do not enter text, credentials, or perform extra navigation unless explicitly requested.\n"
-                + "5) If the target is ambiguous, choose the closest visible match by label/text and execute once.");
+                + "5) If the target is ambiguous or there are multiple similar matches, do not guess.\n"
+                + "   Ask for clarification (or stop with a clear ambiguity note) before acting.\n"
+                + "6) If instruction mentions popup/modal/dialog/overlay/sheet/drawer, scope action inside that container.");
     }
 
     private static List<Map<String, Object>> extractAgentPlanPreview(String objective) {
@@ -767,6 +863,7 @@ public final class AutomationSessionHandler {
     ) {
         final int MAX_AUTONOMOUS_TURNS = Math.max(1, Config.AUTOMATION_AUTONOMOUS_MAX_TURNS);
         final int MAX_AUTONOMOUS_STEPS = Math.max(1, Config.AUTOMATION_AUTONOMOUS_MAX_STEPS);
+        final int maxTurnsThisRun = envelope.checkpointMode ? 1 : MAX_AUTONOMOUS_TURNS;
         int executedSteps = 0;
         int turnCount = 0;
         int noActionTurns = 0;
@@ -782,12 +879,16 @@ public final class AutomationSessionHandler {
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_received",
                 envelope.rawCommand,
-                Map.of("mode", "autonomous", "objective", envelope.objective),
+                Map.of(
+                        "mode", "autonomous",
+                        "objective", envelope.objective,
+                        "checkpointMode", envelope.checkpointMode
+                ),
                 null,
                 null
         );
 
-        for (int turn = 1; turn <= MAX_AUTONOMOUS_TURNS; turn++) {
+        for (int turn = 1; turn <= maxTurnsThisRun; turn++) {
             if (cancelSignal.get()) {
                 cancelled = true;
                 completionReason = "Autonomous run stopped by user.";
@@ -1113,9 +1214,13 @@ public final class AutomationSessionHandler {
         if (goalAchieved && (completionReason == null || completionReason.isBlank())) {
             completionReason = "Objective reached.";
         } else if (!goalAchieved && (completionReason == null || completionReason.isBlank())) {
-            completionReason = cancelled
-                    ? "Autonomous run stopped by user."
-                    : "Autonomous run ended before objective could be confirmed.";
+            if (cancelled) {
+                completionReason = "Autonomous run stopped by user.";
+            } else if (envelope.checkpointMode) {
+                completionReason = "Checkpoint complete. Waiting for your next instruction.";
+            } else {
+                completionReason = "Autonomous run ended before objective could be confirmed.";
+            }
         }
 
         AutomationSessionService.touchState(
@@ -1127,7 +1232,8 @@ public final class AutomationSessionHandler {
                         "turns", turnCount,
                         "stepCount", executedSteps,
                         "goalAchieved", goalAchieved,
-                        "cancelled", cancelled
+                        "cancelled", cancelled,
+                        "checkpointMode", envelope.checkpointMode
                 )
         );
 
@@ -1141,11 +1247,16 @@ public final class AutomationSessionHandler {
         executionPayload.put("currentUrl", latestUrl);
         executionPayload.put("results", allResults);
         executionPayload.put("cancelled", cancelled);
+        executionPayload.put("checkpointMode", envelope.checkpointMode);
 
         AutomationSessionService.addEvent(
                 envelope.sessionId, envelope.projectId, envelope.testcaseId, envelope.userId, envelope.commandId, "command_executed",
                 envelope.rawCommand,
-                Map.of("mode", "autonomous", "objective", envelope.objective),
+                Map.of(
+                        "mode", "autonomous",
+                        "objective", envelope.objective,
+                        "checkpointMode", envelope.checkpointMode
+                ),
                 executionPayload,
                 lastScreenshotPath
         );
@@ -1548,6 +1659,7 @@ public final class AutomationSessionHandler {
         payload.put("deltaY", body.deltaY);
         payload.put("text", body.text);
         payload.put("key", body.key);
+        payload.put("targetHint", body.targetHint);
 
         Map<String, Object> result = AutomationAgentClient.manualAction(sessionId, payload);
         String screenshotPath = result.get("screenshotPath") instanceof String s ? s : null;
@@ -1560,6 +1672,11 @@ public final class AutomationSessionHandler {
         );
 
         Map<String, Object> parsedAction = new HashMap<>();
+        String manualTargetHint = asSafeText(body.targetHint);
+        String derivedTargetDescription = deriveManualTargetDescription(result, manualTargetHint);
+        if (!derivedTargetDescription.isBlank()) {
+            result.put("targetDescription", derivedTargetDescription);
+        }
         if ("click".equals(body.actionType)) {
             parsedAction.put("action", "click");
             if (result.get("selector") instanceof String selector && !selector.isBlank()) {
@@ -1571,6 +1688,9 @@ public final class AutomationSessionHandler {
             if (result.get("targetHtml") instanceof String targetHtml && !targetHtml.isBlank()) {
                 parsedAction.put("targetHtml", targetHtml);
             }
+            if (!derivedTargetDescription.isBlank()) {
+                parsedAction.put("targetDescription", derivedTargetDescription);
+            }
             parsedAction.put("xRatio", body.xRatio);
             parsedAction.put("yRatio", body.yRatio);
         } else if ("drag".equals(body.actionType)) {
@@ -1580,6 +1700,9 @@ public final class AutomationSessionHandler {
             }
             if (result.get("endSelector") instanceof String endSelector && !endSelector.isBlank()) {
                 parsedAction.put("endSelector", endSelector);
+            }
+            if (!manualTargetHint.isBlank()) {
+                parsedAction.put("targetDescription", manualTargetHint);
             }
             parsedAction.put("xRatio", body.xRatio);
             parsedAction.put("yRatio", body.yRatio);
@@ -1602,6 +1725,11 @@ public final class AutomationSessionHandler {
             if (result.get("targetHtml") instanceof String targetHtml && !targetHtml.isBlank()) {
                 parsedAction.put("targetHtml", targetHtml);
             }
+            if (!derivedTargetDescription.isBlank()) {
+                parsedAction.put("targetDescription", derivedTargetDescription);
+            } else if (!manualTargetHint.isBlank()) {
+                parsedAction.put("targetDescription", manualTargetHint);
+            }
             parsedAction.put("value", body.text == null ? "" : body.text);
         } else if ("press".equals(body.actionType)) {
             parsedAction.put("action", "press");
@@ -1614,6 +1742,11 @@ public final class AutomationSessionHandler {
             }
             if (result.get("targetHtml") instanceof String targetHtml && !targetHtml.isBlank()) {
                 parsedAction.put("targetHtml", targetHtml);
+            }
+            if (!derivedTargetDescription.isBlank()) {
+                parsedAction.put("targetDescription", derivedTargetDescription);
+            } else if (!manualTargetHint.isBlank()) {
+                parsedAction.put("targetDescription", manualTargetHint);
             }
         }
 
@@ -1949,6 +2082,52 @@ public final class AutomationSessionHandler {
         if (value == null) return "";
         String out = String.valueOf(value).trim();
         return "null".equalsIgnoreCase(out) ? "" : out;
+    }
+
+    private static String deriveManualTargetDescription(Map<String, Object> result, String targetHint) {
+        if (result == null) {
+            return targetHint == null ? "" : targetHint.trim();
+        }
+        String targetText = asSafeText(result.get("targetText"));
+        if (!targetText.isBlank()) return targetText;
+        String ariaLabel = asSafeText(result.get("ariaLabel"));
+        if (!ariaLabel.isBlank()) return ariaLabel;
+        String placeholder = asSafeText(result.get("placeholder"));
+        if (!placeholder.isBlank()) return placeholder;
+        String selector = asSafeText(result.get("selector"));
+        if (!selector.isBlank()) return selector;
+        String html = asSafeText(result.get("targetHtml"));
+        String fromHtml = extractTextFromHtml(html);
+        if (!fromHtml.isBlank()) return fromHtml;
+        return targetHint == null ? "" : targetHint.trim();
+    }
+
+    private static String extractTextFromHtml(String html) {
+        if (html == null || html.isBlank()) return "";
+        String compact = html.replace("\n", " ").replace("\r", " ").trim();
+        if (compact.isBlank()) return "";
+        String stripped = compact.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+        if (!stripped.isBlank()) {
+            return stripped.length() > 80 ? stripped.substring(0, 80).trim() : stripped;
+        }
+        return "";
+    }
+
+    private static boolean isSingleActionObjective(String goal) {
+        if (goal == null) return false;
+        String lower = goal.toLowerCase();
+        if (lower.isBlank()) return false;
+        if (lower.contains("end-to-end") || lower.contains("full flow") || lower.contains("entire flow")) return false;
+        if (lower.contains("then ") || lower.contains("after that") || lower.contains(" and then ")) return false;
+        if (lower.contains("step 1") || lower.contains("1.") || lower.contains("2.")) return false;
+        return lower.startsWith("enter ")
+                || lower.startsWith("type ")
+                || lower.startsWith("click ")
+                || lower.startsWith("select ")
+                || lower.startsWith("verify ")
+                || lower.startsWith("assert ")
+                || lower.startsWith("close ")
+                || lower.startsWith("dismiss ");
     }
 
     private static boolean shouldAutoGenerateSteps(UUID projectId, UUID userId) {

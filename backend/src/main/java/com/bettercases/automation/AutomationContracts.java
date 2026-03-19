@@ -31,6 +31,7 @@ public final class AutomationContracts {
         public Double deltaY;
         public String text;
         public String key;
+        public String targetHint;
     }
 
     public static class RunScriptBody {

@@ -212,32 +212,37 @@ public final class AutomationIntentParserService {
             String domPlanningContext
     ) throws Exception {
         String prompt = """
-                You are a senior test automation engineer operating an autonomous browser agent.
-                Your approach mirrors how a skilled human QA engineer would interact with a web application.
+                You are a precise browser automation instruction parser for chat mode.
+                Convert the user's latest command into an action plan without expanding scope.
 
-                ## Your Approach
-                1) **Understand context first**: Read the current page carefully — headings, navigation, forms,
-                   buttons, links — to build a mental model of where you are in the application.
-                2) **Infer user intent**: Go beyond literal commands. Understand what the user is really trying to test.
-                   If they say "login", that implies navigating to login, filling credentials, submitting, and verifying success.
-                3) **Navigate naturally**: A real human reads labels, finds navigation menus, clicks through logical paths.
-                   Do the same — don't guess at URLs or selectors; use what's visible on the page.
-                4) **Plan the minimum reliable steps** to accomplish the goal.
+                ## Behavior
+                1) Treat the command literally. Do NOT infer extra goals.
+                2) Do only the requested action(s). If user says "click login", return a click step only.
+                3) Never replace the requested target with a different but related control
+                   (example: do not choose "Forgot Password" when asked for "Login").
+                4) Prefer one-step plans for single-step commands. Return multiple steps only when user explicitly
+                   asks for a sequence (for example: "then", "after that", "and", numbered steps).
+                5) If target/intent is ambiguous or missing, set requiresClarification=true and ask one clear question.
+                6) Use only visible, concrete UI labels/text in targetDescription and expectedText.
+                7) Keep selectors practical (prefer role/label/text/testid style where possible).
+                8) When command mentions popup/modal/dialog/overlay/sheet/drawer, keep that context in targetDescription
+                   (example: "Save button in Create User dialog").
+                9) Be platform-agnostic. Do not assume any specific product workflow unless explicitly requested.
+                   Work from current visible DOM only.
 
                 ## Rules
                 - Supported actions: navigate, click, type, assert_visible, assert_text, assert_clickable.
-                - Prioritize user-requested actions over generic safety checks.
-                - Only add assertions when the user explicitly requests them OR one focused assertion confirms objective completion.
-                - Keep plans lean and action-first.
-                - If needed info is missing, set requiresClarification=true and ask one clear question.
+                - Do not add exploratory navigation, safety checks, or assertions unless explicitly requested.
                 - If user says open/go to a domain like google.com, infer navigate URL with https://.
-                - Keep selectors practical (prefer role/text/testid style where possible).
-                - When similar elements exist, make targetDescription uniquely identifying
-                  (include nearby heading/section/dialog/form context and control type).
                 - For assertions, use concrete DOM-grounded labels/text only (e.g. "Agencies", "New Agency", "Profile").
                 - Never output abstract placeholders like "Dashboard or user profile element indicating successful login".
                 - When entering data into forms, use the test data values provided in the command if available.
                   If no specific test data is provided, use realistic values that match the field context.
+                - For modal/dialog commands (open/close/dismiss/confirm/cancel), prefer the control inside that popup
+                  rather than similarly named controls in the background page.
+                - Normalize user verbs across platforms:
+                  click/tap/press/select/choose/open/type/fill/enter/input/check/verify/assert.
+                  Map them to supported actions without changing user intent.
 
                 Output JSON schema exactly:
                 {
@@ -322,6 +327,7 @@ public final class AutomationIntentParserService {
                    - Identify exact visible labels/text from current page context.
                    - Prefer controls by role/name/label/testid first, then css/xpath only if needed.
                    - Build short, concrete targetDescription using only on-screen words.
+                   - Stay platform-agnostic; never assume app-specific flows that are not requested.
                 4) Return a short actionable step list for this turn only.
                 5) For click/type/assert steps, targetDescription must be concise and locator-friendly:
                    - 2-8 words max
@@ -338,6 +344,8 @@ public final class AutomationIntentParserService {
                     explicitly requested or when needed to confirm final objective completion.
                 11) If target text is likely ambiguous, include context in targetDescription
                     (for example: "Save button in Profile section", "Email field in Login form").
+                11.1) If objective references popup/modal/dialog, keep that scope in targetDescription
+                      (for example: "Confirm button in Delete dialog", "Close icon in Settings modal").
                 12) Navigate the application naturally:
                     - Use navigation menus, breadcrumbs, and links to find features instead of guessing URLs.
                     - Read form labels to understand what data to enter.
@@ -434,11 +442,13 @@ public final class AutomationIntentParserService {
                    - Read the page carefully — headings, navigation, menus, forms, buttons, links.
                    - Infer exact visible labels from current page context.
                    - Prefer role/name/label/testid semantics over brittle selectors.
+                   - Stay platform-agnostic and avoid product-specific assumptions.
                 5) Prefer targetDescription when selector is uncertain.
                 6) targetDescription must be concise (2-8 words), concrete, and based on visible UI text.
                 7) Keep to the remaining step budget.
                 8) Keep steps action-first and avoid unrequested generic checks.
                 9) If UI likely has similar elements, make targetDescription uniquely identifying with compact context.
+                9.1) If objective mentions popup/modal/dialog, scope actions to that container first.
                 10) Navigate naturally like a human recovering from a dead end:
                     - If expected control is missing, explore plausible alternatives (menus, sidebars, search).
                     - Try different navigation paths to reach the same goal.
@@ -704,11 +714,14 @@ public final class AutomationIntentParserService {
         }
 
         if (lower.contains("verify") || lower.contains("assert") || lower.contains("displayed") || lower.contains("visible")) {
-            String target = extractAfterKeywords(raw, List.of("verify that", "verify", "assert that", "assert", "displayed", "visible"));
+            String target = normalizeUiTargetPhrase(
+                    extractAfterKeywords(raw, List.of("verify that", "verify", "assert that", "assert", "displayed", "visible"))
+            );
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "assert_visible";
             step.selector = target != null ? "text=" + target : null;
+            step.targetDescription = target;
             step.expectedText = target;
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
             plan.steps.add(step);
@@ -716,34 +729,88 @@ public final class AutomationIntentParserService {
         }
 
         if (lower.contains("compare text") || lower.contains("text should be") || lower.contains("equals text")) {
-            String target = extractAfterKeywords(raw, List.of("compare text", "text should be", "equals text"));
+            String target = normalizeUiTargetPhrase(extractAfterKeywords(raw, List.of("compare text", "text should be", "equals text")));
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "assert_text";
             step.expectedText = target;
             step.selector = null;
+            step.targetDescription = target;
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
             plan.steps.add(step);
             return plan;
         }
 
         if (lower.contains("clickable") || lower.contains("can click") || lower.contains("enabled")) {
-            String target = extractAfterKeywords(raw, List.of("clickable", "can click", "enabled"));
+            String target = normalizeUiTargetPhrase(extractAfterKeywords(raw, List.of("clickable", "can click", "enabled")));
+            if (target == null || target.isBlank()) {
+                return clarificationPlan("Which exact control should be checked for clickability?");
+            }
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "assert_clickable";
-            step.selector = target != null ? "text=" + target : "button";
+            step.selector = containsPopupCue(target) ? null : "text=" + target;
+            step.targetDescription = target;
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if (lower.contains("type") || lower.contains("fill") || lower.contains("enter ") || lower.contains("input ")) {
+            String value = extractQuotedValue(raw);
+            String target = normalizeUiTargetPhrase(
+                    extractAfterKeywords(raw, List.of("into", "in", "to", "for"))
+            );
+            if ((value == null || value.isBlank()) && target == null) {
+                return clarificationPlan("What value should be entered, and into which field?");
+            }
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "type";
+            step.value = value == null ? "" : value;
+            step.targetDescription = target;
+            step.selector = target == null ? null : "text=" + target;
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if (lower.contains("select ") || lower.contains("choose ") || lower.contains("pick ")) {
+            String optionValue = extractQuotedValue(raw);
+            String target = normalizeUiTargetPhrase(extractAfterKeywords(raw, List.of("from", "in", "on")));
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "type";
+            step.value = optionValue == null ? "" : optionValue;
+            step.targetDescription = target == null ? "dropdown or selection control" : target;
+            step.selector = null;
+            step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
+            plan.steps.add(step);
+            return plan;
+        }
+
+        if ((lower.contains("close") || lower.contains("dismiss") || lower.contains("cancel")) &&
+                (lower.contains("popup") || lower.contains("modal") || lower.contains("dialog") || lower.contains("overlay") || lower.contains("sheet") || lower.contains("drawer"))) {
+            AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
+            step.id = "step-1";
+            step.action = "click";
+            step.selector = null;
+            step.targetDescription = "Close button in dialog";
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
             plan.steps.add(step);
             return plan;
         }
 
         if (lower.contains("click")) {
-            String target = extractAfterKeywords(raw, List.of("click on", "click"));
+            String target = normalizeUiTargetPhrase(extractAfterKeywords(raw, List.of("click on", "click")));
+            if (target == null || target.isBlank()) {
+                return clarificationPlan("Which exact visible button/link should I click?");
+            }
             AutomationContracts.ActionStep step = new AutomationContracts.ActionStep();
             step.id = "step-1";
             step.action = "click";
-            step.selector = target != null ? "text=" + target : "button";
+            step.selector = containsPopupCue(target) ? null : "text=" + target;
+            step.targetDescription = target;
             step.timeoutMs = Config.AUTOMATION_STEP_TIMEOUT_MS;
             plan.steps.add(step);
             return plan;
@@ -883,6 +950,50 @@ public final class AutomationIntentParserService {
                 out = out.replaceAll("^[\"']|[\"']$", "").trim();
                 if (!out.isBlank()) return out;
             }
+        }
+        return null;
+    }
+
+    private static String normalizeUiTargetPhrase(String target) {
+        if (target == null) return null;
+        String out = target.trim();
+        if (out.isBlank()) return null;
+        out = out.replaceAll("^on\\s+", "").trim();
+        out = out.replaceAll("^the\\s+", "").trim();
+        out = out.replaceAll("^button\\s+", "").trim();
+        out = out.replaceAll("^link\\s+", "").trim();
+        out = out.replaceAll("^field\\s+", "").trim();
+        out = out.replaceAll("\\s+", " ").trim();
+        return out.isBlank() ? null : out;
+    }
+
+    private static boolean containsPopupCue(String target) {
+        if (target == null) return false;
+        String t = target.toLowerCase(Locale.ROOT);
+        return t.contains("popup") || t.contains("modal") || t.contains("dialog") ||
+                t.contains("overlay") || t.contains("sheet") || t.contains("drawer");
+    }
+
+    private static String extractQuotedValue(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        Matcher m = Pattern.compile("\"([^\"]+)\"|'([^']+)'").matcher(raw);
+        if (m.find()) {
+            String v = m.group(1) != null ? m.group(1) : m.group(2);
+            return v == null || v.trim().isBlank() ? null : v.trim();
+        }
+        String lower = raw.toLowerCase(Locale.ROOT);
+        for (String key : List.of("enter ", "type ", "fill ", "input ", "choose ", "select ", "pick ")) {
+            int idx = lower.indexOf(key);
+            if (idx < 0) continue;
+            String tail = raw.substring(idx + key.length()).trim();
+            int cut = Integer.MAX_VALUE;
+            for (String stopper : List.of(" into ", " in ", " to ", " for ", " from ", " on ")) {
+                int pos = tail.toLowerCase(Locale.ROOT).indexOf(stopper);
+                if (pos >= 0) cut = Math.min(cut, pos);
+            }
+            String out = (cut == Integer.MAX_VALUE ? tail : tail.substring(0, cut)).trim();
+            out = normalizeUiTargetPhrase(out);
+            if (out != null && !out.isBlank()) return out;
         }
         return null;
     }

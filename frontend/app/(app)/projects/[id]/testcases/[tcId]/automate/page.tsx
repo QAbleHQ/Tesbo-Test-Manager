@@ -42,8 +42,6 @@ type ChatMessage = {
   };
 };
 
-type AutomationMode = "autonomous" | "live";
-
 type TimelineItem = {
   timeLabel: string;
   actionLabel: string;
@@ -61,7 +59,7 @@ type ReviewStep = {
 };
 
 type SessionStartupState = "select-environment" | "starting" | "waiting-stream" | "ready";
-const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
+const AUTOMATION_ALLOCATION_ERROR = "AI Key is not allocated to this project, so AI-assisted automation is unavailable.";
 type BotHighlight = {
   xRatio: number;
   yRatio: number;
@@ -91,10 +89,10 @@ export default function AutomateTestCasePage() {
       openInLivePreview: searchParams.get("livePreview") === "1",
       entry: (() => {
         const raw = (searchParams.get("entry") || "").toLowerCase();
-        if (raw === "autonomous" || raw === "assisted" || raw === "manual") {
+        if (raw === "assisted" || raw === "manual") {
           return raw as AutomateEntryMode;
         }
-        if (raw === "smart") {
+        if (raw === "smart" || raw === "autonomous") {
           return "assisted";
         }
         return "assisted" as AutomateEntryMode;
@@ -128,7 +126,7 @@ export default function AutomateTestCasePage() {
   const [reviewSteps, setReviewSteps] = useState<ReviewStep[]>([]);
   const [streamState, setStreamState] = useState<"Connecting" | "Live" | "Lagging" | "Disconnected">("Connecting");
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
-  const [mode, setMode] = useState<AutomationMode>("live");
+  const [checkpointModeEnabled, setCheckpointModeEnabled] = useState(true);
   const [sessionStartupState, setSessionStartupState] = useState<SessionStartupState>("select-environment");
   const [sessionStartupError, setSessionStartupError] = useState<string | null>(null);
   const [liveStreamFailed, setLiveStreamFailed] = useState(false);
@@ -137,6 +135,7 @@ export default function AutomateTestCasePage() {
   const [selectedEnvironmentUrl, setSelectedEnvironmentUrl] = useState("");
   const [customEnvironmentUrl, setCustomEnvironmentUrl] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
+  const [liveTargetHint, setLiveTargetHint] = useState("");
   const [quickActionBusy, setQuickActionBusy] = useState<"run" | null>(null);
   const [reviewScriptOpen, setReviewScriptOpen] = useState(false);
   const [aiConfigured, setAiConfigured] = useState(true);
@@ -159,8 +158,8 @@ export default function AutomateTestCasePage() {
   const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
   const verboseAutonomousEvents = process.env.NEXT_PUBLIC_AUTONOMOUS_VERBOSE_EVENTS === "true";
   const showAutonomousDebugTrace = verboseAutonomousEvents;
-  const isLiveMode = mode === "live";
-  const isAutonomousMode = mode === "autonomous";
+  const isLiveMode = true;
+  const isAutonomousMode = true;
   const startupReady = sessionStartupState === "ready";
   const selectedStartUrl = (selectedEnvironmentUrl || customEnvironmentUrl).trim();
   const runtimeInfo = session?.runtime;
@@ -275,16 +274,10 @@ export default function AutomateTestCasePage() {
   }
 
   function bootstrapMessageForEntry(entry: AutomateEntryMode): string {
-    if (entry === "autonomous") {
-      return "AI Assisted mode selected. Chat guidance is active with live preview.";
-    }
-    if (entry === "assisted") {
-      return "AI Assisted mode selected. Use guided commands while watching live browser, and intervene whenever needed.";
-    }
     if (entry === "manual") {
-      return "Manual Live mode selected. Interact directly on the browser and use assistant suggestions for assertions.";
+      return "Goal AI mode selected with live preview. You can intervene manually whenever needed.";
     }
-    return "AI Assisted mode selected. Provide guidance in chat and watch execution in live preview.";
+    return "Goal AI mode selected. Provide the outcome you want and guide each turn with checkpoints.";
   }
 
   function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
@@ -976,7 +969,6 @@ export default function AutomateTestCasePage() {
         })
         .catch(() => {});
       if (bootstrapSessionId) {
-        setMode("live");
         setSessionId(bootstrapSessionId);
         setSessionStartupState("waiting-stream");
         setMessages([
@@ -997,7 +989,6 @@ export default function AutomateTestCasePage() {
           if (environments.length > 0) {
             setSelectedEnvironmentUrl(environments[0].url);
           }
-          setMode("live");
           setSessionStartupState("select-environment");
         })
         .catch(() => {
@@ -1094,16 +1085,18 @@ export default function AutomateTestCasePage() {
       if (event.eventType === "manual_action_executed") {
         const action = toText(parsed.action);
         if (action === "click") {
+          const targetDescription = toText(parsed.targetDescription);
           const targetText = toText(parsed.targetText);
           const targetHtml = toText(parsed.targetHtml);
           const selector = toText(parsed.selector);
           rawItems.push({
             at,
             actionLabel: "Clicked on",
-            primary: targetText ? `"${safeSnippet(targetText)}"` : selector || "(unknown target)",
+            primary: targetDescription || (targetText ? `"${safeSnippet(targetText)}"` : selector || "(unknown target)"),
             secondary: safeSnippet(targetHtml || selector),
           });
         } else if (action === "type") {
+          const targetDescription = toText(parsed.targetDescription);
           const value = toText(parsed.value);
           const targetHtml = toText(parsed.targetHtml);
           const selector = toText(parsed.selector);
@@ -1111,10 +1104,11 @@ export default function AutomateTestCasePage() {
             at,
             actionLabel: "Typed",
             primary: value || "(empty)",
-            secondary: selector ? `at ${selector}` : undefined,
+            secondary: targetDescription ? `at ${targetDescription}` : (selector ? `at ${selector}` : undefined),
             tertiary: safeSnippet(targetHtml),
           });
         } else if (action === "press") {
+          const targetDescription = toText(parsed.targetDescription);
           const key = toText(parsed.key) || "Enter";
           const targetHtml = toText(parsed.targetHtml);
           const selector = toText(parsed.selector);
@@ -1122,7 +1116,7 @@ export default function AutomateTestCasePage() {
             at,
             actionLabel: "Pressed",
             primary: key,
-            secondary: selector ? `at ${selector}` : undefined,
+            secondary: targetDescription ? `at ${targetDescription}` : (selector ? `at ${selector}` : undefined),
             tertiary: safeSnippet(targetHtml),
           });
         } else if (action === "scroll") {
@@ -1619,19 +1613,33 @@ export default function AutomateTestCasePage() {
   ) {
     if (!sessionId || !startupReady || !input.trim() || sending) return;
     const shouldUseAutonomousMode = options?.forceAutonomous === true || isAutonomousMode;
+    if ((!shouldUseAutonomousMode || checkpointModeEnabled) && commandInProgress) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            shouldUseAutonomousMode
+              ? "I am still executing the previous goal turn. Please wait for completion (or stop current command) before sending the next instruction."
+              : "I am still executing the previous guided step. Please wait for completion (or stop current command) before sending the next instruction.",
+        },
+      ]);
+      return;
+    }
     if (shouldUseAutonomousMode && !aiConfigured) {
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: AGENT_ALLOCATION_ERROR,
+          content: AUTOMATION_ALLOCATION_ERROR,
         },
       ]);
       return;
     }
     const value = input.trim();
+    const checkpointToken = shouldUseAutonomousMode && checkpointModeEnabled ? "\n[[BC_CHECKPOINT_MODE]]" : "";
     const outboundCommand = shouldUseAutonomousMode
-      ? `Autonomous mode objective: ${value}. Before any action, analyze the current DOM and identify stable locator candidates (role/label/testid/text) for each target. Use concise DOM-grounded target descriptions, then execute the full flow and include meaningful validation assertions in the plan.`
+      ? `Autonomous mode objective: ${value}${checkpointToken}. Before any action, analyze the current DOM and identify stable locator candidates (role/label/testid/text) for each target. Use concise DOM-grounded target descriptions, then execute the flow and include meaningful validation assertions in the plan.${checkpointModeEnabled ? " Stop after this autonomous turn and wait for the user's next instruction." : ""}`
       : value;
     setSending(true);
     lastRecordingActionCountRef.current = 0;
@@ -1775,6 +1783,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
         actionType: "click",
         xRatio,
         yRatio,
+        targetHint: liveTargetHint || undefined,
       });
       if (result.status === "failed") {
         const failMsg = typeof result.message === "string" ? result.message : "Click did not reach the target element.";
@@ -1782,9 +1791,11 @@ Stop when pass/fail outcome is clear and summarize results.`;
         setStreamState("Live");
         return;
       }
+      const targetDescription = typeof result.targetDescription === "string" ? result.targetDescription.trim() : "";
       const targetText = typeof result.targetText === "string" ? result.targetText.trim() : "";
       const selector = typeof result.selector === "string" ? result.selector.trim() : "";
-      const clickTarget = targetText || selector || "";
+      const clickTarget = targetDescription || targetText || selector || "";
+      if (clickTarget) setLiveTargetHint(clickTarget);
       const suggestion = clickTarget
         ? `Clicked "${clickTarget}". Assertion suggestion: verify the next state after this click.`
         : "Assertion suggestion: verify the next state (URL, heading, or CTA visibility) after this click.";
@@ -1844,6 +1855,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
         yRatio: start.yRatio,
         toXRatio,
         toYRatio,
+        targetHint: liveTargetHint || undefined,
       });
       setMessages((prev) => [...prev, { role: "assistant", content: "Manual drag-and-drop recorded in live mode." }]);
     } catch (error) {
@@ -1866,6 +1878,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
         actionType: "scroll",
         deltaX: Math.round(event.deltaX),
         deltaY: Math.round(event.deltaY),
+        targetHint: liveTargetHint || undefined,
       });
     } catch {
       // keep UX smooth; avoid noisy chat for scroll failures
@@ -1885,6 +1898,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           text: item.text,
           xRatio: lastClickTarget?.xRatio,
           yRatio: lastClickTarget?.yRatio,
+          targetHint: liveTargetHint || undefined,
         });
       }
     } catch {
@@ -2002,8 +2016,8 @@ Stop when pass/fail outcome is clear and summarize results.`;
               REC Done ({recordingSummary.compiledActionCount})
             </span>
           )}
-          <div className="flex items-center rounded-[10px] border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">
-            AI Assisted Chat
+          <div className="flex items-center rounded-[10px] border border-indigo-300 bg-indigo-50 px-2 py-1 text-xs font-medium text-indigo-700">
+            Goal AI
           </div>
           <Button
             variant="primary"
@@ -2037,7 +2051,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           </div>
           {!aiConfigured && (
             <p className="mb-2 rounded-lg border border-[var(--warning)]/30 bg-amber-50 px-2 py-1 text-xs text-amber-800">
-              {AGENT_ALLOCATION_ERROR}
+              {AUTOMATION_ALLOCATION_ERROR}
             </p>
           )}
           <div
@@ -2047,13 +2061,21 @@ Stop when pass/fail outcome is clear and summarize results.`;
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
               {messages.length === 0 && (
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--muted)]">
-                  Start by sending a goal. Example: run login flow and verify dashboard is visible.
+                  Goal AI mode: send an outcome-oriented objective. Example: complete login flow and verify dashboard is visible.
                 </div>
               )}
               {messages.map((message, idx) => {
                 const isUser = message.role === "user";
                 const isRecording = message.role === "recording";
                 const isReasoning = message.role === "reasoning";
+                const isThinkingAssistantMessage =
+                  !isUser &&
+                  !isRecording &&
+                  !isReasoning &&
+                  (message.content.startsWith("Turn ") && message.content.includes("plan:") ||
+                    message.content.startsWith("Next turn plan:") ||
+                    message.content.startsWith("After turn") ||
+                    message.content.includes("] Plan -"));
 
                 if (isReasoning) {
                   return (
@@ -2131,9 +2153,16 @@ Stop when pass/fail outcome is clear and summarize results.`;
                       className={`max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-relaxed ${
                         isUser
                           ? "bg-[var(--brand-primary)] text-white"
-                          : "border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"
+                          : isThinkingAssistantMessage
+                            ? "border border-indigo-200 bg-indigo-50 text-indigo-900"
+                            : "border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"
                       }`}
                     >
+                      {isThinkingAssistantMessage && (
+                        <span className="mb-1 inline-flex items-center rounded-full border border-indigo-300 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
+                          Thinking
+                        </span>
+                      )}
                       {message.content}
                     </div>
                   </div>
@@ -2156,11 +2185,19 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 }}
                 placeholder={
                   !aiConfigured
-                    ? AGENT_ALLOCATION_ERROR
-                    : "Tell the agent exactly what to do. Example: Click the Log in button."
+                    ? AUTOMATION_ALLOCATION_ERROR
+                    : "Describe the goal. Example: complete login flow and verify dashboard."
                 }
                 className="w-full resize-none rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-12 text-sm text-[var(--foreground)] placeholder:text-[var(--muted-soft)]"
               />
+              <label className="mt-1 flex items-center gap-2 px-1 text-[11px] text-[var(--muted)]">
+                <input
+                  type="checkbox"
+                  checked={checkpointModeEnabled}
+                  onChange={(e) => setCheckpointModeEnabled(e.target.checked)}
+                />
+                Pause after each goal turn and wait for my next instruction.
+              </label>
               <button
                 type="button"
                 onClick={() => void onSendCommand()}

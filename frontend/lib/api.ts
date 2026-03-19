@@ -791,6 +791,7 @@ export async function sendAutomationManualAction(
     deltaY?: number;
     text?: string;
     key?: string;
+    targetHint?: string;
   }
 ): Promise<Record<string, unknown>> {
   return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/manual-actions`, {

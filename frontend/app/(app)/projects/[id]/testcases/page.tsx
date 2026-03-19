@@ -17,15 +17,11 @@ import {
   deleteTestCase,
   bulkUpdateTestCases,
   bulkDeleteTestCases,
-  getAgentSettings,
-  getProject,
   getExportUrl,
   getTemplateUrl,
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
-import { runAegisInBackground, recoverOrphanedTasks } from "@/lib/aegis-runner";
-import { AegisBackgroundIndicator } from "@/components/aegis-background-indicator";
 import {
   Button,
   Input,
@@ -83,8 +79,6 @@ function priorityTone(p: string) {
   if (p === "P1") return "warning" as const;
   return "neutral" as const;
 }
-
-const AGENT_ALLOCATION_ERROR = "AI Key is not allocated to this Project, can not utilize the Agents";
 
 export default function TestCasesPage() {
   const params = useParams();
@@ -147,11 +141,8 @@ export default function TestCasesPage() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isImportExportMenuOpen, setIsImportExportMenuOpen] = useState(false);
   const importExportMenuRef = useRef<HTMLDivElement>(null);
-  const [canUseAgents, setCanUseAgents] = useState(false);
-
   const loadData = useCallback(async () => {
-    const [suiteList, project] = await Promise.all([listSuites(projectId), getProject(projectId)]);
-    setCanUseAgents(project.aiConfigured === true);
+    const suiteList = await listSuites(projectId);
     setSuites(suiteList);
   }, [projectId]);
 
@@ -163,8 +154,7 @@ export default function TestCasesPage() {
       }
       loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
     });
-    recoverOrphanedTasks(projectId);
-  }, [router, loadData, projectId]);
+  }, [router, loadData]);
 
   const visibleSuites = useMemo(
     () => [...suites].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -564,16 +554,6 @@ export default function TestCasesPage() {
           priority,
           status,
         });
-        if (effectiveAutomationStatus === "Ready for the Automation") {
-          const settings = getAgentSettings(projectId, "aegis");
-          if (settings.autoStartOnReady) {
-            if (canUseAgents) {
-              await runAegisInBackground(projectId, created.id, title, created.externalId || "", "ready_for_automation");
-            } else {
-              setPanelError(AGENT_ALLOCATION_ERROR);
-            }
-          }
-        }
         setSuiteCasesPage(1);
         setSuiteSearch("");
         setDebouncedSuiteSearch("");
@@ -582,7 +562,7 @@ export default function TestCasesPage() {
         setSuiteTypeFilter("all");
         setSuiteAutomationFilter("all");
         await refreshData(1);
-        setPanelSuccess("Test case created successfully. Aegis is working on it in the background.");
+        setPanelSuccess("Test case created successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
           resetForm(suiteId || (viewMode === "allCases" ? null : activeSuiteId));
@@ -608,16 +588,6 @@ export default function TestCasesPage() {
           priority,
           status,
         });
-        if (effectiveAutomationStatus === "Ready for the Automation") {
-          const settings = getAgentSettings(projectId, "aegis");
-          if (settings.autoStartOnReady) {
-            if (canUseAgents) {
-              await runAegisInBackground(projectId, panelTestcaseId, title, "", "ready_for_automation");
-            } else {
-              setPanelError(AGENT_ALLOCATION_ERROR);
-            }
-          }
-        }
         setPanelSuccess("Test case updated successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
         await refreshData();
@@ -636,7 +606,6 @@ export default function TestCasesPage() {
 
   return (
     <main className="px-6 py-6">
-      <AegisBackgroundIndicator />
       <ListWorkspaceLayout
         header={
           <PageHeader
@@ -1389,34 +1358,13 @@ export default function TestCasesPage() {
                                     <FieldLabel>Playwright Script</FieldLabel>
                                     {panelTestcaseId && (
                                       <div className="flex items-center gap-2">
-                                        <Button
-                                          variant="ai"
-                                          size="sm"
-                                          onClick={() => {
-                                            void (async () => {
-                                              try {
-                                                await runAegisInBackground(projectId, panelTestcaseId, title, "", "manual");
-                                                setPanelSuccess("Added to Aegis queue.");
-                                                setPanelError(null);
-                                                setTimeout(() => setPanelSuccess(null), 4000);
-                                              } catch (err) {
-                                                const message =
-                                                  err instanceof Error ? err.message : AGENT_ALLOCATION_ERROR;
-                                                setPanelError(message);
-                                              }
-                                            })();
-                                          }}
-                                          title={!canUseAgents ? AGENT_ALLOCATION_ERROR : "Send to Aegis"}
-                                        >
-                                          Send to Aegis
-                                        </Button>
                                         <a
                                           href={`/projects/${projectId}/testcases/${panelTestcaseId}/automate`}
                                           target="_blank"
                                           rel="noopener noreferrer"
                                           className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-[var(--border)] px-3 text-xs font-semibold text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                                         >
-                                          Open in Aegis
+                                          Open Automate
                                         </a>
                                       </div>
                                     )}

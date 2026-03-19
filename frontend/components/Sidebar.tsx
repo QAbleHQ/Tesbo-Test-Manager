@@ -45,16 +45,9 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
     items: [
       {
         href: "agents",
-        label: "Agent Console",
+        label: "Autonomous Agents (Coming Soon)",
         icon: "agent",
-        children: [
-          { href: "agents/aegis", label: "Aegis", icon: "agent" },
-          { href: "agents/sentinel", label: "Sentinel", icon: "agent" },
-          { href: "agents/aegis/reviews", label: "Review Queue", icon: "clipboard" },
-        ],
       },
-      { href: "ai-test-script", label: "Generate Tests", icon: "sparkles" },
-      { href: "ai-history", label: "AI History", icon: "history" },
     ],
   },
   {
