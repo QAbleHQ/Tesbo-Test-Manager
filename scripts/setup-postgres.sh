@@ -155,7 +155,7 @@ GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 fi
 
 echo
-echo "Use these values in backend/.env:"
+echo "Use these values in Tesbo-Backend/.env:"
 echo "DATABASE_URL=jdbc:postgresql://localhost:5432/${DB_NAME}"
 echo "DATABASE_USER=${DB_USER}"
 echo "DATABASE_PASSWORD=${DB_PASSWORD}"

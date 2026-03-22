@@ -11,7 +11,7 @@
 
 ### Database
 
-Use your existing PostgreSQL. In `backend/.env` set:
+Use your existing PostgreSQL. In `Tesbo-Backend/.env` set:
 
 - **DATABASE_URL** — JDBC URL, e.g. `jdbc:postgresql://localhost:5432/bettercases`
 - **DATABASE_USER** — a PostgreSQL role that exists (e.g. your OS user on Homebrew, not necessarily `postgres`)
@@ -22,7 +22,7 @@ Create a database that user can access (e.g. `createdb bettercases`), or use an 
 ### Backend
 
 ```bash
-cd backend
+cd Tesbo-Backend
 mvn compile exec:java -q -Dexec.mainClass="com.bettercases.Main"
 ```
 
@@ -31,7 +31,7 @@ Runs on http://localhost:7000. Health: http://localhost:7000/health
 ### Frontend
 
 ```bash
-cd frontend
+cd Tesbo-Frontend
 npm install
 npm run dev
 ```
@@ -47,8 +47,8 @@ Runs on http://localhost:3000. Set `NEXT_PUBLIC_API_URL=http://localhost:7000` i
 
 ## Project layout
 
-- `backend/` — Javalin API, Liquibase migrations, auth, audit, RBAC, test cases/suites/plans/cycles/executions, bulk update, export, reporting, AI stub, notifications
-- `frontend/` — Next.js app, login/verify/onboarding, projects, test cases, suites, plans, cycles, execution workflow, bulk actions, export
+- `Tesbo-Backend/` — Javalin API, Liquibase migrations, auth, audit, RBAC, test cases/suites/plans/cycles/executions, bulk update, export, reporting, AI stub, notifications
+- `Tesbo-Frontend/` — Next.js app, login/verify/onboarding, projects, test cases, suites, plans, cycles, execution workflow, bulk actions, export
 
 ## Non-functional notes
 

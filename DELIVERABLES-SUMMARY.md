@@ -125,11 +125,11 @@ Based on analysis of your local implementation code, here's what **should** exis
 1. **Ensure services are running**:
    ```bash
    # Terminal 1: Backend
-   cd backend
+   cd Tesbo-Backend
    mvn spring-boot:run
    
    # Terminal 2: Frontend
-   cd frontend
+   cd Tesbo-Frontend
    npm run dev
    ```
 

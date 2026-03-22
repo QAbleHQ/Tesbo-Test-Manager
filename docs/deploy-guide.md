@@ -1,15 +1,15 @@
 ## TesboX DigitalOcean CI/CD Guide
 
 ### Overview
-- Images are built from `frontend/Dockerfile`, `backend/Dockerfile`, and `automation-agent/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
-- Backend, frontend, and automation services are deployed on separate droplets using files in `deploy/backend/`, `deploy/frontend/`, and `deploy/automation/`.
+- Images are built from `Tesbo-Frontend/Dockerfile`, `Tesbo-Backend/Dockerfile`, `Tesbo-Test-Runner-Agents/Dockerfile`, and `Tesbo-Automation-Agents/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
+- Backend, frontend, and automation services are deployed on separate droplets using files in `deploy/Tesbo-Backend/`, `deploy/Tesbo-Frontend/`, and `deploy/automation/`.
 - PostgreSQL is external (managed DB or self-hosted) and configured through `DATABASE_*` env vars.
 - Artifact storage supports `local` or DigitalOcean Spaces (`TESBO_*` keys).
 
 ### Required GitHub secrets
 - `DO_API_TOKEN`
 - `DOCR_REGISTRY` (example: `registry.digitalocean.com/your-registry`)
-- `DOCR_REPO_FRONTEND`, `DOCR_REPO_BACKEND`, `DOCR_REPO_AUTOMATION`
+- `DOCR_REPO_FRONTEND`, `DOCR_REPO_BACKEND`, `DOCR_REPO_AUTOMATION` (test-runner / queue image), `DOCR_REPO_AUTOMATION_AGENT` (session / automate image)
 - `DROPLET_FRONTEND_IP`, `DROPLET_BACKEND_IP`, `DROPLET_AUTOMATION_IP`
 - `SSH_PRIVATE_KEY`
 - `NEXT_PUBLIC_API_URL` (example: `https://api.yourdomain.com`)
@@ -53,7 +53,7 @@ Automation runtime secrets:
 ### Deploy flow
 1. Add/update all required GitHub secrets.
 2. Trigger `Deploy TesboX to DigitalOcean` from GitHub Actions (`workflow_dispatch`).
-3. Workflow builds and pushes `frontend`, `backend`, and `automation-agent` images tagged with commit SHA and `latest`.
+3. Workflow builds and pushes `Tesbo-Frontend`, `Tesbo-Backend`, `Tesbo-Test-Runner-Agents`, and `Tesbo-Automation-Agents` images tagged with commit SHA and `latest`.
 4. Workflow copies compose files to:
    - Frontend: `/opt/bettercases/frontend`
    - Backend: `/opt/bettercases/backend`
@@ -78,12 +78,13 @@ On each droplet set `IMAGE_TAG=<tag>` in `/opt/bettercases/<service>/.env`, then
 
 ### Queue execution split services (recommended)
 
-- Deploy `automation-agent` in two roles:
-  - `AUTOMATION_SERVICE_ROLE=api` for queue API + session API
+- Deploy `Tesbo-Automation-Agents` for sessions/live/automate (port 7400).
+- Deploy `Tesbo-Test-Runner-Agents` in two roles:
+  - `AUTOMATION_SERVICE_ROLE=api` for queue API (port 7410)
   - `AUTOMATION_SERVICE_ROLE=worker` for queue processing only
 - Point backend to:
-  - `AUTOMATION_AGENT_BASE_URL=http://<automation-api-host>:7400`
-  - `AUTOMATION_QUEUE_API_BASE_URL=http://<automation-api-host>:7400`
+  - `AUTOMATION_AGENT_BASE_URL=http://<session-agent-host>:7400`
+  - `AUTOMATION_QUEUE_API_BASE_URL=http://<queue-api-host>:7410`
 - Scale worker replicas independently (KEDA/queue depth preferred).
 
 ### Queue admission and autoscaling

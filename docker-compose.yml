@@ -1,6 +1,9 @@
 # PostgreSQL for TesboX. Use this if your local Postgres has no "postgres" role.
 # Start: docker compose up -d
 # Stop:  docker compose down
+#
+# Tesbo-Automation-Agents: sessions, live view, recordings, /internal/playwright/run (port 7400).
+# Tesbo-Test-Runner-Agents: BullMQ queue API + workers only (API on 7410).
 services:
   postgres:
     image: postgres:16-alpine
@@ -18,10 +21,19 @@ services:
       - "6379:6379"
   automation-agent:
     build:
-      context: ./automation-agent
+      context: ./Tesbo-Automation-Agents
       dockerfile: Dockerfile
     environment:
       PORT: 7400
+      AGENT_SHARED_TOKEN: changeme
+    ports:
+      - "7400:7400"
+  test-runner-agents-api:
+    build:
+      context: ./Tesbo-Test-Runner-Agents
+      dockerfile: Dockerfile
+    environment:
+      PORT: 7410
       AUTOMATION_SERVICE_ROLE: api
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
@@ -32,13 +44,13 @@ services:
     depends_on:
       - redis
     ports:
-      - "7400:7400"
-  automation-worker:
+      - "7410:7410"
+  test-runner-agents-worker:
     build:
-      context: ./automation-agent
+      context: ./Tesbo-Test-Runner-Agents
       dockerfile: Dockerfile
     environment:
-      PORT: 7401
+      PORT: 7411
       AUTOMATION_SERVICE_ROLE: worker
       REDIS_URL: redis://redis:6379
       BACKEND_BASE_URL: http://host.docker.internal:7000
@@ -48,7 +60,5 @@ services:
       AUTOMATION_QUEUE_CONCURRENCY: 4
     depends_on:
       - redis
-    ports:
-      - "7401:7401"
 volumes:
   bettercases_pgdata:

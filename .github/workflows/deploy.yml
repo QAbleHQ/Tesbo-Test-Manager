@@ -37,9 +37,9 @@ jobs:
             exit 1
           fi
 
-          docker build -f frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
+          docker build -f Tesbo-Frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
             --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
-            frontend
+            Tesbo-Frontend
           docker push "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
           docker tag "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${FRONTEND_IMAGE_CLEAN}:latest"
           docker push "${FRONTEND_IMAGE_CLEAN}:latest"
@@ -55,7 +55,7 @@ jobs:
             exit 1
           fi
 
-          docker build -f backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" backend
+          docker build -f Tesbo-Backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" Tesbo-Backend
           docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
           docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
           docker push "${BACKEND_IMAGE_CLEAN}:latest"
@@ -71,10 +71,28 @@ jobs:
             exit 1
           fi
 
-          docker build -f automation-agent/Dockerfile -t "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" automation-agent
+          docker build -f Tesbo-Test-Runner-Agents/Dockerfile -t "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" Tesbo-Test-Runner-Agents
           docker push "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
           docker tag "${AUTOMATION_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${AUTOMATION_IMAGE_CLEAN}:latest"
           docker push "${AUTOMATION_IMAGE_CLEAN}:latest"
+
+      - name: Build and push Tesbo-Automation-Agents image (sessions / automate)
+        run: |
+          set -euo pipefail
+          REGISTRY_CLEAN="$(printf '%s' "${REGISTRY}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          REPO_CLEAN="$(printf '%s' '${{ secrets.DOCR_REPO_AUTOMATION_AGENT }}' | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+          SESSION_IMAGE="${REGISTRY_CLEAN}/${REPO_CLEAN}:${IMAGE_TAG_CLEAN}"
+
+          if [[ -z "${REGISTRY_CLEAN}" || -z "${REPO_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "REGISTRY, DOCR_REPO_AUTOMATION_AGENT (secret), or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f Tesbo-Automation-Agents/Dockerfile -t "${SESSION_IMAGE}" Tesbo-Automation-Agents
+          docker push "${SESSION_IMAGE}"
+          docker tag "${SESSION_IMAGE}" "${REGISTRY_CLEAN}/${REPO_CLEAN}:latest"
+          docker push "${REGISTRY_CLEAN}/${REPO_CLEAN}:latest"
 
   deploy-frontend:
     needs: build-and-push
@@ -94,7 +112,7 @@ jobs:
         run: |
           set -e
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/frontend"
-          scp -o StrictHostKeyChecking=no deploy/frontend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/frontend/docker-compose.yml
+          scp -o StrictHostKeyChecking=no deploy/Tesbo-Frontend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/frontend/docker-compose.yml
 
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/frontend/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
@@ -127,7 +145,7 @@ jobs:
         run: |
           set -e
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/backend"
-          scp -o StrictHostKeyChecking=no deploy/backend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/backend/docker-compose.yml
+          scp -o StrictHostKeyChecking=no deploy/Tesbo-Backend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/backend/docker-compose.yml
 
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/backend/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
@@ -197,6 +215,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/automation/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
           DOCR_REPO_AUTOMATION=${{ secrets.DOCR_REPO_AUTOMATION }}
+          DOCR_REPO_AUTOMATION_AGENT=${{ secrets.DOCR_REPO_AUTOMATION_AGENT }}
           IMAGE_TAG=${{ github.sha }}
           EOF"
 
