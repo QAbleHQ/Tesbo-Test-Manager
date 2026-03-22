@@ -93,16 +93,16 @@ function RecordingGroupBlock({ items }: { items: Array<{ message: ChatMessage; i
 
   return (
     <div className="flex justify-start">
-      <div className="max-w-[92%] w-full rounded-lg border border-[#D6DEE6] bg-white">
+      <div className="max-w-[92%] w-full rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)]">
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[#F7FAFB] rounded-lg transition-colors"
+          className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--surface-tertiary)] rounded-lg transition-colors"
         >
           <span className="inline-flex h-[18px] items-center rounded-full bg-[#DCFCE7] px-2 text-[10px] font-semibold uppercase tracking-wider text-[#15803D]">
             Executed
           </span>
-          <span className="text-[13px] font-medium text-[#0F1720]">
+          <span className="text-[13px] font-medium text-[var(--foreground)]">
             {count} action{count === 1 ? "" : "s"} recorded
             {failedCount > 0 && (
               <span className="ml-1 text-[#C0392B]">({failedCount} failed)</span>
@@ -2184,7 +2184,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
           >
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
               {messages.length === 0 && (
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--muted)]">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--ai-soft)] px-3 py-2 text-sm text-[var(--foreground)]">
                   Goal AI mode: send an outcome-oriented objective. Example: complete login flow and verify dashboard is visible.
                 </div>
               )}
@@ -2309,7 +2309,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                         className={`max-w-[88%] whitespace-pre-wrap rounded-xl px-3 py-2 text-[13px] leading-relaxed ${
                           isUser
                             ? "bg-[#0F766E] text-white font-medium"
-                            : "border border-[#D6DEE6] bg-white text-[#0F1720]"
+                            : "border border-[var(--border)] bg-[var(--ai-soft)] text-[var(--foreground)]"
                         }`}
                       >
                         {message.content}
@@ -2440,7 +2440,7 @@ Stop when pass/fail outcome is clear and summarize results.`;
                 className="h-full w-full object-fill"
               />
             ) : (
-              <p className="text-sm text-[var(--muted)]">Waiting for browser stream...</p>
+              <p className="text-sm font-medium text-white/90">Waiting for browser stream...</p>
             )}
             {isLiveMode && lastClickTarget && (
               <div
@@ -2474,16 +2474,16 @@ Stop when pass/fail outcome is clear and summarize results.`;
         open={confirmFinalizeOpen}
         onClose={() => setConfirmFinalizeOpen(false)}
         title="Review Steps and Script Before Saving"
-        className="max-w-6xl"
+        className="flex max-h-[min(92vh,900px)] w-[min(96vw,1440px)] flex-col overflow-hidden p-4 sm:p-6"
       >
-        <p className="mt-2 text-sm text-[var(--muted)]">
+        <p className="mt-1 shrink-0 text-sm text-[var(--muted)]">
           Validate plain-English steps and Playwright script side by side. Delete any step you do not want to save;
           the related Playwright action is removed automatically.
         </p>
-        <div className="mt-4 grid gap-4 md:grid-cols-2">
-          <div className="rounded-xl border border-[var(--border)] p-3">
-            <h4 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Script Steps (Simple English)</h4>
-            <div className="max-h-[360px] space-y-2 overflow-auto pr-1">
+        <div className="mt-4 flex min-h-0 flex-1 flex-col gap-4 overflow-hidden md:flex-row md:items-stretch">
+          <div className="flex min-h-[min(38vh,280px)] min-w-0 flex-1 flex-col rounded-xl border border-[var(--border)] p-3 md:min-h-0 md:overflow-hidden">
+            <h4 className="mb-2 shrink-0 text-sm font-semibold text-[var(--foreground)]">Script Steps (Simple English)</h4>
+            <div className="min-h-0 flex-1 space-y-2 overflow-auto pr-1">
               {reviewSteps.length === 0 ? (
                 <p className="text-xs text-[var(--muted)]">No generated steps available for this session yet.</p>
               ) : (
@@ -2510,14 +2510,14 @@ Stop when pass/fail outcome is clear and summarize results.`;
               )}
             </div>
           </div>
-          <div className="rounded-xl border border-[var(--border)] p-3">
-            <h4 className="mb-2 text-sm font-semibold text-[var(--foreground)]">Playwright Script</h4>
-            <pre className="max-h-[360px] overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-3 text-xs text-[var(--foreground)]">
+          <div className="flex min-h-[min(38vh,280px)] min-w-0 flex-1 flex-col rounded-xl border border-[var(--border)] p-3 md:min-h-0 md:overflow-hidden">
+            <h4 className="mb-2 shrink-0 text-sm font-semibold text-[var(--foreground)]">Playwright Script</h4>
+            <pre className="min-h-0 flex-1 overflow-auto rounded-lg bg-[var(--surface-tertiary)] p-3 text-xs text-[var(--foreground)]">
               {buildPlaywrightScriptFromReviewSteps(testcaseTitle, reviewSteps)}
             </pre>
           </div>
         </div>
-        <div className="mt-4 flex items-center justify-end gap-2">
+        <div className="mt-4 flex shrink-0 items-center justify-end gap-2 border-t border-[var(--border-subtle)] pt-4">
           <Button
             variant="secondary"
             onClick={() => setConfirmFinalizeOpen(false)}

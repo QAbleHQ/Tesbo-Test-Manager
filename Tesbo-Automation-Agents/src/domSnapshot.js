@@ -35,6 +35,10 @@ export async function getInteractiveDOM(page, options = {}) {
       "[role='combobox']",
       "[role='searchbox']",
       "[contenteditable='true']",
+      // Image-based controls (often lack button role / inner text; vision is not sent to the LLM).
+      "img[id]",
+      "img[onclick]",
+      "img[tabindex]:not([tabindex='-1'])",
     ].join(", ");
 
     const isVisible = (el) => {
@@ -47,6 +51,12 @@ export async function getInteractiveDOM(page, options = {}) {
     const getText = (el) => {
       const ariaLabel = el.getAttribute("aria-label");
       if (ariaLabel) return ariaLabel.trim();
+      if (el.tagName === "IMG") {
+        const alt = el.getAttribute("alt");
+        if (alt && alt.trim()) return alt.trim().slice(0, 80);
+        const title = el.getAttribute("title");
+        if (title && title.trim()) return title.trim().slice(0, 80);
+      }
       const innerText = (el.textContent || "").replace(/\s+/g, " ").trim();
       return innerText.slice(0, 80);
     };
@@ -61,7 +71,22 @@ export async function getInteractiveDOM(page, options = {}) {
 
       const tag = el.tagName.toLowerCase();
       const attrs = {};
-      for (const name of ["id", "name", "type", "placeholder", "aria-label", "role", "data-testid", "href", "value", "checked", "disabled"]) {
+      for (const name of [
+        "id",
+        "name",
+        "type",
+        "placeholder",
+        "aria-label",
+        "alt",
+        "title",
+        "role",
+        "data-testid",
+        "href",
+        "value",
+        "checked",
+        "disabled",
+        "tabindex",
+      ]) {
         const val = el.getAttribute(name);
         if (val != null && val !== "") attrs[name] = val.length > 100 ? val.slice(0, 100) : val;
       }
@@ -126,8 +151,12 @@ function formatSnapshotAsText(snapshot) {
     const parts = [`[${el.ref}]`, `<${el.tag}>`];
     if (el.text) parts.push(`"${el.text}"`);
     const importantAttrs = [];
+    if (el.attrs.id) importantAttrs.push(`id=${el.attrs.id}`);
+    if (el.attrs["data-testid"]) importantAttrs.push(`data-testid=${el.attrs["data-testid"]}`);
     if (el.attrs.type) importantAttrs.push(`type=${el.attrs.type}`);
     if (el.attrs.placeholder) importantAttrs.push(`placeholder="${el.attrs.placeholder}"`);
+    if (el.attrs.alt) importantAttrs.push(`alt="${el.attrs.alt}"`);
+    if (el.attrs.title) importantAttrs.push(`title="${el.attrs.title}"`);
     if (el.attrs.role) importantAttrs.push(`role=${el.attrs.role}`);
     if (el.attrs.name) importantAttrs.push(`name=${el.attrs.name}`);
     if (el.attrs.href) importantAttrs.push(`href=${el.attrs.href.slice(0, 60)}`);

@@ -486,6 +486,61 @@ export async function executeAgentWithTelemetry(session, commandId, objective) {
 }
 
 /**
+ * True when value is likely a Playwright/CSS locator string (not a human label).
+ */
+function looksLikePlaywrightSelector(value) {
+  const v = String(value || "").trim();
+  if (!v) return false;
+  return (
+    v.startsWith("#") ||
+    v.startsWith(".") ||
+    v.startsWith("[") ||
+    v.startsWith("//") ||
+    v.includes(">>") ||
+    /^[a-zA-Z][a-zA-Z0-9:_-]*(\[.+\])?$/.test(v)
+  );
+}
+
+/**
+ * Pull #id or id="..." / id='...' from natural-language instructions.
+ */
+function extractCssSelectorFromInstruction(instruction) {
+  const s = String(instruction || "");
+  const idEq = s.match(/\bid\s*=\s*["']([^"']+)["']/i);
+  if (idEq) return `#${idEq[1]}`;
+  const hash = s.match(/#([a-zA-Z_][\w-]*)/);
+  if (hash) return `#${hash[1]}`;
+  return null;
+}
+
+function resolveClickLocator(page, element, clickTarget, instruction, actionPlanSelector) {
+  const fromPlan =
+    typeof actionPlanSelector === "string" && actionPlanSelector.trim() && looksLikePlaywrightSelector(actionPlanSelector.trim())
+      ? actionPlanSelector.trim()
+      : null;
+  const hint =
+    element?.selectorHint && looksLikePlaywrightSelector(element.selectorHint) ? element.selectorHint : null;
+  const targetSel = looksLikePlaywrightSelector(clickTarget) ? clickTarget : null;
+  const fromInstruction = extractCssSelectorFromInstruction(instruction);
+
+  if (fromPlan) return page.locator(fromPlan).first();
+  if (hint) return page.locator(hint).first();
+  if (targetSel) return page.locator(targetSel).first();
+  if (fromInstruction) return page.locator(fromInstruction).first();
+
+  const tag = element?.tag;
+  if (tag === "img") {
+    const alt = element?.attrs?.alt;
+    if (alt) return page.getByAltText(alt, { exact: false }).first();
+  }
+
+  return page
+    .getByRole("button", { name: clickTarget, exact: false })
+    .or(page.getByRole("link", { name: clickTarget, exact: false }))
+    .or(page.getByText(clickTarget, { exact: false }));
+}
+
+/**
  * Execute a single step using DOM snapshot + LLM element identification + Playwright action.
  * Records telemetry events compatible with the existing compiler.
  */
@@ -503,7 +558,7 @@ async function executeStepWithLLM(session, stepId, instruction, events) {
   try {
     const snapshot = await getInteractiveDOM(page);
 
-    const prompt = `Given this page state:
+    const prompt = `Given this page state (interactive DOM summary — not a screenshot; image-based controls only appear if they have id, alt, title, or role):
 ${snapshot.text}
 
 Execute this instruction: "${instruction}"
@@ -512,11 +567,17 @@ Respond with a JSON object describing the action:
 {
   "action": "click" | "type" | "navigate" | "press" | "scroll" | "select",
   "ref": <element ref number from the list above>,
+  "selector": "<optional: CSS selector e.g. #myId or [data-testid='x'] when the instruction names an id or the element is an image/icon without button role>",
   "value": "<text to type, if action is 'type' or 'select'>",
   "url": "<URL if action is 'navigate'>",
   "key": "<key name if action is 'press'>",
   "reasoning": "<brief explanation>"
 }
+
+Rules:
+- Prefer matching "ref" to a line in the list. Lines include id=, data-testid=, and alt= when present.
+- For elements labeled <img> or image-like controls, prefer "ref" (and "selector" if id/testid is shown) over guessing button text.
+- If the user gives id="foo" or #foo, set "selector" to "#foo" and pick the matching ref if listed.
 
 Return ONLY the JSON object, nothing else.`;
 
@@ -529,8 +590,20 @@ Return ONLY the JSON object, nothing else.`;
     }
 
     const actionPlan = JSON.parse(jsonMatch[0]);
-    const element = actionPlan.ref ? snapshot.elements.find((e) => e.ref === actionPlan.ref) : null;
-    const target = element?.text || element?.attrs?.["aria-label"] || element?.attrs?.placeholder || element?.selectorHint || instruction;
+    const rawRef = actionPlan.ref;
+    const element =
+      rawRef != null && rawRef !== ""
+        ? snapshot.elements.find(
+            (e) => e.ref === rawRef || e.ref === Number(rawRef) || String(e.ref) === String(rawRef)
+          )
+        : null;
+    const target =
+      element?.text ||
+      element?.attrs?.["aria-label"] ||
+      element?.attrs?.alt ||
+      element?.attrs?.placeholder ||
+      element?.selectorHint ||
+      instruction;
 
     let actSuccess = false;
     let actError = null;
@@ -540,10 +613,8 @@ Return ONLY the JSON object, nothing else.`;
       switch (actionPlan.action) {
         case "click": {
           const clickTarget = target || instruction;
-          const locator = page.getByRole("button", { name: clickTarget, exact: false })
-            .or(page.getByRole("link", { name: clickTarget, exact: false }))
-            .or(page.getByText(clickTarget, { exact: false }));
-          await locator.first().click({ timeout: 10000 });
+          const locator = resolveClickLocator(page, element, clickTarget, instruction, actionPlan.selector);
+          await locator.click({ timeout: 10000 });
           actSuccess = true;
           break;
         }
