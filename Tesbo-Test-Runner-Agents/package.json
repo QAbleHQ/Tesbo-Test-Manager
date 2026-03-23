@@ -1,0 +1,17 @@
+{
+  "name": "bettercases-tesbo-test-runner-agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bullmq": "^5.58.5",
+    "express": "^4.21.2",
+    "ioredis": "^5.8.1",
+    "playwright": "^1.58.2"
+  }
+}

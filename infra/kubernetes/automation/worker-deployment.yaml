@@ -15,11 +15,12 @@ spec:
     spec:
       containers:
         - name: automation-worker
-          image: registry.digitalocean.com/REPLACE_ME/automation-agent:latest
+          # Tesbo-Test-Runner-Agents BullMQ worker (same image as queue API).
+          image: registry.digitalocean.com/REPLACE_ME/tesbo-test-runner-agents:latest
           imagePullPolicy: Always
           env:
             - name: PORT
-              value: "7400"
+              value: "7411"
             - name: AUTOMATION_SERVICE_ROLE
               value: "worker"
             - name: REDIS_URL
@@ -53,12 +54,12 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 7400
+              port: 7411
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: 7400
+              port: 7411
             initialDelaySeconds: 20
             periodSeconds: 20

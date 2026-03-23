@@ -32,7 +32,7 @@ This guide helps you validate UI/UX differences between:
 2. **Ensure local server is running**:
    ```bash
    # In another terminal, start your local server
-   cd frontend
+   cd Tesbo-Frontend
    npm run dev
    ```
 

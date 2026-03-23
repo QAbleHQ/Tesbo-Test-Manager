@@ -47,4 +47,4 @@ else
     \$\$;
   "
 fi
-echo "Done. Use in backend/.env: DATABASE_USER=${USERNAME} DATABASE_PASSWORD=${PASSWORD}"
+echo "Done. Use in Tesbo-Backend/.env: DATABASE_USER=${USERNAME} DATABASE_PASSWORD=${PASSWORD}"

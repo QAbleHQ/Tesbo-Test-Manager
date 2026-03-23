@@ -15,13 +15,14 @@ spec:
     spec:
       containers:
         - name: automation-api
-          image: registry.digitalocean.com/REPLACE_ME/automation-agent:latest
+          # Tesbo-Test-Runner-Agents queue HTTP API (enqueue/cancel/stats). Session/automate API is a separate deployment (Tesbo-Automation-Agents, port 7400).
+          image: registry.digitalocean.com/REPLACE_ME/tesbo-test-runner-agents:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 7400
+            - containerPort: 7410
           env:
             - name: PORT
-              value: "7400"
+              value: "7410"
             - name: AUTOMATION_SERVICE_ROLE
               value: "api"
             - name: REDIS_URL
@@ -53,12 +54,12 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 7400
+              port: 7410
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: 7400
+              port: 7410
             initialDelaySeconds: 20
             periodSeconds: 20

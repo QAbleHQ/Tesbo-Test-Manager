@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Tesbo UI Visual Rule
 
-For any frontend/UI design or implementation task, follow `frontend/visualguideline.txt` as the single source of truth.
+For any frontend/UI design or implementation task, follow `Tesbo-Frontend/visualguideline.txt` as the single source of truth.
 
 ## Required Defaults
 - Use the Tesbo Command Light system (light, operational, high-trust).

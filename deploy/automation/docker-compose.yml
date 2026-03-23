@@ -1,15 +1,17 @@
+# Tesbo-Automation-Agents: interactive sessions + recordings (port 7400).
+# Tesbo-Test-Runner-Agents (test-runner-api / test-runner-worker): BullMQ only; API on 7410.
+# Requires registry repos: DOCR_REPO_AUTOMATION_AGENT and DOCR_REPO_AUTOMATION (test-runner).
+# Total worker throughput ≈ replicas × AUTOMATION_QUEUE_CONCURRENCY.
 version: "3.9"
 
 services:
-  automation-api:
-    image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION}:${IMAGE_TAG:-latest}
+  automation-agent:
+    image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION_AGENT}:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file:
       - app.env
     environment:
       - PORT=7400
-      - AUTOMATION_SERVICE_ROLE=api
-      - AUTOMATION_QUEUE_CONCURRENCY=2
     ports:
       - "7400:7400"
     volumes:
@@ -20,14 +22,33 @@ services:
       timeout: 5s
       retries: 3
 
-  automation-worker:
+  test-runner-api:
     image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION}:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file:
       - app.env
     environment:
-      - PORT=7401
+      - PORT=7410
+      - AUTOMATION_SERVICE_ROLE=api
+      - AUTOMATION_QUEUE_CONCURRENCY=2
+    ports:
+      - "7410:7410"
+    volumes:
+      - ./artifacts:/app/artifacts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7410/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  test-runner-worker:
+    image: ${DOCR_REGISTRY}/${DOCR_REPO_AUTOMATION}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - app.env
+    environment:
+      - PORT=7411
       - AUTOMATION_SERVICE_ROLE=worker
-      - AUTOMATION_QUEUE_CONCURRENCY=4
+      - AUTOMATION_QUEUE_CONCURRENCY=8
     volumes:
       - ./artifacts:/app/artifacts
