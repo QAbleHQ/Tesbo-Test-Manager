@@ -16,8 +16,10 @@ import java.util.Set;
 import java.util.UUID;
 
 public final class ProjectService {
+    private static final Set<String> VALID_PROJECT_TYPES = Set.of("tesbox", "tesbox_executions");
+
     /** Create a new project in the given organization; caller must be an org member. Adds creator as owner. */
-    public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description) {
+    public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description, String projectType) {
         String normalizedKey = key != null ? key.trim().toUpperCase().replaceAll("[^A-Z]", "") : "";
         if (normalizedKey.length() < 3) {
             String fromName = name != null ? name.trim().toUpperCase().replaceAll("[^A-Z]", "") : "";
@@ -26,13 +28,18 @@ public final class ProjectService {
             normalizedKey = normalizedKey.substring(0, 3);
         }
 
-        String sql = "INSERT INTO projects (organization_id, key, name, description) VALUES (?, ?, ?, ?) RETURNING id, key, name, created_at";
+        String resolvedType = projectType != null && VALID_PROJECT_TYPES.contains(projectType.trim().toLowerCase())
+                ? projectType.trim().toLowerCase()
+                : "tesbox";
+
+        String sql = "INSERT INTO projects (organization_id, key, name, description, project_type) VALUES (?, ?, ?, ?, ?) RETURNING id, key, name, project_type, created_at";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, orgId);
             ps.setString(2, normalizedKey);
             ps.setString(3, name != null ? name.trim() : "");
             ps.setString(4, description != null ? description : "");
+            ps.setString(5, resolvedType);
             ResultSet rs = ps.executeQuery();
             if (!rs.next()) throw new RuntimeException("Insert failed");
             UUID projectId = (UUID) rs.getObject("id");
@@ -41,12 +48,15 @@ public final class ProjectService {
                 pm.setObject(2, userId);
                 pm.executeUpdate();
             }
-            SuiteService.ensureDefaultSuiteExists(projectId);
-            ensureBrowserAgentMapping(projectId, c);
+            if ("tesbox".equals(resolvedType)) {
+                SuiteService.ensureDefaultSuiteExists(projectId);
+                ensureBrowserAgentMapping(projectId, c);
+            }
             return Map.of(
                     "id", projectId.toString(),
                     "key", rs.getString("key"),
                     "name", rs.getString("name"),
+                    "projectType", rs.getString("project_type"),
                     "createdAt", rs.getTimestamp("created_at").toInstant().toString()
             );
         } catch (SQLException e) {
@@ -58,7 +68,7 @@ public final class ProjectService {
     }
 
     public static List<Map<String, Object>> listProjectsForUser(UUID userId) {
-        String sql = "SELECT p.id, p.key, p.name, p.description, p.settings, p.archived_at, p.created_at, pm.role " +
+        String sql = "SELECT p.id, p.key, p.name, p.description, p.settings, p.project_type, p.archived_at, p.created_at, pm.role " +
                 "FROM projects p JOIN project_members pm ON p.id = pm.project_id WHERE pm.user_id = ? AND p.archived_at IS NULL ORDER BY p.updated_at DESC";
         List<Map<String, Object>> out = new ArrayList<>();
         try (Connection c = Database.getDataSource().getConnection();
@@ -71,6 +81,7 @@ public final class ProjectService {
                         "key", rs.getString("key"),
                         "name", rs.getString("name"),
                         "description", rs.getString("description") != null ? rs.getString("description") : "",
+                        "projectType", rs.getString("project_type") != null ? rs.getString("project_type") : "tesbox",
                         "role", canonicalProjectRole(rs.getString("role")),
                         "createdAt", rs.getTimestamp("created_at").toInstant().toString()
                 ));
@@ -84,7 +95,7 @@ public final class ProjectService {
     public static Optional<Map<String, Object>> getProject(UUID projectId, UUID userId) {
         Optional<Role> roleOpt = RbacService.getProjectRole(userId, projectId);
         if (roleOpt.isEmpty()) return Optional.empty();
-        String sql = "SELECT id, organization_id, key, name, description, settings, archived_at, created_at, updated_at FROM projects WHERE id = ?";
+        String sql = "SELECT id, organization_id, key, name, description, settings, project_type, archived_at, created_at, updated_at FROM projects WHERE id = ?";
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
@@ -96,6 +107,7 @@ public final class ProjectService {
                 result.put("key", rs.getString("key"));
                 result.put("name", rs.getString("name"));
                 result.put("description", rs.getString("description") != null ? rs.getString("description") : "");
+                result.put("projectType", rs.getString("project_type") != null ? rs.getString("project_type") : "tesbox");
                 result.put("settings", rs.getString("settings") != null ? rs.getString("settings") : "{}");
                 result.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
                 result.put("updatedAt", rs.getTimestamp("updated_at").toInstant().toString());

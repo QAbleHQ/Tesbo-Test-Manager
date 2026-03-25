@@ -82,6 +82,14 @@ public final class Config {
     public static final int AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS =
             Integer.parseInt(getEnv("AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS", "0"));
 
+    /** "legacy" = embedded orchestration (current), "external" = use standalone Tesbo Execution Service */
+    public static final String EXECUTION_SERVICE_MODE = getEnv("EXECUTION_SERVICE_MODE", "legacy").trim().toLowerCase();
+    public static final String EXECUTION_SERVICE_BASE_URL = getEnv("EXECUTION_SERVICE_BASE_URL", "http://localhost:7420");
+    public static final String EXECUTION_SERVICE_API_KEY = getEnv("EXECUTION_SERVICE_API_KEY", "");
+    /** Webhook URL the Execution Service will POST state changes to (should point to this backend) */
+    public static final String EXECUTION_SERVICE_WEBHOOK_URL = getEnv("EXECUTION_SERVICE_WEBHOOK_URL", "");
+    public static final String EXECUTION_SERVICE_WEBHOOK_SECRET = getEnv("EXECUTION_SERVICE_WEBHOOK_SECRET", "");
+
     private static Map<String, String> loadDotEnv() {
         Map<String, String> map = new HashMap<>();
         for (Path dir : new Path[]{

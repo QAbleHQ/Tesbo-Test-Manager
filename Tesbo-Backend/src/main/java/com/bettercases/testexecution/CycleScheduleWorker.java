@@ -22,7 +22,8 @@ public final class CycleScheduleWorker {
     }
 
     private static void pollAndRun() {
-        if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
+        boolean isExternalMode = "external".equals(Config.EXECUTION_SERVICE_MODE);
+        if (!isExternalMode && "queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
             AutomationExecutionQueueService.recoverStuckRunningJobs(Config.AUTOMATION_QUEUE_STALE_MINUTES);
             AutomationExecutionDispatchService.dispatchAllProjectsWithPendingJobs();
         }
@@ -31,8 +32,7 @@ public final class CycleScheduleWorker {
             UUID scheduleId = UUID.fromString(String.valueOf(schedule.get("id")));
             UUID cycleId = UUID.fromString(String.valueOf(schedule.get("cycleId")));
             try {
-                if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
-                    // Queue mode is async; mark schedule tick as successfully dispatched.
+                if (isExternalMode || "queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
                     CycleAutomationRunService.executeAutomatedAsyncInternal(cycleId, true);
                     CycleRunScheduleService.finishRun(scheduleId, "queued", null);
                 } else {

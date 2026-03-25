@@ -21,6 +21,18 @@
 /localhost-run-detail-screenshot.png
 /localhost-test-detail-screenshot.png
 /portal-tesbo-screenshot.png
+
+# Stale/local-only directories
+/automation-agent/
+/backend/
+/frontend/
+
+# Tesbo-Execution (separate repository)
+/Tesbo-Execution/
+
+# Environment files
+.env
+.env.local
 Tesbo-Backend/target/classes/com/bettercases/ai/AiHandler$1.class
 Tesbo-Backend/target/classes/com/bettercases/Config.class
 Tesbo-Backend/target/classes/com/bettercases/Database.class

@@ -1,6 +1,7 @@
 package com.bettercases.project;
 
 import com.bettercases.auth.SessionFilter;
+import com.bettercases.testexecution.ExternalExecutionServiceClient;
 import com.bettercases.workspace.WorkspaceService;
 import io.javalin.http.Context;
 
@@ -24,7 +25,7 @@ public final class ProjectHandler {
             return;
         }
         String key = body.key != null && !body.key.isBlank() ? body.key : body.name;
-        ctx.status(201).json(ProjectService.create(orgId, userId, key, body.name, body.description));
+        ctx.status(201).json(ProjectService.create(orgId, userId, key, body.name, body.description, body.projectType));
     }
 
     public static void get(Context ctx) {
@@ -76,10 +77,47 @@ public final class ProjectHandler {
         ctx.status(204);
     }
 
+    public static void listApiKeys(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        String projectId = ctx.pathParam("id");
+        try {
+            ctx.json(ExternalExecutionServiceClient.listApiKeys(projectId));
+        } catch (Exception e) {
+            ctx.status(502).json(Map.of("error", "Failed to reach execution service", "detail", e.getMessage()));
+        }
+    }
+
+    public static void createApiKey(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        String projectId = ctx.pathParam("id");
+        CreateApiKeyBody body = ctx.bodyAsClass(CreateApiKeyBody.class);
+        String keyName = (body != null && body.name != null && !body.name.isBlank()) ? body.name : "Default key";
+        try {
+            ctx.status(201).json(ExternalExecutionServiceClient.createApiKey(projectId, keyName));
+        } catch (Exception e) {
+            ctx.status(502).json(Map.of("error", "Failed to reach execution service", "detail", e.getMessage()));
+        }
+    }
+
+    public static void revokeApiKey(Context ctx) {
+        SessionFilter.requireUserId(ctx);
+        String keyId = ctx.pathParam("keyId");
+        try {
+            ctx.json(ExternalExecutionServiceClient.revokeApiKey(keyId));
+        } catch (Exception e) {
+            ctx.status(502).json(Map.of("error", "Failed to reach execution service", "detail", e.getMessage()));
+        }
+    }
+
+    public static class CreateApiKeyBody {
+        public String name;
+    }
+
     public static class CreateBody {
         public String key;
         public String name;
         public String description;
+        public String projectType;
     }
 
     public static class UpdateBody {

@@ -1,5 +1,8 @@
 package com.bettercases;
 
+import com.bettercases.admin.AdminHandler;
+import com.bettercases.admin.AdminStatsHandler;
+import com.bettercases.admin.SystemHealthHandler;
 import com.bettercases.auth.AuthHandler;
 import com.bettercases.auth.SessionFilter;
 import com.bettercases.invitation.InvitationHandler;
@@ -13,6 +16,7 @@ import com.bettercases.plan.PlanHandler;
 import com.bettercases.cycle.CycleHandler;
 import com.bettercases.testexecution.AutomationInternalMetricsHandler;
 import com.bettercases.testexecution.AutomationQueueCallbackHandler;
+import com.bettercases.testexecution.ExecutionServiceWebhookHandler;
 import com.bettercases.testexecution.CycleScheduleWorker;
 import com.bettercases.workspace.WorkspaceHandler;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -87,6 +91,9 @@ public final class Main {
         app.get("/api/projects/{id}/members", ProjectHandler::listMembers);
         app.post("/api/projects/{id}/members", ProjectHandler::addMember);
         app.delete("/api/projects/{id}/members/{userId}", ProjectHandler::removeMember);
+        app.get("/api/projects/{id}/apikeys", ProjectHandler::listApiKeys);
+        app.post("/api/projects/{id}/apikeys", ProjectHandler::createApiKey);
+        app.delete("/api/projects/{id}/apikeys/{keyId}", ProjectHandler::revokeApiKey);
 
         app.get("/api/projects/{projectId}/suites", SuiteHandler::listTree);
         app.post("/api/projects/{projectId}/suites", SuiteHandler::create);
@@ -163,11 +170,14 @@ public final class Main {
         app.get("/api/public/shared-runs/{token}", CycleHandler::getPublicRun);
         app.get("/api/public/shared-runs/{token}/executions", CycleHandler::getPublicExecutions);
 
-        // Internal queue callbacks (worker -> backend)
+        // Internal queue callbacks (worker -> backend, legacy mode)
         app.post("/api/internal/automation/jobs/{jobId}/start", AutomationQueueCallbackHandler::start);
         app.post("/api/internal/automation/jobs/{jobId}/heartbeat", AutomationQueueCallbackHandler::heartbeat);
         app.post("/api/internal/automation/jobs/{jobId}/complete", AutomationQueueCallbackHandler::complete);
         app.post("/api/internal/automation/jobs/{jobId}/fail", AutomationQueueCallbackHandler::fail);
+
+        // External Execution Service webhook endpoint (external mode)
+        app.post("/api/webhooks/execution-service", ExecutionServiceWebhookHandler::handle);
 
         app.get("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::list);
         app.post("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::create);
@@ -248,6 +258,13 @@ public final class Main {
         app.post("/api/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifactByKey);
         app.get("/api/public/tesbo-reports/{token}", TesboReportsHandler::getPublicSharedRun);
         app.get("/api/public/tesbo-reports/{token}/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getPublicSharedArtifact);
+
+        // Platform Admin Panel
+        app.get("/api/admin/system/health", SystemHealthHandler::check);
+        app.get("/api/admin/customers", AdminStatsHandler::listCustomers);
+        app.get("/api/admin/admins", AdminHandler::listAdmins);
+        app.post("/api/admin/admins", AdminHandler::addAdmin);
+        app.delete("/api/admin/admins/{adminId}", AdminHandler::removeAdmin);
 
         // Log unhandled exceptions and return 500 with JSON (avoids empty 500 in browser)
         app.exception(Exception.class, (e, ctx) -> {

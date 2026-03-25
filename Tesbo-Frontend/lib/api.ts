@@ -25,12 +25,88 @@ export async function api<T = unknown>(
   return res.json() as Promise<T>;
 }
 
-export async function authMe(): Promise<{ userId: string } | null> {
+export async function authMe(): Promise<{
+  userId: string;
+  isPlatformAdmin?: boolean;
+} | null> {
   try {
-    return await api<{ userId: string }>("/api/auth/me");
+    return await api<{ userId: string; isPlatformAdmin?: boolean }>(
+      "/api/auth/me"
+    );
   } catch {
     return null;
   }
+}
+
+// --- Platform Admin APIs ---
+
+export async function getSystemHealth() {
+  return api<{
+    status: string;
+    timestamp: string;
+    services: Record<
+      string,
+      {
+        status: string;
+        latency_ms?: number;
+        url?: string;
+        error?: string;
+        http_status?: number;
+        provider?: string;
+        latest_migration?: string;
+      }
+    >;
+  }>("/api/admin/system/health");
+}
+
+export async function getAdminCustomers() {
+  return api<{
+    summary: {
+      totalOrganizations: number;
+      totalMembers: number;
+      totalProjects: number;
+      totalTestCases: number;
+      totalAutomated: number;
+      overallAutomationCoverage: number;
+    };
+    customers: Array<{
+      id: string;
+      name: string;
+      slug: string;
+      createdAt: string;
+      memberCount: number;
+      projectCount: number;
+      testCaseCount: number;
+      automatedCount: number;
+      automationCoverage: number;
+      lastActivityAt: string | null;
+    }>;
+  }>("/api/admin/customers");
+}
+
+export async function getAdminList() {
+  return api<
+    Array<{
+      id: string;
+      userId: string;
+      role: string;
+      email: string;
+      name: string | null;
+      avatarUrl: string | null;
+      createdAt: string;
+      grantedBy?: { email: string; name: string };
+    }>
+  >("/api/admin/admins");
+}
+
+export async function addPlatformAdmin(
+  email: string
+): Promise<{ id: string; userId: string; email: string; role: string }> {
+  return api("/api/admin/admins", { method: "POST", body: { email } });
+}
+
+export async function removePlatformAdmin(adminId: string): Promise<void> {
+  await api(`/api/admin/admins/${adminId}`, { method: "DELETE" });
 }
 
 export async function requestOtp(email: string): Promise<void> {
@@ -238,11 +314,14 @@ export async function removeWorkspaceProjectAccess(data: { projectId: string; us
 }
 
 // Projects
+export type ProjectType = "tesbox" | "tesbox_executions";
+
 export interface ProjectSummary {
   id: string;
   key: string;
   name: string;
   description: string;
+  projectType: ProjectType;
   role: string;
   createdAt: string;
 }
@@ -251,8 +330,8 @@ export async function listProjects(): Promise<ProjectSummary[]> {
   return api<ProjectSummary[]>("/api/projects");
 }
 
-export async function createProject(data: { key?: string; name: string; description?: string }): Promise<{ id: string; key: string; name: string; createdAt: string }> {
-  return api<{ id: string; key: string; name: string; createdAt: string }>("/api/projects", { method: "POST", body: data });
+export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<{ id: string; key: string; name: string; projectType: ProjectType; createdAt: string }> {
+  return api<{ id: string; key: string; name: string; projectType: ProjectType; createdAt: string }>("/api/projects", { method: "POST", body: data });
 }
 
 export async function getProject(id: string): Promise<Record<string, unknown>> {
@@ -261,6 +340,29 @@ export async function getProject(id: string): Promise<Record<string, unknown>> {
 
 export async function updateProject(id: string, data: { name?: string; description?: string; settings?: string }): Promise<void> {
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
+}
+
+export interface ExecutionApiKey {
+  id: string;
+  name: string;
+  project_id: string;
+  scopes: string[];
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  masked: string;
+}
+
+export async function listExecutionApiKeys(projectId: string): Promise<{ keys: ExecutionApiKey[] }> {
+  return api<{ keys: ExecutionApiKey[] }>(`/api/projects/${projectId}/apikeys`);
+}
+
+export async function createExecutionApiKey(projectId: string, name: string): Promise<{ key: string; id: string; name: string }> {
+  return api<{ key: string; id: string; name: string }>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: { name } });
+}
+
+export async function revokeExecutionApiKey(projectId: string, keyId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/apikeys/${keyId}`, { method: "DELETE" });
 }
 
 export async function deleteProject(id: string): Promise<void> {

@@ -34,4 +34,6 @@
     <include file="changes/V28_plan_cycle_external_ids.sql" relativeToChangelogFile="true"/>
     <include file="changes/V29_workspace_ai_keys.sql" relativeToChangelogFile="true"/>
     <include file="changes/V30_automation_jobs_dispatch_index.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V31_platform_admins.sql" relativeToChangelogFile="true"/>
+    <include file="changes/V32_project_type.sql" relativeToChangelogFile="true"/>
 </databaseChangeLog>
