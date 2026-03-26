@@ -68,6 +68,17 @@ public final class CycleAutomationRunService {
         if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
             throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
         }
+        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
+            markManualRequiredNotes(rows);
+            UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+            return ExternalExecutionServiceClient.submitRun(
+                    cycleId,
+                    rows,
+                    automationConfig,
+                    Config.AUTOMATION_QUEUE_MAX_RETRIES,
+                    projectId
+            );
+        }
         if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
             assertQueueExecutionAvailable();
             markManualRequiredNotes(rows);
@@ -100,6 +111,9 @@ public final class CycleAutomationRunService {
     public static Map<String, Object> getRunStatus(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
+            return ExternalExecutionServiceClient.getRunStatus(runId.toString());
+        }
         if (AutomationExecutionQueueService.exists(cycleId, runId)) {
             return AutomationExecutionQueueService.snapshot(cycleId, runId);
         }
@@ -109,6 +123,9 @@ public final class CycleAutomationRunService {
     public static Map<String, Object> getLatestRunStatus(UUID cycleId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
+            return ExternalExecutionServiceClient.getLatestRunByExternalRef(cycleId.toString());
+        }
         UUID runId = AutomationExecutionQueueService.findLatestRunId(cycleId);
         if (runId == null) {
             throw new io.javalin.http.NotFoundResponse("No automated run found.");
@@ -119,6 +136,14 @@ public final class CycleAutomationRunService {
     public static void cancelRun(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
+            try {
+                ExternalExecutionServiceClient.cancelRun(runId.toString());
+            } catch (Exception ignored) {
+                // Cancellation on external service is best-effort.
+            }
+            return;
+        }
         if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE) && AutomationExecutionQueueService.exists(cycleId, runId)) {
             AutomationExecutionQueueService.cancelRun(cycleId, runId, "Cancelled by user");
             try {

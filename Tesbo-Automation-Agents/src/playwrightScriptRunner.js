@@ -1,7 +1,8 @@
 /**
  * Standalone Playwright script execution (one browser per run).
- * Shared by Tesbo-Automation-Agents (HTTP + in-session compile) and Tesbo-Test-Runner-Agents (queue jobs).
- * Keep this file in sync with Tesbo-Test-Runner-Agents/src/playwrightScriptRunner.js.
+ * Self-contained for the BetterCasesv3 "legacy" execution mode.
+ * The canonical shared version lives in the separate tesbo-execution repo
+ * at shared/playwrightScriptRunner.js.
  */
 import fs from "node:fs/promises";
 import path from "node:path";

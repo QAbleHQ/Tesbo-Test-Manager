@@ -3,10 +3,14 @@ kind: Service
 metadata:
   name: automation-api
   namespace: bettercases-automation
+  labels:
+    app: automation-api
+    app.kubernetes.io/part-of: tesbo
 spec:
+  type: LoadBalancer
   selector:
     app: automation-api
   ports:
     - name: http
-      port: 7400
-      targetPort: 7400
+      port: 7410
+      targetPort: 7410

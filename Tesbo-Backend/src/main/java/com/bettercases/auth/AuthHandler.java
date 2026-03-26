@@ -1,9 +1,11 @@
 package com.bettercases.auth;
 
 import com.bettercases.Config;
+import com.bettercases.admin.SuperAdminService;
 import com.bettercases.audit.AuditService;
 import io.javalin.http.Context;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -68,7 +70,10 @@ public final class AuthHandler {
 
     public static void me(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
-        ctx.json(Map.of("userId", userId.toString()));
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("userId", userId.toString());
+        response.put("isPlatformAdmin", SuperAdminService.isPlatformAdmin(userId));
+        ctx.json(response);
     }
 
     private static String parseEmailFromBody(String body) {

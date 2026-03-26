@@ -2,9 +2,9 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getProject, listProjects, logout, type ProjectSummary } from "@/lib/api";
+import { authMe, getProject, listProjects, logout, type ProjectSummary, type ProjectType } from "@/lib/api";
 
 type NavItemConfig = {
   href: string;
@@ -56,13 +56,28 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
       { href: "knowledge-base", label: "Knowledge Base", icon: "book" },
     ],
   },
+];
+
+const executionProjectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
   {
-    section: "Automation",
+    section: "Overview",
+    items: [
+      { href: "integration", label: "Integration Guide", icon: "plug" },
+    ],
+  },
+  {
+    section: "Execution",
     items: [
       { href: "tesbo-reports/runs", label: "Automation Runs", icon: "runs" },
       { href: "tesbo-reports/specs", label: "Spec Intelligence", icon: "specs" },
       { href: "tesbo-reports/tests", label: "Test Intelligence", icon: "tests" },
       { href: "tesbo-reports/analytics", label: "Analytics", icon: "analytics" },
+    ],
+  },
+  {
+    section: "Configuration",
+    items: [
+      { href: "settings", label: "Settings", icon: "settings" },
     ],
   },
 ];
@@ -86,7 +101,7 @@ type MenuIconName =
   | "book" | "list" | "clipboard" | "play" | "bug" | "chart"
   | "activity" | "runs" | "specs" | "tests" | "analytics"
   | "agent" | "settings" | "users" | "plug" | "logout"
-  | "chevronLeft" | "chevronRight";
+  | "chevronLeft" | "chevronRight" | "adminPanel" | "key";
 
 function MenuIcon({ name, className = "h-[18px] w-[18px]" }: { name: MenuIconName; className?: string }) {
   const common = { className, fill: "none", stroke: "currentColor", strokeWidth: 1.75, viewBox: "0 0 24 24" } as const;
@@ -114,6 +129,8 @@ function MenuIcon({ name, className = "h-[18px] w-[18px]" }: { name: MenuIconNam
     case "logout": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>;
     case "chevronLeft": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6" /></svg>;
     case "chevronRight": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6" /></svg>;
+    case "adminPanel": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M12 2L3 7v6c0 5.25 3.75 10 9 11 5.25-1 9-5.75 9-11V7l-9-5z" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" /></svg>;
+    case "key": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /></svg>;
     default: return null;
   }
 }
@@ -165,23 +182,31 @@ function NavLink({
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const projectMatch = pathname?.match(/^\/projects\/([^/]+)/);
   const projectId = projectMatch?.[1] ?? null;
   const isInProject = Boolean(projectId);
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
   const [projectName, setProjectName] = useState<string | null>(null);
+  const [projectType, setProjectType] = useState<ProjectType>("tesbox");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [navScope, setNavScope] = useState<NavScope>(isInProject ? "project" : "workspace");
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
 
   useEffect(() => {
     if (!projectId) return;
     let active = true;
     getProject(projectId)
-      .then((p) => { if (active) setProjectName((p.name as string) ?? "Project"); })
+      .then((p) => {
+        if (active) {
+          setProjectName((p.name as string) ?? "Project");
+          setProjectType(((p.projectType as string) ?? "tesbox") as ProjectType);
+        }
+      })
       .catch(() => { if (active) setProjectName("Project"); });
     return () => { active = false; };
   }, [projectId]);
@@ -190,6 +215,14 @@ export default function Sidebar() {
     if (!ENABLE_SCOPE_SWITCHER) return;
     setNavScope(isInProject ? "project" : "workspace");
   }, [isInProject]);
+
+  useEffect(() => {
+    let active = true;
+    authMe().then((data) => {
+      if (active && data?.isPlatformAdmin) setIsPlatformAdmin(true);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!ENABLE_SCOPE_SWITCHER) return;
@@ -209,7 +242,16 @@ export default function Sidebar() {
   const isOnProjectRoot = projectId != null && pathname === `/projects/${projectId}`;
   const isPathActive = (href: string) => {
     if (!pathname) return false;
-    return pathname === href || pathname.startsWith(`${href}/`);
+    const [cleanHref, queryStr] = href.split("?");
+    const pathMatch = pathname === cleanHref || pathname.startsWith(`${cleanHref}/`);
+    if (!pathMatch) return false;
+    if (queryStr) {
+      const hrefParams = new URLSearchParams(queryStr);
+      for (const [k, v] of hrefParams.entries()) {
+        if (searchParams.get(k) !== v) return false;
+      }
+    }
+    return true;
   };
 
   const onLogout = async () => {
@@ -313,11 +355,24 @@ export default function Sidebar() {
                 <option value="" disabled>
                   Select project
                 </option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
+                {projects.filter((p) => (p.projectType || "tesbox") === "tesbox").length > 0 && (
+                  <optgroup label="TesboX">
+                    {projects.filter((p) => (p.projectType || "tesbox") === "tesbox").map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {projects.filter((p) => p.projectType === "tesbox_executions").length > 0 && (
+                  <optgroup label="TesboX-Executions">
+                    {projects.filter((p) => p.projectType === "tesbox_executions").map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
             </div>
           )}
@@ -336,7 +391,7 @@ export default function Sidebar() {
         {showProjectNavigation ? (
           <>
             <div className="space-y-3">
-              {projectNavSections.map(({ section, items }) => (
+              {(projectType === "tesbox_executions" ? executionProjectNavSections : projectNavSections).map(({ section, items }) => (
                 <div key={section}>
                   {!isCollapsed && (
                     <p className="mb-1 px-3 text-[13px] font-semibold uppercase tracking-[0.08em] text-[var(--muted)]">
@@ -376,13 +431,15 @@ export default function Sidebar() {
                   </div>
                 </div>
               ))}
-              <NavLink
-                href={`${projectPathPrefix}/settings`}
-                label="Settings"
-                icon="settings"
-                active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
-                collapsed={isCollapsed}
-              />
+              {projectType !== "tesbox_executions" && (
+                <NavLink
+                  href={`${projectPathPrefix}/settings`}
+                  label="Settings"
+                  icon="settings"
+                  active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
+                  collapsed={isCollapsed}
+                />
+              )}
             </div>
           </>
         ) : null}
@@ -403,7 +460,16 @@ export default function Sidebar() {
         )}
       </nav>
 
-      <div className="border-t border-[var(--border-subtle)] p-2">
+      <div className="border-t border-[var(--border-subtle)] p-2 space-y-1">
+        {isPlatformAdmin && (
+          <NavLink
+            href="/admin"
+            label="Admin Panel"
+            icon="adminPanel"
+            active={pathname?.startsWith("/admin") ?? false}
+            collapsed={isCollapsed}
+          />
+        )}
         <button
           type="button"
           onClick={onLogout}
