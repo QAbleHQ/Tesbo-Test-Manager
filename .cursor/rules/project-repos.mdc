@@ -1,0 +1,27 @@
+---
+description: Project repository structure, product mapping, and deployment topology
+alwaysApply: true
+---
+
+# Project Repositories
+
+This workspace contains two separate products (each with its own git repo):
+
+| Product | Folders | Description |
+|---------|---------|-------------|
+| **TesboX** | `Tesbo-Backend/`, `Tesbo-Frontend/`, `Tesbo-Automation-Agents/` | Main platform — backend API, frontend UI, automation agents |
+| **TesboX-Runner** | `Tesbo-Execution/` (separate git repo) | Standalone test execution service — API + Playwright workers |
+
+## Deployment Topology
+
+| Product | Component | Target | Workflow |
+|---------|-----------|--------|----------|
+| **TesboX** | Frontend | Droplet (80→3000) | `.github/workflows/deploy.yml` |
+| **TesboX** | Backend | Droplet (80→7000) | `.github/workflows/deploy.yml` |
+| **TesboX** | Automation Agent | Droplet (80→7400) | `.github/workflows/deploy.yml` |
+| **TesboX-Runner** | Execution API | Droplet (80→7420) | `Tesbo-Execution/.github/workflows/deploy.yml` |
+| **TesboX-Runner** | Execution Workers | DOKS K8s (KEDA autoscale) | `Tesbo-Execution/.github/workflows/deploy.yml` |
+
+- All images stored in DigitalOcean Container Registry (DOCR).
+- TesboX and TesboX-Runner are independent products with separate deploy pipelines.
+- See `docs/deploy-guide.md` for secrets, setup, and verification steps.

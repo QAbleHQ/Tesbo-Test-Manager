@@ -1,6 +1,5 @@
 package com.bettercases.testexecution;
 
-import com.bettercases.Config;
 import com.bettercases.cycle.CycleRunScheduleService;
 
 import java.util.List;
@@ -22,23 +21,13 @@ public final class CycleScheduleWorker {
     }
 
     private static void pollAndRun() {
-        boolean isExternalMode = "external".equals(Config.EXECUTION_SERVICE_MODE);
-        if (!isExternalMode && "queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
-            AutomationExecutionQueueService.recoverStuckRunningJobs(Config.AUTOMATION_QUEUE_STALE_MINUTES);
-            AutomationExecutionDispatchService.dispatchAllProjectsWithPendingJobs();
-        }
         List<Map<String, Object>> due = CycleRunScheduleService.claimDueSchedules(10);
         for (Map<String, Object> schedule : due) {
             UUID scheduleId = UUID.fromString(String.valueOf(schedule.get("id")));
             UUID cycleId = UUID.fromString(String.valueOf(schedule.get("cycleId")));
             try {
-                if (isExternalMode || "queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
-                    CycleAutomationRunService.executeAutomatedAsyncInternal(cycleId, true);
-                    CycleRunScheduleService.finishRun(scheduleId, "queued", null);
-                } else {
-                    CycleAutomationRunService.executeAutomatedInternal(cycleId, true);
-                    CycleRunScheduleService.finishRun(scheduleId, "passed", null);
-                }
+                CycleAutomationRunService.executeAutomatedAsyncInternal(cycleId, true);
+                CycleRunScheduleService.finishRun(scheduleId, "queued", null);
             } catch (Exception e) {
                 CycleRunScheduleService.finishRun(scheduleId, "failed", e.getMessage());
             }

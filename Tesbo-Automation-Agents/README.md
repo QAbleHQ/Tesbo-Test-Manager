@@ -33,4 +33,4 @@ npm run dev
 - `POST /internal/playwright/run`
 - `GET /internal/sessions/:id/state`, `GET /internal/sessions/:id/live`, recording endpoints
 
-Queue execution lives in **`Tesbo-Test-Runner-Agents`**.
+Queued/scheduled execution lives in **Tesbo-Execution** (standalone execution service).

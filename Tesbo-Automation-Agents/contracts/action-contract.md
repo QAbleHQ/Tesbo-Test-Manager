@@ -1,6 +1,6 @@
 # Action Contract (MVP)
 
-This contract is shared between TesboX backend and `Tesbo-Automation-Agents` / `Tesbo-Test-Runner-Agents`.
+This contract is shared between TesboX backend and `Tesbo-Automation-Agents`.
 
 ## ActionPlan
 

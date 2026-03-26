@@ -2,11 +2,7 @@ package com.bettercases.cycle;
 
 import com.bettercases.audit.AuditService;
 import com.bettercases.auth.SessionFilter;
-import com.bettercases.automation.AutomationAgentClient;
 import com.bettercases.tesbo.TesboArtifactStorageService;
-import com.bettercases.testexecution.AutomationExecutionQueueService;
-import com.bettercases.testexecution.AutomationQueueAutoscalingService;
-import com.bettercases.testexecution.AutomationQueueMetricsService;
 import com.bettercases.testexecution.CycleAutomationRunService;
 import io.javalin.http.Context;
 
@@ -252,29 +248,6 @@ public final class CycleHandler {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID cycleId = UUID.fromString(ctx.pathParam("cycleId"));
         ctx.json(CycleAutomationRunService.getLatestRunStatus(cycleId, userId));
-    }
-
-    public static void queueMetrics(Context ctx) {
-        SessionFilter.requireUserId(ctx);
-        ctx.json(Map.of(
-                "queue", safeQueueStats(),
-                "runs", AutomationQueueMetricsService.currentRunMetrics(),
-                "pendingBullDispatch", AutomationExecutionQueueService.countGlobalPendingBullDispatch(),
-                "autoscaling", AutomationQueueAutoscalingService.recommendWorkers()
-        ));
-    }
-
-    public static void autoscalingRecommendation(Context ctx) {
-        SessionFilter.requireUserId(ctx);
-        ctx.json(AutomationQueueAutoscalingService.recommendWorkers());
-    }
-
-    private static Map<String, Object> safeQueueStats() {
-        try {
-            return AutomationAgentClient.queueStats();
-        } catch (Exception e) {
-            return Map.of("status", "unavailable", "error", e.getMessage());
-        }
     }
 
     /* ───── LIST schedules ───── */

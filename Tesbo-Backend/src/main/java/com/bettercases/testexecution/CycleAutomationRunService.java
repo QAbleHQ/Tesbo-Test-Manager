@@ -19,11 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public final class CycleAutomationRunService {
-    private static final ExecutorService RUNNER_EXECUTOR = Executors.newCachedThreadPool();
     private static final ObjectMapper mapper = new ObjectMapper();
 
     public static Map<String, Object> executeAutomated(UUID cycleId, UUID userId, boolean strictAutomatedOnly) {
@@ -68,92 +65,37 @@ public final class CycleAutomationRunService {
         if (rows.stream().noneMatch(r -> r.script() != null && !r.script().isBlank())) {
             throw new io.javalin.http.BadRequestResponse("No automated test cases found in this test run.");
         }
-        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
-            markManualRequiredNotes(rows);
-            UUID projectId = CycleService.getProjectIdForCycle(cycleId);
-            return ExternalExecutionServiceClient.submitRun(
-                    cycleId,
-                    rows,
-                    automationConfig,
-                    Config.AUTOMATION_QUEUE_MAX_RETRIES,
-                    projectId
-            );
-        }
-        if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE)) {
-            assertQueueExecutionAvailable();
-            markManualRequiredNotes(rows);
-            UUID projectId = CycleService.getProjectIdForCycle(cycleId);
-            return AutomationExecutionOrchestratorService.enqueueRun(
-                    projectId,
-                    cycleId,
-                    rows,
-                    automationConfig,
-                    Config.AUTOMATION_QUEUE_MAX_RETRIES
-            );
-        }
-        UUID runId = CycleAutomationRunTracker.start(cycleId, rows);
-        RUNNER_EXECUTOR.submit(() -> {
-            try {
-                runRows(cycleId, strictAutomatedOnly, rows, runId, automationConfig);
-                CycleAutomationRunTracker.complete(runId);
-            } catch (Exception e) {
-                CycleAutomationRunTracker.fail(runId, e.getMessage());
-            }
-        });
-        return Map.of(
-                "runId", runId.toString(),
-                "cycleId", cycleId.toString(),
-                "status", "running",
-                "totalCases", rows.size()
+        markManualRequiredNotes(rows);
+        UUID projectId = CycleService.getProjectIdForCycle(cycleId);
+        return ExternalExecutionServiceClient.submitRun(
+                cycleId,
+                rows,
+                automationConfig,
+                Config.AUTOMATION_QUEUE_MAX_RETRIES,
+                projectId
         );
     }
 
     public static Map<String, Object> getRunStatus(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
-        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
-            return ExternalExecutionServiceClient.getRunStatus(runId.toString());
-        }
-        if (AutomationExecutionQueueService.exists(cycleId, runId)) {
-            return AutomationExecutionQueueService.snapshot(cycleId, runId);
-        }
-        return CycleAutomationRunTracker.snapshot(cycleId, runId);
+        return ExternalExecutionServiceClient.getRunStatus(runId.toString());
     }
 
     public static Map<String, Object> getLatestRunStatus(UUID cycleId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
-        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
-            return ExternalExecutionServiceClient.getLatestRunByExternalRef(cycleId.toString());
-        }
-        UUID runId = AutomationExecutionQueueService.findLatestRunId(cycleId);
-        if (runId == null) {
-            throw new io.javalin.http.NotFoundResponse("No automated run found.");
-        }
-        return AutomationExecutionQueueService.snapshot(cycleId, runId);
+        return ExternalExecutionServiceClient.getLatestRunByExternalRef(cycleId.toString());
     }
 
     public static void cancelRun(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
-        if ("external".equals(Config.EXECUTION_SERVICE_MODE)) {
-            try {
-                ExternalExecutionServiceClient.cancelRun(runId.toString());
-            } catch (Exception ignored) {
-                // Cancellation on external service is best-effort.
-            }
-            return;
+        try {
+            ExternalExecutionServiceClient.cancelRun(runId.toString());
+        } catch (Exception ignored) {
+            // Cancellation on external service is best-effort.
         }
-        if ("queue".equals(Config.AUTOMATION_EXECUTION_MODE) && AutomationExecutionQueueService.exists(cycleId, runId)) {
-            AutomationExecutionQueueService.cancelRun(cycleId, runId, "Cancelled by user");
-            try {
-                AutomationAgentClient.cancelRunQueue(runId);
-            } catch (Exception ignored) {
-                // Cancellation in queue backend is best-effort.
-            }
-            return;
-        }
-        throw new io.javalin.http.BadRequestResponse("Run cancellation is not available for legacy mode.");
     }
 
     static Map<String, Object> executeAutomatedInternal(UUID cycleId, boolean strictAutomatedOnly) {
@@ -276,16 +218,6 @@ public final class CycleAutomationRunService {
                 "failed", failed,
                 "completedAt", Instant.now().toString()
         );
-    }
-
-    private static void assertQueueExecutionAvailable() {
-        try {
-            AutomationAgentClient.queueStats();
-        } catch (Exception e) {
-            throw new io.javalin.http.ServiceUnavailableResponse(
-                    "Automation queue worker is unavailable. Start Tesbo-Test-Runner-Agents with queue enabled."
-            );
-        }
     }
 
     static CycleAutomationConfig resolveCycleAutomationConfig(UUID cycleId) {
