@@ -1,9 +1,12 @@
 package com.bettercases.project;
 
 import com.bettercases.auth.SessionFilter;
+import com.bettercases.rbac.RbacService;
+import com.bettercases.rbac.Role;
 import com.bettercases.testexecution.ExternalExecutionServiceClient;
 import com.bettercases.workspace.WorkspaceService;
 import io.javalin.http.Context;
+import io.javalin.http.ForbiddenResponse;
 
 import java.util.Map;
 import java.util.UUID;
@@ -78,29 +81,36 @@ public final class ProjectHandler {
     }
 
     public static void listApiKeys(Context ctx) {
-        SessionFilter.requireUserId(ctx);
-        String projectId = ctx.pathParam("id");
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("id"));
+        Role role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canManageProject()) throw new ForbiddenResponse("Cannot manage project API keys");
         try {
-            ctx.json(ExternalExecutionServiceClient.listApiKeys(projectId));
+            ctx.json(ExternalExecutionServiceClient.listApiKeys(projectId.toString()));
         } catch (Exception e) {
             ctx.status(502).json(Map.of("error", "Failed to reach execution service", "detail", e.getMessage()));
         }
     }
 
     public static void createApiKey(Context ctx) {
-        SessionFilter.requireUserId(ctx);
-        String projectId = ctx.pathParam("id");
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("id"));
+        Role role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canManageProject()) throw new ForbiddenResponse("Cannot manage project API keys");
         CreateApiKeyBody body = ctx.bodyAsClass(CreateApiKeyBody.class);
         String keyName = (body != null && body.name != null && !body.name.isBlank()) ? body.name : "Default key";
         try {
-            ctx.status(201).json(ExternalExecutionServiceClient.createApiKey(projectId, keyName));
+            ctx.status(201).json(ExternalExecutionServiceClient.createApiKey(projectId.toString(), keyName));
         } catch (Exception e) {
             ctx.status(502).json(Map.of("error", "Failed to reach execution service", "detail", e.getMessage()));
         }
     }
 
     public static void revokeApiKey(Context ctx) {
-        SessionFilter.requireUserId(ctx);
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("id"));
+        Role role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canManageProject()) throw new ForbiddenResponse("Cannot manage project API keys");
         String keyId = ctx.pathParam("keyId");
         try {
             ctx.json(ExternalExecutionServiceClient.revokeApiKey(keyId));

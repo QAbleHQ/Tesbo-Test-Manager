@@ -8,6 +8,7 @@ import io.javalin.http.Context;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Instant;
@@ -125,7 +126,11 @@ public final class ExecutionServiceWebhookHandler {
 
     private static boolean verifySignature(Context ctx) {
         String secret = Config.EXECUTION_SERVICE_WEBHOOK_SECRET;
-        if (secret == null || secret.isBlank()) return true;
+        if (secret == null || secret.isBlank()) {
+            System.err.println("WARN: EXECUTION_SERVICE_WEBHOOK_SECRET is not configured – rejecting webhook request. "
+                    + "Set the secret to enable execution-service webhooks.");
+            return false;
+        }
 
         String signature = ctx.header("x-webhook-signature");
         if (signature == null || signature.isBlank()) return false;
@@ -135,7 +140,9 @@ public final class ExecutionServiceWebhookHandler {
             mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             byte[] hash = mac.doFinal(ctx.body().getBytes(StandardCharsets.UTF_8));
             String expected = bytesToHex(hash);
-            return expected.equalsIgnoreCase(signature);
+            return MessageDigest.isEqual(
+                    expected.toLowerCase().getBytes(StandardCharsets.UTF_8),
+                    signature.toLowerCase().getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             return false;
         }
