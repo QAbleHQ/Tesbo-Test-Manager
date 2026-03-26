@@ -1,3 +1,7 @@
+# Kubernetes secrets (contain real credentials)
+infra/kubernetes/**/secret.yaml
+infra/kubernetes/base/registry-secret.yaml
+
 # Root-level dependencies
 /node_modules/
 /Tesbo-Test-Runner-Agents/node_modules/

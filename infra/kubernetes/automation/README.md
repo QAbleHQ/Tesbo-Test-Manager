@@ -1,44 +1,44 @@
 # Automation Execution Plane (K8s)
 
-This folder deploys the queue-based execution plane as separate services:
+Deploys the queue-based test execution plane to DigitalOcean Kubernetes:
 
-- `automation-api` (enqueue/cancel/stats API gateway)
-- `automation-worker` (queue consumers only)
-- `ScaledObject` for autoscaling workers from Redis queue depth
+- `automation-api` — HTTP gateway for enqueue/cancel/stats (port 7410, LoadBalancer)
+- `automation-worker` — BullMQ consumers running Playwright browser jobs (port 7411)
+- `keda-trigger-auth` — KEDA authentication to TLS Redis
+- `worker-scaledobject` — KEDA autoscaler: 0→50 workers based on Redis queue depth
 
-## Prerequisites
+## How It Connects to the Droplet Architecture
 
-- Kubernetes cluster
-- [KEDA](https://keda.sh/) installed
-- Redis reachable by worker pods and KEDA trigger
-- Secret `automation-secrets` in `bettercases-automation` namespace
+The backend runs on a **DigitalOcean droplet** (not in this cluster). Communication:
 
-Required secret keys:
+- **Backend droplet → automation-api**: via the LoadBalancer external IP (`http://<LB-IP>:7410`)
+- **automation-worker → Backend droplet**: via `BACKEND_BASE_URL` (e.g. `http://<DROPLET-IP>:80`)
+- **Both → Redis**: via DO Managed Redis (`rediss://...ondigitalocean.com:25061`)
 
-- `redis-url`
-- `backend-base-url`
-- `queue-shared-token`
-- `agent-shared-token`
+## Secret Keys
 
-## Apply
+Secret `automation-secrets` in `bettercases-automation` namespace:
+
+| Key | Description |
+|-----|-------------|
+| `redis-url` | Full Redis connection URL (`rediss://...`) |
+| `redis-password` | Redis password only (for KEDA trigger) |
+| `backend-base-url` | Backend droplet URL (e.g. `http://DROPLET_IP:80`) |
+| `queue-shared-token` | Must match backend `AUTOMATION_QUEUE_SHARED_TOKEN` |
+| `agent-shared-token` | Must match backend `AUTOMATION_AGENT_SHARED_TOKEN` |
+
+## After First Deploy
+
+1. Get the LoadBalancer IP:
 
 ```bash
-kubectl apply -f infra/kubernetes/automation/namespace.yaml
-kubectl -n bettercases-automation create secret generic automation-secrets \
-  --from-literal=redis-url='redis://redis:6379' \
-  --from-literal=backend-base-url='http://backend.default.svc.cluster.local:7000' \
-  --from-literal=queue-shared-token='change-me' \
-  --from-literal=agent-shared-token='change-me'
-kubectl apply -f infra/kubernetes/automation/api-deployment.yaml
-kubectl apply -f infra/kubernetes/automation/api-service.yaml
-kubectl apply -f infra/kubernetes/automation/worker-deployment.yaml
-kubectl apply -f infra/kubernetes/automation/worker-scaledobject.yaml
+kubectl -n bettercases-automation get svc automation-api
 ```
 
-## Important
+2. Update the backend droplet config:
 
-- Update image references (`REPLACE_ME`) before apply.
-- Set `worker-scaledobject.yaml` `address` to your Redis endpoint.
-- Backend should use `AUTOMATION_QUEUE_API_BASE_URL=http://automation-api.bettercases-automation.svc.cluster.local:7400`.
-- If you change queue prefix or queue name, update `worker-scaledobject.yaml` `listName` to match:
-  - `<prefix>:<queueName>:wait` (example: `bull:automation-execution-jobs:wait`).
+```
+AUTOMATION_QUEUE_API_BASE_URL=http://<EXTERNAL-IP>:7410
+```
+
+3. Restart the backend container on the droplet to pick up the new URL.

@@ -3,20 +3,29 @@ kind: Deployment
 metadata:
   name: automation-api
   namespace: bettercases-automation
+  labels:
+    app: automation-api
+    app.kubernetes.io/part-of: tesbo
 spec:
   replicas: 2
   selector:
     matchLabels:
       app: automation-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         app: automation-api
     spec:
+      imagePullSecrets:
+        - name: docr-registry
       containers:
         - name: automation-api
-          # Tesbo-Test-Runner-Agents queue HTTP API (enqueue/cancel/stats). Session/automate API is a separate deployment (Tesbo-Automation-Agents, port 7400).
-          image: registry.digitalocean.com/REPLACE_ME/tesbo-test-runner-agents:latest
+          image: registry.digitalocean.com/bettercases/tesbo-test-runner-agents:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 7410
@@ -51,6 +60,13 @@ spec:
                 secretKeyRef:
                   name: automation-secrets
                   key: agent-shared-token
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
           readinessProbe:
             httpGet:
               path: /health

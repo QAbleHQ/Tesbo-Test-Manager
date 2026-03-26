@@ -13,6 +13,10 @@ spec:
   triggers:
     - type: redis
       metadata:
-        address: REDIS_ADDRESS_REPLACE_ME
+        address: tesbo-redis-do-user-19433638-0.a.db.ondigitalocean.com:25061
         listName: bull:automation-execution-jobs:wait
         listLength: "2"
+        enableTLS: "true"
+        unsafeSsl: "true"
+      authenticationRef:
+        name: redis-trigger-auth

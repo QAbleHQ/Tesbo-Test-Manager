@@ -3,6 +3,9 @@ kind: Deployment
 metadata:
   name: automation-worker
   namespace: bettercases-automation
+  labels:
+    app: automation-worker
+    app.kubernetes.io/part-of: tesbo
 spec:
   replicas: 0
   selector:
@@ -13,16 +16,21 @@ spec:
       labels:
         app: automation-worker
     spec:
+      imagePullSecrets:
+        - name: docr-registry
       containers:
         - name: automation-worker
-          # Tesbo-Test-Runner-Agents BullMQ worker (same image as queue API).
-          image: registry.digitalocean.com/REPLACE_ME/tesbo-test-runner-agents:latest
+          image: registry.digitalocean.com/bettercases/tesbo-test-runner-agents:latest
           imagePullPolicy: Always
+          ports:
+            - containerPort: 7411
           env:
             - name: PORT
               value: "7411"
             - name: AUTOMATION_SERVICE_ROLE
               value: "worker"
+            - name: PLAYWRIGHT_HEADLESS
+              value: "true"
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
@@ -36,6 +44,8 @@ spec:
               value: "true"
             - name: AUTOMATION_QUEUE_CONCURRENCY
               value: "2"
+            - name: AUTOMATION_QUEUE_HEARTBEAT_MS
+              value: "5000"
             - name: BACKEND_BASE_URL
               valueFrom:
                 secretKeyRef:
@@ -51,6 +61,16 @@ spec:
                 secretKeyRef:
                   name: automation-secrets
                   key: agent-shared-token
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
           readinessProbe:
             httpGet:
               path: /health
@@ -63,3 +83,7 @@ spec:
               port: 7411
             initialDelaySeconds: 20
             periodSeconds: 20
+      volumes:
+        - name: artifacts
+          emptyDir:
+            sizeLimit: 2Gi

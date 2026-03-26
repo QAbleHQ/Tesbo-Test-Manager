@@ -1,0 +1,111 @@
+name: Deploy Execution Plane to Kubernetes
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ${{ secrets.DOCR_REGISTRY }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ── Build & Push Test-Runner Image ───────────────────────────────────
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Login to DOCR
+        run: doctl registry login --expiry-seconds 1200
+
+      - name: Build and push test-runner-agents
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${{ secrets.DOCR_REPO_AUTOMATION }}"
+          docker build -f Tesbo-Test-Runner-Agents/Dockerfile \
+            -t "${IMAGE}:${IMAGE_TAG}" \
+            Tesbo-Test-Runner-Agents
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          docker tag "${IMAGE}:${IMAGE_TAG}" "${IMAGE}:latest"
+          docker push "${IMAGE}:latest"
+
+  # ── Deploy to Kubernetes ─────────────────────────────────────────────
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Configure kubectl
+        run: doctl kubernetes cluster kubeconfig save ${{ secrets.DO_K8S_CLUSTER_NAME }}
+
+      # ── Namespace ───────────────────────────────────────────────────
+      - name: Create namespace
+        run: kubectl apply -f infra/kubernetes/automation/namespace.yaml
+
+      # ── Image Pull Secret (idempotent) ──────────────────────────────
+      - name: Create DOCR pull secret
+        run: |
+          kubectl -n bettercases-automation create secret docker-registry docr-registry \
+            --docker-server=registry.digitalocean.com \
+            --docker-username="${{ secrets.DO_API_TOKEN }}" \
+            --docker-password="${{ secrets.DO_API_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ── Sync Secrets from GitHub → K8s ──────────────────────────────
+      - name: Sync automation secrets
+        run: |
+          kubectl -n bettercases-automation create secret generic automation-secrets \
+            --from-literal=redis-url='${{ secrets.REDIS_URL }}' \
+            --from-literal=backend-base-url='${{ secrets.BACKEND_BASE_URL }}' \
+            --from-literal=queue-shared-token='${{ secrets.AUTOMATION_QUEUE_SHARED_TOKEN }}' \
+            --from-literal=agent-shared-token='${{ secrets.AGENT_SHARED_TOKEN }}' \
+            --from-literal=redis-password='${{ secrets.REDIS_PASSWORD }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ── Deploy API Gateway ─────────────────────────────────────────
+      - name: Deploy automation API
+        run: |
+          kubectl apply -f infra/kubernetes/automation/api-service.yaml
+          kubectl apply -f infra/kubernetes/automation/api-deployment.yaml
+          kubectl -n bettercases-automation set image deployment/automation-api \
+            automation-api="${REGISTRY}/${{ secrets.DOCR_REPO_AUTOMATION }}:${IMAGE_TAG}"
+          kubectl -n bettercases-automation rollout status deployment/automation-api --timeout=300s
+
+      # ── Deploy Workers + KEDA ───────────────────────────────────────
+      - name: Deploy automation workers
+        run: |
+          kubectl apply -f infra/kubernetes/automation/worker-deployment.yaml
+          kubectl apply -f infra/kubernetes/automation/keda-trigger-auth.yaml
+          kubectl apply -f infra/kubernetes/automation/worker-scaledobject.yaml
+          kubectl -n bettercases-automation set image deployment/automation-worker \
+            automation-worker="${REGISTRY}/${{ secrets.DOCR_REPO_AUTOMATION }}:${IMAGE_TAG}"
+
+      # ── Verify ──────────────────────────────────────────────────────
+      - name: Verify deployment
+        run: |
+          echo "=== Pods ==="
+          kubectl -n bettercases-automation get pods -o wide
+          echo ""
+          echo "=== Services ==="
+          kubectl -n bettercases-automation get svc
+          echo ""
+          echo "=== ScaledObject ==="
+          kubectl -n bettercases-automation get scaledobject
+          echo ""
+          echo "=== automation-api external IP ==="
+          kubectl -n bettercases-automation get svc automation-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+          echo ""
+          echo ""
+          echo "Set AUTOMATION_QUEUE_API_BASE_URL on your backend droplet to:"
+          echo "  http://<EXTERNAL-IP>:7410"
