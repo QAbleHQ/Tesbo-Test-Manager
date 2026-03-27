@@ -41,12 +41,6 @@ public final class SystemHealthHandler {
         services.put("automation_agent", automationStatus);
         if (!"up".equals(automationStatus.get("status"))) allUp = false;
 
-        // Test Runner API
-        Map<String, Object> testRunnerStatus = probeHttp("test_runner_api",
-                Config.AUTOMATION_QUEUE_API_BASE_URL + "/health");
-        services.put("test_runner_api", testRunnerStatus);
-        if (!"up".equals(testRunnerStatus.get("status"))) allUp = false;
-
         // Artifact Storage
         Map<String, Object> storageStatus = probeArtifactStorage();
         services.put("artifact_storage", storageStatus);

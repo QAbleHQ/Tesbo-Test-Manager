@@ -1,7 +1,6 @@
 package com.bettercases.automation;
 
 import com.bettercases.Config;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -12,7 +11,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -169,59 +167,12 @@ public final class AutomationAgentClient {
         }
     }
 
-    public static Map<String, Object> enqueueAutomationJob(Map<String, Object> payload) {
-        String body = sendQueue("/internal/queue/jobs", "POST", payload);
-        try {
-            return mapper.readValue(body, new TypeReference<>() {});
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse automation queue enqueue response", e);
-        }
-    }
-
-    public static List<Map<String, Object>> enqueueAutomationJobsBatch(List<Map<String, Object>> jobs) {
-        if (jobs == null || jobs.isEmpty()) {
-            return List.of();
-        }
-        Map<String, Object> body = new HashMap<>();
-        body.put("jobs", jobs);
-        String response = sendQueue("/internal/queue/jobs/batch", "POST", body, Duration.ofMinutes(3));
-        try {
-            Map<String, Object> root = mapper.readValue(response, new TypeReference<>() {});
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> results = (List<Map<String, Object>>) root.get("results");
-            return results != null ? results : List.of();
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse automation queue batch enqueue response", e);
-        }
-    }
-
-    public static void cancelRunQueue(UUID runId) {
-        sendQueue("/internal/queue/runs/" + runId + "/cancel", "POST", Map.of());
-    }
-
-    public static Map<String, Object> queueStats() {
-        String body = sendQueue("/internal/queue/stats", "GET", null, Duration.ofSeconds(5));
-        try {
-            return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse automation queue stats", e);
-        }
-    }
-
     private static String send(String path, String method, Object payload) {
         return send(path, method, payload, Duration.ofSeconds(40));
     }
 
     private static String send(String path, String method, Object payload, Duration timeout) {
         return send(Config.AUTOMATION_AGENT_BASE_URL, path, method, payload, timeout);
-    }
-
-    private static String sendQueue(String path, String method, Object payload) {
-        return sendQueue(path, method, payload, Duration.ofSeconds(40));
-    }
-
-    private static String sendQueue(String path, String method, Object payload, Duration timeout) {
-        return send(Config.AUTOMATION_QUEUE_API_BASE_URL, path, method, payload, timeout);
     }
 
     private static String send(String baseUrl, String path, String method, Object payload, Duration timeout) {

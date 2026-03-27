@@ -1533,22 +1533,6 @@ export async function getLatestAutomatedRunStatus(cycleId: string): Promise<Auto
   return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/latest/status`);
 }
 
-export interface AutomationAutoscalingRecommendation {
-  desiredWorkers: number;
-  minWorkers: number;
-  maxWorkers: number;
-  targetJobsPerWorker: number;
-  warmWorkers: number;
-  queuedJobs: number;
-  runningJobs: number;
-  activeRuns: number;
-  scaleReason: string;
-}
-
-export async function getAutomationAutoscalingRecommendation(): Promise<AutomationAutoscalingRecommendation> {
-  return api<AutomationAutoscalingRecommendation>("/api/internal/automation/autoscaling-recommendation");
-}
-
 export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {
   return api<TestRunSchedule[]>(`/api/projects/${projectId}/cycles/schedules`);
 }

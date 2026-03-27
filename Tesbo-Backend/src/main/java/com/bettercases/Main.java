@@ -14,8 +14,6 @@ import com.bettercases.tesbo.TesboReportsHandler;
 import com.bettercases.testcase.TestCaseHandler;
 import com.bettercases.plan.PlanHandler;
 import com.bettercases.cycle.CycleHandler;
-import com.bettercases.testexecution.AutomationInternalMetricsHandler;
-import com.bettercases.testexecution.AutomationQueueCallbackHandler;
 import com.bettercases.testexecution.ExecutionServiceWebhookHandler;
 import com.bettercases.testexecution.CycleScheduleWorker;
 import com.bettercases.workspace.WorkspaceHandler;
@@ -157,9 +155,6 @@ public final class Main {
         app.get("/api/cycles/{cycleId}/execute-automated/latest/status", CycleHandler::getLatestAutomatedRunStatus);
         app.get("/api/cycles/{cycleId}/execute-automated/{runId}/status", CycleHandler::getAutomatedRunStatus);
         app.post("/api/cycles/{cycleId}/execute-automated/{runId}/cancel", CycleHandler::cancelAutomatedRun);
-        app.get("/api/internal/automation/queue-metrics", CycleHandler::queueMetrics);
-        app.get("/api/internal/automation/autoscaling-recommendation", CycleHandler::autoscalingRecommendation);
-        app.get("/api/internal/automation/execution-pool-snapshot", AutomationInternalMetricsHandler::executionPoolSnapshot);
         app.post("/api/cycles/{cycleId}/share", CycleHandler::toggleShare);
         app.get("/api/projects/{projectId}/cycles/schedules", CycleHandler::listSchedules);
         app.post("/api/projects/{projectId}/cycles/schedules", CycleHandler::createSchedule);
@@ -170,13 +165,7 @@ public final class Main {
         app.get("/api/public/shared-runs/{token}", CycleHandler::getPublicRun);
         app.get("/api/public/shared-runs/{token}/executions", CycleHandler::getPublicExecutions);
 
-        // Internal queue callbacks (worker -> backend, legacy mode)
-        app.post("/api/internal/automation/jobs/{jobId}/start", AutomationQueueCallbackHandler::start);
-        app.post("/api/internal/automation/jobs/{jobId}/heartbeat", AutomationQueueCallbackHandler::heartbeat);
-        app.post("/api/internal/automation/jobs/{jobId}/complete", AutomationQueueCallbackHandler::complete);
-        app.post("/api/internal/automation/jobs/{jobId}/fail", AutomationQueueCallbackHandler::fail);
-
-        // External Execution Service webhook endpoint (external mode)
+        // Execution Service webhook endpoint
         app.post("/api/webhooks/execution-service", ExecutionServiceWebhookHandler::handle);
 
         app.get("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::list);

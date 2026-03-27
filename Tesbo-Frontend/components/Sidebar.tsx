@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { authMe, getProject, listProjects, logout, type ProjectSummary, type ProjectType } from "@/lib/api";
 
 type NavItemConfig = {
@@ -179,7 +179,7 @@ function NavLink({
   );
 }
 
-export default function Sidebar() {
+function SidebarContent() {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -491,5 +491,13 @@ export default function Sidebar() {
         )}
       </div>
     </aside>
+  );
+}
+
+export default function Sidebar() {
+  return (
+    <Suspense>
+      <SidebarContent />
+    </Suspense>
   );
 }

@@ -1,97 +1,159 @@
-## TesboX DigitalOcean CI/CD Guide
+## TesboX & TesboX-Runner — DigitalOcean Deploy Guide
 
-### Overview
-- Images are built from `Tesbo-Frontend/Dockerfile`, `Tesbo-Backend/Dockerfile`, `Tesbo-Test-Runner-Agents/Dockerfile`, and `Tesbo-Automation-Agents/Dockerfile`, pushed to DOCR, then deployed via Docker Compose on each droplet.
-- Backend, frontend, and automation services are deployed on separate droplets using files in `deploy/Tesbo-Backend/`, `deploy/Tesbo-Frontend/`, and `deploy/automation/`.
-- PostgreSQL is external (managed DB or self-hosted) and configured through `DATABASE_*` env vars.
-- Artifact storage supports `local` or DigitalOcean Spaces (`TESBO_*` keys).
+---
 
-### Required GitHub secrets
-- `DO_API_TOKEN`
-- `DOCR_REGISTRY` (example: `registry.digitalocean.com/your-registry`)
-- `DOCR_REPO_FRONTEND`, `DOCR_REPO_BACKEND`, `DOCR_REPO_AUTOMATION` (test-runner / queue image), `DOCR_REPO_AUTOMATION_AGENT` (session / automate image)
-- `DROPLET_FRONTEND_IP`, `DROPLET_BACKEND_IP`, `DROPLET_AUTOMATION_IP`
-- `SSH_PRIVATE_KEY`
-- `NEXT_PUBLIC_API_URL` (example: `https://api.yourdomain.com`)
+### Architecture Overview
+
+| Product | Component | Target | Port |
+|---------|-----------|--------|------|
+| **TesboX** | Frontend | Droplet (Docker Compose) | 80 → 3000 |
+| **TesboX** | Backend | Droplet (Docker Compose) | 80 → 7000 |
+| **TesboX** | Automation Agent | Droplet (Docker Compose) | 80 → 7400 |
+| **TesboX-Runner** | Execution API | Droplet (Docker Compose) | 80 → 7420 |
+| **TesboX-Runner** | Execution Workers | DOKS Kubernetes (KEDA autoscale) | 7411 |
+
+All images are stored in DigitalOcean Container Registry (DOCR).
+
+---
+
+### 1. TesboX (Main Platform)
+
+**Workflow:** `.github/workflows/deploy.yml` — manual trigger (`workflow_dispatch`)
+
+#### Required GitHub Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `DO_API_TOKEN` | DigitalOcean API token |
+| `DOCR_REGISTRY` | e.g. `registry.digitalocean.com/your-registry` |
+| `DOCR_REPO_FRONTEND` | Frontend image repo name |
+| `DOCR_REPO_BACKEND` | Backend image repo name |
+| `DOCR_REPO_AUTOMATION_AGENT` | Automation agent image repo name |
+| `DROPLET_FRONTEND_IP` | Frontend droplet IP |
+| `DROPLET_BACKEND_IP` | Backend droplet IP |
+| `DROPLET_AUTOMATION_AGENT_IP` | Automation agent droplet IP |
+| `SSH_PRIVATE_KEY` | SSH key for droplet access |
+| `NEXT_PUBLIC_API_URL` | e.g. `https://api.yourdomain.com` |
+| `AGENT_SHARED_TOKEN` | Shared token between backend ↔ automation agent |
 
 Backend runtime secrets:
 - `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`
-- `CORS_ALLOWED_ORIGINS`, `FRONTEND_URL`
-- `SESSION_DAYS`
+- `CORS_ALLOWED_ORIGINS`, `FRONTEND_URL`, `SESSION_DAYS`
 - `POSTMARK_API_TOKEN`, `POSTMARK_FROM_EMAIL`
 - `JIRA_CLIENT_ID`, `JIRA_CLIENT_SECRET`, `JIRA_REDIRECT_URI`
-- `TESBO_ARTIFACT_STORAGE_PROVIDER`
-- `TESBO_SPACES_ENDPOINT`, `TESBO_SPACES_REGION`, `TESBO_SPACES_BUCKET`
-- `TESBO_SPACES_ACCESS_KEY`, `TESBO_SPACES_SECRET_KEY`
-- `TESBO_SIGNED_URL_TTL_SECONDS`
-- `AUTOMATION_AGENT_BASE_URL` (automation session API)
-- `AUTOMATION_QUEUE_API_BASE_URL` (queue enqueue/cancel/stats API; can be separate service)
-- `AUTOMATION_AGENT_SHARED_TOKEN` (must match automation `AGENT_SHARED_TOKEN`)
-- `AUTOMATION_QUEUE_SHARED_TOKEN`
-- `AUTOMATION_QUEUE_MAX_ACTIVE_RUNS_PER_PROJECT`
-- `AUTOMATION_QUEUE_MAX_QUEUED_JOBS_PER_PROJECT`
-- `AUTOMATION_QUEUE_AUTOSCALE_MIN_WORKERS`
-- `AUTOMATION_QUEUE_AUTOSCALE_MAX_WORKERS`
-- `AUTOMATION_QUEUE_AUTOSCALE_TARGET_JOBS_PER_WORKER`
-- `AUTOMATION_QUEUE_AUTOSCALE_WARM_WORKERS`
+- `TESBO_ARTIFACT_STORAGE_PROVIDER`, `TESBO_SPACES_*`
+- `AUTOMATION_AGENT_BASE_URL`, `AUTOMATION_QUEUE_MAX_RETRIES`
+- `EXECUTION_SERVICE_BASE_URL`, `EXECUTION_SERVICE_API_KEY`
+- `EXECUTION_SERVICE_WEBHOOK_URL`, `EXECUTION_SERVICE_WEBHOOK_SECRET`
 
-Automation runtime secrets:
-- `REDIS_URL`
-- `BACKEND_BASE_URL`
-- `AGENT_SHARED_TOKEN`
-- `AUTOMATION_QUEUE_SHARED_TOKEN`
-- `AUTOMATION_QUEUE_PREFIX`
-- `AUTOMATION_QUEUE_NAME`
-- `AUTOMATION_QUEUE_MAX_RETRIES`
+#### Deploy Flow
 
-### Droplet prep (run once)
-1. Install Docker and Compose plugin:
-   - `curl -fsSL https://get.docker.com | sh`
-2. Ensure the deploy SSH key is present for the target user (`root` in the current workflow).
-3. Open ports `22`, `80`, and `443` in firewall rules.
+1. Add/update all GitHub secrets.
+2. Trigger **Deploy TesboX to DigitalOcean** from GitHub Actions.
+3. Workflow builds and pushes Frontend, Backend, Automation Agent images (tagged `sha` + `latest`).
+4. Deploys each to its droplet via SSH + Docker Compose.
 
-### Deploy flow
-1. Add/update all required GitHub secrets.
-2. Trigger `Deploy TesboX to DigitalOcean` from GitHub Actions (`workflow_dispatch`).
-3. Workflow builds and pushes `Tesbo-Frontend`, `Tesbo-Backend`, `Tesbo-Test-Runner-Agents`, and `Tesbo-Automation-Agents` images tagged with commit SHA and `latest`.
-4. Workflow copies compose files to:
-   - Frontend: `/opt/bettercases/frontend`
-   - Backend: `/opt/bettercases/backend`
-   - Automation: `/opt/bettercases/automation`
-5. Workflow writes `.env` and `app.env`, then runs:
-   - `docker compose pull`
-   - `docker compose up -d --remove-orphans`
+#### Droplet Prep (run once per droplet)
 
-### Manual verification
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+
+Open firewall ports: `22`, `80`, `443`.
+
+#### Verification
+
 - Frontend: `http://<frontend-ip>/`
 - Backend health: `http://<backend-ip>/health`
-- Backend API example: `http://<backend-ip>/api/auth/me`
+- Automation Agent: `http://<agent-ip>/health`
 
-### Manual redeploy by image tag
-On each droplet set `IMAGE_TAG=<tag>` in `/opt/bettercases/<service>/.env`, then run:
-- `docker compose pull`
-- `docker compose up -d --remove-orphans`
+---
 
-### Agent cache note (DigitalOcean)
-- DB persistence is enabled for automation agent action trace/events (handled by backend automation session events).
-- If you rotate droplets without persistent volumes, DB action trace remains available.
+### 2. TesboX-Runner (Execution Service)
 
-### Queue execution split services (recommended)
+**Repo:** `Tesbo-Execution/` (separate git repo)
+**Workflow:** `Tesbo-Execution/.github/workflows/deploy.yml` — manual trigger with target selector (`all`, `api-only`, `workers-only`)
 
-- Deploy `Tesbo-Automation-Agents` for sessions/live/automate (port 7400).
-- Deploy `Tesbo-Test-Runner-Agents` in two roles:
-  - `AUTOMATION_SERVICE_ROLE=api` for queue API (port 7410)
-  - `AUTOMATION_SERVICE_ROLE=worker` for queue processing only
-- Point backend to:
-  - `AUTOMATION_AGENT_BASE_URL=http://<session-agent-host>:7400`
-  - `AUTOMATION_QUEUE_API_BASE_URL=http://<queue-api-host>:7410`
-- Scale worker replicas independently (KEDA/queue depth preferred).
+#### Required GitHub Secrets (in TesboX-Runner repo)
 
-### Queue admission and autoscaling
+| Secret | Description |
+|--------|-------------|
+| `CONTAINER_REGISTRY` | e.g. `registry.digitalocean.com/bettercases` |
+| `REGISTRY_USERNAME` | DOCR username (usually a DO API token) |
+| `REGISTRY_PASSWORD` | DOCR password / API token |
+| `DO_API_TOKEN` | DigitalOcean API token (for K8s access) |
+| `SSH_PRIVATE_KEY` | SSH key for API droplet |
+| `EXECUTION_API_DROPLET_IP` | Execution API droplet IP |
+| `DOKS_CLUSTER_NAME` | DigitalOcean Kubernetes cluster name |
+| `DATABASE_URL` | Managed PostgreSQL connection string |
+| `REDIS_URL` | Managed Redis connection string |
 
-- Backend now enforces per-project execution pressure limits before enqueue:
-  - max active runs per project
-  - max queued jobs per project
-- Backend exposes autoscaling recommendation:
-  - `GET /api/internal/automation/autoscaling-recommendation`
-  - recommendation uses queued + running job pressure and min/max worker bounds.
+#### Deploy Flow
+
+1. Add/update all GitHub secrets in the TesboX-Runner repo.
+2. Trigger **Deploy TesboX-Runner** from GitHub Actions.
+3. Select target: `all` (default), `api-only`, or `workers-only`.
+4. Workflow:
+   - Builds and pushes `tesbox-executions-api` and `tesbox-executions-worker` images
+   - Deploys API to droplet via SSH + Docker Compose
+   - Applies K8s manifests to DOKS cluster for worker autoscaling
+
+#### K8s Setup (one-time)
+
+1. Create the worker secret with managed Redis and API URLs:
+
+```bash
+kubectl create secret generic execution-worker-env \
+  --namespace=tesbo-execution \
+  --from-literal=REDIS_URL="rediss://default:pass@redis-host:25061" \
+  --from-literal=EXECUTION_API_BASE_URL="http://api-droplet-ip" \
+  --from-literal=QUEUE_PREFIX="bull" \
+  --from-literal=QUEUE_NAME="execution-jobs" \
+  --from-literal=PLAYWRIGHT_HEADLESS="true"
+```
+
+2. Install KEDA (if not already):
+
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
+
+3. Apply namespace: `kubectl apply -f infra/kubernetes/namespace.yaml`
+
+#### Verification
+
+- Execution API health: `http://<execution-api-ip>/health`
+- Worker pods: `kubectl get pods -n tesbo-execution`
+- KEDA ScaledObject: `kubectl get scaledobject -n tesbo-execution`
+
+---
+
+### Manual Redeploy
+
+On any droplet, update `IMAGE_TAG` in `/opt/<service>/.env` then:
+
+```bash
+docker compose pull && docker compose up -d --remove-orphans
+```
+
+For K8s workers:
+
+```bash
+kubectl set image deployment/execution-worker \
+  execution-worker=registry.digitalocean.com/bettercases/tesbox-executions-worker:<tag> \
+  -n tesbo-execution
+```
+
+---
+
+### Connecting TesboX ↔ TesboX-Runner
+
+Set these on the TesboX Backend:
+
+```
+EXECUTION_SERVICE_BASE_URL=http://<execution-api-droplet-ip>:7420
+EXECUTION_SERVICE_API_KEY=<your-api-key>
+EXECUTION_SERVICE_WEBHOOK_URL=http://<backend-ip>/api/automation/callback
+EXECUTION_SERVICE_WEBHOOK_SECRET=<your-webhook-secret>
+```

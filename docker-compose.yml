@@ -3,7 +3,7 @@
 # Stop:  docker compose down
 #
 # Tesbo-Automation-Agents: sessions, live view, recordings, /internal/playwright/run (port 7400).
-# Tesbo-Test-Runner-Agents: BullMQ queue API + workers only (API on 7410).
+# Tesbo-Execution: standalone execution service (API on 7420, workers separate).
 services:
   postgres:
     image: postgres:16-alpine
@@ -28,37 +28,5 @@ services:
       AGENT_SHARED_TOKEN: changeme
     ports:
       - "7400:7400"
-  test-runner-agents-api:
-    build:
-      context: ./Tesbo-Test-Runner-Agents
-      dockerfile: Dockerfile
-    environment:
-      PORT: 7410
-      AUTOMATION_SERVICE_ROLE: api
-      REDIS_URL: redis://redis:6379
-      BACKEND_BASE_URL: http://host.docker.internal:7000
-      AUTOMATION_QUEUE_ENABLED: "true"
-      AUTOMATION_QUEUE_SHARED_TOKEN: changeme
-      AGENT_SHARED_TOKEN: changeme
-      AUTOMATION_QUEUE_CONCURRENCY: 2
-    depends_on:
-      - redis
-    ports:
-      - "7410:7410"
-  test-runner-agents-worker:
-    build:
-      context: ./Tesbo-Test-Runner-Agents
-      dockerfile: Dockerfile
-    environment:
-      PORT: 7411
-      AUTOMATION_SERVICE_ROLE: worker
-      REDIS_URL: redis://redis:6379
-      BACKEND_BASE_URL: http://host.docker.internal:7000
-      AUTOMATION_QUEUE_ENABLED: "true"
-      AUTOMATION_QUEUE_SHARED_TOKEN: changeme
-      AGENT_SHARED_TOKEN: changeme
-      AUTOMATION_QUEUE_CONCURRENCY: 4
-    depends_on:
-      - redis
 volumes:
   bettercases_pgdata:
