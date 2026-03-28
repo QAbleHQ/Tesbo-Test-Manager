@@ -2,6 +2,15 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
 type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
+type ApiErrorBody = { error?: string; detail?: string };
+
+function formatApiError(status: number, body: ApiErrorBody): string {
+  const msg = body.error || String(status);
+  const detail = body.detail?.trim();
+  if (detail) return `${msg}: ${detail}`;
+  return msg;
+}
+
 export async function api<T = unknown>(
   path: string,
   options: RequestInitWithBody = {}
@@ -11,15 +20,31 @@ export async function api<T = unknown>(
     "Content-Type": "application/json",
     ...(rest.headers as Record<string, string>),
   };
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...rest,
-    headers,
-    credentials: "include",
-    ...(body !== undefined && { body: JSON.stringify(body) }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...rest,
+      headers,
+      credentials: "include",
+      ...(body !== undefined && { body: JSON.stringify(body) }),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Network request failed";
+    const looksLikeCorsOrNetwork =
+      msg === "Failed to fetch" ||
+      msg === "Load failed" ||
+      msg.includes("NetworkError") ||
+      msg.includes("network");
+    if (looksLikeCorsOrNetwork) {
+      throw new Error(
+        `${msg} — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL, HTTPS, and that the backend allows this page’s origin in CORS_ALLOWED_ORIGINS.`
+      );
+    }
+    throw e instanceof Error ? e : new Error(String(e));
+  }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((err as { error?: string }).error || String(res.status));
+    const err = (await res.json().catch(() => ({}))) as ApiErrorBody;
+    throw new Error(formatApiError(res.status, err));
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
