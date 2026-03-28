@@ -24,6 +24,17 @@ public final class ExternalExecutionServiceClient {
     private static final HttpClient client = HttpClient.newHttpClient();
     private static final ObjectMapper mapper = new ObjectMapper();
 
+    private static String executionServiceBaseUrl() {
+        String base = Config.EXECUTION_SERVICE_BASE_URL == null ? "" : Config.EXECUTION_SERVICE_BASE_URL.trim();
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        if (base.isBlank()) {
+            throw new IllegalStateException("EXECUTION_SERVICE_BASE_URL is empty; set it to the execution API base (e.g. https://exe.tesbo.io)");
+        }
+        return base;
+    }
+
     /**
      * Submit a new execution run to the external Execution Service.
      */
@@ -152,7 +163,7 @@ public final class ExternalExecutionServiceClient {
         try {
             String json = mapper.writeValueAsString(payload);
             HttpRequest.Builder builder = HttpRequest.newBuilder()
-                    .uri(URI.create(Config.EXECUTION_SERVICE_BASE_URL + path))
+                    .uri(URI.create(executionServiceBaseUrl() + path))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8));
@@ -174,7 +185,7 @@ public final class ExternalExecutionServiceClient {
     private static Map<String, Object> sendDelete(String path) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
-                    .uri(URI.create(Config.EXECUTION_SERVICE_BASE_URL + path))
+                    .uri(URI.create(executionServiceBaseUrl() + path))
                     .timeout(Duration.ofSeconds(15))
                     .DELETE();
             addAuth(builder);
@@ -195,7 +206,7 @@ public final class ExternalExecutionServiceClient {
     private static Map<String, Object> sendGet(String path) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
-                    .uri(URI.create(Config.EXECUTION_SERVICE_BASE_URL + path))
+                    .uri(URI.create(executionServiceBaseUrl() + path))
                     .timeout(Duration.ofSeconds(15))
                     .GET();
             addAuth(builder);

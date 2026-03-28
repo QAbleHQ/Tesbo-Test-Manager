@@ -219,8 +219,17 @@ export default function ProjectSettingsPage() {
     try {
       const result = await listExecutionApiKeys(projectId);
       setApiKeys(result.keys || []);
-    } catch {
-      setApiKeyError("Failed to load API keys. Is the execution service running?");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      const executionHint =
+        msg.includes("Failed to reach execution service") ||
+        msg.includes("Execution Service") ||
+        msg.includes("execution service");
+      setApiKeyError(
+        executionHint
+          ? `${msg} Check EXECUTION_SERVICE_BASE_URL and EXECUTION_SERVICE_API_KEY on the backend, and that exe.tesbo.io is reachable from the API server.`
+          : msg
+      );
     } finally {
       setApiKeysLoading(false);
     }
@@ -433,8 +442,8 @@ export default function ProjectSettingsPage() {
       setNewlyCreatedKey(result.key);
       setNewKeyName("");
       await loadApiKeys();
-    } catch {
-      setApiKeyError("Failed to create API key.");
+    } catch (e) {
+      setApiKeyError(e instanceof Error ? e.message : "Failed to create API key.");
     } finally {
       setCreatingKey(false);
     }
@@ -447,8 +456,8 @@ export default function ProjectSettingsPage() {
     try {
       await revokeExecutionApiKey(projectId, keyId);
       await loadApiKeys();
-    } catch {
-      setApiKeyError("Failed to revoke API key.");
+    } catch (e) {
+      setApiKeyError(e instanceof Error ? e.message : "Failed to revoke API key.");
     } finally {
       setRevokingKeyId(null);
     }

@@ -31,7 +31,9 @@ public final class Main {
                 ctx.header("Vary", "Origin");
                 ctx.header("Access-Control-Allow-Credentials", "true");
                 ctx.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-                ctx.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                ctx.header(
+                        "Access-Control-Allow-Headers",
+                        "Content-Type, Authorization, Accept, Accept-Language, X-Request-Id");
                 ctx.header("Access-Control-Max-Age", "86400");
             }
         };
