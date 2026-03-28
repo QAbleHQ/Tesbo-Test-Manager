@@ -38,7 +38,8 @@ All images are stored in DigitalOcean Container Registry (DOCR).
 
 Backend runtime secrets:
 - `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`
-- `CORS_ALLOWED_ORIGINS`, `FRONTEND_URL`, `SESSION_DAYS`
+- `CORS_ALLOWED_ORIGINS` — comma-separated browser origins allowed to call the API (must include your SPA origin, e.g. `https://frontdoor.tesbo.io`). Optional extras: `https://automate.tesbo.io`, `https://exe.tesbo.io` only if a **browser** UI on those hosts calls backdoor; automation agents and execution workers use server-to-server HTTP and do not rely on CORS.
+- `FRONTEND_URL`, `SESSION_DAYS`
 - `POSTMARK_API_TOKEN`, `POSTMARK_FROM_EMAIL`
 - `JIRA_CLIENT_ID`, `JIRA_CLIENT_SECRET`, `JIRA_REDIRECT_URI`
 - `TESBO_ARTIFACT_STORAGE_PROVIDER`, `TESBO_SPACES_*`

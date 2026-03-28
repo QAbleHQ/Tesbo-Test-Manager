@@ -13,6 +13,10 @@ import java.util.Set;
 public final class Config {
     private static final Map<String, String> DOT_ENV = loadDotEnv();
 
+    private static final String CORS_ALLOWED_ORIGINS_DEFAULT =
+            "http://localhost:3000,http://localhost:3001,"
+                    + "https://frontdoor.tesbo.io,https://automate.tesbo.io,https://exe.tesbo.io";
+
     public static final int SERVER_PORT = Integer.parseInt(getEnv("PORT", "7000"));
     public static final String DB_URL = getEnv("DATABASE_URL", "jdbc:postgresql://localhost:5432/bettercases");
     public static final String DB_USER = getEnv("DATABASE_USER", "postgres");
@@ -24,9 +28,7 @@ public final class Config {
     public static final int OTP_RATE_LIMIT_WINDOW_MINUTES = Integer.parseInt(getEnv("OTP_RATE_LIMIT_WINDOW_MINUTES", "15"));
     public static final int SESSION_DAYS = Integer.parseInt(getEnv("SESSION_DAYS", "30"));
     public static final String SESSION_COOKIE_NAME = "bettercases_session";
-    public static final Set<String> CORS_ALLOWED_ORIGINS = parseCsv(
-            getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
-    );
+    public static final Set<String> CORS_ALLOWED_ORIGINS = parseCsv(corsAllowedOriginsEnv());
 
     // Jira OAuth 2.0 (3LO) configuration
     public static final String JIRA_CLIENT_ID = getEnv("JIRA_CLIENT_ID", "");
@@ -94,6 +96,11 @@ public final class Config {
         return Optional.ofNullable(DOT_ENV.get(key))
                 .or(() -> Optional.ofNullable(System.getenv(key)))
                 .orElse(defaultValue);
+    }
+
+    private static String corsAllowedOriginsEnv() {
+        String v = getEnv("CORS_ALLOWED_ORIGINS", CORS_ALLOWED_ORIGINS_DEFAULT);
+        return v.isBlank() ? CORS_ALLOWED_ORIGINS_DEFAULT : v;
     }
 
     private static Set<String> parseCsv(String csv) {
