@@ -15,7 +15,8 @@ public final class Config {
 
     private static final String CORS_ALLOWED_ORIGINS_DEFAULT =
             "http://localhost:3000,http://localhost:3001,"
-                    + "https://frontdoor.tesbo.io,https://automate.tesbo.io,https://exe.tesbo.io";
+                    + "http://127.0.0.1:3000,http://127.0.0.1:3001,"
+                    + "https://frontdoor.tesbo.io,https://automate.tesbo.io,https://exe.tesbo.io,https://backdoor.tesbo.io";
 
     public static final int SERVER_PORT = Integer.parseInt(getEnv("PORT", "7000"));
     public static final String DB_URL = getEnv("DATABASE_URL", "jdbc:postgresql://localhost:5432/bettercases");
