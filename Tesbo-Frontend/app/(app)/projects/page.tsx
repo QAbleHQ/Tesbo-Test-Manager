@@ -197,6 +197,13 @@ function ProjectsPageContent() {
         description: createDescription.trim() || undefined,
         projectType: createProjectType,
       });
+      if (created.projectType === "tesbox_executions" && created.initialApiKey?.key) {
+        try {
+          sessionStorage.setItem(`tesbox_execution_initial_key_${created.id}`, created.initialApiKey.key);
+        } catch {
+          /* ignore quota / private mode */
+        }
+      }
       setCreateOpen(false);
       setCreateName("");
       setCreateKey("");

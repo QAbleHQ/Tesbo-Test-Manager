@@ -355,8 +355,18 @@ export async function listProjects(): Promise<ProjectSummary[]> {
   return api<ProjectSummary[]>("/api/projects");
 }
 
-export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<{ id: string; key: string; name: string; projectType: ProjectType; createdAt: string }> {
-  return api<{ id: string; key: string; name: string; projectType: ProjectType; createdAt: string }>("/api/projects", { method: "POST", body: data });
+export interface CreateProjectResponse {
+  id: string;
+  key: string;
+  name: string;
+  projectType: ProjectType;
+  createdAt: string;
+  /** Present once when creating a Test Execution project; copy the key immediately. */
+  initialApiKey?: { key: string; id?: string; name?: string };
+}
+
+export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<CreateProjectResponse> {
+  return api<CreateProjectResponse>("/api/projects", { method: "POST", body: data });
 }
 
 export async function getProject(id: string): Promise<Record<string, unknown>> {

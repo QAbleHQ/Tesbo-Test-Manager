@@ -109,8 +109,28 @@ public final class Config {
         Arrays.stream(csv.split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
+                .map(Config::normalizeCorsOrigin)
+                .filter(s -> !s.isEmpty())
                 .forEach(values::add);
         return values;
+    }
+
+    /**
+     * Normalizes a browser {@code Origin} or an entry from {@code CORS_ALLOWED_ORIGINS} so they match
+     * even when secrets contain a UTF-8 BOM, stray whitespace, or a trailing slash.
+     */
+    public static String normalizeCorsOrigin(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String o = raw.trim();
+        if (!o.isEmpty() && o.charAt(0) == '\uFEFF') {
+            o = o.substring(1).trim();
+        }
+        while (o.endsWith("/")) {
+            o = o.substring(0, o.length() - 1).trim();
+        }
+        return o;
     }
 
     private Config() {}
