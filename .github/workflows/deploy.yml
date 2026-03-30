@@ -96,8 +96,9 @@ jobs:
           set -e
           SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
 
-          # Stop old container if it was binding port 80 directly
-          $SSH "cd /opt/bettercases/frontend 2>/dev/null && docker compose down 2>/dev/null || true"
+          # Stop all containers on this droplet to free ports
+          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
+          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
@@ -139,8 +140,9 @@ jobs:
           set -e
           SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
 
-          # Stop old container if it was binding port 80 directly
-          $SSH "cd /opt/bettercases/backend 2>/dev/null && docker compose down 2>/dev/null || true"
+          # Stop all containers on this droplet to free ports
+          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
+          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
@@ -208,8 +210,9 @@ jobs:
           set -e
           SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
 
-          # Stop old container if it was binding port 80 directly
-          $SSH "cd /opt/bettercases/automation-agent 2>/dev/null && docker compose down 2>/dev/null || true"
+          # Stop all containers on this droplet to free ports
+          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
+          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
