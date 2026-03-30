@@ -224,7 +224,7 @@ public final class ExternalExecutionServiceClient {
     private static void addAuth(HttpRequest.Builder builder) {
         String apiKey = Config.EXECUTION_SERVICE_API_KEY;
         if (apiKey != null && !apiKey.isBlank()) {
-            builder.header("x-api-key", apiKey);
+            builder.header("x-agent-token", apiKey);
         }
     }
 
