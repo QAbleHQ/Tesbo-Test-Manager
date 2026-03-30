@@ -9,7 +9,7 @@ services:
     environment:
       - JAVA_OPTS=-Xms256m -Xmx768m
     ports:
-      - "80:7000"
+      - "127.0.0.1:7000:7000"
     volumes:
       - ./uploads:/app/uploads
     healthcheck:
