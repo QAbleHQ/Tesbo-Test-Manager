@@ -6,13 +6,18 @@
 
 | Product | Component | Target | Port |
 |---------|-----------|--------|------|
-| **TesboX** | Frontend | Droplet (Docker Compose) | 80 → 3000 |
-| **TesboX** | Backend | Droplet (Docker Compose) | 80 → 7000 |
-| **TesboX** | Automation Agent | Droplet (Docker Compose) | 80 → 7400 |
+| **TesboX** | Frontend | Droplet (Nginx + Docker Compose) | 443 → Nginx → 127.0.0.1:3000 |
+| **TesboX** | Backend | Droplet (Nginx + Docker Compose) | 443 → Nginx → 127.0.0.1:7000 |
+| **TesboX** | Automation Agent | Droplet (Nginx + Docker Compose) | 443 → Nginx → 127.0.0.1:7400 |
 | **TesboX-Runner** | Execution API | Droplet (Docker Compose) | 80 → 7420 |
 | **TesboX-Runner** | Execution Workers | DOKS Kubernetes (KEDA autoscale) | 7411 |
 
 All images are stored in DigitalOcean Container Registry (DOCR).
+
+Each TesboX droplet runs **Nginx** as a reverse proxy with **Let's Encrypt** SSL certificates
+(auto-provisioned and auto-renewed). Docker containers bind to `127.0.0.1` only — not
+publicly exposed. The deploy workflow handles Nginx + Certbot setup automatically via
+`deploy/nginx/setup-ssl.sh`.
 
 ---
 
@@ -33,8 +38,12 @@ All images are stored in DigitalOcean Container Registry (DOCR).
 | `DROPLET_BACKEND_IP` | Backend droplet IP |
 | `DROPLET_AUTOMATION_AGENT_IP` | Automation agent droplet IP |
 | `SSH_PRIVATE_KEY` | SSH key for droplet access |
-| `NEXT_PUBLIC_API_URL` | e.g. `https://api.yourdomain.com` |
+| `NEXT_PUBLIC_API_URL` | e.g. `https://backdoor.tesbo.io` |
 | `AGENT_SHARED_TOKEN` | Shared token between backend ↔ automation agent |
+| `FRONTEND_DOMAIN` | Domain for the frontend droplet, e.g. `frontdoor.tesbo.io` |
+| `BACKEND_DOMAIN` | Domain for the backend droplet, e.g. `backdoor.tesbo.io` |
+| `AUTOMATION_AGENT_DOMAIN` | Domain for the automation agent droplet, e.g. `automate.tesbo.io` |
+| `CERTBOT_EMAIL` | Email for Let's Encrypt certificate notifications |
 
 Backend runtime secrets:
 - `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`
@@ -62,11 +71,22 @@ curl -fsSL https://get.docker.com | sh
 
 Open firewall ports: `22`, `80`, `443`.
 
+#### DNS Setup (Cloudflare or any provider)
+
+Point each domain to the corresponding droplet IP as a plain **A record** (**DNS only** — no
+Cloudflare proxy / orange cloud). SSL is handled on the droplet by Nginx + Let's Encrypt.
+
+| Record | Type | Value | Proxy |
+|--------|------|-------|-------|
+| `frontdoor.tesbo.io` | A | `<FRONTEND_IP>` | DNS only |
+| `backdoor.tesbo.io` | A | `<BACKEND_IP>` | DNS only |
+| `automate.tesbo.io` | A | `<AGENT_IP>` | DNS only |
+
 #### Verification
 
-- Frontend: `http://<frontend-ip>/`
-- Backend health: `http://<backend-ip>/health`
-- Automation Agent: `http://<agent-ip>/health`
+- Frontend: `https://frontdoor.tesbo.io/`
+- Backend health: `https://backdoor.tesbo.io/health`
+- Automation Agent: `https://automate.tesbo.io/health`
 
 ---
 

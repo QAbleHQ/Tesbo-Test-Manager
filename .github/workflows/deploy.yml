@@ -94,21 +94,31 @@ jobs:
           DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
           set -e
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/frontend"
+          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
+
+          # Stop old container if it was binding port 80 directly
+          $SSH "cd /opt/bettercases/frontend 2>/dev/null && docker compose down 2>/dev/null || true"
+
+          # Set up Nginx + SSL (idempotent)
+          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
+          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.FRONTEND_DOMAIN }} 3000 ${{ secrets.CERTBOT_EMAIL }}"
+
+          # Deploy container
+          $SSH "mkdir -p /opt/bettercases/frontend"
           scp -o StrictHostKeyChecking=no deploy/Tesbo-Frontend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/frontend/docker-compose.yml
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/frontend/.env <<'EOF'
+          $SSH "cat > /opt/bettercases/frontend/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
           DOCR_REPO_FRONTEND=${{ secrets.DOCR_REPO_FRONTEND }}
           IMAGE_TAG=${{ github.sha }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/frontend/app.env <<'EOF'
+          $SSH "cat > /opt/bettercases/frontend/app.env <<'EOF'
           NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/frontend && docker compose pull && docker compose up -d --remove-orphans"
+          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          $SSH "cd /opt/bettercases/frontend && docker compose pull && docker compose up -d --remove-orphans"
 
   deploy-backend:
     needs: build-and-push
@@ -127,16 +137,26 @@ jobs:
           DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
           set -e
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/backend"
+          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
+
+          # Stop old container if it was binding port 80 directly
+          $SSH "cd /opt/bettercases/backend 2>/dev/null && docker compose down 2>/dev/null || true"
+
+          # Set up Nginx + SSL (idempotent)
+          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
+          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.BACKEND_DOMAIN }} 7000 ${{ secrets.CERTBOT_EMAIL }}"
+
+          # Deploy container
+          $SSH "mkdir -p /opt/bettercases/backend"
           scp -o StrictHostKeyChecking=no deploy/Tesbo-Backend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/backend/docker-compose.yml
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/backend/.env <<'EOF'
+          $SSH "cat > /opt/bettercases/backend/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
           DOCR_REPO_BACKEND=${{ secrets.DOCR_REPO_BACKEND }}
           IMAGE_TAG=${{ github.sha }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/backend/app.env <<'EOF'
+          $SSH "cat > /opt/bettercases/backend/app.env <<'EOF'
           PORT=7000
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           DATABASE_USER=${{ secrets.DATABASE_USER }}
@@ -165,9 +185,9 @@ jobs:
           EXECUTION_SERVICE_WEBHOOK_SECRET=${{ secrets.EXECUTION_SERVICE_WEBHOOK_SECRET }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
+          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          $SSH "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
+          $SSH "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
 
   deploy-automation-agent:
     needs: build-and-push
@@ -186,21 +206,30 @@ jobs:
           DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
           set -e
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "mkdir -p /opt/bettercases/automation-agent"
+          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
+
+          # Stop old container if it was binding port 80 directly
+          $SSH "cd /opt/bettercases/automation-agent 2>/dev/null && docker compose down 2>/dev/null || true"
+
+          # Set up Nginx + SSL (idempotent)
+          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
+          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.AUTOMATION_AGENT_DOMAIN }} 7400 ${{ secrets.CERTBOT_EMAIL }}"
+
+          # Deploy container
+          $SSH "mkdir -p /opt/bettercases/automation-agent"
           scp -o StrictHostKeyChecking=no deploy/Tesbo-Automation-Agents/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/automation-agent/docker-compose.yml
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/automation-agent/.env <<'EOF'
+          $SSH "cat > /opt/bettercases/automation-agent/.env <<'EOF'
           DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
           DOCR_REPO_AUTOMATION_AGENT=${{ secrets.DOCR_REPO_AUTOMATION_AGENT }}
           IMAGE_TAG=${{ github.sha }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cat > /opt/bettercases/automation-agent/app.env <<'EOF'
+          $SSH "cat > /opt/bettercases/automation-agent/app.env <<'EOF'
           PORT=7400
           AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
           EOF"
 
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "cd /opt/bettercases/automation-agent && docker compose pull && docker compose up -d --remove-orphans"
-          ssh -o StrictHostKeyChecking=no root@"$DROPLET_IP" "sleep 5 && docker compose -f /opt/bettercases/automation-agent/docker-compose.yml ps"
-
+          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          $SSH "cd /opt/bettercases/automation-agent && docker compose pull && docker compose up -d --remove-orphans"
+          $SSH "sleep 5 && docker compose -f /opt/bettercases/automation-agent/docker-compose.yml ps"

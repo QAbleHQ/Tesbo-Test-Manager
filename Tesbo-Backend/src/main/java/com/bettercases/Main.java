@@ -26,16 +26,26 @@ public final class Main {
     private static Handler corsHandler() {
         return ctx -> {
             String origin = ctx.header("Origin");
-            if (origin != null && Config.CORS_ALLOWED_ORIGINS.contains(origin)) {
-                ctx.header("Access-Control-Allow-Origin", origin);
-                ctx.header("Vary", "Origin");
-                ctx.header("Access-Control-Allow-Credentials", "true");
-                ctx.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+            if (origin == null) {
+                return;
+            }
+            String normalized = Config.normalizeCorsOrigin(origin);
+            if (normalized.isEmpty() || !Config.CORS_ALLOWED_ORIGINS.contains(normalized)) {
+                return;
+            }
+            ctx.header("Access-Control-Allow-Origin", normalized);
+            ctx.header("Vary", "Origin");
+            ctx.header("Access-Control-Allow-Credentials", "true");
+            ctx.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+            String requestedHeaders = ctx.header("Access-Control-Request-Headers");
+            if (requestedHeaders != null && !requestedHeaders.isBlank()) {
+                ctx.header("Access-Control-Allow-Headers", requestedHeaders.strip());
+            } else {
                 ctx.header(
                         "Access-Control-Allow-Headers",
                         "Content-Type, Authorization, Accept, Accept-Language, X-Request-Id");
-                ctx.header("Access-Control-Max-Age", "86400");
             }
+            ctx.header("Access-Control-Max-Age", "86400");
         };
     }
     public static void main(String[] args) {

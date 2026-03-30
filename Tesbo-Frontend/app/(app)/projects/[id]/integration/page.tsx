@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { authMe, getProject } from "@/lib/api";
-import { Card } from "@/components/ui";
+import { Button, Card } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
@@ -39,18 +39,34 @@ function StepCard({ step, title, children }: { step: number; title: string; chil
   );
 }
 
+const executionInitialKeyStorageKey = (id: string) => `tesbox_execution_initial_key_${id}`;
+
 export default function IntegrationPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
   const [project, setProject] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(true);
+  const [oneTimeApiKey, setOneTimeApiKey] = useState<string | null>(null);
+  const [oneTimeKeyCopied, setOneTimeKeyCopied] = useState(false);
 
   useEffect(() => {
     authMe().then((me) => {
       if (!me) { router.replace("/login"); return; }
       getProject(projectId)
-        .then((p) => setProject(p))
+        .then((p) => {
+          setProject(p);
+          try {
+            const sk = executionInitialKeyStorageKey(projectId);
+            const raw = sessionStorage.getItem(sk);
+            if (raw) {
+              setOneTimeApiKey(raw);
+              sessionStorage.removeItem(sk);
+            }
+          } catch {
+            /* ignore */
+          }
+        })
         .catch(() => router.replace("/projects"))
         .finally(() => setLoading(false));
     });
@@ -61,6 +77,7 @@ export default function IntegrationPage() {
   }
 
   const apiBase = "https://executions.tesbox.io";
+  const apiKeyExample = oneTimeApiKey ?? "txe_your_api_key_here";
 
   return (
     <StandardPageLayout
@@ -87,13 +104,51 @@ export default function IntegrationPage() {
           </div>
         </Card>
 
+        {oneTimeApiKey && (
+          <Card className="border border-[var(--success)]/35 bg-[color-mix(in_oklab,var(--success)_8%,white)] p-5 space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-[var(--foreground)]">Default API key ready</p>
+                <p className="mt-1 text-sm text-[var(--muted)]">
+                  A key named &quot;Default key&quot; was created for this project. Copy it now — it will not be shown again.
+                </p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(oneTimeApiKey).then(() => {
+                      setOneTimeKeyCopied(true);
+                      setTimeout(() => setOneTimeKeyCopied(false), 2000);
+                    });
+                  }}
+                >
+                  {oneTimeKeyCopied ? "Copied" : "Copy key"}
+                </Button>
+                <Button type="button" variant="secondary" size="sm" onClick={() => setOneTimeApiKey(null)}>
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+            <code className="block rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 font-mono text-sm break-all text-[var(--foreground)]">
+              {oneTimeApiKey}
+            </code>
+          </Card>
+        )}
+
         <div className="space-y-8">
           <StepCard step={1} title="Get your API key">
             <p className="text-sm text-[var(--muted)]">
               Your API key authenticates requests to TesboX-Executions.
-              Go to <span className="font-medium text-[var(--foreground)]">Settings → API Keys</span> to generate one.
+              {oneTimeApiKey
+                ? " Use the key above, or go to "
+                : " Go to "}
+              <span className="font-medium text-[var(--foreground)]">Settings → API Keys</span>
+              {!oneTimeApiKey ? " to generate one." : " to create additional keys or revoke access."}
             </p>
-            <CodeBlock lang="env" code={`TESBOX_API_KEY=txe_your_api_key_here\nTESBOX_PROJECT_ID=${projectId}`} />
+            <CodeBlock lang="env" code={`TESBOX_API_KEY=${apiKeyExample}\nTESBOX_PROJECT_ID=${projectId}`} />
           </StepCard>
 
           <StepCard step={2} title="Install the CLI">
@@ -109,14 +164,14 @@ export default function IntegrationPage() {
               becomes a job that runs in an isolated browser on TesboX infrastructure.
             </p>
             <CodeBlock lang="bash" code={`npx tesbox run "tests/**/*.spec.ts" \\
-  --api-key txe_your_api_key_here \\
+  --api-key ${apiKeyExample} \\
   --project-id ${projectId} \\
   --max-parallel 4 \\
   --start-url https://staging.example.com`} />
             <p className="text-sm text-[var(--muted)]">
               Or use environment variables so you don't need flags every time:
             </p>
-            <CodeBlock lang="bash" code={`export TESBOX_API_KEY=txe_your_api_key_here
+            <CodeBlock lang="bash" code={`export TESBOX_API_KEY=${apiKeyExample}
 export TESBOX_PROJECT_ID=${projectId}
 
 npx tesbox run "tests/**/*.spec.ts" --max-parallel 4`} />
