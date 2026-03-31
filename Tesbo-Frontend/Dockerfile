@@ -23,6 +23,9 @@ COPY --from=deps /app/package.json /app/package-lock.json ./
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/public ./public
 COPY --from=deps /app/.next ./.next
+COPY --from=deps /app/instrumentation.mjs ./instrumentation.mjs
+
+ENV NODE_OPTIONS="--import ./instrumentation.mjs"
 
 EXPOSE 3000
 
