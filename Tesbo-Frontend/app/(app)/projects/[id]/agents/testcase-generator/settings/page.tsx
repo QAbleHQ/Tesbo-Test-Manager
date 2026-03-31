@@ -172,8 +172,8 @@ export default function TestCaseGeneratorSettingsPage() {
       <Card className="p-6">
         <h2 className="text-base font-semibold text-[var(--foreground)] mb-2">Lifecycle</h2>
         <p className="text-sm text-[var(--muted)] leading-relaxed">
-          Trigger detected or user request -> generation queued -> agent generates drafts -> reviewer approves -> approved
-          test cases are saved into repository. Revisions and rejections stay visible in the same lifecycle view.
+          Trigger detected or user request -&gt; generation queued -&gt; agent generates drafts -&gt; reviewer approves -&gt;
+          approved test cases are saved into repository. Revisions and rejections stay visible in the same lifecycle view.
         </p>
       </Card>
 

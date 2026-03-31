@@ -17,6 +17,9 @@ Node.js Playwright service for TesboX **automate** flows: sessions, live view, r
 - `SCREENSHOT_DIR`, `VIDEO_DIR`, `TRACE_DIR`, `RECORD_VIDEO`
 - `USE_TELEMETRY`, `LANGCHAIN_MAX_STEPS`, `DOM_SNAPSHOT_MAX_ELEMENTS`
 - `AGENT_SHARED_TOKEN` (required in non-local environments)
+- `MW_APM_SERVICE_NAME` (default: `tesbo-automation-agents`)
+- `MW_APM_ACCESS_TOKEN` (enables Middleware APM when set)
+- `MW_AGENT_SERVICE` (required if app runs in Docker/Kubernetes and agent is external)
 
 ## Local run
 
@@ -24,6 +27,11 @@ Node.js Playwright service for TesboX **automate** flows: sessions, live view, r
 npm install
 npm run dev
 ```
+
+If running in containers, set:
+
+- Docker: `MW_AGENT_SERVICE=172.17.0.1`
+- Kubernetes: `MW_AGENT_SERVICE=mw-service.mw-agent-ns.svc.cluster.local`
 
 ## Internal API (representative)
 

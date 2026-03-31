@@ -16,6 +16,7 @@ function readDotEnv() {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const idx = trimmed.indexOf("=");
     if (idx <= 0) continue;
+
     const key = trimmed.slice(0, idx).trim();
     let value = trimmed.slice(idx + 1).trim();
     if (
@@ -41,10 +42,11 @@ function env(name, fallback = "") {
 
 const accessToken = env("MW_APM_ACCESS_TOKEN");
 if (!accessToken) {
+  // Allow startup without APM in local/dev environments.
   console.warn("[middleware-apm] Disabled: MW_APM_ACCESS_TOKEN is not set.");
 } else {
   tracker.track({
-    serviceName: env("MW_APM_SERVICE_NAME", "tesbo-frontend"),
+    serviceName: env("MW_APM_SERVICE_NAME", "tesbo-automation-agents"),
     accessToken,
   });
 }
