@@ -19,9 +19,11 @@ public final class Config {
                     + "https://frontdoor.tesbo.io,https://automate.tesbo.io,https://exe.tesbo.io,https://backdoor.tesbo.io";
 
     public static final int SERVER_PORT = Integer.parseInt(getEnv("PORT", "7000"));
-    public static final String DB_URL = getEnv("DATABASE_URL", "jdbc:postgresql://localhost:5432/bettercases");
-    public static final String DB_USER = getEnv("DATABASE_USER", "postgres");
-    public static final String DB_PASSWORD = getEnv("DATABASE_PASSWORD", "postgres");
+    public static final String DB_URL = normalizeJdbcUrl(
+            getEnv("DATABASE_URL", "jdbc:postgresql://localhost:5432/bettercases")
+    );
+    public static final String DB_USER = getOptionalEnv("DATABASE_USER");
+    public static final String DB_PASSWORD = getOptionalEnv("DATABASE_PASSWORD");
     public static final String POSTMARK_API_TOKEN = getEnv("POSTMARK_API_TOKEN", "");
     public static final String POSTMARK_FROM_EMAIL = getEnv("POSTMARK_FROM_EMAIL", "noreply@example.com");
     public static final int OTP_EXPIRY_MINUTES = Integer.parseInt(getEnv("OTP_EXPIRY_MINUTES", "10"));
@@ -99,6 +101,13 @@ public final class Config {
                 .orElse(defaultValue);
     }
 
+    private static String getOptionalEnv(String key) {
+        return Optional.ofNullable(DOT_ENV.get(key))
+                .or(() -> Optional.ofNullable(System.getenv(key)))
+                .map(String::trim)
+                .orElse("");
+    }
+
     private static String corsAllowedOriginsEnv() {
         String v = getEnv("CORS_ALLOWED_ORIGINS", CORS_ALLOWED_ORIGINS_DEFAULT);
         return v.isBlank() ? CORS_ALLOWED_ORIGINS_DEFAULT : v;
@@ -131,6 +140,24 @@ public final class Config {
             o = o.substring(0, o.length() - 1).trim();
         }
         return o;
+    }
+
+    /**
+     * Accepts DATABASE_URL values in either JDBC form (jdbc:postgresql://...)
+     * or URI form (postgresql://... / postgres://...) and normalizes to JDBC.
+     */
+    private static String normalizeJdbcUrl(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String value = raw.trim();
+        if (value.startsWith("jdbc:")) {
+            return value;
+        }
+        if (value.startsWith("postgresql://") || value.startsWith("postgres://")) {
+            return "jdbc:" + value;
+        }
+        return value;
     }
 
     private Config() {}

@@ -19,8 +19,12 @@ public final class Database {
                 if (dataSource == null) {
                     HikariConfig config = new HikariConfig();
                     config.setJdbcUrl(Config.DB_URL);
-                    config.setUsername(Config.DB_USER);
-                    config.setPassword(Config.DB_PASSWORD);
+                    if (!Config.DB_USER.isBlank()) {
+                        config.setUsername(Config.DB_USER);
+                    }
+                    if (!Config.DB_PASSWORD.isBlank()) {
+                        config.setPassword(Config.DB_PASSWORD);
+                    }
                     config.setMaximumPoolSize(10);
                     dataSource = new HikariDataSource(config);
                     runMigrations();

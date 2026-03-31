@@ -16,6 +16,18 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Middleware APM
+
+This app preloads Middleware APM for `npm run dev`, `npm run dev:turbo`, and `npm run start`.
+
+Configure:
+
+- `MW_APM_ACCESS_TOKEN` (required to enable APM)
+- `MW_APM_SERVICE_NAME` (default: `tesbo-frontend`)
+- `MW_AGENT_SERVICE` (for containerized runs):
+  - Docker: `172.17.0.1`
+  - Kubernetes: `mw-service.mw-agent-ns.svc.cluster.local`
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
