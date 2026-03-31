@@ -1042,6 +1042,13 @@ export interface AgentSettings {
   reviewBotEnabled?: boolean;
   autoReviewOnScriptReady?: boolean;
   reviewInstruction?: string;
+  autoGenerateOnNewJiraTickets?: boolean;
+  autoGenerateOnUpdatedJiraTickets?: boolean;
+  autoGenerateOnNewKnowledgeBase?: boolean;
+  autoGenerateOnUpdatedKnowledgeBase?: boolean;
+  autoRunOnTrigger?: boolean;
+  generatedTestcaseCount?: number;
+  autoCommentOnJira?: boolean;
 }
 
 export function getAgentSettings(projectId: string, agentType: string): AgentSettings {
@@ -1098,7 +1105,15 @@ export interface AgentReviewFeedback {
   createdAt: string;
 }
 
-export type AgentTaskQueueSource = "ready_for_automation" | "revision" | "manual" | "failed_fix";
+export type AgentTaskQueueSource =
+  | "ready_for_automation"
+  | "revision"
+  | "manual"
+  | "failed_fix"
+  | "jira_created"
+  | "jira_updated"
+  | "knowledge_base_created"
+  | "knowledge_base_updated";
 
 export interface BotReviewResult {
   status: "passed" | "failed";
