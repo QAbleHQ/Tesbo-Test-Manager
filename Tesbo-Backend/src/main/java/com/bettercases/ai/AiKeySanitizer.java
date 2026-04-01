@@ -12,9 +12,17 @@ public final class AiKeySanitizer {
             key = key.substring(1, key.length() - 1).trim();
         }
 
-        if (key.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            key = key.substring(7).trim();
+        if (key.toLowerCase().startsWith("bearer")) {
+            int split = key.indexOf(' ');
+            if (split < 0) {
+                key = "";
+            } else {
+                key = key.substring(split + 1).trim();
+            }
         }
+
+        // Provider keys should not contain whitespace; strip hidden newlines/tabs from copy-paste.
+        key = key.replaceAll("\\s+", "");
 
         return key;
     }

@@ -257,6 +257,7 @@ public final class Main {
         app.post("/api/tesbo-reports/ingest/playwright", TesboReportsHandler::ingestPlaywrightByKey);
         app.post("/api/tesbo-reports/ingest/playwright/upload", TesboReportsHandler::ingestPlaywrightFileByKey);
         app.post("/api/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifactByKey);
+        app.get("/api/tesbo-reports/project-by-key", TesboReportsHandler::resolveProjectByKey);
         app.get("/api/public/tesbo-reports/{token}", TesboReportsHandler::getPublicSharedRun);
         app.get("/api/public/tesbo-reports/{token}/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getPublicSharedArtifact);
 
