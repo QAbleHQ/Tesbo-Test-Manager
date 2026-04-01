@@ -272,6 +272,14 @@ public final class TesboReportsHandler {
         }
     }
 
+    public static void resolveProjectByKey(Context ctx) {
+        String ingestionKey = extractIngestionKey(ctx);
+        if (ingestionKey == null || ingestionKey.isBlank()) {
+            throw new io.javalin.http.UnauthorizedResponse("Project access key is required");
+        }
+        ctx.json(TesboReportsService.resolveProjectByIngestionKey(ingestionKey));
+    }
+
     public static void uploadCaseArtifact(Context ctx) {
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
         UUID runId = UUID.fromString(ctx.pathParam("runId"));

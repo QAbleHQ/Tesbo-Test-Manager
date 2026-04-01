@@ -943,6 +943,11 @@ public final class TesboReportsService {
         }
     }
 
+    public static Map<String, Object> resolveProjectByIngestionKey(String ingestionKey) {
+        UUID projectId = resolveProjectIdByIngestionKey(ingestionKey);
+        return Map.of("projectId", projectId.toString());
+    }
+
     private static Map<String, Object> mapRunRow(ResultSet rs) throws SQLException {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", rs.getObject("id").toString());
