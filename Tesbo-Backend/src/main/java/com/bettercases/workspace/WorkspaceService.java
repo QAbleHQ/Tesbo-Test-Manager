@@ -1,6 +1,7 @@
 package com.bettercases.workspace;
 
 import com.bettercases.Database;
+import com.bettercases.ai.AiKeySanitizer;
 import com.bettercases.invitation.InvitationService;
 
 import java.sql.*;
@@ -346,7 +347,7 @@ public final class WorkspaceService {
         requireOrgRole(orgId, actorId, "owner");
         String normalizedName = name == null ? "" : name.trim();
         String normalizedProvider = normalizeAiProvider(provider);
-        String normalizedKey = apiKey == null ? "" : apiKey.trim();
+        String normalizedKey = AiKeySanitizer.sanitize(apiKey);
         String normalizedModel = defaultModel == null ? "" : defaultModel.trim();
         if (normalizedName.isBlank()) {
             throw new io.javalin.http.BadRequestResponse("Key name is required.");
