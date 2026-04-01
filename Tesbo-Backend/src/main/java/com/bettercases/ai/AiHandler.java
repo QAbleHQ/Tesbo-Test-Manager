@@ -229,15 +229,25 @@ public final class AiHandler {
 
     private static String resolveProviderApiKey(String provider, Map<String, String> aiConfig) {
         if (provider.equals("openai")) {
-            String key = aiConfig.getOrDefault("openAiApiKey", "");
+            String key = AiKeySanitizer.sanitize(aiConfig.getOrDefault("openAiApiKey", ""));
             if (key.isBlank()) {
                 throw new io.javalin.http.BadRequestResponse("OpenAI API key is missing. Workspace owner must allocate an AI key to this project.");
             }
+            if (AiKeySanitizer.looksLikeAnthropicKey(key)) {
+                throw new io.javalin.http.BadRequestResponse(
+                        "Allocated key/provider mismatch: this project is set to OpenAI but the key looks like an Anthropic key. Update Workspace Settings -> Integrations."
+                );
+            }
             return key;
         }
-        String key = aiConfig.getOrDefault("anthropicApiKey", "");
+        String key = AiKeySanitizer.sanitize(aiConfig.getOrDefault("anthropicApiKey", ""));
         if (key.isBlank()) {
             throw new io.javalin.http.BadRequestResponse("Anthropic API key is missing. Workspace owner must allocate an AI key to this project.");
+        }
+        if (AiKeySanitizer.looksLikeOpenAiKey(key)) {
+            throw new io.javalin.http.BadRequestResponse(
+                    "Allocated key/provider mismatch: this project is set to Anthropic but the key looks like an OpenAI key. Update Workspace Settings -> Integrations."
+            );
         }
         return key;
     }
@@ -282,7 +292,7 @@ public final class AiHandler {
             }
             Map<String, String> out = new HashMap<>();
             String workspaceProvider = rs.getString("workspace_provider");
-            String workspaceApiKey = rs.getString("workspace_api_key");
+            String workspaceApiKey = AiKeySanitizer.sanitize(rs.getString("workspace_api_key"));
             String workspaceDefaultModel = rs.getString("workspace_default_model");
             if (workspaceProvider != null && workspaceApiKey != null && !workspaceApiKey.isBlank()) {
                 String provider = workspaceProvider.trim().toLowerCase();
