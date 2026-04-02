@@ -3,45 +3,136 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --primary: #14b8a6;
-  --brand-primary: #14b8a6;
-  --brand-hover: #0d9488;
-  --brand-pressed: #0f766e;
-  --brand-soft: rgba(20, 184, 166, 0.12);
-  --brand-surface: rgba(20, 184, 166, 0.06);
+  --primary: #0969da;
+  --brand-primary: #0969da;
+  --brand-hover: #0860ca;
+  --brand-pressed: #0757ba;
+  --brand-soft: #ddf4ff;
+  --brand-surface: #edf7ff;
+  --brand-border: rgba(9, 105, 218, 0.18);
 
-  --ai-primary: #818cf8;
-  --ai-hover: #6366f1;
-  --ai-soft: rgba(129, 140, 248, 0.12);
-  --ai-surface: rgba(129, 140, 248, 0.06);
+  --ai-primary: #4f46e5;
+  --ai-hover: #4338ca;
+  --ai-pressed: #3730a3;
+  --ai-soft: #e8e7ff;
+  --ai-surface: #f4f3ff;
+  --ai-border: rgba(79, 70, 229, 0.16);
 
-  --background: #0c0d12;
-  --app-shell: #0c0d12;
-  --surface: #16181f;
-  --surface-secondary: #1c1e27;
-  --surface-tertiary: #23252f;
+  --background: #f4f7f8;
+  --app-shell: #eff3f5;
+  --surface: #ffffff;
+  --surface-secondary: #f7fafb;
+  --surface-tertiary: #edf2f4;
+  --surface-overlay: #ffffff;
 
-  --foreground: #e4e7eb;
-  --muted: #8b919a;
-  --muted-soft: #5e6370;
-  --border: #2a2d38;
-  --border-subtle: #21232c;
-  --border-strong: #363944;
+  --foreground: #0f1720;
+  --muted: #52606d;
+  --muted-soft: #74808b;
+  --border: #d6dee6;
+  --border-subtle: #e3e8ee;
+  --border-strong: #c2ccd6;
+  --overlay-backdrop: rgba(15, 23, 32, 0.42);
 
-  --success: #22c55e;
-  --success-soft: rgba(34, 197, 94, 0.12);
-  --warning: #eab308;
-  --warning-soft: rgba(234, 179, 8, 0.12);
-  --error: #ef4444;
-  --error-soft: rgba(239, 68, 68, 0.12);
-  --info: #3b82f6;
-  --info-soft: rgba(59, 130, 246, 0.12);
+  --success: #15803d;
+  --success-foreground: #166534;
+  --success-soft: #dcfce7;
+  --success-border: rgba(21, 128, 61, 0.18);
+  --warning: #b7791f;
+  --warning-foreground: #92400e;
+  --warning-soft: #fef3c7;
+  --warning-border: rgba(183, 121, 31, 0.2);
+  --error: #c0392b;
+  --error-foreground: #b42318;
+  --error-soft: #fde8e8;
+  --error-border: rgba(192, 57, 43, 0.2);
+  --info: #2563eb;
+  --info-foreground: #1d4ed8;
+  --info-soft: #dbeafe;
+  --info-border: rgba(37, 99, 235, 0.2);
 
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2), 0 6px 18px rgba(0, 0, 0, 0.15);
-  --shadow-elevated: 0 8px 28px rgba(0, 0, 0, 0.35);
+  --confidence-high: #2563eb;
+  --confidence-high-foreground: #1d4ed8;
+  --confidence-high-soft: #dbeafe;
+  --confidence-high-border: rgba(37, 99, 235, 0.2);
+  --confidence-medium: #b7791f;
+  --confidence-medium-foreground: #92400e;
+  --confidence-medium-soft: #fef3c7;
+  --confidence-medium-border: rgba(183, 121, 31, 0.22);
+  --confidence-low: #c0392b;
+  --confidence-low-foreground: #b42318;
+  --confidence-low-soft: #fde8e8;
+  --confidence-low-border: rgba(192, 57, 43, 0.2);
+
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 6px 18px rgba(16, 24, 40, 0.04);
+  --shadow-elevated: 0 8px 28px rgba(16, 24, 40, 0.08);
   --radius-card: 16px;
   --radius-control: 12px;
   --content-max: 1360px;
+}
+
+.dark {
+  --primary: #2f81f7;
+  --brand-primary: #2f81f7;
+  --brand-hover: #58a6ff;
+  --brand-pressed: #1f6feb;
+  --brand-soft: rgba(47, 129, 247, 0.16);
+  --brand-surface: rgba(47, 129, 247, 0.1);
+  --brand-border: rgba(47, 129, 247, 0.26);
+
+  --ai-primary: #818cf8;
+  --ai-hover: #a5b4fc;
+  --ai-pressed: #6366f1;
+  --ai-soft: rgba(129, 140, 248, 0.18);
+  --ai-surface: rgba(129, 140, 248, 0.1);
+  --ai-border: rgba(129, 140, 248, 0.26);
+
+  --background: #0d1117;
+  --app-shell: #0f1720;
+  --surface: #161b22;
+  --surface-secondary: #1d2633;
+  --surface-tertiary: #243041;
+  --surface-overlay: #161b22;
+
+  --foreground: #f3f4f6;
+  --muted: #c7d1db;
+  --muted-soft: #94a3b8;
+  --border: #334155;
+  --border-subtle: #243244;
+  --border-strong: #475569;
+  --overlay-backdrop: rgba(2, 6, 23, 0.6);
+
+  --success: #4ade80;
+  --success-foreground: #86efac;
+  --success-soft: rgba(34, 197, 94, 0.16);
+  --success-border: rgba(74, 222, 128, 0.24);
+  --warning: #fbbf24;
+  --warning-foreground: #fde68a;
+  --warning-soft: rgba(251, 191, 36, 0.16);
+  --warning-border: rgba(251, 191, 36, 0.24);
+  --error: #f87171;
+  --error-foreground: #fecaca;
+  --error-soft: rgba(248, 113, 113, 0.16);
+  --error-border: rgba(248, 113, 113, 0.24);
+  --info: #60a5fa;
+  --info-foreground: #bfdbfe;
+  --info-soft: rgba(96, 165, 250, 0.16);
+  --info-border: rgba(96, 165, 250, 0.24);
+
+  --confidence-high: #60a5fa;
+  --confidence-high-foreground: #bfdbfe;
+  --confidence-high-soft: rgba(96, 165, 250, 0.16);
+  --confidence-high-border: rgba(96, 165, 250, 0.24);
+  --confidence-medium: #fbbf24;
+  --confidence-medium-foreground: #fde68a;
+  --confidence-medium-soft: rgba(251, 191, 36, 0.16);
+  --confidence-medium-border: rgba(251, 191, 36, 0.24);
+  --confidence-low: #f87171;
+  --confidence-low-foreground: #fecaca;
+  --confidence-low-soft: rgba(248, 113, 113, 0.16);
+  --confidence-low-border: rgba(248, 113, 113, 0.24);
+
+  --shadow-card: 0 1px 2px rgba(2, 6, 23, 0.28), 0 10px 30px rgba(2, 6, 23, 0.2);
+  --shadow-elevated: 0 18px 40px rgba(2, 6, 23, 0.42);
 }
 
 @theme inline {
@@ -59,8 +150,16 @@ body {
   font-size: 15px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  line-height: 1.6;
+  line-height: 1.55;
   letter-spacing: -0.011em;
+  color-scheme: light;
+}
+
+html {
+  background: var(--background);
+}
+
+.dark body {
   color-scheme: dark;
 }
 
@@ -76,11 +175,11 @@ a {
   margin-inline: auto;
   width: 100%;
   max-width: var(--content-max);
-  padding: 2rem 1.5rem;
+  padding: 1.75rem 1.5rem 2.5rem;
 }
 @media (min-width: 768px) {
   .tesbo-page {
-    padding: 2rem 2rem;
+    padding: 2rem 2rem 2.75rem;
   }
 }
 
@@ -92,6 +191,7 @@ a {
   background: var(--surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
 }
 
 .tesbo-card-elevated {
@@ -112,7 +212,7 @@ a {
 .tesbo-table th {
   text-align: left;
   font-size: 0.8125rem;
-  font-weight: 500;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--muted-soft);

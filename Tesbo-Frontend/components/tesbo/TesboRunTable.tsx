@@ -30,8 +30,8 @@ export function TesboRunTable({ runs }: { runs: TesboRunSummary[] }) {
               <td className="px-4 py-3 text-[var(--foreground)]">{run.name}</td>
               <td className="px-4 py-3 text-[var(--muted)]">{run.status}</td>
               <td className="px-4 py-3 text-right">{run.total}</td>
-              <td className="px-4 py-3 text-right text-green-600">{run.passed}</td>
-              <td className="px-4 py-3 text-right text-red-600">{run.failed}</td>
+              <td className="px-4 py-3 text-right text-[var(--success)]">{run.passed}</td>
+              <td className="px-4 py-3 text-right text-[var(--error)]">{run.failed}</td>
               <td className="px-4 py-3 text-[var(--muted)]">
                 {new Date(run.createdAt).toLocaleString()}
               </td>

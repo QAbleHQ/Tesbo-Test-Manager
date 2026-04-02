@@ -6,15 +6,15 @@ export function Card({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
 }
 
 export function CardHeader({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cx("mb-3 flex items-start justify-between gap-3", className)} {...props} />;
+  return <div className={cx("mb-4 flex items-start justify-between gap-3", className)} {...props} />;
 }
 
 export function CardTitle({ className, ...props }: HTMLAttributes<HTMLHeadingElement>) {
-  return <h3 className={cx("text-[17px] font-semibold text-[var(--foreground)]", className)} {...props} />;
+  return <h3 className={cx("text-[18px] font-semibold leading-6 text-[var(--foreground)]", className)} {...props} />;
 }
 
 export function CardBody({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cx("text-[15px] text-[var(--muted)]", className)} {...props} />;
+  return <div className={cx("text-[14px] leading-6 text-[var(--muted)]", className)} {...props} />;
 }
 
 export function CardFooter({ className, ...props }: HTMLAttributes<HTMLDivElement>) {

@@ -156,37 +156,58 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
 
   if (!open) return null;
 
+  const isStepComplete = (candidate: ImportStep) =>
+    (step === "mapping" && candidate === "upload") || (step === "result" && candidate !== "result");
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="mx-4 flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay-backdrop)] backdrop-blur-sm">
+      <div className="mx-4 flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface-overlay)] shadow-[var(--shadow-elevated)]">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-zinc-200 px-6 py-4 dark:border-zinc-700">
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4">
           <div>
-            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Import Test Cases</h2>
-            <p className="text-sm text-zinc-500">
+            <h2 className="text-lg font-semibold text-[var(--foreground)]">Import Test Cases</h2>
+            <p className="text-sm text-[var(--muted)]">
               {step === "upload" && "Upload a CSV or Excel file to import test cases."}
               {step === "mapping" && "Map your file columns to test case fields."}
               {step === "result" && "Import complete."}
             </p>
           </div>
-          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-300">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+          >
             <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
           </button>
         </div>
 
         {/* Steps indicator */}
-        <div className="flex items-center gap-2 border-b border-zinc-100 px-6 py-3 dark:border-zinc-800">
+        <div className="flex items-center gap-2 border-b border-[var(--border-subtle)] px-6 py-3">
           {(["upload", "mapping", "result"] as ImportStep[]).map((s, i) => (
             <div key={s} className="flex items-center gap-2">
-              {i > 0 && <div className="h-px w-8 bg-zinc-200 dark:bg-zinc-700" />}
-              <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-medium ${
-                step === s ? "bg-blue-600 text-white" : s === "result" && step === "mapping" ? "bg-zinc-200 text-zinc-500 dark:bg-zinc-700 dark:text-zinc-400" : "bg-zinc-200 text-zinc-500 dark:bg-zinc-700 dark:text-zinc-400"
-              } ${(step === "mapping" && s === "upload") || step === "result" ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400" : ""}`}>
-                {((step === "mapping" && s === "upload") || (step === "result" && s !== "result")) ? (
+              {i > 0 && <div className="h-px w-8 bg-[var(--border)]" />}
+              <div
+                className={`flex h-6 w-6 items-center justify-center rounded-full border text-xs font-medium ${
+                  step === s
+                    ? "border-[var(--confidence-high-border)] bg-[var(--confidence-high-soft)] text-[var(--confidence-high-foreground)]"
+                    : isStepComplete(s)
+                      ? "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success-foreground)]"
+                      : "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]"
+                }`}
+              >
+                {isStepComplete(s) ? (
                   <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                 ) : i + 1}
               </div>
-              <span className={`text-xs font-medium ${step === s ? "text-blue-600 dark:text-blue-400" : "text-zinc-500 dark:text-zinc-400"}`}>
+              <span
+                className={`text-xs font-medium ${
+                  step === s
+                    ? "text-[var(--confidence-high-foreground)]"
+                    : isStepComplete(s)
+                      ? "text-[var(--success-foreground)]"
+                      : "text-[var(--muted)]"
+                }`}
+              >
                 {s === "upload" ? "Upload" : s === "mapping" ? "Map Columns" : "Results"}
               </span>
             </div>
@@ -201,26 +222,26 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
               <div
                 className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-10 transition-colors ${
                   dragActive
-                    ? "border-blue-400 bg-blue-50/50 dark:border-blue-500 dark:bg-blue-950/20"
-                    : "border-zinc-300 hover:border-zinc-400 dark:border-zinc-600 dark:hover:border-zinc-500"
+                    ? "border-[var(--confidence-high)] bg-[color-mix(in_oklab,var(--confidence-high-soft)_60%,transparent)]"
+                    : "border-[var(--border-strong)] hover:border-[var(--confidence-high-border)]"
                 }`}
                 onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
                 onDragLeave={() => setDragActive(false)}
                 onDrop={handleDrop}
               >
-                <svg className="mb-3 h-10 w-10 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg className="mb-3 h-10 w-10 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                 </svg>
-                <p className="mb-1 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                <p className="mb-1 text-sm font-medium text-[var(--foreground)]">
                   {file ? file.name : "Drop your CSV or Excel file here"}
                 </p>
-                <p className="mb-3 text-xs text-zinc-500">
+                <p className="mb-3 text-xs text-[var(--muted)]">
                   {file ? `${(file.size / 1024).toFixed(1)} KB` : "Supports .csv, .xlsx, and .xls files"}
                 </p>
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="rounded-lg border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                  className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-medium text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
                 >
                   Browse Files
                 </button>
@@ -237,22 +258,22 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
               </div>
 
               {uploadError && (
-                <div className="mt-3 rounded-lg bg-red-50 px-4 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
+                <div className="mt-3 rounded-lg border border-[var(--error-border)] bg-[var(--error-soft)] px-4 py-2 text-sm text-[var(--error-foreground)]">
                   {uploadError}
                 </div>
               )}
 
-              <div className="mt-4 flex items-center gap-3 rounded-lg bg-zinc-50 px-4 py-3 dark:bg-zinc-800/50">
-                <svg className="h-5 w-5 shrink-0 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div className="mt-4 flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-4 py-3">
+                <svg className="h-5 w-5 shrink-0 text-[var(--muted-soft)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <div className="flex-1 text-xs text-zinc-600 dark:text-zinc-400">
+                <div className="flex-1 text-xs text-[var(--muted)]">
                   Not sure about the format? Download a{" "}
-                  <a href={getTemplateUrl(projectId, "csv")} className="font-medium text-blue-600 hover:underline dark:text-blue-400" target="_blank" rel="noreferrer">
+                  <a href={getTemplateUrl(projectId, "csv")} className="font-medium text-[var(--confidence-high-foreground)] hover:underline" target="_blank" rel="noreferrer">
                     sample CSV
                   </a>{" "}
                   or{" "}
-                  <a href={getTemplateUrl(projectId, "xlsx")} className="font-medium text-blue-600 hover:underline dark:text-blue-400" target="_blank" rel="noreferrer">
+                  <a href={getTemplateUrl(projectId, "xlsx")} className="font-medium text-[var(--confidence-high-foreground)] hover:underline" target="_blank" rel="noreferrer">
                     sample Excel
                   </a>{" "}
                   template to get started.
@@ -264,16 +285,16 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           {/* ---- STEP 2: MAPPING ---- */}
           {step === "mapping" && preview && (
             <div>
-              <div className="mb-4 rounded-lg bg-blue-50 px-4 py-2 text-sm text-blue-800 dark:bg-blue-900/30 dark:text-blue-200">
+              <div className="mb-4 rounded-lg border border-[var(--confidence-high-border)] bg-[var(--confidence-high-soft)] px-4 py-2 text-sm text-[var(--confidence-high-foreground)]">
                 {preview.totalRows} row{preview.totalRows !== 1 ? "s" : ""} found in your file. Map the columns below.
               </div>
 
               <div className="space-y-2">
                 {IMPORTABLE_FIELDS.map((field) => (
                   <div key={field.key} className="flex items-center gap-3">
-                    <label className="w-40 shrink-0 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                    <label className="w-40 shrink-0 text-sm font-medium text-[var(--foreground)]">
                       {field.label}
-                      {field.required && <span className="ml-0.5 text-red-500">*</span>}
+                      {field.required && <span className="ml-0.5 text-[var(--error)]">*</span>}
                     </label>
                     <select
                       value={mapping[field.key] ?? ""}
@@ -281,7 +302,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                         const val = e.target.value;
                         updateMapping(field.key, val === "" ? null : parseInt(val, 10));
                       }}
-                      className="flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200"
+                      className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm text-[var(--foreground)]"
                     >
                       <option value="">-- Skip --</option>
                       {preview.headers.map((header, idx) => (
@@ -295,13 +316,13 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
               {/* Preview table */}
               {mappedPreviewData.length > 0 && (
                 <div className="mt-5">
-                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Preview (first {mappedPreviewData.length} rows)</p>
-                  <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">Preview (first {mappedPreviewData.length} rows)</p>
+                  <div className="overflow-x-auto rounded-lg border border-[var(--border)]">
                     <table className="min-w-full text-xs">
                       <thead>
-                        <tr className="bg-zinc-50 dark:bg-zinc-800">
+                        <tr className="bg-[var(--surface-secondary)]">
                           {IMPORTABLE_FIELDS.filter((f) => mapping[f.key] != null).map((f) => (
-                            <th key={f.key} className="whitespace-nowrap px-3 py-2 text-left font-medium text-zinc-600 dark:text-zinc-400">
+                            <th key={f.key} className="whitespace-nowrap px-3 py-2 text-left font-medium text-[var(--muted)]">
                               {f.label}
                             </th>
                           ))}
@@ -309,10 +330,10 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                       </thead>
                       <tbody>
                         {mappedPreviewData.map((row, i) => (
-                          <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
+                          <tr key={i} className="border-t border-[var(--border-subtle)]">
                             {IMPORTABLE_FIELDS.filter((f) => mapping[f.key] != null).map((f) => (
-                              <td key={f.key} className="max-w-[200px] truncate whitespace-nowrap px-3 py-1.5 text-zinc-700 dark:text-zinc-300">
-                                {row[f.key] || <span className="text-zinc-400">--</span>}
+                              <td key={f.key} className="max-w-[200px] truncate whitespace-nowrap px-3 py-1.5 text-[var(--foreground)]">
+                                {row[f.key] || <span className="text-[var(--muted-soft)]">--</span>}
                               </td>
                             ))}
                           </tr>
@@ -324,7 +345,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
               )}
 
               {importError && (
-                <div className="mt-3 rounded-lg bg-red-50 px-4 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
+                <div className="mt-3 rounded-lg border border-[var(--error-border)] bg-[var(--error-soft)] px-4 py-2 text-sm text-[var(--error-foreground)]">
                   {importError}
                 </div>
               )}
@@ -334,15 +355,15 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           {/* ---- STEP 3: RESULT ---- */}
           {step === "result" && result && (
             <div className="space-y-4">
-              <div className="flex items-center gap-3 rounded-xl bg-green-50 p-4 dark:bg-green-900/20">
-                <svg className="h-8 w-8 shrink-0 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div className="flex items-center gap-3 rounded-xl border border-[var(--success-border)] bg-[var(--success-soft)] p-4">
+                <svg className="h-8 w-8 shrink-0 text-[var(--success)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 <div>
-                  <p className="font-semibold text-green-800 dark:text-green-200">
+                  <p className="font-semibold text-[var(--success-foreground)]">
                     {result.imported} test case{result.imported !== 1 ? "s" : ""} imported successfully
                   </p>
-                  <p className="text-sm text-green-600 dark:text-green-400">
+                  <p className="text-sm text-[var(--success)]">
                     Out of {result.total} total rows in the file.
                   </p>
                 </div>
@@ -350,22 +371,22 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
 
               {result.errors.length > 0 && (
                 <div>
-                  <p className="mb-2 text-sm font-medium text-red-700 dark:text-red-300">
+                  <p className="mb-2 text-sm font-medium text-[var(--error-foreground)]">
                     {result.errors.length} row{result.errors.length !== 1 ? "s" : ""} had errors:
                   </p>
-                  <div className="max-h-48 overflow-y-auto rounded-lg border border-red-200 dark:border-red-800">
+                  <div className="max-h-48 overflow-y-auto rounded-lg border border-[var(--error-border)]">
                     <table className="w-full text-xs">
                       <thead>
-                        <tr className="bg-red-50 dark:bg-red-900/20">
-                          <th className="px-3 py-1.5 text-left font-medium text-red-700 dark:text-red-300">Row</th>
-                          <th className="px-3 py-1.5 text-left font-medium text-red-700 dark:text-red-300">Error</th>
+                        <tr className="bg-[var(--error-soft)]">
+                          <th className="px-3 py-1.5 text-left font-medium text-[var(--error-foreground)]">Row</th>
+                          <th className="px-3 py-1.5 text-left font-medium text-[var(--error-foreground)]">Error</th>
                         </tr>
                       </thead>
                       <tbody>
                         {result.errors.map((err, i) => (
-                          <tr key={i} className="border-t border-red-100 dark:border-red-800/50">
-                            <td className="px-3 py-1.5 text-red-600 dark:text-red-400">{err.row}</td>
-                            <td className="px-3 py-1.5 text-red-600 dark:text-red-400">{err.message}</td>
+                          <tr key={i} className="border-t border-[var(--error-border)]">
+                            <td className="px-3 py-1.5 text-[var(--error)]">{err.row}</td>
+                            <td className="px-3 py-1.5 text-[var(--error)]">{err.message}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -378,17 +399,17 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-3 border-t border-zinc-200 px-6 py-4 dark:border-zinc-700">
+        <div className="flex items-center justify-end gap-3 border-t border-[var(--border)] px-6 py-4">
           {step === "upload" && (
             <>
-              <button type="button" onClick={onClose} className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-400 dark:hover:bg-zinc-800">
+              <button type="button" onClick={onClose} className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]">
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={() => void handleUpload()}
                 disabled={!file || uploading}
-                className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--brand-hover)] disabled:opacity-50"
               >
                 {uploading ? "Parsing..." : "Next"}
               </button>
@@ -396,21 +417,21 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           )}
           {step === "mapping" && (
             <>
-              <button type="button" onClick={() => { setStep("upload"); setPreview(null); }} className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-400 dark:hover:bg-zinc-800">
+              <button type="button" onClick={() => { setStep("upload"); setPreview(null); }} className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]">
                 Back
               </button>
               <button
                 type="button"
                 onClick={() => void handleImport()}
                 disabled={importing || mapping.title == null}
-                className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--brand-hover)] disabled:opacity-50"
               >
                 {importing ? "Importing..." : `Import ${preview?.totalRows ?? 0} rows`}
               </button>
             </>
           )}
           {step === "result" && (
-            <button type="button" onClick={onClose} className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-medium text-white hover:bg-blue-700">
+            <button type="button" onClick={onClose} className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--brand-hover)]">
               Done
             </button>
           )}

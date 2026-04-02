@@ -131,7 +131,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
           value={form.name}
           onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
           placeholder="Rule name"
-          className="w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
+          className="w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted-soft)]"
           required
         />
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
@@ -143,7 +143,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
                 conditionType: e.target.value as "FAILURE_RATIO" | "PASS_RATIO" | "BUILD_UPDATE",
               }))
             }
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)]"
           >
             <option value="FAILURE_RATIO">Failure ratio</option>
             <option value="PASS_RATIO">Pass ratio</option>
@@ -155,7 +155,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
               setForm((prev) => ({ ...prev, comparator: e.target.value as "GREATER_THAN" | "GREATER_OR_EQUAL" }))
             }
             disabled={thresholdDisabled}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm disabled:opacity-60"
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] disabled:opacity-60"
           >
             <option value="GREATER_OR_EQUAL">Greater or equal</option>
             <option value="GREATER_THAN">Greater than</option>
@@ -167,20 +167,20 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
             value={form.threshold}
             onChange={(e) => setForm((prev) => ({ ...prev, threshold: Number(e.target.value || 0) }))}
             disabled={thresholdDisabled}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm disabled:opacity-60"
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] disabled:opacity-60"
           />
         </div>
         <textarea
           value={form.recipientsText}
           onChange={(e) => setForm((prev) => ({ ...prev, recipientsText: e.target.value }))}
           placeholder="Recipients (comma or newline separated)"
-          className="w-full h-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
+          className="h-20 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted-soft)]"
         />
         <div className="flex flex-wrap items-center gap-3">
           <select
             value={form.frequency}
             onChange={(e) => setForm((prev) => ({ ...prev, frequency: e.target.value as "IMMEDIATE" | "DAILY" }))}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
+            className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)]"
           >
             <option value="IMMEDIATE">Immediate</option>
             <option value="DAILY">Daily</option>
@@ -196,7 +196,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
           <button
             type="submit"
             disabled={saving}
-            className="rounded-lg bg-[var(--brand-primary)] text-white px-3 py-2 text-sm hover:opacity-90 disabled:opacity-50"
+            className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-3 py-2 text-sm text-white transition-colors hover:bg-[var(--brand-hover)] disabled:opacity-50"
           >
             {saving ? "Saving..." : editingId ? "Update alert" : "Create alert"}
           </button>
@@ -204,7 +204,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
             <button
               type="button"
               onClick={startNew}
-              className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm"
+              className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
             >
               Clear
             </button>
@@ -219,7 +219,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
           {rules.map((rule) => (
             <li
               key={rule.id}
-              className="rounded-lg border border-[var(--border)] px-3 py-2 flex items-center justify-between"
+              className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2"
             >
               <div>
                 <p className="text-sm font-medium text-[var(--foreground)]">{rule.name}</p>
@@ -239,7 +239,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
                       .then(load)
                       .finally(() => setBusyId(null));
                   }}
-                  className="rounded border border-[var(--border)] px-2 py-1 text-xs"
+                  className="rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
                   disabled={busyId === rule.id}
                 >
                   {rule.enabled ? "Disable" : "Enable"}
@@ -252,7 +252,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
                       .then(() => setBanner("Test alert sent."))
                       .finally(() => setBusyId(null));
                   }}
-                  className="rounded border border-[var(--border)] px-2 py-1 text-xs"
+                  className="rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
                   disabled={busyId === rule.id}
                 >
                   Send test
@@ -260,7 +260,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
                 <button
                   type="button"
                   onClick={() => editRule(rule)}
-                  className="rounded border border-[var(--border)] px-2 py-1 text-xs"
+                  className="rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
                 >
                   Edit
                 </button>
@@ -272,7 +272,7 @@ export function TesboAlertSettings({ projectId }: { projectId: string }) {
                       .then(load)
                       .finally(() => setBusyId(null));
                   }}
-                  className="rounded border border-red-300 px-2 py-1 text-xs text-red-600"
+                  className="rounded border border-[var(--error-border)] bg-[var(--surface)] px-2 py-1 text-xs text-[var(--error)] transition-colors hover:bg-[var(--error-soft)]"
                   disabled={busyId === rule.id}
                 >
                   Delete

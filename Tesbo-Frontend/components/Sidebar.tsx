@@ -5,6 +5,7 @@ import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { authMe, getProject, listProjects, logout, type ProjectSummary, type ProjectType } from "@/lib/api";
+import ThemeToggle from "@/components/ThemeToggle";
 
 type NavItemConfig = {
   href: string;
@@ -160,16 +161,16 @@ function NavLink({
       href={href}
       title={collapsed ? label : undefined}
       aria-label={label}
-      className={`group relative flex items-center overflow-hidden rounded-lg py-2 text-[15px] font-semibold transition-colors duration-150 ${
+      className={`group relative flex items-center overflow-hidden rounded-xl py-2 text-[14px] font-medium transition-colors duration-150 ${
         collapsed
           ? "justify-center px-2"
           : nested
-            ? "gap-2.5 pl-11 pr-3.5"
-            : "gap-2.5 pl-5 pr-3.5"
+            ? "gap-2.5 pl-10 pr-3.5"
+            : "gap-2.5 pl-4 pr-3.5"
       } ${
         active
-          ? "bg-[var(--brand-surface)] text-[var(--foreground)] font-medium"
-          : "text-[var(--muted)] hover:bg-[var(--surface)]/70 hover:text-[var(--foreground)]"
+          ? "border border-[var(--brand-border)] bg-[var(--brand-surface)] text-[var(--foreground)] shadow-sm"
+          : "border border-transparent text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)]"
       }`}
     >
       {active && <span className="absolute inset-y-1 left-0 w-[3px] rounded-r-full bg-[var(--brand-primary)]" aria-hidden />}
@@ -193,10 +194,8 @@ function SidebarContent() {
   const isInProject = Boolean(projectId);
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
-  const [projectName, setProjectName] = useState<string | null>(null);
   const [projectType, setProjectType] = useState<ProjectType>("tesbox");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [navScope, setNavScope] = useState<NavScope>(isInProject ? "project" : "workspace");
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
@@ -208,18 +207,12 @@ function SidebarContent() {
     getProject(projectId)
       .then((p) => {
         if (active) {
-          setProjectName((p.name as string) ?? "Project");
           setProjectType(((p.projectType as string) ?? "tesbox") as ProjectType);
         }
       })
-      .catch(() => { if (active) setProjectName("Project"); });
+      .catch(() => {});
     return () => { active = false; };
   }, [projectId]);
-
-  useEffect(() => {
-    if (!ENABLE_SCOPE_SWITCHER) return;
-    setNavScope(isInProject ? "project" : "workspace");
-  }, [isInProject]);
 
   useEffect(() => {
     let active = true;
@@ -275,7 +268,6 @@ function SidebarContent() {
   };
 
   const onScopeChange = (scope: NavScope) => {
-    setNavScope(scope);
     if (scope === "workspace" && isInProject) {
       router.push("/projects");
       return;
@@ -288,21 +280,20 @@ function SidebarContent() {
 
   const onProjectSelect = (nextProjectId: string) => {
     if (!nextProjectId) return;
-    setNavScope("project");
     router.push(`/projects/${nextProjectId}`);
   };
 
-  const showGlobalNavigation = !ENABLE_SCOPE_SWITCHER || navScope === "workspace";
-  const showProjectNavigation = (!ENABLE_SCOPE_SWITCHER && isInProject && Boolean(projectId))
-    || (ENABLE_SCOPE_SWITCHER && navScope === "project" && isInProject && Boolean(projectId));
+  const navScope: NavScope = isInProject ? "project" : "workspace";
+  const showGlobalNavigation = !ENABLE_SCOPE_SWITCHER || !isInProject;
+  const showProjectNavigation = isInProject && Boolean(projectId);
 
   return (
     <aside
-      className={`sticky top-0 shrink-0 flex h-screen flex-col bg-[var(--app-shell)] border-r border-[var(--border-subtle)] transition-[width] duration-200 ${
-        isCollapsed ? "w-[68px]" : "w-[256px]"
+      className={`sticky top-0 shrink-0 flex h-screen flex-col border-r border-[var(--border)] bg-[var(--app-shell)] transition-[width] duration-200 ${
+        isCollapsed ? "w-[72px]" : "w-[248px]"
       }`}
     >
-      <div className="flex h-14 items-center justify-between gap-2 border-b border-[var(--border-subtle)] px-3">
+      <div className="flex h-14 items-center justify-between gap-2 border-b border-[var(--border)] px-3">
         <Link href="/projects" className={`flex items-center ${isCollapsed ? "justify-center" : ""}`} aria-label="TesboX">
           {isCollapsed ? (
             <span className="text-base font-bold text-[var(--foreground)]">TX</span>
@@ -313,7 +304,7 @@ function SidebarContent() {
         <button
           type="button"
           onClick={() => setIsCollapsed((prev) => !prev)}
-          className="rounded-lg p-1.5 text-[var(--muted-soft)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] transition-colors"
+          className="rounded-lg p-1.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--foreground)]"
           aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
           <MenuIcon name={isCollapsed ? "chevronRight" : "chevronLeft"} className="h-4 w-4" />
@@ -321,13 +312,13 @@ function SidebarContent() {
       </div>
 
       {ENABLE_SCOPE_SWITCHER && !isCollapsed && (
-        <div className="border-b border-[var(--border-subtle)] px-3 py-2.5">
+        <div className="border-b border-[var(--border)] px-3 py-3">
           <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Scope Lock</p>
-          <div className="mt-2 grid grid-cols-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] p-1">
+          <div className="mt-2 grid grid-cols-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-1 shadow-[var(--shadow-card)]">
             <button
               type="button"
               onClick={() => onScopeChange("workspace")}
-              className={`rounded-md px-2 py-1.5 text-[12px] font-semibold transition-colors ${
+              className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
                 navScope === "workspace"
                   ? "bg-[var(--brand-surface)] text-[var(--foreground)]"
                   : "text-[var(--muted)] hover:text-[var(--foreground)]"
@@ -338,7 +329,7 @@ function SidebarContent() {
             <button
               type="button"
               onClick={() => onScopeChange("project")}
-              className={`rounded-md px-2 py-1.5 text-[12px] font-semibold transition-colors ${
+              className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
                 navScope === "project"
                   ? "bg-[var(--brand-surface)] text-[var(--foreground)]"
                   : "text-[var(--muted)] hover:text-[var(--foreground)]"
@@ -355,7 +346,7 @@ function SidebarContent() {
               <select
                 value={projectId ?? ""}
                 onChange={(e) => onProjectSelect(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] px-2.5 py-2 text-[13px] text-[var(--foreground)]"
+                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[13px] text-[var(--foreground)] shadow-[var(--shadow-card)]"
               >
                 <option value="" disabled>
                   Select project
@@ -384,7 +375,7 @@ function SidebarContent() {
         </div>
       )}
 
-      <nav className="flex-1 overflow-y-auto px-2 pb-2 pt-2 space-y-3">
+      <nav className="flex-1 space-y-3 overflow-y-auto px-2 pb-3 pt-3">
         {showGlobalNavigation && (
           <div className="space-y-0.5">
             {(ENABLE_SCOPE_SWITCHER ? workspaceModeNavItems : globalNavItems).map(({ href, label, icon }) => (
@@ -399,7 +390,7 @@ function SidebarContent() {
               {(projectType === "tesbox_executions" ? executionProjectNavSections : projectNavSections).map(({ section, items }) => (
                 <div key={section}>
                   {!isCollapsed && (
-                    <p className="mb-1 px-3 text-[13px] font-semibold uppercase tracking-[0.08em] text-[var(--muted)]">
+                    <p className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
                       {section}
                     </p>
                   )}
@@ -453,7 +444,7 @@ function SidebarContent() {
         {showGlobalNavigation && !ENABLE_SCOPE_SWITCHER && (
           <div>
             {!isCollapsed && (
-              <p className="mb-1 px-3 text-[13px] font-semibold uppercase tracking-[0.08em] text-[var(--muted)]">
+              <p className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
                 Workspace
               </p>
             )}
@@ -465,7 +456,15 @@ function SidebarContent() {
         )}
       </nav>
 
-      <div className="border-t border-[var(--border-subtle)] p-2 space-y-1">
+      <div className="space-y-2 border-t border-[var(--border)] p-2">
+        {!isCollapsed && (
+          <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-2">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+              Theme
+            </p>
+            <ThemeToggle />
+          </div>
+        )}
         {isPlatformAdmin && (
           <NavLink
             href="/admin"
@@ -479,7 +478,7 @@ function SidebarContent() {
           type="button"
           onClick={onLogout}
           disabled={isLoggingOut}
-          className={`w-full rounded-lg py-2 text-[14px] text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] transition-colors disabled:opacity-60 ${
+          className={`w-full rounded-xl border border-transparent py-2 text-[14px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--foreground)] disabled:opacity-60 ${
             isCollapsed ? "flex justify-center px-2" : "flex items-center gap-2.5 px-2.5 text-left"
           }`}
           aria-label={isLoggingOut ? "Logging out" : "Log out"}
