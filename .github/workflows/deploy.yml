@@ -99,6 +99,11 @@ jobs:
           # Stop all containers on this droplet to free ports
           $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
           $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
+          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
+          $SSH "docker builder prune -af || true"
+          $SSH "docker image prune -af || true"
+          $SSH "docker volume prune -f || true"
+          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
@@ -143,6 +148,11 @@ jobs:
           # Stop all containers on this droplet to free ports
           $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
           $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
+          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
+          $SSH "docker builder prune -af || true"
+          $SSH "docker image prune -af || true"
+          $SSH "docker volume prune -f || true"
+          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
@@ -213,6 +223,11 @@ jobs:
           # Stop all containers on this droplet to free ports
           $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
           $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
+          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
+          $SSH "docker builder prune -af || true"
+          $SSH "docker image prune -af || true"
+          $SSH "docker volume prune -f || true"
+          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
 
           # Set up Nginx + SSL (idempotent)
           scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
