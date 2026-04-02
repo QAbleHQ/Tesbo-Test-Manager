@@ -580,6 +580,23 @@ function Stat({ label, value, tone }: { label: string; value: string | number; t
 
 function toAbsoluteArtifactUrl(url: string): string {
   if (!url) return url;
-  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    try {
+      const parsed = new URL(url);
+      // Some deployments store absolute artifact URLs on a backend-only host.
+      // When the same path is exposed via the current app host, prefer it so
+      // browser viewers (including Playwright trace viewer) can load artifacts.
+      if (typeof window !== "undefined") {
+        const backendOnlyHost = parsed.hostname.toLowerCase().includes("backdoor");
+        const likelyPublicArtifactPath = parsed.pathname.startsWith("/app/artifacts/");
+        if ((backendOnlyHost || likelyPublicArtifactPath) && parsed.origin !== window.location.origin) {
+          return `${window.location.origin}${parsed.pathname}${parsed.search}`;
+        }
+      }
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
   return `${API_BASE}${url.startsWith("/") ? "" : "/"}${url}`;
 }
