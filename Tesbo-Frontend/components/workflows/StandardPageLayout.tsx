@@ -11,7 +11,7 @@ export default function StandardPageLayout({ header, children, className }: Stan
   return (
     <div className={cx("w-full", className)}>
       {header}
-      <div className="space-y-5">{children}</div>
+      <div className="space-y-6">{children}</div>
     </div>
   );
 }
