@@ -53,6 +53,7 @@ public final class ExternalExecutionServiceClient {
             job.put("title", row.title());
             job.put("startUrl", automationConfig.startUrl());
             job.put("maxRetries", maxRetries);
+            job.put("testCaseCount", 1);
             jobs.add(job);
         }
 
@@ -60,7 +61,6 @@ public final class ExternalExecutionServiceClient {
         payload.put("jobs", jobs);
         payload.put("externalRef", cycleId.toString());
         payload.put("projectId", projectId.toString());
-        payload.put("maxParallel", automationConfig.maxParallel());
         payload.put("executionProvider", automationConfig.executionProvider());
         payload.put("providerConfig", automationConfig.providerConfig());
         payload.put("modelProvider", automationConfig.modelProvider());

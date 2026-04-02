@@ -121,6 +121,9 @@ jobs:
 
           $SSH "cat > /opt/bettercases/frontend/app.env <<'EOF'
           NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          MW_APM_ACCESS_TOKEN=${{ secrets.MW_APM_ACCESS_TOKEN }}
+          MW_AGENT_SERVICE=${{ secrets.MW_AGENT_SERVICE }}
+          MW_APM_SERVICE_NAME=tesbo-frontend
           EOF"
 
           $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
@@ -246,6 +249,9 @@ jobs:
           $SSH "cat > /opt/bettercases/automation-agent/app.env <<'EOF'
           PORT=7400
           AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
+          MW_APM_ACCESS_TOKEN=${{ secrets.MW_APM_ACCESS_TOKEN }}
+          MW_AGENT_SERVICE=${{ secrets.MW_AGENT_SERVICE }}
+          MW_APM_SERVICE_NAME=tesbo-automation-agents
           EOF"
 
           $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
