@@ -227,7 +227,7 @@ export default function TesboRunsPage() {
                 <tbody>
                   {paginatedRuns.map((run, idx) => (
                     <tr key={run.id} className="cursor-pointer" onClick={() => router.push(`/projects/${projectId}/tesbo-reports/runs/${run.id}`)}>
-                      <td className="px-4 py-3 font-semibold text-[var(--foreground)]">#{run.runNumber || String((runPage - 1) * pageSize + idx + 1)}</td>
+                      <td className="px-4 py-3 font-semibold text-[var(--foreground)]">#{run.runNumber || String(runs.length - ((runPage - 1) * pageSize + idx))}</td>
                       <td className="px-4 py-3">{run.name}</td>
                       <td className="px-4 py-3">{run.branchName || "-"}</td>
                       <td className="px-4 py-3">{run.pullRequest || "-"}</td>

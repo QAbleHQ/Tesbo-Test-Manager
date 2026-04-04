@@ -710,6 +710,11 @@ public final class TesboReportsService {
 
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
+
+            if (runNumber == null || runNumber.isBlank()) {
+                runNumber = nextRunNumber(c, projectId);
+            }
+
             UUID runId;
             try (PreparedStatement ps = c.prepareStatement(insertRunSql)) {
                 ps.setObject(1, projectId);
@@ -738,6 +743,21 @@ public final class TesboReportsService {
                  project_name, browser_name, browser_version, os_name, os_platform, os_arch,
                  tags_json, steps_json, executed_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?)
+                ON CONFLICT (run_id, spec_name, test_name) DO UPDATE SET
+                  status = EXCLUDED.status,
+                  duration_ms = EXCLUDED.duration_ms,
+                  trace_url = COALESCE(EXCLUDED.trace_url, tesbo_report_cases.trace_url),
+                  screenshot_url = COALESCE(EXCLUDED.screenshot_url, tesbo_report_cases.screenshot_url),
+                  video_url = COALESCE(EXCLUDED.video_url, tesbo_report_cases.video_url),
+                  trace_storage_key = COALESCE(EXCLUDED.trace_storage_key, tesbo_report_cases.trace_storage_key),
+                  screenshot_storage_key = COALESCE(EXCLUDED.screenshot_storage_key, tesbo_report_cases.screenshot_storage_key),
+                  video_storage_key = COALESCE(EXCLUDED.video_storage_key, tesbo_report_cases.video_storage_key),
+                  full_title = COALESCE(EXCLUDED.full_title, tesbo_report_cases.full_title),
+                  error_message = EXCLUDED.error_message,
+                  error_stack = EXCLUDED.error_stack,
+                  attempt = EXCLUDED.attempt,
+                  steps_json = EXCLUDED.steps_json,
+                  executed_at = COALESCE(EXCLUDED.executed_at, tesbo_report_cases.executed_at)
                 """;
             try (PreparedStatement ps = c.prepareStatement(insertCaseSql)) {
                 for (Map<String, Object> test : tests) {
@@ -1227,6 +1247,16 @@ public final class TesboReportsService {
             if (item instanceof Map<?, ?>) out.add((Map<String, Object>) item);
         }
         return out;
+    }
+
+    private static String nextRunNumber(Connection c, UUID projectId) throws SQLException {
+        String sql = "SELECT COUNT(*)::int + 1 AS next_num FROM tesbo_report_runs WHERE project_id = ?";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            return String.valueOf(rs.getInt("next_num"));
+        }
     }
 
     private static String asText(Object value, String fallback) {
