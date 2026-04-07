@@ -1,6 +1,9 @@
 import express from "express";
+import http from "node:http";
 import { config } from "./config.js";
 import { logError, logInfo } from "./logger.js";
+import { getRedisClient } from "./redisClient.js";
+import { createLiveWsServer } from "./liveWs.js";
 import {
   getSession,
   createSession,
@@ -19,9 +22,13 @@ import {
 const app = express();
 app.use(express.json({ limit: "8mb" }));
 
-function isAuthorized(req) {
+function isAuthorized(req, reqUrl = null) {
   if (!config.sharedToken) return true;
-  const token = req.header("x-agent-token");
+  const tokenFromHeader = typeof req.header === "function"
+    ? req.header("x-agent-token")
+    : req.headers?.["x-agent-token"];
+  const tokenFromQuery = reqUrl?.searchParams?.get("token");
+  const token = tokenFromHeader || tokenFromQuery;
   return token === config.sharedToken;
 }
 
@@ -34,10 +41,14 @@ app.use("/internal", (req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
+  const redisReady = Boolean(config.redisUrl && config.redisUrl.trim());
   res.json({
     status: "ok",
     service: "tesbo-automation-agents",
     role: config.serviceRole,
+    websocketLiveEnabled: config.enableWebSocketLiveStream,
+    redisConfigured: redisReady,
+    sessionRepositoryMode: config.sessionRepositoryMode,
   });
 });
 
@@ -262,6 +273,13 @@ app.get("/internal/sessions/:sessionId/live", async (req, res) => {
   });
 });
 
+app.get("/internal/sessions/:sessionId/live/ws", async (_req, res) => {
+  res.status(426).json({
+    error: "Upgrade Required",
+    message: "Use WebSocket upgrade for this endpoint.",
+  });
+});
+
 app.get("/internal/sessions/:sessionId/recording", async (req, res) => {
   const { sessionId } = req.params;
   const session = getSession(sessionId);
@@ -334,11 +352,23 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(config.port, () => {
+const server = http.createServer(app);
+createLiveWsServer({
+  server,
+  isAuthorized,
+  getSession,
+});
+
+server.listen(config.port, async () => {
   startCleanupWatchdog();
+  if (config.enableRedisSessionRepository && config.redisUrl) {
+    await getRedisClient().catch(() => null);
+  }
   logInfo("automation_agent_started", {
     port: config.port,
     headless: config.headless,
     role: config.serviceRole,
+    websocketLiveEnabled: config.enableWebSocketLiveStream,
+    sessionRepositoryMode: config.sessionRepositoryMode,
   });
 });

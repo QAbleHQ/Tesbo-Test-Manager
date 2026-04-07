@@ -5,9 +5,31 @@
  * at shared/playwrightScriptRunner.js.
  */
 import fs from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 import { chromium } from "playwright";
 import { config } from "./config.js";
+
+const BLOCKED_HOSTNAMES = new Set(["localhost", "metadata.google.internal"]);
+const BLOCKED_IPV4_CIDRS = [
+  [10, 0, 0, 0, 8],
+  [127, 0, 0, 0, 8],
+  [169, 254, 0, 0, 16],
+  [172, 16, 0, 0, 12],
+  [192, 168, 0, 0, 16],
+];
+const BLOCKED_SCRIPT_PATTERNS = [
+  /\bprocess\b/,
+  /\bglobalThis\b/,
+  /\bglobal\b/,
+  /\bFunction\b/,
+  /\bconstructor\b/,
+  /\brequire\s*\(/,
+  /\bimport\s*\(/,
+  /\bchild_process\b/,
+  /\bfs\b/,
+  /\beval\s*\(/,
+];
 
 export async function ensureScreenshotDir() {
   await fs.mkdir(config.screenshotDir, { recursive: true });
@@ -22,13 +44,68 @@ export async function ensureTraceDir() {
   await fs.mkdir(config.traceDir, { recursive: true });
 }
 
+function ipToInt(ip) {
+  return ip.split(".").reduce((acc, octet) => ((acc << 8) + Number(octet)) >>> 0, 0);
+}
+
+function isBlockedIpv4(ip) {
+  const value = ipToInt(ip);
+  return BLOCKED_IPV4_CIDRS.some(([a, b, c, d, prefix]) => {
+    const base = ipToInt(`${a}.${b}.${c}.${d}`);
+    const mask = prefix === 0 ? 0 : (~((1 << (32 - prefix)) - 1)) >>> 0;
+    return (value & mask) === (base & mask);
+  });
+}
+
+function isBlockedHost(hostname) {
+  const normalized = String(hostname || "").trim().toLowerCase();
+  if (!normalized) return true;
+  if (BLOCKED_HOSTNAMES.has(normalized)) return true;
+  if (normalized.endsWith(".local")) return true;
+  const ipType = isIP(normalized);
+  if (ipType === 4 && isBlockedIpv4(normalized)) return true;
+  if (ipType === 6) {
+    return normalized === "::1" || normalized.startsWith("fe80:") || normalized.startsWith("fc") || normalized.startsWith("fd");
+  }
+  return false;
+}
+
+export function validateAndNormalizeUrl(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) throw new Error("URL is required");
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only http/https URLs are allowed");
+  }
+  if (isBlockedHost(parsed.hostname)) {
+    throw new Error("Navigation to local or private network addresses is blocked");
+  }
+  return parsed.toString();
+}
+
+export function assertSafePlaywrightScript(script) {
+  const source = String(script || "");
+  if (!source.trim()) throw new Error("Script is required");
+  for (const pattern of BLOCKED_SCRIPT_PATTERNS) {
+    if (pattern.test(source)) {
+      throw new Error("Script contains blocked JavaScript constructs");
+    }
+  }
+}
+
 export async function navigateToStartUrl(page, startUrl) {
+  const safeStartUrl = validateAndNormalizeUrl(startUrl);
   const timeoutMs = Math.max(5000, Number(config.startUrlTimeoutMs || 60000));
   try {
-    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.goto(safeStartUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     return;
   } catch {
-    await page.goto(startUrl, { waitUntil: "load", timeout: timeoutMs });
+    await page.goto(safeStartUrl, { waitUntil: "load", timeout: timeoutMs });
   }
 }
 
@@ -141,8 +218,10 @@ export function createInstrumentedPage(page, recordStep) {
   return new Proxy(page, {
     get(target, prop) {
       if (prop === "goto") {
-        return async (url, options) =>
-          recordStep("navigate", { url: String(url || "") }, async () => target.goto(url, options));
+        return async (url, options) => {
+          const safeUrl = validateAndNormalizeUrl(url);
+          return recordStep("navigate", { url: safeUrl }, async () => target.goto(safeUrl, options));
+        };
       }
       if (prop === "locator") {
         return (selector) => createLocatorWrapper(target.locator(selector), String(selector || ""), recordStep);
@@ -284,6 +363,7 @@ export async function runPlaywrightScript(executionId, script, startUrl = null, 
     }
   };
   try {
+    assertSafePlaywrightScript(script);
     if (startUrl) {
       await navigateToStartUrl(page, startUrl);
     }

@@ -20,6 +20,11 @@ public final class OnboardingHandler {
         String orgName = req.orgName.trim();
         String orgSlug = slugify(orgName);
 
+        if (userAlreadyOwnsWorkspace(userId)) {
+            ctx.status(409).json(Map.of("error", "You already have a workspace. Go to Projects."));
+            return;
+        }
+
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
             try {
@@ -104,6 +109,23 @@ public final class OnboardingHandler {
             ResultSet rs = ps.executeQuery();
             rs.next();
             return (UUID) rs.getObject("id");
+        }
+    }
+
+    private static boolean userAlreadyOwnsWorkspace(UUID userId) {
+        String sql = """
+                SELECT 1
+                FROM organization_members
+                WHERE user_id = ?
+                LIMIT 1
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, userId);
+            ResultSet rs = ps.executeQuery();
+            return rs.next();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
         }
     }
 

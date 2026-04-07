@@ -15,6 +15,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +80,7 @@ public final class CycleAutomationRunService {
     public static Map<String, Object> getRunStatus(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        requireRunBoundToCycle(cycleId, runId);
         return ExternalExecutionServiceClient.getRunStatus(runId.toString());
     }
 
@@ -91,6 +93,7 @@ public final class CycleAutomationRunService {
     public static void cancelRun(UUID cycleId, UUID runId, UUID userId) {
         UUID projectId = CycleService.getProjectIdForCycle(cycleId);
         RbacService.requireProjectRole(userId, projectId);
+        requireRunBoundToCycle(cycleId, runId);
         try {
             ExternalExecutionServiceClient.cancelRun(runId.toString());
         } catch (Exception ignored) {
@@ -253,6 +256,7 @@ public final class CycleAutomationRunService {
                 }
                 startUrl = resolved;
             }
+            ensureSafeStartUrl(startUrl);
             String executionProvider = resolveExecutionProvider(settings);
             int maxParallel = resolveMaxParallel(settings);
             Map<String, Object> providerConfig = resolveProviderConfig(settings, executionProvider);
@@ -355,6 +359,59 @@ public final class CycleAutomationRunService {
     private static boolean looksLikeUrl(String value) {
         String lower = value.toLowerCase();
         return lower.startsWith("http://") || lower.startsWith("https://");
+    }
+
+    private static void ensureSafeStartUrl(String rawUrl) {
+        try {
+            URI uri = URI.create(rawUrl);
+            String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
+            if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                throw new io.javalin.http.BadRequestResponse("Automation start URL must use http or https");
+            }
+            String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase();
+            if (host.isBlank()) {
+                throw new io.javalin.http.BadRequestResponse("Automation start URL host is required");
+            }
+            if (host.equals("localhost") || host.endsWith(".local") || host.equals("metadata.google.internal")) {
+                throw new io.javalin.http.BadRequestResponse("Automation start URL points to a blocked host");
+            }
+            if (isPrivateOrLocalIp(host)) {
+                throw new io.javalin.http.BadRequestResponse("Automation start URL cannot target private or local network addresses");
+            }
+        } catch (IllegalArgumentException e) {
+            throw new io.javalin.http.BadRequestResponse("Invalid automation start URL");
+        }
+    }
+
+    private static boolean isPrivateOrLocalIp(String host) {
+        if (!host.matches("^\\d+\\.\\d+\\.\\d+\\.\\d+$")) return false;
+        String[] parts = host.split("\\.");
+        int a = Integer.parseInt(parts[0]);
+        int b = Integer.parseInt(parts[1]);
+        return a == 10
+                || a == 127
+                || (a == 169 && b == 254)
+                || (a == 172 && b >= 16 && b <= 31)
+                || (a == 192 && b == 168);
+    }
+
+    private static void requireRunBoundToCycle(UUID cycleId, UUID runId) {
+        String sql = """
+                SELECT 1
+                FROM cycle_automation_runs
+                WHERE id = ? AND cycle_id = ?
+                """;
+        try (Connection c = Database.getDataSource().getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, runId);
+            ps.setObject(2, cycleId);
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) {
+                throw new io.javalin.http.NotFoundResponse("Automated run not found for this cycle");
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public static List<String> validateAutomatedOnly(UUID cycleId) {

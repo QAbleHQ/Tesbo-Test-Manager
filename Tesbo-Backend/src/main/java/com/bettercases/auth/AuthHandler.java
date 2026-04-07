@@ -11,6 +11,7 @@ import java.util.UUID;
 
 public final class AuthHandler {
     private static final OtpService otpService = new OtpService();
+    private static final String COOKIE_SAME_SITE = "Lax";
 
     public static void requestOtp(Context ctx) {
         String body = ctx.body();
@@ -51,7 +52,7 @@ public final class AuthHandler {
         }
         UUID userId = otpService.resolveSession(token.get()).orElseThrow();
         AuditService.log(userId, "login", "auth", req.email, "{}", ip, ua);
-        ctx.cookie(Config.SESSION_COOKIE_NAME, token.get(), 86400 * Config.SESSION_DAYS);
+        setSessionCookie(ctx, token.get(), 86400 * Config.SESSION_DAYS);
         ctx.json(Map.of("ok", true, "userId", userId.toString()));
     }
 
@@ -59,8 +60,8 @@ public final class AuthHandler {
         String token = ctx.cookie(Config.SESSION_COOKIE_NAME);
         UUID userId = SessionFilter.getUserId(ctx).orElse(null);
         if (token != null) {
-            // Invalidate session by clearing cookie; optional: delete from DB
-            ctx.removeCookie(Config.SESSION_COOKIE_NAME);
+            otpService.invalidateSession(token);
+            clearSessionCookie(ctx);
         }
         if (userId != null) {
             AuditService.log(userId, "logout", "auth", null, "{}", ctx.ip(), ctx.userAgent());
@@ -87,6 +88,35 @@ public final class AuthHandler {
             }
         } catch (Exception ignored) {}
         return null;
+    }
+
+    private static void setSessionCookie(Context ctx, String token, int maxAgeSeconds) {
+        boolean secure = isSecureRequest(ctx);
+        StringBuilder cookie = new StringBuilder();
+        cookie.append(Config.SESSION_COOKIE_NAME).append("=").append(token).append("; Path=/; Max-Age=").append(maxAgeSeconds);
+        cookie.append("; HttpOnly; SameSite=").append(COOKIE_SAME_SITE);
+        if (secure) {
+            cookie.append("; Secure");
+        }
+        ctx.header("Set-Cookie", cookie.toString());
+    }
+
+    private static void clearSessionCookie(Context ctx) {
+        boolean secure = isSecureRequest(ctx);
+        StringBuilder cookie = new StringBuilder();
+        cookie.append(Config.SESSION_COOKIE_NAME).append("=; Path=/; Max-Age=0");
+        cookie.append("; HttpOnly; SameSite=").append(COOKIE_SAME_SITE);
+        if (secure) {
+            cookie.append("; Secure");
+        }
+        ctx.header("Set-Cookie", cookie.toString());
+    }
+
+    private static boolean isSecureRequest(Context ctx) {
+        if ("https".equalsIgnoreCase(ctx.scheme())) return true;
+        String forwardedProto = ctx.header("X-Forwarded-Proto");
+        if (forwardedProto != null && "https".equalsIgnoreCase(forwardedProto.trim())) return true;
+        return Config.FRONTEND_URL != null && Config.FRONTEND_URL.startsWith("https://");
     }
 
     public static class VerifyRequest {

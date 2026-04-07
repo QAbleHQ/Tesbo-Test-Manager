@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui";
+import { Button, StatusChip } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 
 export const REPO_TC_AI_DISABLED_TITLE =
@@ -159,6 +159,27 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
 };
 
 const MAX_WIDTH = 560;
+
+function repoStatusTone(status: string) {
+  if (status === "Approved") return "success" as const;
+  if (status === "In Review") return "warning" as const;
+  if (status === "Deprecated" || status === "Archived") return "neutral" as const;
+  return "brand" as const;
+}
+
+function repoPriorityTone(priority: string) {
+  if (priority === "P0") return "error" as const;
+  if (priority === "P1") return "warning" as const;
+  if (priority === "P2") return "confidenceHigh" as const;
+  return "neutral" as const;
+}
+
+function repoAutomationTone(status: string) {
+  if (status === "Automated") return "success" as const;
+  if (status === "Ready for the Automation") return "confidenceHigh" as const;
+  if (status === "Not able to Automate") return "warning" as const;
+  return "neutral" as const;
+}
 
 type TablePrefs = {
   dataOrder: RepoDataColumnId[];
@@ -473,6 +494,7 @@ export function RepositoryTestCaseTable({
               type="checkbox"
               checked={selectedCaseIdSet.has(tc.id)}
               onChange={() => onToggleCase(tc.id)}
+              onClick={(e) => e.stopPropagation()}
               aria-label={`Select ${tc.title}`}
             />
           </td>
@@ -535,7 +557,7 @@ export function RepositoryTestCaseTable({
                 e.stopPropagation();
                 onRunSingle(tc.id);
               }}
-              className="border-[var(--success)] text-[var(--success)] hover:bg-[var(--brand-soft)]"
+              className="border-[var(--success-border)] text-[var(--success)] hover:bg-[var(--success-soft)]"
               title="Run this test case in live preview"
             >
               Run this test case
@@ -568,13 +590,17 @@ export function RepositoryTestCaseTable({
       case "priority":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
-            <span className={innerTruncate}>{tc.priority}</span>
+            <StatusChip tone={repoPriorityTone(tc.priority)} className="max-w-full">
+              <span className={innerTruncate}>{tc.priority}</span>
+            </StatusChip>
           </td>
         );
       case "status":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
-            <span className={innerTruncate}>{tc.status}</span>
+            <StatusChip tone={repoStatusTone(tc.status)} className="max-w-full">
+              <span className={innerTruncate}>{tc.status}</span>
+            </StatusChip>
           </td>
         );
       case "updated":
@@ -592,7 +618,9 @@ export function RepositoryTestCaseTable({
       case "automationFeasibility":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
-            <span className={innerTruncate}>{tc.automationStatus}</span>
+            <StatusChip tone={repoAutomationTone(tc.automationStatus)} className="max-w-full">
+              <span className={innerTruncate}>{tc.automationStatus}</span>
+            </StatusChip>
           </td>
         );
       default:
@@ -602,10 +630,18 @@ export function RepositoryTestCaseTable({
 
   return (
     <div className="space-y-2">
-      <div className="flex justify-end">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusChip tone="neutral">
+            {visibleDataColumns.length} of {DATA_COLUMN_IDS.length} fields shown
+          </StatusChip>
+          <p className="text-xs text-[var(--muted)]">
+            Drag headers to reorder. Resize columns when using expanded table mode.
+          </p>
+        </div>
         <div ref={columnsMenuRef} className="relative">
           <Button variant="secondary" size="sm" type="button" onClick={() => setColumnsMenuOpen((o) => !o)}>
-            Column visibility
+            Customize table
           </Button>
           {columnsMenuOpen && (
             <div className="absolute right-0 top-full z-30 mt-1 w-72 max-h-80 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] py-2 shadow-lg">
@@ -666,7 +702,10 @@ export function RepositoryTestCaseTable({
             {cases.map((tc) => (
               <tr
                 key={tc.id}
-                className={rowHighlightId === tc.id ? "bg-[var(--brand-soft)]" : ""}
+                onClick={() => void onOpenRow(tc.id)}
+                className={`cursor-pointer transition-colors hover:bg-[var(--surface-secondary)] ${
+                  rowHighlightId === tc.id ? "bg-[var(--brand-soft)]" : ""
+                }`}
               >
                 {orderedColumns.map((col) => renderBodyCell(col, tc))}
               </tr>

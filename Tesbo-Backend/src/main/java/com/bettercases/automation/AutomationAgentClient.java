@@ -4,10 +4,12 @@ import com.bettercases.Config;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.net.ConnectException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
@@ -22,6 +24,18 @@ public final class AutomationAgentClient {
     private static final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
+    public static final class AgentUnavailableException extends RuntimeException {
+        public final String code;
+        public final int upstreamStatus;
+        public final boolean retryable;
+
+        public AgentUnavailableException(String code, String message, int upstreamStatus, boolean retryable, Throwable cause) {
+            super(message, cause);
+            this.code = code;
+            this.upstreamStatus = upstreamStatus;
+            this.retryable = retryable;
+        }
+    }
 
     public static Map<String, Object> createSession(
             UUID sessionId,
@@ -40,7 +54,7 @@ public final class AutomationAgentClient {
         if (modelProvider != null && !modelProvider.isBlank()) payload.put("modelProvider", modelProvider);
         if (modelApiKey != null && !modelApiKey.isBlank()) payload.put("modelApiKey", modelApiKey);
         if (model != null && !model.isBlank()) payload.put("model", model);
-        String body = send("/internal/sessions", "POST", payload);
+        String body = sendWithRetry("/internal/sessions", "POST", payload, Duration.ofSeconds(40), sessionId.toString(), 2);
         try {
             return mapper.readValue(body, new com.fasterxml.jackson.core.type.TypeReference<>() {});
         } catch (Exception e) {
@@ -49,10 +63,10 @@ public final class AutomationAgentClient {
     }
 
     public static AutomationContracts.AgentExecuteResponse executeSteps(UUID sessionId, String commandId, java.util.List<AutomationContracts.ActionStep> steps) {
-        String body = send("/internal/sessions/" + sessionId + "/execute", "POST", Map.of(
+        String body = sendWithRetry("/internal/sessions/" + sessionId + "/execute", "POST", Map.of(
                 "commandId", commandId,
                 "steps", steps
-        ), Duration.ofSeconds(180));
+        ), Duration.ofSeconds(180), commandId, 1);
         try {
             return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
         } catch (Exception e) {
@@ -61,10 +75,10 @@ public final class AutomationAgentClient {
     }
 
     public static AutomationContracts.AgentExecuteResponse executeAgent(UUID sessionId, String commandId, String objective) {
-        String body = send("/internal/sessions/" + sessionId + "/execute-agent", "POST", Map.of(
+        String body = sendWithRetry("/internal/sessions/" + sessionId + "/execute-agent", "POST", Map.of(
                 "commandId", commandId,
                 "objective", objective == null ? "" : objective
-        ), Duration.ofSeconds(240));
+        ), Duration.ofSeconds(240), commandId, 1);
         try {
             return mapper.readValue(body, AutomationContracts.AgentExecuteResponse.class);
         } catch (Exception e) {
@@ -172,10 +186,32 @@ public final class AutomationAgentClient {
     }
 
     private static String send(String path, String method, Object payload, Duration timeout) {
-        return send(Config.AUTOMATION_AGENT_BASE_URL, path, method, payload, timeout);
+        return send(Config.AUTOMATION_AGENT_BASE_URL, path, method, payload, timeout, null);
     }
 
-    private static String send(String baseUrl, String path, String method, Object payload, Duration timeout) {
+    private static String sendWithRetry(String path, String method, Object payload, Duration timeout, String idempotencyKey, int maxRetries) {
+        int attempts = 0;
+        AgentUnavailableException last = null;
+        while (attempts <= Math.max(0, maxRetries)) {
+            attempts += 1;
+            try {
+                return send(Config.AUTOMATION_AGENT_BASE_URL, path, method, payload, timeout, idempotencyKey);
+            } catch (AgentUnavailableException e) {
+                last = e;
+                if (!e.retryable || attempts > Math.max(0, maxRetries)) throw e;
+                try {
+                    Thread.sleep(200L * attempts);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        if (last != null) throw last;
+        throw new AgentUnavailableException("upstream_unavailable", "Automation agent request failed", 0, true, null);
+    }
+
+    private static String send(String baseUrl, String path, String method, Object payload, Duration timeout, String idempotencyKey) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + path))
@@ -183,6 +219,9 @@ public final class AutomationAgentClient {
                     .header("Content-Type", "application/json");
             if (!Config.AUTOMATION_AGENT_SHARED_TOKEN.isBlank()) {
                 builder.header("x-agent-token", Config.AUTOMATION_AGENT_SHARED_TOKEN);
+            }
+            if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+                builder.header("x-idempotency-key", idempotencyKey);
             }
             if ("GET".equals(method)) {
                 builder.GET();
@@ -192,12 +231,47 @@ public final class AutomationAgentClient {
             }
             HttpResponse<String> response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new RuntimeException("Automation agent error (" + response.statusCode() + "): " + response.body());
+                throw classifyStatus(response.statusCode(), response.body(), null);
             }
             return response.body();
         } catch (Exception e) {
-            throw new RuntimeException("Automation agent request failed: " + e.getMessage(), e);
+            if (e instanceof AgentUnavailableException aue) throw aue;
+            if (e instanceof HttpTimeoutException || e instanceof ConnectException) {
+                throw new AgentUnavailableException("upstream_unavailable",
+                        "Automation agent request failed: " + e.getMessage(), 0, true, e);
+            }
+            String message = e.getMessage() == null ? "Automation agent request failed" : e.getMessage();
+            throw new AgentUnavailableException("upstream_unavailable", "Automation agent request failed: " + message, 0, true, e);
         }
+    }
+
+    private static AgentUnavailableException classifyStatus(int statusCode, String body, Throwable cause) {
+        String safeBody = body == null ? "" : body;
+        String code;
+        boolean retryable;
+        if (statusCode == 429) {
+            code = "busy";
+            retryable = true;
+        } else if (statusCode == 409) {
+            code = "lock_conflict";
+            retryable = true;
+        } else if (statusCode == 425 || statusCode == 423 || statusCode == 404) {
+            code = "session_not_ready";
+            retryable = true;
+        } else if (statusCode == 503 || statusCode == 502 || statusCode == 504) {
+            code = "upstream_unavailable";
+            retryable = true;
+        } else {
+            code = "upstream_unavailable";
+            retryable = false;
+        }
+        return new AgentUnavailableException(
+                code,
+                "Automation agent error (" + statusCode + "): " + safeBody,
+                statusCode,
+                retryable,
+                cause
+        );
     }
 
     private AutomationAgentClient() {}

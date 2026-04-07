@@ -181,6 +181,22 @@ export default function TestCasesPage() {
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
   const areAllCasesSelected =
     selectedSuiteCases.length > 0 && selectedSuiteCases.every((tc) => selectedCaseIdSet.has(tc.id));
+  const totalSuiteCount = visibleSuites.length;
+  const repositoryCaseCount = useMemo(
+    () => visibleSuites.reduce((sum, suite) => sum + suite.testCaseCount, 0),
+    [visibleSuites]
+  );
+  const activeFilterCount = [
+    suiteSearch.trim() !== "",
+    suiteStatusFilter !== "all",
+    suitePriorityFilter !== "all",
+    suiteTypeFilter !== "all",
+    suiteAutomationFilter !== "all",
+    viewMode === "allCases" && allCasesSuiteFilter !== "all",
+  ].filter(Boolean).length;
+  const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / PAGE_SIZE));
+  const pageStart = suiteCasesTotal === 0 ? 0 : (suiteCasesPage - 1) * PAGE_SIZE + 1;
+  const pageEnd = suiteCasesTotal === 0 ? 0 : Math.min(suiteCasesTotal, suiteCasesPage * PAGE_SIZE);
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -333,6 +349,14 @@ export default function TestCasesPage() {
     setPanelMode("create");
     setPanelTab("overview");
     resetForm(viewMode === "allCases" ? null : activeSuiteId);
+  }
+
+  async function openCreatePanelForSuite(targetSuiteId: string) {
+    setPanelError(null);
+    setPanelTestcaseId(null);
+    setPanelMode("create");
+    setPanelTab("overview");
+    resetForm(targetSuiteId);
   }
 
   async function openViewPanel(testcaseId: string) {
@@ -619,17 +643,17 @@ export default function TestCasesPage() {
         header={
           <PageHeader
             title="Test case repository"
-            subtitle="Switch between suite view and all test cases listing."
+            subtitle="Organize suites, curate test cases, and move from repository review into execution and automation with a cleaner operational workspace."
             actions={
-              <>
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-card)]">
                   <button
                     type="button"
                     onClick={() => handleViewModeChange("bySuites")}
-                    className={`rounded-lg px-3 py-1 text-sm ${
+                    className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                       viewMode === "bySuites"
-                        ? "bg-[var(--foreground)] text-[var(--surface)]"
-                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+                        ? "bg-[var(--brand-surface)] text-[var(--brand-primary)]"
+                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                     }`}
                   >
                     By Suites
@@ -637,10 +661,10 @@ export default function TestCasesPage() {
                   <button
                     type="button"
                     onClick={() => handleViewModeChange("allCases")}
-                    className={`rounded-lg px-3 py-1 text-sm ${
+                    className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                       viewMode === "allCases"
-                        ? "bg-[var(--foreground)] text-[var(--surface)]"
-                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+                        ? "bg-[var(--brand-surface)] text-[var(--brand-primary)]"
+                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                     }`}
                   >
                     All Test Cases
@@ -658,7 +682,7 @@ export default function TestCasesPage() {
                     </svg>
                   </Button>
                   {isImportExportMenuOpen && (
-                    <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-lg">
+                    <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
                       <button
                         type="button"
                         onClick={() => {
@@ -714,17 +738,78 @@ export default function TestCasesPage() {
                   Add Suite
                 </Button>
                 <Button
-                  variant="secondary"
                   onClick={() => { void openCreatePanel(); }}
                   disabled={viewMode === "bySuites" && !activeSuiteId}
+                  title={viewMode === "bySuites" && !activeSuiteId ? "Open a suite first to create a case inside it." : undefined}
                 >
-                  Add Test cases
+                  Add Test Case
                 </Button>
-              </>
+              </div>
             }
           />
         }
       >
+        <Card className="p-4 lg:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <StatusChip tone={viewMode === "allCases" ? "confidenceHigh" : "brand"}>
+                  {viewMode === "allCases" ? "All repository cases" : "Suites workspace"}
+                </StatusChip>
+                {selectedSuite ? <StatusChip tone="brand">{selectedSuite.name}</StatusChip> : null}
+                {activeFilterCount > 0 ? (
+                  <StatusChip tone="warning">
+                    {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"} active
+                  </StatusChip>
+                ) : null}
+              </div>
+              <p className="max-w-3xl text-sm leading-6 text-[var(--muted)]">
+                {viewMode === "allCases"
+                  ? "Use the repository-wide view to search, filter, and bulk-edit cases across suites with stronger visibility into readiness and review state."
+                  : activeSuiteId && selectedSuite
+                    ? "Work inside a single suite with cleaner filtering, bulk actions, and quick access to automation and execution."
+                    : "Browse suites first, then drill into a focused case list when you are ready to review or edit detailed test coverage."}
+              </p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Suites</p>
+              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">{totalSuiteCount}</p>
+              <p className="mt-1 text-sm text-[var(--muted)]">Structured coverage groups in this project</p>
+            </div>
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Repository Cases</p>
+              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">{repositoryCaseCount}</p>
+              <p className="mt-1 text-sm text-[var(--muted)]">Total cases currently organized across suites</p>
+            </div>
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Current View</p>
+              <p className="mt-2 text-[20px] font-semibold tracking-tight text-[var(--foreground)]">
+                {viewMode === "allCases" ? "All test cases" : activeSuiteId && selectedSuite ? selectedSuite.name : "Browse suites"}
+              </p>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                {viewMode === "allCases"
+                  ? "Cross-suite review mode"
+                  : activeSuiteId && selectedSuite
+                    ? `${selectedSuite.testCaseCount} case${selectedSuite.testCaseCount === 1 ? "" : "s"} in this suite`
+                    : "Choose a suite to review contained cases"}
+              </p>
+            </div>
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Filtered Results</p>
+              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">
+                {loading ? "..." : suiteCasesTotal}
+              </p>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                {activeFilterCount > 0
+                  ? "Results after the current search and filter set"
+                  : "Visible results in the active repository view"}
+              </p>
+            </div>
+          </div>
+        </Card>
+
         {loading ? (
           <p className="text-[var(--muted)]">Loading suites...</p>
         ) : viewMode === "bySuites" && activeSuiteId && !selectedSuite ? (
@@ -738,11 +823,34 @@ export default function TestCasesPage() {
             }
           />
         ) : viewMode === "allCases" || (viewMode === "bySuites" && activeSuiteId && selectedSuite) ? (
-          <section className="mt-2">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <div className="flex items-center gap-3">
-                {viewMode === "bySuites" && selectedSuite ? (
-                  <>
+          <section className="mt-2 space-y-4">
+            <Card className="p-4">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {viewMode === "bySuites" && selectedSuite ? <StatusChip tone="brand">{selectedSuite.name}</StatusChip> : null}
+                    <StatusChip tone="confidenceHigh">
+                      {pageStart}-{pageEnd} of {suiteCasesTotal}
+                    </StatusChip>
+                    {selectedCaseIds.length > 0 ? (
+                      <StatusChip tone="warning">
+                        {selectedCaseIds.length} selected
+                      </StatusChip>
+                    ) : null}
+                  </div>
+                  <div>
+                    <h2 className="text-[22px] font-semibold tracking-tight text-[var(--foreground)]">
+                      {viewMode === "bySuites" && selectedSuite ? `${selectedSuite.name} test cases` : "All test cases"}
+                    </h2>
+                    <p className="mt-1 text-sm text-[var(--muted)]">
+                      {viewMode === "bySuites" && selectedSuite
+                        ? `Review ${selectedSuite.testCaseCount} case${selectedSuite.testCaseCount === 1 ? "" : "s"} in this suite, then open the side panel for detailed editing and automation.`
+                        : `Search, filter, and bulk-manage repository cases across ${totalSuiteCount} suite${totalSuiteCount === 1 ? "" : "s"}.`}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {viewMode === "bySuites" && selectedSuite ? (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -750,103 +858,142 @@ export default function TestCasesPage() {
                     >
                       Back to suites
                     </Button>
-                    <h2 className="text-lg font-semibold text-[var(--foreground)]">
-                      {selectedSuite.name} test cases
-                    </h2>
-                  </>
-                ) : (
-                  <h2 className="text-lg font-semibold text-[var(--foreground)]">All test cases</h2>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                {selectedCaseIds.length > 0 && (
-                  <>
-                    <span className="text-xs text-[var(--muted)]">{selectedCaseIds.length} selected</span>
-                    <Select
-                      value={bulkAction}
-                      onChange={(e) => setBulkAction(e.target.value as BulkAction)}
-                      className="h-9 w-auto min-w-[100px]"
-                    >
-                      <option value="">Action</option>
-                      <option value="delete">Delete</option>
-                      <option value="update">Update</option>
-                      <option value="archive">Archive</option>
-                    </Select>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => openBulkActionModal(bulkAction)}
-                      disabled={!bulkAction}
-                    >
-                      Apply
-                    </Button>
-                  </>
-                )}
-                <Button variant="secondary" size="sm" onClick={() => void openCreatePanel()}>
-                  Add test case
-                </Button>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <Card className="p-3">
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
-                  <Input
-                    type="text"
-                    value={suiteSearch}
-                    onChange={(e) => setSuiteSearch(e.target.value)}
-                    placeholder="Search by ID, title, or type"
-                    className="h-9"
-                  />
-                  {viewMode === "allCases" && (
-                    <Select
-                      value={allCasesSuiteFilter}
-                      onChange={(e) => setAllCasesSuiteFilter(e.target.value)}
-                      className="h-9"
-                    >
-                      <option value="all">All suites</option>
-                      {visibleSuites.map((suite) => (
-                        <option key={suite.id} value={suite.id}>
-                          {suite.name}
-                        </option>
-                      ))}
-                    </Select>
-                  )}
-                  <Select value={suiteTypeFilter} onChange={(e) => setSuiteTypeFilter(e.target.value)} className="h-9">
-                    <option value="all">All types</option>
-                    {TESTCASE_TYPES.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </Select>
-                  <Select value={suiteAutomationFilter} onChange={(e) => setSuiteAutomationFilter(e.target.value)} className="h-9">
-                    <option value="all">All automation feasibility</option>
-                    {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </Select>
-                  <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-9">
-                    <option value="all">All statuses</option>
-                    {TESTCASE_STATUSES.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </Select>
-                  <Select value={suitePriorityFilter} onChange={(e) => setSuitePriorityFilter(e.target.value)} className="h-9">
-                    <option value="all">All priorities</option>
-                    {TESTCASE_PRIORITIES.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </Select>
-                  <Button variant="secondary" size="sm" onClick={clearSuiteFilters}>
-                    Clear filters
+                  ) : null}
+                  {selectedCaseIds.length > 0 ? (
+                    <>
+                      <Select
+                        value={bulkAction}
+                        onChange={(e) => setBulkAction(e.target.value as BulkAction)}
+                        className="h-9 w-auto min-w-[140px]"
+                      >
+                        <option value="">Bulk action</option>
+                        <option value="delete">Delete</option>
+                        <option value="update">Update</option>
+                        <option value="archive">Archive</option>
+                      </Select>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => openBulkActionModal(bulkAction)}
+                        disabled={!bulkAction}
+                      >
+                        Apply to selection
+                      </Button>
+                    </>
+                  ) : null}
+                  <Button size="sm" onClick={() => { void openCreatePanel(); }}>
+                    Add test case
                   </Button>
                 </div>
-                <p className="mt-2 text-xs text-[var(--muted)]">
-                  Showing {selectedSuiteCases.length} of {suiteCasesTotal} matching test cases
+              </div>
+            </Card>
+
+            <div className="space-y-3">
+              <Card className="p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Filter repository
+                    </p>
+                    <p className="mt-1 text-sm text-[var(--muted)]">
+                      Narrow results by search, suite scope, workflow status, and automation readiness.
+                    </p>
+                  </div>
+                  {activeFilterCount > 0 ? (
+                    <StatusChip tone="warning">
+                      {activeFilterCount} active filter{activeFilterCount === 1 ? "" : "s"}
+                    </StatusChip>
+                  ) : null}
+                </div>
+                <div className={`mt-4 grid gap-3 ${viewMode === "allCases" ? "sm:grid-cols-2 xl:grid-cols-6" : "sm:grid-cols-2 xl:grid-cols-5"}`}>
+                  <div className={viewMode === "allCases" ? "xl:col-span-2" : "xl:col-span-1"}>
+                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Search
+                    </label>
+                    <Input
+                      type="text"
+                      value={suiteSearch}
+                      onChange={(e) => setSuiteSearch(e.target.value)}
+                      placeholder="Search by ID, title, or type"
+                      className="h-9"
+                    />
+                  </div>
+                  {viewMode === "allCases" && (
+                    <div>
+                      <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                        Suite
+                      </label>
+                      <Select
+                        value={allCasesSuiteFilter}
+                        onChange={(e) => setAllCasesSuiteFilter(e.target.value)}
+                        className="h-9"
+                      >
+                        <option value="all">All suites</option>
+                        {visibleSuites.map((suite) => (
+                          <option key={suite.id} value={suite.id}>
+                            {suite.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  )}
+                  <div>
+                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Type
+                    </label>
+                    <Select value={suiteTypeFilter} onChange={(e) => setSuiteTypeFilter(e.target.value)} className="h-9">
+                      <option value="all">All types</option>
+                      {TESTCASE_TYPES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Automation
+                    </label>
+                    <Select value={suiteAutomationFilter} onChange={(e) => setSuiteAutomationFilter(e.target.value)} className="h-9">
+                      <option value="all">All automation states</option>
+                      {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Workflow status
+                    </label>
+                    <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-9">
+                      <option value="all">All statuses</option>
+                      {TESTCASE_STATUSES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      Priority
+                    </label>
+                    <div className="flex gap-2">
+                      <Select value={suitePriorityFilter} onChange={(e) => setSuitePriorityFilter(e.target.value)} className="h-9">
+                        <option value="all">All priorities</option>
+                        {TESTCASE_PRIORITIES.map((option) => (
+                          <option key={option} value={option}>{option}</option>
+                        ))}
+                      </Select>
+                      <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="shrink-0">
+                        Clear
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-[var(--muted)]">
+                  Showing {pageStart}-{pageEnd} of {suiteCasesTotal} matching test case{suiteCasesTotal === 1 ? "" : "s"}.
                 </p>
               </Card>
 
               {suiteCasesError ? (
-                <p className="rounded-xl border border-[var(--error)] bg-[var(--surface)] p-4 text-sm text-[var(--error)]">
+                <p className="rounded-xl border border-[var(--error-border)] bg-[var(--error-soft)] p-4 text-sm text-[var(--error-foreground)]">
                   {suiteCasesError}
                 </p>
               ) : suiteCasesLoading ? (
@@ -875,9 +1022,9 @@ export default function TestCasesPage() {
                     onRunSingle={openSingleTestRun}
                   />
 
-                  <Card className="flex items-center justify-between px-3 py-2 text-sm">
+                  <Card className="flex items-center justify-between px-4 py-3 text-sm">
                     <span className="text-[var(--muted)]">
-                      Page {suiteCasesPage} of {Math.max(1, Math.ceil(suiteCasesTotal / PAGE_SIZE))}
+                      Showing {pageStart}-{pageEnd} of {suiteCasesTotal} on page {suiteCasesPage} of {totalPages}
                     </span>
                     <div className="flex items-center gap-2">
                       <Button
@@ -893,10 +1040,10 @@ export default function TestCasesPage() {
                         size="sm"
                         onClick={() =>
                           setSuiteCasesPage((prev) =>
-                            prev >= Math.ceil(suiteCasesTotal / PAGE_SIZE) ? prev : prev + 1
+                            prev >= totalPages ? prev : prev + 1
                           )
                         }
-                        disabled={suiteCasesPage >= Math.ceil(suiteCasesTotal / PAGE_SIZE) || suiteCasesLoading}
+                        disabled={suiteCasesPage >= totalPages || suiteCasesLoading}
                       >
                         Next
                       </Button>
@@ -1405,31 +1552,51 @@ export default function TestCasesPage() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {visibleSuites.map((suite) => (
-              <Card key={suite.id} className="p-4">
-                <button
-                  type="button"
-                  onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}
-                  className="truncate text-left text-base font-semibold text-[var(--foreground)] hover:underline"
-                >
-                  {suite.name}
-                </button>
-                <p className="mt-2 text-sm text-[var(--muted)]">
-                  Open suite to browse test cases
-                </p>
-                <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                  <Button variant="secondary" size="sm" onClick={() => handleRenameSuite(suite.id, suite.name)}>
-                    Rename
-                  </Button>
-                  <Button variant="destructive" size="sm" onClick={() => setDeleteSuiteId(suite.id)}>
-                    Delete
+              <Card key={suite.id} className="p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}
+                      className="truncate text-left text-[18px] font-semibold text-[var(--foreground)] hover:underline"
+                    >
+                      {suite.name}
+                    </button>
+                    <p className="mt-1.5 text-sm text-[var(--muted)]">
+                      Open this suite to review contained cases, bulk-manage items, and jump into automation or execution.
+                    </p>
+                  </div>
+                  <StatusChip tone={suite.testCaseCount > 0 ? "confidenceHigh" : "neutral"}>
+                    {suite.testCaseCount} case{suite.testCaseCount === 1 ? "" : "s"}
+                  </StatusChip>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}>
+                    Open suite
                   </Button>
                   <Button
                     variant="secondary"
                     size="sm"
-                    onClick={() => router.push(`/projects/${projectId}/testcases/new?suiteId=${suite.id}`)}
+                    onClick={() => { void openCreatePanelForSuite(suite.id); }}
                   >
                     Add test case
                   </Button>
+                </div>
+                <div className="mt-4 flex flex-wrap items-center gap-3 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => handleRenameSuite(suite.id, suite.name)}
+                    className="font-medium text-[var(--muted)] hover:text-[var(--foreground)]"
+                  >
+                    Rename
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeleteSuiteId(suite.id)}
+                    className="font-medium text-[var(--error)] hover:opacity-80"
+                  >
+                    Delete
+                  </button>
                 </div>
               </Card>
             ))}

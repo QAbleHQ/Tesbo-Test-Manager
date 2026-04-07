@@ -199,9 +199,12 @@ public final class TestCaseService {
     }
 
     public static Map<String, Object> create(UUID projectId, UUID userId, CreateDto dto) {
-        RbacService.requireProjectRole(userId, projectId);
-        if (!RbacService.getProjectRole(userId, projectId).get().canEditCases())
+        var role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canEditCases())
             throw new io.javalin.http.ForbiddenResponse("Cannot create test cases");
+        if (dto.automationScript != null && !dto.automationScript.isBlank() && !role.canManageProject()) {
+            throw new io.javalin.http.ForbiddenResponse("Only managers can define automation scripts");
+        }
         String externalId = dto.externalId != null && !dto.externalId.isBlank() ? dto.externalId : nextExternalId(projectId);
         String resolvedAutomationStatus = (dto.automationScript != null && !dto.automationScript.isBlank())
                 ? "Automated"
@@ -291,9 +294,12 @@ public final class TestCaseService {
 
     public static void update(UUID testcaseId, UUID userId, UpdateDto dto) {
         UUID projectId = getProjectId(testcaseId);
-        RbacService.requireProjectRole(userId, projectId);
-        if (!RbacService.getProjectRole(userId, projectId).get().canEditCases())
+        var role = RbacService.requireProjectRole(userId, projectId);
+        if (!role.canEditCases())
             throw new io.javalin.http.ForbiddenResponse("Cannot edit test cases");
+        if (dto.automationScript != null && !dto.automationScript.isBlank() && !role.canManageProject()) {
+            throw new io.javalin.http.ForbiddenResponse("Only managers can define automation scripts");
+        }
         try (Connection c = Database.getDataSource().getConnection()) {
             int nextVersion;
             try (PreparedStatement ps = c.prepareStatement("SELECT COALESCE(MAX(version), 0) + 1 FROM testcase_versions WHERE testcase_id = ?")) {
