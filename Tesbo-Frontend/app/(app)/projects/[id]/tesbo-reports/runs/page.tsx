@@ -317,61 +317,38 @@ export default function TesboRunsPage() {
                 </thead>
                 <tbody>
                   {paginatedRuns.map((run, idx) => (
-                    <tr key={run.id} className="cursor-pointer" onClick={() => router.push(`/projects/${projectId}/tesbo-reports/runs/${run.id}`)}>
-                      <td className="px-4 py-3 font-semibold text-[var(--foreground)]">#{run.runNumber || String(runs.length - ((runPage - 1) * pageSize + idx))}</td>
+                    <tr
+                      key={run.id}
+                      className="cursor-pointer hover:bg-[var(--surface-secondary)]"
+                      onClick={() => router.push(`/projects/${projectId}/tesbo-reports/runs/${run.id}`)}
+                    >
+                      <td className="px-4 py-3 font-semibold text-[var(--foreground)]">
+                        #{run.runNumber || String(runs.length - ((runPage - 1) * pageSize + idx))}
+                      </td>
                       <td className="px-4 py-3">{run.name}</td>
                       <td className="px-4 py-3">{run.branchName || "-"}</td>
                       <td className="px-4 py-3">{run.pullRequest || "-"}</td>
                       <td className="px-4 py-3">{run.commitAuthor || "-"}</td>
                       <td className="px-4 py-3">{run.githubRunId || "-"}</td>
-                      <td className="px-4 py-3">{run.status}</td>
+                      <td className="px-4 py-3">
+                        <StatusChip tone={statusTone(run.status)}>{statusLabel(run.status)}</StatusChip>
+                      </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
                           <span className="rounded-full bg-[var(--success)] text-white px-2 py-0.5 text-xs">{run.passed}</span>
                           <span className="rounded-full bg-[var(--error)] text-white px-2 py-0.5 text-xs">{run.failed}</span>
                           <span className="rounded-full bg-[var(--warning)] text-black px-2 py-0.5 text-xs">{run.skipped}</span>
                         </div>
-
-                        <p className="text-sm text-[var(--foreground)] truncate max-w-lg font-medium" title={run.name}>
-                          {run.name}
-                        </p>
-
-                        {hasMeta && (
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            {run.branchName && (
-                              <MetaTag>
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 3v12m0 0a3 3 0 103 3 3 3 0 00-3-3zm12-6a3 3 0 10-3-3 3 3 0 003 3zm0 0v6a3 3 0 01-3 3H9" /></svg>
-                                {run.branchName}
-                              </MetaTag>
-                            )}
-                            {run.pullRequest && (
-                              <MetaTag>
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
-                                PR #{run.pullRequest}
-                              </MetaTag>
-                            )}
-                            {run.commitAuthor && (
-                              <MetaTag>
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0" /></svg>
-                                {run.commitAuthor}
-                              </MetaTag>
-                            )}
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Right: test results + action */}
-                      <div className="flex items-center gap-5 sm:flex-col sm:items-end sm:gap-3">
-                        <TestResultBar passed={run.passed} failed={run.failed} skipped={run.skipped} total={run.total} />
-                        <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--brand-primary)] opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
-                          View run details
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" /></svg>
-                        </div>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
+                      </td>
+                      <td className="px-4 py-3">{normalizeSource(run.sourceType)}</td>
+                      <td className="px-4 py-3">{relativeTime(run.startedAt)}</td>
+                      <td className="px-4 py-3 text-right">
+                        <span className="text-xs font-medium text-[var(--brand-primary)]">View</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
 
             {/* Pagination */}
