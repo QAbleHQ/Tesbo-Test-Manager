@@ -293,33 +293,22 @@ export default function TesboRunDetailPage() {
       </section>
 
       <section className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
-        <div>
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">Pass vs fail by spec</h2>
-          <p className="mt-1 text-xs text-[var(--muted)]">Failure-heavy specs surface first for quicker triage.</p>
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <h2 className="text-sm font-semibold text-[var(--foreground)]">Pass vs fail by spec</h2>
+            <p className="mt-1 text-xs text-[var(--muted)]">Failure-heavy specs surface first for quicker triage.</p>
+          </div>
+          <div className="flex items-center gap-4 text-xs text-[var(--muted)]">
+            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500" />Passed</span>
+            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-rose-500" />Failed</span>
+            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-400" />Skipped</span>
+          </div>
         </div>
-        <div className="mt-4 space-y-3">
-          {specBreakdown.map((spec) => {
-            const passWidth = spec.total > 0 ? (spec.passed / spec.total) * 100 : 0;
-            const failWidth = spec.total > 0 ? (spec.failed / spec.total) * 100 : 0;
-            const skipWidth = Math.max(0, 100 - passWidth - failWidth);
-            return (
-              <div key={spec.specName}>
-                <div className="mb-1 flex items-center justify-between gap-3 text-xs">
-                  <p className="font-medium text-[var(--muted)] break-all">{spec.specName}</p>
-                  <p className="text-[var(--muted)]">
-                    {spec.passed} passed · {spec.failed} failed · {spec.skipped} skipped
-                  </p>
-                </div>
-                <div className="h-3 w-full overflow-hidden rounded-full bg-[var(--surface-secondary)] border border-[var(--border)]">
-                  <div className="h-full bg-emerald-500 float-left" style={{ width: `${passWidth}%` }} />
-                  <div className="h-full bg-rose-500 float-left" style={{ width: `${failWidth}%` }} />
-                  <div className="h-full bg-amber-400 float-left" style={{ width: `${skipWidth}%` }} />
-                </div>
-              </div>
-            );
-          })}
-          {specBreakdown.length === 0 && <p className="text-sm text-[var(--muted)]">No spec-level data available.</p>}
-        </div>
+        {specBreakdown.length > 0 ? (
+          <SpecBarChart specs={specBreakdown} />
+        ) : (
+          <p className="mt-4 text-sm text-[var(--muted)]">No spec-level data available.</p>
+        )}
       </section>
 
       <section className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5">
@@ -467,6 +456,26 @@ export default function TesboRunDetailPage() {
                   <Stat label="Browser" value={activeCase.browserName || "-"} />
                 </div>
 
+                {(activeCase.errorMessage || activeCase.errorStack) && (
+                  <div className="rounded-xl border border-rose-300 bg-rose-50 p-3">
+                    <p className="text-xs uppercase tracking-[0.2em] text-rose-700">Failure details</p>
+                    {activeCase.errorMessage && <p className="mt-2 text-sm text-rose-700">{activeCase.errorMessage}</p>}
+                    {activeCase.errorStack && <pre className="mt-2 whitespace-pre-wrap text-xs text-rose-800 max-h-56 overflow-y-auto">{activeCase.errorStack}</pre>}
+                  </div>
+                )}
+
+                <div className="rounded-xl border border-[var(--border)] p-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Steps</p>
+                  <div className="mt-2 space-y-2">
+                    {(activeCase.steps || []).map((step, index) => (
+                      <div key={`step-${index}`} className="rounded border border-[var(--border)] px-3 py-2 text-sm">
+                        <span className="text-xs text-[var(--muted)]">#{index + 1}</span> {step.description || "Step"}
+                      </div>
+                    ))}
+                    {(!activeCase.steps || activeCase.steps.length === 0) && <p className="text-sm text-[var(--muted)]">No steps captured for this test case.</p>}
+                  </div>
+                </div>
+
                 <div className="rounded-xl border border-[var(--border)] p-3">
                   <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Artifacts</p>
                   <div className="mt-2 flex flex-wrap gap-3 text-sm">
@@ -540,26 +549,6 @@ export default function TesboRunDetailPage() {
                     </div>
                   </div>
                 )}
-
-                {(activeCase.errorMessage || activeCase.errorStack) && (
-                  <div className="rounded-xl border border-rose-300 bg-rose-50 p-3">
-                    <p className="text-xs uppercase tracking-[0.2em] text-rose-700">Failure details</p>
-                    {activeCase.errorMessage && <p className="mt-2 text-sm text-rose-700">{activeCase.errorMessage}</p>}
-                    {activeCase.errorStack && <pre className="mt-2 whitespace-pre-wrap text-xs text-rose-800 max-h-56 overflow-y-auto">{activeCase.errorStack}</pre>}
-                  </div>
-                )}
-
-                <div className="rounded-xl border border-[var(--border)] p-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Steps</p>
-                  <div className="mt-2 space-y-2">
-                    {(activeCase.steps || []).map((step, index) => (
-                      <div key={`step-${index}`} className="rounded border border-[var(--border)] px-3 py-2 text-sm">
-                        <span className="text-xs text-[var(--muted)]">#{index + 1}</span> {step.description || "Step"}
-                      </div>
-                    ))}
-                    {(!activeCase.steps || activeCase.steps.length === 0) && <p className="text-sm text-[var(--muted)]">No steps captured for this test case.</p>}
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -574,6 +563,89 @@ function Stat({ label, value, tone }: { label: string; value: string | number; t
     <div className="rounded-lg border border-[var(--border)] p-3 bg-[var(--surface)]">
       <p className="text-xs text-[var(--muted)]">{label}</p>
       <p className={`mt-1 text-sm font-semibold ${tone || "text-[var(--foreground)]"}`}>{value}</p>
+    </div>
+  );
+}
+
+function SpecBarChart({ specs }: { specs: { specName: string; total: number; passed: number; failed: number; skipped: number }[] }) {
+  const maxTotal = Math.max(...specs.map((s) => s.total), 1);
+  const CHART_HEIGHT = 200;
+  const BAR_WIDTH = 48;
+  const BAR_GAP = 12;
+  const gridLines = 4;
+  const stepValue = Math.ceil(maxTotal / gridLines);
+  const ticks = Array.from({ length: gridLines + 1 }, (_, i) => i * stepValue).filter((v) => v <= maxTotal + stepValue);
+
+  const chartWidth = specs.length * (BAR_WIDTH + BAR_GAP) + BAR_GAP;
+
+  return (
+    <div className="mt-4 flex">
+      {/* Y-axis labels */}
+      <div className="flex flex-col justify-between shrink-0 pr-2 pb-[52px]" style={{ height: CHART_HEIGHT }}>
+        {[...ticks].reverse().map((tick) => (
+          <span key={tick} className="text-[10px] text-[var(--muted)] leading-none text-right tabular-nums">{tick}</span>
+        ))}
+      </div>
+
+      {/* Scrollable chart area */}
+      <div className="flex-1 overflow-x-auto" style={{ scrollbarWidth: "thin" }}>
+        <div style={{ width: Math.max(chartWidth, 0), minWidth: "100%" }}>
+          {/* Grid + bars */}
+          <div className="relative border-l border-b border-[var(--border)]" style={{ height: CHART_HEIGHT }}>
+            {/* Horizontal grid lines */}
+            {ticks.map((tick) => {
+              const y = CHART_HEIGHT - (tick / (ticks[ticks.length - 1] || 1)) * CHART_HEIGHT;
+              return (
+                <div
+                  key={`grid-${tick}`}
+                  className="absolute left-0 right-0 border-t border-[var(--border)] opacity-40"
+                  style={{ top: y }}
+                />
+              );
+            })}
+
+            {/* Bars */}
+            <div className="absolute inset-0 flex items-end" style={{ gap: BAR_GAP, paddingLeft: BAR_GAP / 2, paddingRight: BAR_GAP / 2 }}>
+              {specs.map((spec) => {
+                const scale = (ticks[ticks.length - 1] || 1);
+                const passH = (spec.passed / scale) * CHART_HEIGHT;
+                const failH = (spec.failed / scale) * CHART_HEIGHT;
+                const skipH = (spec.skipped / scale) * CHART_HEIGHT;
+                return (
+                  <div key={spec.specName} className="group relative flex flex-col items-center" style={{ width: BAR_WIDTH }}>
+                    {/* Tooltip */}
+                    <div className="pointer-events-none absolute -top-2 left-1/2 -translate-x-1/2 -translate-y-full z-10 opacity-0 group-hover:opacity-100 transition-opacity rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-lg px-3 py-2 text-xs whitespace-nowrap">
+                      <p className="font-medium text-[var(--foreground)] mb-1 max-w-[200px] truncate">{spec.specName}</p>
+                      <p className="text-emerald-600">{spec.passed} passed</p>
+                      <p className="text-rose-600">{spec.failed} failed</p>
+                      <p className="text-amber-600">{spec.skipped} skipped</p>
+                    </div>
+                    {/* Stacked bar */}
+                    <div className="w-full flex flex-col-reverse rounded-t-md overflow-hidden" style={{ width: BAR_WIDTH }}>
+                      {spec.passed > 0 && <div className="bg-emerald-500 transition-all" style={{ height: passH }} />}
+                      {spec.failed > 0 && <div className="bg-rose-500 transition-all" style={{ height: failH }} />}
+                      {spec.skipped > 0 && <div className="bg-amber-400 transition-all" style={{ height: skipH }} />}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* X-axis labels */}
+          <div className="flex mt-2" style={{ gap: BAR_GAP, paddingLeft: BAR_GAP / 2, paddingRight: BAR_GAP / 2 }}>
+            {specs.map((spec) => {
+              const shortName = spec.specName.split("/").pop()?.replace(/\.spec\.\w+$/, "") || spec.specName;
+              return (
+                <div key={spec.specName} className="text-center" style={{ width: BAR_WIDTH }}>
+                  <p className="text-[10px] text-[var(--muted)] leading-tight truncate" title={spec.specName}>{shortName}</p>
+                  <p className="text-[10px] font-medium text-[var(--foreground)] tabular-nums">{spec.total}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

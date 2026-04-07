@@ -1,5 +1,6 @@
 package com.bettercases.tesbo;
 
+import com.bettercases.Config;
 import com.bettercases.Database;
 import com.bettercases.auth.EmailService;
 import com.bettercases.rbac.RbacService;
@@ -206,15 +207,21 @@ public final class TesboReportsService {
             SELECT r.id AS run_id, r.name AS run_name, c.status, c.executed_at
             FROM tesbo_report_cases c
             JOIN tesbo_report_runs r ON r.id = c.run_id
-            WHERE c.project_id = ? AND c.spec_name = ? AND c.test_name = ?
+            WHERE c.project_id = ?
+              AND lower(trim(c.test_name)) = lower(trim(?))
+              AND (
+                replace(lower(trim(c.spec_name)), '\\\\', '/') = replace(lower(trim(?)), '\\\\', '/')
+                OR replace(lower(trim(c.spec_name)), '\\\\', '/') LIKE ('%/' || replace(lower(trim(?)), '\\\\', '/'))
+              )
             ORDER BY c.executed_at DESC NULLS LAST, r.created_at DESC
             """;
         List<Map<String, Object>> runs = new ArrayList<>();
         try (Connection c = Database.getDataSource().getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setObject(1, projectId);
-            ps.setString(2, specName);
-            ps.setString(3, testName);
+            ps.setString(2, testName);
+            ps.setString(3, specName);
+            ps.setString(4, specName);
             ResultSet rs = ps.executeQuery();
             while (rs.next()) {
                 Map<String, Object> row = new LinkedHashMap<>();
@@ -478,7 +485,7 @@ public final class TesboReportsService {
         }
     }
 
-    public static Map<String, Object> getShareState(UUID projectId, UUID userId, UUID runId, String apiBaseUrl) {
+    public static Map<String, Object> getShareState(UUID projectId, UUID userId, UUID runId) {
         RbacService.requireProjectRole(userId, projectId);
         String sql = """
             SELECT s.enabled, s.token
@@ -503,14 +510,14 @@ public final class TesboReportsService {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("enabled", enabled);
             out.put("token", token);
-            out.put("publicUrl", (enabled && token != null) ? (apiBaseUrl + "/api/public/tesbo-reports/" + token) : null);
+            out.put("publicUrl", (enabled && token != null) ? buildPublicShareUrl(token) : null);
             return out;
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }
 
-    public static Map<String, Object> createShare(UUID projectId, UUID userId, UUID runId, int expiresInHours, String apiBaseUrl) {
+    public static Map<String, Object> createShare(UUID projectId, UUID userId, UUID runId, int expiresInHours) {
         if (!RbacService.requireProjectRole(userId, projectId).canManageProject()) {
             throw new io.javalin.http.ForbiddenResponse("Cannot manage sharing");
         }
@@ -540,11 +547,19 @@ public final class TesboReportsService {
             return Map.of(
                 "enabled", rs.getBoolean("enabled"),
                 "token", createdToken,
-                "publicUrl", apiBaseUrl + "/api/public/tesbo-reports/" + createdToken
+                "publicUrl", buildPublicShareUrl(createdToken)
             );
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private static String buildPublicShareUrl(String token) {
+        String base = Config.FRONTEND_URL == null ? "" : Config.FRONTEND_URL.trim();
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base + "/share/tesbo/" + token;
     }
 
     public static void disableShare(UUID projectId, UUID userId, UUID runId) {

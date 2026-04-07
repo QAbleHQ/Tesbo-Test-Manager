@@ -113,7 +113,7 @@ public final class TesboReportsHandler {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
         UUID runId = UUID.fromString(ctx.pathParam("runId"));
-        ctx.json(TesboReportsService.getShareState(projectId, userId, runId, ctx.scheme() + "://" + ctx.host()));
+        ctx.json(TesboReportsService.getShareState(projectId, userId, runId));
     }
 
     @SuppressWarnings("unchecked")
@@ -126,7 +126,7 @@ public final class TesboReportsHandler {
         if (body != null && body.get("expiresInHours") instanceof Number n) {
             expiresInHours = n.intValue();
         }
-        ctx.json(TesboReportsService.createShare(projectId, userId, runId, expiresInHours, ctx.scheme() + "://" + ctx.host()));
+        ctx.json(TesboReportsService.createShare(projectId, userId, runId, expiresInHours));
     }
 
     public static void disableShare(Context ctx) {

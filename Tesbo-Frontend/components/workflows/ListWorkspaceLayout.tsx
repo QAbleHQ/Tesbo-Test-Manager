@@ -18,7 +18,7 @@ export default function ListWorkspaceLayout({
     <div className={cx("w-full", className)}>
       {header}
       {filterBar}
-      <div className="space-y-5">{children}</div>
+      <div className="mt-5 space-y-5">{children}</div>
     </div>
   );
 }
