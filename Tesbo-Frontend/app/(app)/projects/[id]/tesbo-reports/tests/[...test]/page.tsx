@@ -33,6 +33,7 @@ export default function TesboTestDetailPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedRunLoading, setSelectedRunLoading] = useState(false);
   const [isDetailPopupOpen, setIsDetailPopupOpen] = useState(false);
+  const [showArtifacts, setShowArtifacts] = useState(false);
   const [showTraceViewer, setShowTraceViewer] = useState(false);
   const [previewScreenshotSrc, setPreviewScreenshotSrc] = useState<string | null>(null);
   const [previewVideoSrc, setPreviewVideoSrc] = useState<string | null>(null);
@@ -109,6 +110,7 @@ export default function TesboTestDetailPage() {
 
   useEffect(() => {
     setIsDetailPopupOpen(false);
+    setShowArtifacts(false);
     setShowTraceViewer(false);
   }, [selectedRunId]);
 
@@ -120,6 +122,7 @@ export default function TesboTestDetailPage() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setIsDetailPopupOpen(false);
+        setShowArtifacts(false);
         setShowTraceViewer(false);
       }
     };
@@ -128,7 +131,7 @@ export default function TesboTestDetailPage() {
   }, [isDetailPopupOpen]);
 
   useEffect(() => {
-    if (!isDetailPopupOpen || !selectedCase) {
+    if (!isDetailPopupOpen || !selectedCase || !showArtifacts) {
       setPreviewScreenshotSrc(null);
       setPreviewVideoSrc(null);
       setPreviewLoading(false);
@@ -193,7 +196,7 @@ export default function TesboTestDetailPage() {
       if (screenshotObjectUrl) URL.revokeObjectURL(screenshotObjectUrl);
       if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
     };
-  }, [isDetailPopupOpen, selectedCase]);
+  }, [isDetailPopupOpen, selectedCase, showArtifacts]);
 
   const screenshotUrl = selectedCase?.screenshotUrl ? toAbsoluteArtifactUrl(selectedCase.screenshotUrl) : null;
   const videoUrl = selectedCase?.videoUrl ? toAbsoluteArtifactUrl(selectedCase.videoUrl) : null;
@@ -201,6 +204,7 @@ export default function TesboTestDetailPage() {
   const traceViewerUrl = traceUrl
     ? `https://trace.playwright.dev/?trace=${encodeURIComponent(traceUrl)}`
     : null;
+  const hasArtifacts = Boolean(traceViewerUrl || screenshotUrl || videoUrl);
 
   const totals = useMemo(() => {
     if (!history) {
@@ -407,6 +411,7 @@ export default function TesboTestDetailPage() {
             aria-label="Close test details popup"
             onClick={() => {
               setIsDetailPopupOpen(false);
+              setShowArtifacts(false);
               setShowTraceViewer(false);
             }}
           />
@@ -423,6 +428,7 @@ export default function TesboTestDetailPage() {
                     type="button"
                     onClick={() => {
                       setIsDetailPopupOpen(false);
+                      setShowArtifacts(false);
                       setShowTraceViewer(false);
                     }}
                     className="rounded border border-[var(--border)] px-2 py-1 text-xs"
@@ -447,49 +453,85 @@ export default function TesboTestDetailPage() {
                   </div>
                 )}
 
-                <div className="rounded-lg border border-[var(--border)] p-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Artifacts</p>
-                  <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
-                    {traceViewerUrl && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => setShowTraceViewer((prev) => !prev)}
-                          className="rounded border border-[var(--border)] px-2 py-1 text-xs"
-                        >
-                          {showTraceViewer ? "Hide trace viewer" : "Watch trace"}
-                        </button>
-                        <a
-                          className="text-[var(--brand-primary)] hover:underline"
-                          href={traceViewerUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Open trace in new tab
-                        </a>
-                      </>
-                    )}
-                    {screenshotUrl && (
-                      <a className="text-[var(--brand-primary)] hover:underline" href={screenshotUrl} target="_blank" rel="noreferrer">
-                        Open screenshot
-                      </a>
-                    )}
-                    {videoUrl && (
-                      <a className="text-[var(--brand-primary)] hover:underline" href={videoUrl} target="_blank" rel="noreferrer">
-                        Open video
-                      </a>
-                    )}
-                    {!traceViewerUrl && !screenshotUrl && !videoUrl && (
-                      <span className="text-[var(--muted)]">No artifacts available for this test case.</span>
+                <div className="rounded-lg border border-[var(--border)] p-2">
+                  <p className="text-[var(--muted)] text-xs uppercase tracking-[0.2em]">Steps</p>
+                  <div className="mt-2 space-y-1.5">
+                    {(selectedCase.steps || []).map((step, idx) => (
+                      <div key={idx} className="rounded border border-[var(--border)] px-2 py-1">
+                        <span className="text-xs text-[var(--muted)]">#{idx + 1}</span> {step.description || "Step"}
+                      </div>
+                    ))}
+                    {(!selectedCase.steps || selectedCase.steps.length === 0) && (
+                      <p className="text-[var(--muted)]">No steps captured for this run.</p>
                     )}
                   </div>
-                  {previewLoading && (screenshotUrl || videoUrl) && (
-                    <p className="mt-2 text-xs text-[var(--muted)]">Loading screenshot/video preview...</p>
-                  )}
-                  {previewError && <p className="mt-2 text-xs text-rose-600">{previewError}</p>}
                 </div>
 
-                {showTraceViewer && traceViewerUrl && (
+                <div className="rounded-lg border border-[var(--border)] p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Artifacts</p>
+                    {hasArtifacts && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowArtifacts((prev) => {
+                            const next = !prev;
+                            if (!next) setShowTraceViewer(false);
+                            return next;
+                          });
+                        }}
+                        className="rounded border border-[var(--border)] px-2 py-1 text-xs"
+                      >
+                        {showArtifacts ? "Hide artifacts" : "Show artifacts"}
+                      </button>
+                    )}
+                  </div>
+                  {!hasArtifacts ? (
+                    <p className="mt-2 text-[var(--muted)] text-sm">No artifacts available for this test case.</p>
+                  ) : !showArtifacts ? (
+                    <p className="mt-2 text-[var(--muted)] text-sm">Artifacts are hidden. Click "Show artifacts" to view them.</p>
+                  ) : (
+                    <>
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+                        {traceViewerUrl && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setShowTraceViewer((prev) => !prev)}
+                              className="rounded border border-[var(--border)] px-2 py-1 text-xs"
+                            >
+                              {showTraceViewer ? "Hide trace viewer" : "Watch trace"}
+                            </button>
+                            <a
+                              className="text-[var(--brand-primary)] hover:underline"
+                              href={traceViewerUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Open trace in new tab
+                            </a>
+                          </>
+                        )}
+                        {screenshotUrl && (
+                          <a className="text-[var(--brand-primary)] hover:underline" href={screenshotUrl} target="_blank" rel="noreferrer">
+                            Open screenshot
+                          </a>
+                        )}
+                        {videoUrl && (
+                          <a className="text-[var(--brand-primary)] hover:underline" href={videoUrl} target="_blank" rel="noreferrer">
+                            Open video
+                          </a>
+                        )}
+                      </div>
+                      {previewLoading && (screenshotUrl || videoUrl) && (
+                        <p className="mt-2 text-xs text-[var(--muted)]">Loading screenshot/video preview...</p>
+                      )}
+                      {previewError && <p className="mt-2 text-xs text-rose-600">{previewError}</p>}
+                    </>
+                  )}
+                </div>
+
+                {showArtifacts && showTraceViewer && traceViewerUrl && (
                   <div className="rounded-lg border border-[var(--border)] p-2">
                     <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)] mb-2">Trace viewer</p>
                     <iframe
@@ -503,7 +545,7 @@ export default function TesboTestDetailPage() {
                   </div>
                 )}
 
-                {screenshotUrl && (
+                {showArtifacts && screenshotUrl && (
                   <div className="rounded-lg border border-[var(--border)] p-2">
                     <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Screenshot</p>
                     <div className="mt-2 relative overflow-hidden rounded border border-[var(--border)] p-2">
@@ -520,7 +562,7 @@ export default function TesboTestDetailPage() {
                   </div>
                 )}
 
-                {videoUrl && (
+                {showArtifacts && videoUrl && (
                   <div className="rounded-lg border border-[var(--border)] p-2">
                     <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Video</p>
                     <div className="mt-2 overflow-hidden rounded border border-[var(--border)] p-2">
@@ -534,20 +576,6 @@ export default function TesboTestDetailPage() {
                     </div>
                   </div>
                 )}
-
-                <div className="rounded-lg border border-[var(--border)] p-2">
-                  <p className="text-[var(--muted)] text-xs uppercase tracking-[0.2em]">Steps</p>
-                  <div className="mt-2 space-y-1.5">
-                    {(selectedCase.steps || []).map((step, idx) => (
-                      <div key={idx} className="rounded border border-[var(--border)] px-2 py-1">
-                        <span className="text-xs text-[var(--muted)]">#{idx + 1}</span> {step.description || "Step"}
-                      </div>
-                    ))}
-                    {(!selectedCase.steps || selectedCase.steps.length === 0) && (
-                      <p className="text-[var(--muted)]">No steps captured for this run.</p>
-                    )}
-                  </div>
-                </div>
               </div>
             </div>
           </div>

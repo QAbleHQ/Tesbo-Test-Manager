@@ -16,12 +16,8 @@ import {
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
-  listExecutionApiKeys,
-  createExecutionApiKey,
-  revokeExecutionApiKey,
   type JiraConnection,
   type TestEnvironmentSetting,
-  type ExecutionApiKey,
   type ProjectType,
 } from "@/lib/api";
 import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
@@ -78,7 +74,7 @@ type ProjectSettingsPayload = {
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "testRuns" | "members" | "jira" | "tesbo" | "alerts" | "integrations" | "apiKeys";
+type SettingsTab = "general" | "testRuns" | "members" | "jira" | "tesbo" | "alerts" | "integrations";
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
@@ -153,24 +149,13 @@ export default function ProjectSettingsPage() {
   const [deleteProjectModalOpen, setDeleteProjectModalOpen] = useState(false);
   const [deleteProjectTypedName, setDeleteProjectTypedName] = useState("");
   const [projectType, setProjectType] = useState<ProjectType>("tesbox");
-  const [apiKeys, setApiKeys] = useState<ExecutionApiKey[]>([]);
-  const [apiKeysLoading, setApiKeysLoading] = useState(false);
-  const [newKeyName, setNewKeyName] = useState("");
-  const [creatingKey, setCreatingKey] = useState(false);
-  const [newlyCreatedKey, setNewlyCreatedKey] = useState<string | null>(null);
-  const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
-  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
-  const [apiKeyCopied, setApiKeyCopied] = useState(false);
   const jiraTabEnabled = jiraStatus?.connected === true;
-
-  const isExecutionProject = projectType === "tesbox_executions";
   const visibleTabs: Array<{ key: SettingsTab; label: string }> = [
     { key: "general", label: "General" },
-    ...(isExecutionProject ? [{ key: "apiKeys" as const, label: "API Keys" }] : []),
     { key: "testRuns", label: "Test Environments" },
     { key: "members", label: "Members" },
     ...(jiraTabEnabled ? [{ key: "jira" as const, label: "Jira" }] : []),
-    { key: "tesbo", label: "Automation Reports" },
+    { key: "tesbo", label: "API Keys" },
     { key: "alerts", label: "Alerts" },
     { key: "integrations", label: "Integrations" },
   ];
@@ -212,34 +197,6 @@ export default function ProjectSettingsPage() {
       })
       .filter((item): item is TestEnvironmentSetting => item !== null);
   }
-
-  const loadApiKeys = useCallback(async () => {
-    setApiKeysLoading(true);
-    setApiKeyError(null);
-    try {
-      const result = await listExecutionApiKeys(projectId);
-      setApiKeys(result.keys || []);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      const executionHint =
-        msg.includes("Failed to reach execution service") ||
-        msg.includes("Execution Service") ||
-        msg.includes("execution service");
-      setApiKeyError(
-        executionHint
-          ? `${msg} Check EXECUTION_SERVICE_BASE_URL and EXECUTION_SERVICE_API_KEY on the backend, and that exe.tesbo.io is reachable from the API server.`
-          : msg
-      );
-    } finally {
-      setApiKeysLoading(false);
-    }
-  }, [projectId]);
-
-  useEffect(() => {
-    if (activeTab === "apiKeys" && isExecutionProject) {
-      loadApiKeys();
-    }
-  }, [activeTab, isExecutionProject, loadApiKeys]);
 
   const loadMembers = useCallback(async () => {
     try {
@@ -425,41 +382,6 @@ export default function ProjectSettingsPage() {
       setMessage("Failed to rotate Automation Reports ingestion key.");
     } finally {
       setRotatingTesboKey(false);
-    }
-  }
-
-  async function handleCreateApiKey(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newKeyName.trim()) {
-      setApiKeyError("Key name is required");
-      return;
-    }
-    setCreatingKey(true);
-    setApiKeyError(null);
-    setNewlyCreatedKey(null);
-    try {
-      const result = await createExecutionApiKey(projectId, newKeyName.trim());
-      setNewlyCreatedKey(result.key);
-      setNewKeyName("");
-      await loadApiKeys();
-    } catch (e) {
-      setApiKeyError(e instanceof Error ? e.message : "Failed to create API key.");
-    } finally {
-      setCreatingKey(false);
-    }
-  }
-
-  async function handleRevokeApiKey(keyId: string) {
-    if (!confirm("Revoke this API key? Any integrations using it will stop working.")) return;
-    setRevokingKeyId(keyId);
-    setApiKeyError(null);
-    try {
-      await revokeExecutionApiKey(projectId, keyId);
-      await loadApiKeys();
-    } catch (e) {
-      setApiKeyError(e instanceof Error ? e.message : "Failed to revoke API key.");
-    } finally {
-      setRevokingKeyId(null);
     }
   }
 
@@ -874,9 +796,9 @@ export default function ProjectSettingsPage() {
           {activeTab === "tesbo" && (
             <Card className="p-4 space-y-4">
               <div>
-                <h2 className="text-base font-semibold text-[var(--foreground)]">Automation Reports</h2>
+                <h2 className="text-base font-semibold text-[var(--foreground)]">API Keys</h2>
                 <p className="mt-1 text-sm text-[var(--muted)]">
-                  Controls for embedded Automation Reports features in this project.
+                  Manage project access keys and report ingestion settings.
                 </p>
               </div>
               <label className="flex items-center gap-3 cursor-pointer">
@@ -1197,157 +1119,6 @@ export default function ProjectSettingsPage() {
             </div>
           </div>
         </Card>
-      )}
-
-      {activeTab === "apiKeys" && isExecutionProject && (
-        <section className="space-y-5">
-          <Card className="p-4 space-y-4">
-            <div>
-              <h2 className="text-base font-semibold text-[var(--foreground)]">Execution API Keys</h2>
-              <p className="mt-1 text-sm text-[var(--muted)]">
-                API keys authenticate requests from your CI/CD pipeline to TesboX-Executions.
-                Include the key in the <code className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-xs font-mono">x-api-key</code> header.
-              </p>
-            </div>
-
-            {newlyCreatedKey && (
-              <div className="rounded-lg border border-[var(--success)]/30 bg-[color-mix(in_oklab,var(--success)_8%,white)] p-4 space-y-2">
-                <p className="text-sm font-semibold text-[var(--success)]">API key created</p>
-                <p className="text-xs text-[var(--muted)]">
-                  Copy this key now. It will not be shown again.
-                </p>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 font-mono text-sm break-all text-[var(--foreground)]">
-                    {newlyCreatedKey}
-                  </code>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(newlyCreatedKey);
-                      } catch {
-                        const ta = document.createElement("textarea");
-                        ta.value = newlyCreatedKey;
-                        ta.style.position = "fixed";
-                        ta.style.opacity = "0";
-                        document.body.appendChild(ta);
-                        ta.select();
-                        document.execCommand("copy");
-                        document.body.removeChild(ta);
-                      }
-                      setApiKeyCopied(true);
-                      setTimeout(() => setApiKeyCopied(false), 2000);
-                    }}
-                  >
-                    {apiKeyCopied ? "Copied!" : "Copy"}
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            <form onSubmit={handleCreateApiKey} className="grid gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
-              <Field>
-                <FieldLabel>Key name</FieldLabel>
-                <Input
-                  type="text"
-                  value={newKeyName}
-                  onChange={(e) => setNewKeyName(e.target.value)}
-                  placeholder="e.g. CI/CD Pipeline, Staging"
-                  disabled={creatingKey}
-                />
-              </Field>
-              <Button type="submit" disabled={creatingKey || !newKeyName.trim()}>
-                {creatingKey ? "Creating…" : "Generate API key"}
-              </Button>
-            </form>
-
-            {apiKeyError && (
-              <p className="text-sm text-[var(--error)]">{apiKeyError}</p>
-            )}
-          </Card>
-
-          <Card className="overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="tesbo-table min-w-full text-sm">
-                <thead>
-                  <tr className="text-left text-[var(--muted)]">
-                    <th className="px-4 py-3 font-medium">Name</th>
-                    <th className="px-4 py-3 font-medium">Scopes</th>
-                    <th className="px-4 py-3 font-medium">Created</th>
-                    <th className="px-4 py-3 font-medium">Last used</th>
-                    <th className="px-4 py-3 font-medium">Status</th>
-                    <th className="px-4 py-3 font-medium text-right">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {apiKeys.map((k) => {
-                    const isRevoked = !!k.revoked_at;
-                    return (
-                      <tr key={k.id} className={isRevoked ? "opacity-50" : ""}>
-                        <td className="px-4 py-3 text-[var(--foreground)] font-medium">{k.name}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1">
-                            {k.scopes.map((s) => (
-                              <span key={s} className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[11px] font-mono text-[var(--muted)]">
-                                {s}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3 text-[var(--muted)] whitespace-nowrap">
-                          {new Date(k.created_at).toLocaleDateString()}
-                        </td>
-                        <td className="px-4 py-3 text-[var(--muted)] whitespace-nowrap">
-                          {k.last_used_at ? new Date(k.last_used_at).toLocaleDateString() : "Never"}
-                        </td>
-                        <td className="px-4 py-3">
-                          {isRevoked ? (
-                            <span className="inline-flex items-center rounded-md bg-[color-mix(in_oklab,var(--error)_12%,white)] px-2 py-0.5 text-xs font-medium text-[var(--error)]">
-                              Revoked
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1.5 rounded-md bg-[color-mix(in_oklab,var(--success)_12%,white)] px-2 py-0.5 text-xs font-medium text-[var(--success)]">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
-                              Active
-                            </span>
-                          )}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          {!isRevoked && (
-                            <button
-                              type="button"
-                              onClick={() => handleRevokeApiKey(k.id)}
-                              disabled={revokingKeyId === k.id}
-                              className="text-[var(--error)] hover:underline disabled:opacity-50 text-sm"
-                            >
-                              {revokingKeyId === k.id ? "Revoking…" : "Revoke"}
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {!apiKeysLoading && apiKeys.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="px-4 py-8 text-center text-[var(--muted)]">
-                        No API keys yet. Generate one to start integrating.
-                      </td>
-                    </tr>
-                  )}
-                  {apiKeysLoading && (
-                    <tr>
-                      <td colSpan={6} className="px-4 py-8 text-center text-[var(--muted)]">
-                        Loading API keys…
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        </section>
       )}
 
       {(activeTab === "alerts" || activeTab === "integrations") && message && (

@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../../TesboPlaywrightDemo"
+		},
+		{
+			"path": "../../codegen_demo"
 		}
 	],
 	"settings": {}
