@@ -298,31 +298,38 @@ export default function TesboRunsPage() {
           />
         ) : (
           <div className="space-y-4">
-            {/* Run cards */}
-            <div className="space-y-2">
-              {paginatedRuns.map((run, idx) => {
-                const tone = statusTone(run.status);
-                const hasMeta = run.branchName || run.pullRequest || run.commitAuthor;
-                return (
-                  <button
-                    key={run.id}
-                    type="button"
-                    onClick={() => router.push(`/projects/${projectId}/tesbo-reports/runs/${run.id}`)}
-                    className={`tesbo-card w-full text-left border-l-4 ${accentBorder(run.status)} p-4 transition-shadow hover:shadow-md group`}
-                  >
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                      {/* Left: primary info */}
-                      <div className="min-w-0 flex-1 space-y-2">
-                        <div className="flex items-center gap-2.5 flex-wrap">
-                          <span className="text-sm font-bold text-[var(--foreground)]">
-                            #{run.runNumber || String((runPage - 1) * pageSize + idx + 1)}
-                          </span>
-                          <StatusChip tone={tone} live={tone === "neutral"}>
-                            {statusLabel(run.status)}
-                          </StatusChip>
-                          <span className="text-xs text-[var(--muted)]" title={run.startedAt ? new Date(run.startedAt).toLocaleString() : undefined}>
-                            {relativeTime(run.startedAt)}
-                          </span>
+            <div className="tesbo-card overflow-x-auto">
+              <table className="tesbo-table min-w-[1000px] w-full text-sm">
+                <thead>
+                  <tr>
+                    <th className="px-4 py-3 text-left">Run #</th>
+                    <th className="px-4 py-3 text-left">Name</th>
+                    <th className="px-4 py-3 text-left">Branch</th>
+                    <th className="px-4 py-3 text-left">PR</th>
+                    <th className="px-4 py-3 text-left">Commit author</th>
+                    <th className="px-4 py-3 text-left">GitHub build</th>
+                    <th className="px-4 py-3 text-left">Status</th>
+                    <th className="px-4 py-3 text-left">Totals</th>
+                    <th className="px-4 py-3 text-left">Source</th>
+                    <th className="px-4 py-3 text-left">Started</th>
+                    <th className="px-4 py-3 text-right">Details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedRuns.map((run, idx) => (
+                    <tr key={run.id} className="cursor-pointer" onClick={() => router.push(`/projects/${projectId}/tesbo-reports/runs/${run.id}`)}>
+                      <td className="px-4 py-3 font-semibold text-[var(--foreground)]">#{run.runNumber || String(runs.length - ((runPage - 1) * pageSize + idx))}</td>
+                      <td className="px-4 py-3">{run.name}</td>
+                      <td className="px-4 py-3">{run.branchName || "-"}</td>
+                      <td className="px-4 py-3">{run.pullRequest || "-"}</td>
+                      <td className="px-4 py-3">{run.commitAuthor || "-"}</td>
+                      <td className="px-4 py-3">{run.githubRunId || "-"}</td>
+                      <td className="px-4 py-3">{run.status}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <span className="rounded-full bg-[var(--success)] text-white px-2 py-0.5 text-xs">{run.passed}</span>
+                          <span className="rounded-full bg-[var(--error)] text-white px-2 py-0.5 text-xs">{run.failed}</span>
+                          <span className="rounded-full bg-[var(--warning)] text-black px-2 py-0.5 text-xs">{run.skipped}</span>
                         </div>
 
                         <p className="text-sm text-[var(--foreground)] truncate max-w-lg font-medium" title={run.name}>
