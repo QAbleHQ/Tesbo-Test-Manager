@@ -714,96 +714,154 @@ public final class TesboReportsService {
         String sourceType = asText(payload.get("sourceType"), "PLAYWRIGHT");
         String githubRunId = asText(payload.get("githubRunId"), null);
         Instant startedAt = parseInstant(payload.get("startedAt"), Instant.now());
-        Instant completedAt = parseInstant(payload.get("completedAt"), startedAt);
-
-        String insertRunSql = """
-            INSERT INTO tesbo_report_runs
-            (project_id, name, status, started_at, ended_at, created_by, branch_name, pull_request, commit_author, run_number, source_type, github_run_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
-            """;
+        Instant completedAt = parseInstant(payload.get("completedAt"), null);
+        UUID existingRunId = parseUuid(payload.get("runId")).orElse(null);
 
         try (Connection c = Database.getDataSource().getConnection()) {
             c.setAutoCommit(false);
+
             UUID runId;
-            try (PreparedStatement ps = c.prepareStatement(insertRunSql)) {
-                ps.setObject(1, projectId);
-                ps.setString(2, runName);
-                ps.setString(3, status);
-                ps.setTimestamp(4, Timestamp.from(startedAt));
-                ps.setTimestamp(5, Timestamp.from(completedAt));
-                ps.setObject(6, createdByUserId);
-                ps.setString(7, branchName);
-                ps.setString(8, pullRequest);
-                ps.setString(9, commitAuthor);
-                ps.setString(10, runNumber);
-                ps.setString(11, sourceType);
-                ps.setString(12, githubRunId);
-                ResultSet rs = ps.executeQuery();
-                rs.next();
-                runId = (UUID) rs.getObject("id");
+            if (existingRunId != null && runExistsForProject(c, existingRunId, projectId)) {
+                runId = existingRunId;
+                updateRunStatus(c, runId, status, completedAt);
+            } else {
+                if (runNumber == null || runNumber.isBlank()) {
+                    runNumber = nextRunNumber(c, projectId);
+                }
+                String insertRunSql = """
+                    INSERT INTO tesbo_report_runs
+                    (project_id, name, status, started_at, ended_at, created_by, branch_name, pull_request, commit_author, run_number, source_type, github_run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """;
+                try (PreparedStatement ps = c.prepareStatement(insertRunSql)) {
+                    ps.setObject(1, projectId);
+                    ps.setString(2, runName);
+                    ps.setString(3, status);
+                    ps.setTimestamp(4, Timestamp.from(startedAt));
+                    ps.setTimestamp(5, completedAt != null ? Timestamp.from(completedAt) : null);
+                    ps.setObject(6, createdByUserId);
+                    ps.setString(7, branchName);
+                    ps.setString(8, pullRequest);
+                    ps.setString(9, commitAuthor);
+                    ps.setString(10, runNumber);
+                    ps.setString(11, sourceType);
+                    ps.setString(12, githubRunId);
+                    ResultSet rs = ps.executeQuery();
+                    rs.next();
+                    runId = (UUID) rs.getObject("id");
+                }
             }
 
             List<Map<String, Object>> tests = castListOfMaps(payload.get("tests"));
-            String insertCaseSql = """
-                INSERT INTO tesbo_report_cases
-                (id, run_id, project_id, spec_name, test_name, status, duration_ms, trace_url, screenshot_url, video_url,
-                 trace_storage_key, screenshot_storage_key, video_storage_key,
-                 full_title, error_message, error_stack, attempt,
-                 project_name, browser_name, browser_version, os_name, os_platform, os_arch,
-                 tags_json, steps_json, executed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?)
-                """;
-            try (PreparedStatement ps = c.prepareStatement(insertCaseSql)) {
-                for (Map<String, Object> test : tests) {
-                    UUID caseId = parseUuid(test.get("caseId")).orElseGet(UUID::randomUUID);
-                    String traceContentType = asText(test.get("traceContentType"), "application/zip");
-                    String screenshotContentType = asText(test.get("screenshotContentType"), "image/png");
-                    String videoContentType = asText(test.get("videoContentType"), "video/webm");
-
-                    byte[] traceBytes = TesboArtifactStorageService.decodeBase64(test.get("traceBase64"));
-                    byte[] screenshotBytes = TesboArtifactStorageService.decodeBase64(test.get("screenshotBase64"));
-                    byte[] videoBytes = TesboArtifactStorageService.decodeBase64(test.get("videoBase64"));
-
-                    TesboArtifactStorageService.ArtifactLocation traceLocation = saveArtifact(projectId, runId, caseId, "trace", traceContentType, traceBytes);
-                    TesboArtifactStorageService.ArtifactLocation screenshotLocation = saveArtifact(projectId, runId, caseId, "screenshot", screenshotContentType, screenshotBytes);
-                    TesboArtifactStorageService.ArtifactLocation videoLocation = saveArtifact(projectId, runId, caseId, "video", videoContentType, videoBytes);
-
-                    ps.setObject(1, caseId);
-                    ps.setObject(2, runId);
-                    ps.setObject(3, projectId);
-                    ps.setString(4, asText(test.get("spec"), "unknown.spec"));
-                    ps.setString(5, asText(test.get("name"), "Unnamed test"));
-                    ps.setString(6, asText(test.get("status"), "Unknown"));
-                    Integer duration = asNullableInt(test.get("durationMs"));
-                    ps.setObject(7, duration);
-                    ps.setString(8, asText(test.get("traceUrl"), null));
-                    ps.setString(9, asText(test.get("screenshotUrl"), null));
-                    ps.setString(10, asText(test.get("videoUrl"), null));
-                    ps.setString(11, traceLocation != null ? traceLocation.storageKey() : null);
-                    ps.setString(12, screenshotLocation != null ? screenshotLocation.storageKey() : null);
-                    ps.setString(13, videoLocation != null ? videoLocation.storageKey() : null);
-                    ps.setString(14, asText(test.get("fullTitle"), null));
-                    ps.setString(15, asText(test.get("errorMessage"), null));
-                    ps.setString(16, asText(test.get("errorStack"), null));
-                    ps.setObject(17, asNullableInt(test.get("attempt")));
-                    ps.setString(18, asText(test.get("projectName"), null));
-                    ps.setString(19, asText(test.get("browserName"), null));
-                    ps.setString(20, asText(test.get("browserVersion"), null));
-                    ps.setString(21, asText(test.get("osName"), null));
-                    ps.setString(22, asText(test.get("osPlatform"), null));
-                    ps.setString(23, asText(test.get("osArch"), null));
-                    ps.setString(24, safeJsonArray(test.get("tags")));
-                    ps.setString(25, safeJsonArray(test.get("steps")));
-                    ps.setTimestamp(26, Timestamp.from(completedAt));
-                    ps.addBatch();
-                }
-                ps.executeBatch();
+            if (!tests.isEmpty()) {
+                Instant caseTimestamp = completedAt != null ? completedAt : Instant.now();
+                upsertCases(c, runId, projectId, tests, caseTimestamp);
             }
+
             c.commit();
             return Map.of("runId", runId.toString());
         } catch (SQLException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static boolean runExistsForProject(Connection c, UUID runId, UUID projectId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM tesbo_report_runs WHERE id = ? AND project_id = ?")) {
+            ps.setObject(1, runId);
+            ps.setObject(2, projectId);
+            return ps.executeQuery().next();
+        }
+    }
+
+    private static void updateRunStatus(Connection c, UUID runId, String status, Instant completedAt) throws SQLException {
+        String sql = completedAt != null
+            ? "UPDATE tesbo_report_runs SET status = ?, ended_at = ?, updated_at = now() WHERE id = ?"
+            : "UPDATE tesbo_report_runs SET status = ?, updated_at = now() WHERE id = ?";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, status);
+            if (completedAt != null) {
+                ps.setTimestamp(2, Timestamp.from(completedAt));
+                ps.setObject(3, runId);
+            } else {
+                ps.setObject(2, runId);
+            }
+            ps.executeUpdate();
+        }
+    }
+
+    private static void upsertCases(Connection c, UUID runId, UUID projectId,
+                                     List<Map<String, Object>> tests, Instant caseTimestamp) throws SQLException {
+        String insertCaseSql = """
+            INSERT INTO tesbo_report_cases
+            (id, run_id, project_id, spec_name, test_name, status, duration_ms, trace_url, screenshot_url, video_url,
+             trace_storage_key, screenshot_storage_key, video_storage_key,
+             full_title, error_message, error_stack, attempt,
+             project_name, browser_name, browser_version, os_name, os_platform, os_arch,
+             tags_json, steps_json, executed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?)
+            ON CONFLICT (run_id, spec_name, test_name) DO UPDATE SET
+              status = EXCLUDED.status,
+              duration_ms = EXCLUDED.duration_ms,
+              trace_url = COALESCE(EXCLUDED.trace_url, tesbo_report_cases.trace_url),
+              screenshot_url = COALESCE(EXCLUDED.screenshot_url, tesbo_report_cases.screenshot_url),
+              video_url = COALESCE(EXCLUDED.video_url, tesbo_report_cases.video_url),
+              trace_storage_key = COALESCE(EXCLUDED.trace_storage_key, tesbo_report_cases.trace_storage_key),
+              screenshot_storage_key = COALESCE(EXCLUDED.screenshot_storage_key, tesbo_report_cases.screenshot_storage_key),
+              video_storage_key = COALESCE(EXCLUDED.video_storage_key, tesbo_report_cases.video_storage_key),
+              full_title = COALESCE(EXCLUDED.full_title, tesbo_report_cases.full_title),
+              error_message = EXCLUDED.error_message,
+              error_stack = EXCLUDED.error_stack,
+              attempt = EXCLUDED.attempt,
+              steps_json = EXCLUDED.steps_json,
+              executed_at = COALESCE(EXCLUDED.executed_at, tesbo_report_cases.executed_at)
+            """;
+        try (PreparedStatement ps = c.prepareStatement(insertCaseSql)) {
+            for (Map<String, Object> test : tests) {
+                UUID caseId = parseUuid(test.get("caseId")).orElseGet(UUID::randomUUID);
+                String traceContentType = asText(test.get("traceContentType"), "application/zip");
+                String screenshotContentType = asText(test.get("screenshotContentType"), "image/png");
+                String videoContentType = asText(test.get("videoContentType"), "video/webm");
+
+                byte[] traceBytes = TesboArtifactStorageService.decodeBase64(test.get("traceBase64"));
+                byte[] screenshotBytes = TesboArtifactStorageService.decodeBase64(test.get("screenshotBase64"));
+                byte[] videoBytes = TesboArtifactStorageService.decodeBase64(test.get("videoBase64"));
+
+                TesboArtifactStorageService.ArtifactLocation traceLocation = saveArtifact(projectId, runId, caseId, "trace", traceContentType, traceBytes);
+                TesboArtifactStorageService.ArtifactLocation screenshotLocation = saveArtifact(projectId, runId, caseId, "screenshot", screenshotContentType, screenshotBytes);
+                TesboArtifactStorageService.ArtifactLocation videoLocation = saveArtifact(projectId, runId, caseId, "video", videoContentType, videoBytes);
+
+                ps.setObject(1, caseId);
+                ps.setObject(2, runId);
+                ps.setObject(3, projectId);
+                ps.setString(4, asText(test.get("spec"), "unknown.spec"));
+                ps.setString(5, asText(test.get("name"), "Unnamed test"));
+                ps.setString(6, asText(test.get("status"), "Unknown"));
+                Integer duration = asNullableInt(test.get("durationMs"));
+                ps.setObject(7, duration);
+                ps.setString(8, asText(test.get("traceUrl"), null));
+                ps.setString(9, asText(test.get("screenshotUrl"), null));
+                ps.setString(10, asText(test.get("videoUrl"), null));
+                ps.setString(11, traceLocation != null ? traceLocation.storageKey() : null);
+                ps.setString(12, screenshotLocation != null ? screenshotLocation.storageKey() : null);
+                ps.setString(13, videoLocation != null ? videoLocation.storageKey() : null);
+                ps.setString(14, asText(test.get("fullTitle"), null));
+                ps.setString(15, asText(test.get("errorMessage"), null));
+                ps.setString(16, asText(test.get("errorStack"), null));
+                ps.setObject(17, asNullableInt(test.get("attempt")));
+                ps.setString(18, asText(test.get("projectName"), null));
+                ps.setString(19, asText(test.get("browserName"), null));
+                ps.setString(20, asText(test.get("browserVersion"), null));
+                ps.setString(21, asText(test.get("osName"), null));
+                ps.setString(22, asText(test.get("osPlatform"), null));
+                ps.setString(23, asText(test.get("osArch"), null));
+                ps.setString(24, safeJsonArray(test.get("tags")));
+                ps.setString(25, safeJsonArray(test.get("steps")));
+                ps.setTimestamp(26, Timestamp.from(caseTimestamp));
+                ps.addBatch();
+            }
+            ps.executeBatch();
         }
     }
 
@@ -1242,6 +1300,16 @@ public final class TesboReportsService {
             if (item instanceof Map<?, ?>) out.add((Map<String, Object>) item);
         }
         return out;
+    }
+
+    private static String nextRunNumber(Connection c, UUID projectId) throws SQLException {
+        String sql = "SELECT COUNT(*)::int + 1 AS next_num FROM tesbo_report_runs WHERE project_id = ?";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setObject(1, projectId);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            return String.valueOf(rs.getInt("next_num"));
+        }
     }
 
     private static String asText(Object value, String fallback) {
