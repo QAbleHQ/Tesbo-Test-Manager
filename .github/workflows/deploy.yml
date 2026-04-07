@@ -249,6 +249,17 @@ jobs:
           $SSH "cat > /opt/bettercases/automation-agent/app.env <<'EOF'
           PORT=7400
           AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
+          ENABLE_WEBSOCKET_LIVE_STREAM=${{ secrets.ENABLE_WEBSOCKET_LIVE_STREAM }}
+          SESSION_REPOSITORY_MODE=${{ secrets.SESSION_REPOSITORY_MODE }}
+          ENABLE_REDIS_SESSION_REPOSITORY=${{ secrets.ENABLE_REDIS_SESSION_REPOSITORY }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          REDIS_PREFIX=${{ secrets.REDIS_PREFIX }}
+          REDIS_SESSION_TTL_SECONDS=${{ secrets.REDIS_SESSION_TTL_SECONDS }}
+          REDIS_LOCK_TTL_MS=${{ secrets.REDIS_LOCK_TTL_MS }}
+          REDIS_HEARTBEAT_INTERVAL_MS=${{ secrets.REDIS_HEARTBEAT_INTERVAL_MS }}
+          WS_HEARTBEAT_MS=${{ secrets.WS_HEARTBEAT_MS }}
+          WS_CLIENT_IDLE_TIMEOUT_MS=${{ secrets.WS_CLIENT_IDLE_TIMEOUT_MS }}
+          SESSION_CREATE_CONCURRENCY=${{ secrets.SESSION_CREATE_CONCURRENCY }}
           MW_APM_ACCESS_TOKEN=${{ secrets.MW_APM_ACCESS_TOKEN }}
           MW_AGENT_SERVICE=${{ secrets.MW_AGENT_SERVICE }}
           MW_APM_SERVICE_NAME=tesbo-automation-agents
@@ -257,3 +268,5 @@ jobs:
           $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
           $SSH "cd /opt/bettercases/automation-agent && docker compose pull && docker compose up -d --remove-orphans"
           $SSH "sleep 5 && docker compose -f /opt/bettercases/automation-agent/docker-compose.yml ps"
+          $SSH "for i in \$(seq 1 30); do curl -fsS http://127.0.0.1:7400/health >/dev/null && exit 0; echo 'waiting for local health...'; sleep 2; done; echo 'agent health check failed'; docker compose -f /opt/bettercases/automation-agent/docker-compose.yml logs --tail=200; exit 1"
+          $SSH "for i in \$(seq 1 30); do curl -kfsS https://${{ secrets.AUTOMATION_AGENT_DOMAIN }}/health >/dev/null && exit 0; echo 'waiting for tls health...'; sleep 2; done; echo 'tls health check failed'; docker compose -f /opt/bettercases/automation-agent/docker-compose.yml logs --tail=200; exit 1"

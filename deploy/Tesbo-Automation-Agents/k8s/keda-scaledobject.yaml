@@ -1,0 +1,19 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: tesbo-automation-agent-redis-queue
+spec:
+  scaleTargetRef:
+    name: tesbo-automation-agent
+  minReplicaCount: 3
+  maxReplicaCount: 30
+  pollingInterval: 15
+  cooldownPeriod: 180
+  triggers:
+    - type: redis
+      metadata:
+        address: redis-master.default.svc.cluster.local:6379
+        listName: tesbo:auto:session:start:queue
+        listLength: "5"
+      authenticationRef:
+        name: keda-redis-auth

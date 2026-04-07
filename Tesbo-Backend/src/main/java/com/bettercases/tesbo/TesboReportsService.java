@@ -441,7 +441,9 @@ public final class TesboReportsService {
     }
 
     public static void sendTestAlert(UUID projectId, UUID userId, UUID alertId) {
-        RbacService.requireProjectRole(userId, projectId);
+        if (!RbacService.requireProjectRole(userId, projectId).canManageProject()) {
+            throw new io.javalin.http.ForbiddenResponse("Cannot manage Tesbo alerts");
+        }
         String sql = """
             SELECT a.name, a.condition_type, a.comparator, a.threshold, a.recipients_json,
                    p.name AS project_name

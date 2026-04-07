@@ -45,7 +45,8 @@ public final class AutomationSessionService {
     }
 
     public static Optional<Map<String, Object>> getSession(UUID sessionId, UUID projectId, UUID userId) {
-        RbacService.requireProjectRole(userId, projectId);
+        var role = RbacService.requireProjectRole(userId, projectId);
+        boolean canManageProject = role.canManageProject();
         String sql = "SELECT id, project_id, testcase_id, user_id, status, started_at, ended_at, current_url, browser_context_meta, last_screenshot_path, updated_at " +
                 "FROM automation_sessions WHERE id = ? AND project_id = ?";
         try (Connection c = Database.getDataSource().getConnection();
@@ -54,11 +55,15 @@ public final class AutomationSessionService {
             ps.setObject(2, projectId);
             ResultSet rs = ps.executeQuery();
             if (!rs.next()) return Optional.empty();
+            UUID sessionOwnerId = (UUID) rs.getObject("user_id");
+            if (!canManageProject && !userId.equals(sessionOwnerId)) {
+                return Optional.empty();
+            }
             Map<String, Object> out = new HashMap<>();
             out.put("id", rs.getObject("id").toString());
             out.put("projectId", rs.getObject("project_id").toString());
             out.put("testcaseId", rs.getObject("testcase_id").toString());
-            out.put("userId", rs.getObject("user_id").toString());
+            out.put("userId", sessionOwnerId.toString());
             out.put("status", rs.getString("status"));
             out.put("startedAt", rs.getTimestamp("started_at").toInstant().toString());
             out.put("endedAt", rs.getTimestamp("ended_at") != null ? rs.getTimestamp("ended_at").toInstant().toString() : null);

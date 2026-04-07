@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../../codegen_demo"
+		},
+		{
+			"path": "../../shannon"
 		}
 	],
 	"settings": {}

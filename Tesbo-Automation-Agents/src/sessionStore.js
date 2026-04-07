@@ -16,12 +16,16 @@ import {
   ensureTraceDir,
   navigateToStartUrl,
   extractPlaywrightTestBody,
+  assertSafePlaywrightScript,
+  validateAndNormalizeUrl,
   createExpect,
   createInstrumentedPage,
   runPlaywrightScript,
 } from "./playwrightScriptRunner.js";
+import { getSessionRepository } from "./sessionRepository.js";
 
-const sessions = new Map();
+const sessionRepository = getSessionRepository();
+const repositoryOwnerId = `agent-${process.pid}`;
 let sessionCreateInFlight = 0;
 
 class SessionCreationError extends Error {
@@ -114,7 +118,7 @@ function buildSessionState(sessionId, browser, context, page) {
 }
 
 function getSession(sessionId) {
-  return sessions.get(sessionId) || null;
+  return sessionRepository.getRuntimeSession(sessionId);
 }
 
 /**
@@ -125,7 +129,8 @@ function getSession(sessionId) {
  *   { modelProvider, modelApiKey, model }
  */
 async function createSession(sessionId, startUrl, options = {}) {
-  if (sessions.has(sessionId)) return sessions.get(sessionId);
+  const existing = getSession(sessionId);
+  if (existing) return existing;
   if (sessionCreateInFlight >= Math.max(1, config.sessionCreateConcurrency)) {
     throw new SessionCreationError(
       "SESSION_CREATION_CAPACITY_REACHED",
@@ -148,7 +153,12 @@ async function createSession(sessionId, startUrl, options = {}) {
         startUrl,
         { provider: modelProvider, apiKey: modelApiKey, model }
       );
-      sessions.set(sessionId, state);
+      sessionRepository.setRuntimeSession(sessionId, state);
+      await sessionRepository.upsertSessionMeta(sessionId, {
+        sessionType: "agent",
+        status: "active",
+        currentUrl: state.currentUrl || "",
+      });
       return state;
     }
 
@@ -160,9 +170,14 @@ async function createSession(sessionId, startUrl, options = {}) {
     }
     const { browser, context, page } = await launchBrowserContext(startUrl);
     const state = buildSessionState(sessionId, browser, context, page);
-    sessions.set(sessionId, state);
+    sessionRepository.setRuntimeSession(sessionId, state);
     await takeScreenshot(state).catch(() => {});
     state.currentUrl = page.url();
+    await sessionRepository.upsertSessionMeta(sessionId, {
+      sessionType: "playwright",
+      status: "active",
+      currentUrl: state.currentUrl || "",
+    });
     logInfo("session_created", { sessionId });
     return state;
   } catch (error) {
@@ -179,7 +194,7 @@ async function createSession(sessionId, startUrl, options = {}) {
 }
 
 async function resetSession(sessionId, startUrl) {
-  const session = sessions.get(sessionId);
+  const session = getSession(sessionId);
   if (!session) throw new Error("Session not found");
   const currentSession = session;
   try {
@@ -204,6 +219,10 @@ async function resetSession(sessionId, startUrl) {
     startUrl: startUrl || "",
   });
   logInfo("session_reset", { sessionId, startUrl: startUrl || "" });
+  await sessionRepository.upsertSessionMeta(sessionId, {
+    currentUrl: currentSession.currentUrl || "",
+    status: "active",
+  });
   return {
     sessionId,
     currentUrl: currentSession.currentUrl,
@@ -299,6 +318,7 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
     if (startUrl) {
       await navigateToStartUrl(session.page, startUrl);
     }
+    assertSafePlaywrightScript(script);
     const body = extractPlaywrightTestBody(script);
     const AsyncFunction = Object.getPrototypeOf(async function noop() {}).constructor;
     const fn = new AsyncFunction("page", "expect", body);
@@ -350,14 +370,21 @@ async function runPlaywrightScriptInSession(sessionId, executionId, script, star
 }
 
 function pushEvent(session, event) {
-  session.events.push({
+  const row = {
     ...event,
     createdAt: nowIso(),
-  });
+  };
+  session.events.push(row);
   if (session.events.length > 2000) {
     session.events.splice(0, session.events.length - 2000);
   }
   session.updatedAt = nowIso();
+  if (session?.id) {
+    void sessionRepository.heartbeat(session.id, { currentUrl: session.currentUrl || "" });
+    if (typeof sessionRepository.appendEvent === "function") {
+      void sessionRepository.appendEvent(session.id, row);
+    }
+  }
 }
 
 async function selectorAtPoint(page, x, y) {
@@ -903,7 +930,8 @@ async function executeStep(session, commandId, step) {
     };
 
     if (step.action === "navigate") {
-      await session.page.goto(step.url, { waitUntil: "domcontentloaded", timeout });
+      const safeUrl = validateAndNormalizeUrl(step.url);
+      await session.page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout });
       waitsApplied.push("goto:domcontentloaded");
     } else if (step.action === "click") {
       const target = step.selector || step.targetDescription || step.expectedText || "";
@@ -1142,11 +1170,18 @@ async function executeSteps(sessionId, commandId, steps) {
   if (!session) {
     throw new Error("Session not found");
   }
+  const locked = await sessionRepository.acquireSessionLock(sessionId, repositoryOwnerId, config.redisLockTtlMs);
+  if (!locked) throw new Error("Session is busy");
   const results = [];
-  for (const step of steps) {
-    const result = await executeStep(session, commandId, step);
-    results.push(result);
-    if (result.status !== "passed") break;
+  try {
+    for (const step of steps) {
+      await sessionRepository.renewSessionLock(sessionId, repositoryOwnerId, config.redisLockTtlMs);
+      const result = await executeStep(session, commandId, step);
+      results.push(result);
+      if (result.status !== "passed") break;
+    }
+  } finally {
+    await sessionRepository.releaseSessionLock(sessionId, repositoryOwnerId);
   }
   return {
     sessionId,
@@ -1162,11 +1197,17 @@ async function executeAgent(sessionId, commandId, objective, options = {}) {
   if (session.type !== "agent") {
     throw new Error("Session is not an agent session. Use execute with steps for Playwright sessions.");
   }
+  const locked = await sessionRepository.acquireSessionLock(sessionId, repositoryOwnerId, config.redisLockTtlMs);
+  if (!locked) throw new Error("Session is busy");
   const useTelemetry = options.useTelemetry ?? config.useTelemetry;
-  if (useTelemetry) {
-    return executeAgentWithTelemetry(session, commandId, objective);
+  try {
+    if (useTelemetry) {
+      return await executeAgentWithTelemetry(session, commandId, objective);
+    }
+    return await executeAgentObjective(session, commandId, objective);
+  } finally {
+    await sessionRepository.releaseSessionLock(sessionId, repositoryOwnerId);
   }
-  return executeAgentObjective(session, commandId, objective);
 }
 
 async function manualAction(sessionId, action) {
@@ -1410,9 +1451,9 @@ async function manualAction(sessionId, action) {
 }
 
 async function closeSession(sessionId) {
-  const session = sessions.get(sessionId);
+  const session = getSession(sessionId);
   if (!session) return { videoPath: null };
-  sessions.delete(sessionId);
+  sessionRepository.removeRuntimeSession(sessionId);
   let videoPath = null;
   if (session.type === "agent") {
     await closeAgentSession(session);
@@ -1430,6 +1471,12 @@ async function closeSession(sessionId) {
     await session.context?.close?.().catch(() => {});
     await session.browser?.close?.().catch(() => {});
   }
+  await sessionRepository.upsertSessionMeta(sessionId, {
+    status: "closed",
+    currentUrl: session.currentUrl || "",
+    closedAt: nowIso(),
+  });
+  await sessionRepository.releaseSessionLock(sessionId, repositoryOwnerId).catch(() => {});
   logInfo("session_closed", { sessionId });
   return { videoPath };
 }
@@ -1522,7 +1569,7 @@ async function sessionState(sessionId) {
 function startCleanupWatchdog() {
   setInterval(async () => {
     const cutoff = Date.now() - config.sessionTtlMs;
-    for (const [sessionId, session] of sessions.entries()) {
+    for (const [sessionId, session] of sessionRepository.listRuntimeSessions()) {
       const updatedAtMs = new Date(session.updatedAt).getTime();
       if (updatedAtMs < cutoff) {
         logInfo("session_expired", { sessionId });

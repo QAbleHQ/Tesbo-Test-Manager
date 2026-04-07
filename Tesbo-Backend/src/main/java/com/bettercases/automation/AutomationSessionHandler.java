@@ -103,6 +103,14 @@ public final class AutomationSessionHandler {
             Map<String, Object> browserMeta = new HashMap<>();
             browserMeta.put("sessionType", sessionType);
             AutomationSessionService.touchState(sessionId, startUrl == null ? "" : startUrl, null, browserMeta);
+        } catch (AutomationAgentClient.AgentUnavailableException e) {
+            AutomationSessionService.markSessionStartFailed(sessionId, "Session start failed: " + e.getMessage());
+            String message = "Failed to create automation session: " + e.getMessage();
+            switch (e.code) {
+                case "busy" -> throw new io.javalin.http.TooManyRequestsResponse(message);
+                case "lock_conflict", "session_not_ready", "upstream_unavailable" -> throw new io.javalin.http.ServiceUnavailableResponse(message);
+                default -> throw new io.javalin.http.ServiceUnavailableResponse(message);
+            }
         } catch (Exception e) {
             AutomationSessionService.markSessionStartFailed(sessionId, "Session start failed: " + e.getMessage());
             throw new io.javalin.http.ServiceUnavailableResponse("Failed to create automation session: " + e.getMessage());
@@ -1518,6 +1526,24 @@ public final class AutomationSessionHandler {
         }
     }
 
+    public static void liveWsInfo(Context ctx) {
+        UUID userId = SessionFilter.requireUserId(ctx);
+        UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
+        AutomationSessionService.getSession(sessionId, projectId, userId)
+                .orElseThrow(io.javalin.http.NotFoundResponse::new);
+        String base = com.bettercases.Config.AUTOMATION_AGENT_BASE_URL;
+        String upstreamWs = base
+                .replaceFirst("^https://", "wss://")
+                .replaceFirst("^http://", "ws://")
+                + "/internal/sessions/" + sessionId + "/live/ws";
+        ctx.json(Map.of(
+                "preferredTransport", "websocket",
+                "websocketUrl", upstreamWs,
+                "fallbackPath", "/api/projects/" + projectId + "/automation/sessions/" + sessionId + "/live"
+        ));
+    }
+
     public static void getRecording(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
@@ -1566,9 +1592,10 @@ public final class AutomationSessionHandler {
     }
 
     public static void getRecordingById(Context ctx) {
-        SessionFilter.requireUserId(ctx);
+        UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
         UUID recordingId = UUID.fromString(ctx.pathParam("recordingId"));
+        com.bettercases.rbac.RbacService.requireProjectRole(userId, projectId);
         Map<String, Object> recording = AutomationRecordingService.getRecording(recordingId)
                 .orElseThrow(io.javalin.http.NotFoundResponse::new);
         if (!projectId.toString().equals(recording.get("projectId"))) {
@@ -1578,9 +1605,10 @@ public final class AutomationSessionHandler {
     }
 
     public static void listRecordingsByTestcase(Context ctx) {
-        SessionFilter.requireUserId(ctx);
+        UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
         UUID testcaseId = UUID.fromString(ctx.pathParam("testcaseId"));
+        com.bettercases.rbac.RbacService.requireProjectRole(userId, projectId);
         String limitParam = ctx.queryParam("limit");
         int limit = 20;
         if (limitParam != null) {
@@ -1591,8 +1619,9 @@ public final class AutomationSessionHandler {
     }
 
     public static void listRecordingsByProject(Context ctx) {
-        SessionFilter.requireUserId(ctx);
+        UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        com.bettercases.rbac.RbacService.requireProjectRole(userId, projectId);
         String limitParam = ctx.queryParam("limit");
         int limit = 20;
         if (limitParam != null) {
@@ -1879,6 +1908,9 @@ public final class AutomationSessionHandler {
     public static void runPlaywrightScript(Context ctx) {
         UUID userId = SessionFilter.requireUserId(ctx);
         UUID projectId = UUID.fromString(ctx.pathParam("projectId"));
+        if (!com.bettercases.rbac.RbacService.requireProjectRole(userId, projectId).canManageProject()) {
+            throw new io.javalin.http.ForbiddenResponse("Only managers can run custom Playwright scripts");
+        }
         UUID sessionId = UUID.fromString(ctx.pathParam("sessionId"));
         Map<String, Object> session = AutomationSessionService.getSession(sessionId, projectId, userId)
                 .orElseThrow(io.javalin.http.NotFoundResponse::new);

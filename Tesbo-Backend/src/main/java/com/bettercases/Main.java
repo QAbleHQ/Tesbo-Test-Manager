@@ -59,7 +59,15 @@ public final class Main {
         })
                 .before(corsHandler())
                 .before(sessionFilter)
-                .before(ctx -> ctx.header("X-Request-Id", java.util.UUID.randomUUID().toString()));
+                .before(ctx -> ctx.header("X-Request-Id", java.util.UUID.randomUUID().toString()))
+                .after(ctx -> {
+                    String forwardedProto = ctx.header("X-Forwarded-Proto");
+                    boolean secure = "https".equalsIgnoreCase(ctx.scheme())
+                            || (forwardedProto != null && "https".equalsIgnoreCase(forwardedProto.trim()));
+                    if (secure) {
+                        ctx.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+                    }
+                });
 
         // Handle CORS preflight so OPTIONS returns 204 with CORS headers
         app.options("/*", ctx -> ctx.status(204).result(""));
@@ -124,6 +132,7 @@ public final class Main {
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);
+        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live/ws-info", AutomationSessionHandler::liveWsInfo);
         app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/trace", AutomationSessionHandler::downloadLatestTrace);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/reset", AutomationSessionHandler::reset);
         app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);

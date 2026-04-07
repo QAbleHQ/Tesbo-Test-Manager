@@ -58,4 +58,15 @@ export const config = {
   serviceRole: NORMALIZED_SERVICE_ROLE,
   enableLambdaTestProvider: env("AUTOMATION_PROVIDER_LAMBDATEST_ENABLED", "false") === "true",
   enableBrowserStackProvider: env("AUTOMATION_PROVIDER_BROWSERSTACK_ENABLED", "false") === "true",
+  enableRedisSessionRepository: env("ENABLE_REDIS_SESSION_REPOSITORY", "false") === "true",
+  redisUrl: env("REDIS_URL", ""),
+  redisPrefix: env("REDIS_PREFIX", "tesbo:auto"),
+  redisConnectTimeoutMs: Number(env("REDIS_CONNECT_TIMEOUT_MS", "3000")),
+  redisSessionTtlSeconds: Number(env("REDIS_SESSION_TTL_SECONDS", "1800")),
+  redisLockTtlMs: Number(env("REDIS_LOCK_TTL_MS", "15000")),
+  redisHeartbeatIntervalMs: Number(env("REDIS_HEARTBEAT_INTERVAL_MS", "5000")),
+  enableWebSocketLiveStream: env("ENABLE_WEBSOCKET_LIVE_STREAM", "true") !== "false",
+  websocketHeartbeatMs: Number(env("WS_HEARTBEAT_MS", "15000")),
+  websocketClientIdleTimeoutMs: Number(env("WS_CLIENT_IDLE_TIMEOUT_MS", "90000")),
+  sessionRepositoryMode: env("SESSION_REPOSITORY_MODE", "memory"), // memory | dual-write | redis
 };
