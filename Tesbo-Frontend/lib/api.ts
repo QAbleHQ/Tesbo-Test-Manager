@@ -339,7 +339,7 @@ export async function removeWorkspaceProjectAccess(data: { projectId: string; us
 }
 
 // Projects
-export type ProjectType = "tesbox" | "tesbox_executions";
+export type ProjectType = "tesbox";
 
 export interface ProjectSummary {
   id: string;
@@ -361,8 +361,6 @@ export interface CreateProjectResponse {
   name: string;
   projectType: ProjectType;
   createdAt: string;
-  /** Present once when creating a Test Execution project; copy the key immediately. */
-  initialApiKey?: { key: string; id?: string; name?: string };
 }
 
 export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<CreateProjectResponse> {
@@ -377,28 +375,6 @@ export async function updateProject(id: string, data: { name?: string; descripti
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
 }
 
-export interface ExecutionApiKey {
-  id: string;
-  name: string;
-  project_id: string;
-  scopes: string[];
-  created_at: string;
-  last_used_at: string | null;
-  revoked_at: string | null;
-  masked: string;
-}
-
-export async function listExecutionApiKeys(projectId: string): Promise<{ keys: ExecutionApiKey[] }> {
-  return api<{ keys: ExecutionApiKey[] }>(`/api/projects/${projectId}/apikeys`);
-}
-
-export async function createExecutionApiKey(projectId: string, name: string): Promise<{ key: string; id: string; name: string }> {
-  return api<{ key: string; id: string; name: string }>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: { name } });
-}
-
-export async function revokeExecutionApiKey(projectId: string, keyId: string): Promise<void> {
-  await api(`/api/projects/${projectId}/apikeys/${keyId}`, { method: "DELETE" });
-}
 
 export async function deleteProject(id: string): Promise<void> {
   await api(`/api/projects/${id}`, { method: "DELETE" });

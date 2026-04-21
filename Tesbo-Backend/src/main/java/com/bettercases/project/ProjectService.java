@@ -5,7 +5,6 @@ import com.bettercases.ai.AiHandler;
 import com.bettercases.rbac.Role;
 import com.bettercases.rbac.RbacService;
 import com.bettercases.suite.SuiteService;
-import com.bettercases.testexecution.ExternalExecutionServiceClient;
 import com.bettercases.workspace.WorkspaceService;
 
 import java.sql.*;
@@ -18,7 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 
 public final class ProjectService {
-    private static final Set<String> VALID_PROJECT_TYPES = Set.of("tesbox", "tesbox_executions");
+    private static final Set<String> VALID_PROJECT_TYPES = Set.of("tesbox");
 
     /** Create a new project in the given organization; caller must be an org member. Adds creator as owner. */
     public static Map<String, Object> create(UUID orgId, UUID userId, String key, String name, String description, String projectType) {
@@ -50,19 +49,14 @@ public final class ProjectService {
                 pm.setObject(2, userId);
                 pm.executeUpdate();
             }
-            if ("tesbox".equals(resolvedType)) {
-                SuiteService.ensureDefaultSuiteExists(projectId);
-                ensureBrowserAgentMapping(projectId, c);
-            }
+            SuiteService.ensureDefaultSuiteExists(projectId);
+            ensureBrowserAgentMapping(projectId, c);
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("id", projectId.toString());
             result.put("key", rs.getString("key"));
             result.put("name", rs.getString("name"));
             result.put("projectType", rs.getString("project_type"));
             result.put("createdAt", rs.getTimestamp("created_at").toInstant().toString());
-            if ("tesbox_executions".equals(resolvedType)) {
-                provisionDefaultExecutionApiKey(projectId, result);
-            }
             return result;
         } catch (SQLException e) {
             if (e.getSQLState() != null && e.getSQLState().equals("23505")) {
@@ -260,58 +254,6 @@ public final class ProjectService {
         if ("qa_member".equals(normalized)) return "member";
         if ("viewer".equals(normalized)) return "member";
         return normalized;
-    }
-
-    private static void provisionDefaultExecutionApiKey(UUID projectId, Map<String, Object> projectCreateResult) {
-        try {
-            Map<String, Object> keyResp = ExternalExecutionServiceClient.createApiKey(projectId.toString(), "Default key");
-            String secret = firstNonBlankString(keyResp, "key", "apiKey", "secret", "token");
-            if (secret == null) {
-                deleteProjectRow(projectId);
-                throw new io.javalin.http.ServiceUnavailableResponse("Execution service did not return an API key secret.");
-            }
-            Map<String, Object> initial = new LinkedHashMap<>();
-            initial.put("key", secret);
-            String id = firstNonBlankString(keyResp, "id");
-            if (id != null) {
-                initial.put("id", id);
-            }
-            String keyName = firstNonBlankString(keyResp, "name");
-            if (keyName != null) {
-                initial.put("name", keyName);
-            }
-            projectCreateResult.put("initialApiKey", initial);
-        } catch (io.javalin.http.HttpResponseException e) {
-            throw e;
-        } catch (Exception e) {
-            deleteProjectRow(projectId);
-            throw new io.javalin.http.ServiceUnavailableResponse("Could not provision a default execution API key: " + e.getMessage());
-        }
-    }
-
-    private static void deleteProjectRow(UUID projectId) {
-        String sql = "DELETE FROM projects WHERE id = ?";
-        try (Connection c = Database.getDataSource().getConnection();
-             PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setObject(1, projectId);
-            ps.executeUpdate();
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static String firstNonBlankString(Map<String, Object> map, String... keys) {
-        for (String k : keys) {
-            Object v = map.get(k);
-            if (v == null) {
-                continue;
-            }
-            String s = v.toString().trim();
-            if (!s.isEmpty()) {
-                return s;
-            }
-        }
-        return null;
     }
 
     private static void ensureBrowserAgentMapping(UUID projectId, Connection c) throws SQLException {

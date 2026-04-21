@@ -18,7 +18,6 @@ import {
   removeProjectMember,
   type JiraConnection,
   type TestEnvironmentSetting,
-  type ProjectType,
 } from "@/lib/api";
 import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
 import ThemeToggle from "@/components/ThemeToggle";
@@ -148,7 +147,6 @@ export default function ProjectSettingsPage() {
   const [deletingProject, setDeletingProject] = useState(false);
   const [deleteProjectModalOpen, setDeleteProjectModalOpen] = useState(false);
   const [deleteProjectTypedName, setDeleteProjectTypedName] = useState("");
-  const [projectType, setProjectType] = useState<ProjectType>("tesbox");
   const jiraTabEnabled = jiraStatus?.connected === true;
   const visibleTabs: Array<{ key: SettingsTab; label: string }> = [
     { key: "general", label: "General" },
@@ -225,7 +223,6 @@ export default function ProjectSettingsPage() {
         setProject(p);
         setName((p.name as string) ?? "");
         setDescription((p.description as string) ?? "");
-        setProjectType(((p.projectType as string) ?? "tesbox") as ProjectType);
         const parsedSettings = parseProjectSettings(p.settings);
         setJiraAutoComment(parsedSettings.jiraAutoComment === true);
         setJiraTicketSelector(parsedSettings.jiraTicketSelector === true);

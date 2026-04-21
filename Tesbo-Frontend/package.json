@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "NODE_OPTIONS='--import ./instrumentation.mjs' next dev --webpack",
-    "dev:turbo": "NODE_OPTIONS='--import ./instrumentation.mjs' next dev --turbopack",
+    "dev": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --webpack",
+    "dev:turbo": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --turbopack",
     "build": "next build",
-    "start": "NODE_OPTIONS='--import ./instrumentation.mjs' next start",
+    "start": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next start",
     "lint": "eslint"
   },
   "dependencies": {
@@ -20,6 +20,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "cross-env": "^10.1.0",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",

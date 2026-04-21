@@ -749,67 +749,6 @@ export default function TestCasesPage() {
           />
         }
       >
-        <Card className="p-4 lg:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <StatusChip tone={viewMode === "allCases" ? "confidenceHigh" : "brand"}>
-                  {viewMode === "allCases" ? "All repository cases" : "Suites workspace"}
-                </StatusChip>
-                {selectedSuite ? <StatusChip tone="brand">{selectedSuite.name}</StatusChip> : null}
-                {activeFilterCount > 0 ? (
-                  <StatusChip tone="warning">
-                    {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"} active
-                  </StatusChip>
-                ) : null}
-              </div>
-              <p className="max-w-3xl text-sm leading-6 text-[var(--muted)]">
-                {viewMode === "allCases"
-                  ? "Use the repository-wide view to search, filter, and bulk-edit cases across suites with stronger visibility into readiness and review state."
-                  : activeSuiteId && selectedSuite
-                    ? "Work inside a single suite with cleaner filtering, bulk actions, and quick access to automation and execution."
-                    : "Browse suites first, then drill into a focused case list when you are ready to review or edit detailed test coverage."}
-              </p>
-            </div>
-          </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
-              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Suites</p>
-              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">{totalSuiteCount}</p>
-              <p className="mt-1 text-sm text-[var(--muted)]">Structured coverage groups in this project</p>
-            </div>
-            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
-              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Repository Cases</p>
-              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">{repositoryCaseCount}</p>
-              <p className="mt-1 text-sm text-[var(--muted)]">Total cases currently organized across suites</p>
-            </div>
-            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
-              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Current View</p>
-              <p className="mt-2 text-[20px] font-semibold tracking-tight text-[var(--foreground)]">
-                {viewMode === "allCases" ? "All test cases" : activeSuiteId && selectedSuite ? selectedSuite.name : "Browse suites"}
-              </p>
-              <p className="mt-1 text-sm text-[var(--muted)]">
-                {viewMode === "allCases"
-                  ? "Cross-suite review mode"
-                  : activeSuiteId && selectedSuite
-                    ? `${selectedSuite.testCaseCount} case${selectedSuite.testCaseCount === 1 ? "" : "s"} in this suite`
-                    : "Choose a suite to review contained cases"}
-              </p>
-            </div>
-            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-4">
-              <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Filtered Results</p>
-              <p className="mt-2 text-[28px] font-semibold tracking-tight text-[var(--foreground)]">
-                {loading ? "..." : suiteCasesTotal}
-              </p>
-              <p className="mt-1 text-sm text-[var(--muted)]">
-                {activeFilterCount > 0
-                  ? "Results after the current search and filter set"
-                  : "Visible results in the active repository view"}
-              </p>
-            </div>
-          </div>
-        </Card>
-
         {loading ? (
           <p className="text-[var(--muted)]">Loading suites...</p>
         ) : viewMode === "bySuites" && activeSuiteId && !selectedSuite ? (
@@ -826,29 +765,6 @@ export default function TestCasesPage() {
           <section className="mt-2 space-y-4">
             <Card className="p-4">
               <div className="flex flex-wrap items-start justify-between gap-4">
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    {viewMode === "bySuites" && selectedSuite ? <StatusChip tone="brand">{selectedSuite.name}</StatusChip> : null}
-                    <StatusChip tone="confidenceHigh">
-                      {pageStart}-{pageEnd} of {suiteCasesTotal}
-                    </StatusChip>
-                    {selectedCaseIds.length > 0 ? (
-                      <StatusChip tone="warning">
-                        {selectedCaseIds.length} selected
-                      </StatusChip>
-                    ) : null}
-                  </div>
-                  <div>
-                    <h2 className="text-[22px] font-semibold tracking-tight text-[var(--foreground)]">
-                      {viewMode === "bySuites" && selectedSuite ? `${selectedSuite.name} test cases` : "All test cases"}
-                    </h2>
-                    <p className="mt-1 text-sm text-[var(--muted)]">
-                      {viewMode === "bySuites" && selectedSuite
-                        ? `Review ${selectedSuite.testCaseCount} case${selectedSuite.testCaseCount === 1 ? "" : "s"} in this suite, then open the side panel for detailed editing and automation.`
-                        : `Search, filter, and bulk-manage repository cases across ${totalSuiteCount} suite${totalSuiteCount === 1 ? "" : "s"}.`}
-                    </p>
-                  </div>
-                </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {viewMode === "bySuites" && selectedSuite ? (
                     <Button
@@ -889,107 +805,64 @@ export default function TestCasesPage() {
             </Card>
 
             <div className="space-y-3">
-              <Card className="p-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Filter repository
-                    </p>
-                    <p className="mt-1 text-sm text-[var(--muted)]">
-                      Narrow results by search, suite scope, workflow status, and automation readiness.
-                    </p>
-                  </div>
-                  {activeFilterCount > 0 ? (
-                    <StatusChip tone="warning">
-                      {activeFilterCount} active filter{activeFilterCount === 1 ? "" : "s"}
-                    </StatusChip>
-                  ) : null}
-                </div>
-                <div className={`mt-4 grid gap-3 ${viewMode === "allCases" ? "sm:grid-cols-2 xl:grid-cols-6" : "sm:grid-cols-2 xl:grid-cols-5"}`}>
-                  <div className={viewMode === "allCases" ? "xl:col-span-2" : "xl:col-span-1"}>
-                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Search
-                    </label>
+              <Card className="p-3">
+                <div className={`flex flex-wrap items-center gap-2 ${viewMode === "allCases" ? "" : ""}`}>
+                  <div className={viewMode === "allCases" ? "min-w-[180px] flex-[2]" : "min-w-[160px] flex-[2]"}>
                     <Input
                       type="text"
                       value={suiteSearch}
                       onChange={(e) => setSuiteSearch(e.target.value)}
                       placeholder="Search by ID, title, or type"
-                      className="h-9"
+                      className="h-8 text-sm"
                     />
                   </div>
                   {viewMode === "allCases" && (
-                    <div>
-                      <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                        Suite
-                      </label>
-                      <Select
-                        value={allCasesSuiteFilter}
-                        onChange={(e) => setAllCasesSuiteFilter(e.target.value)}
-                        className="h-9"
-                      >
-                        <option value="all">All suites</option>
-                        {visibleSuites.map((suite) => (
-                          <option key={suite.id} value={suite.id}>
-                            {suite.name}
-                          </option>
-                        ))}
-                      </Select>
-                    </div>
+                    <Select
+                      value={allCasesSuiteFilter}
+                      onChange={(e) => setAllCasesSuiteFilter(e.target.value)}
+                      className="h-8 min-w-[120px] flex-1 text-sm"
+                    >
+                      <option value="all">All suites</option>
+                      {visibleSuites.map((suite) => (
+                        <option key={suite.id} value={suite.id}>
+                          {suite.name}
+                        </option>
+                      ))}
+                    </Select>
                   )}
-                  <div>
-                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Type
-                    </label>
-                    <Select value={suiteTypeFilter} onChange={(e) => setSuiteTypeFilter(e.target.value)} className="h-9">
-                      <option value="all">All types</option>
-                      {TESTCASE_TYPES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </Select>
-                  </div>
-                  <div>
-                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Automation
-                    </label>
-                    <Select value={suiteAutomationFilter} onChange={(e) => setSuiteAutomationFilter(e.target.value)} className="h-9">
-                      <option value="all">All automation states</option>
-                      {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </Select>
-                  </div>
-                  <div>
-                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Workflow status
-                    </label>
-                    <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-9">
-                      <option value="all">All statuses</option>
-                      {TESTCASE_STATUSES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </Select>
-                  </div>
-                  <div>
-                    <label className="mb-1.5 block text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      Priority
-                    </label>
-                    <div className="flex gap-2">
-                      <Select value={suitePriorityFilter} onChange={(e) => setSuitePriorityFilter(e.target.value)} className="h-9">
-                        <option value="all">All priorities</option>
-                        {TESTCASE_PRIORITIES.map((option) => (
-                          <option key={option} value={option}>{option}</option>
-                        ))}
-                      </Select>
-                      <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="shrink-0">
-                        Clear
-                      </Button>
-                    </div>
-                  </div>
+                  <Select value={suiteTypeFilter} onChange={(e) => setSuiteTypeFilter(e.target.value)} className="h-8 min-w-[110px] flex-1 text-sm">
+                    <option value="all">All types</option>
+                    {TESTCASE_TYPES.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </Select>
+                  <Select value={suiteAutomationFilter} onChange={(e) => setSuiteAutomationFilter(e.target.value)} className="h-8 min-w-[140px] flex-1 text-sm">
+                    <option value="all">All automation states</option>
+                    {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </Select>
+                  <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-8 min-w-[120px] flex-1 text-sm">
+                    <option value="all">All statuses</option>
+                    {TESTCASE_STATUSES.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </Select>
+                  <Select value={suitePriorityFilter} onChange={(e) => setSuitePriorityFilter(e.target.value)} className="h-8 min-w-[110px] flex-1 text-sm">
+                    <option value="all">All priorities</option>
+                    {TESTCASE_PRIORITIES.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </Select>
+                  {activeFilterCount > 0 ? (
+                    <StatusChip tone="warning">
+                      {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"}
+                    </StatusChip>
+                  ) : null}
+                  <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="h-8 shrink-0">
+                    Clear
+                  </Button>
                 </div>
-                <p className="mt-3 text-xs text-[var(--muted)]">
-                  Showing {pageStart}-{pageEnd} of {suiteCasesTotal} matching test case{suiteCasesTotal === 1 ? "" : "s"}.
-                </p>
               </Card>
 
               {suiteCasesError ? (
@@ -1053,491 +926,6 @@ export default function TestCasesPage() {
               )}
             </div>
 
-            {/* Detail panel */}
-            {panelMode !== "closed" && (
-              <div className="fixed inset-0 z-40">
-                <button
-                  type="button"
-                  aria-label="Close panel"
-                  onClick={closePanel}
-                  className="absolute inset-0 bg-black/35"
-                />
-                <aside className="absolute right-0 top-0 flex h-full w-1/2 min-w-[480px] flex-col border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
-                  {/* Panel header */}
-                  <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--border)] px-6 py-4">
-                    <div className="min-w-0 flex-1">
-                      <p className="mb-0.5 text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">
-                        {panelMode === "create" ? "New Test Case" : "Test Case"}
-                      </p>
-                      <h3 className="truncate text-lg font-semibold text-[var(--foreground)]">
-                        {panelMode === "create" ? "Create Test Case" : (title || "Untitled")}
-                      </h3>
-                      {panelMode === "edit" && (
-                        <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                          {status && <StatusChip tone={statusTone(status)}>{status}</StatusChip>}
-                          {priority && <StatusChip tone={priorityTone(priority)}>{priority}</StatusChip>}
-                          {panelJiraIssueKey && (
-                            <StatusChip tone="info">
-                              <svg viewBox="0 0 24 24" className="h-3 w-3 shrink-0" fill="currentColor" aria-hidden="true">
-                                <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
-                              </svg>
-                              {panelJiraUrl ? (
-                                <a href={panelJiraUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">{panelJiraIssueKey}</a>
-                              ) : panelJiraIssueKey}
-                            </StatusChip>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {panelMode === "edit" && panelTestcaseId && (
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => openSingleTestRun(panelTestcaseId)}
-                          className="border-[var(--success)] text-[var(--success)]"
-                        >
-                          Run Test
-                        </Button>
-                      )}
-                      <button
-                        type="button"
-                        aria-label="Close panel"
-                        onClick={closePanel}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
-                      >
-                        <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
-                          <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                        </svg>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Tabs (only for edit mode) */}
-                  {panelMode === "edit" && (
-                    <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
-                      {(["overview", "steps", "automation"] as PanelTab[]).map((tab) => (
-                        <button
-                          key={tab}
-                          type="button"
-                          onClick={() => setPanelTab(tab)}
-                          className={`-mb-px border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
-                            panelTab === tab
-                              ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
-                              : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
-                          }`}
-                        >
-                          {tab === "overview" ? "Overview" : tab === "steps" ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}` : "Automation"}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Alerts */}
-                  {(panelError || panelSuccess) && (
-                    <div className="shrink-0 px-6 pt-3">
-                      {panelError && (
-                        <p className="rounded-lg border border-[var(--error)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--error)]">
-                          {panelError}
-                        </p>
-                      )}
-                      {panelSuccess && (
-                        <p className="rounded-lg border border-[var(--success)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--success)]">
-                          {panelSuccess}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Scrollable body */}
-                  <div className="min-h-0 flex-1 overflow-y-auto">
-                    {panelLoading ? (
-                      <div className="flex items-center justify-center p-12">
-                        <div className="flex flex-col items-center gap-3">
-                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--brand-primary)]" />
-                          <p className="text-sm text-[var(--muted)]">Loading test case...</p>
-                        </div>
-                      </div>
-                    ) : (
-                      <form onSubmit={handlePanelSubmit} id="panel-form">
-                        {/* CREATE MODE */}
-                        {panelMode === "create" && (
-                          <div className="space-y-5 px-6 py-5">
-                            <Field>
-                              <FieldLabel>Title <span className="text-[var(--error)]">*</span></FieldLabel>
-                              <Input
-                                type="text"
-                                value={title}
-                                onChange={(e) => setTitle(e.target.value)}
-                                required
-                                placeholder="Describe what this test case validates"
-                              />
-                            </Field>
-                            <Field>
-                              <FieldLabel>Description</FieldLabel>
-                              <Textarea
-                                value={description}
-                                onChange={(e) => setDescription(e.target.value)}
-                                rows={3}
-                                placeholder="What does this test case cover?"
-                              />
-                            </Field>
-                            <div className="grid grid-cols-3 gap-3">
-                              <Field>
-                                <FieldLabel>Suite</FieldLabel>
-                                <Select value={suiteId} onChange={(e) => setSuiteId(e.target.value)}>
-                                  <option value="">No suite</option>
-                                  {suites.map((suite) => (
-                                    <option key={suite.id} value={suite.id}>{suite.name}</option>
-                                  ))}
-                                </Select>
-                              </Field>
-                              <Field>
-                                <FieldLabel>Type</FieldLabel>
-                                <Select value={type} onChange={(e) => setType(e.target.value)}>
-                                  {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-                                </Select>
-                              </Field>
-                              <Field>
-                                <FieldLabel>Priority</FieldLabel>
-                                <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
-                                  {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
-                                </Select>
-                              </Field>
-                              <Field>
-                                <FieldLabel>Status</FieldLabel>
-                                <Select value={status} onChange={(e) => setStatus(e.target.value)}>
-                                  {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
-                                </Select>
-                              </Field>
-                              <Field>
-                                <FieldLabel>Estimated Duration</FieldLabel>
-                                <Input
-                                  type="text"
-                                  value={estimatedDuration}
-                                  onChange={(e) => setEstimatedDuration(e.target.value)}
-                                  placeholder="e.g. 10 min"
-                                />
-                              </Field>
-                              <Field>
-                                <FieldLabel>Automation</FieldLabel>
-                                <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                                  {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                                </Select>
-                              </Field>
-                            </div>
-                            <Field>
-                              <FieldLabel>Preconditions</FieldLabel>
-                              <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={2} />
-                            </Field>
-                            <Field>
-                              <FieldLabel>Test Data</FieldLabel>
-                              <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
-                            </Field>
-                            <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
-                            {/* Test steps section */}
-                            <div>
-                              <div className="mb-3 flex items-center justify-between">
-                                <FieldLabel>Test Steps</FieldLabel>
-                                <Button variant="secondary" size="sm" onClick={addStep} className="border-[var(--brand-primary)] text-[var(--brand-primary)]">
-                                  + Add step
-                                </Button>
-                              </div>
-                              <div className="space-y-3">
-                                {steps.map((step, index) => (
-                                  <div key={index} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-3">
-                                    <div className="mb-2 flex items-center justify-between">
-                                      <div className="flex items-center gap-2">
-                                        <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-[var(--brand-primary)] text-xs font-semibold text-white">{index + 1}</span>
-                                        <p className="text-sm font-medium text-[var(--foreground)]">Step {index + 1}</p>
-                                      </div>
-                                      {steps.length > 1 && (
-                                        <button type="button" onClick={() => removeStep(index)} className="rounded px-2 py-1 text-xs text-[var(--error)] hover:bg-[var(--surface-secondary)]">Remove</button>
-                                      )}
-                                    </div>
-                                    <div className="grid gap-2">
-                                      <div>
-                                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">Action</label>
-                                        <Textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="px-2 py-1.5" />
-                                      </div>
-                                      <div>
-                                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">Expected Result</label>
-                                        <Textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="px-2 py-1.5" />
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                            <Field>
-                              <FieldLabel>Playwright Script</FieldLabel>
-                              <Textarea
-                                value={automationScript}
-                                onChange={(e) => setAutomationScript(e.target.value)}
-                                rows={8}
-                                placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
-                                className="font-mono text-xs"
-                              />
-                              <p className="mt-1 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
-                            </Field>
-                            <Field>
-                              <FieldLabel>Attachments</FieldLabel>
-                              <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
-                            </Field>
-                          </div>
-                        )}
-
-                        {/* EDIT MODE — tabbed content */}
-                        {panelMode === "edit" && (
-                          <>
-                            {/* Overview tab */}
-                            {panelTab === "overview" && (
-                              <div className="space-y-5 px-6 py-5">
-                                <Field>
-                                  <FieldLabel>Title <span className="text-[var(--error)]">*</span></FieldLabel>
-                                  <Input
-                                    type="text"
-                                    value={title}
-                                    onChange={(e) => setTitle(e.target.value)}
-                                    required
-                                  />
-                                </Field>
-                                <Field>
-                                  <FieldLabel>Description</FieldLabel>
-                                  <Textarea
-                                    value={description}
-                                    onChange={(e) => setDescription(e.target.value)}
-                                    rows={4}
-                                  />
-                                </Field>
-                                <Field>
-                                  <FieldLabel>Preconditions</FieldLabel>
-                                  <Textarea
-                                    value={preconditions}
-                                    onChange={(e) => setPreconditions(e.target.value)}
-                                    rows={3}
-                                  />
-                                </Field>
-                                <Field>
-                                  <FieldLabel>Test Data</FieldLabel>
-                                  <Textarea
-                                    value={testData}
-                                    onChange={(e) => setTestData(e.target.value)}
-                                    rows={2}
-                                    placeholder="Input data, sample values, or setup-specific data"
-                                  />
-                                </Field>
-                                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-                                  <Field>
-                                    <FieldLabel>Suite</FieldLabel>
-                                    <Select value={suiteId} onChange={(e) => setSuiteId(e.target.value)}>
-                                      <option value="">No suite</option>
-                                      {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
-                                    </Select>
-                                  </Field>
-                                  <Field>
-                                    <FieldLabel>Type</FieldLabel>
-                                    <Select value={type} onChange={(e) => setType(e.target.value)}>
-                                      {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-                                    </Select>
-                                  </Field>
-                                  <Field>
-                                    <FieldLabel>Priority</FieldLabel>
-                                    <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
-                                      {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
-                                    </Select>
-                                  </Field>
-                                  <Field>
-                                    <FieldLabel>Status</FieldLabel>
-                                    <Select value={status} onChange={(e) => setStatus(e.target.value)}>
-                                      {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
-                                    </Select>
-                                  </Field>
-                                  <Field>
-                                    <FieldLabel>Estimated Duration</FieldLabel>
-                                    <Input
-                                      type="text"
-                                      value={estimatedDuration}
-                                      onChange={(e) => setEstimatedDuration(e.target.value)}
-                                      placeholder="e.g. 10 min"
-                                    />
-                                  </Field>
-                                  <Field>
-                                    <FieldLabel>Automation</FieldLabel>
-                                    <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                                      {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                                    </Select>
-                                  </Field>
-                                </div>
-                                <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
-                                <Field>
-                                  <FieldLabel>Attachments</FieldLabel>
-                                  <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
-                                </Field>
-                              </div>
-                            )}
-
-                            {/* Steps tab */}
-                            {panelTab === "steps" && (
-                              <div className="px-6 py-5">
-                                <div className="mb-4 flex items-center justify-between">
-                                  <p className="text-sm font-medium text-[var(--foreground)]">
-                                    {steps.length} step{steps.length === 1 ? "" : "s"}
-                                  </p>
-                                  <Button variant="secondary" size="sm" onClick={addStep} className="border-[var(--brand-primary)] text-[var(--brand-primary)]">
-                                    + Add step
-                                  </Button>
-                                </div>
-                                {steps.length === 0 ? (
-                                  <EmptyStateBlock
-                                    title="No steps yet"
-                                    description="Add your first step above."
-                                  />
-                                ) : (
-                                  <div className="space-y-3">
-                                    {steps.map((step, index) => (
-                                      <div key={index} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4">
-                                        <div className="mb-3 flex items-center justify-between">
-                                          <div className="flex items-center gap-2">
-                                            <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[var(--brand-primary)] text-xs font-semibold text-white">{index + 1}</span>
-                                            <p className="text-sm font-semibold text-[var(--foreground)]">Step {index + 1}</p>
-                                          </div>
-                                          {steps.length > 1 && (
-                                            <button type="button" onClick={() => removeStep(index)} className="rounded-lg px-2 py-1 text-xs text-[var(--error)] hover:bg-[var(--surface-secondary)]">Remove</button>
-                                          )}
-                                        </div>
-                                        <div className="grid gap-3">
-                                          <div>
-                                            <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Action</label>
-                                            <Textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="px-3 py-2" />
-                                          </div>
-                                          <div>
-                                            <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Expected Result</label>
-                                            <Textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="px-3 py-2" />
-                                          </div>
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Automation tab */}
-                            {panelTab === "automation" && (
-                              <div className="space-y-5 px-6 py-5">
-                                <div>
-                                  <div className="mb-3 flex items-center justify-between">
-                                    <FieldLabel>Playwright Script</FieldLabel>
-                                    {panelTestcaseId && (
-                                      <div className="flex items-center gap-2">
-                                        {aiConfigured ? (
-                                          <a
-                                            href={`/projects/${projectId}/testcases/${panelTestcaseId}/automate`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-[var(--ai-primary)] bg-[var(--ai-soft)] px-3 text-xs font-semibold text-[var(--ai-primary)] hover:bg-[var(--ai-surface)]"
-                                          >
-                                            Open Automate
-                                          </a>
-                                        ) : (
-                                          <Button
-                                            type="button"
-                                            variant="ai"
-                                            size="sm"
-                                            disabled
-                                            title={REPO_TC_AI_DISABLED_TITLE}
-                                          >
-                                            Open Automate
-                                          </Button>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                  <Textarea
-                                    value={automationScript}
-                                    onChange={(e) => setAutomationScript(e.target.value)}
-                                    rows={16}
-                                    placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"}
-                                    className="bg-[var(--background)] font-mono text-xs leading-relaxed"
-                                  />
-                                  <p className="mt-1.5 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
-                                </div>
-                                <Field>
-                                  <FieldLabel>Automation Feasibility</FieldLabel>
-                                  <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                                    {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                                  </Select>
-                                </Field>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </form>
-                    )}
-                  </div>
-
-                  {/* Sticky footer with actions */}
-                  {!panelLoading && (
-                    <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-6 py-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2">
-                          <Button
-                            type="submit"
-                            form="panel-form"
-                            variant="primary"
-                            onClick={() => setSubmitAction("create")}
-                            disabled={panelSaving}
-                          >
-                            {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save changes"}
-                          </Button>
-                          {panelMode === "create" && (
-                            <Button
-                              type="submit"
-                              form="panel-form"
-                              variant="secondary"
-                              onClick={() => setSubmitAction("create-next")}
-                              disabled={panelSaving}
-                              className="border-[var(--brand-primary)] text-[var(--brand-primary)]"
-                            >
-                              {panelSaving ? "Saving..." : "Create & Add Next"}
-                            </Button>
-                          )}
-                          <Button
-                            variant="secondary"
-                            onClick={closePanel}
-                            disabled={panelSaving}
-                          >
-                            Cancel
-                          </Button>
-                        </div>
-                        {panelMode === "edit" && panelTestcaseId && (
-                          <div className="flex items-center gap-2">
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              onClick={() => void handleArchivePanelTestCase()}
-                              disabled={panelSaving}
-                              className="border-[var(--warning)] text-[var(--warning)]"
-                            >
-                              Archive
-                            </Button>
-                            <Button
-                              variant="destructive"
-                              size="sm"
-                              onClick={() => void handleDeletePanelTestCase()}
-                              disabled={panelSaving}
-                            >
-                              Delete
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </aside>
-              </div>
-            )}
           </section>
         ) : visibleSuites.length === 0 ? (
           <EmptyStateBlock
@@ -1550,52 +938,49 @@ export default function TestCasesPage() {
             }
           />
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {visibleSuites.map((suite) => (
-              <Card key={suite.id} className="p-5">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <button
-                      type="button"
-                      onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}
-                      className="truncate text-left text-[18px] font-semibold text-[var(--foreground)] hover:underline"
-                    >
-                      {suite.name}
-                    </button>
-                    <p className="mt-1.5 text-sm text-[var(--muted)]">
-                      Open this suite to review contained cases, bulk-manage items, and jump into automation or execution.
-                    </p>
-                  </div>
-                  <StatusChip tone={suite.testCaseCount > 0 ? "confidenceHigh" : "neutral"}>
-                    {suite.testCaseCount} case{suite.testCaseCount === 1 ? "" : "s"}
-                  </StatusChip>
-                </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <Button size="sm" onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}>
-                    Open suite
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => { void openCreatePanelForSuite(suite.id); }}
-                  >
-                    Add test case
-                  </Button>
-                </div>
-                <div className="mt-4 flex flex-wrap items-center gap-3 text-xs">
+              <Card key={suite.id} className="p-3">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => handleRenameSuite(suite.id, suite.name)}
-                    className="font-medium text-[var(--muted)] hover:text-[var(--foreground)]"
+                    onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}
+                    className="min-w-0 flex-1 truncate text-left text-sm font-semibold text-[var(--foreground)] hover:text-[var(--brand-primary)]"
                   >
-                    Rename
+                    {suite.name}
+                  </button>
+                  <StatusChip tone={suite.testCaseCount > 0 ? "confidenceHigh" : "neutral"}>
+                    {suite.testCaseCount}
+                  </StatusChip>
+                  <button
+                    type="button"
+                    title="Add test case"
+                    onClick={() => { void openCreatePanelForSuite(suite.id); }}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[var(--brand-primary)] text-white transition-opacity hover:opacity-80"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
+                    </svg>
                   </button>
                   <button
                     type="button"
-                    onClick={() => setDeleteSuiteId(suite.id)}
-                    className="font-medium text-[var(--error)] hover:opacity-80"
+                    title="Rename suite"
+                    onClick={() => handleRenameSuite(suite.id, suite.name)}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                   >
-                    Delete
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    title="Delete suite"
+                    onClick={() => setDeleteSuiteId(suite.id)}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--error)] hover:bg-[var(--surface-secondary)] hover:opacity-80"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
                   </button>
                 </div>
               </Card>
@@ -1603,6 +988,377 @@ export default function TestCasesPage() {
           </div>
         )}
       </ListWorkspaceLayout>
+
+      {/* Detail panel — page-level so it works from suite grid and case table views */}
+      {panelMode !== "closed" && (
+        <div className="fixed inset-0 z-40">
+          <button
+            type="button"
+            aria-label="Close panel"
+            onClick={closePanel}
+            className="absolute inset-0 bg-black/35"
+          />
+          <aside className="absolute right-0 top-0 flex h-full w-1/2 min-w-[480px] flex-col border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
+            {/* Panel header */}
+            <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--border)] px-6 py-4">
+              <div className="min-w-0 flex-1">
+                <p className="mb-0.5 text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">
+                  {panelMode === "create" ? "New Test Case" : "Test Case"}
+                </p>
+                <h3 className="truncate text-lg font-semibold text-[var(--foreground)]">
+                  {panelMode === "create" ? "Create Test Case" : (title || "Untitled")}
+                </h3>
+                {panelMode === "edit" && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    {status && <StatusChip tone={statusTone(status)}>{status}</StatusChip>}
+                    {priority && <StatusChip tone={priorityTone(priority)}>{priority}</StatusChip>}
+                    {panelJiraIssueKey && (
+                      <StatusChip tone="info">
+                        <svg viewBox="0 0 24 24" className="h-3 w-3 shrink-0" fill="currentColor" aria-hidden="true">
+                          <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
+                        </svg>
+                        {panelJiraUrl ? (
+                          <a href={panelJiraUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">{panelJiraIssueKey}</a>
+                        ) : panelJiraIssueKey}
+                      </StatusChip>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {panelMode === "edit" && panelTestcaseId && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => openSingleTestRun(panelTestcaseId)}
+                    className="border-[var(--success)] text-[var(--success)]"
+                  >
+                    Run Test
+                  </Button>
+                )}
+                <button
+                  type="button"
+                  aria-label="Close panel"
+                  onClick={closePanel}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+                >
+                  <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+                    <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            {/* Tabs (only for edit mode) */}
+            {panelMode === "edit" && (
+              <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
+                {(["overview", "steps", "automation"] as PanelTab[]).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setPanelTab(tab)}
+                    className={`-mb-px border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
+                      panelTab === tab
+                        ? "border-[var(--brand-primary)] text-[var(--brand-primary)]"
+                        : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
+                    }`}
+                  >
+                    {tab === "overview" ? "Overview" : tab === "steps" ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}` : "Automation"}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Alerts */}
+            {(panelError || panelSuccess) && (
+              <div className="shrink-0 px-6 pt-3">
+                {panelError && (
+                  <p className="rounded-lg border border-[var(--error)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--error)]">
+                    {panelError}
+                  </p>
+                )}
+                {panelSuccess && (
+                  <p className="rounded-lg border border-[var(--success)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--success)]">
+                    {panelSuccess}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Scrollable body */}
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {panelLoading ? (
+                <div className="flex items-center justify-center p-12">
+                  <div className="flex flex-col items-center gap-3">
+                    <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--brand-primary)]" />
+                    <p className="text-sm text-[var(--muted)]">Loading test case...</p>
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handlePanelSubmit} id="panel-form-global">
+                  {/* CREATE MODE */}
+                  {panelMode === "create" && (
+                    <div className="space-y-5 px-6 py-5">
+                      <Field>
+                        <FieldLabel>Title <span className="text-[var(--error)]">*</span></FieldLabel>
+                        <Input type="text" value={title} onChange={(e) => setTitle(e.target.value)} required placeholder="Describe what this test case validates" />
+                      </Field>
+                      <Field>
+                        <FieldLabel>Description</FieldLabel>
+                        <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="What does this test case cover?" />
+                      </Field>
+                      <div className="grid grid-cols-3 gap-3">
+                        <Field>
+                          <FieldLabel>Suite</FieldLabel>
+                          <Select value={suiteId} onChange={(e) => setSuiteId(e.target.value)}>
+                            <option value="">No suite</option>
+                            {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
+                          </Select>
+                        </Field>
+                        <Field>
+                          <FieldLabel>Type</FieldLabel>
+                          <Select value={type} onChange={(e) => setType(e.target.value)}>
+                            {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                          </Select>
+                        </Field>
+                        <Field>
+                          <FieldLabel>Priority</FieldLabel>
+                          <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                            {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                          </Select>
+                        </Field>
+                        <Field>
+                          <FieldLabel>Status</FieldLabel>
+                          <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+                            {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                          </Select>
+                        </Field>
+                        <Field>
+                          <FieldLabel>Estimated Duration</FieldLabel>
+                          <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 10 min" />
+                        </Field>
+                        <Field>
+                          <FieldLabel>Automation</FieldLabel>
+                          <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
+                            {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                          </Select>
+                        </Field>
+                      </div>
+                      <Field>
+                        <FieldLabel>Preconditions</FieldLabel>
+                        <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={2} />
+                      </Field>
+                      <Field>
+                        <FieldLabel>Test Data</FieldLabel>
+                        <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
+                      </Field>
+                      <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
+                      <div>
+                        <div className="mb-3 flex items-center justify-between">
+                          <FieldLabel>Test Steps</FieldLabel>
+                          <Button variant="secondary" size="sm" onClick={addStep} className="border-[var(--brand-primary)] text-[var(--brand-primary)]">+ Add step</Button>
+                        </div>
+                        <div className="space-y-3">
+                          {steps.map((step, index) => (
+                            <div key={index} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-3">
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-[var(--brand-primary)] text-xs font-semibold text-white">{index + 1}</span>
+                                  <p className="text-sm font-medium text-[var(--foreground)]">Step {index + 1}</p>
+                                </div>
+                                {steps.length > 1 && (
+                                  <button type="button" onClick={() => removeStep(index)} className="rounded px-2 py-1 text-xs text-[var(--error)] hover:bg-[var(--surface-secondary)]">Remove</button>
+                                )}
+                              </div>
+                              <div className="grid gap-2">
+                                <div>
+                                  <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">Action</label>
+                                  <Textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="px-2 py-1.5" />
+                                </div>
+                                <div>
+                                  <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">Expected Result</label>
+                                  <Textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="px-2 py-1.5" />
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <Field>
+                        <FieldLabel>Playwright Script</FieldLabel>
+                        <Textarea value={automationScript} onChange={(e) => setAutomationScript(e.target.value)} rows={8} placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"} className="font-mono text-xs" />
+                        <p className="mt-1 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
+                      </Field>
+                      <Field>
+                        <FieldLabel>Attachments</FieldLabel>
+                        <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
+                      </Field>
+                    </div>
+                  )}
+
+                  {/* EDIT MODE — tabbed content */}
+                  {panelMode === "edit" && (
+                    <>
+                      {panelTab === "overview" && (
+                        <div className="space-y-5 px-6 py-5">
+                          <Field>
+                            <FieldLabel>Title <span className="text-[var(--error)]">*</span></FieldLabel>
+                            <Input type="text" value={title} onChange={(e) => setTitle(e.target.value)} required />
+                          </Field>
+                          <Field>
+                            <FieldLabel>Description</FieldLabel>
+                            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={4} />
+                          </Field>
+                          <Field>
+                            <FieldLabel>Preconditions</FieldLabel>
+                            <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={3} />
+                          </Field>
+                          <Field>
+                            <FieldLabel>Test Data</FieldLabel>
+                            <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
+                          </Field>
+                          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                            <Field>
+                              <FieldLabel>Suite</FieldLabel>
+                              <Select value={suiteId} onChange={(e) => setSuiteId(e.target.value)}>
+                                <option value="">No suite</option>
+                                {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
+                              </Select>
+                            </Field>
+                            <Field>
+                              <FieldLabel>Type</FieldLabel>
+                              <Select value={type} onChange={(e) => setType(e.target.value)}>
+                                {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                              </Select>
+                            </Field>
+                            <Field>
+                              <FieldLabel>Priority</FieldLabel>
+                              <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                                {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                              </Select>
+                            </Field>
+                            <Field>
+                              <FieldLabel>Status</FieldLabel>
+                              <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+                                {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                              </Select>
+                            </Field>
+                            <Field>
+                              <FieldLabel>Estimated Duration</FieldLabel>
+                              <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 10 min" />
+                            </Field>
+                            <Field>
+                              <FieldLabel>Automation</FieldLabel>
+                              <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
+                                {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                              </Select>
+                            </Field>
+                          </div>
+                          <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
+                          <Field>
+                            <FieldLabel>Attachments</FieldLabel>
+                            <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
+                          </Field>
+                        </div>
+                      )}
+                      {panelTab === "steps" && (
+                        <div className="px-6 py-5">
+                          <div className="mb-4 flex items-center justify-between">
+                            <p className="text-sm font-medium text-[var(--foreground)]">{steps.length} step{steps.length === 1 ? "" : "s"}</p>
+                            <Button variant="secondary" size="sm" onClick={addStep} className="border-[var(--brand-primary)] text-[var(--brand-primary)]">+ Add step</Button>
+                          </div>
+                          {steps.length === 0 ? (
+                            <EmptyStateBlock title="No steps yet" description="Add your first step above." />
+                          ) : (
+                            <div className="space-y-3">
+                              {steps.map((step, index) => (
+                                <div key={index} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4">
+                                  <div className="mb-3 flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[var(--brand-primary)] text-xs font-semibold text-white">{index + 1}</span>
+                                      <p className="text-sm font-semibold text-[var(--foreground)]">Step {index + 1}</p>
+                                    </div>
+                                    {steps.length > 1 && (
+                                      <button type="button" onClick={() => removeStep(index)} className="rounded-lg px-2 py-1 text-xs text-[var(--error)] hover:bg-[var(--surface-secondary)]">Remove</button>
+                                    )}
+                                  </div>
+                                  <div className="grid gap-3">
+                                    <div>
+                                      <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Action</label>
+                                      <Textarea placeholder="Describe the action to perform" value={step.action ?? ""} onChange={(e) => updateStep(index, "action", e.target.value)} rows={2} className="px-3 py-2" />
+                                    </div>
+                                    <div>
+                                      <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Expected Result</label>
+                                      <Textarea placeholder="Describe the expected outcome" value={step.expectedResult ?? ""} onChange={(e) => updateStep(index, "expectedResult", e.target.value)} rows={2} className="px-3 py-2" />
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {panelTab === "automation" && (
+                        <div className="space-y-5 px-6 py-5">
+                          <div>
+                            <div className="mb-3 flex items-center justify-between">
+                              <FieldLabel>Playwright Script</FieldLabel>
+                              {panelTestcaseId && (
+                                <div className="flex items-center gap-2">
+                                  {aiConfigured ? (
+                                    <a href={`/projects/${projectId}/testcases/${panelTestcaseId}/automate`} target="_blank" rel="noopener noreferrer" className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-[var(--ai-primary)] bg-[var(--ai-soft)] px-3 text-xs font-semibold text-[var(--ai-primary)] hover:bg-[var(--ai-surface)]">
+                                      Open Automate
+                                    </a>
+                                  ) : (
+                                    <Button type="button" variant="ai" size="sm" disabled title={REPO_TC_AI_DISABLED_TITLE}>Open Automate</Button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            <Textarea value={automationScript} onChange={(e) => setAutomationScript(e.target.value)} rows={16} placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"} className="bg-[var(--background)] font-mono text-xs leading-relaxed" />
+                            <p className="mt-1.5 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
+                          </div>
+                          <Field>
+                            <FieldLabel>Automation Feasibility</FieldLabel>
+                            <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
+                              {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                            </Select>
+                          </Field>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </form>
+              )}
+            </div>
+
+            {/* Sticky footer */}
+            {!panelLoading && (
+              <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-6 py-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Button type="submit" form="panel-form-global" variant="primary" onClick={() => setSubmitAction("create")} disabled={panelSaving}>
+                      {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save changes"}
+                    </Button>
+                    {panelMode === "create" && (
+                      <Button type="submit" form="panel-form-global" variant="secondary" onClick={() => setSubmitAction("create-next")} disabled={panelSaving} className="border-[var(--brand-primary)] text-[var(--brand-primary)]">
+                        {panelSaving ? "Saving..." : "Create & Add Next"}
+                      </Button>
+                    )}
+                    <Button variant="secondary" onClick={closePanel} disabled={panelSaving}>Cancel</Button>
+                  </div>
+                  {panelMode === "edit" && panelTestcaseId && (
+                    <div className="flex items-center gap-2">
+                      <Button variant="secondary" size="sm" onClick={() => void handleArchivePanelTestCase()} disabled={panelSaving} className="border-[var(--warning)] text-[var(--warning)]">Archive</Button>
+                      <Button variant="destructive" size="sm" onClick={() => void handleDeletePanelTestCase()} disabled={panelSaving}>Delete</Button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </aside>
+        </div>
+      )}
 
       {/* Add Suite Modal */}
       <Modal

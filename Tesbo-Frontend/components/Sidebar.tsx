@@ -4,7 +4,7 @@ import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { authMe, getProject, listProjects, logout, type ProjectSummary, type ProjectType } from "@/lib/api";
+import { authMe, listProjects, logout, type ProjectSummary } from "@/lib/api";
 import ThemeToggle from "@/components/ThemeToggle";
 
 type NavItemConfig = {
@@ -49,8 +49,6 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
         label: "Agents Control Center",
         icon: "agent",
         children: [
-          { href: "agents/aegis", label: "Aegis", icon: "agent" },
-          { href: "agents/sentinel", label: "Sentinel", icon: "agent" },
           { href: "agents/testcase-generator", label: "Test Case Generator", icon: "agent" },
         ],
       },
@@ -64,29 +62,6 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
   },
 ];
 
-const executionProjectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
-  {
-    section: "Overview",
-    items: [
-      { href: "integration", label: "Integration Guide", icon: "plug" },
-    ],
-  },
-  {
-    section: "Execution",
-    items: [
-      { href: "tesbo-reports/runs", label: "Automation Runs", icon: "runs" },
-      { href: "tesbo-reports/specs", label: "Spec Intelligence", icon: "specs" },
-      { href: "tesbo-reports/tests", label: "Test Intelligence", icon: "tests" },
-      { href: "tesbo-reports/analytics", label: "Analytics", icon: "analytics" },
-    ],
-  },
-  {
-    section: "Configuration",
-    items: [
-      { href: "settings", label: "Settings", icon: "settings" },
-    ],
-  },
-];
 
 const workspaceSettingsNavItems = [
   { href: "/settings/members", label: "Members", icon: "users" },
@@ -194,25 +169,11 @@ function SidebarContent() {
   const isInProject = Boolean(projectId);
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
-  const [projectType, setProjectType] = useState<ProjectType>("tesbox");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
-
-  useEffect(() => {
-    if (!projectId) return;
-    let active = true;
-    getProject(projectId)
-      .then((p) => {
-        if (active) {
-          setProjectType(((p.projectType as string) ?? "tesbox") as ProjectType);
-        }
-      })
-      .catch(() => {});
-    return () => { active = false; };
-  }, [projectId]);
 
   useEffect(() => {
     let active = true;
@@ -351,24 +312,11 @@ function SidebarContent() {
                 <option value="" disabled>
                   Select project
                 </option>
-                {projects.filter((p) => (p.projectType || "tesbox") === "tesbox").length > 0 && (
-                  <optgroup label="TesboX">
-                    {projects.filter((p) => (p.projectType || "tesbox") === "tesbox").map((project) => (
-                      <option key={project.id} value={project.id}>
-                        {project.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {projects.filter((p) => p.projectType === "tesbox_executions").length > 0 && (
-                  <optgroup label="TesboX-Executions">
-                    {projects.filter((p) => p.projectType === "tesbox_executions").map((project) => (
-                      <option key={project.id} value={project.id}>
-                        {project.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
               </select>
             </div>
           )}
@@ -387,7 +335,7 @@ function SidebarContent() {
         {showProjectNavigation ? (
           <>
             <div className="space-y-3">
-              {(projectType === "tesbox_executions" ? executionProjectNavSections : projectNavSections).map(({ section, items }) => (
+              {projectNavSections.map(({ section, items }) => (
                 <div key={section}>
                   {!isCollapsed && (
                     <p className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
@@ -427,15 +375,13 @@ function SidebarContent() {
                   </div>
                 </div>
               ))}
-              {projectType !== "tesbox_executions" && (
-                <NavLink
-                  href={`${projectPathPrefix}/settings`}
-                  label="Settings"
-                  icon="settings"
-                  active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
-                  collapsed={isCollapsed}
-                />
-              )}
+              <NavLink
+                href={`${projectPathPrefix}/settings`}
+                label="Settings"
+                icon="settings"
+                active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
+                collapsed={isCollapsed}
+              />
             </div>
           </>
         ) : null}
