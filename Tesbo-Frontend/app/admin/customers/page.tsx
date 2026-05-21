@@ -8,8 +8,6 @@ type CustomerSummary = {
   totalMembers: number;
   totalProjects: number;
   totalTestCases: number;
-  totalAutomated: number;
-  overallAutomationCoverage: number;
 };
 
 type Customer = {
@@ -20,8 +18,6 @@ type Customer = {
   memberCount: number;
   projectCount: number;
   testCaseCount: number;
-  automatedCount: number;
-  automationCoverage: number;
   lastActivityAt: string | null;
 };
 
@@ -31,8 +27,6 @@ type SortKey = keyof Pick<
   | "memberCount"
   | "projectCount"
   | "testCaseCount"
-  | "automatedCount"
-  | "automationCoverage"
   | "createdAt"
 >;
 
@@ -83,22 +77,6 @@ function formatRelativeDate(dateStr: string | null) {
   if (diffDays < 30) return `${diffDays}d ago`;
   if (diffDays < 365) return `${Math.floor(diffDays / 30)}mo ago`;
   return `${Math.floor(diffDays / 365)}y ago`;
-}
-
-function CoverageBar({ coverage }: { coverage: number }) {
-  return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
-        <div
-          className="h-full rounded-full bg-[var(--brand-primary)] transition-all"
-          style={{ width: `${Math.min(coverage, 100)}%` }}
-        />
-      </div>
-      <span className="text-[13px] font-medium text-[var(--foreground)]">
-        {coverage}%
-      </span>
-    </div>
-  );
 }
 
 export default function CustomersPage() {
@@ -199,17 +177,11 @@ export default function CustomersPage() {
 
       {/* Summary stats */}
       {summary && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard label="Organizations" value={summary.totalOrganizations} />
           <StatCard label="Total Members" value={summary.totalMembers} />
           <StatCard label="Projects" value={summary.totalProjects} />
           <StatCard label="Test Cases" value={summary.totalTestCases} />
-          <StatCard label="Automated" value={summary.totalAutomated} />
-          <StatCard
-            label="Coverage"
-            value={summary.overallAutomationCoverage}
-            suffix="%"
-          />
         </div>
       )}
 
@@ -231,16 +203,6 @@ export default function CustomersPage() {
                   field="testCaseCount"
                   align="right"
                 />
-                <SortHeader
-                  label="Automated"
-                  field="automatedCount"
-                  align="right"
-                />
-                <SortHeader
-                  label="Coverage"
-                  field="automationCoverage"
-                  align="right"
-                />
                 <SortHeader label="Created" field="createdAt" />
                 <th className="px-4 py-3 text-left text-[12px] font-semibold uppercase tracking-wider text-[var(--muted)]">
                   Last Active
@@ -251,7 +213,7 @@ export default function CustomersPage() {
               {sorted.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={8}
+                    colSpan={6}
                     className="px-4 py-12 text-center text-[15px] text-[var(--muted)]"
                   >
                     No organizations found
@@ -281,12 +243,6 @@ export default function CustomersPage() {
                     </td>
                     <td className="px-4 py-3 text-right text-[14px] font-medium text-[var(--foreground)]">
                       {c.testCaseCount.toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 text-right text-[14px] font-medium text-[var(--foreground)]">
-                      {c.automatedCount.toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <CoverageBar coverage={c.automationCoverage} />
                     </td>
                     <td className="px-4 py-3 text-[13px] text-[var(--muted)]">
                       {formatDate(c.createdAt)}

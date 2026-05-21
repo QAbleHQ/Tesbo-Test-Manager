@@ -15,10 +15,6 @@ import {
   listSuites,
   toggleTestRunShare,
   createBug,
-  executeAutomatedTestRun,
-  getAutomatedRunStatus,
-  getLatestAutomatedRunStatus,
-  type AutomatedRunLiveStatus,
   type TestRunDetail,
   type ExecutionItem,
   type TestCaseListItem,
@@ -28,18 +24,9 @@ import { Button, StatusChip, Input, Select, Textarea } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
-const MANUAL_REQUIRED_NOTE = "Manual execution required (no linked automation script).";
 
 /* ───── Constants ───── */
 const EXEC_STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"] as const;
-const LIVE_STATUS_TO_EXEC_STATUS: Record<string, string> = {
-  queued: "Untested",
-  running: "Retest",
-  passed: "Passed",
-  failed: "Failed",
-  manual: "Untested",
-  cancelled: "Skipped",
-};
 
 /* ───── Status tone helpers ───── */
 function statusToTone(status: string) {
@@ -186,11 +173,6 @@ export default function TestRunDetailPage() {
   const [bugDesc, setBugDesc] = useState("");
   const [bugUrl, setBugUrl] = useState("");
   const [bugSaving, setBugSaving] = useState(false);
-  const [automatedRunId, setAutomatedRunId] = useState<string | null>(null);
-  const [automatedLiveStatus, setAutomatedLiveStatus] = useState<AutomatedRunLiveStatus | null>(null);
-  const [automatedSummary, setAutomatedSummary] = useState<string | null>(null);
-  const [automatedStarting, setAutomatedStarting] = useState(false);
-
   const load = useCallback(() => {
     Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId)])
       .then(([r, e]) => {
@@ -203,28 +185,6 @@ export default function TestRunDetailPage() {
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
 
-  const restoreLatestAutomationRun = useCallback(async () => {
-    try {
-      const latest = await getLatestAutomatedRunStatus(cycleId);
-      setAutomatedLiveStatus(latest);
-      if (latest.status === "running") {
-        setAutomatedRunId(latest.runId);
-        setAutomatedSummary(
-          `Resumed live run: ${latest.completed}/${latest.totalCases} completed • Passed ${latest.passed}, Failed ${latest.failed}.`
-        );
-      } else {
-        const manualCount = latest.items.filter((item) => item.status === "manual").length;
-        setAutomatedRunId(null);
-        setAutomatedSummary(
-          latest.status === "completed"
-            ? `Last automated run completed: ${latest.passed} passed, ${latest.failed} failed, ${manualCount} manual (${latest.completed}/${latest.totalCases}).`
-            : `Last automated run failed: ${latest.error || "Unknown error"}`
-        );
-      }
-    } catch {
-      // No previous automation run for this cycle.
-    }
-  }, [cycleId]);
 
   useEffect(() => {
     authMe().then((me) => {
@@ -233,44 +193,10 @@ export default function TestRunDetailPage() {
         return;
       }
       load();
-      restoreLatestAutomationRun().catch(() => {});
+      
     });
-  }, [router, load, restoreLatestAutomationRun]);
+  }, [router, load]);
 
-  useEffect(() => {
-    if (!automatedRunId) return;
-    let cancelled = false;
-    const poll = async () => {
-      try {
-        const status = await getAutomatedRunStatus(cycleId, automatedRunId);
-        if (cancelled) return;
-        setAutomatedLiveStatus(status);
-        if (status.status === "completed" || status.status === "failed") {
-          const manualCount = status.items.filter((item) => item.status === "manual").length;
-          setAutomatedRunId(null);
-          setAutomatedSummary(
-            status.status === "completed"
-              ? `Automated run completed: ${status.passed} passed, ${status.failed} failed, ${manualCount} manual (${status.completed}/${status.totalCases}).`
-              : `Automated run failed: ${status.error || "Unknown error"}`
-          );
-          load();
-          return;
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setAutomatedSummary(e instanceof Error ? e.message : "Failed to fetch live automation status");
-          setAutomatedRunId(null);
-        }
-      }
-      if (!cancelled) {
-        setTimeout(poll, 2000);
-      }
-    };
-    poll();
-    return () => {
-      cancelled = true;
-    };
-  }, [automatedRunId, cycleId, load]);
 
   /* ───── Load test cases for picker ───── */
   async function openPicker() {
@@ -418,32 +344,6 @@ export default function TestRunDetailPage() {
     }
   }
 
-  async function handleRunAutomated() {
-    setAutomatedSummary(null);
-    setAutomatedLiveStatus(null);
-    setAutomatedStarting(true);
-    try {
-      const result = await executeAutomatedTestRun(cycleId);
-      if (result?.runId) {
-        setAutomatedRunId(result.runId);
-        setAutomatedSummary("Automated run started. Live status will update in a moment...");
-      } else {
-        const fallback = (result as unknown as { passed?: number; failed?: number; totalCases?: number }) || {};
-        if (typeof fallback.passed === "number" || typeof fallback.failed === "number") {
-          setAutomatedSummary(
-            `Automated run completed: ${fallback.passed ?? 0} passed, ${fallback.failed ?? 0} failed (${fallback.totalCases ?? 0} total).`
-          );
-          load();
-        } else {
-          setAutomatedSummary("Run request accepted, but no live run id was returned. Please restart backend to enable live updates.");
-        }
-      }
-    } catch (e) {
-      setAutomatedSummary(e instanceof Error ? e.message : "Automated run failed");
-    } finally {
-      setAutomatedStarting(false);
-    }
-  }
 
   /* ───── Share toggle ───── */
   async function handleShareToggle(enabled: boolean) {
@@ -506,29 +406,6 @@ export default function TestRunDetailPage() {
     [stats]
   );
 
-  const liveStatusByExecutionId = useMemo(() => {
-    const map = new Map<string, { status: string; message?: string }>();
-    if (!automatedLiveStatus) return map;
-    for (const item of automatedLiveStatus.items) {
-      map.set(item.executionId, { status: item.status, message: item.message });
-    }
-    return map;
-  }, [automatedLiveStatus]);
-
-  const runningLiveItems = useMemo(
-    () =>
-      (automatedLiveStatus?.items ?? [])
-        .filter((item) => item.status === "running")
-        .sort((a, b) => a.index - b.index),
-    [automatedLiveStatus]
-  );
-  const queuedLiveItems = useMemo(
-    () =>
-      (automatedLiveStatus?.items ?? [])
-        .filter((item) => item.status === "queued")
-        .sort((a, b) => a.index - b.index),
-    [automatedLiveStatus]
-  );
 
   if (loading || !run) {
     return (
@@ -596,13 +473,6 @@ export default function TestRunDetailPage() {
               </Button>
             )}
             <Button
-              variant="ai"
-              onClick={handleRunAutomated}
-              disabled={automatedRunId !== null || executions.length === 0 || automatedStarting}
-            >
-              {automatedStarting ? "Starting..." : automatedRunId ? "Running Automated..." : "Run Automated Test Cases"}
-            </Button>
-            <Button
               variant="secondary"
               onClick={() => setShowShare(true)}
             >
@@ -623,42 +493,6 @@ export default function TestRunDetailPage() {
         </div>
 
         {/* ───── Dashboard: Metric Cards + Donut Chart ───── */}
-        {automatedLiveStatus && automatedRunId && (
-          <div className="mb-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-2 text-sm text-violet-800">
-            Live automation: {automatedLiveStatus.completed}/{automatedLiveStatus.totalCases} completed • Passed {automatedLiveStatus.passed}, Failed {automatedLiveStatus.failed}
-            {runningLiveItems.length > 0 && (
-              <div className="mt-1 text-xs">
-                Running now:{" "}
-                <span className="font-semibold">
-                  {runningLiveItems
-                    .map((item) => item.externalId || item.title)
-                    .join(", ")}
-                </span>
-              </div>
-            )}
-            {queuedLiveItems.length > 0 && (
-              <div className="mt-1 text-xs">
-                In queue: <span className="font-semibold">{queuedLiveItems.length}</span>{" "}
-                {queuedLiveItems.length === 1 ? "test" : "tests"}
-                {queuedLiveItems.length <= 3 && (
-                  <span>
-                    {" "}
-                    (
-                    {queuedLiveItems
-                      .map((item) => item.externalId || item.title)
-                      .join(", ")}
-                    )
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-        {automatedSummary && (
-          <div className="mb-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-2 text-sm text-violet-800">
-            {automatedSummary}
-          </div>
-        )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
           {/* Metric cards (left 2 cols) */}
           <div className="lg:col-span-2 grid grid-cols-2 sm:grid-cols-3 gap-3">
@@ -770,26 +604,6 @@ export default function TestRunDetailPage() {
                           >
                             {e.title}
                           </Link>
-                          {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "running" && (
-                            <StatusChip tone="info" live className="text-[10px] uppercase tracking-wide">
-                              Running
-                            </StatusChip>
-                          )}
-                          {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "queued" && (
-                            <StatusChip tone="warning" className="text-[10px] uppercase tracking-wide">
-                              In Queue
-                            </StatusChip>
-                          )}
-                          {automatedRunId && liveStatusByExecutionId.get(e.id)?.status === "manual" && (
-                            <StatusChip tone="neutral" className="text-[10px] uppercase tracking-wide">
-                              Manual
-                            </StatusChip>
-                          )}
-                          {e.status === "Untested" && e.actualResult === MANUAL_REQUIRED_NOTE && (
-                            <StatusChip tone="neutral" className="text-[10px] uppercase tracking-wide">
-                              Manual
-                            </StatusChip>
-                          )}
                         </div>
                       </td>
                       <td className="px-5 py-3">
@@ -799,22 +613,7 @@ export default function TestRunDetailPage() {
                         <span className="text-xs text-[var(--muted)]">{e.type || "—"}</span>
                       </td>
                       <td className="px-5 py-3">
-                        {automatedRunId && liveStatusByExecutionId.has(e.id) ? (
-                          <div className="flex items-center gap-2">
-                            <StatusChip tone={statusToTone(LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested")}>
-                              {LIVE_STATUS_TO_EXEC_STATUS[liveStatusByExecutionId.get(e.id)?.status || "queued"] || "Untested"}
-                            </StatusChip>
-                            {liveStatusByExecutionId.get(e.id)?.status === "running" && (
-                              <span className="text-xs text-blue-600">Running...</span>
-                            )}
-                            {liveStatusByExecutionId.get(e.id)?.status === "queued" && (
-                              <span className="text-xs text-amber-600">Queued</span>
-                            )}
-                            {liveStatusByExecutionId.get(e.id)?.status === "manual" && (
-                              <span className="text-xs text-[var(--muted)]">Manual run required</span>
-                            )}
-                          </div>
-                        ) : isInProgress ? (
+                        {isInProgress ? (
                           <select
                             value={e.status}
                             onChange={(ev) => handleStatusChange(e.id, ev.target.value)}

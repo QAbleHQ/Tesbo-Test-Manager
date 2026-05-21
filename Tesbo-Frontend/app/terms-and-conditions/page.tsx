@@ -66,7 +66,7 @@ export default function TermsAndConditionsPage() {
               <li>Do not use the service for unlawful, harmful, or abusive activities.</li>
               <li>Do not attempt to disrupt, probe, or bypass service security controls.</li>
               <li>Do not upload or share content that infringes intellectual property rights.</li>
-              <li>Do not misuse API or automation features in ways that degrade service availability.</li>
+              <li>Do not misuse API features in ways that degrade service availability.</li>
             </ul>
           </section>
 

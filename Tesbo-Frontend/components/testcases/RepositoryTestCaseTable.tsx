@@ -4,22 +4,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, StatusChip } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 
-export const REPO_TC_AI_DISABLED_TITLE =
-  "AI Key is not allocated to this project, so AI-assisted automation is unavailable.";
-
 export type RepoTcColumnId =
   | "select"
   | "id"
   | "title"
   | "suite"
-  | "automate"
   | "run"
   | "jira"
   | "priority"
   | "status"
   | "updated"
-  | "type"
-  | "automationFeasibility";
+  | "type";
 
 type RepoDataColumnId = Exclude<RepoTcColumnId, "select">;
 
@@ -27,14 +22,12 @@ const DATA_COLUMN_IDS: RepoDataColumnId[] = [
   "id",
   "title",
   "suite",
-  "automate",
   "run",
   "jira",
   "priority",
   "status",
   "updated",
   "type",
-  "automationFeasibility",
 ];
 
 const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
@@ -42,42 +35,36 @@ const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
   id: "ID",
   title: "Test case title",
   suite: "Suite",
-  automate: "Automate",
   run: "Run this test case",
   jira: "Jira",
   priority: "Priority",
   status: "Status",
   updated: "Updated",
   type: "Type",
-  automationFeasibility: "Automation feasibility",
 };
 
 const FIELD_IDS: Record<RepoDataColumnId, string> = {
   id: "id",
   title: "title",
   suite: "suite",
-  automate: "automate",
   run: "run",
   jira: "jira",
   priority: "priority",
   status: "status",
   updated: "updated",
   type: "type",
-  automationFeasibility: "automationStatus",
 };
 
 const DEFAULT_DATA_ORDER: RepoDataColumnId[] = [
   "id",
   "title",
   "suite",
-  "automate",
   "run",
   "jira",
   "priority",
   "status",
   "updated",
   "type",
-  "automationFeasibility",
 ];
 
 /** First five data columns shown by default; remainder off until the user enables them (saved in localStorage). */
@@ -85,7 +72,6 @@ const DEFAULT_ON_DATA_COLUMNS: ReadonlySet<RepoDataColumnId> = new Set([
   "id",
   "title",
   "suite",
-  "automate",
   "run",
 ]);
 
@@ -93,14 +79,12 @@ const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
   id: true,
   title: true,
   suite: true,
-  automate: true,
   run: true,
   jira: false,
   priority: false,
   status: false,
   updated: false,
   type: false,
-  automationFeasibility: false,
 };
 
 /** When exactly these five (+ row select) are visible, the table uses full width and percentage columns to fit the screen. */
@@ -116,16 +100,14 @@ function isDefaultFiveOnlyView(visible: Record<RepoDataColumnId, boolean>): bool
 const FIT_LAYOUT_PCT: Record<RepoTcColumnId, number> = {
   select: 4,
   id: 9,
-  title: 34,
-  suite: 17,
-  automate: 14,
-  run: 22,
+  title: 42,
+  suite: 21,
+  run: 24,
   jira: 0,
   priority: 0,
   status: 0,
   updated: 0,
   type: 0,
-  automationFeasibility: 0,
 };
 
 const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -133,14 +115,12 @@ const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
   id: 112,
   title: 240,
   suite: 160,
-  automate: 108,
   run: 148,
   jira: 112,
   priority: 88,
   status: 112,
   updated: 108,
   type: 120,
-  automationFeasibility: 168,
 };
 
 const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -148,14 +128,12 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
   id: 72,
   title: 140,
   suite: 96,
-  automate: 88,
   run: 120,
   jira: 80,
   priority: 72,
   status: 88,
   updated: 96,
   type: 88,
-  automationFeasibility: 120,
 };
 
 const MAX_WIDTH = 560;
@@ -171,13 +149,6 @@ function repoPriorityTone(priority: string) {
   if (priority === "P0") return "error" as const;
   if (priority === "P1") return "warning" as const;
   if (priority === "P2") return "confidenceHigh" as const;
-  return "neutral" as const;
-}
-
-function repoAutomationTone(status: string) {
-  if (status === "Automated") return "success" as const;
-  if (status === "Ready for the Automation") return "confidenceHigh" as const;
-  if (status === "Not able to Automate") return "warning" as const;
   return "neutral" as const;
 }
 
@@ -248,7 +219,6 @@ export type RepositoryTestCaseTableProps = {
   projectId: string;
   suiteNameMap: Map<string, string>;
   cases: TestCaseListItem[];
-  aiConfigured: boolean;
   rowHighlightId: string | null;
   selectedCaseIdSet: Set<string>;
   areAllCasesSelected: boolean;
@@ -262,7 +232,6 @@ export function RepositoryTestCaseTable({
   projectId,
   suiteNameMap,
   cases,
-  aiConfigured,
   rowHighlightId,
   selectedCaseIdSet,
   areAllCasesSelected,
@@ -525,28 +494,6 @@ export function RepositoryTestCaseTable({
             <span className={innerTruncate}>{tc.suiteId ? suiteNameMap.get(tc.suiteId) ?? "—" : "—"}</span>
           </td>
         );
-      case "automate":
-        return (
-          <td key={col} style={tdStyle} className={cellClass}>
-            <Button
-              variant="ai"
-              size="sm"
-              disabled={!aiConfigured}
-              title={!aiConfigured ? REPO_TC_AI_DISABLED_TITLE : "Open AI-assisted automation for this test case"}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!aiConfigured) return;
-                window.open(
-                  `/projects/${projectId}/testcases/${tc.id}/automate`,
-                  "_blank",
-                  "noopener,noreferrer",
-                );
-              }}
-            >
-              Automate
-            </Button>
-          </td>
-        );
       case "run":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
@@ -613,14 +560,6 @@ export function RepositoryTestCaseTable({
         return (
           <td key={col} style={tdStyle} className={cellClass}>
             <span className={innerTruncate}>{tc.type}</span>
-          </td>
-        );
-      case "automationFeasibility":
-        return (
-          <td key={col} style={tdStyle} className={cellClass}>
-            <StatusChip tone={repoAutomationTone(tc.automationStatus)} className="max-w-full">
-              <span className={innerTruncate}>{tc.automationStatus}</span>
-            </StatusChip>
           </td>
         );
       default:

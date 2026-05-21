@@ -4,23 +4,14 @@ import com.bettercases.Config;
 import com.bettercases.Database;
 import io.javalin.http.Context;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 public final class SystemHealthHandler {
-
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
 
     public static void check(Context ctx) {
         SuperAdminService.requirePlatformAdmin(ctx);
@@ -34,12 +25,6 @@ public final class SystemHealthHandler {
         Map<String, Object> dbStatus = probeDatabase();
         services.put("database", dbStatus);
         if (!"up".equals(dbStatus.get("status"))) allUp = false;
-
-        // Automation Agent
-        Map<String, Object> automationStatus = probeHttp("automation_agent",
-                Config.AUTOMATION_AGENT_BASE_URL + "/health");
-        services.put("automation_agent", automationStatus);
-        if (!"up".equals(automationStatus.get("status"))) allUp = false;
 
         // Artifact Storage
         Map<String, Object> storageStatus = probeArtifactStorage();
@@ -75,34 +60,6 @@ public final class SystemHealthHandler {
             status.put("status", "down");
             status.put("error", e.getMessage());
             status.put("latency_ms", System.currentTimeMillis() - start);
-        }
-        return status;
-    }
-
-    private static Map<String, Object> probeHttp(String name, String url) {
-        Map<String, Object> status = new LinkedHashMap<>();
-        long start = System.currentTimeMillis();
-        try {
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(5))
-                    .GET()
-                    .build();
-            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-            long latency = System.currentTimeMillis() - start;
-            if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
-                status.put("status", "up");
-            } else {
-                status.put("status", "down");
-                status.put("http_status", resp.statusCode());
-            }
-            status.put("latency_ms", latency);
-            status.put("url", url);
-        } catch (Exception e) {
-            status.put("status", "down");
-            status.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
-            status.put("latency_ms", System.currentTimeMillis() - start);
-            status.put("url", url);
         }
         return status;
     }

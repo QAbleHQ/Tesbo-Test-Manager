@@ -1,9 +1,14 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+
 # Kubernetes secrets (contain real credentials)
 infra/kubernetes/**/secret.yaml
 infra/kubernetes/base/registry-secret.yaml
 
 # Root-level dependencies
 /node_modules/
+/Tesbo-Automation-Agents/
 /Tesbo-Automation-Agents/node_modules/
 
 # Backend build output
@@ -15,6 +20,7 @@ infra/kubernetes/base/registry-secret.yaml
 /Tesbo-Backend/logs/*.lck
 
 # Local uploaded/generated artifacts
+/Tesbo-Backend/uploads/
 /Tesbo-Backend/uploads/tesbo-artifacts/
 /Tesbo-Automation-Agents/artifacts/
 
@@ -35,6 +41,8 @@ infra/kubernetes/base/registry-secret.yaml
 # Environment files
 .env
 .env.local
+*.env
+!*.env.example
 Tesbo-Backend/target/classes/com/bettercases/ai/AiHandler$1.class
 Tesbo-Backend/target/classes/com/bettercases/Config.class
 Tesbo-Backend/target/classes/com/bettercases/Database.class

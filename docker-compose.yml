@@ -1,9 +1,6 @@
 # PostgreSQL for TesboX. Use this if your local Postgres has no "postgres" role.
 # Start: docker compose up -d
 # Stop:  docker compose down
-#
-# Tesbo-Automation-Agents: sessions, live view, recordings, /internal/playwright/run (port 7400).
-# Tesbo-Execution: standalone execution service (API on 7420, workers separate).
 services:
   postgres:
     image: postgres:16-alpine
@@ -19,14 +16,5 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-  automation-agent:
-    build:
-      context: ./Tesbo-Automation-Agents
-      dockerfile: Dockerfile
-    environment:
-      PORT: 7400
-      AGENT_SHARED_TOKEN: changeme
-    ports:
-      - "7400:7400"
 volumes:
   bettercases_pgdata:

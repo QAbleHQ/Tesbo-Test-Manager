@@ -23,13 +23,11 @@ public final class AdminStatsHandler {
                 (SELECT COUNT(*) FROM organization_members om WHERE om.organization_id = o.id) AS member_count,
                 (SELECT COUNT(*) FROM projects p WHERE p.organization_id = o.id AND p.archived_at IS NULL) AS project_count,
                 COALESCE(tc_stats.total, 0) AS test_case_count,
-                COALESCE(tc_stats.automated, 0) AS automated_count,
                 tc_stats.last_activity
             FROM organizations o
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE tc.automation_status = 'Automated' OR tc.automated_at IS NOT NULL) AS automated,
                     MAX(tc.updated_at) AS last_activity
                 FROM testcases tc
                 JOIN projects p ON tc.project_id = p.id
@@ -52,12 +50,7 @@ public final class AdminStatsHandler {
                 org.put("projectCount", rs.getInt("project_count"));
 
                 long totalCases = rs.getLong("test_case_count");
-                long automatedCases = rs.getLong("automated_count");
                 org.put("testCaseCount", totalCases);
-                org.put("automatedCount", automatedCases);
-                org.put("automationCoverage", totalCases > 0
-                        ? Math.round(automatedCases * 1000.0 / totalCases) / 10.0
-                        : 0.0);
 
                 Timestamp lastActivity = rs.getTimestamp("last_activity");
                 org.put("lastActivityAt", lastActivity != null ? lastActivity.toInstant().toString() : null);
@@ -74,12 +67,7 @@ public final class AdminStatsHandler {
         summary.put("totalMembers", customers.stream().mapToInt(c2 -> (int) c2.get("memberCount")).sum());
         summary.put("totalProjects", customers.stream().mapToInt(c2 -> (int) c2.get("projectCount")).sum());
         long totalTestCases = customers.stream().mapToLong(c2 -> (long) c2.get("testCaseCount")).sum();
-        long totalAutomated = customers.stream().mapToLong(c2 -> (long) c2.get("automatedCount")).sum();
         summary.put("totalTestCases", totalTestCases);
-        summary.put("totalAutomated", totalAutomated);
-        summary.put("overallAutomationCoverage", totalTestCases > 0
-                ? Math.round(totalAutomated * 1000.0 / totalTestCases) / 10.0
-                : 0.0);
 
         ctx.json(Map.of("summary", summary, "customers", customers));
     }

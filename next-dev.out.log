@@ -1,0 +1,13 @@
+
+> tesbo-frontend@0.1.0 dev
+> cross-env NODE_OPTIONS="--import ./instrumentation.mjs" next dev --webpack
+
+Pyroscope profiling is not available
+Pyroscope profiling is not available
+▲ Next.js 16.1.6 (webpack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.1.25:3000
+
+✓ Starting...
+✓ Ready in 1084ms
+ GET / 200 in 3.1s (compile: 2.9s, render: 125ms)

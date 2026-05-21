@@ -11,7 +11,6 @@ import {
   getJiraStatus,
   getJiraAuthUrl,
   disconnectJira,
-  rotateTesboIngestionKey,
   listProjectMembers,
   listWorkspaceMembers,
   addProjectMember,
@@ -19,7 +18,6 @@ import {
   type JiraConnection,
   type TestEnvironmentSetting,
 } from "@/lib/api";
-import { TesboAlertSettings } from "@/components/tesbo/TesboAlertSettings";
 import ThemeToggle from "@/components/ThemeToggle";
 import {
   Button,
@@ -33,39 +31,12 @@ import {
 } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
-const AUTOMATION_PARALLEL_CEILING = 200;
-
 type ProjectSettingsPayload = {
-  automation?: {
-    executionProvider?: "default" | "lambdatest" | "browserstack";
-    maxParallel?: number;
-    /** Max concurrent jobs in Redis/running for this project (tenant fair-share). */
-    maxConcurrentJobs?: number;
-    providers?: {
-      lambdatest?: {
-        endpoint?: string;
-        username?: string;
-        accessKey?: string;
-      };
-      browserstack?: {
-        endpoint?: string;
-        username?: string;
-        accessKey?: string;
-      };
-    };
-  };
   ai?: {
     enabled?: boolean;
   };
   jiraAutoComment?: boolean;
   jiraTicketSelector?: boolean;
-  tesboReports?: {
-    keepTrace?: boolean;
-    traceRetentionDays?: number;
-    ingestionApiKey?: string;
-    alertsEnabled?: boolean;
-    shareByDefault?: boolean;
-  };
   testRunEnvironments?: Array<{
     name?: string;
     url?: string;
@@ -73,7 +44,7 @@ type ProjectSettingsPayload = {
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "testRuns" | "members" | "jira" | "tesbo" | "alerts" | "integrations";
+type SettingsTab = "general" | "testRuns" | "members" | "jira" | "integrations";
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
@@ -111,24 +82,9 @@ export default function ProjectSettingsPage() {
   const [description, setDescription] = useState("");
   const [jiraAutoComment, setJiraAutoComment] = useState(false);
   const [jiraTicketSelector, setJiraTicketSelector] = useState(false);
-  const [tesboKeepTrace, setTesboKeepTrace] = useState(true);
-  const [tesboTraceRetentionDays, setTesboTraceRetentionDays] = useState(14);
-  const [tesboIngestionApiKey, setTesboIngestionApiKey] = useState("");
-  const [tesboAlertsEnabled, setTesboAlertsEnabled] = useState(true);
-  const [tesboShareByDefault, setTesboShareByDefault] = useState(false);
   const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
-  const [executionProvider, setExecutionProvider] = useState<"default" | "lambdatest" | "browserstack">("default");
-  const [maxParallel, setMaxParallel] = useState(1);
-  const [maxConcurrentJobs, setMaxConcurrentJobs] = useState(50);
-  const [lambdaTestEndpoint, setLambdaTestEndpoint] = useState("");
-  const [lambdaTestUsername, setLambdaTestUsername] = useState("");
-  const [lambdaTestAccessKey, setLambdaTestAccessKey] = useState("");
-  const [browserStackEndpoint, setBrowserStackEndpoint] = useState("");
-  const [browserStackUsername, setBrowserStackUsername] = useState("");
-  const [browserStackAccessKey, setBrowserStackAccessKey] = useState("");
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
   const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
-  const [rotatingTesboKey, setRotatingTesboKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
@@ -153,8 +109,6 @@ export default function ProjectSettingsPage() {
     { key: "testRuns", label: "Test Environments" },
     { key: "members", label: "Members" },
     ...(jiraTabEnabled ? [{ key: "jira" as const, label: "Jira" }] : []),
-    { key: "tesbo", label: "API Keys" },
-    { key: "alerts", label: "Alerts" },
     { key: "integrations", label: "Integrations" },
   ];
 
@@ -226,39 +180,7 @@ export default function ProjectSettingsPage() {
         const parsedSettings = parseProjectSettings(p.settings);
         setJiraAutoComment(parsedSettings.jiraAutoComment === true);
         setJiraTicketSelector(parsedSettings.jiraTicketSelector === true);
-        const tesbo = parsedSettings.tesboReports;
-        setTesboKeepTrace(tesbo?.keepTrace !== false);
-        setTesboTraceRetentionDays(
-          typeof tesbo?.traceRetentionDays === "number" && tesbo.traceRetentionDays > 0
-            ? tesbo.traceRetentionDays
-            : 14
-        );
-        setTesboIngestionApiKey(tesbo?.ingestionApiKey ?? "");
-        setTesboAlertsEnabled(tesbo?.alertsEnabled !== false);
-        setTesboShareByDefault(tesbo?.shareByDefault === true);
         setTestRunEnvironments(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
-        const automation = parsedSettings.automation;
-        const resolvedProvider =
-          automation?.executionProvider === "lambdatest" || automation?.executionProvider === "browserstack"
-            ? automation.executionProvider
-            : "default";
-        setExecutionProvider(resolvedProvider);
-        setMaxParallel(
-          typeof automation?.maxParallel === "number" && automation.maxParallel > 0
-            ? Math.min(AUTOMATION_PARALLEL_CEILING, Math.floor(automation.maxParallel))
-            : 1
-        );
-        setMaxConcurrentJobs(
-          typeof automation?.maxConcurrentJobs === "number" && automation.maxConcurrentJobs > 0
-            ? Math.min(AUTOMATION_PARALLEL_CEILING, Math.floor(automation.maxConcurrentJobs))
-            : 50
-        );
-        setLambdaTestEndpoint(automation?.providers?.lambdatest?.endpoint ?? "");
-        setLambdaTestUsername(automation?.providers?.lambdatest?.username ?? "");
-        setLambdaTestAccessKey(automation?.providers?.lambdatest?.accessKey ?? "");
-        setBrowserStackEndpoint(automation?.providers?.browserstack?.endpoint ?? "");
-        setBrowserStackUsername(automation?.providers?.browserstack?.username ?? "");
-        setBrowserStackAccessKey(automation?.providers?.browserstack?.accessKey ?? "");
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       loadMembers().catch(() => {});
@@ -292,33 +214,6 @@ export default function ProjectSettingsPage() {
         ...currentSettings,
         jiraAutoComment,
         jiraTicketSelector,
-        tesboReports: {
-          keepTrace: tesboKeepTrace,
-          traceRetentionDays: tesboTraceRetentionDays,
-          ingestionApiKey: tesboIngestionApiKey.trim(),
-          alertsEnabled: tesboAlertsEnabled,
-          shareByDefault: tesboShareByDefault,
-        },
-        automation: {
-          executionProvider,
-          maxParallel: Math.max(1, Math.min(AUTOMATION_PARALLEL_CEILING, Math.floor(maxParallel || 1))),
-          maxConcurrentJobs: Math.max(
-            1,
-            Math.min(AUTOMATION_PARALLEL_CEILING, Math.floor(maxConcurrentJobs || 50))
-          ),
-          providers: {
-            lambdatest: {
-              endpoint: lambdaTestEndpoint.trim(),
-              username: lambdaTestUsername.trim(),
-              accessKey: lambdaTestAccessKey.trim(),
-            },
-            browserstack: {
-              endpoint: browserStackEndpoint.trim(),
-              username: browserStackUsername.trim(),
-              accessKey: browserStackAccessKey.trim(),
-            },
-          },
-        },
         testRunEnvironments: environmentsToSave.map((item) => ({
           name: item.name.trim(),
           url: item.url.trim(),
@@ -365,20 +260,6 @@ export default function ProjectSettingsPage() {
       setMessage("Failed to disconnect Jira.");
     } finally {
       setJiraLoading(false);
-    }
-  }
-
-  async function handleRotateTesboKey() {
-    setRotatingTesboKey(true);
-    setMessage(null);
-    try {
-      const result = await rotateTesboIngestionKey(projectId);
-      setTesboIngestionApiKey(result.ingestionApiKey ?? "");
-      setMessage("Automation Reports ingestion key rotated. Save project settings to persist other changes.");
-    } catch {
-      setMessage("Failed to rotate Automation Reports ingestion key.");
-    } finally {
-      setRotatingTesboKey(false);
     }
   }
 
@@ -540,7 +421,7 @@ export default function ProjectSettingsPage() {
         </div>
       </div>
 
-      {(activeTab === "general" || activeTab === "testRuns" || activeTab === "jira" || activeTab === "tesbo") && (
+      {(activeTab === "general" || activeTab === "testRuns" || activeTab === "jira") && (
         <form onSubmit={handleSubmit} className="space-y-5">
           {activeTab === "general" && (
             <>
@@ -657,97 +538,6 @@ export default function ProjectSettingsPage() {
                   Add
                 </Button>
               </div>
-              <div className="rounded-lg border border-[var(--border)] p-3 space-y-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-[var(--foreground)]">Automation Execution</h3>
-                  <p className="mt-1 text-xs text-[var(--muted)]">
-                    Configure how automated test cases execute in parallel and which provider is used.
-                  </p>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Field>
-                    <FieldLabel>Execution provider</FieldLabel>
-                    <Select
-                      value={executionProvider}
-                      onChange={(e) => setExecutionProvider(e.target.value as "default" | "lambdatest" | "browserstack")}
-                    >
-                      <option value="default">Default</option>
-                      <option value="lambdatest">LambdaTest</option>
-                      <option value="browserstack">BrowserStack</option>
-                    </Select>
-                  </Field>
-                  <Field>
-                    <FieldLabel>Max parallel per test run</FieldLabel>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={AUTOMATION_PARALLEL_CEILING}
-                      value={maxParallel}
-                      onChange={(e) => setMaxParallel(Number(e.target.value || 1))}
-                    />
-                    <p className="mt-1 text-xs text-[var(--muted)]">
-                      Concurrent cases per single automated run (capped by deployment).
-                    </p>
-                  </Field>
-                  <Field>
-                    <FieldLabel>Max concurrent jobs (project)</FieldLabel>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={AUTOMATION_PARALLEL_CEILING}
-                      value={maxConcurrentJobs}
-                      onChange={(e) => setMaxConcurrentJobs(Number(e.target.value || 50))}
-                    />
-                    <p className="mt-1 text-xs text-[var(--muted)]">
-                      Total browsers/queue slots this project may use at once across all runs.
-                    </p>
-                  </Field>
-                </div>
-                {executionProvider === "lambdatest" && (
-                  <div className="grid gap-2 sm:grid-cols-3">
-                    <Input
-                      type="url"
-                      value={lambdaTestEndpoint}
-                      onChange={(e) => setLambdaTestEndpoint(e.target.value)}
-                      placeholder="LambdaTest endpoint"
-                    />
-                    <Input
-                      type="text"
-                      value={lambdaTestUsername}
-                      onChange={(e) => setLambdaTestUsername(e.target.value)}
-                      placeholder="LambdaTest username"
-                    />
-                    <Input
-                      type="password"
-                      value={lambdaTestAccessKey}
-                      onChange={(e) => setLambdaTestAccessKey(e.target.value)}
-                      placeholder="LambdaTest access key"
-                    />
-                  </div>
-                )}
-                {executionProvider === "browserstack" && (
-                  <div className="grid gap-2 sm:grid-cols-3">
-                    <Input
-                      type="url"
-                      value={browserStackEndpoint}
-                      onChange={(e) => setBrowserStackEndpoint(e.target.value)}
-                      placeholder="BrowserStack endpoint"
-                    />
-                    <Input
-                      type="text"
-                      value={browserStackUsername}
-                      onChange={(e) => setBrowserStackUsername(e.target.value)}
-                      placeholder="BrowserStack username"
-                    />
-                    <Input
-                      type="password"
-                      value={browserStackAccessKey}
-                      onChange={(e) => setBrowserStackAccessKey(e.target.value)}
-                      placeholder="BrowserStack access key"
-                    />
-                  </div>
-                )}
-              </div>
             </Card>
           )}
 
@@ -789,84 +579,6 @@ export default function ProjectSettingsPage() {
               </label>
             </Card>
           )}
-
-          {activeTab === "tesbo" && (
-            <Card className="p-4 space-y-4">
-              <div>
-                <h2 className="text-base font-semibold text-[var(--foreground)]">API Keys</h2>
-                <p className="mt-1 text-sm text-[var(--muted)]">
-                  Manage project access keys and report ingestion settings.
-                </p>
-              </div>
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={tesboKeepTrace}
-                  onChange={(e) => setTesboKeepTrace(e.target.checked)}
-                />
-                <span className="text-sm font-medium text-[var(--foreground)]">Keep trace artifacts</span>
-              </label>
-              <div>
-                <h3 className="text-sm font-medium text-[var(--foreground)] mb-1">Project access key</h3>
-                <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 font-mono text-sm break-all">
-                  {tesboIngestionApiKey || "No key generated yet."}
-                </div>
-                <div className="mt-2 flex gap-2">
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => navigator.clipboard.writeText(tesboIngestionApiKey || "")}
-                  >
-                    Copy
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => handleRotateTesboKey().catch(() => {})}
-                    disabled={rotatingTesboKey}
-                  >
-                    {rotatingTesboKey ? "Rotating…" : "Rotate key"}
-                  </Button>
-                </div>
-              </div>
-              <Field>
-                <FieldLabel>Trace retention</FieldLabel>
-                <Select
-                  value={tesboTraceRetentionDays}
-                  onChange={(e) => setTesboTraceRetentionDays(Number(e.target.value || 14))}
-                  disabled={!tesboKeepTrace}
-                >
-                  <option value={2}>2 days</option>
-                  <option value={14}>2 weeks</option>
-                  <option value={30}>1 month</option>
-                  <option value={180}>6 months</option>
-                  <option value={365}>12 months</option>
-                </Select>
-              </Field>
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={tesboAlertsEnabled}
-                  onChange={(e) => setTesboAlertsEnabled(e.target.checked)}
-                />
-                <span className="text-sm font-medium text-[var(--foreground)]">Enable Automation Reports alerts</span>
-              </label>
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={tesboShareByDefault}
-                  onChange={(e) => setTesboShareByDefault(e.target.checked)}
-                />
-                <span className="text-sm font-medium text-[var(--foreground)]">Share runs by default</span>
-              </label>
-              <p className="text-xs text-[var(--muted)]">
-                Automation Reports alert rules are managed in the Alerts tab.
-              </p>
-            </Card>
-          )}
-
           {message && (
             <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
               {message}
@@ -1018,13 +730,6 @@ export default function ProjectSettingsPage() {
           </Card>
         </section>
       )}
-
-      {activeTab === "alerts" && (
-        <div>
-          <TesboAlertSettings projectId={projectId} />
-        </div>
-      )}
-
       {activeTab === "integrations" && (
         <Card className="p-4 space-y-4">
           <div>

@@ -42,19 +42,6 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
     ],
   },
   {
-    section: "Agents",
-    items: [
-      {
-        href: "agents",
-        label: "Agents Control Center",
-        icon: "agent",
-        children: [
-          { href: "agents/testcase-generator", label: "Test Case Generator", icon: "agent" },
-        ],
-      },
-    ],
-  },
-  {
     section: "Assets",
     items: [
       { href: "knowledge-base", label: "Knowledge Base", icon: "book" },
@@ -81,7 +68,7 @@ type MenuIconName =
   | "home" | "dashboard" | "project" | "sparkles" | "history"
   | "book" | "list" | "clipboard" | "play" | "bug" | "chart"
   | "activity" | "runs" | "specs" | "tests" | "analytics"
-  | "agent" | "settings" | "users" | "plug" | "logout"
+  | "settings" | "users" | "plug" | "logout"
   | "chevronLeft" | "chevronRight" | "adminPanel" | "key";
 
 function MenuIcon({ name, className = "h-[18px] w-[18px]" }: { name: MenuIconName; className?: string }) {
@@ -103,7 +90,6 @@ function MenuIcon({ name, className = "h-[18px] w-[18px]" }: { name: MenuIconNam
     case "specs": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M7 4h10v16l-5-3-5 3V4z" /></svg>;
     case "tests": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M8 4h8M9 4v4l-4 7a4 4 0 0 0 3.5 6h7a4 4 0 0 0 3.5-6l-4-7V4" /></svg>;
     case "analytics": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 20V10M10 20V4M16 20v-8M22 20v-4" /></svg>;
-    case "agent": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M12 2L3 7v6c0 5.25 3.75 10 9 11 5.25-1 9-5.75 9-11V7l-9-5z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4" /></svg>;
     case "settings": return <svg {...common}><circle cx="12" cy="12" r="3" /><path strokeLinecap="round" strokeLinejoin="round" d="M19.4 15a1 1 0 0 0 .2 1.1l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9V20a2 2 0 1 1-4 0v-.1a1 1 0 0 0-.7-.9 1 1 0 0 0-1.1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H4a2 2 0 1 1 0-4h.1a1 1 0 0 0 .9-.7 1 1 0 0 0-.2-1.1l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1 1 0 0 0 1.1.2h.1a1 1 0 0 0 .6-.9V4a2 2 0 1 1 4 0v.1a1 1 0 0 0 .6.9h.1a1 1 0 0 0 1.1-.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1 1 0 0 0-.2 1.1v.1a1 1 0 0 0 .9.6H20a2 2 0 1 1 0 4h-.1a1 1 0 0 0-.9.6z" /></svg>;
     case "users": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path strokeLinecap="round" strokeLinejoin="round" d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></svg>;
     case "plug": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 3v6M15 3v6M7 9h10v2a5 5 0 0 1-5 5v5" /></svg>;

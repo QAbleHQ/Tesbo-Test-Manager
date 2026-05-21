@@ -59,24 +59,6 @@ jobs:
           docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
           docker push "${BACKEND_IMAGE_CLEAN}:latest"
 
-      - name: Build and push Tesbo-Automation-Agents image (sessions / automate)
-        run: |
-          set -euo pipefail
-          REGISTRY_CLEAN="$(printf '%s' "${REGISTRY}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
-          REPO_CLEAN="$(printf '%s' '${{ secrets.DOCR_REPO_AUTOMATION_AGENT }}' | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##')"
-          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
-          SESSION_IMAGE="${REGISTRY_CLEAN}/${REPO_CLEAN}:${IMAGE_TAG_CLEAN}"
-
-          if [[ -z "${REGISTRY_CLEAN}" || -z "${REPO_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
-            echo "REGISTRY, DOCR_REPO_AUTOMATION_AGENT (secret), or IMAGE_TAG is empty after normalization."
-            exit 1
-          fi
-
-          docker build -f Tesbo-Automation-Agents/Dockerfile -t "${SESSION_IMAGE}" Tesbo-Automation-Agents
-          docker push "${SESSION_IMAGE}"
-          docker tag "${SESSION_IMAGE}" "${REGISTRY_CLEAN}/${REPO_CLEAN}:latest"
-          docker push "${REGISTRY_CLEAN}/${REPO_CLEAN}:latest"
-
   deploy-frontend:
     needs: build-and-push
     runs-on: ubuntu-latest
@@ -191,82 +173,8 @@ jobs:
           TESBO_SPACES_ACCESS_KEY=${{ secrets.TESBO_SPACES_ACCESS_KEY }}
           TESBO_SPACES_SECRET_KEY=${{ secrets.TESBO_SPACES_SECRET_KEY }}
           TESBO_SIGNED_URL_TTL_SECONDS=${{ secrets.TESBO_SIGNED_URL_TTL_SECONDS }}
-          AUTOMATION_AGENT_BASE_URL=${{ secrets.AUTOMATION_AGENT_BASE_URL }}
-          AUTOMATION_AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
-          AUTOMATION_QUEUE_MAX_RETRIES=${{ secrets.AUTOMATION_QUEUE_MAX_RETRIES }}
-          EXECUTION_SERVICE_BASE_URL=${{ secrets.EXECUTION_SERVICE_BASE_URL }}
-          EXECUTION_SERVICE_API_KEY=${{ secrets.EXECUTION_SERVICE_API_KEY }}
-          EXECUTION_SERVICE_WEBHOOK_URL=${{ secrets.EXECUTION_SERVICE_WEBHOOK_URL }}
-          EXECUTION_SERVICE_WEBHOOK_SECRET=${{ secrets.EXECUTION_SERVICE_WEBHOOK_SECRET }}
           EOF"
 
           $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
           $SSH "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
           $SSH "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
-
-  deploy-automation-agent:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Start SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Deploy automation agent
-        env:
-          DROPLET_IP: ${{ secrets.DROPLET_AUTOMATION_AGENT_IP }}
-          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
-        run: |
-          set -e
-          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
-
-          # Stop all containers on this droplet to free ports
-          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
-          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
-          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
-          $SSH "docker builder prune -af || true"
-          $SSH "docker image prune -af || true"
-          $SSH "docker volume prune -f || true"
-          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
-
-          # Set up Nginx + SSL (idempotent)
-          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
-          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.AUTOMATION_AGENT_DOMAIN }} 7400 ${{ secrets.CERTBOT_EMAIL }}"
-
-          # Deploy container
-          $SSH "mkdir -p /opt/bettercases/automation-agent"
-          scp -o StrictHostKeyChecking=no deploy/Tesbo-Automation-Agents/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/automation-agent/docker-compose.yml
-
-          $SSH "cat > /opt/bettercases/automation-agent/.env <<'EOF'
-          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
-          DOCR_REPO_AUTOMATION_AGENT=${{ secrets.DOCR_REPO_AUTOMATION_AGENT }}
-          IMAGE_TAG=${{ github.sha }}
-          EOF"
-
-          $SSH "cat > /opt/bettercases/automation-agent/app.env <<'EOF'
-          PORT=7400
-          AGENT_SHARED_TOKEN=${{ secrets.AGENT_SHARED_TOKEN }}
-          ENABLE_WEBSOCKET_LIVE_STREAM=${{ secrets.ENABLE_WEBSOCKET_LIVE_STREAM }}
-          SESSION_REPOSITORY_MODE=${{ secrets.SESSION_REPOSITORY_MODE }}
-          ENABLE_REDIS_SESSION_REPOSITORY=${{ secrets.ENABLE_REDIS_SESSION_REPOSITORY }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
-          REDIS_PREFIX=${{ secrets.REDIS_PREFIX }}
-          REDIS_SESSION_TTL_SECONDS=${{ secrets.REDIS_SESSION_TTL_SECONDS }}
-          REDIS_LOCK_TTL_MS=${{ secrets.REDIS_LOCK_TTL_MS }}
-          REDIS_HEARTBEAT_INTERVAL_MS=${{ secrets.REDIS_HEARTBEAT_INTERVAL_MS }}
-          WS_HEARTBEAT_MS=${{ secrets.WS_HEARTBEAT_MS }}
-          WS_CLIENT_IDLE_TIMEOUT_MS=${{ secrets.WS_CLIENT_IDLE_TIMEOUT_MS }}
-          SESSION_CREATE_CONCURRENCY=${{ secrets.SESSION_CREATE_CONCURRENCY }}
-          MW_APM_ACCESS_TOKEN=${{ secrets.MW_APM_ACCESS_TOKEN }}
-          MW_AGENT_SERVICE=${{ secrets.MW_AGENT_SERVICE }}
-          MW_APM_SERVICE_NAME=tesbo-automation-agents
-          EOF"
-
-          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
-          $SSH "cd /opt/bettercases/automation-agent && docker compose pull && docker compose up -d --remove-orphans"
-          $SSH "sleep 5 && docker compose -f /opt/bettercases/automation-agent/docker-compose.yml ps"
-          $SSH "for i in \$(seq 1 30); do curl -fsS http://127.0.0.1:7400/health >/dev/null && exit 0; echo 'waiting for local health...'; sleep 2; done; echo 'agent health check failed'; docker compose -f /opt/bettercases/automation-agent/docker-compose.yml logs --tail=200; exit 1"
-          $SSH "for i in \$(seq 1 30); do curl -kfsS https://${{ secrets.AUTOMATION_AGENT_DOMAIN }}/health >/dev/null && exit 0; echo 'waiting for tls health...'; sleep 2; done; echo 'tls health check failed'; docker compose -f /opt/bettercases/automation-agent/docker-compose.yml logs --tail=200; exit 1"

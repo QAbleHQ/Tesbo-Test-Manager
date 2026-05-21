@@ -22,14 +22,6 @@ type HealthResponse = {
 const SERVICE_META: Record<string, { label: string; description: string }> = {
   backend: { label: "Backend API", description: "Javalin API server" },
   database: { label: "PostgreSQL", description: "Primary database" },
-  automation_agent: {
-    label: "Automation Agent",
-    description: "Interactive automation service",
-  },
-  test_runner_api: {
-    label: "Test Runner API",
-    description: "Queue-based execution API",
-  },
   artifact_storage: {
     label: "Artifact Storage",
     description: "Screenshots & trace storage",

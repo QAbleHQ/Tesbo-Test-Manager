@@ -342,7 +342,7 @@ function ProjectsPageContent() {
                   {p.description ? (
                     <p className="mt-2 line-clamp-2 text-sm text-[var(--muted)]">{p.description}</p>
                   ) : (
-                    <p className="mt-2 text-sm text-[var(--muted-soft)]">Add project context to guide agent execution and reviews.</p>
+                    <p className="mt-2 text-sm text-[var(--muted-soft)]">Add project context to guide test case planning and execution.</p>
                   )}
                   <div className="mt-4 grid grid-cols-3 gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3">
                     <div>

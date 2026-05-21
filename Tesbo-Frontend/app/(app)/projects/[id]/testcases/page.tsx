@@ -3,7 +3,6 @@
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import TagInput from "@/components/TagInput";
 import {
   authMe,
   listTestCases,
@@ -19,14 +18,10 @@ import {
   bulkDeleteTestCases,
   getExportUrl,
   getTemplateUrl,
-  getProject,
   type TestCaseListItem,
   type SuiteNode,
 } from "@/lib/api";
-import {
-  RepositoryTestCaseTable,
-  REPO_TC_AI_DISABLED_TITLE,
-} from "@/components/testcases/RepositoryTestCaseTable";
+import { RepositoryTestCaseTable } from "@/components/testcases/RepositoryTestCaseTable";
 import {
   Button,
   Input,
@@ -56,22 +51,13 @@ const TESTCASE_TYPES = [
   "Performance",
   "Security",
 ];
-const AUTOMATION_FEASIBILITY_OPTIONS = ["In Planning", "Not able to Automate", "Ready for the Automation", "Automated"];
-
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
-type PanelTab = "overview" | "steps" | "automation";
+type PanelTab = "overview" | "steps";
 type BulkAction = "" | "delete" | "update" | "archive";
 type ViewMode = "bySuites" | "allCases";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
-
-function parseTagString(raw: string): string[] {
-  return raw
-    .split(",")
-    .map((tag) => tag.trim())
-    .filter(Boolean);
-}
 
 function statusTone(s: string) {
   if (s === "Approved") return "success" as const;
@@ -115,11 +101,8 @@ export default function TestCasesPage() {
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
-  const [automationStatus, setAutomationStatus] = useState("In Planning");
-  const [automationScript, setAutomationScript] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
   const [attachments, setAttachments] = useState("");
-  const [automationTags, setAutomationTags] = useState<string[]>([]);
   const [type, setType] = useState("Functional");
   const [priority, setPriority] = useState("P2");
   const [status, setStatus] = useState("Draft");
@@ -139,14 +122,12 @@ export default function TestCasesPage() {
   const [suiteStatusFilter, setSuiteStatusFilter] = useState("all");
   const [suitePriorityFilter, setSuitePriorityFilter] = useState("all");
   const [suiteTypeFilter, setSuiteTypeFilter] = useState("all");
-  const [suiteAutomationFilter, setSuiteAutomationFilter] = useState("all");
   const [allCasesSuiteFilter, setAllCasesSuiteFilter] = useState("all");
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("bySuites");
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isImportExportMenuOpen, setIsImportExportMenuOpen] = useState(false);
   const importExportMenuRef = useRef<HTMLDivElement>(null);
-  const [aiConfigured, setAiConfigured] = useState(false);
   const loadData = useCallback(async () => {
     const suiteList = await listSuites(projectId);
     setSuites(suiteList);
@@ -159,9 +140,6 @@ export default function TestCasesPage() {
         return;
       }
       loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
-      getProject(projectId)
-        .then((p) => setAiConfigured(p.aiConfigured === true))
-        .catch(() => setAiConfigured(false));
     });
   }, [router, loadData, projectId]);
 
@@ -191,7 +169,6 @@ export default function TestCasesPage() {
     suiteStatusFilter !== "all",
     suitePriorityFilter !== "all",
     suiteTypeFilter !== "all",
-    suiteAutomationFilter !== "all",
     viewMode === "allCases" && allCasesSuiteFilter !== "all",
   ].filter(Boolean).length;
   const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / PAGE_SIZE));
@@ -226,7 +203,6 @@ export default function TestCasesPage() {
     suiteStatusFilter,
     suitePriorityFilter,
     suiteTypeFilter,
-    suiteAutomationFilter,
   ]);
 
   const loadSelectedSuiteCases = useCallback(async (pageOverride?: number) => {
@@ -251,7 +227,6 @@ export default function TestCasesPage() {
         status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
         priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
         type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
-        automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
         search: debouncedSuiteSearch || undefined,
       });
       setSuiteCases(list);
@@ -271,7 +246,6 @@ export default function TestCasesPage() {
     debouncedSuiteSearch,
     projectId,
     suiteCasesPage,
-    suiteAutomationFilter,
     suitePriorityFilter,
     suiteStatusFilter,
     suiteTypeFilter,
@@ -284,14 +258,6 @@ export default function TestCasesPage() {
   useEffect(() => {
     const visibleIds = new Set(selectedSuiteCases.map((tc) => tc.id));
     setSelectedCaseIds((prev) => prev.filter((id) => visibleIds.has(id)));
-  }, [selectedSuiteCases]);
-
-  const existingTagSuggestions = useMemo(() => {
-    const unique = new Set<string>();
-    selectedSuiteCases.forEach((tc) => {
-      parseTagString(tc.automationTags ?? "").forEach((tag) => unique.add(tag));
-    });
-    return Array.from(unique).sort((a, b) => a.localeCompare(b));
   }, [selectedSuiteCases]);
 
   function parseSteps(raw: unknown): Step[] {
@@ -311,11 +277,8 @@ export default function TestCasesPage() {
     setPreconditions((data.preconditions as string) ?? "");
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
-    setAutomationStatus((data.automationStatus as string) ?? "In Planning");
-    setAutomationScript((data.automationScript as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
     setAttachments((data.attachments as string) ?? "");
-    setAutomationTags(parseTagString((data.automationTags as string) ?? ""));
     setType((data.type as string) ?? "Functional");
     setPriority((data.priority as string) ?? "P2");
     setStatus((data.status as string) ?? "Draft");
@@ -330,11 +293,8 @@ export default function TestCasesPage() {
     setPreconditions("");
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
-    setAutomationStatus("In Planning");
-    setAutomationScript("");
     setEstimatedDuration("");
     setAttachments("");
-    setAutomationTags([]);
     setType("Functional");
     setPriority("P2");
     setStatus("Draft");
@@ -386,7 +346,6 @@ export default function TestCasesPage() {
     setSuiteStatusFilter("all");
     setSuitePriorityFilter("all");
     setSuiteTypeFilter("all");
-    setSuiteAutomationFilter("all");
     setAllCasesSuiteFilter("all");
     setSuiteCasesPage(1);
   }
@@ -569,7 +528,6 @@ export default function TestCasesPage() {
     setPanelSuccess(null);
     try {
       if (panelMode === "create") {
-        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         const created = await createTestCase(projectId, {
           suiteId: suiteId || undefined,
           title,
@@ -577,12 +535,8 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
-          automationTags: automationTags.join(", "),
-          automationScript,
-          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -593,7 +547,6 @@ export default function TestCasesPage() {
         setSuiteStatusFilter("all");
         setSuitePriorityFilter("all");
         setSuiteTypeFilter("all");
-        setSuiteAutomationFilter("all");
         await refreshData(1);
         setPanelSuccess("Test case created successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
@@ -603,7 +556,6 @@ export default function TestCasesPage() {
           await openViewPanel(created.id);
         }
       } else if (panelMode === "edit" && panelTestcaseId) {
-        const effectiveAutomationStatus = automationScript.trim() ? "Automated" : automationStatus;
         await updateTestCase(projectId, panelTestcaseId, {
           suiteId: suiteId || undefined,
           title,
@@ -611,12 +563,8 @@ export default function TestCasesPage() {
           preconditions,
           steps: JSON.stringify(steps),
           testData,
-          automationStatus: effectiveAutomationStatus,
           estimatedDuration,
           attachments,
-          automationTags: automationTags.join(", "),
-          automationScript,
-          automationScriptLanguage: "playwright-ts",
           type,
           priority,
           status,
@@ -643,7 +591,7 @@ export default function TestCasesPage() {
         header={
           <PageHeader
             title="Test case repository"
-            subtitle="Organize suites, curate test cases, and move from repository review into execution and automation with a cleaner operational workspace."
+            subtitle="Organize suites, curate test cases, and move from repository review into execution with a cleaner operational workspace."
             actions={
               <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-card)]">
@@ -836,12 +784,6 @@ export default function TestCasesPage() {
                       <option key={option} value={option}>{option}</option>
                     ))}
                   </Select>
-                  <Select value={suiteAutomationFilter} onChange={(e) => setSuiteAutomationFilter(e.target.value)} className="h-8 min-w-[140px] flex-1 text-sm">
-                    <option value="all">All automation states</option>
-                    {AUTOMATION_FEASIBILITY_OPTIONS.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </Select>
                   <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-8 min-w-[120px] flex-1 text-sm">
                     <option value="all">All statuses</option>
                     {TESTCASE_STATUSES.map((option) => (
@@ -885,7 +827,6 @@ export default function TestCasesPage() {
                     projectId={projectId}
                     suiteNameMap={suiteNameMap}
                     cases={selectedSuiteCases}
-                    aiConfigured={aiConfigured}
                     rowHighlightId={panelTestcaseId}
                     selectedCaseIdSet={selectedCaseIdSet}
                     areAllCasesSelected={areAllCasesSelected}
@@ -1052,7 +993,7 @@ export default function TestCasesPage() {
             {/* Tabs (only for edit mode) */}
             {panelMode === "edit" && (
               <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
-                {(["overview", "steps", "automation"] as PanelTab[]).map((tab) => (
+                {(["overview", "steps"] as PanelTab[]).map((tab) => (
                   <button
                     key={tab}
                     type="button"
@@ -1063,7 +1004,7 @@ export default function TestCasesPage() {
                         : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
                     }`}
                   >
-                    {tab === "overview" ? "Overview" : tab === "steps" ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}` : "Automation"}
+                    {tab === "overview" ? "Overview" : `Steps${steps.length > 0 ? ` (${steps.length})` : ""}`}
                   </button>
                 ))}
               </div>
@@ -1137,12 +1078,6 @@ export default function TestCasesPage() {
                           <FieldLabel>Estimated Duration</FieldLabel>
                           <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 10 min" />
                         </Field>
-                        <Field>
-                          <FieldLabel>Automation</FieldLabel>
-                          <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                            {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                          </Select>
-                        </Field>
                       </div>
                       <Field>
                         <FieldLabel>Preconditions</FieldLabel>
@@ -1152,7 +1087,6 @@ export default function TestCasesPage() {
                         <FieldLabel>Test Data</FieldLabel>
                         <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
                       </Field>
-                      <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
                       <div>
                         <div className="mb-3 flex items-center justify-between">
                           <FieldLabel>Test Steps</FieldLabel>
@@ -1184,11 +1118,6 @@ export default function TestCasesPage() {
                           ))}
                         </div>
                       </div>
-                      <Field>
-                        <FieldLabel>Playwright Script</FieldLabel>
-                        <Textarea value={automationScript} onChange={(e) => setAutomationScript(e.target.value)} rows={8} placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"} className="font-mono text-xs" />
-                        <p className="mt-1 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
-                      </Field>
                       <Field>
                         <FieldLabel>Attachments</FieldLabel>
                         <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
@@ -1247,14 +1176,7 @@ export default function TestCasesPage() {
                               <FieldLabel>Estimated Duration</FieldLabel>
                               <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 10 min" />
                             </Field>
-                            <Field>
-                              <FieldLabel>Automation</FieldLabel>
-                              <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                                {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                              </Select>
-                            </Field>
                           </div>
-                          <TagInput label="Tags / Labels" selectedTags={automationTags} onChange={setAutomationTags} suggestions={existingTagSuggestions} placeholder="Type a tag then press Enter" />
                           <Field>
                             <FieldLabel>Attachments</FieldLabel>
                             <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Links/paths to screenshots, logs, or reference docs" />
@@ -1296,34 +1218,6 @@ export default function TestCasesPage() {
                               ))}
                             </div>
                           )}
-                        </div>
-                      )}
-                      {panelTab === "automation" && (
-                        <div className="space-y-5 px-6 py-5">
-                          <div>
-                            <div className="mb-3 flex items-center justify-between">
-                              <FieldLabel>Playwright Script</FieldLabel>
-                              {panelTestcaseId && (
-                                <div className="flex items-center gap-2">
-                                  {aiConfigured ? (
-                                    <a href={`/projects/${projectId}/testcases/${panelTestcaseId}/automate`} target="_blank" rel="noopener noreferrer" className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-[var(--ai-primary)] bg-[var(--ai-soft)] px-3 text-xs font-semibold text-[var(--ai-primary)] hover:bg-[var(--ai-surface)]">
-                                      Open Automate
-                                    </a>
-                                  ) : (
-                                    <Button type="button" variant="ai" size="sm" disabled title={REPO_TC_AI_DISABLED_TITLE}>Open Automate</Button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                            <Textarea value={automationScript} onChange={(e) => setAutomationScript(e.target.value)} rows={16} placeholder={"import { test, expect } from '@playwright/test';\n\ntest('sample', async ({ page }) => {\n  await page.goto('https://example.com');\n  await expect(page).toHaveTitle(/Example/);\n});"} className="bg-[var(--background)] font-mono text-xs leading-relaxed" />
-                            <p className="mt-1.5 text-xs text-[var(--muted)]">Saving with script content will mark automation status as Automated.</p>
-                          </div>
-                          <Field>
-                            <FieldLabel>Automation Feasibility</FieldLabel>
-                            <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
-                              {AUTOMATION_FEASIBILITY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                            </Select>
-                          </Field>
                         </div>
                       )}
                     </>

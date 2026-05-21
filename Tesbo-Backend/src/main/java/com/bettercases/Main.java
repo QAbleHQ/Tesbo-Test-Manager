@@ -8,14 +8,10 @@ import com.bettercases.auth.SessionFilter;
 import com.bettercases.invitation.InvitationHandler;
 import com.bettercases.onboarding.OnboardingHandler;
 import com.bettercases.project.ProjectHandler;
-import com.bettercases.automation.AutomationSessionHandler;
 import com.bettercases.suite.SuiteHandler;
-import com.bettercases.tesbo.TesboReportsHandler;
 import com.bettercases.testcase.TestCaseHandler;
 import com.bettercases.plan.PlanHandler;
 import com.bettercases.cycle.CycleHandler;
-import com.bettercases.testexecution.ExecutionServiceWebhookHandler;
-import com.bettercases.testexecution.CycleScheduleWorker;
 import com.bettercases.workspace.WorkspaceHandler;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
@@ -126,24 +122,6 @@ public final class Main {
         app.post("/api/projects/{projectId}/testcases/bulk-update", com.bettercases.testcase.BulkUpdateHandler::bulkUpdate);
         app.post("/api/projects/{projectId}/testcases/bulk-delete", com.bettercases.testcase.BulkUpdateHandler::bulkDelete);
         app.get("/api/projects/{projectId}/testcases/linked-jira-keys", TestCaseHandler::linkedJiraKeys);
-        app.post("/api/projects/{projectId}/testcases/{testcaseId}/automation/sessions", AutomationSessionHandler::start);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands", AutomationSessionHandler::runCommand);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/commands/stop", AutomationSessionHandler::stopActiveCommand);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}", AutomationSessionHandler::getSession);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/stream", AutomationSessionHandler::stream);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live", AutomationSessionHandler::live);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/live/ws-info", AutomationSessionHandler::liveWsInfo);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/trace", AutomationSessionHandler::downloadLatestTrace);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/reset", AutomationSessionHandler::reset);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/finalize", AutomationSessionHandler::finalizeSession);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/cancel", AutomationSessionHandler::cancel);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/manual-actions", AutomationSessionHandler::manualAction);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/run-script", AutomationSessionHandler::runPlaywrightScript);
-        app.get("/api/projects/{projectId}/automation/sessions/{sessionId}/recording", AutomationSessionHandler::getRecording);
-        app.post("/api/projects/{projectId}/automation/sessions/{sessionId}/recording/compile", AutomationSessionHandler::compileRecording);
-        app.get("/api/projects/{projectId}/automation/recordings", AutomationSessionHandler::listRecordingsByProject);
-        app.get("/api/projects/{projectId}/automation/recordings/{recordingId}", AutomationSessionHandler::getRecordingById);
-        app.get("/api/projects/{projectId}/testcases/{testcaseId}/automation/recordings", AutomationSessionHandler::listRecordingsByTestcase);
 
         app.get("/api/projects/{projectId}/plans", PlanHandler::list);
         app.post("/api/projects/{projectId}/plans", PlanHandler::create);
@@ -167,15 +145,8 @@ public final class Main {
         app.delete("/api/cycles/{cycleId}/testcases/{testcaseId}", CycleHandler::removeTestCase);
         app.get("/api/cycles/{cycleId}/executions", CycleHandler::listExecutions);
         app.patch("/api/cycles/{cycleId}/executions/{executionId}", CycleHandler::updateExecution);
-        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-report", CycleHandler::getExecutionAutomationReport);
-        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-video", CycleHandler::streamExecutionAutomationVideo);
-        app.get("/api/cycles/{cycleId}/executions/{executionId}/automation-trace", CycleHandler::streamExecutionAutomationTrace);
         app.post("/api/cycles/{cycleId}/executions/bulk-assign", CycleHandler::bulkAssign);
         app.post("/api/cycles/{cycleId}/executions/bulk-status", CycleHandler::bulkUpdateStatus);
-        app.post("/api/cycles/{cycleId}/execute-automated", CycleHandler::executeAutomated);
-        app.get("/api/cycles/{cycleId}/execute-automated/latest/status", CycleHandler::getLatestAutomatedRunStatus);
-        app.get("/api/cycles/{cycleId}/execute-automated/{runId}/status", CycleHandler::getAutomatedRunStatus);
-        app.post("/api/cycles/{cycleId}/execute-automated/{runId}/cancel", CycleHandler::cancelAutomatedRun);
         app.post("/api/cycles/{cycleId}/share", CycleHandler::toggleShare);
         app.get("/api/projects/{projectId}/cycles/schedules", CycleHandler::listSchedules);
         app.post("/api/projects/{projectId}/cycles/schedules", CycleHandler::createSchedule);
@@ -185,9 +156,6 @@ public final class Main {
         // Public sharing endpoints (no authentication required)
         app.get("/api/public/shared-runs/{token}", CycleHandler::getPublicRun);
         app.get("/api/public/shared-runs/{token}/executions", CycleHandler::getPublicExecutions);
-
-        // Execution Service webhook endpoint
-        app.post("/api/webhooks/execution-service", ExecutionServiceWebhookHandler::handle);
 
         app.get("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::list);
         app.post("/api/projects/{projectId}/bugs", com.bettercases.bug.BugHandler::create);
@@ -239,37 +207,6 @@ public final class Main {
         app.get("/api/notifications", com.bettercases.notifications.NotificationHandler::list);
         app.post("/api/notifications/{id}/read", com.bettercases.notifications.NotificationHandler::markRead);
 
-        // Tesbo Reports (embedded module)
-        app.get("/api/projects/{projectId}/tesbo-reports/runs", TesboReportsHandler::listRuns);
-        app.get("/api/projects/{projectId}/tesbo-reports/runs/{runId}", TesboReportsHandler::getRun);
-        app.get("/api/projects/{projectId}/tesbo-reports/specs", TesboReportsHandler::listSpecs);
-        app.get("/api/projects/{projectId}/tesbo-reports/specs/{specName}", TesboReportsHandler::getSpec);
-        app.get("/api/projects/{projectId}/tesbo-reports/specs/{specName}/tests/{testName}", TesboReportsHandler::getTestHistory);
-        app.get("/api/projects/{projectId}/tesbo-reports/tests", TesboReportsHandler::listTests);
-        app.get("/api/projects/{projectId}/tesbo-reports/analytics", TesboReportsHandler::analytics);
-        app.get("/api/projects/{projectId}/tesbo-reports/alerts", TesboReportsHandler::listAlerts);
-        app.post("/api/projects/{projectId}/tesbo-reports/alerts", TesboReportsHandler::createAlert);
-        app.put("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}", TesboReportsHandler::updateAlert);
-        app.delete("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}", TesboReportsHandler::deleteAlert);
-        app.post("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}/toggle", TesboReportsHandler::toggleAlert);
-        app.post("/api/projects/{projectId}/tesbo-reports/alerts/{alertId}/send-test", TesboReportsHandler::sendTestAlert);
-        app.get("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::getShare);
-        app.post("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::createShare);
-        app.delete("/api/projects/{projectId}/tesbo-reports/runs/{runId}/share", TesboReportsHandler::disableShare);
-        app.get("/api/projects/{projectId}/tesbo-reports/settings", TesboReportsHandler::getSettings);
-        app.put("/api/projects/{projectId}/tesbo-reports/settings", TesboReportsHandler::updateSettings);
-        app.post("/api/projects/{projectId}/tesbo-reports/settings/rotate-key", TesboReportsHandler::rotateIngestionKey);
-        app.post("/api/projects/{projectId}/tesbo-reports/ingest/playwright", TesboReportsHandler::ingestPlaywright);
-        app.post("/api/projects/{projectId}/tesbo-reports/ingest/playwright/upload", TesboReportsHandler::ingestPlaywrightFile);
-        app.post("/api/projects/{projectId}/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifact);
-        app.get("/api/projects/{projectId}/tesbo-reports/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getCaseArtifact);
-        app.post("/api/tesbo-reports/ingest/playwright", TesboReportsHandler::ingestPlaywrightByKey);
-        app.post("/api/tesbo-reports/ingest/playwright/upload", TesboReportsHandler::ingestPlaywrightFileByKey);
-        app.post("/api/tesbo-reports/runs/{runId}/cases/{caseId}/artifacts/{kind}/upload", TesboReportsHandler::uploadCaseArtifactByKey);
-        app.get("/api/tesbo-reports/project-by-key", TesboReportsHandler::resolveProjectByKey);
-        app.get("/api/public/tesbo-reports/{token}", TesboReportsHandler::getPublicSharedRun);
-        app.get("/api/public/tesbo-reports/{token}/cases/{caseId}/artifacts/{kind}", TesboReportsHandler::getPublicSharedArtifact);
-
         // Platform Admin Panel
         app.get("/api/admin/system/health", SystemHealthHandler::check);
         app.get("/api/admin/customers", AdminStatsHandler::listCustomers);
@@ -284,7 +221,6 @@ public final class Main {
             ctx.status(500).json(java.util.Map.of("error", "Internal server error"));
         });
 
-        CycleScheduleWorker.start();
         app.start(Config.SERVER_PORT);
         System.out.println("Backend running on http://localhost:" + Config.SERVER_PORT);
     }
