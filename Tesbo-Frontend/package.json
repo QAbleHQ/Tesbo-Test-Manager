@@ -1,0 +1,29 @@
+{
+  "name": "tesbo-frontend",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --webpack",
+    "dev:turbo": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --turbopack",
+    "build": "next build",
+    "start": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@middleware.io/node-apm": "^2.4.2",
+    "next": "16.1.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "cross-env": "^10.1.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.1.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

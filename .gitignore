@@ -1,0 +1,53 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+.cursor/
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+.next/
+**/.next/
+dist/
+build/
+**/target/
+*.class
+
+# Runtime logs and lock files
+*.log
+*.lck
+next-dev*.log
+
+# Environment files
+.env
+.env.*
+*.env
+!*.env.example
+
+# Secrets and credentials
+infra/kubernetes/**/secret.yaml
+infra/kubernetes/base/registry-secret.yaml
+*.pem
+*.key
+*.p12
+*.jks
+
+# Local uploaded/generated artifacts
+Tesbo-Backend/uploads/
+Tesbo-Backend/uploads/tesbo-artifacts/
+Tesbo-Automation-Agents/
+Tesbo-Test-Runner-Agents/
+Tesbo-Execution/
+
+# Local validation screenshots
+localhost-screenshot.png
+localhost-run-detail-screenshot.png
+localhost-test-detail-screenshot.png
+portal-tesbo-screenshot.png
+
+# Stale/local-only directories
+automation-agent/
+backend/
+frontend/

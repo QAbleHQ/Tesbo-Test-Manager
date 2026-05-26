@@ -1,0 +1,180 @@
+name: Deploy TesboX to DigitalOcean
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ${{ secrets.DOCR_REGISTRY }}
+  FRONTEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_FRONTEND }}
+  BACKEND_IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO_BACKEND }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Login to DOCR
+        run: doctl registry login --expiry-seconds 1200
+
+      - name: Build and push frontend image
+        run: |
+          set -euo pipefail
+          FRONTEND_IMAGE_CLEAN="$(printf '%s' "${FRONTEND_IMAGE}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+
+          if [[ -z "${FRONTEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "FRONTEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f Tesbo-Frontend/Dockerfile -t "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" \
+            --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
+            Tesbo-Frontend
+          docker push "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${FRONTEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${FRONTEND_IMAGE_CLEAN}:latest"
+          docker push "${FRONTEND_IMAGE_CLEAN}:latest"
+
+      - name: Build and push backend image
+        run: |
+          set -euo pipefail
+          BACKEND_IMAGE_CLEAN="$(printf '%s' "${BACKEND_IMAGE}" | tr -d '\r\n' | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#//+#/#g; s#^https?://##; s#/*$##')"
+          IMAGE_TAG_CLEAN="$(printf '%s' "${IMAGE_TAG}" | tr -d '\r\n[:space:]')"
+
+          if [[ -z "${BACKEND_IMAGE_CLEAN}" || -z "${IMAGE_TAG_CLEAN}" ]]; then
+            echo "BACKEND_IMAGE or IMAGE_TAG is empty after normalization."
+            exit 1
+          fi
+
+          docker build -f Tesbo-Backend-Nest/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" Tesbo-Backend-Nest
+          docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
+          docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
+          docker push "${BACKEND_IMAGE_CLEAN}:latest"
+
+  deploy-frontend:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy frontend
+        env:
+          DROPLET_IP: ${{ secrets.DROPLET_FRONTEND_IP }}
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          set -e
+          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
+
+          # Stop all containers on this droplet to free ports
+          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
+          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
+          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
+          $SSH "docker builder prune -af || true"
+          $SSH "docker image prune -af || true"
+          $SSH "docker volume prune -f || true"
+          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
+
+          # Set up Nginx + SSL (idempotent)
+          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
+          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.FRONTEND_DOMAIN }} 3000 ${{ secrets.CERTBOT_EMAIL }}"
+
+          # Deploy container
+          $SSH "mkdir -p /opt/bettercases/frontend"
+          scp -o StrictHostKeyChecking=no deploy/Tesbo-Frontend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/frontend/docker-compose.yml
+
+          $SSH "cat > /opt/bettercases/frontend/.env <<'EOF'
+          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
+          DOCR_REPO_FRONTEND=${{ secrets.DOCR_REPO_FRONTEND }}
+          IMAGE_TAG=${{ github.sha }}
+          EOF"
+
+          $SSH "cat > /opt/bettercases/frontend/app.env <<'EOF'
+          NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          MW_APM_ACCESS_TOKEN=${{ secrets.MW_APM_ACCESS_TOKEN }}
+          MW_AGENT_SERVICE=${{ secrets.MW_AGENT_SERVICE }}
+          MW_APM_SERVICE_NAME=tesbo-frontend
+          EOF"
+
+          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          $SSH "cd /opt/bettercases/frontend && docker compose pull && docker compose up -d --remove-orphans"
+
+  deploy-backend:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy backend
+        env:
+          DROPLET_IP: ${{ secrets.DROPLET_BACKEND_IP }}
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          set -e
+          SSH="ssh -o StrictHostKeyChecking=no root@$DROPLET_IP"
+
+          # Stop all containers on this droplet to free ports
+          $SSH "docker stop \$(docker ps -q) 2>/dev/null || true"
+          $SSH "docker rm \$(docker ps -aq) 2>/dev/null || true"
+          $SSH "echo 'Docker disk usage before cleanup:' && docker system df || true"
+          $SSH "docker builder prune -af || true"
+          $SSH "docker image prune -af || true"
+          $SSH "docker volume prune -f || true"
+          $SSH "echo 'Docker disk usage after cleanup:' && docker system df || true"
+
+          # Set up Nginx + SSL (idempotent)
+          scp -o StrictHostKeyChecking=no deploy/nginx/setup-ssl.sh root@"$DROPLET_IP":/tmp/setup-ssl.sh
+          $SSH "chmod +x /tmp/setup-ssl.sh && /tmp/setup-ssl.sh ${{ secrets.BACKEND_DOMAIN }} 7000 ${{ secrets.CERTBOT_EMAIL }}"
+
+          # Deploy container
+          $SSH "mkdir -p /opt/bettercases/backend"
+          scp -o StrictHostKeyChecking=no deploy/Tesbo-Backend/docker-compose.yml root@"$DROPLET_IP":/opt/bettercases/backend/docker-compose.yml
+
+          $SSH "cat > /opt/bettercases/backend/.env <<'EOF'
+          DOCR_REGISTRY=${{ secrets.DOCR_REGISTRY }}
+          DOCR_REPO_BACKEND=${{ secrets.DOCR_REPO_BACKEND }}
+          IMAGE_TAG=${{ github.sha }}
+          EOF"
+
+          $SSH "cat > /opt/bettercases/backend/app.env <<'EOF'
+          PORT=7000
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          DATABASE_USER=${{ secrets.DATABASE_USER }}
+          DATABASE_PASSWORD=${{ secrets.DATABASE_PASSWORD }}
+          CORS_ALLOWED_ORIGINS=${{ secrets.CORS_ALLOWED_ORIGINS }}
+          FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+          SESSION_DAYS=${{ secrets.SESSION_DAYS }}
+          POSTMARK_API_TOKEN=${{ secrets.POSTMARK_API_TOKEN }}
+          POSTMARK_FROM_EMAIL=${{ secrets.POSTMARK_FROM_EMAIL }}
+          JIRA_CLIENT_ID=${{ secrets.JIRA_CLIENT_ID }}
+          JIRA_CLIENT_SECRET=${{ secrets.JIRA_CLIENT_SECRET }}
+          JIRA_REDIRECT_URI=${{ secrets.JIRA_REDIRECT_URI }}
+          TESBO_ARTIFACT_STORAGE_PROVIDER=${{ secrets.TESBO_ARTIFACT_STORAGE_PROVIDER }}
+          TESBO_SPACES_ENDPOINT=${{ secrets.TESBO_SPACES_ENDPOINT }}
+          TESBO_SPACES_REGION=${{ secrets.TESBO_SPACES_REGION }}
+          TESBO_SPACES_BUCKET=${{ secrets.TESBO_SPACES_BUCKET }}
+          TESBO_SPACES_ACCESS_KEY=${{ secrets.TESBO_SPACES_ACCESS_KEY }}
+          TESBO_SPACES_SECRET_KEY=${{ secrets.TESBO_SPACES_SECRET_KEY }}
+          TESBO_SIGNED_URL_TTL_SECONDS=${{ secrets.TESBO_SIGNED_URL_TTL_SECONDS }}
+          EOF"
+
+          $SSH "docker login registry.digitalocean.com -u doctl -p ${DO_API_TOKEN}"
+          $SSH "cd /opt/bettercases/backend && docker compose pull && docker compose up -d --remove-orphans"
+          $SSH "sleep 5 && docker compose -f /opt/bettercases/backend/docker-compose.yml ps"
