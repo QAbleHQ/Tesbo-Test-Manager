@@ -255,7 +255,7 @@ See attached screenshots:
 ```json
 {
   "url": "http://localhost:3000/projects/4804a8b3-7c9c-4f2d-807f-c52ba1a2380f/tesbo-reports/runs",
-  "title": "TesboX",
+  "title": "Tesbo",
   "headings": [
     {
       "tag": "H1",

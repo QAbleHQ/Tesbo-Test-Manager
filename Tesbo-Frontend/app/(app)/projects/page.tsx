@@ -238,7 +238,7 @@ function ProjectsPageContent() {
       header={(
         <PageHeader
           title="Projects"
-          subtitle="TesboX end-to-end test management projects."
+          subtitle="Tesbo end-to-end test management projects."
           actions={canCreateProject ? (
             <Button onClick={() => setCreateOpen(true)}>
               {projects.length === 0 ? "Create your first project" : "Create project"}
@@ -252,7 +252,7 @@ function ProjectsPageContent() {
           title="No projects yet"
           description={
             canCreateProject
-              ? "Create a TesboX project for full E2E test management."
+              ? "Create a Tesbo project for full E2E test management."
               : "You do not have project access yet. Ask your manager to grant access."
           }
           action={canCreateProject ? <Button onClick={() => setCreateOpen(true)}>Create first project</Button> : null}
@@ -312,7 +312,7 @@ function ProjectsPageContent() {
         <div className="mt-6">
           <h3 className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted)]">
             <svg className="h-4 w-4 text-[var(--brand-primary)]" fill="none" stroke="currentColor" strokeWidth={1.75} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M3 7h8l2 2h8v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" /></svg>
-            TesboX Projects
+            Tesbo Projects
           </h3>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
@@ -342,7 +342,7 @@ function ProjectsPageContent() {
                   {p.description ? (
                     <p className="mt-2 line-clamp-2 text-sm text-[var(--muted)]">{p.description}</p>
                   ) : (
-                    <p className="mt-2 text-sm text-[var(--muted-soft)]">Add project context to guide agent execution and reviews.</p>
+                    <p className="mt-2 text-sm text-[var(--muted-soft)]">Add project context to guide test case planning and execution.</p>
                   )}
                   <div className="mt-4 grid grid-cols-3 gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3">
                     <div>

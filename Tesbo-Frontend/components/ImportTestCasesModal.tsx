@@ -21,7 +21,6 @@ const IMPORTABLE_FIELDS: { key: string; label: string; required?: boolean }[] = 
   { key: "priority", label: "Priority" },
   { key: "severity", label: "Severity" },
   { key: "type", label: "Type" },
-  { key: "automationStatus", label: "Automation Status" },
   { key: "status", label: "Status" },
   { key: "suite", label: "Suite" },
   { key: "component", label: "Component" },

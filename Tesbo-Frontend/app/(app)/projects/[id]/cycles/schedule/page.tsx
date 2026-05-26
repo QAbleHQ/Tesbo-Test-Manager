@@ -112,7 +112,7 @@ export default function ScheduleRunsPage() {
       header={
         <PageHeader
           title="Schedule Test Run"
-          subtitle="Schedule automated execution for runs that contain automated test cases only."
+          subtitle="Create one-time or recurring reminders for planned test runs."
           actions={
             <Link
               href={`/projects/${projectId}/cycles`}

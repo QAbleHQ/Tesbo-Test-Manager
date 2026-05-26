@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 
 export const metadata: Metadata = {
-  title: "Privacy Policy | TesboX",
-  description: "Privacy Policy for TesboX and Jira integration.",
+  title: "Privacy Policy | Tesbo",
+  description: "Privacy Policy for Tesbo and Jira integration.",
 };
 
 export default function PrivacyPolicyPage() {
@@ -17,8 +17,8 @@ export default function PrivacyPolicyPage() {
           <section>
             <h2 className="text-lg font-semibold text-[var(--foreground)]">1. Scope</h2>
             <p className="mt-2">
-              This Privacy Policy explains how TesboX collects, uses, stores, and shares information when you use
-              the TesboX web application, including Jira integration features made available through Atlassian.
+              This Privacy Policy explains how Tesbo collects, uses, stores, and shares information when you use
+              the Tesbo web application, including Jira integration features made available through Atlassian.
             </p>
           </section>
 
@@ -35,7 +35,7 @@ export default function PrivacyPolicyPage() {
               </li>
               <li>
                 Jira integration data, including Jira site URL, project metadata, issue metadata, and mapped links
-                between Jira issues and TesboX records.
+                between Jira issues and Tesbo records.
               </li>
               <li>Operational logs and audit activity required for security, troubleshooting, and product operation.</li>
             </ul>
@@ -59,9 +59,9 @@ export default function PrivacyPolicyPage() {
               4. Jira and Atlassian Data Handling
             </h2>
             <p className="mt-2">
-              When a workspace administrator connects Jira, TesboX receives and stores OAuth credentials and
+              When a workspace administrator connects Jira, Tesbo receives and stores OAuth credentials and
               selected Jira project and issue data needed for integration features. We use this data only to provide
-              Jira-related functionality inside TesboX, such as synchronization and issue linking.
+              Jira-related functionality inside Tesbo, such as synchronization and issue linking.
             </p>
           </section>
 
@@ -69,7 +69,7 @@ export default function PrivacyPolicyPage() {
             <h2 className="text-lg font-semibold text-[var(--foreground)]">
               5. Third-Party Processors
             </h2>
-            <p className="mt-2">Depending on configuration, TesboX may use third-party providers for:</p>
+            <p className="mt-2">Depending on configuration, Tesbo may use third-party providers for:</p>
             <ul className="mt-2 list-disc pl-5 space-y-1">
               <li>Email delivery (for OTP and notification messages).</li>
               <li>Atlassian APIs for Jira integration.</li>
@@ -82,7 +82,7 @@ export default function PrivacyPolicyPage() {
             <h2 className="text-lg font-semibold text-[var(--foreground)]">6. Data Sharing</h2>
             <p className="mt-2">
               We do not sell personal information. We share data only with service providers as required to operate
-              TesboX, to comply with legal obligations, or based on your workspace configuration and user actions.
+              Tesbo, to comply with legal obligations, or based on your workspace configuration and user actions.
             </p>
           </section>
 
@@ -97,7 +97,7 @@ export default function PrivacyPolicyPage() {
           <section>
             <h2 className="text-lg font-semibold text-[var(--foreground)]">8. Security</h2>
             <p className="mt-2">
-              TesboX applies technical and organizational controls designed to protect stored information. No
+              Tesbo applies technical and organizational controls designed to protect stored information. No
               method of transmission or storage is completely secure, and absolute security cannot be guaranteed.
             </p>
           </section>
@@ -114,8 +114,8 @@ export default function PrivacyPolicyPage() {
             <h2 className="text-lg font-semibold text-[var(--foreground)]">10. Contact</h2>
             <p className="mt-2">
               For privacy requests or questions, contact us at{" "}
-              <a href="mailto:support@bettercases.ai" className="text-[var(--brand-primary)] hover:underline">
-                support@bettercases.ai
+              <a href="mailto:support@tesbo.io" className="text-[var(--brand-primary)] hover:underline">
+                support@tesbo.io
               </a>
               .
             </p>

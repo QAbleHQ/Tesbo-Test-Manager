@@ -1,7 +1,7 @@
 {
   "name": "tesbo-frontend",
   "version": "0.1.0",
-  "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --webpack",
     "dev:turbo": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --turbopack",

@@ -1,9 +1,0 @@
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: tesbo-automation-agent-pdb
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: tesbo-automation-agent

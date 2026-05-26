@@ -21,9 +21,9 @@ if command -v docker &>/dev/null && docker compose exec postgres true 2>/dev/nul
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${USERNAME}') THEN
         CREATE USER ${USERNAME} WITH PASSWORD '${PASSWORD}';
-        GRANT ALL PRIVILEGES ON DATABASE bettercases TO ${USERNAME};
-        ALTER DATABASE bettercases OWNER TO ${USERNAME};
-        RAISE NOTICE 'Created user ${USERNAME} and granted access to bettercases.';
+        GRANT ALL PRIVILEGES ON DATABASE tesbo TO ${USERNAME};
+        ALTER DATABASE tesbo OWNER TO ${USERNAME};
+        RAISE NOTICE 'Created user ${USERNAME} and granted access to tesbo.';
       ELSE
         RAISE NOTICE 'User ${USERNAME} already exists.';
       END IF;
@@ -37,9 +37,9 @@ else
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${USERNAME}') THEN
         CREATE USER ${USERNAME} WITH PASSWORD '${PASSWORD}';
-        GRANT ALL PRIVILEGES ON DATABASE bettercases TO ${USERNAME};
-        ALTER DATABASE bettercases OWNER TO ${USERNAME};
-        RAISE NOTICE 'Created user ${USERNAME} and granted access to bettercases.';
+        GRANT ALL PRIVILEGES ON DATABASE tesbo TO ${USERNAME};
+        ALTER DATABASE tesbo OWNER TO ${USERNAME};
+        RAISE NOTICE 'Created user ${USERNAME} and granted access to tesbo.';
       ELSE
         RAISE NOTICE 'User ${USERNAME} already exists.';
       END IF;
@@ -47,4 +47,4 @@ else
     \$\$;
   "
 fi
-echo "Done. Use in Tesbo-Backend/.env: DATABASE_USER=${USERNAME} DATABASE_PASSWORD=${PASSWORD}"
+echo "Done. Use in Tesbo-Backend-Nest/.env: DATABASE_USER=${USERNAME} DATABASE_PASSWORD=${PASSWORD}"
