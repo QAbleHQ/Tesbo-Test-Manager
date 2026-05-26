@@ -146,7 +146,7 @@ export default function ManageAdminsPage() {
             </p>
           )}
           <p className="mt-2 text-[12px] text-[var(--muted)]">
-            The user must already have a TesboX account. Admins can view all
+            The user must already have a Tesbo account. Admins can view all
             platform data. Only owners can manage other admins.
           </p>
         </div>

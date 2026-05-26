@@ -178,7 +178,7 @@ export default function AdminSidebar() {
         <Link
           href="/admin"
           className={`flex items-center gap-2 ${isCollapsed ? "justify-center" : ""}`}
-          aria-label="TesboX Admin"
+          aria-label="Tesbo Admin"
         >
           {isCollapsed ? (
             <span className="text-base font-bold text-[var(--brand-primary)]">
@@ -191,7 +191,7 @@ export default function AdminSidebar() {
                 className="h-5 w-5 text-[var(--brand-primary)]"
               />
               <span className="text-[15px] font-bold text-[var(--foreground)]">
-                TesboX Admin
+                Tesbo Admin
               </span>
             </div>
           )}

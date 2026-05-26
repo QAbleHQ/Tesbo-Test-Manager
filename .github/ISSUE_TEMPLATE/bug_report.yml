@@ -52,7 +52,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS, browser, Node, Java, database, deployment method, or other relevant details.
+      description: OS, browser, Node, database, deployment method, or other relevant details.
 
   - type: textarea
     id: logs

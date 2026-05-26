@@ -1,12 +1,12 @@
-# Contributing to TesboX
+# Contributing to Tesbo
 
-Thanks for helping improve TesboX.
+Thanks for helping improve Tesbo.
 
-TesboX is exclusively developed and maintained by QAble Testlab.
+Tesbo is exclusively developed and maintained by QAble Testlab.
 
 ## Development
 
-TesboX is a monorepo with three main services:
+Tesbo is a monorepo with three main services:
 
 - `Tesbo-Frontend/` - Next.js frontend
 - `Tesbo-Backend/` - Java 17 backend
@@ -34,4 +34,4 @@ mvn test
 
 ## License
 
-TesboX is licensed under the Apache License 2.0. See `LICENSE`.
+Tesbo is licensed under the Apache License 2.0. See `LICENSE`.

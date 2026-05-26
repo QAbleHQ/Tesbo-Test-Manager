@@ -20,7 +20,7 @@ type HealthResponse = {
 };
 
 const SERVICE_META: Record<string, { label: string; description: string }> = {
-  backend: { label: "Backend API", description: "Javalin API server" },
+  backend: { label: "Backend API", description: "NestJS API server" },
   database: { label: "PostgreSQL", description: "Primary database" },
   artifact_storage: {
     label: "Artifact Storage",

@@ -241,11 +241,11 @@ function SidebarContent() {
       }`}
     >
       <div className="flex h-14 items-center justify-between gap-2 border-b border-[var(--border)] px-3">
-        <Link href="/projects" className={`flex items-center ${isCollapsed ? "justify-center" : ""}`} aria-label="TesboX">
+        <Link href="/projects" className={`flex items-center ${isCollapsed ? "justify-center" : ""}`} aria-label="Tesbo">
           {isCollapsed ? (
             <span className="text-base font-bold text-[var(--foreground)]">TX</span>
           ) : (
-            <Image src="/tesbox-logo-transparent.png" alt="TesboX" width={110} height={30} priority className="h-7 w-auto" />
+            <Image src="/tesbox-logo-transparent.png" alt="Tesbo" width={110} height={30} priority className="h-7 w-auto" />
           )}
         </Link>
         <button

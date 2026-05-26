@@ -1,6 +1,6 @@
 # Code of Conduct
 
-TesboX contributors are expected to keep project spaces respectful, constructive, and focused on improving the software.
+Tesbo contributors are expected to keep project spaces respectful, constructive, and focused on improving the software.
 
 ## Expected Behavior
 

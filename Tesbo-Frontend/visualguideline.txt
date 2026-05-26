@@ -1,8 +1,8 @@
-# Tesbo-X Visual Language Spec
+# Tesbo Visual Language Spec
 
 ## Product Positioning
 
-Tesbo-X is not a QA admin dashboard. It is a control plane for autonomous testing operations.
+Tesbo is not a QA admin dashboard. It is a control plane for autonomous testing operations.
 
 The interface must communicate three things at all times:
 
@@ -718,4 +718,4 @@ Implement the frontend using reusable design tokens and shared primitives.
 
 ## One-Line North Star
 
-Tesbo-X should feel like a precision control plane for autonomous testing systems, where agents execute, humans approve, and every screen makes operational progress visible.
+Tesbo should feel like a precision control plane for autonomous testing systems, where agents execute, humans approve, and every screen makes operational progress visible.

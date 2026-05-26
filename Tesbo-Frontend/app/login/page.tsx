@@ -1,10 +1,10 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
-import { requestOtp } from "@/lib/api";
+import { getSetupStatus, loginWithPassword, requestOtp } from "@/lib/api";
 import { Button, Field, FieldError, FieldHint, FieldLabel, Input } from "@/components/ui";
 
 function LoginForm() {
@@ -14,8 +14,23 @@ function LoginForm() {
   const inviteEmail = searchParams.get("inviteEmail")?.trim().toLowerCase() || "";
   const isInviteEmailLocked = Boolean(inviteEmail);
   const [email, setEmail] = useState(inviteEmail);
+  const [password, setPassword] = useState("");
+  const [otpMode, setOtpMode] = useState(Boolean(inviteEmail));
+  const [checkingSetup, setCheckingSetup] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    getSetupStatus()
+      .then((status) => {
+        if (status.required) {
+          router.replace("/setup");
+          return;
+        }
+        setCheckingSetup(false);
+      })
+      .catch(() => setCheckingSetup(false));
+  }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -25,21 +40,40 @@ function LoginForm() {
       setError("Email is required");
       return;
     }
+    if (!otpMode && !password) {
+      setError("Password is required");
+      return;
+    }
+
     setLoading(true);
     try {
-      await requestOtp(emailToUse);
-      const qp = new URLSearchParams({ email: emailToUse });
-      if (redirect) qp.set("redirect", redirect);
-      if (isInviteEmailLocked) {
-        qp.set("inviteEmail", inviteEmail);
-        qp.set("lockEmail", "1");
+      if (otpMode) {
+        await requestOtp(emailToUse);
+        const qp = new URLSearchParams({ email: emailToUse });
+        if (redirect) qp.set("redirect", redirect);
+        if (isInviteEmailLocked) {
+          qp.set("inviteEmail", inviteEmail);
+          qp.set("lockEmail", "1");
+        }
+        router.push(`/verify-otp?${qp.toString()}`);
+      } else {
+        await loginWithPassword(emailToUse, password);
+        router.push(redirect || "/projects");
+        router.refresh();
       }
-      router.push(`/verify-otp?${qp.toString()}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Request failed. You may be rate limited.");
+      setError(err instanceof Error ? err.message : "Sign in failed.");
     } finally {
       setLoading(false);
     }
+  }
+
+  if (checkingSetup) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--background)]">
+        <p className="text-[var(--muted)]">Loading...</p>
+      </div>
+    );
   }
 
   return (
@@ -48,13 +82,15 @@ function LoginForm() {
         <div className="text-center">
           <Image
             src="/tesbox-logo-transparent.png"
-            alt="TesboX"
+            alt="Tesbo"
             width={280}
             height={80}
             priority
             className="mx-auto h-14 w-auto"
           />
-          <p className="mt-1 text-sm text-[var(--muted)]">Sign in with your email</p>
+          <p className="mt-1 text-sm text-[var(--muted)]">
+            {otpMode ? "Sign in with a one-time code" : "Sign in with your admin password"}
+          </p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <Field>
@@ -74,17 +110,39 @@ function LoginForm() {
               </FieldHint>
             )}
           </Field>
+          {!otpMode && (
+            <Field>
+              <FieldLabel htmlFor="password">Password</FieldLabel>
+              <Input
+                id="password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Your password"
+                disabled={loading}
+              />
+            </Field>
+          )}
           {error && <FieldError>{error}</FieldError>}
-          <Button
-            type="submit"
-            disabled={loading}
-            fullWidth
-          >
-            {loading ? "Sending…" : "Send login code"}
+          <Button type="submit" disabled={loading} fullWidth>
+            {loading ? (otpMode ? "Sending..." : "Signing in...") : (otpMode ? "Send login code" : "Sign in")}
           </Button>
         </form>
+        {!isInviteEmailLocked && (
+          <button
+            type="button"
+            onClick={() => {
+              setError("");
+              setOtpMode((value) => !value);
+            }}
+            className="w-full text-center text-sm font-medium text-[var(--brand-primary)] hover:underline"
+          >
+            {otpMode ? "Sign in with password" : "Use email code instead"}
+          </button>
+        )}
         <p className="text-center text-sm text-[var(--muted)]">
-          We’ll send a one-time code to your email. No password needed.
+          {otpMode ? "We will send a one-time code to your email." : "Use the password created during initial setup."}
         </p>
         <p className="text-center text-xs text-[var(--muted-soft)]">
           <Link href="/privacy-policy" className="hover:underline">
@@ -102,7 +160,7 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen flex items-center justify-center">Loading…</div>}>
+    <Suspense fallback={<div className="min-h-screen flex items-center justify-center">Loading...</div>}>
       <LoginForm />
     </Suspense>
   );

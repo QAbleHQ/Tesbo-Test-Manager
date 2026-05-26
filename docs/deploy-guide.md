@@ -1,4 +1,4 @@
-# TesboX DigitalOcean Deploy Guide
+# Tesbo DigitalOcean Deploy Guide
 
 This guide covers the first public release: the core test case management platform.
 
@@ -50,7 +50,7 @@ Backend runtime secrets:
 ## Deploy Flow
 
 1. Add or update all GitHub secrets.
-2. Trigger **Deploy TesboX to DigitalOcean** from GitHub Actions.
+2. Trigger **Deploy Tesbo to DigitalOcean** from GitHub Actions.
 3. The workflow builds and pushes frontend and backend images with `sha` and `latest` tags.
 4. The workflow deploys each image to its droplet through SSH and Docker Compose.
 

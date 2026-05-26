@@ -6,14 +6,16 @@ services:
     restart: unless-stopped
     env_file:
       - app.env
-    environment:
-      - JAVA_OPTS=-Xms256m -Xmx768m
     ports:
       - "127.0.0.1:7000:7000"
     volumes:
       - ./uploads:/app/uploads
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7000/health"]
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:7000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+        ]
       interval: 30s
       timeout: 5s
       retries: 3

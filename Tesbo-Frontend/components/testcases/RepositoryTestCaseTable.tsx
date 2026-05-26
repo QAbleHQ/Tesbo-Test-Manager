@@ -159,7 +159,7 @@ type TablePrefs = {
 };
 
 function storageKey(projectId: string) {
-  return `bettercases-repo-tc-table:v1:${projectId}`;
+  return `tesbo-repo-tc-table:v1:${projectId}`;
 }
 
 function normalizeDataOrder(raw: unknown): RepoDataColumnId[] {

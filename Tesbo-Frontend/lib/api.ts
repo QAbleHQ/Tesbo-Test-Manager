@@ -138,6 +138,23 @@ export async function requestOtp(email: string): Promise<void> {
   await api("/api/auth/otp/request", { method: "POST", body: { email } });
 }
 
+export async function getSetupStatus(): Promise<{ required: boolean }> {
+  return api<{ required: boolean }>("/api/setup/status");
+}
+
+export async function createFirstAdmin(data: {
+  email: string;
+  password: string;
+  orgName: string;
+  demoData: boolean;
+}): Promise<{ userId: string; organizationId: string; projectId: string }> {
+  return api("/api/setup/first-admin", { method: "POST", body: data });
+}
+
+export async function loginWithPassword(email: string, password: string): Promise<{ ok: boolean; userId: string }> {
+  return api("/api/auth/password/login", { method: "POST", body: { email, password } });
+}
+
 export async function verifyOtp(email: string, code: string): Promise<{ ok: boolean; userId: string }> {
   return api("/api/auth/otp/verify", { method: "POST", body: { email, code } });
 }

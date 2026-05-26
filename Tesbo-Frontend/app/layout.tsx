@@ -3,7 +3,7 @@ import "./globals.css";
 import { THEME_STORAGE_KEY } from "@/lib/theme";
 
 export const metadata: Metadata = {
-  title: "TesboX",
+  title: "Tesbo",
   description: "AI-Powered Test Case Management",
   icons: {
     icon: "/tesbox-logo-transparent.png",

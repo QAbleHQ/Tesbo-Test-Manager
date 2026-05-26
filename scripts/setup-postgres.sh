@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Idempotent local PostgreSQL setup for BetterCases.
+# Idempotent local PostgreSQL setup for Tesbo.
 # - Prefers Docker Compose postgres service (project default)
 # - Falls back to local psql if Docker is unavailable
 #
 # Usage:
 #   ./scripts/setup-postgres.sh
-#   ./scripts/setup-postgres.sh --user lifetools --password lifetools --db bettercases
+#   ./scripts/setup-postgres.sh --user lifetools --password lifetools --db tesbo
 
 set -euo pipefail
 
@@ -15,7 +15,7 @@ cd "$PROJECT_ROOT"
 
 DB_USER="postgres"
 DB_PASSWORD="postgres"
-DB_NAME="bettercases"
+DB_NAME="tesbo"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "Setting up PostgreSQL for BetterCases..."
+echo "Setting up PostgreSQL for Tesbo..."
 
 if command -v docker >/dev/null 2>&1; then
   echo "Docker detected. Starting postgres service..."
@@ -155,7 +155,7 @@ GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 fi
 
 echo
-echo "Use these values in Tesbo-Backend/.env:"
+echo "Use these values in Tesbo-Backend-Nest/.env:"
 echo "DATABASE_URL=jdbc:postgresql://localhost:5432/${DB_NAME}"
 echo "DATABASE_USER=${DB_USER}"
 echo "DATABASE_PASSWORD=${DB_PASSWORD}"

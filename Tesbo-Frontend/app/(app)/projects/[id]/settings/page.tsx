@@ -823,7 +823,7 @@ export default function ProjectSettingsPage() {
         </Card>
       )}
 
-      {(activeTab === "alerts" || activeTab === "integrations") && message && (
+      {activeTab === "integrations" && message && (
         <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
           {message}
         </p>

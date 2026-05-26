@@ -1,7 +1,7 @@
 # Kubernetes Infrastructure
 
 The test execution plane (queued/scheduled Playwright runs) is now handled by
-the standalone **Tesbo-Execution** service, deployed from the **TesboX-Runner** repo.
+the standalone **Tesbo-Execution** service, deployed from the **Tesbo-Runner** repo.
 
 Kubernetes manifests and deployment workflows live in that repository.
 

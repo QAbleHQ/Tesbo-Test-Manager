@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
 
-          docker build -f Tesbo-Backend/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" Tesbo-Backend
+          docker build -f Tesbo-Backend-Nest/Dockerfile -t "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" Tesbo-Backend-Nest
           docker push "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}"
           docker tag "${BACKEND_IMAGE_CLEAN}:${IMAGE_TAG_CLEAN}" "${BACKEND_IMAGE_CLEAN}:latest"
           docker push "${BACKEND_IMAGE_CLEAN}:latest"
