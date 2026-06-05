@@ -1589,6 +1589,15 @@ export interface JiraConnection {
   connectedProjects?: JiraConnectedProject[];
 }
 
+export interface JiraOAuthConfig {
+  configured: boolean;
+  source: "project" | "environment" | "none";
+  clientId: string;
+  redirectUri: string;
+  hasClientSecret: boolean;
+  updatedAt: string | null;
+}
+
 export interface JiraConnectedProject {
   id: string;
   jiraProjectId: string;
@@ -1625,6 +1634,20 @@ export interface JiraTicket {
 
 export async function getJiraAuthUrl(projectId: string): Promise<{ url: string }> {
   return api<{ url: string }>(`/api/projects/${projectId}/jira/auth-url`);
+}
+
+export async function getJiraConfig(projectId: string): Promise<JiraOAuthConfig> {
+  return api<JiraOAuthConfig>(`/api/projects/${projectId}/jira/config`);
+}
+
+export async function updateJiraConfig(
+  projectId: string,
+  data: { clientId: string; clientSecret: string; redirectUri: string }
+): Promise<JiraOAuthConfig> {
+  return api<JiraOAuthConfig>(`/api/projects/${projectId}/jira/config`, {
+    method: "PATCH",
+    body: data,
+  });
 }
 
 export async function jiraCallback(projectId: string, code: string): Promise<{ connectionId: string; cloudId: string; siteUrl: string }> {

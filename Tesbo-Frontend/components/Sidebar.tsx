@@ -50,7 +50,7 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
         icon: "sparkles",
         children: [
           { href: "agents/tasks", label: "Tasks", icon: "clipboard" },
-          { href: "agents", label: "Settings", icon: "settings" },
+          { href: "agents", label: "Agent list", icon: "settings" },
         ],
       },
       { href: "knowledge-base", label: "Knowledge Base", icon: "book" },

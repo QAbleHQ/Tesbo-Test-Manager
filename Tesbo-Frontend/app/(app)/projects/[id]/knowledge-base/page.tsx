@@ -22,13 +22,11 @@ import {
 import {
   Button,
   Input,
-  Card,
   StatusChip,
   Modal,
   Field,
   FieldLabel,
   Textarea,
-  EmptyStateBlock,
 } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
@@ -624,7 +622,6 @@ function DocumentsTab({ projectId }: { projectId: string }) {
 // ─── Jira Tickets Tab ───────────────────────────────────────────────────────
 
 function JiraTab({ projectId }: { projectId: string }) {
-  const router = useRouter();
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [tickets, setTickets] = useState<JiraTicket[]>([]);
   const [total, setTotal] = useState(0);
@@ -710,7 +707,7 @@ function JiraTab({ projectId }: { projectId: string }) {
             </button>
             <Link
               href={`/projects/${projectId}/settings/integrations/jira`}
-              className="rounded-lg border border-[var(--border)] border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--muted)] text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:bg-[var(--surface-tertiary)] transition-colors"
+              className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
             >
               Manage
             </Link>
@@ -736,8 +733,9 @@ function JiraTab({ projectId }: { projectId: string }) {
             Link your Jira account to automatically import tickets and use them as context for generating test cases.
           </p>
           <Link
-            href={`/projects/${projectId}/settings`}
-            className="mt-4 inline-block rounded-lg bg-[var(--brand-primary)] text-white px-5 py-2 text-sm font-medium hover:bg-[var(--brand-hover)] transition-colors"
+            href={`/projects/${projectId}/settings?tab=integrations`}
+            style={{ color: "#fff" }}
+            className="mt-4 inline-flex items-center justify-center rounded-lg bg-[var(--brand-primary)] px-5 py-2 text-sm font-semibold !text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
           >
             Go to Project Settings
           </Link>
@@ -761,7 +759,7 @@ function JiraTab({ projectId }: { projectId: string }) {
             </button>
             <Link
               href={`/projects/${projectId}/settings/integrations/jira`}
-              className="text-sm text-[var(--brand-primary)] hover:underline"
+              className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
             >
               Manage Jira Projects
             </Link>

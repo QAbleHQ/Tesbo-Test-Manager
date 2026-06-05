@@ -67,6 +67,19 @@ function normalizeJsonArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
 }
 
+function jiraDescriptionToText(value: unknown): string {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(jiraDescriptionToText).filter(Boolean).join("\n");
+  if (typeof value !== "object") return String(value);
+
+  const node = value as Body;
+  const parts: string[] = [];
+  if (typeof node.text === "string") parts.push(node.text);
+  if (Array.isArray(node.content)) parts.push(jiraDescriptionToText(node.content));
+  return parts.filter(Boolean).join(node.type === "paragraph" ? "\n" : " ");
+}
+
 function normalizeProviderModel(provider: string, model?: string | null): string {
   const value = String(model || "").trim();
   if (provider === "anthropic") {
@@ -940,8 +953,369 @@ export class LegacyService {
     return [];
   }
 
-  async jiraStatus() {
-    return { connected: false, connectedProjects: [] };
+  private envJiraConfig() {
+    const clientId = process.env.JIRA_CLIENT_ID || "";
+    const clientSecret = process.env.JIRA_CLIENT_SECRET || "";
+    const redirectUri = process.env.JIRA_REDIRECT_URI || "";
+    if (!clientId || !clientSecret || !redirectUri) return null;
+    return { clientId, clientSecret, redirectUri };
+  }
+
+  private async jiraConfig(projectId: string) {
+    const saved = await this.db.query(
+      "SELECT client_id, client_secret, redirect_uri FROM jira_oauth_config WHERE project_id = $1",
+      [projectId]
+    ).catch(() => ({ rows: [] as Body[] }));
+    const row = saved.rows[0];
+    if (row?.client_id && row?.client_secret && row?.redirect_uri) {
+      return {
+        clientId: String(row.client_id),
+        clientSecret: String(row.client_secret),
+        redirectUri: String(row.redirect_uri)
+      };
+    }
+    const env = this.envJiraConfig();
+    if (env) return env;
+    throw new BadRequestException({ error: "Jira OAuth is not configured. Add Client ID, Client Secret, and Redirect URI in Jira Integration settings." });
+  }
+
+  async jiraConfigStatus(projectId: string) {
+    const saved = await this.db.query(
+      "SELECT client_id, redirect_uri, updated_at FROM jira_oauth_config WHERE project_id = $1",
+      [projectId]
+    ).catch(() => ({ rows: [] as Body[] }));
+    const row = saved.rows[0];
+    const env = this.envJiraConfig();
+    if (row) {
+      return {
+        configured: true,
+        source: "project",
+        clientId: row.client_id,
+        redirectUri: row.redirect_uri,
+        hasClientSecret: true,
+        updatedAt: row.updated_at
+      };
+    }
+    return {
+      configured: !!env,
+      source: env ? "environment" : "none",
+      clientId: env?.clientId ?? "",
+      redirectUri: env?.redirectUri ?? this.defaultJiraRedirectUri(),
+      hasClientSecret: !!env?.clientSecret,
+      updatedAt: null
+    };
+  }
+
+  async updateJiraConfig(projectId: string, userId: string | null | undefined, body: Body) {
+    const clientId = String(body.clientId || "").trim();
+    const requestedClientSecret = String(body.clientSecret || "").trim();
+    const redirectUri = String(body.redirectUri || "").trim();
+    const existing = await this.db.query("SELECT client_secret FROM jira_oauth_config WHERE project_id = $1", [projectId])
+      .catch(() => ({ rows: [] as Body[] }));
+    const clientSecret = requestedClientSecret || String(existing.rows[0]?.client_secret || "");
+    if (!clientId || !clientSecret || !redirectUri) {
+      throw new BadRequestException({ error: "Client ID, Client Secret, and Redirect URI are required." });
+    }
+    if (!/^https?:\/\//i.test(redirectUri)) {
+      throw new BadRequestException({ error: "Redirect URI must start with http:// or https://." });
+    }
+    await this.db.query(
+      `INSERT INTO jira_oauth_config (project_id, client_id, client_secret, redirect_uri, updated_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (project_id) DO UPDATE SET
+         client_id = EXCLUDED.client_id,
+         client_secret = EXCLUDED.client_secret,
+         redirect_uri = EXCLUDED.redirect_uri,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()`,
+      [projectId, clientId, clientSecret, redirectUri, userId || null]
+    );
+    return this.jiraConfigStatus(projectId);
+  }
+
+  private defaultJiraRedirectUri() {
+    const frontend = process.env.FRONTEND_URL || process.env.APP_URL || "http://localhost:1010";
+    return `${frontend.replace(/\/$/, "")}/jira/callback`;
+  }
+
+  async jiraAuthUrl(projectId: string) {
+    const { clientId, redirectUri } = await this.jiraConfig(projectId);
+    const params = new URLSearchParams({
+      audience: "api.atlassian.com",
+      client_id: clientId,
+      scope: "read:jira-work read:jira-user write:jira-work offline_access",
+      redirect_uri: redirectUri,
+      state: projectId,
+      response_type: "code",
+      prompt: "consent"
+    });
+    return { url: `https://auth.atlassian.com/authorize?${params.toString()}` };
+  }
+
+  async jiraCallback(projectId: string, userId: string | null | undefined, body: Body) {
+    const code = String(body.code || "");
+    if (!code) throw new BadRequestException({ error: "Jira authorization code is required." });
+    const { clientId, clientSecret, redirectUri } = await this.jiraConfig(projectId);
+
+    const token = await this.jiraFetch<Body>("https://auth.atlassian.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        redirect_uri: redirectUri
+      })
+    });
+    const accessToken = String(token.access_token || "");
+    const refreshToken = String(token.refresh_token || "");
+    if (!accessToken || !refreshToken) throw new BadRequestException({ error: "Jira did not return OAuth tokens." });
+
+    const resources = await this.jiraFetch<Body[]>("https://api.atlassian.com/oauth/token/accessible-resources", {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const resource = resources[0];
+    if (!resource?.id || !resource?.url) throw new BadRequestException({ error: "No accessible Jira site was found." });
+
+    const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
+    const res = await this.db.query(
+      `INSERT INTO jira_connections (project_id, cloud_id, site_url, access_token, refresh_token, token_expires_at, connected_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (project_id) DO UPDATE SET
+         cloud_id = EXCLUDED.cloud_id,
+         site_url = EXCLUDED.site_url,
+         access_token = EXCLUDED.access_token,
+         refresh_token = EXCLUDED.refresh_token,
+         token_expires_at = EXCLUDED.token_expires_at,
+         connected_by = EXCLUDED.connected_by,
+         updated_at = now()
+       RETURNING id, cloud_id, site_url`,
+      [projectId, String(resource.id), String(resource.url), accessToken, refreshToken, expiresAt, userId || null]
+    );
+    return { connectionId: res.rows[0].id, cloudId: res.rows[0].cloud_id, siteUrl: res.rows[0].site_url };
+  }
+
+  async jiraStatus(projectId: string) {
+    const connection = await this.getJiraConnection(projectId, false);
+    if (!connection) return { connected: false, connectedProjects: [] };
+    const projects = await this.db.query(
+      `SELECT id, jira_project_id, jira_project_key, jira_project_name, created_at
+       FROM jira_project_mappings
+       WHERE project_id = $1 AND enabled = true
+       ORDER BY jira_project_key`,
+      [projectId]
+    );
+    return {
+      connected: true,
+      id: connection.id,
+      cloudId: connection.cloud_id,
+      siteUrl: connection.site_url,
+      tokenExpiresAt: connection.token_expires_at,
+      connectedBy: connection.connected_by,
+      createdAt: connection.created_at,
+      connectedProjects: projects.rows.map(toCamel)
+    };
+  }
+
+  async jiraDisconnect(projectId: string) {
+    await this.db.query("DELETE FROM jira_connections WHERE project_id = $1", [projectId]);
+    return { disconnected: true };
+  }
+
+  async jiraProjects(projectId: string) {
+    const connection = await this.getJiraConnection(projectId, true);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    const data = await this.jiraFetch<Body>(
+      `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/project/search?maxResults=100`,
+      { headers: { Authorization: `Bearer ${connection.access_token}` } }
+    );
+    const connected = await this.db.query(
+      "SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true",
+      [projectId]
+    );
+    const connectedIds = new Set(connected.rows.map((row) => String(row.jira_project_id)));
+    return normalizeJsonArray(data.values).map((project) => ({
+      id: String(project.id || ""),
+      key: String(project.key || ""),
+      name: String(project.name || project.key || "Jira project"),
+      style: String(project.style || ""),
+      connected: connectedIds.has(String(project.id || ""))
+    })).filter((project) => project.id && project.key);
+  }
+
+  async connectJiraProjects(projectId: string, body: Body) {
+    const connection = await this.getJiraConnection(projectId, false);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    const projects = normalizeJsonArray(body.projects)
+      .map((project) => ({
+        id: String(project.id || "").trim(),
+        key: String(project.key || "").trim(),
+        name: String(project.name || project.key || "").trim()
+      }))
+      .filter((project) => project.id && project.key);
+    await this.db.query("DELETE FROM jira_project_mappings WHERE project_id = $1", [projectId]);
+    for (const project of projects) {
+      await this.db.query(
+        `INSERT INTO jira_project_mappings (jira_connection_id, project_id, jira_project_id, jira_project_key, jira_project_name)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (jira_connection_id, jira_project_id) DO UPDATE SET
+           jira_project_key = EXCLUDED.jira_project_key,
+           jira_project_name = EXCLUDED.jira_project_name,
+           enabled = true`,
+        [connection.id, projectId, project.id, project.key, project.name]
+      );
+    }
+    return { linked: projects.length };
+  }
+
+  async syncJira(projectId: string) {
+    const connection = await this.getJiraConnection(projectId, true);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    const mappings = await this.db.query(
+      "SELECT jira_project_key FROM jira_project_mappings WHERE project_id = $1 AND enabled = true",
+      [projectId]
+    );
+    const keys = mappings.rows.map((row) => String(row.jira_project_key)).filter(Boolean);
+    if (!keys.length) return { synced: 0 };
+
+    let synced = 0;
+    for (const key of keys) {
+      const jql = `project = "${key}" ORDER BY updated DESC`;
+      const params = new URLSearchParams({
+        jql,
+        maxResults: "100",
+        fields: "summary,description,issuetype,status,priority,assignee,reporter,labels,created,updated"
+      });
+      const data = await this.jiraFetch<Body>(
+        `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/search?${params.toString()}`,
+        { headers: { Authorization: `Bearer ${connection.access_token}` } }
+      );
+      for (const issue of normalizeJsonArray(data.issues)) {
+        const fields = (issue.fields || {}) as Body;
+        await this.db.query(
+          `INSERT INTO jira_tickets (
+             project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description,
+             issue_type, status, priority, assignee, reporter, labels, jira_created_at, jira_updated_at, jira_url, synced_at
+           )
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+           ON CONFLICT (jira_connection_id, jira_issue_id) DO UPDATE SET
+             jira_issue_key = EXCLUDED.jira_issue_key,
+             summary = EXCLUDED.summary,
+             description = EXCLUDED.description,
+             issue_type = EXCLUDED.issue_type,
+             status = EXCLUDED.status,
+             priority = EXCLUDED.priority,
+             assignee = EXCLUDED.assignee,
+             reporter = EXCLUDED.reporter,
+             labels = EXCLUDED.labels,
+             jira_created_at = EXCLUDED.jira_created_at,
+             jira_updated_at = EXCLUDED.jira_updated_at,
+             jira_url = EXCLUDED.jira_url,
+             synced_at = now()`,
+          [
+            projectId,
+            connection.id,
+            String(issue.id || ""),
+            String(issue.key || ""),
+            String(fields.summary || ""),
+            jiraDescriptionToText(fields.description),
+            String(fields.issuetype?.name || ""),
+            String(fields.status?.name || ""),
+            String(fields.priority?.name || ""),
+            String(fields.assignee?.displayName || ""),
+            String(fields.reporter?.displayName || ""),
+            normalizeJsonArray(fields.labels).join(", "),
+            fields.created || null,
+            fields.updated || null,
+            `${connection.site_url}/browse/${issue.key}`
+          ]
+        );
+        synced += 1;
+      }
+    }
+    return { synced };
+  }
+
+  async jiraTickets(projectId: string, query: Body) {
+    const limit = Math.max(1, Math.min(100, Number(query.limit || 25)));
+    const offset = Math.max(0, Number(query.offset || 0));
+    const search = String(query.search || "").trim();
+    const filters = ["project_id = $1"];
+    const values: any[] = [projectId];
+    if (search) {
+      values.push(`%${search}%`);
+      filters.push(`(jira_issue_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
+    }
+    const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM jira_tickets WHERE ${filters.join(" AND ")}`, values);
+    values.push(limit, offset);
+    const res = await this.db.query(
+      `SELECT * FROM jira_tickets
+       WHERE ${filters.join(" AND ")}
+       ORDER BY jira_updated_at DESC NULLS LAST, synced_at DESC
+       LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values
+    );
+    return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
+  }
+
+  async jiraComment(projectId: string, body: Body) {
+    const connection = await this.getJiraConnection(projectId, true);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    const issueKey = String(body.issueKey || body.jiraIssueKey || "").trim();
+    const comment = String(body.comment || body.body || "").trim();
+    if (!issueKey || !comment) throw new BadRequestException({ error: "Jira issue key and comment are required." });
+    await this.jiraFetch(
+      `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${connection.access_token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          body: {
+            type: "doc",
+            version: 1,
+            content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }]
+          }
+        })
+      }
+    );
+    return { ok: true };
+  }
+
+  private async getJiraConnection(projectId: string, refresh: boolean): Promise<Body | null> {
+    const res = await this.db.query("SELECT * FROM jira_connections WHERE project_id = $1", [projectId]);
+    const connection = res.rows[0] as Body | undefined;
+    if (!connection) return null;
+    if (!refresh || new Date(connection.token_expires_at).getTime() > Date.now() + 60_000) return connection;
+
+    const { clientId, clientSecret } = await this.jiraConfig(projectId);
+    const token = await this.jiraFetch<Body>("https://auth.atlassian.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: connection.refresh_token
+      })
+    });
+    const accessToken = String(token.access_token || "");
+    const refreshToken = String(token.refresh_token || connection.refresh_token);
+    const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
+    await this.db.query(
+      "UPDATE jira_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1",
+      [connection.id, accessToken, refreshToken, expiresAt]
+    );
+    return { ...connection, access_token: accessToken, refresh_token: refreshToken, token_expires_at: expiresAt };
+  }
+
+  private async jiraFetch<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new BadRequestException({ error: `Jira request failed (${res.status}).`, detail: text.slice(0, 500) });
+    }
+    return (await res.json()) as T;
   }
 
   async zyraAgent(projectId: string) {

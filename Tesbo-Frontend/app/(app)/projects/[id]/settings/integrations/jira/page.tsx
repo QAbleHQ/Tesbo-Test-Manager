@@ -1,18 +1,22 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type FormEvent } from "react";
 import Link from "next/link";
 import {
   authMe,
+  getJiraAuthUrl,
+  getJiraConfig,
   getJiraStatus,
   listJiraProjects,
   connectJiraProjects,
   syncJiraTickets,
+  updateJiraConfig,
+  type JiraOAuthConfig,
   type JiraProject,
   type JiraConnection,
 } from "@/lib/api";
-import { Button, Card, EmptyStateBlock } from "@/components/ui";
+import { Button, Card, Field, FieldLabel, Input } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
 export default function JiraIntegrationPage() {
@@ -22,12 +26,17 @@ export default function JiraIntegrationPage() {
 
   const [loading, setLoading] = useState(true);
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
+  const [jiraConfig, setJiraConfig] = useState<JiraOAuthConfig | null>(null);
   const [jiraProjects, setJiraProjects] = useState<JiraProject[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(false);
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [redirectUri, setRedirectUri] = useState("");
 
   const loadData = useCallback(async () => {
     try {
@@ -36,8 +45,16 @@ export default function JiraIntegrationPage() {
         router.replace("/login");
         return;
       }
-      const status = await getJiraStatus(projectId);
+      const [status, config] = await Promise.all([
+        getJiraStatus(projectId),
+        getJiraConfig(projectId).catch(() => null),
+      ]);
       setJiraStatus(status);
+      setJiraConfig(config);
+      if (config) {
+        setClientId(config.clientId || "");
+        setRedirectUri(config.redirectUri || "");
+      }
 
       if (status.connected) {
         setProjectsLoading(true);
@@ -69,6 +86,38 @@ export default function JiraIntegrationPage() {
       }
       return next;
     });
+  }
+
+  async function handleSaveConfig(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setMessage(null);
+    try {
+      const config = await updateJiraConfig(projectId, {
+        clientId: clientId.trim(),
+        clientSecret: clientSecret.trim(),
+        redirectUri: redirectUri.trim(),
+      });
+      setJiraConfig(config);
+      setClientSecret("");
+      setMessage({ type: "success", text: "Jira configuration saved. You can connect Jira now." });
+    } catch (err) {
+      setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to save Jira configuration." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleConnectJira() {
+    setConnecting(true);
+    setMessage(null);
+    try {
+      const { url } = await getJiraAuthUrl(projectId);
+      window.location.href = url;
+    } catch (err) {
+      setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to initiate Jira authentication." });
+      setConnecting(false);
+    }
   }
 
   async function handleSaveProjects() {
@@ -120,22 +169,91 @@ export default function JiraIntegrationPage() {
           <PageHeader
             title="Jira Integration"
             breadcrumb={
-              <Link href={`/projects/${projectId}/settings`} className="text-[var(--brand-primary)] hover:underline">
+              <Link href={`/projects/${projectId}/settings?tab=integrations`} className="text-[var(--brand-primary)] hover:underline">
                 &larr; Back to Project Settings
               </Link>
             }
           />
         }
       >
-        <EmptyStateBlock
-          title="Jira not connected"
-          description="Jira is not connected for this project. Go back to project settings and click Connect to start."
-          action={
-            <Link href={`/projects/${projectId}/settings`}>
-              <Button>Go to Settings</Button>
-            </Link>
-          }
-        />
+        {message && (
+          <div
+            className={`rounded-lg border px-3 py-2 text-sm ${
+              message.type === "success"
+                ? "border-[var(--success)]/30 bg-[color-mix(in_oklab,var(--success)_8%,white)] text-[var(--success)]"
+                : "border-[var(--error)]/30 bg-[color-mix(in_oklab,var(--error)_8%,white)] text-[var(--error)]"
+            }`}
+          >
+            {message.text}
+          </div>
+        )}
+
+        <Card className="p-4">
+          <h2 className="text-base font-semibold text-[var(--foreground)]">Configure Jira OAuth</h2>
+          <p className="mt-1 text-sm text-[var(--muted)]">
+            Add the OAuth app values from Atlassian Developer Console. These values are used only for this project&apos;s Jira connection.
+          </p>
+
+          <div className="mt-4 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 text-sm text-[var(--foreground)]">
+            <p className="font-medium">In Atlassian Developer Console:</p>
+            <ol className="mt-2 list-decimal space-y-1 pl-5 text-[var(--muted)]">
+              <li>Create an OAuth 2.0 integration.</li>
+              <li>Add this callback URL under Authorization callback URLs.</li>
+              <li>Enable scopes: <span className="font-mono text-[var(--foreground)]">read:jira-work</span>, <span className="font-mono text-[var(--foreground)]">read:jira-user</span>, <span className="font-mono text-[var(--foreground)]">write:jira-work</span>, and <span className="font-mono text-[var(--foreground)]">offline_access</span>.</li>
+              <li>Copy the Client ID and Client Secret into the form below.</li>
+            </ol>
+          </div>
+
+          <form onSubmit={handleSaveConfig} className="mt-4 space-y-4">
+            <Field>
+              <FieldLabel>Authorization callback URL</FieldLabel>
+              <Input
+                type="url"
+                value={redirectUri}
+                onChange={(event) => setRedirectUri(event.target.value)}
+                placeholder="http://localhost:1010/jira/callback"
+              />
+              <p className="mt-1 text-xs text-[var(--muted)]">
+                Paste this exact value into Atlassian. For this app, the callback page is <span className="font-mono text-[var(--foreground)]">/jira/callback</span>.
+              </p>
+            </Field>
+            <Field>
+              <FieldLabel>Client ID</FieldLabel>
+              <Input
+                value={clientId}
+                onChange={(event) => setClientId(event.target.value)}
+                placeholder="Paste Atlassian OAuth client ID"
+              />
+            </Field>
+            <Field>
+              <FieldLabel>Client Secret</FieldLabel>
+              <Input
+                type="password"
+                value={clientSecret}
+                onChange={(event) => setClientSecret(event.target.value)}
+                placeholder={jiraConfig?.hasClientSecret ? "Saved. Enter a new secret only to replace it." : "Paste Atlassian OAuth client secret"}
+              />
+            </Field>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button type="submit" disabled={saving}>
+                {saving ? "Saving..." : "Save Jira Configuration"}
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={handleConnectJira}
+                disabled={connecting || !jiraConfig?.configured}
+              >
+                {connecting ? "Connecting..." : "Connect Jira"}
+              </Button>
+              {jiraConfig?.configured && (
+                <span className="text-xs text-[var(--success)]">
+                  Configuration saved from {jiraConfig.source === "environment" ? "environment variables" : "project settings"}.
+                </span>
+              )}
+            </div>
+          </form>
+        </Card>
       </StandardPageLayout>
     );
   }
@@ -154,7 +272,7 @@ export default function JiraIntegrationPage() {
             </>
           }
           breadcrumb={
-            <Link href={`/projects/${projectId}/settings`} className="text-[var(--brand-primary)] hover:underline">
+            <Link href={`/projects/${projectId}/settings?tab=integrations`} className="text-[var(--brand-primary)] hover:underline">
               &larr; Back to Project Settings
             </Link>
           }

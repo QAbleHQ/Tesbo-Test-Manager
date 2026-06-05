@@ -3,33 +3,38 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { authMe, getZyraAgent, updateZyraSettings, type ZyraAgentState } from "@/lib/api";
-import { Button, Card, Field, FieldLabel, Input, StatusChip } from "@/components/ui";
+import { authMe, getZyraAgent, type ZyraAgentState } from "@/lib/api";
+import { StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat().format(value || 0);
-}
+const futureAgents = [
+  {
+    name: "Run Analyst",
+    role: "Execution insight agent",
+    summary: "Planned for run failure clustering, flaky-test signals, and release risk notes.",
+  },
+  {
+    name: "Bug Triage",
+    role: "Defect analysis agent",
+    summary: "Planned for duplicate bug checks, severity suggestions, and owner recommendations.",
+  },
+];
 
-export default function AgentSettingsPage() {
+export default function AgentsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
   const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [testcaseCount, setTestcaseCount] = useState(5);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     try {
       const data = await getZyraAgent(projectId);
       setState(data);
-      setTestcaseCount(data.settings.testcaseCount || 5);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load agent settings.");
+      setError(err instanceof Error ? err.message : "Failed to load agents.");
     } finally {
       setLoading(false);
     }
@@ -42,25 +47,10 @@ export default function AgentSettingsPage() {
     });
   }, [loadData, router]);
 
-  async function handleSaveSettings() {
-    setSaving(true);
-    setMessage(null);
-    setError(null);
-    try {
-      await updateZyraSettings(projectId, { testcaseCount });
-      setMessage("Agent settings saved.");
-      await loadData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save agent settings.");
-    } finally {
-      setSaving(false);
-    }
-  }
-
   if (loading || !state) {
     return (
-      <StandardPageLayout header={<PageHeader title="Agent settings" />}>
-        <div className="flex min-h-[220px] items-center justify-center text-sm text-[var(--muted)]">Loading settings...</div>
+      <StandardPageLayout header={<PageHeader title="Agents" />}>
+        <div className="flex min-h-[220px] items-center justify-center text-sm text-[var(--muted)]">Loading agents...</div>
       </StandardPageLayout>
     );
   }
@@ -69,54 +59,56 @@ export default function AgentSettingsPage() {
     <StandardPageLayout
       header={
         <PageHeader
-          title="Agent settings"
-          subtitle="Configure AI testcase generation agents and review their workspace usage."
-          actions={<Link href={`/projects/${projectId}/agents/tasks`} className="rounded-xl bg-[var(--brand-primary)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--brand-hover)]">Open tasks</Link>}
+          title="Agents"
+          subtitle="Select the AI agent you want to work with. Each agent has its own workspace and settings."
         />
       }
     >
-      {message && <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm">{message}</p>}
       {error && <p className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">{error}</p>}
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
-        <Card className="p-4 space-y-5">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h2 className="text-lg font-semibold text-[var(--foreground)]">{state.agent.name}</h2>
-              <p className="mt-1 text-sm text-[var(--muted)]">{state.agent.role}</p>
-            </div>
-            <StatusChip tone={state.agent.active ? "success" : "warning"}>{state.agent.active ? "Active" : "Inactive"}</StatusChip>
-          </div>
-          <p className="text-sm text-[var(--muted)]">{state.agent.activationReason}</p>
-          {!state.agent.active && (
-            <Link href="/settings/integrations" className="inline-flex text-sm font-medium text-[var(--brand-primary)] hover:underline">
-              Add and allocate an AI key
-            </Link>
-          )}
-          {state.aiKey && (
-            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 text-sm">
-              <div className="font-semibold text-[var(--foreground)]">{state.aiKey.name}</div>
-              <div className="mt-1 text-[var(--muted)]">{state.aiKey.provider.toUpperCase()} {state.aiKey.defaultModel ? `- ${state.aiKey.defaultModel}` : ""}</div>
-              <div className="mt-1 font-mono text-xs text-[var(--muted)]">{state.aiKey.maskedKey}</div>
-            </div>
-          )}
-        </Card>
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-base font-semibold text-[var(--foreground)]">Available agents</h2>
+          <p className="mt-1 text-sm text-[var(--muted)]">Open an agent first, then use that agent's settings page when configuration is needed.</p>
+        </div>
 
-        <Card className="p-4 space-y-4">
-          <div>
-            <h2 className="text-base font-semibold text-[var(--foreground)]">Generation defaults</h2>
-            <p className="mt-1 text-sm text-[var(--muted)]">Used when a user allocates a new task.</p>
-          </div>
-          <Field>
-            <FieldLabel>Testcases per task</FieldLabel>
-            <Input type="number" min={1} max={50} value={testcaseCount} onChange={(event) => setTestcaseCount(Number(event.target.value))} />
-          </Field>
-          <Button onClick={handleSaveSettings} disabled={saving}>{saving ? "Saving..." : "Save settings"}</Button>
-          <div className="rounded-lg bg-[var(--surface-secondary)] p-3 text-sm text-[var(--muted)]">
-            <span className="font-semibold text-[var(--foreground)]">{formatNumber(state.tokenUsage.total)}</span> tokens used by Zyra
-          </div>
-        </Card>
-      </div>
+        <div className="grid gap-4 lg:grid-cols-3">
+          <article className="rounded-lg border border-[var(--brand-primary)] bg-[var(--surface)] p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-[var(--foreground)]">{state.agent.name}</h3>
+                <p className="mt-1 text-sm text-[var(--muted)]">{state.agent.role}</p>
+              </div>
+              <StatusChip tone={state.agent.active ? "success" : "warning"}>{state.agent.active ? "Active" : "Inactive"}</StatusChip>
+            </div>
+            <p className="mt-3 text-sm text-[var(--muted)]">Generates detailed testcases from stories, knowledge, Jira tickets, existing testcases, and Zyra memory.</p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Link
+                href={`/projects/${projectId}/agents/tasks`}
+                className="inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold"
+                style={{ backgroundColor: "var(--foreground)", color: "var(--surface)" }}
+              >
+                Work with Zyra
+              </Link>
+              <Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>
+            </div>
+          </article>
+
+          {futureAgents.map((agent) => (
+            <article key={agent.name} className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] p-4 opacity-80">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-[var(--foreground)]">{agent.name}</h3>
+                  <p className="mt-1 text-sm text-[var(--muted)]">{agent.role}</p>
+                </div>
+                <StatusChip tone="neutral">Coming soon</StatusChip>
+              </div>
+              <p className="mt-3 text-sm text-[var(--muted)]">{agent.summary}</p>
+              <button type="button" disabled className="mt-4 rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)]">Unavailable</button>
+            </article>
+          ))}
+        </div>
+      </section>
     </StandardPageLayout>
   );
 }

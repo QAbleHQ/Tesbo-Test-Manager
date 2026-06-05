@@ -556,43 +556,59 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/jira/auth-url")
-  jiraAuth() {
-    return { url: "" };
+  jiraAuth(@Param("projectId") projectId: string) {
+    return this.legacy.jiraAuthUrl(projectId);
+  }
+
+  @Get("/api/projects/:projectId/jira/config")
+  jiraConfig(@Param("projectId") projectId: string) {
+    return this.legacy.jiraConfigStatus(projectId);
+  }
+
+  @Patch("/api/projects/:projectId/jira/config")
+  updateJiraConfig(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateJiraConfig(projectId, req.userId, body);
   }
 
   @Post("/api/projects/:projectId/jira/callback")
-  jiraCallback() {
-    return { connectionId: "", cloudId: "", siteUrl: "" };
+  jiraCallback(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.jiraCallback(projectId, req.userId, body);
   }
 
   @Get("/api/projects/:projectId/jira/status")
-  jiraStatus() {
-    return this.legacy.jiraStatus();
+  jiraStatus(@Param("projectId") projectId: string) {
+    return this.legacy.jiraStatus(projectId);
   }
 
   @Delete("/api/projects/:projectId/jira/disconnect")
-  jiraDisconnect() {}
+  jiraDisconnect(@Param("projectId") projectId: string) {
+    return this.legacy.jiraDisconnect(projectId);
+  }
 
   @Get("/api/projects/:projectId/jira/projects")
-  jiraProjects() {
-    return [];
+  jiraProjects(@Param("projectId") projectId: string) {
+    return this.legacy.jiraProjects(projectId);
   }
 
   @Post("/api/projects/:projectId/jira/projects")
-  connectJiraProjects() {}
+  connectJiraProjects(@Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectJiraProjects(projectId, body);
+  }
 
   @Post("/api/projects/:projectId/jira/sync")
-  syncJira() {
-    return { synced: 0 };
+  syncJira(@Param("projectId") projectId: string) {
+    return this.legacy.syncJira(projectId);
   }
 
   @Get("/api/projects/:projectId/jira/tickets")
-  jiraTickets() {
-    return { list: [], total: 0 };
+  jiraTickets(@Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.jiraTickets(projectId, query);
   }
 
   @Post("/api/projects/:projectId/jira/comment")
-  jiraComment() {}
+  jiraComment(@Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.jiraComment(projectId, body);
+  }
 
   @Get("/api/projects/:projectId/activity")
   activity() {

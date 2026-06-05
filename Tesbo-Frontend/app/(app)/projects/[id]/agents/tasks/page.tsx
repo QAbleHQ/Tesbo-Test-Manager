@@ -138,7 +138,7 @@ export default function ZyraTasksPage() {
         <PageHeader
           title="Zyra"
           subtitle="Track every task on the Kanban board, then open a card to review generated testcases, feedback, sources, and activity."
-          actions={<Link href={`/projects/${projectId}/agents`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>}
+          actions={<Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>}
         />
       }
     >

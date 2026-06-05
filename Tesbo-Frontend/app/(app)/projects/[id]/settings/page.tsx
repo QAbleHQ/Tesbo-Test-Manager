@@ -9,7 +9,6 @@ import {
   updateProject,
   deleteProject as deleteProjectRequest,
   getJiraStatus,
-  getJiraAuthUrl,
   disconnectJira,
   listProjectMembers,
   listWorkspaceMembers,
@@ -246,17 +245,6 @@ export default function ProjectSettingsPage() {
       setMessage(text);
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function handleConnectJira() {
-    setJiraLoading(true);
-    try {
-      const { url } = await getJiraAuthUrl(projectId);
-      window.location.href = url;
-    } catch {
-      setMessage("Failed to initiate Jira authentication.");
-      setJiraLoading(false);
     }
   }
 
@@ -811,14 +799,12 @@ export default function ProjectSettingsPage() {
                   </Button>
                 </>
               ) : (
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={handleConnectJira}
-                  disabled={jiraLoading}
+                <Link
+                  href={`/projects/${projectId}/settings/integrations/jira`}
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                 >
-                  {jiraLoading ? "Connecting…" : "Connect"}
-                </Button>
+                  Configure
+                </Link>
               )}
             </div>
           </div>
