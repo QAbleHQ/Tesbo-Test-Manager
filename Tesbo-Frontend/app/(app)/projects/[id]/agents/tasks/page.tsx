@@ -103,7 +103,7 @@ export default function ZyraTasksPage() {
     setMessage(null);
     setError(null);
     try {
-      const result = await createZyraTask(projectId, {
+      await createZyraTask(projectId, {
         story,
         context,
         jiraIssueKeys: selectedJiraKeys,
@@ -114,9 +114,8 @@ export default function ZyraTasksPage() {
       setContext("");
       setSelectedJiraKeys([]);
       setSelectedKnowledgeItemIds([]);
-      setMessage("Task generated and moved to In Review.");
+      setMessage("Task created in Todo. Zyra will pick it up and move it to In Progress.");
       await loadData();
-      router.push(`/projects/${projectId}/agents/tasks/${result.task.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to allocate task.");
     } finally {
@@ -253,7 +252,7 @@ export default function ZyraTasksPage() {
               )}
             </Field>
           )}
-          <Button type="submit" disabled={working || !state.agent.active || !story.trim()}>{working ? "Generating..." : "Generate testcases"}</Button>
+          <Button type="submit" disabled={working || !state.agent.active || !story.trim()}>{working ? "Creating task..." : "Create task"}</Button>
         </Card>
       </form>
 

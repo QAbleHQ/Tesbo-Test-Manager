@@ -648,6 +648,7 @@ export async function listTestCases(
     priority?: string;
     type?: string;
     automationStatus?: string;
+    jiraIssueKey?: string;
     search?: string;
   }
 ): Promise<{ list: TestCaseListItem[]; total: number }> {
@@ -659,6 +660,7 @@ export async function listTestCases(
   if (params?.priority) sp.set("priority", params.priority);
   if (params?.type) sp.set("type", params.type);
   if (params?.automationStatus) sp.set("automationStatus", params.automationStatus);
+  if (params?.jiraIssueKey) sp.set("jiraIssueKey", params.jiraIssueKey);
   if (params?.search) sp.set("search", params.search);
   const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/testcases?${sp}`, { credentials: "include" });
   const list = await res.json();

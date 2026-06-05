@@ -2,14 +2,28 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  previewImport,
-  executeImport,
+  createTestCase,
   getTemplateUrl,
-  type ImportPreviewResult,
   type ImportResult,
 } from "@/lib/api";
 
 type ImportStep = "upload" | "mapping" | "result";
+type ParsedSheet = {
+  name: string;
+  headers: string[];
+  rows: string[][];
+  totalRows: number;
+  headerRowIndex: number;
+};
+
+type ImportPreviewResult = {
+  uploadId: string;
+  sheets: ParsedSheet[];
+  selectedSheetName: string;
+  headers: string[];
+  previewRows: string[][];
+  totalRows: number;
+};
 
 const IMPORTABLE_FIELDS: { key: string; label: string; required?: boolean }[] = [
   { key: "title", label: "Title", required: true },
@@ -40,6 +54,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ImportPreviewResult | null>(null);
+  const [selectedSheetName, setSelectedSheetName] = useState("");
   const [mapping, setMapping] = useState<Record<string, number>>({});
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
@@ -53,6 +68,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setUploading(false);
     setUploadError(null);
     setPreview(null);
+    setSelectedSheetName("");
     setMapping({});
     setImporting(false);
     setResult(null);
@@ -64,19 +80,92 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     if (!open) reset();
   }, [open, reset]);
 
+  const normalizeHeader = useCallback((value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ""), []);
+
   const autoMap = useCallback((headers: string[]) => {
     const map: Record<string, number> = {};
-    const lowerHeaders = headers.map((h) => h.toLowerCase().replace(/[_\s-]+/g, ""));
+    const lowerHeaders = headers.map(normalizeHeader);
+    const aliases: Record<string, string[]> = {
+      title: ["title", "testcasetitle", "testcase", "name", "summary", "scenario"],
+      description: ["description", "desc", "details"],
+      preconditions: ["preconditions", "precondition", "prerequisites", "prerequisite"],
+      postconditions: ["postconditions", "postcondition"],
+      steps: ["steps", "teststeps", "action", "actions"],
+      testData: ["testdata", "data", "inputdata"],
+      priority: ["priority", "prio"],
+      severity: ["severity"],
+      type: ["type", "testtype", "casetype"],
+      status: ["status", "state"],
+      suite: ["suite", "folder", "module"],
+      component: ["component", "feature", "area"],
+      estimatedDuration: ["estimatedduration", "duration", "estimate"],
+    };
     for (const field of IMPORTABLE_FIELDS) {
-      const normalized = field.key.toLowerCase();
-      const labelNormalized = field.label.toLowerCase().replace(/[_\s-]+/g, "");
+      const normalized = normalizeHeader(field.key);
+      const labelNormalized = normalizeHeader(field.label);
+      const candidates = new Set([normalized, labelNormalized, ...(aliases[field.key] || [])]);
       const idx = lowerHeaders.findIndex(
-        (h) => h === normalized || h === labelNormalized
+        (h) => candidates.has(h)
       );
       if (idx >= 0) map[field.key] = idx;
     }
     return map;
+  }, [normalizeHeader]);
+
+  const buildPreview = useCallback((sheets: ParsedSheet[], sheetName: string): ImportPreviewResult => {
+    const selected = sheets.find((sheet) => sheet.name === sheetName) || sheets[0];
+    return {
+      uploadId: `${Date.now()}`,
+      sheets,
+      selectedSheetName: selected?.name || "",
+      headers: selected?.headers || [],
+      previewRows: selected?.rows.slice(0, 5) || [],
+      totalRows: selected?.totalRows || 0,
+    };
   }, []);
+
+  const selectSheet = useCallback((sheetName: string, sheetsOverride?: ParsedSheet[]) => {
+    const sheets = sheetsOverride || preview?.sheets || [];
+    if (!sheets.length) return;
+    const nextPreview = buildPreview(sheets, sheetName);
+    setSelectedSheetName(nextPreview.selectedSheetName);
+    setPreview(nextPreview);
+    setMapping(autoMap(nextPreview.headers));
+    setImportError(null);
+  }, [autoMap, buildPreview, preview?.sheets]);
+
+  const parseWorkbook = useCallback(async (inputFile: File): Promise<ParsedSheet[]> => {
+    const XLSX = await import("xlsx");
+    const buffer = await inputFile.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: "array", cellDates: false });
+    const sheets = workbook.SheetNames.map((name) => {
+      const worksheet = workbook.Sheets[name];
+      const rawRows = XLSX.utils.sheet_to_json<string[]>(worksheet, {
+        header: 1,
+        blankrows: false,
+        defval: "",
+        raw: false,
+      });
+      const rows = rawRows
+        .map((row) => row.map((cell) => String(cell ?? "").trim()))
+        .filter((row) => row.some(Boolean));
+      const headerRowIndex = rows.findIndex((row) => row.some((cell) => {
+        const normalized = normalizeHeader(cell);
+        return ["title", "testcasetitle", "testcase", "summary", "name"].includes(normalized);
+      }));
+      const effectiveHeaderIndex = headerRowIndex >= 0 ? headerRowIndex : 0;
+      const headers = (rows[effectiveHeaderIndex] || []).map((cell, index) => cell || `Column ${index + 1}`);
+      const dataRows = rows.slice(effectiveHeaderIndex + 1).filter((row) => row.some(Boolean));
+      return {
+        name,
+        headers,
+        rows: dataRows,
+        totalRows: dataRows.length,
+        headerRowIndex: effectiveHeaderIndex,
+      };
+    });
+    return sheets.filter((sheet) => sheet.headers.length > 0);
+  }, [normalizeHeader]);
 
   const handleFileSelect = (f: File) => {
     setFile(f);
@@ -88,8 +177,12 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setUploading(true);
     setUploadError(null);
     try {
-      const result = await previewImport(projectId, file);
+      const sheets = await parseWorkbook(file);
+      if (!sheets.length) throw new Error("No readable sheets or rows were found in this file.");
+      const preferredSheet = sheets.find((sheet) => autoMap(sheet.headers).title != null && sheet.totalRows > 0) || sheets[0];
+      const result = buildPreview(sheets, preferredSheet.name);
       setPreview(result);
+      setSelectedSheetName(result.selectedSheetName);
       setMapping(autoMap(result.headers));
       setStep("mapping");
     } catch (err) {
@@ -108,10 +201,50 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setImporting(true);
     setImportError(null);
     try {
-      const res = await executeImport(projectId, {
-        uploadId: preview.uploadId,
-        columnMapping: mapping,
-      });
+      const activeSheet = preview.sheets.find((sheet) => sheet.name === selectedSheetName) || preview.sheets[0];
+      const errors: { row: number; message: string }[] = [];
+      let imported = 0;
+      for (const [index, row] of activeSheet.rows.entries()) {
+        const valueFor = (field: string) => {
+          const idx = mapping[field];
+          return idx != null && idx >= 0 && idx < row.length ? String(row[idx] || "").trim() : "";
+        };
+        const title = valueFor("title");
+        if (!title) {
+          errors.push({ row: activeSheet.headerRowIndex + index + 2, message: "Title is required" });
+          continue;
+        }
+        const stepsText = valueFor("steps");
+        const steps = stepsText
+          ? stepsText.split(/\r?\n|(?:\s*\|\s*)/).map((part, stepIndex) => ({
+              stepNumber: stepIndex + 1,
+              action: part.trim(),
+              expectedResult: "",
+            })).filter((step) => step.action)
+          : [];
+        try {
+          await createTestCase(projectId, {
+            title,
+            description: valueFor("description"),
+            preconditions: valueFor("preconditions"),
+            postconditions: valueFor("postconditions"),
+            steps,
+            testData: valueFor("testData"),
+            priority: valueFor("priority") || "P2",
+            severity: valueFor("severity") || undefined,
+            type: valueFor("type") || "Functional",
+            status: valueFor("status") || "Draft",
+            component: valueFor("component") || undefined,
+          });
+          imported += 1;
+        } catch (err) {
+          errors.push({
+            row: activeSheet.headerRowIndex + index + 2,
+            message: err instanceof Error ? err.message : "Failed to import row",
+          });
+        }
+      }
+      const res = { imported, errors, total: activeSheet.totalRows };
       setResult(res);
       setStep("result");
       if (res.imported > 0) onImported();
@@ -285,8 +418,27 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           {step === "mapping" && preview && (
             <div>
               <div className="mb-4 rounded-lg border border-[var(--confidence-high-border)] bg-[var(--confidence-high-soft)] px-4 py-2 text-sm text-[var(--confidence-high-foreground)]">
-                {preview.totalRows} row{preview.totalRows !== 1 ? "s" : ""} found in your file. Map the columns below.
+                {preview.totalRows} row{preview.totalRows !== 1 ? "s" : ""} found in {selectedSheetName || "your file"}. Map the columns below.
               </div>
+
+              {preview.sheets.length > 1 && (
+                <div className="mb-4">
+                  <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+                    Worksheet
+                  </label>
+                  <select
+                    value={selectedSheetName}
+                    onChange={(e) => selectSheet(e.target.value)}
+                    className="w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)]"
+                  >
+                    {preview.sheets.map((sheet) => (
+                      <option key={sheet.name} value={sheet.name}>
+                        {sheet.name} ({sheet.totalRows} row{sheet.totalRows === 1 ? "" : "s"})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               <div className="space-y-2">
                 {IMPORTABLE_FIELDS.map((field) => (

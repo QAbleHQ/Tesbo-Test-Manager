@@ -77,6 +77,7 @@ export default function TestCasesPage() {
   const searchParams = useSearchParams();
   const projectId = params.id as string;
   const activeSuiteId = searchParams.get("suiteId");
+  const activeJiraIssueKey = searchParams.get("jiraIssueKey") || "";
 
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [suiteCases, setSuiteCases] = useState<TestCaseListItem[]>([]);
@@ -170,6 +171,7 @@ export default function TestCasesPage() {
     suitePriorityFilter !== "all",
     suiteTypeFilter !== "all",
     viewMode === "allCases" && allCasesSuiteFilter !== "all",
+    activeJiraIssueKey !== "",
   ].filter(Boolean).length;
   const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / PAGE_SIZE));
   const pageStart = suiteCasesTotal === 0 ? 0 : (suiteCasesPage - 1) * PAGE_SIZE + 1;
@@ -203,6 +205,7 @@ export default function TestCasesPage() {
     suiteStatusFilter,
     suitePriorityFilter,
     suiteTypeFilter,
+    activeJiraIssueKey,
   ]);
 
   const loadSelectedSuiteCases = useCallback(async (pageOverride?: number) => {
@@ -227,6 +230,7 @@ export default function TestCasesPage() {
         status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
         priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
         type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
+        jiraIssueKey: activeJiraIssueKey || undefined,
         search: debouncedSuiteSearch || undefined,
       });
       setSuiteCases(list);
@@ -249,7 +253,15 @@ export default function TestCasesPage() {
     suitePriorityFilter,
     suiteStatusFilter,
     suiteTypeFilter,
+    activeJiraIssueKey,
   ]);
+
+  useEffect(() => {
+    if (activeJiraIssueKey) {
+      setViewMode("allCases");
+      setAllCasesSuiteFilter("all");
+    }
+  }, [activeJiraIssueKey]);
 
   useEffect(() => {
     void loadSelectedSuiteCases();
@@ -348,6 +360,7 @@ export default function TestCasesPage() {
     setSuiteTypeFilter("all");
     setAllCasesSuiteFilter("all");
     setSuiteCasesPage(1);
+    if (activeJiraIssueKey) router.replace(`/projects/${projectId}/testcases`);
   }
 
   function handleViewModeChange(nextMode: ViewMode) {
@@ -799,6 +812,11 @@ export default function TestCasesPage() {
                   {activeFilterCount > 0 ? (
                     <StatusChip tone="warning">
                       {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"}
+                    </StatusChip>
+                  ) : null}
+                  {activeJiraIssueKey ? (
+                    <StatusChip tone="info">
+                      Jira: {activeJiraIssueKey}
                     </StatusChip>
                   ) : null}
                   <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="h-8 shrink-0">

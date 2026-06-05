@@ -13,12 +13,35 @@ import {
   Res
 } from "@nestjs/common";
 import type { Response } from "express";
+import * as XLSX from "xlsx";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 
 @Controller()
 export class LegacyController {
   constructor(private readonly legacy: LegacyService) {}
+
+  private csvEscape(value: unknown): string {
+    const text = String(value ?? "");
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  private rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
+    return [
+      headers.join(","),
+      ...rows.map((row) => headers.map((header) => this.csvEscape(row[header])).join(","))
+    ].join("\n");
+  }
+
+  private sendWorkbook(res: Response, fileName: string, sheetName: string, rows: Record<string, unknown>[]) {
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send(buffer);
+  }
 
   @Post("/api/onboarding/workspace")
   createWorkspace(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
@@ -398,20 +421,45 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/testcases/export/csv")
-  @Header("Content-Type", "text/csv")
-  exportCsv() {
-    return "externalId,title,priority,status\n";
+  async exportCsv(@Param("projectId") projectId: string, @Res() res: Response) {
+    const rows = await this.legacy.exportTestCases(projectId);
+    const headers = ["externalId", "title", "description", "preconditions", "steps", "testData", "priority", "severity", "type", "status", "suite", "component"];
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="testcases.csv"');
+    res.send(this.rowsToCsv(headers, rows));
   }
 
   @Get("/api/projects/:projectId/testcases/export/xlsx")
-  exportXlsx() {
-    return {};
+  async exportXlsx(@Param("projectId") projectId: string, @Res() res: Response) {
+    const rows = await this.legacy.exportTestCases(projectId);
+    this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows);
   }
 
   @Get("/api/projects/:projectId/testcases/import/template")
-  @Header("Content-Type", "text/csv")
-  template() {
-    return "title,description,priority,status\n";
+  template(@Query("format") format: string | undefined, @Res() res: Response) {
+    const rows = [
+      {
+        title: "Example login test",
+        description: "Verify a valid user can sign in.",
+        preconditions: "User account exists.",
+        steps: "Open login page | Enter credentials | Submit form",
+        testData: "user@example.com",
+        priority: "P2",
+        severity: "Medium",
+        type: "Functional",
+        status: "Draft",
+        suite: "Authentication",
+        component: "Login"
+      }
+    ];
+    if (format === "xlsx") {
+      this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows);
+      return;
+    }
+    const headers = Object.keys(rows[0]);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="testcase-import-template.csv"');
+    res.send(this.rowsToCsv(headers, rows));
   }
 
   @Post("/api/projects/:projectId/testcases/import/preview")

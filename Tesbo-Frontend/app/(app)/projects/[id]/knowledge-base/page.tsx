@@ -6,6 +6,7 @@ import Link from "next/link";
 import {
   authMe,
   getJiraStatus,
+  createZyraTask,
   listJiraTickets,
   listLinkedJiraKeys,
   syncJiraTickets,
@@ -622,6 +623,7 @@ function DocumentsTab({ projectId }: { projectId: string }) {
 // ─── Jira Tickets Tab ───────────────────────────────────────────────────────
 
 function JiraTab({ projectId }: { projectId: string }) {
+  const router = useRouter();
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [tickets, setTickets] = useState<JiraTicket[]>([]);
   const [total, setTotal] = useState(0);
@@ -634,6 +636,7 @@ function JiraTab({ projectId }: { projectId: string }) {
   const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [generatingKey, setGeneratingKey] = useState<string | null>(null);
 
   const loadTickets = useCallback(
     async (pageNum: number, query: string) => {
@@ -678,6 +681,33 @@ function JiraTab({ projectId }: { projectId: string }) {
       setSyncError(err instanceof Error ? err.message : "Failed to sync Jira tickets.");
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleGenerateFromTicket(ticket: JiraTicket, mode: "generate" | "regenerate") {
+    setGeneratingKey(ticket.jiraIssueKey);
+    setSyncError(null);
+    try {
+      const existingCount = jiraKeyCounts[ticket.jiraIssueKey] || 0;
+      const story = `${ticket.jiraIssueKey}: ${ticket.summary}`;
+      const context = [
+        ticket.description,
+        ticket.status ? `Status: ${ticket.status}` : "",
+        ticket.priority ? `Priority: ${ticket.priority}` : "",
+        mode === "regenerate"
+          ? `Regenerate testcase coverage for ${ticket.jiraIssueKey}. Update existing linked testcases where coverage overlaps, and add new testcases for new or changed Jira requirements. Mark regenerated cases clearly with Zyra/Jira tags. Existing linked testcase count: ${existingCount}.`
+          : `Generate testcase coverage for ${ticket.jiraIssueKey}. Mark generated cases clearly with Zyra/Jira tags.`
+      ].filter(Boolean).join("\n\n");
+      await createZyraTask(projectId, {
+        story,
+        context,
+        jiraIssueKeys: [ticket.jiraIssueKey],
+      });
+      router.push(`/projects/${projectId}/agents/tasks`);
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : "Failed to create Zyra task from Jira ticket.");
+    } finally {
+      setGeneratingKey(null);
     }
   }
 
@@ -872,6 +902,40 @@ function JiraTab({ projectId }: { projectId: string }) {
                               </svg>
                               {jiraKeyCounts[ticket.jiraIssueKey] || 0} saved
                             </span>
+                          )}
+                          {linkedJiraKeys.has(ticket.jiraIssueKey) ? (
+                            <>
+                              <Link
+                                href={`/projects/${projectId}/testcases?jiraIssueKey=${encodeURIComponent(ticket.jiraIssueKey)}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View testcases
+                              </Link>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleGenerateFromTicket(ticket, "regenerate");
+                                }}
+                                disabled={generatingKey === ticket.jiraIssueKey}
+                                className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
+                              >
+                                {generatingKey === ticket.jiraIssueKey ? "Assigning..." : "Regenerate with Zyra"}
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleGenerateFromTicket(ticket, "generate");
+                              }}
+                              disabled={generatingKey === ticket.jiraIssueKey}
+                              className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
+                            >
+                              {generatingKey === ticket.jiraIssueKey ? "Assigning..." : "Assign to Zyra"}
+                            </button>
                           )}
                         </div>
                       </td>
