@@ -193,6 +193,32 @@ a {
   color: var(--brand-primary);
 }
 
+a[class~="text-white"],
+a[class~="!text-white"],
+a[class*="bg-[var(--brand-primary)]"],
+a[class*="bg-[var(--brand-hover)]"],
+a[class*="bg-[var(--error)]"],
+a[class*="bg-[var(--success)]"],
+a[class*="bg-[var(--ai-primary)]"],
+button[class~="text-white"],
+button[class~="!text-white"],
+button[class*="bg-[var(--brand-primary)]"],
+button[class*="bg-[var(--brand-hover)]"],
+button[class*="bg-[var(--error)]"],
+button[class*="bg-[var(--success)]"],
+button[class*="bg-[var(--ai-primary)]"] {
+  color: #fff !important;
+}
+
+a[class*="bg-[var(--surface)]"],
+a[class*="bg-[var(--surface-secondary)]"],
+a[class*="bg-[var(--surface-tertiary)]"],
+button[class*="bg-[var(--surface)]"],
+button[class*="bg-[var(--surface-secondary)]"],
+button[class*="bg-[var(--surface-tertiary)]"] {
+  color: var(--foreground);
+}
+
 .tesbo-page {
   margin-inline: auto;
   width: 100%;

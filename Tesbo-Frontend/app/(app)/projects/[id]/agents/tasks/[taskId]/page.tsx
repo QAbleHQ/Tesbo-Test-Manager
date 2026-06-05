@@ -264,6 +264,15 @@ export default function ZyraTaskDetailPage() {
             <p className="mt-2 text-sm text-[var(--muted)]">
               {task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"} generated, {task.savedCount} saved, {task.tokenUsage.total} tokens, updated {new Date(task.updatedAt).toLocaleString()}
             </p>
+            {task.jiraIssueKeys.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {task.jiraIssueKeys.map((key) => (
+                  <span key={key} className="rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs font-medium text-[var(--brand-primary)]">
+                    {key}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={done || working}>Close task</Button>

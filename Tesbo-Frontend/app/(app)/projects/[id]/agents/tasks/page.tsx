@@ -124,6 +124,31 @@ export default function ZyraTasksPage() {
     }
   }
 
+  function handleSelectJiraTicket(key: string) {
+    if (!key || selectedJiraKeys.includes(key)) return;
+    const ticket = jiraTickets.find((item) => item.jiraIssueKey === key);
+    setSelectedJiraKeys((prev) => [...prev, key]);
+    if (!ticket) return;
+
+    const title = `${ticket.jiraIssueKey}: ${ticket.summary}`.trim();
+    const description = [ticket.description, ticket.status ? `Status: ${ticket.status}` : "", ticket.priority ? `Priority: ${ticket.priority}` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+
+    setStory((prev) => {
+      if (!prev.trim()) return title;
+      if (prev.includes(ticket.jiraIssueKey) || prev.includes(ticket.summary)) return prev;
+      return `${prev.trim()}\n\n${title}`;
+    });
+    setContext((prev) => {
+      if (!description.trim()) return prev;
+      const block = `Jira ${ticket.jiraIssueKey}\n${description}`;
+      if (!prev.trim()) return block;
+      if (prev.includes(ticket.jiraIssueKey)) return prev;
+      return `${prev.trim()}\n\n${block}`;
+    });
+  }
+
   if (loading || !state) {
     return (
       <StandardPageLayout header={<PageHeader title="Agent tasks" />}>
@@ -170,8 +195,7 @@ export default function ZyraTasksPage() {
               <Select
                 value=""
                 onChange={(event) => {
-                  const key = event.target.value;
-                  if (key && !selectedJiraKeys.includes(key)) setSelectedJiraKeys((prev) => [...prev, key]);
+                  handleSelectJiraTicket(event.target.value);
                 }}
               >
                 <option value="">Select ticket...</option>
@@ -247,6 +271,20 @@ export default function ZyraTasksPage() {
                   <Link key={task.id} href={`/projects/${projectId}/agents/tasks/${task.id}`} className="block rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 transition-colors hover:border-[var(--brand-primary)]">
                     <StatusChip tone={tone(task.taskStatus)}>{normalizeStatus(task.taskStatus).replaceAll("_", " ")}</StatusChip>
                     <h3 className="mt-2 line-clamp-3 text-sm font-semibold text-[var(--foreground)]">{task.userStory}</h3>
+                    {task.jiraIssueKeys.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {task.jiraIssueKeys.slice(0, 3).map((key) => (
+                          <span key={key} className="rounded-full bg-[var(--brand-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--brand-primary)]">
+                            {key}
+                          </span>
+                        ))}
+                        {task.jiraIssueKeys.length > 3 && (
+                          <span className="rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[11px] font-medium text-[var(--muted)]">
+                            +{task.jiraIssueKeys.length - 3}
+                          </span>
+                        )}
+                      </div>
+                    )}
                     <p className="mt-2 text-xs text-[var(--muted)]">{task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"} generated - {task.tokenUsage.total} tokens</p>
                   </Link>
                 ))}

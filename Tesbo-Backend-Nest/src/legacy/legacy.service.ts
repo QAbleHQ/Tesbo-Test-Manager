@@ -1182,14 +1182,17 @@ export class LegacyService {
     let synced = 0;
     for (const key of keys) {
       const jql = `project = "${key}" ORDER BY updated DESC`;
-      const params = new URLSearchParams({
-        jql,
-        maxResults: "100",
-        fields: "summary,description,issuetype,status,priority,assignee,reporter,labels,created,updated"
-      });
       const data = await this.jiraFetch<Body>(
-        `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/search?${params.toString()}`,
-        { headers: { Authorization: `Bearer ${connection.access_token}` } }
+        `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/search/jql`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${connection.access_token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jql,
+            maxResults: 100,
+            fields: ["summary", "description", "issuetype", "status", "priority", "assignee", "reporter", "labels", "created", "updated"]
+          })
+        }
       );
       for (const issue of normalizeJsonArray(data.issues)) {
         const fields = (issue.fields || {}) as Body;
@@ -1799,17 +1802,85 @@ export class LegacyService {
   }
 
   private async jiraSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string }>> {
-    if (!keys.length) return [];
+    const selectedKeys = Array.from(new Set(keys.map((key) => key.trim()).filter(Boolean)));
+    if (!selectedKeys.length) return [];
     const res = await this.db.query(
       `SELECT jira_issue_key, summary, description FROM jira_tickets
        WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])`,
-      [projectId, keys]
+      [projectId, selectedKeys]
     ).catch(() => ({ rows: [] as any[] }));
-    return res.rows.map((row) => ({
-      key: row.jira_issue_key,
-      summary: row.summary || "",
-      description: row.description || ""
-    }));
+    const byKey = new Map<string, { key: string; summary: string; description: string }>(
+      res.rows.map((row) => [
+        String(row.jira_issue_key),
+        {
+          key: String(row.jira_issue_key),
+          summary: String(row.summary || ""),
+          description: String(row.description || "")
+        }
+      ])
+    );
+
+    const missingKeys = selectedKeys.filter((key) => !byKey.has(key));
+    if (missingKeys.length) {
+      const connection = await this.getJiraConnection(projectId, true).catch(() => null);
+      if (connection) {
+        for (const key of missingKeys) {
+          const issue = await this.jiraFetch<Body>(
+            `https://api.atlassian.com/ex/jira/${connection.cloud_id}/rest/api/3/issue/${encodeURIComponent(key)}?fields=summary,description,issuetype,status,priority,assignee,reporter,labels,created,updated`,
+            { headers: { Authorization: `Bearer ${connection.access_token}` } }
+          ).catch(() => null);
+          if (!issue) continue;
+          const fields = (issue.fields || {}) as Body;
+          const summary = String(fields.summary || "");
+          const description = jiraDescriptionToText(fields.description);
+          byKey.set(key, { key, summary, description });
+          await this.db.query(
+            `INSERT INTO jira_tickets (
+               project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description,
+               issue_type, status, priority, assignee, reporter, labels, jira_created_at, jira_updated_at, jira_url, synced_at
+             )
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+             ON CONFLICT (jira_connection_id, jira_issue_id) DO UPDATE SET
+               jira_issue_key = EXCLUDED.jira_issue_key,
+               summary = EXCLUDED.summary,
+               description = EXCLUDED.description,
+               issue_type = EXCLUDED.issue_type,
+               status = EXCLUDED.status,
+               priority = EXCLUDED.priority,
+               assignee = EXCLUDED.assignee,
+               reporter = EXCLUDED.reporter,
+               labels = EXCLUDED.labels,
+               jira_created_at = EXCLUDED.jira_created_at,
+               jira_updated_at = EXCLUDED.jira_updated_at,
+               jira_url = EXCLUDED.jira_url,
+               synced_at = now()`,
+            [
+              projectId,
+              connection.id,
+              String(issue.id || key),
+              String(issue.key || key),
+              summary,
+              description,
+              String(fields.issuetype?.name || ""),
+              String(fields.status?.name || ""),
+              String(fields.priority?.name || ""),
+              String(fields.assignee?.displayName || ""),
+              String(fields.reporter?.displayName || ""),
+              normalizeJsonArray(fields.labels).join(", "),
+              fields.created || null,
+              fields.updated || null,
+              `${connection.site_url}/browse/${issue.key || key}`
+            ]
+          ).catch(() => undefined);
+        }
+      }
+    }
+
+    return selectedKeys.map((key) => byKey.get(key) || {
+      key,
+      summary: "Selected Jira ticket",
+      description: "Ticket details were not available from the local cache or Jira API, but the selected key was included for Zyra context."
+    });
   }
 
   private async generateZyraWithProvider(params: {

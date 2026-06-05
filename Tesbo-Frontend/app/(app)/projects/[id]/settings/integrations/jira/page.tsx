@@ -145,8 +145,8 @@ export default function JiraIntegrationPage() {
     try {
       const result = await syncJiraTickets(projectId);
       setMessage({ type: "success", text: `Synced ${result.synced} tickets from Jira.` });
-    } catch {
-      setMessage({ type: "error", text: "Failed to sync Jira tickets." });
+    } catch (err) {
+      setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to sync Jira tickets." });
     } finally {
       setSyncing(false);
     }

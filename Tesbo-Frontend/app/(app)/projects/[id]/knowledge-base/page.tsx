@@ -633,6 +633,7 @@ function JiraTab({ projectId }: { projectId: string }) {
   const [linkedJiraKeys, setLinkedJiraKeys] = useState<Set<string>>(new Set());
   const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const loadTickets = useCallback(
     async (pageNum: number, query: string) => {
@@ -669,11 +670,12 @@ function JiraTab({ projectId }: { projectId: string }) {
 
   async function handleSync() {
     setSyncing(true);
+    setSyncError(null);
     try {
       await syncJiraTickets(projectId);
       await loadTickets(page, search);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : "Failed to sync Jira tickets.");
     } finally {
       setSyncing(false);
     }
@@ -715,6 +717,15 @@ function JiraTab({ projectId }: { projectId: string }) {
           <span className="text-sm text-[var(--muted)]">
             {total} ticket{total !== 1 ? "s" : ""}
           </span>
+        </div>
+      )}
+
+      {syncError && (
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2.5 text-sm text-[var(--error)]">
+          <span>{syncError}</span>
+          <button type="button" onClick={() => setSyncError(null)} className="ml-3 text-[var(--error)] hover:opacity-80">
+            Dismiss
+          </button>
         </div>
       )}
 
