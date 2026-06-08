@@ -2,6 +2,8 @@
 
 Tesbo Test Manager is exclusively developed by [QAble Testlab](https://qable.io).
 
+We have been working with QA teams for years. One repeated problem we saw: test case management is either too expensive, too heavy, too disconnected from real QA workflows, or locked inside enterprise tools. So we built Tesbo Test Manager as an open-source foundation for modern quality engineering teams.
+
 ## License
 
 Tesbo Test Manager is open source under the Apache License 2.0.
