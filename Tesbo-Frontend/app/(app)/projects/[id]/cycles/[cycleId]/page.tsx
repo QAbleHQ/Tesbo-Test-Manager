@@ -164,6 +164,7 @@ export default function TestRunDetailPage() {
   const [shareEnabled, setShareEnabled] = useState(false);
   const [shareToken, setShareToken] = useState<string | null>(null);
   const [shareToggling, setShareToggling] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   /* bug report dialog state (triggered on "Failed") */
@@ -287,7 +288,7 @@ export default function TestRunDetailPage() {
         const exec = executions.find((e) => e.id === executionId);
         if (exec) {
           setBugExecution({ ...exec, status: newStatus });
-          setBugTitle(`Failed: ${exec.title}`);
+          setBugTitle(`Failed: ${exec.title || exec.snapshotTitle || "Untitled test case"}`);
           setBugDesc("");
           setBugUrl("");
           setShowBugDialog(true);
@@ -348,12 +349,14 @@ export default function TestRunDetailPage() {
   /* ───── Share toggle ───── */
   async function handleShareToggle(enabled: boolean) {
     setShareToggling(true);
+    setShareError(null);
     try {
       const result = await toggleTestRunShare(cycleId, enabled);
       setShareEnabled(result.shareEnabled);
       setShareToken(result.shareToken || null);
-    } catch {
-      // ignore
+      setRun((current) => current ? { ...current, shareEnabled: result.shareEnabled, shareToken: result.shareToken || null } : current);
+    } catch (error) {
+      setShareError(error instanceof Error ? error.message : "Failed to update public sharing.");
     } finally {
       setShareToggling(false);
     }
@@ -602,7 +605,7 @@ export default function TestRunDetailPage() {
                             href={`/projects/${projectId}/cycles/${cycleId}/execute/${e.id}`}
                             className="text-sm text-[var(--brand-primary)] hover:text-[var(--brand-hover)] hover:underline"
                           >
-                            {e.title}
+                            {e.title || e.snapshotTitle || "Untitled test case"}
                           </Link>
                         </div>
                       </td>
@@ -853,7 +856,7 @@ export default function TestRunDetailPage() {
               <p className="text-sm font-medium text-red-800">Test case marked as Failed</p>
               <p className="text-xs text-red-600 mt-0.5">
                 {bugExecution?.externalId && <span className="font-mono mr-1">{bugExecution.externalId}</span>}
-                {bugExecution?.title}
+                {bugExecution?.title || bugExecution?.snapshotTitle || "Untitled test case"}
               </p>
             </div>
           </div>
@@ -927,6 +930,11 @@ export default function TestRunDetailPage() {
           <p className="text-sm text-[var(--muted)]">
             Create a public link to share this test run&apos;s results with anyone &mdash; no login required.
           </p>
+          {shareError && (
+            <p className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">
+              {shareError}
+            </p>
+          )}
 
           {/* Toggle */}
           <div className="flex items-center justify-between rounded-lg border border-[var(--border)] p-4">

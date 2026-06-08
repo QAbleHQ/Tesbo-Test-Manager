@@ -25,6 +25,30 @@ function statusToTone(status: string) {
   return map[status] ?? "neutral";
 }
 
+function executionTitle(execution: ExecutionItem) {
+  return execution.title || execution.snapshotTitle || "Untitled test case";
+}
+
+function normalizeSteps(value: unknown): Array<{ action: string; expected: string }> {
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return value.trim() ? [{ action: value, expected: "" }] : [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.map((item, index) => {
+    if (typeof item === "string") return { action: item, expected: "" };
+    const row = item as Record<string, unknown>;
+    return {
+      action: String(row.action || row.step || row.description || `Step ${index + 1}`),
+      expected: String(row.expected || row.expectedResult || row.result || "")
+    };
+  });
+}
+
 export default function ExecutionDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -84,6 +108,8 @@ export default function ExecutionDetailPage() {
     );
   }
 
+  const steps = normalizeSteps(execution.steps);
+
   return (
     <div className="min-h-screen bg-[var(--background)]">
       <header className="border-b border-[var(--border)] bg-[var(--surface)] px-6 py-3">
@@ -103,7 +129,7 @@ export default function ExecutionDetailPage() {
       <main className="max-w-2xl mx-auto px-6 py-8">
         <div className="flex items-center gap-3 mb-6">
           <h1 className="text-xl font-bold text-[var(--foreground)]">
-            {execution.title}
+            {executionTitle(execution)}
           </h1>
           <StatusChip tone={statusToTone(status)}>{status}</StatusChip>
         </div>
@@ -111,6 +137,46 @@ export default function ExecutionDetailPage() {
         {execution.externalId && (
           <p className="text-xs text-[var(--muted-soft)] font-mono mb-4">{execution.externalId}</p>
         )}
+
+        <section className="mb-6 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+          <h2 className="mb-3 text-sm font-semibold text-[var(--foreground)]">Test case details</h2>
+          <div className="space-y-4 text-sm">
+            {execution.description && (
+              <div>
+                <p className="mb-1 text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Description</p>
+                <p className="whitespace-pre-wrap text-[var(--foreground)]">{execution.description}</p>
+              </div>
+            )}
+            {execution.preconditions && (
+              <div>
+                <p className="mb-1 text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Preconditions</p>
+                <p className="whitespace-pre-wrap text-[var(--foreground)]">{execution.preconditions}</p>
+              </div>
+            )}
+            {execution.testData && (
+              <div>
+                <p className="mb-1 text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Test data</p>
+                <p className="whitespace-pre-wrap text-[var(--foreground)]">{execution.testData}</p>
+              </div>
+            )}
+            {steps.length > 0 && (
+              <div>
+                <p className="mb-2 text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">Steps</p>
+                <ol className="space-y-2">
+                  {steps.map((step, index) => (
+                    <li key={`${step.action}-${index}`} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-secondary)] p-3">
+                      <p className="font-medium text-[var(--foreground)]">{index + 1}. {step.action}</p>
+                      {step.expected && <p className="mt-1 text-[var(--muted)]">Expected: {step.expected}</p>}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+            {!execution.description && !execution.preconditions && !execution.testData && steps.length === 0 && (
+              <p className="text-[var(--muted)]">No additional test case details were captured for this execution.</p>
+            )}
+          </div>
+        </section>
 
         <form onSubmit={handleSave} className="space-y-5">
           {/* Status buttons */}

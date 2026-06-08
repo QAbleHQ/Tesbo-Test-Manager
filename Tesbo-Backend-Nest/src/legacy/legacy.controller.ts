@@ -365,8 +365,8 @@ export class LegacyController {
   bulkStatus() {}
 
   @Post("/api/cycles/:cycleId/share")
-  shareCycle() {
-    return { enabled: false, token: null };
+  shareCycle(@Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.shareCycle(cycleId, body);
   }
 
   @Get("/api/projects/:projectId/cycles/schedules")
@@ -386,13 +386,13 @@ export class LegacyController {
   deleteSchedule() {}
 
   @Get("/api/public/shared-runs/:token")
-  publicRun() {
-    return { error: "Shared run not found" };
+  publicRun(@Param("token") token: string) {
+    return this.legacy.publicCycle(token);
   }
 
   @Get("/api/public/shared-runs/:token/executions")
-  publicExecutions() {
-    return [];
+  publicExecutions(@Param("token") token: string) {
+    return this.legacy.publicCycleExecutions(token);
   }
 
   @Get("/api/projects/:projectId/bugs")
@@ -489,13 +489,13 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/reports/execution")
-  executionReport() {
-    return { filterBy: "status", filterValue: null, rows: [] };
+  executionReport(@Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.executionReport(projectId, query);
   }
 
   @Get("/api/projects/:projectId/reports/requirement-matrix")
-  matrix() {
-    return { rows: [] };
+  matrix(@Param("projectId") projectId: string) {
+    return this.legacy.requirementMatrix(projectId);
   }
 
   @Get("/api/projects/:projectId/reports/repository-summary")

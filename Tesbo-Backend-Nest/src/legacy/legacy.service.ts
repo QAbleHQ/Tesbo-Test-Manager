@@ -1,4 +1,5 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { randomBytes } from "crypto";
 import type { QueryResultRow } from "pg";
 import { DatabaseService } from "../database/database.service";
 
@@ -747,6 +748,33 @@ export class LegacyService {
     return toCamel(res.rows[0]);
   }
 
+  async shareCycle(cycleId: string, body: Body) {
+    const enabled = body.enabled !== false;
+    const existing = await this.db.query("SELECT id, share_token FROM cycles WHERE id = $1", [cycleId]);
+    if (!existing.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
+    const shareToken = existing.rows[0].share_token || randomBytes(24).toString("hex");
+    const res = await this.db.query(
+      "UPDATE cycles SET share_enabled = $2, share_token = $3, updated_at = now() WHERE id = $1 RETURNING share_enabled, share_token",
+      [cycleId, enabled, shareToken]
+    );
+    return {
+      shareEnabled: Boolean(res.rows[0]?.share_enabled),
+      shareToken: res.rows[0]?.share_token || null
+    };
+  }
+
+  async publicCycle(token: string) {
+    const res = await this.db.query("SELECT * FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    if (!res.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
+    return toCamel(res.rows[0]);
+  }
+
+  async publicCycleExecutions(token: string) {
+    const run = await this.db.query("SELECT id FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    if (!run.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
+    return this.executions(run.rows[0].id);
+  }
+
   async updateCycle(cycleId: string, body: Body) {
     await this.db.query(
       `UPDATE cycles SET name=COALESCE($2,name), description=COALESCE($3,description),
@@ -795,7 +823,10 @@ export class LegacyService {
   async executions(cycleId: string) {
     const res = await this.db.query(
       `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
-              ci.id AS cycle_item_id, ci.testcase_id, ci.snapshot_title, t.external_id, t.priority, t.suite_id
+              ci.id AS cycle_item_id, ci.testcase_id, ci.snapshot_title,
+              COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
+              t.external_id, t.priority, t.type, t.suite_id, t.description, t.preconditions, t.postconditions,
+              t.steps, t.test_data, t.automation_status, t.automation_tags
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
        WHERE ci.cycle_id = $1 ORDER BY ci.position, ci.created_at`,
@@ -852,6 +883,122 @@ export class LegacyService {
 
   async deleteBug(bugId: string) {
     await this.db.query("DELETE FROM bugs WHERE id = $1", [bugId]);
+  }
+
+  async executionReport(projectId: string, query: Body) {
+    const filterBy = String(query.filterBy || "overall");
+    const filterValue = query.filterValue ? String(query.filterValue) : null;
+    const res = await this.db.query(
+      `SELECT
+         e.id AS execution_id,
+         COALESCE(e.status, 'Untested') AS execution_status,
+         e.assignee_id,
+         ci.testcase_id,
+         COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
+         COALESCE(t.priority, 'Unspecified') AS priority,
+         COALESCE(t.automation_tags, '') AS automation_tags,
+         t.suite_id,
+         COALESCE(s.name, 'No Suite') AS suite_name,
+         c.id AS run_id,
+         COALESCE(c.name, 'Untitled test run') AS run_name,
+         c.plan_id,
+         COALESCE(p.name, 'No Plan') AS plan_name,
+         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name
+       FROM cycles c
+       JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN testcases t ON t.id = ci.testcase_id
+       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN plans p ON p.id = c.plan_id
+       LEFT JOIN users u ON u.id = e.assignee_id
+       WHERE c.project_id = $1
+       ORDER BY c.created_at DESC, ci.position, ci.created_at`,
+      [projectId]
+    );
+    const statusKeys = ["Passed", "Failed", "Blocked", "Skipped", "Untested", "Retest"] as const;
+    const groups = new Map<string, Body>();
+    const add = (groupId: string, groupName: string, status: string) => {
+      const normalizedStatus = statusKeys.includes(status as any) ? status : "Untested";
+      const row = groups.get(groupId) || {
+        groupId,
+        groupName,
+        Passed: 0,
+        Failed: 0,
+        Blocked: 0,
+        Skipped: 0,
+        Untested: 0,
+        Retest: 0,
+        total: 0
+      };
+      row[normalizedStatus] = Number(row[normalizedStatus] || 0) + 1;
+      row.total = Number(row.total || 0) + 1;
+      groups.set(groupId, row);
+    };
+    for (const row of res.rows) {
+      const tags = String(row.automation_tags || "")
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+      const matchesFilter = (() => {
+        if (!filterValue || filterBy === "overall") return true;
+        if (filterBy === "person") return String(row.assignee_id || "unassigned") === filterValue;
+        if (filterBy === "plan") return String(row.plan_id || "none") === filterValue;
+        if (filterBy === "run") return String(row.run_id) === filterValue;
+        if (filterBy === "suite") return String(row.suite_id || "none") === filterValue;
+        if (filterBy === "priority") return String(row.priority || "Unspecified") === filterValue;
+        if (filterBy === "tags") return tags.includes(filterValue);
+        return true;
+      })();
+      if (!matchesFilter) continue;
+      const status = String(row.execution_status || "Untested");
+      if (filterBy === "person") add(String(row.assignee_id || "unassigned"), String(row.assignee_name || "Unassigned"), status);
+      else if (filterBy === "plan") add(String(row.plan_id || "none"), String(row.plan_name || "No Plan"), status);
+      else if (filterBy === "suite") add(String(row.suite_id || "none"), String(row.suite_name || "No Suite"), status);
+      else if (filterBy === "priority") add(String(row.priority || "Unspecified"), String(row.priority || "Unspecified"), status);
+      else if (filterBy === "tags") {
+        const effectiveTags = tags.length ? tags : ["Untagged"];
+        for (const tag of effectiveTags) add(tag, tag, status);
+      } else {
+        add(String(row.run_id), String(row.run_name || "Untitled test run"), status);
+      }
+    }
+    return {
+      filterBy,
+      filterValue,
+      rows: Array.from(groups.values()).sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
+    };
+  }
+
+  async requirementMatrix(projectId: string) {
+    const res = await this.db.query(
+      `SELECT
+         t.id AS testcase_id,
+         COALESCE(t.external_id, '') AS external_id,
+         COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS testcase_title,
+         COALESCE(t.priority, '') AS priority,
+         COALESCE(t.status, '') AS testcase_status,
+         s.name AS suite_name,
+         c.id AS run_id,
+         c.name AS run_name,
+         c.status AS run_status,
+         e.id AS execution_id,
+         e.status AS execution_status,
+         e.executed_at,
+         b.id AS bug_id,
+         b.title AS bug_title,
+         b.status AS bug_status,
+         b.external_url AS bug_url
+       FROM testcases t
+       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
+       LEFT JOIN cycles c ON c.id = ci.cycle_id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN bugs b ON b.execution_id = e.id
+       WHERE t.project_id = $1
+       ORDER BY t.external_id, c.created_at DESC NULLS LAST`,
+      [projectId]
+    );
+    return { rows: res.rows.map(toCamel) };
   }
 
   async analytics(projectId?: string) {
