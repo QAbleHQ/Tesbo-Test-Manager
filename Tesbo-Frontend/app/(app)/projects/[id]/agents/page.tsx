@@ -69,7 +69,7 @@ export default function AgentsPage() {
       <section className="space-y-3">
         <div>
           <h2 className="text-base font-semibold text-[var(--foreground)]">Available agents</h2>
-          <p className="mt-1 text-sm text-[var(--muted)]">Open an agent first, then use that agent's settings page when configuration is needed.</p>
+          <p className="mt-1 text-sm text-[var(--muted)]">Open an agent first, then use that agent&apos;s settings page when configuration is needed.</p>
         </div>
 
         <div className="grid gap-4 lg:grid-cols-3">
@@ -84,12 +84,13 @@ export default function AgentsPage() {
             <p className="mt-3 text-sm text-[var(--muted)]">Generates detailed testcases from stories, knowledge, Jira tickets, existing testcases, and Zyra memory.</p>
             <div className="mt-4 flex flex-wrap gap-2">
               <Link
-                href={`/projects/${projectId}/agents/tasks`}
+                href={`/projects/${projectId}/agents/zyra`}
                 className="inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold"
                 style={{ backgroundColor: "var(--foreground)", color: "var(--surface)" }}
               >
                 Work with Zyra
               </Link>
+              <Link href={`/projects/${projectId}/agents/tasks`} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Task board</Link>
               <Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>
             </div>
           </article>

@@ -533,6 +533,31 @@ export class LegacyController {
     return this.legacy.updateZyraSettings(projectId, body);
   }
 
+  @Get("/api/projects/:projectId/agents/zyra/chat/sessions")
+  zyraChatSessions(@Param("projectId") projectId: string) {
+    return this.legacy.zyraChatSessions(projectId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions")
+  createZyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createZyraChatSession(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  zyraChatSession(@Param("projectId") projectId: string, @Param("sessionId") sessionId: string) {
+    return this.legacy.zyraChatSession(projectId, sessionId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
+  sendZyraChatMessage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+  }
+
   @Post("/api/projects/:projectId/agents/zyra/tasks")
   createZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
     return this.legacy.aiGenerate(projectId, req.userId, body);

@@ -54,6 +54,35 @@ type ZyraAiResult = {
   requestId?: string;
 };
 
+type ZyraChatDecision = {
+  reply: string;
+  reasoningSummary: string;
+  actionType: "answer" | "create" | "update" | "archive" | "mixed";
+  operations: Array<{
+    type: "create" | "update" | "archive";
+    testcaseId?: string;
+    externalId?: string;
+    draft?: Body;
+    fields?: Body;
+    reason?: string;
+  }>;
+  testcases: Body[];
+};
+
+type ZyraChatIntent = "answer" | "example" | "list" | "create" | "update" | "archive" | "jira_pending_testcases";
+
+type ZyraChatProjectSnapshot = {
+  knowledgeCount: number;
+  knowledgeTitles: string[];
+  testcaseCount: number;
+  linkedJiraTestcaseCount: number;
+  jiraConnected: boolean;
+  jiraProjectCount: number;
+  jiraTicketCount: number;
+  pendingJiraTicketCount: number;
+  lastJiraSyncAt: string | null;
+};
+
 function camel(key: string): string {
   return key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
@@ -110,12 +139,13 @@ function normalizeProviderModel(provider: string, model?: string | null): string
   const value = String(model || "").trim();
   if (provider === "anthropic") {
     const aliases: Record<string, string> = {
-      "": "claude-sonnet-4-20250514",
-      "claude-sonnet": "claude-sonnet-4-20250514",
-      "claude-sonnet-4": "claude-sonnet-4-20250514",
-      "claude-4-sonnet": "claude-sonnet-4-20250514",
-      "sonnet": "claude-sonnet-4-20250514",
-      "sonnet-4": "claude-sonnet-4-20250514",
+      "": "claude-sonnet-4-6",
+      "claude-sonnet": "claude-sonnet-4-6",
+      "claude-sonnet-4": "claude-sonnet-4-6",
+      "claude-4-sonnet": "claude-sonnet-4-6",
+      "sonnet": "claude-sonnet-4-6",
+      "sonnet-4": "claude-sonnet-4-6",
+      "claude-sonnet-4-20250514": "claude-sonnet-4-6",
       "claude-3.5-sonnet": "claude-3-5-sonnet-20241022",
       "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
       "claude-3-7-sonnet": "claude-3-7-sonnet-20250219"
@@ -123,6 +153,16 @@ function normalizeProviderModel(provider: string, model?: string | null): string
     return aliases[value.toLowerCase()] || value;
   }
   return value || "gpt-4o";
+}
+
+function anthropicModelCandidates(model?: string | null): string[] {
+  const normalized = normalizeProviderModel("anthropic", model);
+  return Array.from(new Set([
+    normalized,
+    "claude-sonnet-4-6",
+    "claude-3-7-sonnet-20250219",
+    "claude-3-5-sonnet-20241022"
+  ].filter(Boolean)));
 }
 
 function normalizeChatCompletionsUrl(baseUrl?: string | null): string {
@@ -148,6 +188,43 @@ export class LegacyService {
     const result = await this.db.query("SELECT 1 FROM platform_admins WHERE user_id = $1 LIMIT 1", [uid]);
     if (!result.rows[0]) throw new ForbiddenException({ error: "Platform admin access required" });
     return uid;
+  }
+
+  private async logProjectActivity(projectId: string, actorId: string | null, action: string, entityType: string, entityId: string | null, entityName: string | null, diff: Body) {
+    await this.db.query(
+      `INSERT INTO audit_logs (project_id, actor_id, action, entity_type, entity_id, entity_name, diff)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [projectId, actorId, action, entityType, entityId, entityName, JSON.stringify(diff)]
+    ).catch(() => undefined);
+  }
+
+  private async zyraAiAllocation(projectId: string): Promise<{ key: Body | null; reason: string }> {
+    const allocation = await this.db.query(
+      `SELECT k.id, k.name, k.provider, k.default_model, k.base_url, k.auth_header_name, k.auth_scheme, k.is_active, k.api_key
+       FROM project_ai_key_allocations a
+       JOIN workspace_ai_keys k ON k.id = a.workspace_ai_key_id
+       WHERE a.project_id = $1`,
+      [projectId]
+    );
+    const key = allocation.rows[0] || null;
+    if (key?.is_active) return { key, reason: "Workspace AI key allocated to this project." };
+    if (key && !key.is_active) return { key: null, reason: `AI key "${key.name}" is allocated to this project but is inactive.` };
+
+    const project = await this.db.query("SELECT organization_id FROM projects WHERE id = $1", [projectId]);
+    const organizationId = project.rows[0]?.organization_id;
+    if (!organizationId) return { key: null, reason: "Project was not found while checking AI key allocation." };
+    const workspaceKeys = await this.db.query(
+      `SELECT provider, COUNT(*)::int AS count
+       FROM workspace_ai_keys
+       WHERE organization_id = $1 AND is_active = true
+       GROUP BY provider`,
+      [organizationId]
+    );
+    if (workspaceKeys.rows.length) {
+      const providers = workspaceKeys.rows.map((row) => `${row.provider} (${row.count})`).join(", ");
+      return { key: null, reason: `Active workspace AI key(s) exist (${providers}), but none is allocated to this project.` };
+    }
+    return { key: null, reason: "No active workspace AI key is available for this project." };
   }
 
   async createWorkspace(userId: string | null | undefined, body: Body) {
@@ -1705,13 +1782,7 @@ export class LegacyService {
   async zyraAgent(projectId: string) {
     const [project, allocation, usage, tasks] = await Promise.all([
       this.getProject(projectId),
-      this.db.query(
-        `SELECT k.id, k.name, k.provider, k.default_model, k.base_url, k.auth_header_name, k.auth_scheme, k.is_active, k.api_key
-         FROM project_ai_key_allocations a
-         JOIN workspace_ai_keys k ON k.id = a.workspace_ai_key_id
-         WHERE a.project_id = $1 AND k.is_active = true`,
-        [projectId]
-      ),
+      this.zyraAiAllocation(projectId),
       this.db.query<{ total: string }>(
         "SELECT COALESCE(SUM(token_total), 0) AS total FROM ai_generation_requests WHERE project_id = $1 AND agent_name = ANY($2::text[])",
         [projectId, ZYRA_AGENT_NAMES]
@@ -1728,13 +1799,13 @@ export class LegacyService {
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
-    const key = allocation.rows[0];
+    const key = allocation.key;
     return {
       agent: {
         name: ZYRA_AGENT_NAME,
         role: "AI testcase generation agent",
         active: Boolean(key),
-        activationReason: key ? "Workspace AI key allocated to this project." : "Add and allocate an OpenAI or Claude key to activate Zyra."
+        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5)
@@ -1779,6 +1850,338 @@ export class LegacyService {
     settings.zyraAgent = { ...(settings.zyraAgent || {}), testcaseCount: count };
     await this.db.query("UPDATE projects SET settings = $2::jsonb, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(settings)]);
     return { testcaseCount: count };
+  }
+
+  async zyraChatSessions(projectId: string) {
+    const res = await this.db.query(
+      `SELECT id, project_id, user_id, title, created_at, updated_at
+       FROM zyra_chat_sessions
+       WHERE project_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 50`,
+      [projectId]
+    );
+    return { list: res.rows.map(toCamel) };
+  }
+
+  async zyraChatSession(projectId: string, sessionId: string) {
+    const session = await this.db.query(
+      "SELECT id, project_id, user_id, title, created_at, updated_at FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId]
+    );
+    if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    const messages = await this.db.query(
+      `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
+              status, testcases, activity, created_at
+       FROM zyra_chat_messages
+       WHERE session_id = $1 AND project_id = $2
+       ORDER BY created_at ASC`,
+      [sessionId, projectId]
+    );
+    return {
+      ...toCamel(session.rows[0]),
+      messages: messages.rows.map((row) => {
+        const item = toCamel(row);
+        item.testcases = normalizeJsonArray(row.testcases);
+        item.activity = normalizeJsonArray(row.activity);
+        return item;
+      })
+    };
+  }
+
+  async createZyraChatSession(projectId: string, userId: string | null | undefined, body: Body) {
+    const title = String(body.title || "Zyra chat").trim().slice(0, 240) || "Zyra chat";
+    const res = await this.db.query(
+      `INSERT INTO zyra_chat_sessions (project_id, user_id, title)
+       VALUES ($1,$2,$3)
+       RETURNING id, project_id, user_id, title, created_at, updated_at`,
+      [projectId, userId || null, title]
+    );
+    return { ...toCamel(res.rows[0]), messages: [] };
+  }
+
+  async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    const message = String(body.message || "").trim();
+    if (!message) throw new BadRequestException({ error: "message is required" });
+    const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+
+    await this.db.query(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status)
+       VALUES ($1,$2,$3,'user',$4,'sent')`,
+      [sessionId, projectId, uid, message]
+    );
+
+    const decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message);
+    const applied = await this.applyZyraChatOperations(projectId, uid, decision.operations);
+    const activity = [
+      { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
+      ...applied.activity
+    ];
+    const testcases = applied.testcases.length ? applied.testcases : decision.testcases;
+    const assistant = await this.db.query(
+      `INSERT INTO zyra_chat_messages
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb)
+       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at`,
+      [
+        sessionId,
+        projectId,
+        uid,
+        decision.reply,
+        decision.reasoningSummary,
+        decision.actionType,
+        JSON.stringify(testcases),
+        JSON.stringify(activity)
+      ]
+    );
+    const title = this.compactTitle(message);
+    await this.db.query(
+      "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId, title]
+    );
+    const item = toCamel(assistant.rows[0]);
+    item.testcases = normalizeJsonArray(assistant.rows[0].testcases);
+    item.activity = normalizeJsonArray(assistant.rows[0].activity);
+    return { message: item, session: await this.zyraChatSession(projectId, sessionId) };
+  }
+
+  private async buildZyraChatDecision(projectId: string, userId: string, sessionId: string, message: string): Promise<ZyraChatDecision> {
+    const intent = this.detectZyraChatIntent(message);
+    const mentionedJiraKeys = this.extractJiraIssueKeys(message);
+    const [history, knowledge, existingTestcases, allocation, projectSnapshot, mentionedJira] = await Promise.all([
+      this.db.query(
+        `SELECT role, content, reasoning_summary, testcases
+         FROM zyra_chat_messages
+         WHERE session_id = $1 AND project_id = $2
+         ORDER BY created_at DESC
+         LIMIT 12`,
+        [sessionId, projectId]
+      ),
+      this.knowledgeSnapshot(projectId),
+      this.existingTestcaseSnapshot(projectId, message, ""),
+      this.zyraAiAllocation(projectId),
+      this.zyraChatProjectSnapshot(projectId),
+      this.jiraSnapshot(projectId, mentionedJiraKeys)
+    ]);
+    const key = allocation.key;
+    if (!key) {
+      return this.aiUnavailableForZyraChat(existingTestcases.length, allocation.reason);
+    }
+
+    const provider = String(key.provider || "openai").toLowerCase();
+    const model = normalizeProviderModel(provider, key.default_model);
+    if (intent === "create") {
+      return this.generateZyraChatTestcasesWithAi({
+        projectId,
+        userId,
+        provider,
+        model,
+        key,
+        message,
+        knowledge,
+        existingTestcases,
+        jiraIssueKeys: mentionedJiraKeys,
+        requestedCount: this.requestedTestcaseCount(message)
+      });
+    }
+    const context = [
+      "You are Zyra, an expert test engineer and edge-case designer for this product.",
+      "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
+      "Supported actions:",
+      "- answer: answer product, feature, test strategy, or knowledge-base questions conversationally.",
+      "- list: show existing testcase or coverage rows when the user asks to show/list/compare coverage.",
+      "- jira_pending_testcases: count Jira tickets, linked testcase coverage, and pending tickets for testcase writing.",
+      "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases.",
+      "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
+      "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage.",
+      "Use the project snapshot to choose the action. If the query asks for numbers from Jira/testcase links, choose jira_pending_testcases instead of guessing.",
+      "If the user asks a normal product, feature, explanation, example, or how-to question, choose answer with empty operations and empty testcases.",
+      "Only return testcase rows when the user explicitly asks to create, update, archive/remove, list, compare, or show testcase coverage.",
+      "Only create/update/archive when the user clearly asks for a repository mutation. Otherwise suggest what could be done without mutating anything.",
+      "Do not reveal hidden chain-of-thought. Provide a concise reasoningSummary with observable factors and action steps.",
+      "Treat remove/delete requests as archive operations unless the user clearly names an existing app delete control.",
+      `Detected local intent hint: ${intent}. Follow the user's actual wording if it is clearer than this hint.`,
+      "Return only valid JSON with shape:",
+      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive\",\"actionType\":\"answer|create|update|archive|mixed\",\"operations\":[{\"type\":\"create|update|archive\",\"testcaseId\":\"\",\"externalId\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
+      "",
+      "Project snapshot:",
+      JSON.stringify(projectSnapshot),
+      "",
+      "Knowledge base:",
+      knowledge.map((item) => `${item.title}\n${item.content}`).join("\n\n") || "No knowledge-base notes.",
+      "",
+      "Jira tickets explicitly mentioned by the user:",
+      mentionedJira.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n") || "No explicit Jira issue key was mentioned or found in the local Jira cache.",
+      "",
+      "Existing testcases:",
+      existingTestcases.map((tc) => `${tc.externalId} | ${tc.title} | ${tc.priority} | ${tc.status}\n${tc.description}\nSteps: ${tc.stepsSummary}`).join("\n\n") || "No existing testcases.",
+      "",
+      "Recent chat:",
+      history.rows.reverse().map((row) => `${row.role}: ${row.content}`).join("\n") || "No prior chat."
+    ].join("\n");
+
+    try {
+      const raw = provider === "anthropic"
+        ? await this.zyraChatWithAnthropic(key, model, context, message)
+        : await this.zyraChatWithOpenAi(key, model, context, message);
+      const modelIntent = this.intentFromZyraModelAction(raw.action, intent);
+      if (modelIntent === "jira_pending_testcases") {
+        const toolDecision = await this.analyzeZyraJiraTestcaseCoverage(projectId);
+        return this.finalizeZyraToolDecisionWithAi({
+          key,
+          provider,
+          model,
+          message,
+          context,
+          toolName: "jira_pending_testcases",
+          toolDecision
+        });
+      }
+      if (modelIntent === "create") {
+        return this.generateZyraChatTestcasesWithAi({
+          projectId,
+          userId,
+          provider,
+          model,
+          key,
+          message,
+          knowledge,
+          existingTestcases,
+          jiraIssueKeys: mentionedJiraKeys,
+          requestedCount: this.requestedTestcaseCount(message)
+        });
+      }
+      return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
+    } catch {
+      await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: "AI provider failed; no system fallback response was generated." });
+      return this.aiUnavailableForZyraChat(existingTestcases.length, "AI provider call failed before Zyra could complete the chat response.");
+    }
+  }
+
+  private async applyZyraChatOperations(projectId: string, userId: string, operations: ZyraChatDecision["operations"]) {
+    const testcases: Body[] = [];
+    const activity: Body[] = [];
+    for (const op of operations.slice(0, 10)) {
+      if (op.type === "create" && op.draft) {
+        const created = await this.createTestCase(projectId, {
+          title: op.draft.title,
+          description: op.draft.description || op.draft.expectedSummary || "",
+          preconditions: op.draft.preconditions || "",
+          stepsJson: this.safeSteps(op.draft.stepsJson || op.draft.steps),
+          testData: op.draft.testData || "",
+          priority: op.draft.priority || "P2",
+          severity: op.draft.severity || null,
+          type: op.draft.type || "Functional",
+          status: op.draft.status || "Draft",
+          component: op.draft.component || null,
+          jiraIssueKey: op.draft.jiraIssueKey || null
+        });
+        const row = await this.getTestCase(created.id);
+        testcases.push(this.chatTestcaseRow(row, "created", op.reason));
+        activity.push({ actor: "agent", title: "Created testcase", detail: `${created.externalId} ${created.title}`, createdAt: new Date().toISOString() });
+        await this.logProjectActivity(projectId, userId, "zyra_created", "testcase", created.id, `${created.externalId} - ${created.title}`, { source: "zyra_chat", reason: op.reason || null });
+      } else if ((op.type === "update" || op.type === "archive") && (op.testcaseId || op.externalId)) {
+        const found = await this.findProjectTestcase(projectId, op.testcaseId, op.externalId);
+        if (!found) continue;
+        const fields = op.type === "archive" ? { status: "Archived" } : this.sanitizeZyraUpdateFields(op.fields || {});
+        await this.patchTestCaseFromZyra(found.id, fields);
+        const row = await this.getTestCase(found.id);
+        const action = op.type === "archive" ? "archived" : "updated";
+        testcases.push(this.chatTestcaseRow(row, action, op.reason));
+        activity.push({ actor: "agent", title: `${action[0].toUpperCase()}${action.slice(1)} testcase`, detail: `${row.externalId} ${row.title}`, createdAt: new Date().toISOString() });
+        await this.logProjectActivity(projectId, userId, `zyra_${action}`, "testcase", found.id, `${row.externalId} - ${row.title}`, { source: "zyra_chat", fields, reason: op.reason || null });
+      }
+    }
+    return { testcases, activity };
+  }
+
+  private async generateZyraChatTestcasesWithAi(params: {
+    projectId: string;
+    userId: string;
+    provider: string;
+    model: string;
+    key: Body;
+    message: string;
+    knowledge: Array<{ title: string; content: string }>;
+    existingTestcases: ZyraGenerationInput["existingTestcases"];
+    jiraIssueKeys: string[];
+    requestedCount: number;
+  }): Promise<ZyraChatDecision> {
+    const jira = await this.jiraSnapshot(params.projectId, params.jiraIssueKeys);
+    const aiResult = await this.generateZyraWithProvider({
+      provider: params.provider,
+      model: params.model,
+      apiKey: params.key.api_key,
+      baseUrl: params.key.base_url,
+      authHeaderName: params.key.auth_header_name,
+      authScheme: params.key.auth_scheme,
+      projectId: params.projectId,
+      input: {
+        story: params.message,
+        context: "Generated from Zyra chat after reading project knowledge, Jira ticket details, Zyra memory, and existing testcase coverage.",
+        acceptanceCriteria: "",
+        feedback: "",
+        knowledge: params.knowledge,
+        jira,
+        existingTestcases: params.existingTestcases,
+        requestedCount: params.requestedCount
+      }
+    });
+    await this.rememberZyraMemory(params.projectId, params.userId, [
+      `Chat request: ${params.message}`,
+      `AI generated ${aiResult.drafts.length} testcase draft(s).`,
+      params.jiraIssueKeys.length ? `Jira keys: ${params.jiraIssueKeys.join(", ")}` : "",
+      `Sources considered: ${params.knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${params.existingTestcases.length} existing testcase(s).`
+    ].filter(Boolean).join("\n"));
+    return {
+      reply: `I used the AI provider to generate ${aiResult.drafts.length} testcase candidate(s) after reading ${jira.length} Jira ticket(s), ${params.knowledge.length} knowledge-base item(s), and ${params.existingTestcases.length} nearby testcase(s).`,
+      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${aiResult.usage.input}, output ${aiResult.usage.output}.`,
+      actionType: "create",
+      operations: aiResult.drafts.map((draft) => ({
+        type: "create",
+        draft: {
+          ...draft,
+          jiraIssueKey: params.jiraIssueKeys[0] || draft.jiraIssueKey || null
+        },
+        reason: "Generated by AI from Zyra chat context."
+      })),
+      testcases: aiResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
+    };
+  }
+
+  private async finalizeZyraToolDecisionWithAi(params: {
+    key: Body;
+    provider: string;
+    model: string;
+    message: string;
+    context: string;
+    toolName: string;
+    toolDecision: ZyraChatDecision;
+  }): Promise<ZyraChatDecision> {
+    const finalizePrompt = [
+      params.context,
+      "",
+      "A backend project-data tool has completed. Use this exact tool result as factual source data.",
+      "Write the final user-facing response in Zyra's expert QA voice.",
+      "Do not invent numbers, tickets, or testcase rows beyond the tool result.",
+      "Return only valid JSON with shape:",
+      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer\",\"actionType\":\"answer\",\"operations\":[],\"testcases\":[{}]}",
+      "",
+      `Tool name: ${params.toolName}`,
+      `Tool result JSON: ${JSON.stringify(params.toolDecision)}`
+    ].join("\n");
+    const raw = params.provider === "anthropic"
+      ? await this.zyraChatWithAnthropic(params.key, params.model, finalizePrompt, params.message)
+      : await this.zyraChatWithOpenAi(params.key, params.model, finalizePrompt, params.message);
+    return {
+      reply: String(raw.reply || params.toolDecision.reply || "").slice(0, 5000),
+      reasoningSummary: String(raw.reasoningSummary || params.toolDecision.reasoningSummary || "").slice(0, 1500),
+      actionType: "answer",
+      operations: [],
+      testcases: normalizeJsonArray(raw.testcases).length ? normalizeJsonArray(raw.testcases).slice(0, 50) : params.toolDecision.testcases
+    };
   }
 
   async aiGenerate(projectId: string, userId: string | null | undefined, body: Body) {
@@ -2546,47 +2949,53 @@ export class LegacyService {
     projectId: string;
     input: ZyraGenerationInput;
   }): Promise<ZyraAiResult> {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": params.apiKey,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: normalizeProviderModel("anthropic", params.model),
-        max_tokens: 4000,
-        temperature: 0.2,
-        system: [
-          {
-            type: "text",
-            text: `${this.zyraSystemPrompt()}\n\n${this.zyraStaticSourcePrompt(params.input)}`,
-            cache_control: { type: "ephemeral" }
-          }
-        ],
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: this.zyraDynamicTaskPrompt(params.input) }]
-          }
-        ]
-      })
-    });
-    const body = await response.json().catch(() => ({} as Body)) as Body;
-    if (!response.ok) {
-      const message = body.error?.message || body.error || response.statusText;
-      throw new BadRequestException({ error: "Claude testcase generation failed", detail: String(message) });
+    let lastMessage = "";
+    for (const model of anthropicModelCandidates(params.model)) {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": params.apiKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4000,
+          temperature: 0.2,
+          system: [
+            {
+              type: "text",
+              text: `${this.zyraSystemPrompt()}\n\n${this.zyraStaticSourcePrompt(params.input)}`,
+              cache_control: { type: "ephemeral" }
+            }
+          ],
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "text", text: this.zyraDynamicTaskPrompt(params.input) }]
+            }
+          ]
+        })
+      });
+      const body = await response.json().catch(() => ({} as Body)) as Body;
+      if (!response.ok) {
+        const message = body.error?.message || body.error || response.statusText;
+        lastMessage = String(message);
+        if (!/model|not.?found|invalid/i.test(lastMessage)) break;
+        continue;
+      }
+      const content = normalizeJsonArray(body.content).map((item) => item?.text || "").join("\n").trim();
+      const usage = body.usage || {};
+      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+      const input = Number(usage.input_tokens || 0) + cached;
+      const output = Number(usage.output_tokens || 0);
+      return {
+        drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
+        usage: { input, output, total: input + output, cached },
+        requestId: response.headers.get("request-id") || undefined
+      };
     }
-    const content = normalizeJsonArray(body.content).map((item) => item?.text || "").join("\n").trim();
-    const usage = body.usage || {};
-    const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
-    const input = Number(usage.input_tokens || 0) + cached;
-    const output = Number(usage.output_tokens || 0);
-    return {
-      drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
-      usage: { input, output, total: input + output, cached },
-      requestId: response.headers.get("request-id") || undefined
-    };
+    throw new BadRequestException({ error: "Claude testcase generation failed", detail: lastMessage || "No compatible Claude model was accepted." });
   }
 
   private generateZyraDrafts(input: {
@@ -2649,6 +3058,430 @@ export class LegacyService {
       input.feedback ? "review feedback" : null
     ].filter(Boolean).join(", ");
     return `I checked ${signals || "the submitted story"} and planned coverage across happy path, negative, boundary, permission, data-state, and traceability risks before drafting the testcases.`;
+  }
+
+  private async zyraChatWithOpenAi(key: Body, model: string, context: string, message: string): Promise<Body> {
+    const body = {
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: context },
+        { role: "user", content: message }
+      ]
+    };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const authHeader = String(key.auth_header_name || "Authorization");
+    const scheme = String(key.auth_scheme || "Bearer").trim();
+    headers[authHeader] = scheme ? `${scheme} ${key.api_key}` : String(key.api_key);
+    const res = await fetch(normalizeChatCompletionsUrl(key.base_url), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(`OpenAI chat failed: ${res.status}`);
+    const data = await res.json() as Body;
+    const content = String(data.choices?.[0]?.message?.content || "{}");
+    return JSON.parse(this.extractJsonPayload(content));
+  }
+
+  private async zyraChatWithAnthropic(key: Body, model: string, context: string, message: string): Promise<Body> {
+    let lastStatus = "";
+    for (const candidate of anthropicModelCandidates(model)) {
+      const body = {
+        model: candidate,
+        max_tokens: 2200,
+        system: context,
+        messages: [{ role: "user", content: message }]
+      };
+      const res = await fetch(String(key.base_url || "https://api.anthropic.com/v1/messages"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": String(key.api_key || ""),
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({} as Body)) as Body;
+        lastStatus = String(data.error?.message || data.error || res.status);
+        if (!/model|not.?found|invalid/i.test(lastStatus)) break;
+        continue;
+      }
+      const data = await res.json() as Body;
+      const content = normalizeJsonArray(data.content).map((item) => item?.text || "").join("\n").trim();
+      return JSON.parse(this.extractJsonPayload(content || "{}"));
+    }
+    throw new Error(`Claude chat failed: ${lastStatus || "No compatible model was accepted."}`);
+  }
+
+  private normalizeZyraChatDecision(raw: Body, message: string, existingTestcases: ZyraGenerationInput["existingTestcases"], intent: ZyraChatIntent): ZyraChatDecision {
+    const modelActionType = ["answer", "create", "update", "archive", "mixed"].includes(String(raw.actionType))
+      ? String(raw.actionType) as ZyraChatDecision["actionType"]
+      : "answer";
+    const mutationIntent = intent === "create" || intent === "update" || intent === "archive";
+    const tableIntent = mutationIntent || intent === "list";
+    const actionType = mutationIntent ? modelActionType : "answer";
+    const operations = normalizeJsonArray(raw.operations)
+      .map((op) => ({
+        type: ["create", "update", "archive"].includes(String(op?.type)) ? op.type : "create",
+        testcaseId: op?.testcaseId ? String(op.testcaseId) : undefined,
+        externalId: op?.externalId ? String(op.externalId) : undefined,
+        draft: op?.draft && typeof op.draft === "object" ? op.draft : undefined,
+        fields: op?.fields && typeof op.fields === "object" ? op.fields : undefined,
+        reason: op?.reason ? String(op.reason).slice(0, 500) : undefined
+      }))
+      .filter((op) => op.type === "create" ? op.draft : op.testcaseId || op.externalId)
+      .slice(0, 10);
+    const testcases = tableIntent ? normalizeJsonArray(raw.testcases).slice(0, 25) : [];
+    return {
+      reply: String(raw.reply || this.defaultZyraReply(message, existingTestcases)).slice(0, 5000),
+      reasoningSummary: String(raw.reasoningSummary || this.defaultReasoningSummary(existingTestcases.length)).slice(0, 1500),
+      actionType,
+      operations: mutationIntent ? operations : [],
+      testcases
+    };
+  }
+
+  private fallbackZyraChatDecision(message: string, knowledge: Array<{ title: string; content: string }>, existingTestcases: ZyraGenerationInput["existingTestcases"], intent: ZyraChatIntent): ZyraChatDecision {
+    if (intent === "create") {
+      return this.aiUnavailableForZyraChat(existingTestcases.length, "AI provider path was unavailable.");
+    }
+    if ((intent === "update" || intent === "archive") && existingTestcases[0]) {
+      const target = existingTestcases[0];
+      const type = intent === "archive" ? "archive" : "update";
+      return {
+        reply: intent === "archive"
+          ? `I found ${target.externalId} as the closest matching testcase and archived it instead of permanently deleting it.`
+          : `I found ${target.externalId} as the closest matching testcase and marked it for review with Zyra context.`,
+        reasoningSummary: this.defaultReasoningSummary(existingTestcases.length),
+        actionType: type,
+        operations: [{
+          type,
+          externalId: target.externalId,
+          fields: { status: "In Review", priority: target.priority || "P2" },
+          reason: "Closest match from the current testcase repository context."
+        }],
+        testcases: [this.chatDraftRow(target, type === "archive" ? "archived" : "updated", "Closest match from repository context.")]
+      };
+    }
+    if (intent === "list") {
+      return {
+        reply: existingTestcases.length
+          ? `I found ${existingTestcases.length} related testcase(s). The table shows the strongest nearby coverage.`
+          : "I did not find matching testcase coverage in the current repository context.",
+        reasoningSummary: this.defaultReasoningSummary(existingTestcases.length),
+        actionType: "answer",
+        operations: [],
+        testcases: existingTestcases.slice(0, 8).map((tc) => this.chatDraftRow(tc, "covered", "Relevant existing coverage."))
+      };
+    }
+    return {
+      reply: this.defaultZyraReply(message, existingTestcases),
+      reasoningSummary: this.defaultReasoningSummary(existingTestcases.length),
+      actionType: "answer",
+      operations: [],
+      testcases: []
+    };
+  }
+
+  private detectZyraChatIntent(message: string): ZyraChatIntent {
+    const lower = message.toLowerCase();
+    const jiraWords = /\b(jira|ticket|tickets|story|stories|issue|issues)\b/.test(lower);
+    const pendingTestcaseWords = /\b(pending|missing|without|not covered|uncovered|need|needs|remaining)\b/.test(lower)
+      && /\b(testcase|test case|testcases|test cases|tests|coverage|writing)\b/.test(lower);
+    const testcaseWords = /\b(testcase|test case|testcases|test cases|case|cases|coverage)\b/.test(lower);
+    const createWords = /\b(create|generate|add|write|draft|make|prepare|new)\b/.test(lower);
+    const updateWords = /\b(update|change|mark|revise|edit|modify|improve)\b/.test(lower);
+    const archiveWords = /\b(remove|delete|archive|drop|deprecate)\b/.test(lower);
+    const listWords = /\b(show|list|which|what|find|display|compare|covered|covers|coverage|existing)\b/.test(lower);
+    const exampleWords = /\b(example|sample|explain|how|why|what is|what are|walk me|describe)\b/.test(lower);
+
+    if (jiraWords && pendingTestcaseWords) return "jira_pending_testcases";
+    if (archiveWords && testcaseWords) return "archive";
+    if (updateWords && testcaseWords) return "update";
+    if (createWords && testcaseWords) return "create";
+    if (testcaseWords && listWords) return "list";
+    if (exampleWords) return "example";
+    return "answer";
+  }
+
+  private aiUnavailableForZyraChat(existingCount: number, reason = "AI generation was not available for this chat request."): ZyraChatDecision {
+    return {
+      reply: `I could not complete this as an AI chat response because ${reason} Zyra chat is configured to be AI-based only, so I did not generate a system/template answer or save placeholder testcases.`,
+      reasoningSummary: `AI-only chat path stopped before response generation. Nearby testcase context available: ${existingCount}. AI availability detail: ${reason}`,
+      actionType: "answer",
+      operations: [],
+      testcases: []
+    };
+  }
+
+  private extractJiraIssueKeys(message: string): string[] {
+    const keys = new Set<string>();
+    for (const match of message.match(/\b[A-Z][A-Z0-9]+-\d+\b/gi) || []) {
+      keys.add(match.toUpperCase());
+    }
+    const loosePattern = /\b([A-Z][A-Z0-9]{1,9})\s+(\d+)\b/gi;
+    let loose: RegExpExecArray | null;
+    while ((loose = loosePattern.exec(message))) {
+      const prefix = loose[1].toUpperCase();
+      if (["THE", "FOR", "AND", "WITH", "FROM", "THIS", "THAT", "CASE", "TEST"].includes(prefix)) continue;
+      keys.add(`${prefix}-${loose[2]}`);
+    }
+    return Array.from(keys);
+  }
+
+  private requestedTestcaseCount(message: string): number {
+    const explicit = message.match(/\b(\d{1,2})\s+(?:testcases|test cases|tests|cases)\b/i);
+    if (explicit) return Math.max(1, Math.min(25, Number(explicit[1])));
+    const lower = message.toLowerCase();
+    if (lower.includes("all type") || lower.includes("all types") || lower.includes("full coverage")) return 8;
+    return 5;
+  }
+
+  private intentFromZyraModelAction(action: unknown, fallback: ZyraChatIntent): ZyraChatIntent {
+    const value = String(action || "").trim().toLowerCase();
+    if (value === "jira_pending_testcases") return "jira_pending_testcases";
+    if (value === "create" || value === "create_testcases") return "create";
+    if (value === "update" || value === "update_testcases") return "update";
+    if (value === "archive" || value === "archive_testcases") return "archive";
+    if (value === "list" || value === "list_testcases") return "list";
+    if (value === "answer") return "answer";
+    return fallback;
+  }
+
+  private async zyraChatProjectSnapshot(projectId: string): Promise<ZyraChatProjectSnapshot> {
+    const [knowledge, testcases, jira, pending, status] = await Promise.all([
+      this.db.query(
+        `SELECT title
+         FROM knowledge_base_items
+         WHERE project_id = $1
+         ORDER BY updated_at DESC
+         LIMIT 12`,
+        [projectId]
+      ).catch(() => ({ rows: [] as Body[] })),
+      this.db.query(
+        `SELECT
+           COUNT(*)::int AS testcase_count,
+           COUNT(*) FILTER (WHERE jira_issue_key IS NOT NULL AND COALESCE(status, '') <> 'Archived')::int AS linked_jira_testcase_count
+         FROM testcases
+         WHERE project_id = $1`,
+        [projectId]
+      ).catch(() => ({ rows: [{}] as Body[] })),
+      this.db.query(
+        `SELECT COUNT(*)::int AS jira_ticket_count, MAX(synced_at) AS last_jira_sync_at
+         FROM jira_tickets
+         WHERE project_id = $1`,
+        [projectId]
+      ).catch(() => ({ rows: [{}] as Body[] })),
+      this.db.query(
+        `WITH linked AS (
+           SELECT jira_issue_key
+           FROM testcases
+           WHERE project_id = $1
+             AND jira_issue_key IS NOT NULL
+             AND COALESCE(status, '') <> 'Archived'
+           GROUP BY jira_issue_key
+         )
+         SELECT COUNT(j.id)::int AS pending_jira_ticket_count
+         FROM jira_tickets j
+         LEFT JOIN linked l ON l.jira_issue_key = j.jira_issue_key
+         WHERE j.project_id = $1 AND l.jira_issue_key IS NULL`,
+        [projectId]
+      ).catch(() => ({ rows: [{}] as Body[] })),
+      this.jiraStatus(projectId).catch(() => ({ connected: false, connectedProjects: [] }))
+    ]);
+    return {
+      knowledgeCount: knowledge.rows.length,
+      knowledgeTitles: knowledge.rows.map((row) => String(row.title || "")).filter(Boolean),
+      testcaseCount: Number(testcases.rows[0]?.testcase_count || 0),
+      linkedJiraTestcaseCount: Number(testcases.rows[0]?.linked_jira_testcase_count || 0),
+      jiraConnected: Boolean((status as Body).connected),
+      jiraProjectCount: normalizeJsonArray((status as Body).connectedProjects).length,
+      jiraTicketCount: Number(jira.rows[0]?.jira_ticket_count || 0),
+      pendingJiraTicketCount: Number(pending.rows[0]?.pending_jira_ticket_count || 0),
+      lastJiraSyncAt: jira.rows[0]?.last_jira_sync_at || null
+    };
+  }
+
+  private async analyzeZyraJiraTestcaseCoverage(projectId: string): Promise<ZyraChatDecision> {
+    const [status, totals, pending] = await Promise.all([
+      this.jiraStatus(projectId).catch(() => ({ connected: false, connectedProjects: [] })),
+      this.db.query(
+        `WITH linked AS (
+           SELECT jira_issue_key, COUNT(*)::int AS testcase_count
+           FROM testcases
+           WHERE project_id = $1
+             AND jira_issue_key IS NOT NULL
+             AND COALESCE(status, '') <> 'Archived'
+           GROUP BY jira_issue_key
+         )
+         SELECT
+           COUNT(j.id)::int AS total_tickets,
+           COUNT(l.jira_issue_key)::int AS covered_tickets,
+           (COUNT(j.id) - COUNT(l.jira_issue_key))::int AS pending_tickets,
+           COALESCE(SUM(l.testcase_count), 0)::int AS linked_testcases,
+           MAX(j.synced_at) AS last_synced_at
+         FROM jira_tickets j
+         LEFT JOIN linked l ON l.jira_issue_key = j.jira_issue_key
+         WHERE j.project_id = $1`,
+        [projectId]
+      ),
+      this.db.query(
+        `WITH linked AS (
+           SELECT jira_issue_key, COUNT(*)::int AS testcase_count
+           FROM testcases
+           WHERE project_id = $1
+             AND jira_issue_key IS NOT NULL
+             AND COALESCE(status, '') <> 'Archived'
+           GROUP BY jira_issue_key
+         )
+         SELECT j.jira_issue_key, j.summary, j.issue_type, j.status, j.priority, j.assignee, j.jira_url, j.synced_at
+         FROM jira_tickets j
+         LEFT JOIN linked l ON l.jira_issue_key = j.jira_issue_key
+         WHERE j.project_id = $1 AND l.jira_issue_key IS NULL
+         ORDER BY j.jira_updated_at DESC NULLS LAST, j.synced_at DESC
+         LIMIT 50`,
+        [projectId]
+      )
+    ]);
+    const row = totals.rows[0] || {};
+    const totalTickets = Number(row.total_tickets || 0);
+    const coveredTickets = Number(row.covered_tickets || 0);
+    const pendingTickets = Number(row.pending_tickets || 0);
+    const linkedTestcases = Number(row.linked_testcases || 0);
+    const connected = Boolean((status as Body).connected);
+    const projectCount = normalizeJsonArray((status as Body).connectedProjects).length;
+    const pendingRows = pending.rows.map((ticket) => ({
+      id: null,
+      externalId: ticket.jira_issue_key,
+      title: ticket.summary || "Untitled Jira ticket",
+      priority: ticket.priority || "Unspecified",
+      status: ticket.status || "Unspecified",
+      type: ticket.issue_type || "Jira ticket",
+      expectedSummary: [
+        ticket.assignee ? `Assignee: ${ticket.assignee}` : "Assignee: Unassigned",
+        ticket.jira_url ? `URL: ${ticket.jira_url}` : ""
+      ].filter(Boolean).join(" | "),
+      action: "pending testcase",
+      reason: "No active testcase is linked to this Jira issue key."
+    }));
+    const coveragePct = totalTickets ? Math.round((coveredTickets / totalTickets) * 100) : 0;
+    const reply = totalTickets
+      ? [
+          `I checked the Jira ticket cache and testcase links for this project.`,
+          `Total Jira tickets: ${totalTickets}.`,
+          `Tickets with at least one active linked testcase: ${coveredTickets}.`,
+          `Pending tickets for testcase writing: ${pendingTickets}.`,
+          `Active linked testcases across covered tickets: ${linkedTestcases}.`,
+          `Coverage by Jira ticket: ${coveragePct}%.`,
+          pendingTickets ? "The pending tickets are listed in the table." : "No Jira tickets are currently pending testcase coverage."
+        ].join("\n")
+      : connected
+        ? "Jira is connected, but I did not find synced Jira tickets in the local cache yet. Run Jira sync first, then ask me again and I will calculate pending testcase coverage."
+        : "Jira is not connected for this project yet, so I cannot calculate pending testcase coverage. Connect Jira and sync tickets first.";
+    return {
+      reply,
+      reasoningSummary: connected
+        ? `Checked ${projectCount} connected Jira project mapping(s), ${totalTickets} cached Jira ticket(s), and active testcases linked by jira_issue_key. Pending means the Jira issue key has zero non-archived linked testcases. Last Jira sync seen: ${row.last_synced_at || "not available"}.`
+        : "Checked Jira connection status first; coverage cannot be calculated until Jira is connected and tickets are synced.",
+      actionType: "answer",
+      operations: [],
+      testcases: pendingRows
+    };
+  }
+
+  private defaultZyraReply(message: string, existingTestcases: ZyraGenerationInput["existingTestcases"]): string {
+    if (existingTestcases.length) {
+      return `I found ${existingTestcases.length} related testcase(s) in the repository context. At a high level, I would use them as reference coverage, then look for gaps around negative flows, boundaries, permissions, data state, and audit behavior. Ask me to show the related testcases if you want the table.`;
+    }
+    if (/\b(example|sample|for example|how would|how to)\b/i.test(message)) {
+      return "Example: for a password reset feature, I would first explain the expected user flow, then call out risk areas like expired tokens, reused links, throttling, account enumeration, and email delivery delays. I would only create testcase rows if you ask me to generate or save them.";
+    }
+    return `I can help with that as a QA-focused product assistant. I will answer directly first, then create, list, or update testcases only when you ask for that output.`;
+  }
+
+  private defaultReasoningSummary(existingCount: number): string {
+    return `Reviewed available knowledge-base notes, recent chat context, and ${existingCount} nearby testcase(s). Focused on coverage gaps, duplicate avoidance, edge cases, boundary values, permissions, data integrity, state transitions, and auditability.`;
+  }
+
+  private async findProjectTestcase(projectId: string, testcaseId?: string, externalId?: string) {
+    const res = await this.db.query(
+      `SELECT id FROM testcases
+       WHERE project_id = $1 AND (($2::uuid IS NOT NULL AND id = $2::uuid) OR ($3::text IS NOT NULL AND external_id = $3::text))
+       LIMIT 1`,
+      [projectId, testcaseId || null, externalId || null]
+    ).catch(() => ({ rows: [] as Body[] }));
+    return res.rows[0] || null;
+  }
+
+  private sanitizeZyraUpdateFields(fields: Body): Body {
+    const allowed = ["title", "description", "preconditions", "postconditions", "stepsJson", "testData", "priority", "severity", "type", "automationStatus", "automationTags", "component", "status", "jiraIssueKey", "jiraUrl"];
+    const cleaned: Body = {};
+    for (const key of allowed) {
+      if (fields[key] !== undefined && fields[key] !== null) cleaned[key] = fields[key];
+    }
+    if (cleaned.stepsJson) cleaned.stepsJson = this.safeSteps(cleaned.stepsJson);
+    return cleaned;
+  }
+
+  private async patchTestCaseFromZyra(testcaseId: string, fields: Body) {
+    const keys = [
+      ["title", "title"],
+      ["description", "description"],
+      ["preconditions", "preconditions"],
+      ["postconditions", "postconditions"],
+      ["stepsJson", "steps"],
+      ["testData", "test_data"],
+      ["priority", "priority"],
+      ["severity", "severity"],
+      ["type", "type"],
+      ["automationStatus", "automation_status"],
+      ["automationTags", "automation_tags"],
+      ["component", "component"],
+      ["status", "status"],
+      ["jiraIssueKey", "jira_issue_key"],
+      ["jiraUrl", "jira_url"]
+    ] as const;
+    const sets: string[] = [];
+    const values: any[] = [testcaseId];
+    for (const [key, column] of keys) {
+      if (fields[key] === undefined) continue;
+      values.push(column === "steps" ? JSON.stringify(this.safeSteps(fields[key])) : fields[key]);
+      sets.push(`${column} = $${values.length}${column === "steps" ? "::jsonb" : ""}`);
+    }
+    if (!sets.length) return;
+    await this.db.query(`UPDATE testcases SET ${sets.join(", ")}, updated_at = now() WHERE id = $1`, values);
+  }
+
+  private chatDraftRow(value: Body, action: string, reason?: string): Body {
+    return {
+      id: value.id || null,
+      externalId: value.externalId || value.external_id || "",
+      title: value.title || "Untitled testcase",
+      priority: value.priority || "P2",
+      status: value.status || "Draft",
+      type: value.type || "Functional",
+      preconditions: value.preconditions || "",
+      expectedSummary: value.expectedSummary || value.description || "",
+      stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      action,
+      reason: reason || ""
+    };
+  }
+
+  private chatTestcaseRow(row: Body, action: string, reason?: string): Body {
+    return this.chatDraftRow({
+      id: row.id,
+      externalId: row.externalId,
+      title: row.title,
+      priority: row.priority,
+      status: row.status,
+      type: row.type,
+      preconditions: row.preconditions,
+      description: row.description,
+      stepsJson: row.steps
+    }, action, reason);
   }
 
   private formatAiTask(row: Body) {

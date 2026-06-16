@@ -534,6 +534,45 @@ export interface ZyraAgentState {
   tasks: ZyraTask[];
 }
 
+export interface ZyraChatTestcaseRow {
+  id?: string | null;
+  externalId?: string;
+  title: string;
+  priority?: string;
+  status?: string;
+  type?: string;
+  preconditions?: string;
+  expectedSummary?: string;
+  stepsJson?: unknown;
+  action?: string;
+  reason?: string;
+}
+
+export interface ZyraChatMessage {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  userId: string | null;
+  role: "user" | "assistant" | string;
+  content: string;
+  reasoningSummary: string | null;
+  actionType: string | null;
+  status: string;
+  testcases: ZyraChatTestcaseRow[];
+  activity: Array<{ actor?: string; title?: string; detail?: string; createdAt?: string }>;
+  createdAt: string;
+}
+
+export interface ZyraChatSession {
+  id: string;
+  projectId: string;
+  userId: string | null;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages?: ZyraChatMessage[];
+}
+
 export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
   return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
 }
@@ -542,6 +581,32 @@ export async function updateZyraSettings(projectId: string, data: { testcaseCoun
   return api<{ testcaseCount: number }>(`/api/projects/${projectId}/agents/zyra/settings`, {
     method: "PATCH",
     body: data,
+  });
+}
+
+export async function listZyraChatSessions(projectId: string): Promise<{ list: ZyraChatSession[] }> {
+  return api<{ list: ZyraChatSession[] }>(`/api/projects/${projectId}/agents/zyra/chat/sessions`);
+}
+
+export async function createZyraChatSession(projectId: string, data: { title?: string } = {}): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function getZyraChatSession(projectId: string, sessionId: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`);
+}
+
+export async function sendZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  message: string
+): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: { message },
   });
 }
 
