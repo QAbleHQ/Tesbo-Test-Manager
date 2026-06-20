@@ -1,4 +1,4 @@
-﻿
+
 CREATE TABLE IF NOT EXISTS execution_automation_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     cycle_id UUID NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,

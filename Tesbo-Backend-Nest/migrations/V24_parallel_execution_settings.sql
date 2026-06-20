@@ -1,4 +1,4 @@
-﻿ALTER TABLE automation_runs
+ALTER TABLE automation_runs
     ADD COLUMN IF NOT EXISTS execution_provider TEXT NOT NULL DEFAULT 'default',
     ADD COLUMN IF NOT EXISTS max_parallel INT NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS provider_config_json JSONB;

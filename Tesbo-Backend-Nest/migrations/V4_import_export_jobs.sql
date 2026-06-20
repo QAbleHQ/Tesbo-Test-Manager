@@ -1,4 +1,4 @@
-﻿-- Import jobs (CSV import history and errors)
+-- Import jobs (CSV import history and errors)
 CREATE TABLE import_jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

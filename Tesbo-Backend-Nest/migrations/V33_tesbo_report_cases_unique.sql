@@ -1,4 +1,4 @@
-﻿
+
 DELETE FROM tesbo_report_cases
 WHERE id NOT IN (
     SELECT DISTINCT ON (run_id, spec_name, test_name) id

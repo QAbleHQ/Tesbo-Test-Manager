@@ -1,4 +1,4 @@
-﻿-- Plans (collection of suites/cases for a release)
+-- Plans (collection of suites/cases for a release)
 CREATE TABLE plans (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

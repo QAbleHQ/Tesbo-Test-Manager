@@ -1,4 +1,4 @@
-﻿
+
 -- Lightweight bug tracker linked to test executions
 CREATE TABLE bugs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

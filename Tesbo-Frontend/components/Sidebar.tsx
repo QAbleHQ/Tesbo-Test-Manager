@@ -3,6 +3,29 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import {
+  IconHome,
+  IconLayoutDashboard,
+  IconStack2,
+  IconSparkles,
+  IconBook,
+  IconFolders,
+  IconClipboardList,
+  IconFileText,
+  IconPlayerPlay,
+  IconBug,
+  IconChartBar,
+  IconActivity,
+  IconSettings,
+  IconUsers,
+  IconPlug,
+  IconLogout,
+  IconChevronLeft,
+  IconChevronRight,
+  IconShield,
+  IconKey,
+  IconList,
+} from "@tabler/icons-react";
 import { authMe, listProjects, logout, type ProjectSummary } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
 import ThemeToggle from "@/components/ThemeToggle";
@@ -27,15 +50,21 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
   {
     section: "Overview",
     items: [
-      { href: "", label: "Project Home", icon: "home" },
-      { href: "activity", label: "Activity Stream", icon: "activity" },
+      { href: "", label: "Project home", icon: "home" },
+      { href: "activity", label: "Activity stream", icon: "activity" },
     ],
   },
   {
-    section: "Scenarios",
+    section: "Test management",
     items: [
-      { href: "suites", label: "Suites", icon: "list" },
-      { href: "plans", label: "Test Plans", icon: "clipboard" },
+      { href: "testcases", label: "Test cases", icon: "fileText" },
+      { href: "suites", label: "Suites", icon: "folders" },
+      { href: "plans", label: "Test plans", icon: "clipboard" },
+    ],
+  },
+  {
+    section: "Execution",
+    items: [
       { href: "cycles", label: "Runs", icon: "play" },
       { href: "bugs", label: "Bugs", icon: "bug" },
       { href: "reports", label: "Insights", icon: "chart" },
@@ -53,7 +82,7 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
           { href: "agents", label: "Agent list", icon: "settings" },
         ],
       },
-      { href: "knowledge-base", label: "Knowledge Base", icon: "book" },
+      { href: "knowledge-base", label: "Knowledge base", icon: "book" },
     ],
   },
 ];
@@ -75,39 +104,36 @@ type NavScope = "workspace" | "project";
 
 type MenuIconName =
   | "home" | "dashboard" | "project" | "sparkles" | "history"
-  | "book" | "list" | "clipboard" | "play" | "bug" | "chart"
+  | "book" | "list" | "folders" | "fileText" | "clipboard" | "play" | "bug" | "chart"
   | "activity" | "runs" | "specs" | "tests" | "analytics"
   | "settings" | "users" | "plug" | "logout"
   | "chevronLeft" | "chevronRight" | "adminPanel" | "key";
 
-function MenuIcon({ name, className = "h-[18px] w-[18px]" }: { name: MenuIconName; className?: string }) {
-  const common = { className, fill: "none", stroke: "currentColor", strokeWidth: 1.75, viewBox: "0 0 24 24" } as const;
+function MenuIcon({ name, className = "h-[20px] w-[20px]" }: { name: MenuIconName; className?: string }) {
+  const props = { className, size: 20, stroke: 1.75 } as const;
   switch (name) {
-    case "home": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M3 11.5l9-7 9 7" /><path strokeLinecap="round" strokeLinejoin="round" d="M5 10v10h14V10" /></svg>;
-    case "dashboard": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 4h7v7H4zM13 4h7v5h-7zM13 11h7v9h-7zM4 13h7v7H4z" /></svg>;
-    case "project": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M3 7h8l2 2h8v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" /></svg>;
-    case "sparkles": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8L12 3z" /><path strokeLinecap="round" strokeLinejoin="round" d="M5 17l.8 1.9L8 20l-2.2.9L5 23l-.8-2.1L2 20l2.2-1.1L5 17z" /></svg>;
-    case "history": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M3 12a9 9 0 1 0 3-6.7" /><path strokeLinecap="round" strokeLinejoin="round" d="M3 4v3h3M12 7v5l3 2" /></svg>;
-    case "book": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 6a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V6z" /></svg>;
-    case "list": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M8 7h12M8 12h12M8 17h12M4 7h.01M4 12h.01M4 17h.01" /></svg>;
-    case "clipboard": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 4h6a2 2 0 0 1 2 2v14H7V6a2 2 0 0 1 2-2z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2H9V4z" /></svg>;
-    case "play": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M8 5v14l11-7-11-7z" /></svg>;
-    case "bug": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M8 9h8M8 15h8M12 5v14M7 7l-2-2M17 7l2-2M7 17l-2 2M17 17l2 2" /><rect x="8" y="7" width="8" height="10" rx="4" /></svg>;
-    case "chart": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 20h16M7 16v-4M12 16V8M17 16v-6" /></svg>;
-    case "activity": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M3 12h4l2-5 4 10 2-5h6" /></svg>;
-    case "runs": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 4h16v16H4z" /><path strokeLinecap="round" strokeLinejoin="round" d="M9 8v8l7-4-7-4z" /></svg>;
-    case "specs": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M7 4h10v16l-5-3-5 3V4z" /></svg>;
-    case "tests": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M8 4h8M9 4v4l-4 7a4 4 0 0 0 3.5 6h7a4 4 0 0 0 3.5-6l-4-7V4" /></svg>;
-    case "analytics": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M4 20V10M10 20V4M16 20v-8M22 20v-4" /></svg>;
-    case "settings": return <svg {...common}><circle cx="12" cy="12" r="3" /><path strokeLinecap="round" strokeLinejoin="round" d="M19.4 15a1 1 0 0 0 .2 1.1l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9V20a2 2 0 1 1-4 0v-.1a1 1 0 0 0-.7-.9 1 1 0 0 0-1.1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H4a2 2 0 1 1 0-4h.1a1 1 0 0 0 .9-.7 1 1 0 0 0-.2-1.1l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1 1 0 0 0 1.1.2h.1a1 1 0 0 0 .6-.9V4a2 2 0 1 1 4 0v.1a1 1 0 0 0 .6.9h.1a1 1 0 0 0 1.1-.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1 1 0 0 0-.2 1.1v.1a1 1 0 0 0 .9.6H20a2 2 0 1 1 0 4h-.1a1 1 0 0 0-.9.6z" /></svg>;
-    case "users": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path strokeLinecap="round" strokeLinejoin="round" d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></svg>;
-    case "plug": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 3v6M15 3v6M7 9h10v2a5 5 0 0 1-5 5v5" /></svg>;
-    case "logout": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>;
-    case "chevronLeft": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6" /></svg>;
-    case "chevronRight": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M9 18l6-6-6-6" /></svg>;
-    case "adminPanel": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M12 2L3 7v6c0 5.25 3.75 10 9 11 5.25-1 9-5.75 9-11V7l-9-5z" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" /></svg>;
-    case "key": return <svg {...common}><path strokeLinecap="round" strokeLinejoin="round" d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /></svg>;
-    default: return null;
+    case "home":        return <IconHome {...props} />;
+    case "dashboard":   return <IconLayoutDashboard {...props} />;
+    case "project":     return <IconStack2 {...props} />;
+    case "sparkles":    return <IconSparkles {...props} />;
+    case "book":        return <IconBook {...props} />;
+    case "list":        return <IconList {...props} />;
+    case "folders":     return <IconFolders {...props} />;
+    case "fileText":    return <IconFileText {...props} />;
+    case "clipboard":   return <IconClipboardList {...props} />;
+    case "play":        return <IconPlayerPlay {...props} />;
+    case "bug":         return <IconBug {...props} />;
+    case "chart":       return <IconChartBar {...props} />;
+    case "activity":    return <IconActivity {...props} />;
+    case "settings":    return <IconSettings {...props} />;
+    case "users":       return <IconUsers {...props} />;
+    case "plug":        return <IconPlug {...props} />;
+    case "logout":      return <IconLogout {...props} />;
+    case "chevronLeft": return <IconChevronLeft {...props} />;
+    case "chevronRight":return <IconChevronRight {...props} />;
+    case "adminPanel":  return <IconShield {...props} />;
+    case "key":         return <IconKey {...props} />;
+    default:            return null;
   }
 }
 
@@ -131,23 +157,22 @@ function NavLink({
       href={href}
       title={collapsed ? label : undefined}
       aria-label={label}
-      className={`group relative flex items-center overflow-hidden rounded-xl py-2 text-[14px] font-medium transition-colors duration-150 ${
+      className={`group relative flex items-center overflow-hidden rounded-[6px] py-2 text-[13px] transition-colors duration-150 ${
         collapsed
           ? "justify-center px-2"
           : nested
-            ? "gap-2.5 pl-10 pr-3.5"
-            : "gap-2.5 pl-4 pr-3.5"
+            ? "gap-2 pl-10 pr-3"
+            : "gap-2 pl-3 pr-3"
       } ${
         active
-          ? "tesbo-nav-item tesbo-nav-item-active text-[var(--foreground)]"
-          : "tesbo-nav-item tesbo-nav-item-idle text-[var(--muted)] hover:text-[var(--foreground)]"
+          ? "tesbo-nav-item tesbo-nav-item-active"
+          : "tesbo-nav-item tesbo-nav-item-idle text-[var(--ink-400)] hover:text-[var(--ink-800)]"
       }`}
     >
-      {active && <span className="absolute inset-y-1 left-0 w-[3px] rounded-r-full bg-[var(--brand-primary)]" aria-hidden />}
       <MenuIcon
         name={icon}
         className={`h-[18px] w-[18px] shrink-0 ${
-          active ? "text-[var(--brand-primary)]" : "text-[var(--muted-soft)]"
+          active ? "text-[var(--denim)]" : "text-[var(--ink-300)]"
         }`}
       />
       {collapsed ? <span className="sr-only">{label}</span> : <span className="truncate">{label}</span>}
@@ -246,7 +271,7 @@ function SidebarContent() {
   return (
     <aside
       className={`tesbo-sidebar sticky top-0 shrink-0 flex h-screen flex-col border-r transition-[width] duration-200 ${
-        isCollapsed ? "w-[72px]" : "w-[248px]"
+        isCollapsed ? "w-[52px]" : "w-[260px]"
       }`}
     >
       <div className="flex h-16 items-center justify-between gap-2 border-b border-[var(--glass-border)] px-3">
@@ -265,7 +290,7 @@ function SidebarContent() {
           className="rounded-xl border border-transparent p-1.5 text-[var(--muted-soft)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
           aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
-          <MenuIcon name={isCollapsed ? "chevronRight" : "chevronLeft"} className="h-4 w-4" />
+          <MenuIcon name={isCollapsed ? "chevronRight" : "chevronLeft"} className="h-[16px] w-[16px]" />
         </button>
       </div>
 
@@ -278,7 +303,7 @@ function SidebarContent() {
               onClick={() => onScopeChange("workspace")}
               className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
                 navScope === "workspace"
-                  ? "bg-[var(--brand-surface)] text-[var(--foreground)] shadow-sm"
+                  ? "bg-[var(--denim)] text-white shadow-sm"
                   : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
               }`}
             >
@@ -289,7 +314,7 @@ function SidebarContent() {
               onClick={() => onScopeChange("project")}
               className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
                 navScope === "project"
-                  ? "bg-[var(--brand-surface)] text-[var(--foreground)] shadow-sm"
+                  ? "bg-[var(--denim)] text-white shadow-sm"
                   : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
               }`}
             >
@@ -335,7 +360,7 @@ function SidebarContent() {
               {projectNavSections.map(({ section, items }) => (
                 <div key={section}>
                   {!isCollapsed && (
-                    <p className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                    <p className="mb-1 px-3 text-[11px] font-medium uppercase tracking-[0.06em] text-[var(--ink-300)]">
                       {section}
                     </p>
                   )}
@@ -430,7 +455,7 @@ function SidebarContent() {
           }`}
           aria-label={isLoggingOut ? "Logging out" : "Log out"}
         >
-          <MenuIcon name="logout" className="h-[18px] w-[18px] shrink-0 text-[var(--muted-soft)]" />
+          <MenuIcon name="logout" className="h-[20px] w-[20px] shrink-0 text-[var(--ink-300)]" />
           {isCollapsed ? (
             <span className="sr-only">{isLoggingOut ? "Logging out..." : "Log out"}</span>
           ) : (

@@ -1,4 +1,4 @@
-﻿
+
 -- Add unified timeline column that replaces events + direct_actions + reasoning_log
 ALTER TABLE automation_recordings ADD COLUMN IF NOT EXISTS timeline JSONB NOT NULL DEFAULT '[]'::jsonb;
 

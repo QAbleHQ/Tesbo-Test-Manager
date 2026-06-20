@@ -1,4 +1,4 @@
-﻿
+
 ALTER TABLE testcases
     ADD COLUMN IF NOT EXISTS automation_script TEXT,
     ADD COLUMN IF NOT EXISTS automation_script_language VARCHAR(64) DEFAULT 'playwright-ts',

@@ -1,4 +1,4 @@
-﻿
+
 ALTER TABLE tesbo_report_runs
     ADD COLUMN IF NOT EXISTS branch_name VARCHAR(255),
     ADD COLUMN IF NOT EXISTS pull_request VARCHAR(128),
