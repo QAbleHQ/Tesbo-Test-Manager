@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   authMe,
   createZyraChatSession,
@@ -16,60 +16,95 @@ import {
   type ZyraChatTestcaseRow,
 } from "@/lib/api";
 import { Button, Textarea } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader } from "@/components/workflows";
 
-function formatTime(value?: string) {
-  if (!value) return "";
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+// ─── Quick actions shown on empty chat ───────────────────────────────────────
+const QUICK_ACTIONS = [
+  { label: "Generate smoke tests", prompt: "Generate smoke test cases covering the most critical user flows in this project." },
+  { label: "Find coverage gaps", prompt: "Analyze existing test cases and identify the most important areas of missing coverage." },
+  { label: "Add negative scenarios", prompt: "Add negative test cases for the main features, focusing on invalid inputs and error states." },
+  { label: "Improve expected results", prompt: "Review existing test cases and rewrite any weak or vague expected results to be more specific." },
+  { label: "Regression test cases", prompt: "Generate a regression test suite that covers the core product functionality." },
+  { label: "Review this module", prompt: "Review all test cases in this project and identify duplicates, outdated cases, and weak coverage." },
+  { label: "Edge cases", prompt: "Create edge case test scenarios covering boundary values, empty states, and unexpected inputs." },
+  { label: "API test cases", prompt: "Generate API test cases for the main endpoints covering success, error, and boundary scenarios." },
+];
+
+// ─── Simple markdown renderer ─────────────────────────────────────────────────
+function renderMarkdown(text: string): string {
+  return text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/^[\-\*] (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>)/g, (match) => `<ul>${match}</ul>`)
+    .replace(/^\d+\. (.+)$/gm, '<li>$1</li>')
+    .replace(/\n\n/g, '<br/><br/>')
+    .replace(/\n/g, '<br/>');
 }
 
-function stepsPreview(value: unknown) {
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function formatTime(value?: string) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function stepsPreview(value: unknown): string {
   if (!value) return "";
   if (Array.isArray(value)) {
     return value.map((step) => {
       if (typeof step === "string") return step;
-      return [step.step, step.action, step.expected].filter(Boolean).join(" - ");
-    }).filter(Boolean).join(" | ");
+      return [step.step, step.action, step.expected].filter(Boolean).join(" → ");
+    }).filter(Boolean).slice(0, 3).join(" | ");
   }
   if (typeof value !== "string") return String(value);
-  try {
-    return stepsPreview(JSON.parse(value));
-  } catch {
-    return value;
-  }
+  try { return stepsPreview(JSON.parse(value)); } catch { return value; }
 }
 
+// ─── TestcaseTable ────────────────────────────────────────────────────────────
 function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
   if (!rows.length) return null;
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-[var(--border)]">
+    <div className="mt-4 overflow-hidden rounded-xl border border-[var(--border)]">
       <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-[var(--border)] text-sm">
-          <thead className="bg-[var(--surface-secondary)] text-left text-xs font-semibold uppercase text-[var(--muted)]">
-            <tr>
-              <th className="px-3 py-2">Case</th>
-              <th className="px-3 py-2">Priority</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Coverage</th>
-              <th className="px-3 py-2">Zyra action</th>
+          <thead className="bg-[var(--surface-secondary)]">
+            <tr className="text-left text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">
+              <th className="px-4 py-2.5">Test case</th>
+              <th className="px-3 py-2.5">Priority</th>
+              <th className="px-3 py-2.5">Status</th>
+              <th className="px-3 py-2.5">Coverage</th>
+              <th className="px-3 py-2.5">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--border)] bg-[var(--surface)]">
-            {rows.map((row, index) => (
-              <tr key={`${row.id || row.externalId || row.title}-${index}`} className="align-top">
-                <td className="max-w-[320px] px-3 py-3">
-                  <div className="font-semibold text-[var(--foreground)]">{row.externalId ? `${row.externalId} ` : ""}{row.title}</div>
-                  {row.type && <div className="mt-1 text-xs text-[var(--muted)]">{row.type}</div>}
+            {rows.map((row, i) => (
+              <tr key={`${row.id || row.externalId || row.title}-${i}`} className="align-top hover:bg-[var(--surface-secondary)] transition-colors">
+                <td className="max-w-[280px] px-4 py-3">
+                  <div className="font-medium text-[var(--foreground)]">
+                    {row.externalId && <span className="mr-1 text-[var(--muted)]">{row.externalId}</span>}
+                    {row.title}
+                  </div>
+                  {row.type && <div className="mt-0.5 text-[11px] text-[var(--muted)]">{row.type}</div>}
                 </td>
-                <td className="px-3 py-3 text-[var(--foreground)]">{row.priority || "P2"}</td>
-                <td className="px-3 py-3 text-[var(--foreground)]">{row.status || "Draft"}</td>
-                <td className="max-w-[420px] px-3 py-3 text-[var(--muted)]">
-                  <div>{row.expectedSummary || row.preconditions || "Coverage details available in the testcase."}</div>
-                  {row.stepsJson ? <div className="mt-1 line-clamp-2 text-xs">{stepsPreview(row.stepsJson)}</div> : null}
+                <td className="px-3 py-3">
+                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${row.priority === "P1" ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" : row.priority === "P3" ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400" : "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"}`}>
+                    {row.priority || "P2"}
+                  </span>
                 </td>
-                <td className="max-w-[240px] px-3 py-3">
-                  <div className="font-medium capitalize text-[var(--foreground)]">{row.action || "suggested"}</div>
-                  {row.reason && <div className="mt-1 text-xs text-[var(--muted)]">{row.reason}</div>}
+                <td className="px-3 py-3 text-xs text-[var(--muted)]">{row.status || "Draft"}</td>
+                <td className="max-w-[360px] px-3 py-3 text-xs text-[var(--muted)]">
+                  <div className="line-clamp-2">{row.expectedSummary || row.preconditions || "—"}</div>
+                  {!!row.stepsJson && <div className="mt-1 line-clamp-1 text-[10px] opacity-70">{stepsPreview(row.stepsJson)}</div>}
+                </td>
+                <td className="px-3 py-3">
+                  <span className={`text-xs font-medium capitalize ${row.action === "archived" ? "text-red-500" : row.action === "updated" ? "text-blue-500" : row.action === "created" ? "text-green-600 dark:text-green-400" : "text-[var(--muted)]"}`}>
+                    {row.action || "suggested"}
+                  </span>
+                  {row.reason && <div className="mt-0.5 text-[10px] text-[var(--muted)] line-clamp-2">{row.reason}</div>}
                 </td>
               </tr>
             ))}
@@ -80,25 +115,104 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
   );
 }
 
+// ─── MessageBubble ────────────────────────────────────────────────────────────
 function MessageBubble({ message }: { message: ZyraChatMessage }) {
   const isUser = message.role === "user";
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(message.content).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
   return (
-    <article className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-      <div className={`max-w-[92%] rounded-lg border px-4 py-3 ${isUser ? "border-[var(--brand-primary)] bg-[var(--brand-primary)] text-white" : "border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"}`}>
-        <div className="whitespace-pre-wrap text-sm leading-6">{message.content}</div>
-        {!isUser && message.reasoningSummary && (
-          <div className="mt-3 rounded-md border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
-            <span className="font-semibold text-[var(--foreground)]">Zyra reasoning summary: </span>
-            {message.reasoningSummary}
-          </div>
-        )}
-        {!isUser && <TestcaseTable rows={message.testcases || []} />}
-        <div className={`mt-2 text-[11px] ${isUser ? "text-white/75" : "text-[var(--muted)]"}`}>{formatTime(message.createdAt)}</div>
+    <article className={`group flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
+      <div className={`mt-1 h-7 w-7 shrink-0 rounded-full flex items-center justify-center text-xs font-bold ${isUser ? "bg-[var(--brand-primary)] text-white" : "bg-[var(--surface)] border border-[var(--border)] text-[var(--muted)]"}`}>
+        {isUser ? "You" : "Z"}
+      </div>
+
+      <div className={`flex-1 ${isUser ? "items-end" : "items-start"} flex flex-col gap-1 min-w-0`}>
+        <div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${isUser ? "rounded-tr-sm bg-[var(--brand-primary)] text-white" : "rounded-tl-sm border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"}`}>
+          {isUser ? (
+            <div className="whitespace-pre-wrap">{message.content}</div>
+          ) : (
+            <div
+              className="zyra-prose"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+            />
+          )}
+
+          {!isUser && message.reasoningSummary && (
+            <details className="mt-3">
+              <summary className="cursor-pointer text-xs font-medium text-[var(--muted)] hover:text-[var(--foreground)] select-none">
+                Zyra reasoning
+              </summary>
+              <div className="mt-2 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
+                {message.reasoningSummary}
+              </div>
+            </details>
+          )}
+
+          {!isUser && <TestcaseTable rows={message.testcases || []} />}
+        </div>
+
+        <div className={`flex items-center gap-2 px-1 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
+          <time className="text-[10px] text-[var(--muted)]">{formatTime(message.createdAt)}</time>
+          {!isUser && (
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="text-[10px] text-[var(--muted)] opacity-0 group-hover:opacity-100 transition-opacity hover:text-[var(--foreground)]"
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          )}
+        </div>
       </div>
     </article>
   );
 }
 
+// ─── ThinkingBubble ───────────────────────────────────────────────────────────
+function ThinkingBubble() {
+  return (
+    <div className="flex gap-3">
+      <div className="mt-1 h-7 w-7 shrink-0 rounded-full flex items-center justify-center text-xs font-bold bg-[var(--surface)] border border-[var(--border)] text-[var(--muted)]">Z</div>
+      <div className="rounded-2xl rounded-tl-sm border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+        <div className="flex items-center gap-1.5">
+          <span className="h-1.5 w-1.5 rounded-full bg-[var(--muted)] animate-bounce [animation-delay:0ms]" />
+          <span className="h-1.5 w-1.5 rounded-full bg-[var(--muted)] animate-bounce [animation-delay:150ms]" />
+          <span className="h-1.5 w-1.5 rounded-full bg-[var(--muted)] animate-bounce [animation-delay:300ms]" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── NoKeyBanner ─────────────────────────────────────────────────────────────
+function NoKeyBanner({ projectId }: { projectId: string }) {
+  return (
+    <div className="mx-auto max-w-lg rounded-2xl border border-amber-500/30 bg-amber-500/10 p-6 text-center">
+      <div className="text-2xl mb-2">⚡</div>
+      <h3 className="text-sm font-semibold text-amber-700 dark:text-amber-400">AI provider not connected</h3>
+      <p className="mt-2 text-xs text-amber-700/80 dark:text-amber-400/80">
+        Zyra needs an Anthropic or OpenAI key allocated to this project before it can respond.
+      </p>
+      <div className="mt-4 flex flex-col gap-2">
+        <Link href="/settings/integrations" className="inline-flex items-center justify-center gap-1 rounded-lg bg-amber-600 px-4 py-2 text-xs font-semibold text-white hover:bg-amber-700">
+          Set up AI key
+        </Link>
+        <Link href={`/projects/${projectId}/agents/zyra/settings`} className="text-xs text-amber-700/70 hover:underline dark:text-amber-400/70">
+          Check Zyra settings
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main page ────────────────────────────────────────────────────────────────
 export default function ZyraChatPage() {
   const params = useParams();
   const router = useRouter();
@@ -111,7 +225,7 @@ export default function ZyraChatPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
-
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messages = useMemo(() => activeSession?.messages || [], [activeSession]);
 
   const refreshSessions = useCallback(async () => {
@@ -129,6 +243,7 @@ export default function ZyraChatPage() {
     const session = await createZyraChatSession(projectId);
     setSessions((prev) => [session, ...prev]);
     setActiveSession(session);
+    setTimeout(() => textareaRef.current?.focus(), 100);
   }, [projectId]);
 
   const loadData = useCallback(async () => {
@@ -156,10 +271,9 @@ export default function ZyraChatPage() {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages.length, sending]);
 
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!activeSession || !input.trim() || sending) return;
-    const text = input.trim();
+  async function submitMessage(text: string) {
+    if (!activeSession || !text.trim() || sending) return;
+    const trimmed = text.trim();
     setInput("");
     setSending(true);
     setError(null);
@@ -169,7 +283,7 @@ export default function ZyraChatPage() {
       projectId,
       userId: null,
       role: "user",
-      content: text,
+      content: trimmed,
       reasoningSummary: null,
       actionType: null,
       status: "sent",
@@ -179,102 +293,237 @@ export default function ZyraChatPage() {
     };
     setActiveSession((prev) => prev ? { ...prev, messages: [...(prev.messages || []), optimistic] } : prev);
     try {
-      const result = await sendZyraChatMessage(projectId, activeSession.id, text);
+      const result = await sendZyraChatMessage(projectId, activeSession.id, trimmed);
       setActiveSession(result.session);
       void refreshSessions();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Zyra could not answer.");
-      setActiveSession((prev) => prev ? { ...prev, messages: (prev.messages || []).filter((item) => item.id !== optimistic.id) } : prev);
+      const msg = err instanceof Error ? err.message : "Zyra could not answer.";
+      setError(msg);
+      setActiveSession((prev) => prev ? { ...prev, messages: (prev.messages || []).filter((m) => m.id !== optimistic.id) } : prev);
     } finally {
       setSending(false);
+      setTimeout(() => textareaRef.current?.focus(), 50);
     }
   }
 
+  function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    void submitMessage(input);
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void submitMessage(input);
+    }
+  }
+
+  function onQuickAction(prompt: string) {
+    setInput(prompt);
+    setTimeout(() => textareaRef.current?.focus(), 50);
+  }
+
+  // ─── Page header (shared between loading and loaded states) ─────────────────
+  const pageHeader = (
+    <PageHeader
+      title="Zyra"
+      subtitle="AI test case assistant — generate, update, and manage test cases through conversation."
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          {agent && (
+            <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${agent.agent.active ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" : "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"}`}>
+              <span className={`h-1.5 w-1.5 rounded-full ${agent.agent.active ? "bg-green-500" : "bg-amber-500"}`} />
+              {agent.agent.active ? "AI connected" : "No AI key"}
+            </span>
+          )}
+          <Link href={`/projects/${projectId}/agents/tasks`} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
+            Task board
+          </Link>
+          <Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
+            Settings
+          </Link>
+        </div>
+      }
+    />
+  );
+
   if (loading) {
     return (
-      <StandardPageLayout header={<PageHeader title="Zyra chat" />}>
-        <div className="flex min-h-[220px] items-center justify-center text-sm text-[var(--muted)]">Loading Zyra chat...</div>
-      </StandardPageLayout>
+      // calc subtracts tesbo-page vertical padding (2rem top + 2.75rem bottom = 4.75rem)
+      <div className="flex flex-col w-full" style={{ height: "calc(100vh - 4.75rem)" }}>
+        {pageHeader}
+        <div className="flex flex-1 items-center justify-center">
+          <div className="text-center space-y-2">
+            <div className="h-8 w-8 rounded-full border-2 border-[var(--brand-primary)] border-t-transparent animate-spin mx-auto" />
+            <p className="text-sm text-[var(--muted)]">Loading Zyra...</p>
+          </div>
+        </div>
+      </div>
     );
   }
 
   return (
-    <StandardPageLayout
-      header={
-        <PageHeader
-          title="Zyra chat"
-          subtitle="Chat with Zyra about product behavior, coverage gaps, testcase updates, and edge-case design."
-          actions={
-            <div className="flex flex-wrap gap-2">
-              <Link href={`/projects/${projectId}/agents/tasks`} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Task board</Link>
-              <Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>
-            </div>
-          }
-        />
-      }
-    >
-      {error && <p className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error)]">{error}</p>}
+    // Full-height flex column — fills the available viewport minus tesbo-page vertical padding
+    <div className="flex flex-col w-full" style={{ height: "calc(100vh - 4.75rem)" }}>
+      {pageHeader}
 
-      <div className="grid min-h-[calc(100vh-220px)] gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="rounded-lg border border-[var(--border)] bg-[var(--surface)]">
-          <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+      {/* Error banner */}
+      {error && (
+        <div className="mb-3 shrink-0 rounded-xl border border-[var(--error)]/40 bg-[var(--error-soft)] px-4 py-3 text-sm text-[var(--error)] flex items-start justify-between gap-3">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)} className="shrink-0 text-[var(--error)]/60 hover:text-[var(--error)]">✕</button>
+        </div>
+      )}
+
+      {/* Main grid — flex-1 + min-h-0 so it takes remaining height without overflowing */}
+      <div className="flex-1 min-h-0 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)] pb-6">
+
+        {/* ── Session sidebar ─────────────────────────────────────────── */}
+        <aside className="flex flex-col rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+          {/* Sidebar header */}
+          <div className="shrink-0 flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
             <div>
-              <h2 className="text-sm font-semibold text-[var(--foreground)]">Session history</h2>
-              <p className="text-xs text-[var(--muted)]">{agent?.agent.active ? "Provider active" : "Local fallback ready"}</p>
+              <p className="text-sm font-semibold text-[var(--foreground)]">Conversations</p>
+              <p className="text-[11px] text-[var(--muted)]">
+                {sessions.length} {sessions.length === 1 ? "session" : "sessions"}
+              </p>
             </div>
-            <Button size="sm" variant="secondary" onClick={() => void createSession()}>New</Button>
+            <Button size="sm" variant="secondary" onClick={() => void createSession()}>+ New</Button>
           </div>
-          <div className="max-h-[calc(100vh-300px)] overflow-y-auto p-2">
-            {sessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                onClick={() => void openSession(session.id)}
-                className={`w-full rounded-md px-3 py-2 text-left text-sm transition-colors ${activeSession?.id === session.id ? "bg-[var(--surface-secondary)] text-[var(--foreground)]" : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"}`}
-              >
-                <span className="block truncate font-medium">{session.title}</span>
-                <span className="mt-1 block text-xs">{formatTime(session.updatedAt)}</span>
-              </button>
-            ))}
+
+          {/* Session list — scrollable */}
+          <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+            {sessions.length === 0 && (
+              <p className="px-3 py-8 text-center text-xs text-[var(--muted)]">No conversations yet</p>
+            )}
+            {sessions.map((session) => {
+              const isActive = activeSession?.id === session.id;
+              return (
+                <button
+                  key={session.id}
+                  type="button"
+                  onClick={() => void openSession(session.id)}
+                  className={`w-full rounded-lg px-3 py-2.5 text-left transition-colors border-l-2 ${
+                    isActive
+                      ? "border-[var(--brand-primary)] bg-[var(--surface-secondary)]"
+                      : "border-transparent hover:bg-[var(--surface-secondary)]"
+                  }`}
+                >
+                  <span className={`block truncate text-[13px] font-medium ${isActive ? "text-[var(--foreground)]" : "text-[var(--muted)]"}`}>
+                    {session.title}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-[var(--muted-soft)]">
+                    {formatTime(session.updatedAt)}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </aside>
 
-        <section className="flex min-h-[560px] flex-col rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)]">
-          <div className="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-            <h2 className="text-sm font-semibold text-[var(--foreground)]">{activeSession?.title || "Zyra chat"}</h2>
-            <p className="text-xs text-[var(--muted)]">Ask about covered features, missing edge cases, or request testcase creation and updates.</p>
+        {/* ── Chat area ───────────────────────────────────────────────── */}
+        <section className="flex flex-col rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] overflow-hidden min-h-0">
+          {/* Chat header — fixed */}
+          <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-3">
+            <p className="text-sm font-semibold text-[var(--foreground)]">{activeSession?.title || "Zyra"}</p>
+            <p className="text-xs text-[var(--muted)]">
+              {agent?.aiKey
+                ? `${agent.aiKey.provider.toUpperCase()} · ${agent.aiKey.defaultModel || "default model"}`
+                : "No AI key connected"}
+            </p>
           </div>
 
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+          {/* Messages — scrollable */}
+          <div className="flex-1 overflow-y-auto px-5 py-5 space-y-5">
             {!messages.length && (
-              <div className="mx-auto max-w-2xl rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] p-5 text-sm text-[var(--muted)]">
-                Try: “What checkout edge cases do we cover?”, “Create testcases for password reset rate limiting”, or “Mark TC-12 for update with accessibility checks”.
+              <div className="flex h-full flex-col items-center justify-center gap-6 py-8">
+                {!agent?.agent.active ? (
+                  <NoKeyBanner projectId={projectId} />
+                ) : (
+                  <>
+                    <div className="text-center max-w-md">
+                      <div className="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-xl font-bold text-white">Z</div>
+                      <h3 className="text-base font-semibold text-[var(--foreground)]">How can I help?</h3>
+                      <p className="mt-1 text-sm text-[var(--muted)]">
+                        Generate test cases, find coverage gaps, update existing tests, or review your test suite — all through conversation.
+                      </p>
+                    </div>
+                    <div className="w-full max-w-2xl">
+                      <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">Quick actions</p>
+                      <div className="flex flex-wrap gap-2">
+                        {QUICK_ACTIONS.map((action) => (
+                          <button
+                            key={action.label}
+                            type="button"
+                            onClick={() => onQuickAction(action.prompt)}
+                            className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-all hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             )}
-            {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
-            {sending && (
-              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-sm text-[var(--muted)]">
-                Zyra is reviewing knowledge, repository coverage, and testcase metadata...
-              </div>
-            )}
+
+            {messages.map((msg) => <MessageBubble key={msg.id} message={msg} />)}
+            {sending && <ThinkingBubble />}
             <div ref={endRef} />
           </div>
 
-          <form onSubmit={onSubmit} className="border-t border-[var(--border)] bg-[var(--surface)] p-4">
-            <Textarea
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              rows={3}
-              placeholder="Ask Zyra about product coverage, missing cases, or testcase updates..."
-              className="resize-none"
-            />
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <p className="text-xs text-[var(--muted)]">Zyra logs testcase create/update/archive actions to activity.</p>
-              <Button type="submit" disabled={!input.trim() || sending}>{sending ? "Thinking..." : "Send"}</Button>
-            </div>
-          </form>
+          {/* Input — fixed at bottom */}
+          <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+            <form onSubmit={onSubmit}>
+              <Textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                rows={3}
+                placeholder={
+                  agent?.agent.active
+                    ? "Ask Zyra to generate, update, or review test cases..."
+                    : "Connect an AI key to start chatting with Zyra"
+                }
+                disabled={sending || !agent?.agent.active}
+                className="resize-none"
+              />
+              <div className="mt-2.5 flex items-center justify-between gap-3">
+                <p className="text-[11px] text-[var(--muted)]">
+                  <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}send
+                  {" · "}
+                  <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{" "}new line
+                </p>
+                <Button type="submit" size="sm" disabled={!input.trim() || sending || !agent?.agent.active}>
+                  {sending ? "Thinking..." : "Send"}
+                </Button>
+              </div>
+            </form>
+          </div>
         </section>
       </div>
-    </StandardPageLayout>
+
+      {/* Inline styles for markdown prose */}
+      <style>{`
+        .zyra-prose strong { font-weight: 600; }
+        .zyra-prose em { font-style: italic; }
+        .zyra-prose .inline-code {
+          font-family: ui-monospace, monospace;
+          font-size: 0.8em;
+          background: var(--surface-secondary);
+          border: 1px solid var(--border);
+          border-radius: 4px;
+          padding: 1px 4px;
+        }
+        .zyra-prose ul {
+          list-style: disc;
+          padding-left: 1.25rem;
+          margin: 0.5rem 0;
+        }
+        .zyra-prose li { margin: 0.2rem 0; }
+      `}</style>
+    </div>
   );
 }

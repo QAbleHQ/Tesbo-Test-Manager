@@ -13,6 +13,7 @@ import {
   EmptyStateBlock,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { IconClipboardList, IconPlayerPlay } from "@tabler/icons-react";
 
 function StatusBadge({ count, label, color }: { count: number; label: string; color: string }) {
   if (count === 0) return null;
@@ -25,15 +26,15 @@ function StatusBadge({ count, label, color }: { count: number; label: string; co
 }
 
 function ProgressBar({ passed, failed, untested, total }: { passed: number; failed: number; untested: number; total: number }) {
-  if (total === 0) return <div className="h-2 rounded-full bg-[var(--surface-tertiary)] w-full" />;
+  if (total === 0) return <div className="h-1.5 rounded-full bg-[var(--ink-100)] w-full" />;
   const pPassed = (passed / total) * 100;
   const pFailed = (failed / total) * 100;
   const other = 100 - pPassed - pFailed;
   return (
-    <div className="h-2 rounded-full bg-[var(--surface-tertiary)] w-full overflow-hidden flex">
-      {pPassed > 0 && <div className="bg-emerald-500 h-full transition-all" style={{ width: `${pPassed}%` }} />}
-      {pFailed > 0 && <div className="bg-red-500 h-full transition-all" style={{ width: `${pFailed}%` }} />}
-      {other > 0 && <div className="bg-[var(--surface-secondary)] h-full transition-all" style={{ width: `${other}%` }} />}
+    <div className="h-1.5 rounded-full bg-[var(--ink-100)] w-full overflow-hidden flex">
+      {pPassed > 0 && <div className="h-full transition-all" style={{ width: `${pPassed}%`, background: "var(--status-pass-dot)" }} />}
+      {pFailed > 0 && <div className="h-full transition-all" style={{ width: `${pFailed}%`, background: "var(--status-fail-dot)" }} />}
+      {other > 0 && <div className="h-full transition-all" style={{ width: `${other}%`, background: "var(--ink-200)" }} />}
     </div>
   );
 }
@@ -103,30 +104,26 @@ export default function PlansPage() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="flex flex-col items-center gap-3">
-          <div className="w-8 h-8 border-2 border-[var(--brand-primary)] border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-[var(--muted)]">Loading test plans...</p>
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--ink-200)] border-t-[var(--denim)]" />
+          <p className="text-[13px] text-[var(--ink-400)]">Loading plans…</p>
         </div>
       </div>
     );
   }
 
   return (
-    <main className="tesbo-page max-w-5xl mx-auto">
-      <ListWorkspaceLayout
+    <ListWorkspaceLayout
         header={
           <PageHeader
-            title="Test Plans"
-            subtitle="Organize test runs and track overall testing progress"
+            title="Test plans"
+            subtitle="Organise test runs and track overall testing progress."
             actions={
               canManagePlans ? (
                 <Button
                   variant="primary"
                   onClick={() => setShowCreate(!showCreate)}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                  </svg>
-                  Create Test Plan
+                  New test plan
                 </Button>
               ) : undefined
             }
@@ -198,11 +195,7 @@ export default function PlansPage() {
                 ? "Create your first test plan to organize test runs and track progress."
                 : "No test plans have been created for this project yet."
             }
-            icon={
-              <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-              </svg>
-            }
+            icon={<IconClipboardList size={48} stroke={1.25} className="text-[var(--ink-300)]" />}
             action={
               canManagePlans ? (
                 <Button variant="primary" onClick={() => setShowCreate(true)}>
@@ -218,11 +211,11 @@ export default function PlansPage() {
               const total = plan.totalCases || 0;
               return (
                 <Link key={plan.id} href={`/projects/${projectId}/plans/${plan.id}`}>
-                  <Card className="block p-5 hover:border-[var(--brand-primary)]/50 hover:shadow-md transition-all group">
+                  <Card className="block p-5 transition-colors hover:border-[var(--border-strong)] group">
                     <div className="flex items-start justify-between">
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-3">
-                        <h3 className="text-base font-semibold text-[var(--foreground)] group-hover:text-[var(--brand-primary)] transition-colors truncate">
+                        <h3 className="text-[15px] font-medium text-[var(--ink-800)] transition-colors group-hover:text-[var(--denim)] truncate">
                           {plan.name}
                         </h3>
                         {plan.targetRelease && (
@@ -236,11 +229,9 @@ export default function PlansPage() {
                         )}
                       </div>
                       <div className="flex items-center gap-2 ml-4 shrink-0">
-                        <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--surface-tertiary)] px-3 py-1 text-xs font-medium text-[var(--muted)]">
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                        </svg>
-                        {plan.runCount} {plan.runCount === 1 ? "run" : "runs"}
+                        <span className="inline-flex items-center gap-1.5 rounded-[6px] bg-[var(--ink-50)] px-2.5 py-1 text-[12px] font-medium text-[var(--ink-400)]">
+                          <IconPlayerPlay size={12} stroke={1.75} />
+                          {plan.runCount} {plan.runCount === 1 ? "run" : "runs"}
                         </span>
                         {total > 0 && (
                           <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-bold ${
@@ -278,7 +269,6 @@ export default function PlansPage() {
             })}
           </div>
         )}
-      </ListWorkspaceLayout>
-    </main>
+    </ListWorkspaceLayout>
   );
 }

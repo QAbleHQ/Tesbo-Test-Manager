@@ -228,7 +228,10 @@ function ProjectsPageContent() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-[var(--muted)]">Loading…</p>
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--ink-200)] border-t-[var(--denim)]" />
+          <p className="text-[13px] text-[var(--ink-400)]">Loading projects…</p>
+        </div>
       </div>
     );
   }
@@ -371,14 +374,14 @@ function ProjectsPageContent() {
                         {p.teamMembers.slice(0, 4).map((member, idx) => (
                           <span
                             key={member.userId}
-                            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--surface-primary)] bg-[var(--brand-soft)] text-[11px] font-semibold text-[var(--brand-primary)] ${idx > 0 ? "-ml-2" : ""}`}
+                            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--surface)] bg-[var(--brand-soft)] text-[11px] font-semibold text-[var(--brand-primary)] ${idx > 0 ? "-ml-2" : ""}`}
                             title={member.name}
                           >
                             {getInitials(member.name)}
                           </span>
                         ))}
                         {p.teamMembers.length > 4 ? (
-                          <span className="-ml-2 inline-flex h-7 min-w-7 items-center justify-center rounded-full border border-[var(--surface-primary)] bg-[var(--surface-tertiary)] px-2 text-[11px] font-semibold text-[var(--foreground)]">
+                          <span className="-ml-2 inline-flex h-7 min-w-7 items-center justify-center rounded-full border border-[var(--surface)] bg-[var(--surface-tertiary)] px-2 text-[11px] font-semibold text-[var(--foreground)]">
                             +{p.teamMembers.length - 4}
                           </span>
                         ) : null}

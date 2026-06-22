@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { authMe } from "@/lib/api";
-import AdminSidebar from "@/components/AdminSidebar";
+import Sidebar from "@/components/Sidebar";
 
 export default function AdminLayout({
   children,
@@ -59,7 +59,7 @@ export default function AdminLayout({
 
   return (
     <div className="tesbo-app-shell flex min-h-screen">
-      <AdminSidebar />
+      <Sidebar />
       <main className="flex-1 min-w-0 overflow-y-auto">
         <div className="tesbo-page">{children}</div>
       </main>

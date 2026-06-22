@@ -5,11 +5,8 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import {
   IconHome,
-  IconLayoutDashboard,
-  IconStack2,
   IconSparkles,
   IconBook,
-  IconFolders,
   IconClipboardList,
   IconFileText,
   IconPlayerPlay,
@@ -26,7 +23,7 @@ import {
   IconKey,
   IconList,
 } from "@tabler/icons-react";
-import { authMe, listProjects, logout, type ProjectSummary } from "@/lib/api";
+import { authMe, logout } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
 import ThemeToggle from "@/components/ThemeToggle";
 
@@ -41,11 +38,6 @@ type NavItemConfig = {
   }>;
 };
 
-const globalNavItems: NavItemConfig[] = [
-  { href: "/projects", label: "Projects", icon: "project" },
-  { href: "/dashboard", label: "Workspace Insights", icon: "dashboard" },
-];
-
 const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
   {
     section: "Overview",
@@ -58,7 +50,6 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
     section: "Test management",
     items: [
       { href: "testcases", label: "Test cases", icon: "fileText" },
-      { href: "suites", label: "Suites", icon: "folders" },
       { href: "plans", label: "Test plans", icon: "clipboard" },
     ],
   },
@@ -87,53 +78,33 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
   },
 ];
 
-
-const workspaceSettingsNavItems = [
-  { href: "/settings/members", label: "Members", icon: "users" },
-  { href: "/settings/integrations", label: "Integrations", icon: "plug" },
-] as const;
-
-const workspaceModeNavItems: NavItemConfig[] = [
-  ...globalNavItems,
-  ...workspaceSettingsNavItems,
-];
-
-// Easy rollback switch: set to false to disable
-const ENABLE_SCOPE_SWITCHER = true;
-type NavScope = "workspace" | "project";
-
 type MenuIconName =
-  | "home" | "dashboard" | "project" | "sparkles" | "history"
-  | "book" | "list" | "folders" | "fileText" | "clipboard" | "play" | "bug" | "chart"
-  | "activity" | "runs" | "specs" | "tests" | "analytics"
-  | "settings" | "users" | "plug" | "logout"
-  | "chevronLeft" | "chevronRight" | "adminPanel" | "key";
+  | "home" | "sparkles" | "book" | "list" | "fileText" | "clipboard"
+  | "play" | "bug" | "chart" | "activity" | "settings" | "users" | "plug"
+  | "logout" | "chevronLeft" | "chevronRight" | "adminPanel" | "key";
 
 function MenuIcon({ name, className = "h-[20px] w-[20px]" }: { name: MenuIconName; className?: string }) {
   const props = { className, size: 20, stroke: 1.75 } as const;
   switch (name) {
-    case "home":        return <IconHome {...props} />;
-    case "dashboard":   return <IconLayoutDashboard {...props} />;
-    case "project":     return <IconStack2 {...props} />;
-    case "sparkles":    return <IconSparkles {...props} />;
-    case "book":        return <IconBook {...props} />;
-    case "list":        return <IconList {...props} />;
-    case "folders":     return <IconFolders {...props} />;
-    case "fileText":    return <IconFileText {...props} />;
-    case "clipboard":   return <IconClipboardList {...props} />;
-    case "play":        return <IconPlayerPlay {...props} />;
-    case "bug":         return <IconBug {...props} />;
-    case "chart":       return <IconChartBar {...props} />;
-    case "activity":    return <IconActivity {...props} />;
-    case "settings":    return <IconSettings {...props} />;
-    case "users":       return <IconUsers {...props} />;
-    case "plug":        return <IconPlug {...props} />;
-    case "logout":      return <IconLogout {...props} />;
-    case "chevronLeft": return <IconChevronLeft {...props} />;
-    case "chevronRight":return <IconChevronRight {...props} />;
-    case "adminPanel":  return <IconShield {...props} />;
-    case "key":         return <IconKey {...props} />;
-    default:            return null;
+    case "home":         return <IconHome {...props} />;
+    case "sparkles":     return <IconSparkles {...props} />;
+    case "book":         return <IconBook {...props} />;
+    case "list":         return <IconList {...props} />;
+    case "fileText":     return <IconFileText {...props} />;
+    case "clipboard":    return <IconClipboardList {...props} />;
+    case "play":         return <IconPlayerPlay {...props} />;
+    case "bug":          return <IconBug {...props} />;
+    case "chart":        return <IconChartBar {...props} />;
+    case "activity":     return <IconActivity {...props} />;
+    case "settings":     return <IconSettings {...props} />;
+    case "users":        return <IconUsers {...props} />;
+    case "plug":         return <IconPlug {...props} />;
+    case "logout":       return <IconLogout {...props} />;
+    case "chevronLeft":  return <IconChevronLeft {...props} />;
+    case "chevronRight": return <IconChevronRight {...props} />;
+    case "adminPanel":   return <IconShield {...props} />;
+    case "key":          return <IconKey {...props} />;
+    default:             return null;
   }
 }
 
@@ -180,6 +151,20 @@ function NavLink({
   );
 }
 
+function BackToProjects({ collapsed }: { collapsed: boolean }) {
+  return (
+    <Link
+      href="/projects"
+      className={`group flex items-center rounded-[6px] py-2 text-[13px] transition-colors duration-150 tesbo-nav-item tesbo-nav-item-idle text-[var(--ink-400)] hover:text-[var(--ink-800)] ${
+        collapsed ? "justify-center px-2" : "gap-2 pl-3 pr-3"
+      }`}
+    >
+      <MenuIcon name="chevronLeft" className="h-[18px] w-[18px] shrink-0 text-[var(--ink-300)]" />
+      {collapsed ? <span className="sr-only">All Projects</span> : <span className="truncate font-medium">All Projects</span>}
+    </Link>
+  );
+}
+
 function SidebarContent() {
   const pathname = usePathname();
   const router = useRouter();
@@ -189,7 +174,6 @@ function SidebarContent() {
   const isInProject = Boolean(projectId);
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
@@ -203,20 +187,9 @@ function SidebarContent() {
     return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    if (!ENABLE_SCOPE_SWITCHER) return;
-    let active = true;
-    listProjects()
-      .then((items) => {
-        if (active) setProjects(Array.isArray(items) ? items : []);
-      })
-      .catch(() => {
-        if (active) setProjects([]);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+  const isInSettings = Boolean(
+    pathname?.startsWith("/settings") || pathname?.startsWith("/admin")
+  );
 
   const isOnProjectRoot = projectId != null && pathname === `/projects/${projectId}`;
   const isPathActive = (href: string) => {
@@ -248,25 +221,8 @@ function SidebarContent() {
     }
   };
 
-  const onScopeChange = (scope: NavScope) => {
-    if (scope === "workspace" && isInProject) {
-      router.push("/projects");
-      return;
-    }
-    if (scope === "project" && !isInProject) {
-      const fallbackProjectId = projects[0]?.id;
-      if (fallbackProjectId) router.push(`/projects/${fallbackProjectId}`);
-    }
-  };
-
-  const onProjectSelect = (nextProjectId: string) => {
-    if (!nextProjectId) return;
-    router.push(`/projects/${nextProjectId}`);
-  };
-
-  const navScope: NavScope = isInProject ? "project" : "workspace";
-  const showGlobalNavigation = !ENABLE_SCOPE_SWITCHER || !isInProject;
-  const showProjectNavigation = isInProject && Boolean(projectId);
+  const showProjectNav = !isInSettings && isInProject && Boolean(projectId);
+  const showSettingsNav = isInSettings;
 
   return (
     <aside
@@ -274,6 +230,7 @@ function SidebarContent() {
         isCollapsed ? "w-[52px]" : "w-[260px]"
       }`}
     >
+      {/* Header */}
       <div className="flex h-16 items-center justify-between gap-2 border-b border-[var(--glass-border)] px-3">
         <Link href="/projects" className={`flex items-center ${isCollapsed ? "justify-center" : ""}`} aria-label="Tesbo Test Manager">
           {isCollapsed ? (
@@ -294,150 +251,106 @@ function SidebarContent() {
         </button>
       </div>
 
-      {ENABLE_SCOPE_SWITCHER && !isCollapsed && (
-        <div className="border-b border-[var(--glass-border)] px-3 py-3">
-          <p className="text-[12px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">Scope Lock</p>
-          <div className="tesbo-glass-strong mt-2 grid grid-cols-2 rounded-xl p-1">
-            <button
-              type="button"
-              onClick={() => onScopeChange("workspace")}
-              className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
-                navScope === "workspace"
-                  ? "bg-[var(--denim)] text-white shadow-sm"
-                  : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
-              }`}
-            >
-              Workspace
-            </button>
-            <button
-              type="button"
-              onClick={() => onScopeChange("project")}
-              className={`rounded-lg px-2 py-1.5 text-[12px] font-semibold transition-colors ${
-                navScope === "project"
-                  ? "bg-[var(--denim)] text-white shadow-sm"
-                  : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
-              }`}
-            >
-              Project
-            </button>
-          </div>
-          {navScope === "project" && (
-            <div className="mt-2">
-              <label className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                Project Switcher
-              </label>
-              <select
-                value={projectId ?? ""}
-                onChange={(e) => onProjectSelect(e.target.value)}
-                className="w-full rounded-xl border border-[var(--glass-border)] bg-[var(--glass-surface-strong)] px-3 py-2 text-[13px] text-[var(--foreground)] shadow-[var(--shadow-card)] backdrop-blur"
-              >
-                <option value="" disabled>
-                  Select project
-                </option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-        </div>
-      )}
-
+      {/* Navigation */}
       <nav className="flex-1 space-y-3 overflow-y-auto px-2.5 pb-3 pt-3">
-        {showGlobalNavigation && (
-          <div className="space-y-0.5">
-            {(ENABLE_SCOPE_SWITCHER ? workspaceModeNavItems : globalNavItems).map(({ href, label, icon }) => (
-              <NavLink key={href} href={href} label={label} icon={icon} active={isPathActive(href)} collapsed={isCollapsed} />
-            ))}
+
+        {/* Settings mode */}
+        {showSettingsNav && (
+          <div className="space-y-3">
+            <div className="space-y-0.5">
+              <BackToProjects collapsed={isCollapsed} />
+            </div>
+
+            <div>
+              {!isCollapsed && (
+                <p className="mb-1 px-3 text-[11px] font-medium uppercase tracking-[0.06em] text-[var(--ink-300)]">Workspace</p>
+              )}
+              <div className="space-y-0.5">
+                <NavLink href="/settings/members" label="Members" icon="users" active={isPathActive("/settings/members")} collapsed={isCollapsed} />
+                <NavLink href="/settings/integrations" label="Integrations" icon="plug" active={isPathActive("/settings/integrations")} collapsed={isCollapsed} />
+              </div>
+            </div>
+
+            {isPlatformAdmin && (
+              <div>
+                {!isCollapsed && (
+                  <p className="mb-1 px-3 text-[11px] font-medium uppercase tracking-[0.06em] text-[var(--ink-300)]">Platform Admin</p>
+                )}
+                <div className="space-y-0.5">
+                  <NavLink href="/admin" label="System Health" icon="activity" active={pathname === "/admin"} collapsed={isCollapsed} />
+                  <NavLink href="/admin/admins" label="Manage Admins" icon="users" active={isPathActive("/admin/admins")} collapsed={isCollapsed} />
+                </div>
+              </div>
+            )}
           </div>
         )}
 
-        {showProjectNavigation ? (
-          <>
-            <div className="space-y-3">
-              {projectNavSections.map(({ section, items }) => (
-                <div key={section}>
-                  {!isCollapsed && (
-                    <p className="mb-1 px-3 text-[11px] font-medium uppercase tracking-[0.06em] text-[var(--ink-300)]">
-                      {section}
-                    </p>
-                  )}
-                  <div className="space-y-0.5">
-                    {items.map(({ href, label, icon, children }) => {
-                      const fullHref = href ? `${projectPathPrefix}/${href}` : projectPathPrefix;
-                      const active = isPathActive(fullHref) || (href === "" && isOnProjectRoot);
-                      const isParentOpen = Boolean(children && active);
-
-                      return (
-                        <div key={href || label}>
-                          <NavLink href={fullHref} label={label} icon={icon} active={active} collapsed={isCollapsed} />
-                          {!isCollapsed && isParentOpen && children ? (
-                            <div className="mt-0.5 space-y-0.5">
-                              {children.map((child) => {
-                                const childHref = `${projectPathPrefix}/${child.href}`;
-                                const childActive =
-                                  child.href === "agents"
-                                    ? pathname === childHref
-                                    : isPathActive(childHref);
-                                return (
-                                  <NavLink
-                                    key={child.href}
-                                    href={childHref}
-                                    label={child.label}
-                                    icon={child.icon}
-                                    active={childActive}
-                                    collapsed={isCollapsed}
-                                    nested
-                                  />
-                                );
-                              })}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
-              <NavLink
-                href={`${projectPathPrefix}/settings`}
-                label="Settings"
-                icon="settings"
-                active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
-                collapsed={isCollapsed}
-              />
+        {/* Project mode */}
+        {showProjectNav && (
+          <div className="space-y-3">
+            <div className="space-y-0.5">
+              <BackToProjects collapsed={isCollapsed} />
             </div>
-          </>
-        ) : null}
 
-        {/* Workspace settings */}
-        {showGlobalNavigation && !ENABLE_SCOPE_SWITCHER && (
-          <div>
-            {!isCollapsed && (
-              <p className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                Workspace
-              </p>
-            )}
-            {workspaceSettingsNavItems.map(({ href, label, icon }) => {
-              const active = pathname === href || pathname?.startsWith(`${href}/`);
-              return <NavLink key={href} href={href} label={label} icon={icon} active={active} collapsed={isCollapsed} />;
-            })}
+            {projectNavSections.map(({ section, items }) => (
+              <div key={section}>
+                {!isCollapsed && (
+                  <p className="mb-1 px-3 text-[11px] font-medium uppercase tracking-[0.06em] text-[var(--ink-300)]">
+                    {section}
+                  </p>
+                )}
+                <div className="space-y-0.5">
+                  {items.map(({ href, label, icon, children }) => {
+                    const fullHref = href ? `${projectPathPrefix}/${href}` : projectPathPrefix;
+                    const active = isPathActive(fullHref) || (href === "" && isOnProjectRoot);
+                    const isParentOpen = Boolean(children && active);
+
+                    return (
+                      <div key={href || label}>
+                        <NavLink href={fullHref} label={label} icon={icon} active={active} collapsed={isCollapsed} />
+                        {!isCollapsed && isParentOpen && children ? (
+                          <div className="mt-0.5 space-y-0.5">
+                            {children.map((child) => {
+                              const childHref = `${projectPathPrefix}/${child.href}`;
+                              const childActive =
+                                child.href === "agents"
+                                  ? pathname === childHref
+                                  : isPathActive(childHref);
+                              return (
+                                <NavLink
+                                  key={child.href}
+                                  href={childHref}
+                                  label={child.label}
+                                  icon={child.icon}
+                                  active={childActive}
+                                  collapsed={isCollapsed}
+                                  nested
+                                />
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+
+            <NavLink
+              href={`${projectPathPrefix}/settings`}
+              label="Settings"
+              icon="settings"
+              active={pathname === `${projectPathPrefix}/settings` || (pathname?.startsWith(`${projectPathPrefix}/settings/`) ?? false)}
+              collapsed={isCollapsed}
+            />
           </div>
         )}
       </nav>
 
-      <div className="space-y-2 border-t border-[var(--glass-border)] p-2.5">
-        {!isCollapsed && (
-          <div className="tesbo-glass-strong rounded-xl p-2">
-            <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-              Theme
-            </p>
-            <ThemeToggle />
-          </div>
-        )}
-        {isPlatformAdmin && (
+      {/* Footer */}
+      <div className="space-y-1 border-t border-[var(--glass-border)] p-2.5">
+        {isPlatformAdmin && !isInSettings && (
           <NavLink
             href="/admin"
             label="Admin Panel"
@@ -446,24 +359,24 @@ function SidebarContent() {
             collapsed={isCollapsed}
           />
         )}
-        <button
-          type="button"
-          onClick={onLogout}
-          disabled={isLoggingOut}
-          className={`w-full rounded-xl border border-transparent py-2 text-[14px] text-[var(--muted)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)] disabled:opacity-60 ${
-            isCollapsed ? "flex justify-center px-2" : "flex items-center gap-2.5 px-2.5 text-left"
-          }`}
-          aria-label={isLoggingOut ? "Logging out" : "Log out"}
-        >
-          <MenuIcon name="logout" className="h-[20px] w-[20px] shrink-0 text-[var(--ink-300)]" />
-          {isCollapsed ? (
-            <span className="sr-only">{isLoggingOut ? "Logging out..." : "Log out"}</span>
-          ) : (
-            <span>{isLoggingOut ? "Logging out..." : "Log out"}</span>
-          )}
-        </button>
+        <div className={`flex items-center ${isCollapsed ? "flex-col gap-1" : "gap-2"}`}>
+          <ThemeToggle />
+          <button
+            type="button"
+            onClick={onLogout}
+            disabled={isLoggingOut}
+            className={`flex items-center rounded-[6px] border border-transparent py-1.5 text-[13px] text-[var(--muted)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)] disabled:opacity-60 ${
+              isCollapsed ? "justify-center px-2" : "flex-1 gap-2 px-2"
+            }`}
+            aria-label={isLoggingOut ? "Logging out" : "Log out"}
+          >
+            <MenuIcon name="logout" className="h-[18px] w-[18px] shrink-0 text-[var(--ink-300)]" />
+            {!isCollapsed && <span>{isLoggingOut ? "Logging out..." : "Log out"}</span>}
+            {isCollapsed && <span className="sr-only">{isLoggingOut ? "Logging out..." : "Log out"}</span>}
+          </button>
+        </div>
         {logoutError && !isCollapsed && (
-          <p className="mt-1.5 px-2.5 text-xs text-[var(--error)]">{logoutError}</p>
+          <p className="mt-1 px-2 text-xs text-[var(--error)]">{logoutError}</p>
         )}
       </div>
     </aside>

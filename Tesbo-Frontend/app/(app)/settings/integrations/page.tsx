@@ -75,14 +75,16 @@ export default function WorkspaceIntegrationsPage() {
     setMessage(null);
     setError(null);
     try {
+      const isKnownProvider = ["openai", "anthropic"].includes(providerValue);
       await createWorkspaceAiKey({
         name: newName.trim(),
         provider: providerValue,
         apiKey: newApiKey.trim(),
         defaultModel: newDefaultModel.trim() === "custom" ? undefined : newDefaultModel.trim() || undefined,
         baseUrl: newBaseUrl.trim() || undefined,
-        authHeaderName: newAuthHeaderName.trim() || undefined,
-        authScheme: newAuthScheme.trim(),
+        // Only send auth overrides for custom providers — known providers use well-defined SDK defaults
+        authHeaderName: isKnownProvider ? undefined : (newAuthHeaderName.trim() || undefined),
+        authScheme: isKnownProvider ? undefined : (newAuthScheme.trim() || undefined),
       });
       setNewName("");
       setNewCustomProvider("");

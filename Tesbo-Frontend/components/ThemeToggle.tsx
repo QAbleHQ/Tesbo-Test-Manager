@@ -33,7 +33,7 @@ export default function ThemeToggle() {
   };
 
   return (
-    <div className="tesbo-glass-strong inline-flex items-center rounded-xl p-1">
+    <div className="tesbo-glass-strong inline-flex items-center rounded-lg p-0.5">
       {(["light", "dark"] as ThemeMode[]).map((mode) => {
         const active = theme === mode;
         return (
@@ -43,14 +43,13 @@ export default function ThemeToggle() {
             aria-pressed={active}
             aria-label={`Use ${mode} theme`}
             onClick={() => setMode(mode)}
-            className={`inline-flex items-center gap-2 rounded-[10px] px-3 py-2 text-[13px] font-semibold transition-colors ${
+            className={`rounded-md p-1.5 transition-colors ${
               active
                 ? "bg-[var(--brand-surface)] text-[var(--foreground)] shadow-sm"
                 : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
             }`}
           >
             <ThemeIcon mode={mode} />
-            <span className="capitalize">{mode}</span>
           </button>
         );
       })}

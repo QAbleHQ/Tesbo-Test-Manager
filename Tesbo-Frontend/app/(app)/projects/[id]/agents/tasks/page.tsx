@@ -172,6 +172,7 @@ export default function ZyraTasksPage() {
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <Button onClick={() => setCreateOpen(true)} disabled={!state.agent.active}>Create task</Button>
+              <Link href={`/projects/${projectId}/agents/zyra`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Chat</Link>
               <Link href={`/projects/${projectId}/agents/zyra/settings`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Settings</Link>
             </div>
           }

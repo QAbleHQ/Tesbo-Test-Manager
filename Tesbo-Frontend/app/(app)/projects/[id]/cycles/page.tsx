@@ -3,6 +3,7 @@
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { IconPencil, IconTrash, IconCalendarEvent, IconPlayerPlay } from "@tabler/icons-react";
 import {
   authMe,
   listTestRuns,
@@ -193,16 +194,15 @@ export default function TestRunsPage() {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p className="text-[var(--muted)]">Loading…</p>
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--ink-200)] border-t-[var(--denim)]" />
+          <p className="text-[13px] text-[var(--ink-400)]">Loading runs…</p>
+        </div>
       </div>
     );
   }
 
-  const emptyIcon = (
-    <svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-    </svg>
-  );
+  const emptyIcon = <IconPlayerPlay size={48} stroke={1.25} className="text-[var(--ink-300)]" />;
 
   return (
     <ListWorkspaceLayout
@@ -224,9 +224,10 @@ export default function TestRunsPage() {
                 </Button>
                 <Link
                   href={`/projects/${projectId}/cycles/schedule`}
-                  className="inline-flex items-center justify-center h-10 rounded-xl px-4 text-sm font-medium border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors"
+                  className="inline-flex h-9 items-center gap-2 rounded-[6px] border border-[var(--ink-200)] px-4 text-[13px] font-medium text-[var(--ink-600)] transition-colors hover:bg-[var(--ink-100)]"
                 >
-                  Schedule Run
+                  <IconCalendarEvent size={15} stroke={1.75} />
+                  Schedule
                 </Link>
               </div>
             ) : undefined
@@ -249,78 +250,84 @@ export default function TestRunsPage() {
       )}
 
       {/* Cards list */}
-      <div className="grid gap-4">
+      <div className="grid gap-3">
         {runs.map((r) => {
           const total = r.totalCases;
-          const passRate = total > 0 ? Math.round((r.passed / total) * 100) : 0;
+          const passRate = total > 0 ? Math.round((r.passed / total) * 100) : null;
+          const passRateColor =
+            passRate === null ? "var(--ink-400)"
+            : passRate >= 80 ? "var(--status-pass-text)"
+            : passRate >= 50 ? "var(--status-blocked-text)"
+            : "var(--status-fail-text)";
           return (
-            <Card key={r.id} className="p-5 hover:shadow-md transition-shadow">
-              <div className="flex items-start justify-between">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-3 mb-1">
+            <Card key={r.id} className="p-5 transition-colors hover:border-[var(--border-strong)]">
+              <div className="flex items-start justify-between gap-4">
+                {/* Left: name + meta */}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Link
                       href={`/projects/${projectId}/cycles/${r.id}`}
-                      className="text-lg font-semibold text-[var(--foreground)] hover:text-[var(--brand-primary)] truncate"
+                      className="text-[15px] font-medium text-[var(--ink-800)] hover:text-[var(--denim)] transition-colors"
                     >
                       {r.name}
                     </Link>
                     <StatusChip tone={statusTone(r.status)}>{r.status}</StatusChip>
                   </div>
                   {r.description && (
-                    <p className="text-sm text-[var(--muted)] truncate mb-2">
+                    <p className="mt-1 line-clamp-1 text-[13px] text-[var(--ink-400)]">
                       {r.description}
                     </p>
                   )}
-                  <div className="flex items-center gap-4 text-xs text-[var(--muted-soft)]">
-                    {r.environment && <span>Env: {r.environment}</span>}
-                    {r.buildVersion && <span>Build: {r.buildVersion}</span>}
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-[12px] text-[var(--ink-400)]">
+                    {r.environment && (
+                      <span className="rounded bg-[var(--ink-50)] px-2 py-0.5 font-medium">
+                        {r.environment}
+                      </span>
+                    )}
+                    {r.buildVersion && (
+                      <span className="rounded bg-[var(--ink-50)] px-2 py-0.5 font-mono">
+                        {r.buildVersion}
+                      </span>
+                    )}
                     <span>{new Date(r.createdAt).toLocaleDateString()}</span>
                   </div>
                 </div>
 
-                {/* Quick stats */}
-                <div className="flex items-center gap-4 ml-4 shrink-0">
-                  <div className="text-center">
-                    <p className="text-lg font-bold text-[var(--foreground)]">
-                      {total}
-                    </p>
-                    <p className="text-xs text-[var(--muted-soft)]">Cases</p>
+                {/* Right: stats + actions */}
+                <div className="flex shrink-0 items-center gap-5">
+                  <div className="text-right">
+                    <p className="text-[18px] font-semibold leading-none text-[var(--ink-800)]">{total}</p>
+                    <p className="mt-1 text-[11px] text-[var(--ink-400)]">cases</p>
                   </div>
-                  {total > 0 && (
-                    <div className="text-center">
-                      <p className="text-lg font-bold text-[var(--success)]">{passRate}%</p>
-                      <p className="text-xs text-[var(--muted-soft)]">Pass</p>
-                    </div>
-                  )}
+                  <div className="text-right">
+                    {passRate !== null ? (
+                      <>
+                        <p className="text-[18px] font-semibold leading-none" style={{ color: passRateColor }}>{passRate}%</p>
+                        <p className="mt-1 text-[11px] text-[var(--ink-400)]">pass rate</p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-[18px] font-semibold leading-none text-[var(--ink-300)]">—</p>
+                        <p className="mt-1 text-[11px] text-[var(--ink-400)]">no cases</p>
+                      </>
+                    )}
+                  </div>
 
-                  {/* Actions */}
                   {canManageRuns && (
                     <div className="flex items-center gap-1">
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setFormError(null);
-                          openEdit(r);
-                        }}
-                        className="p-1.5 rounded-lg hover:bg-[var(--surface-secondary)] text-[var(--muted-soft)] hover:text-[var(--muted)]"
+                        onClick={(e) => { e.stopPropagation(); setFormError(null); openEdit(r); }}
+                        className="rounded-[6px] p-1.5 text-[var(--ink-400)] transition-colors hover:bg-[var(--ink-100)] hover:text-[var(--ink-800)]"
                         title="Edit"
                       >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                        </svg>
+                        <IconPencil size={15} stroke={1.75} />
                       </button>
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setFormError(null);
-                          setDeleteTarget(r);
-                        }}
-                        className="p-1.5 rounded-lg hover:bg-red-50 text-[var(--muted-soft)] hover:text-[var(--error)]"
+                        onClick={(e) => { e.stopPropagation(); setFormError(null); setDeleteTarget(r); }}
+                        className="rounded-[6px] p-1.5 text-[var(--ink-400)] transition-colors hover:bg-[var(--status-fail-fill)] hover:text-[var(--status-fail-text)]"
                         title="Delete"
                       >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
+                        <IconTrash size={15} stroke={1.75} />
                       </button>
                     </div>
                   )}

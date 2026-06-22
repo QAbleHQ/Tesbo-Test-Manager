@@ -528,6 +528,11 @@ export class LegacyController {
     return this.legacy.zyraAgent(projectId);
   }
 
+  @Get("/api/projects/:projectId/agents/zyra/test")
+  testZyraConnection(@Param("projectId") projectId: string) {
+    return this.legacy.testZyraAiConnection(projectId);
+  }
+
   @Patch("/api/projects/:projectId/agents/zyra/settings")
   updateZyraSettings(@Param("projectId") projectId: string, @Body() body: Record<string, any>) {
     return this.legacy.updateZyraSettings(projectId, body);

@@ -512,6 +512,13 @@ export interface ZyraTask {
   updatedAt: string;
 }
 
+export interface ZyraCapabilities {
+  generation: boolean;
+  knowledgeBase: boolean;
+  testcaseStorage: boolean;
+  suiteOperations: boolean;
+}
+
 export interface ZyraAgentState {
   agent: {
     name: string;
@@ -519,7 +526,7 @@ export interface ZyraAgentState {
     active: boolean;
     activationReason: string;
   };
-  settings: { testcaseCount: number };
+  settings: { testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities };
   aiKey: {
     id: string;
     name: string;
@@ -577,8 +584,15 @@ export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
   return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
 }
 
-export async function updateZyraSettings(projectId: string, data: { testcaseCount: number }): Promise<{ testcaseCount: number }> {
-  return api<{ testcaseCount: number }>(`/api/projects/${projectId}/agents/zyra/settings`, {
+export async function testZyraAiConnection(projectId: string): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
+  return api(`/api/projects/${projectId}/agents/zyra/test`);
+}
+
+export async function updateZyraSettings(
+  projectId: string,
+  data: { testcaseRange?: string; capabilities?: Partial<ZyraCapabilities> }
+): Promise<{ testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities }> {
+  return api<{ testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities }>(`/api/projects/${projectId}/agents/zyra/settings`, {
     method: "PATCH",
     body: data,
   });
