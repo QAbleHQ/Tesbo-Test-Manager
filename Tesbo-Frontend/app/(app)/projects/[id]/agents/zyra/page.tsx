@@ -30,18 +30,58 @@ const QUICK_ACTIONS = [
   { label: "API test cases", prompt: "Generate API test cases for the main endpoints covering success, error, and boundary scenarios." },
 ];
 
-// ─── Simple markdown renderer ─────────────────────────────────────────────────
-function renderMarkdown(text: string): string {
-  return text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>')
+// ─── Markdown renderer ────────────────────────────────────────────────────────
+function mdInline(s: string): string {
+  return s
+    .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/^[\-\*] (.+)$/gm, '<li>$1</li>')
-    .replace(/(<li>[\s\S]*?<\/li>)/g, (match) => `<ul>${match}</ul>`)
-    .replace(/^\d+\. (.+)$/gm, '<li>$1</li>')
-    .replace(/\n\n/g, '<br/><br/>')
-    .replace(/\n/g, '<br/>');
+    .replace(/\*(.+?)\*/g, "<em>$1</em>");
+}
+
+function mdTable(lines: string[]): string {
+  const isSep = (l: string) => /^\|[\s\-:|]+\|$/.test(l.trim());
+  const cells = (l: string) => l.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+  const data = lines.filter(l => !isSep(l));
+  if (!data.length) return "";
+  const [hdr, ...rows] = data;
+  const thead = `<thead><tr>${cells(hdr).map(h => `<th>${mdInline(h)}</th>`).join("")}</tr></thead>`;
+  const tbody = `<tbody>${rows.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  return `<div class="zyra-md-table-wrap"><table class="zyra-md-table">${thead}${tbody}</table></div>`;
+}
+
+function renderMarkdown(text: string): string {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const lines = esc(text).split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const t = lines[i].trim();
+    if (/^### /.test(t)) { out.push(`<h3>${mdInline(t.slice(4))}</h3>`); i++; continue; }
+    if (/^## /.test(t)) { out.push(`<h2>${mdInline(t.slice(3))}</h2>`); i++; continue; }
+    if (/^# /.test(t)) { out.push(`<h1>${mdInline(t.slice(2))}</h1>`); i++; continue; }
+    if (/^---+$/.test(t)) { out.push("<hr/>"); i++; continue; }
+    if (t.startsWith("|")) {
+      const tbl: string[] = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) { tbl.push(lines[i]); i++; }
+      out.push(mdTable(tbl));
+      continue;
+    }
+    if (/^[-*] /.test(t) || /^\d+\. /.test(t)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const l = lines[i].trim();
+        if (/^[-*] /.test(l)) { items.push(`<li>${mdInline(l.slice(2))}</li>`); i++; }
+        else if (/^\d+\. /.test(l)) { items.push(`<li>${mdInline(l.replace(/^\d+\. /, ""))}</li>`); i++; }
+        else break;
+      }
+      out.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+    if (t === "") { out.push("<br/>"); i++; continue; }
+    out.push(`<p>${mdInline(t)}</p>`);
+    i++;
+  }
+  return out.join("");
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -115,13 +155,43 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
   );
 }
 
+// ─── resolveContent ───────────────────────────────────────────────────────────
+// message.content may be a raw JSON blob from the AI when the backend fallback
+// stored the full structured response as-is. Extract reply + testcases from it.
+function resolveContent(message: ZyraChatMessage): { text: string; testcases: ZyraChatTestcaseRow[]; reasoning: string | null } {
+  let text = message.content ?? "";
+  let testcases: ZyraChatTestcaseRow[] = message.testcases ?? [];
+  let reasoning = message.reasoningSummary ?? null;
+
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (typeof parsed.reply === "string" && parsed.reply) text = parsed.reply;
+        if (!reasoning && typeof parsed.reasoningSummary === "string" && parsed.reasoningSummary) {
+          reasoning = parsed.reasoningSummary;
+        }
+        if (Array.isArray(parsed.testcases) && parsed.testcases.length > 0 && testcases.length === 0) {
+          testcases = parsed.testcases as ZyraChatTestcaseRow[];
+        }
+      }
+    } catch {
+      // Not JSON — use content as-is
+    }
+  }
+
+  return { text, testcases, reasoning };
+}
+
 // ─── MessageBubble ────────────────────────────────────────────────────────────
 function MessageBubble({ message }: { message: ZyraChatMessage }) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
+  const { text, testcases, reasoning } = isUser ? { text: message.content, testcases: [], reasoning: null } : resolveContent(message);
 
   function handleCopy() {
-    navigator.clipboard.writeText(message.content).then(() => {
+    navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
@@ -134,28 +204,28 @@ function MessageBubble({ message }: { message: ZyraChatMessage }) {
       </div>
 
       <div className={`flex-1 ${isUser ? "items-end" : "items-start"} flex flex-col gap-1 min-w-0`}>
+        {!isUser && reasoning && (
+          <details className="max-w-[88%] w-full mb-1">
+            <summary className="cursor-pointer text-xs font-medium text-[var(--muted)] hover:text-[var(--foreground)] select-none">
+              Zyra reasoning
+            </summary>
+            <div className="mt-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
+              {reasoning}
+            </div>
+          </details>
+        )}
+
         <div className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${isUser ? "rounded-tr-sm bg-[var(--brand-primary)] text-white" : "rounded-tl-sm border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]"}`}>
           {isUser ? (
-            <div className="whitespace-pre-wrap">{message.content}</div>
+            <div className="whitespace-pre-wrap">{text}</div>
           ) : (
             <div
               className="zyra-prose"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
             />
           )}
 
-          {!isUser && message.reasoningSummary && (
-            <details className="mt-3">
-              <summary className="cursor-pointer text-xs font-medium text-[var(--muted)] hover:text-[var(--foreground)] select-none">
-                Zyra reasoning
-              </summary>
-              <div className="mt-2 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
-                {message.reasoningSummary}
-              </div>
-            </details>
-          )}
-
-          {!isUser && <TestcaseTable rows={message.testcases || []} />}
+          {!isUser && <TestcaseTable rows={testcases} />}
         </div>
 
         <div className={`flex items-center gap-2 px-1 ${isUser ? "flex-row-reverse" : "flex-row"}`}>

@@ -744,3 +744,50 @@ textarea:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--brand-primary) 40%, transparent);
   outline-offset: 1px;
 }
+
+/* ── Zyra chat prose ─────────────────────────────────────────────────────── */
+.zyra-prose { line-height: 1.65; }
+.zyra-prose h1 { font-size: 1.0625rem; font-weight: 700; margin: 1rem 0 0.4rem; color: var(--foreground); }
+.zyra-prose h2 { font-size: 1rem; font-weight: 700; margin: 0.9rem 0 0.35rem; color: var(--foreground); }
+.zyra-prose h3 { font-size: 0.9375rem; font-weight: 600; margin: 0.75rem 0 0.3rem; color: var(--foreground); }
+.zyra-prose h1:first-child,
+.zyra-prose h2:first-child,
+.zyra-prose h3:first-child { margin-top: 0; }
+.zyra-prose hr { border: none; border-top: 1px solid var(--border); margin: 0.6rem 0; }
+.zyra-prose p { margin: 0.25rem 0; }
+.zyra-prose ul { margin: 0.3rem 0; padding-left: 1.25rem; list-style: disc; }
+.zyra-prose li { margin: 0.15rem 0; }
+.zyra-prose strong { font-weight: 600; color: var(--foreground); }
+.zyra-prose em { font-style: italic; }
+.zyra-prose .inline-code {
+  font-family: var(--font-mono);
+  font-size: 0.8125em;
+  background: var(--surface-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  color: var(--foreground);
+}
+
+.zyra-md-table-wrap { overflow-x: auto; margin: 0.6rem 0; border-radius: 8px; border: 1px solid var(--border); }
+.zyra-md-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.zyra-md-table th {
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: var(--surface-secondary);
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.zyra-md-table td {
+  padding: 0.375rem 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--foreground);
+  vertical-align: top;
+}
+.zyra-md-table tbody tr:last-child td { border-bottom: none; }
+.zyra-md-table tbody tr:hover { background: var(--surface-secondary); }

@@ -2179,8 +2179,15 @@ export class LegacyService {
       "Do not reveal hidden chain-of-thought. Provide a concise reasoningSummary with observable factors and action steps.",
       "Treat remove/delete requests as archive operations unless the user clearly names an existing app delete control.",
       `Detected local intent hint: ${intent}. Follow the user's actual wording if it is clearer than this hint.`,
-      "Return only valid JSON with shape:",
+      "Return ONLY a single valid JSON object — no markdown fences, no text before or after the JSON:",
       "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive|create_suite|move_to_suite\",\"actionType\":\"answer|create|update|archive|suite|mixed\",\"operations\":[{\"type\":\"create|update|archive|create_suite|move_to_suite\",\"testcaseId\":\"\",\"externalId\":\"\",\"externalIds\":[],\"allExisting\":false,\"suiteName\":\"\",\"suiteId\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
+      "REPLY FIELD RULES — reply is rendered as markdown in a chat UI, must be human-readable:",
+      "  - Use ## for main headings, ### for subsections, **bold** for emphasis, - for bullets, 1. for numbered steps.",
+      "  - For comparisons or tabular data use markdown table syntax: | Heading | Heading |\\n|---|---|\\n| value | value |",
+      "  - When testcase rows are in the testcases array the UI already renders them in a table — only write a brief summary in reply (e.g. 'Created 3 test cases covering the checkout flow.'). Do NOT duplicate testcase data as a markdown table in reply.",
+      "  - NEVER put raw JSON, object/array literals, code blocks, or placeholder text like <string> in reply.",
+      "  - Be direct — skip filler openers like 'Certainly!', 'Sure!', or 'Here is your answer:'.",
+      "  - For analytical responses (coverage gaps, test strategy, explanations) use structured headings and bullets so the answer is easy to scan.",
       "",
       "Existing suites (use these names/ids for move_to_suite; reuse an existing suite instead of duplicating it):",
       projectSnapshot.suites.length ? projectSnapshot.suites.map((s) => `${s.name} (id: ${s.id}, ${s.testCaseCount} testcase(s))`).join("\n") : "No suites yet.",
@@ -2200,7 +2207,17 @@ export class LegacyService {
       existingTestcases.map((tc) => `${tc.externalId} | ${tc.title} | ${tc.priority} | ${tc.status}\n${tc.description}\nSteps: ${tc.stepsSummary}`).join("\n\n") || "No existing testcases.",
       "",
       "Recent chat:",
-      history.rows.reverse().map((row) => `${row.role}: ${row.content}`).join("\n") || "No prior chat."
+      history.rows.reverse().map((row) => {
+        let content = String(row.content || "");
+        const trimmed = content.trim();
+        if (trimmed.startsWith("{")) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed?.reply === "string" && parsed.reply) content = parsed.reply;
+          } catch { /* not JSON — use as-is */ }
+        }
+        return `${row.role}: ${content}`;
+      }).join("\n") || "No prior chat."
     ].join("\n");
 
     try {
@@ -2262,19 +2279,25 @@ export class LegacyService {
     });
     for (const op of allowed.slice(0, 10)) {
       if (op.type === "create" && op.draft) {
-        const created = await this.createTestCase(projectId, {
-          title: op.draft.title,
-          description: op.draft.description || op.draft.expectedSummary || "",
-          preconditions: op.draft.preconditions || "",
-          stepsJson: this.safeSteps(op.draft.stepsJson || op.draft.steps),
-          testData: op.draft.testData || "",
-          priority: op.draft.priority || "P2",
-          severity: op.draft.severity || null,
-          type: op.draft.type || "Functional",
-          status: op.draft.status || "Draft",
-          component: op.draft.component || null,
-          jiraIssueKey: op.draft.jiraIssueKey || null
-        });
+        let created: Body | null = null;
+        try {
+          created = await this.createTestCase(projectId, {
+            title: op.draft.title,
+            description: op.draft.description || op.draft.expectedSummary || "",
+            preconditions: op.draft.preconditions || "",
+            stepsJson: this.safeSteps(op.draft.stepsJson || op.draft.steps),
+            testData: op.draft.testData || "",
+            priority: op.draft.priority || "P2",
+            severity: op.draft.severity || null,
+            type: op.draft.type || "Functional",
+            status: op.draft.status || "Draft",
+            component: op.draft.component || null,
+            jiraIssueKey: op.draft.jiraIssueKey || null
+          });
+        } catch (err: unknown) {
+          if ((err as { code?: string })?.code === "23505") continue; // duplicate — skip silently
+          throw err;
+        }
         const row = await this.getTestCase(created.id);
         testcases.push(this.chatTestcaseRow(row, "created", op.reason));
         activity.push({ actor: "agent", title: "Created testcase", detail: `${created.externalId} ${created.title}`, createdAt: new Date().toISOString() });
@@ -2427,8 +2450,9 @@ export class LegacyService {
       "A backend project-data tool has completed. Use this exact tool result as factual source data.",
       "Write the final user-facing response in Zyra's expert QA voice.",
       "Do not invent numbers, tickets, or testcase rows beyond the tool result.",
-      "Return only valid JSON with shape:",
+      "Return ONLY a single valid JSON object — no markdown fences, no text outside the JSON:",
       "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer\",\"actionType\":\"answer\",\"operations\":[],\"testcases\":[{}]}",
+      "REPLY FIELD: human-readable markdown. Use ## headings, - bullets, **bold**, markdown tables (| H | H |\\n|---|---|\\n| v | v |). Never put raw JSON or code blocks inside reply. Be direct and structured.",
       "",
       `Tool name: ${params.toolName}`,
       `Tool result JSON: ${JSON.stringify(params.toolDecision)}`
@@ -2437,7 +2461,7 @@ export class LegacyService {
       ? await this.zyraChatWithAnthropic(params.key, params.model, finalizePrompt, params.message)
       : await this.zyraChatWithOpenAi(params.key, params.model, finalizePrompt, params.message);
     return {
-      reply: String(raw.reply || params.toolDecision.reply || "").slice(0, 5000),
+      reply: this.sanitizeZyraReply(raw.reply, String(params.toolDecision.reply || "")),
       reasoningSummary: String(raw.reasoningSummary || params.toolDecision.reasoningSummary || "").slice(0, 1500),
       actionType: "answer",
       operations: [],
@@ -3426,6 +3450,18 @@ export class LegacyService {
     throw new Error(`Claude chat failed: ${lastStatus || "No compatible model was accepted."}`);
   }
 
+  private sanitizeZyraReply(raw: unknown, fallback: string): string {
+    let text = String(raw ?? "").trim();
+    // AI occasionally nests a full JSON blob inside the reply field — unwrap it
+    if (text.startsWith("{")) {
+      try {
+        const inner = JSON.parse(text);
+        if (typeof inner?.reply === "string" && inner.reply) text = inner.reply.trim();
+      } catch { /* not JSON */ }
+    }
+    return (text || fallback).slice(0, 5000);
+  }
+
   private normalizeZyraChatDecision(raw: Body, message: string, existingTestcases: ZyraGenerationInput["existingTestcases"], intent: ZyraChatIntent): ZyraChatDecision {
     const modelActionType = ["answer", "create", "update", "archive", "suite", "mixed"].includes(String(raw.actionType))
       ? String(raw.actionType) as ZyraChatDecision["actionType"]
@@ -3462,7 +3498,7 @@ export class LegacyService {
       .slice(0, 10);
     const testcases = tableIntent ? normalizeJsonArray(raw.testcases).slice(0, 25) : [];
     return {
-      reply: String(raw.reply || this.defaultZyraReply(message, existingTestcases)).slice(0, 5000),
+      reply: this.sanitizeZyraReply(raw.reply, this.defaultZyraReply(message, existingTestcases)),
       reasoningSummary: String(raw.reasoningSummary || this.defaultReasoningSummary(existingTestcases.length)).slice(0, 1500),
       actionType,
       operations: mutationIntent ? operations : [],
@@ -3922,8 +3958,12 @@ export class LegacyService {
       || normalizeTestcaseIdPrefix(settings.testcaseIdPrefix)
       || normalizeTestcaseIdPrefix(project.rows[0]?.key)
       || "TC";
-    const count = await this.db.query<{ count: string }>("SELECT COUNT(*) AS count FROM testcases WHERE project_id = $1", [projectId]);
-    return `${key}-TC-${Number(count.rows[0]?.count || 0) + 1}`;
+    // Use MAX of the trailing numeric part to avoid collisions when IDs have gaps
+    const maxRes = await this.db.query<{ n: string }>(
+      "SELECT COALESCE(MAX((regexp_match(external_id, '\\d+$'))[1]::int), 0) AS n FROM testcases WHERE project_id = $1 AND external_id LIKE $2",
+      [projectId, `${key}-TC-%`]
+    );
+    return `${key}-TC-${Number(maxRes.rows[0]?.n || 0) + 1}`;
   }
 
   private async groupTestcases(projectId: string, column: string) {
