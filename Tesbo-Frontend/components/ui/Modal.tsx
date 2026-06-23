@@ -19,13 +19,13 @@ export default function Modal({ open, onClose, title, children, className }: Mod
     >
       <div
         className={cx(
-          "w-full rounded-2xl border border-[var(--border)] bg-[var(--surface-overlay)] p-6 shadow-[var(--shadow-elevated)]",
-          className === undefined ? "max-w-lg" : className,
+          "w-full rounded-[10px] border border-[var(--border)] bg-[var(--surface-overlay)] p-6 shadow-[var(--shadow-elevated)]",
+          className === undefined ? "max-w-[560px]" : className,
         )}
         onClick={(event) => event.stopPropagation()}
       >
         {title ? (
-          <h2 className="mb-4 shrink-0 text-[22px] font-semibold tracking-tight text-[var(--foreground)]">{title}</h2>
+          <h2 className="mb-4 shrink-0 text-[24px] font-semibold leading-[1.2] tracking-[-0.02em] text-[var(--ink-800)]">{title}</h2>
         ) : null}
         {children}
       </div>

@@ -1,4 +1,4 @@
-﻿CREATE TABLE ai_generation_requests (
+CREATE TABLE ai_generation_requests (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id                  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     requested_by                UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

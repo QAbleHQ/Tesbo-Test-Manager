@@ -3,13 +3,26 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --primary: #0969da;
-  --brand-primary: #0969da;
-  --brand-hover: #0860ca;
-  --brand-pressed: #0757ba;
-  --brand-soft: #ddf4ff;
-  --brand-surface: #edf7ff;
-  --brand-border: rgba(9, 105, 218, 0.18);
+  /* ── Tesbo Denim brand scale (v2) ─────────────────────────────────── */
+  --denim: #1D3F6E;
+  --denim-400: #2A5A9E;
+  --denim-200: #4A7AB5;
+  --denim-50: #E8EFF8;
+  --raisin: #1E1B2E;
+
+  /* CTA accent — orange for primary action buttons and links only */
+  --cta-primary: #E8600A;
+  --cta-hover: #CC5208;
+  --cta-soft: #FFF0E8;
+
+  /* Legacy brand alias → now points to Tesbo Denim */
+  --primary: #1D3F6E;
+  --brand-primary: #1D3F6E;
+  --brand-hover: #2A5A9E;
+  --brand-pressed: #1A3660;
+  --brand-soft: #E8EFF8;
+  --brand-surface: #F0F5FB;
+  --brand-border: rgba(29, 63, 110, 0.18);
 
   --ai-primary: #4f46e5;
   --ai-hover: #4338ca;
@@ -18,77 +31,136 @@
   --ai-surface: #f4f3ff;
   --ai-border: rgba(79, 70, 229, 0.16);
 
-  --background: #f4f7f8;
-  --app-shell: #eff3f5;
+  /* ── Ink neutral scale ───────────────────────────────────────────── */
+  --ink-900: #0D0E14;
+  --ink-800: #1C1E2A;
+  --ink-600: #3A3D4E;
+  --ink-400: #6B7280;
+  --ink-300: #A8ABBE;
+  --ink-200: #D4D8E4;
+  --ink-100: #ECEEF4;
+  --ink-50: #F8F9FC;
+
+  /* ── Surfaces ────────────────────────────────────────────────────── */
+  --background: #F8F9FC;
+  --app-shell: #F0F4F8;
   --surface: #ffffff;
-  --surface-secondary: #f7fafb;
-  --surface-tertiary: #edf2f4;
+  --surface-secondary: #F8F9FC;
+  --surface-tertiary: #ECEEF4;
   --surface-overlay: #ffffff;
   --glass-surface: rgba(255, 255, 255, 0.72);
   --glass-surface-strong: rgba(255, 255, 255, 0.88);
-  --glass-surface-muted: rgba(247, 250, 251, 0.64);
+  --glass-surface-muted: rgba(248, 249, 252, 0.64);
   --glass-border: rgba(255, 255, 255, 0.68);
   --glass-highlight: rgba(255, 255, 255, 0.92);
-  --glass-shadow: 0 18px 50px rgba(31, 41, 55, 0.12);
-  --glass-ring: rgba(9, 105, 218, 0.18);
+  --glass-shadow: 0 18px 50px rgba(29, 63, 110, 0.1);
+  --glass-ring: rgba(29, 63, 110, 0.18);
   --shell-gradient:
-    linear-gradient(135deg, rgba(9, 105, 218, 0.1), transparent 34%),
-    linear-gradient(45deg, rgba(20, 184, 166, 0.08), transparent 32%),
-    linear-gradient(180deg, #f8fbfd 0%, #eef4f7 100%);
+    linear-gradient(135deg, rgba(29, 63, 110, 0.06), transparent 34%),
+    linear-gradient(45deg, rgba(74, 122, 181, 0.05), transparent 32%),
+    linear-gradient(180deg, #f8f9fc 0%, #eef2f8 100%);
 
-  --foreground: #0f1720;
-  --muted: #52606d;
-  --muted-soft: #74808b;
-  --border: #d6dee6;
-  --border-subtle: #e3e8ee;
-  --border-strong: #c2ccd6;
-  --overlay-backdrop: rgba(15, 23, 32, 0.42);
+  /* ── Foreground / text ───────────────────────────────────────────── */
+  --foreground: #0D0E14;
+  --muted: #3A3D4E;
+  --muted-soft: #6B7280;
+  --border: #D4D8E4;
+  --border-subtle: #ECEEF4;
+  --border-strong: #A8ABBE;
+  --overlay-backdrop: rgba(13, 14, 20, 0.4);
 
-  --success: #15803d;
-  --success-foreground: #166534;
-  --success-soft: #dcfce7;
-  --success-border: rgba(21, 128, 61, 0.18);
-  --warning: #b7791f;
-  --warning-foreground: #92400e;
-  --warning-soft: #fef3c7;
-  --warning-border: rgba(183, 121, 31, 0.2);
-  --error: #c0392b;
-  --error-foreground: #b42318;
-  --error-soft: #fde8e8;
-  --error-border: rgba(192, 57, 43, 0.2);
-  --info: #2563eb;
-  --info-foreground: #1d4ed8;
-  --info-soft: #dbeafe;
-  --info-border: rgba(37, 99, 235, 0.2);
+  /* ── Semantic status colors (test execution states) ──────────────── */
+  /* Pass */
+  --status-pass-text: #1A6B35;
+  --status-pass-dot: #2D9A52;
+  --status-pass-fill: #EAF7EE;
+  /* Fail */
+  --status-fail-text: #8B1F1F;
+  --status-fail-dot: #D83A3A;
+  --status-fail-fill: #FDEAEA;
+  /* Blocked */
+  --status-blocked-text: #7A4A0A;
+  --status-blocked-dot: #D97C0A;
+  --status-blocked-fill: #FFF7E6;
+  /* Skipped */
+  --status-skipped-text: #3E4456;
+  --status-skipped-dot: #8B91A8;
+  --status-skipped-fill: #EFF0F3;
+  /* In Review */
+  --status-inreview-text: #2D3DB0;
+  --status-inreview-dot: #4C5FD5;
+  --status-inreview-fill: #EEF2FF;
+  /* Draft */
+  --status-draft-text: #4A2FA0;
+  --status-draft-dot: #7C5FCC;
+  --status-draft-fill: #F5F0FF;
+  /* Running */
+  --status-running-text: #8B3200;
+  --status-running-dot: #E8600A;
+  --status-running-fill: #FFF0E8;
+  /* Not Run */
+  --status-notrun-text: #0D5070;
+  --status-notrun-dot: #1D7FA8;
+  --status-notrun-fill: #E6F5FB;
 
-  --confidence-high: #2563eb;
-  --confidence-high-foreground: #1d4ed8;
-  --confidence-high-soft: #dbeafe;
-  --confidence-high-border: rgba(37, 99, 235, 0.2);
-  --confidence-medium: #b7791f;
-  --confidence-medium-foreground: #92400e;
-  --confidence-medium-soft: #fef3c7;
-  --confidence-medium-border: rgba(183, 121, 31, 0.22);
-  --confidence-low: #c0392b;
-  --confidence-low-foreground: #b42318;
-  --confidence-low-soft: #fde8e8;
-  --confidence-low-border: rgba(192, 57, 43, 0.2);
+  /* ── Semantic utility colors ─────────────────────────────────────── */
+  --success: #2D9A52;
+  --success-foreground: #1A6B35;
+  --success-soft: #EAF7EE;
+  --success-border: rgba(45, 154, 82, 0.2);
+  --warning: #D97C0A;
+  --warning-foreground: #7A4A0A;
+  --warning-soft: #FFF7E6;
+  --warning-border: rgba(217, 124, 10, 0.2);
+  --error: #D83A3A;
+  --error-foreground: #8B1F1F;
+  --error-soft: #FDEAEA;
+  --error-border: rgba(216, 58, 58, 0.2);
+  --info: #4C5FD5;
+  --info-foreground: #2D3DB0;
+  --info-soft: #EEF2FF;
+  --info-border: rgba(76, 95, 213, 0.2);
 
-  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 6px 18px rgba(16, 24, 40, 0.04);
-  --shadow-elevated: 0 8px 28px rgba(16, 24, 40, 0.08);
-  --radius-card: 16px;
-  --radius-control: 12px;
-  --content-max: 1360px;
+  --confidence-high: #4C5FD5;
+  --confidence-high-foreground: #2D3DB0;
+  --confidence-high-soft: #EEF2FF;
+  --confidence-high-border: rgba(76, 95, 213, 0.2);
+  --confidence-medium: #D97C0A;
+  --confidence-medium-foreground: #7A4A0A;
+  --confidence-medium-soft: #FFF7E6;
+  --confidence-medium-border: rgba(217, 124, 10, 0.22);
+  --confidence-low: #D83A3A;
+  --confidence-low-foreground: #8B1F1F;
+  --confidence-low-soft: #FDEAEA;
+  --confidence-low-border: rgba(216, 58, 58, 0.2);
+
+  /* ── Shadows & radius ────────────────────────────────────────────── */
+  --shadow-card: 0 1px 2px rgba(29, 63, 110, 0.04), 0 6px 18px rgba(29, 63, 110, 0.06);
+  --shadow-elevated: 0 8px 28px rgba(29, 63, 110, 0.1);
+  --radius-card: 10px;
+  --radius-control: 6px;
+  --content-max: 1280px;
 }
 
 .dark {
-  --primary: #2f81f7;
-  --brand-primary: #2f81f7;
-  --brand-hover: #58a6ff;
-  --brand-pressed: #1f6feb;
-  --brand-soft: rgba(47, 129, 247, 0.16);
-  --brand-surface: rgba(47, 129, 247, 0.1);
-  --brand-border: rgba(47, 129, 247, 0.26);
+  /* Brand stays denim in dark mode, lighter weight for readability */
+  --denim: #4A7AB5;
+  --denim-400: #2A5A9E;
+  --denim-200: #1D3F6E;
+  --denim-50: rgba(29, 63, 110, 0.2);
+  --raisin: #1E1B2E;
+
+  --cta-primary: #F07030;
+  --cta-hover: #E8600A;
+  --cta-soft: rgba(232, 96, 10, 0.16);
+
+  --primary: #4A7AB5;
+  --brand-primary: #4A7AB5;
+  --brand-hover: #5A8DC8;
+  --brand-pressed: #2A5A9E;
+  --brand-soft: rgba(74, 122, 181, 0.18);
+  --brand-surface: rgba(74, 122, 181, 0.1);
+  --brand-border: rgba(74, 122, 181, 0.26);
 
   --ai-primary: #818cf8;
   --ai-hover: #a5b4fc;
@@ -97,60 +169,96 @@
   --ai-surface: rgba(129, 140, 248, 0.1);
   --ai-border: rgba(129, 140, 248, 0.26);
 
+  /* Ink scale dark overrides */
+  --ink-900: #F3F4F6;
+  --ink-800: #E5E7EB;
+  --ink-600: #C7CDD8;
+  --ink-400: #94A3B8;
+  --ink-300: #64748B;
+  --ink-200: #334155;
+  --ink-100: #1E293B;
+  --ink-50: #0F172A;
+
   --background: #0d1117;
   --app-shell: #0f1720;
-  --surface: #161b22;
+  --surface: #1E1B2E;
   --surface-secondary: #1d2633;
   --surface-tertiary: #243041;
-  --surface-overlay: #161b22;
-  --glass-surface: rgba(22, 27, 34, 0.66);
-  --glass-surface-strong: rgba(22, 27, 34, 0.84);
+  --surface-overlay: #1E1B2E;
+  --glass-surface: rgba(30, 27, 46, 0.66);
+  --glass-surface-strong: rgba(30, 27, 46, 0.84);
   --glass-surface-muted: rgba(29, 38, 51, 0.58);
-  --glass-border: rgba(148, 163, 184, 0.18);
-  --glass-highlight: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(74, 122, 181, 0.18);
+  --glass-highlight: rgba(255, 255, 255, 0.06);
   --glass-shadow: 0 24px 60px rgba(2, 6, 23, 0.46);
-  --glass-ring: rgba(47, 129, 247, 0.24);
+  --glass-ring: rgba(74, 122, 181, 0.24);
   --shell-gradient:
-    linear-gradient(135deg, rgba(47, 129, 247, 0.16), transparent 36%),
-    linear-gradient(45deg, rgba(45, 212, 191, 0.1), transparent 30%),
-    linear-gradient(180deg, #0b1017 0%, #111827 100%);
+    linear-gradient(135deg, rgba(29, 63, 110, 0.22), transparent 36%),
+    linear-gradient(45deg, rgba(74, 122, 181, 0.12), transparent 30%),
+    linear-gradient(180deg, #0d1117 0%, #1E1B2E 100%);
 
-  --foreground: #f3f4f6;
-  --muted: #c7d1db;
-  --muted-soft: #94a3b8;
+  --foreground: #F3F4F6;
+  --muted: #C7CDD8;
+  --muted-soft: #94A3B8;
   --border: #334155;
   --border-subtle: #243244;
   --border-strong: #475569;
   --overlay-backdrop: rgba(2, 6, 23, 0.6);
 
+  /* Status colors — lightened for dark bg readability */
+  --status-pass-text: #6EE098;
+  --status-pass-dot: #4ade80;
+  --status-pass-fill: rgba(45, 154, 82, 0.18);
+  --status-fail-text: #FCA5A5;
+  --status-fail-dot: #f87171;
+  --status-fail-fill: rgba(216, 58, 58, 0.18);
+  --status-blocked-text: #FCD34D;
+  --status-blocked-dot: #FBBF24;
+  --status-blocked-fill: rgba(217, 124, 10, 0.18);
+  --status-skipped-text: #94A3B8;
+  --status-skipped-dot: #64748B;
+  --status-skipped-fill: rgba(139, 145, 168, 0.18);
+  --status-inreview-text: #A5B4FC;
+  --status-inreview-dot: #818CF8;
+  --status-inreview-fill: rgba(76, 95, 213, 0.18);
+  --status-draft-text: #C4B5FD;
+  --status-draft-dot: #A78BFA;
+  --status-draft-fill: rgba(124, 95, 204, 0.18);
+  --status-running-text: #FDB585;
+  --status-running-dot: #F07030;
+  --status-running-fill: rgba(232, 96, 10, 0.18);
+  --status-notrun-text: #7DD3EF;
+  --status-notrun-dot: #38BDF8;
+  --status-notrun-fill: rgba(29, 127, 168, 0.18);
+
   --success: #4ade80;
   --success-foreground: #86efac;
-  --success-soft: rgba(34, 197, 94, 0.16);
+  --success-soft: rgba(45, 154, 82, 0.18);
   --success-border: rgba(74, 222, 128, 0.24);
-  --warning: #fbbf24;
-  --warning-foreground: #fde68a;
-  --warning-soft: rgba(251, 191, 36, 0.16);
+  --warning: #FBBF24;
+  --warning-foreground: #FDE68A;
+  --warning-soft: rgba(217, 124, 10, 0.18);
   --warning-border: rgba(251, 191, 36, 0.24);
   --error: #f87171;
   --error-foreground: #fecaca;
-  --error-soft: rgba(248, 113, 113, 0.16);
+  --error-soft: rgba(216, 58, 58, 0.18);
   --error-border: rgba(248, 113, 113, 0.24);
-  --info: #60a5fa;
-  --info-foreground: #bfdbfe;
-  --info-soft: rgba(96, 165, 250, 0.16);
-  --info-border: rgba(96, 165, 250, 0.24);
+  --info: #818CF8;
+  --info-foreground: #A5B4FC;
+  --info-soft: rgba(76, 95, 213, 0.18);
+  --info-border: rgba(129, 140, 248, 0.24);
 
-  --confidence-high: #60a5fa;
-  --confidence-high-foreground: #bfdbfe;
-  --confidence-high-soft: rgba(96, 165, 250, 0.16);
-  --confidence-high-border: rgba(96, 165, 250, 0.24);
-  --confidence-medium: #fbbf24;
-  --confidence-medium-foreground: #fde68a;
-  --confidence-medium-soft: rgba(251, 191, 36, 0.16);
+  --confidence-high: #818CF8;
+  --confidence-high-foreground: #A5B4FC;
+  --confidence-high-soft: rgba(76, 95, 213, 0.18);
+  --confidence-high-border: rgba(129, 140, 248, 0.24);
+  --confidence-medium: #FBBF24;
+  --confidence-medium-foreground: #FDE68A;
+  --confidence-medium-soft: rgba(217, 124, 10, 0.18);
   --confidence-medium-border: rgba(251, 191, 36, 0.24);
   --confidence-low: #f87171;
   --confidence-low-foreground: #fecaca;
-  --confidence-low-soft: rgba(248, 113, 113, 0.16);
+  --confidence-low-soft: rgba(216, 58, 58, 0.18);
   --confidence-low-border: rgba(248, 113, 113, 0.24);
 
   --shadow-card: 0 1px 2px rgba(2, 6, 23, 0.28), 0 10px 30px rgba(2, 6, 23, 0.2);
@@ -160,8 +268,8 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --font-sans: var(--font-inter), Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 
 body {
@@ -169,10 +277,10 @@ body {
   color: var(--foreground);
   font-family: var(--font-sans);
   font-feature-settings: "cv11", "ss01";
-  font-size: 15px;
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  line-height: 1.55;
+  line-height: 1.6;
   letter-spacing: 0;
   color-scheme: light;
 }
@@ -284,14 +392,21 @@ button[class*="bg-[var(--surface-tertiary)]"] {
 
 .tesbo-nav-item {
   border: 1px solid transparent;
+  border-left: 2px solid transparent;
 }
 
 .tesbo-nav-item-active {
-  background:
-    linear-gradient(135deg, color-mix(in oklab, var(--brand-primary) 16%, transparent), transparent 85%),
-    var(--glass-surface-strong);
-  border-color: var(--glass-ring);
-  box-shadow: 0 10px 24px rgba(9, 105, 218, 0.12);
+  background: var(--denim-50);
+  border-color: transparent;
+  border-left-color: transparent;
+  color: var(--denim);
+  font-weight: 500;
+}
+
+.dark .tesbo-nav-item-active {
+  background: rgba(74, 122, 181, 0.15);
+  border-left-color: transparent;
+  color: var(--denim);
 }
 
 .tesbo-nav-item-idle:hover {
@@ -309,17 +424,19 @@ button[class*="bg-[var(--surface-tertiary)]"] {
 }
 .tesbo-table th {
   text-align: left;
-  font-size: 0.8125rem;
-  font-weight: 600;
+  font-size: 0.75rem;
+  font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--muted-soft);
-  padding: 0.75rem 1rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-400);
+  padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--border-subtle);
 }
 .tesbo-table td {
-  padding: 0.875rem 1rem;
-  font-size: 0.9375rem;
+  padding: 0 1rem;
+  height: 40px;
+  font-size: 0.8125rem;
+  font-weight: 500;
   color: var(--foreground);
   border-bottom: 1px solid var(--border-subtle);
 }
@@ -327,7 +444,11 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   border-bottom: none;
 }
 .tesbo-table tbody tr:hover {
-  background: var(--surface-secondary);
+  background: var(--ink-50);
+}
+.tesbo-table tbody tr.selected {
+  background: var(--denim-50);
+  border-left: 2px solid var(--denim);
 }
 
 /* Legacy Tailwind class remaps to CSS vars */
@@ -623,3 +744,50 @@ textarea:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--brand-primary) 40%, transparent);
   outline-offset: 1px;
 }
+
+/* ── Zyra chat prose ─────────────────────────────────────────────────────── */
+.zyra-prose { line-height: 1.65; }
+.zyra-prose h1 { font-size: 1.0625rem; font-weight: 700; margin: 1rem 0 0.4rem; color: var(--foreground); }
+.zyra-prose h2 { font-size: 1rem; font-weight: 700; margin: 0.9rem 0 0.35rem; color: var(--foreground); }
+.zyra-prose h3 { font-size: 0.9375rem; font-weight: 600; margin: 0.75rem 0 0.3rem; color: var(--foreground); }
+.zyra-prose h1:first-child,
+.zyra-prose h2:first-child,
+.zyra-prose h3:first-child { margin-top: 0; }
+.zyra-prose hr { border: none; border-top: 1px solid var(--border); margin: 0.6rem 0; }
+.zyra-prose p { margin: 0.25rem 0; }
+.zyra-prose ul { margin: 0.3rem 0; padding-left: 1.25rem; list-style: disc; }
+.zyra-prose li { margin: 0.15rem 0; }
+.zyra-prose strong { font-weight: 600; color: var(--foreground); }
+.zyra-prose em { font-style: italic; }
+.zyra-prose .inline-code {
+  font-family: var(--font-mono);
+  font-size: 0.8125em;
+  background: var(--surface-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  color: var(--foreground);
+}
+
+.zyra-md-table-wrap { overflow-x: auto; margin: 0.6rem 0; border-radius: 8px; border: 1px solid var(--border); }
+.zyra-md-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.zyra-md-table th {
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: var(--surface-secondary);
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.zyra-md-table td {
+  padding: 0.375rem 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--foreground);
+  vertical-align: top;
+}
+.zyra-md-table tbody tr:last-child td { border-bottom: none; }
+.zyra-md-table tbody tr:hover { background: var(--surface-secondary); }

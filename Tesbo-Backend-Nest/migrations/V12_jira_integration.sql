@@ -1,4 +1,4 @@
-﻿
+
 -- Stores Jira OAuth credentials per project (one Jira site connection per project)
 CREATE TABLE jira_connections (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

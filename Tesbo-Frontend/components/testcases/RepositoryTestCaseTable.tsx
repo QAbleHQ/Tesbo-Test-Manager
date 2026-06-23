@@ -74,8 +74,8 @@ const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
   title: true,
   suite: true,
   jira: false,
-  priority: false,
-  status: false,
+  priority: true,
+  status: true,
   updated: false,
   type: false,
 };

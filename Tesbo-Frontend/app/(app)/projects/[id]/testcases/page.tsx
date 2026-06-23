@@ -2,7 +2,7 @@
 
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
+import { IconFolders } from "@tabler/icons-react";
 import {
   authMe,
   getProject,
@@ -35,28 +35,22 @@ import {
   Field,
   FieldLabel,
 } from "@/components/ui";
-import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { PageHeader } from "@/components/workflows";
 import ImportTestCasesModal from "@/components/ImportTestCasesModal";
 
-const PAGE_SIZE = 100;
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
+const DEFAULT_PAGE_SIZE = 25;
 const TESTCASE_STATUSES = ["Draft", "In Review", "Approved", "Deprecated", "Archived"];
 const TESTCASE_PRIORITIES = ["P0", "P1", "P2", "P3"];
 const TESTCASE_TYPES = [
-  "Functional",
-  "Regression",
-  "Smoke",
-  "Sanity",
-  "Integration",
-  "API",
-  "UI",
-  "Performance",
-  "Security",
+  "Functional", "Regression", "Smoke", "Sanity", "Integration",
+  "API", "UI", "Performance", "Security",
 ];
+
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
 type PanelTab = "overview" | "steps";
-type BulkAction = "" | "delete" | "update" | "archive";
-type ViewMode = "bySuites" | "allCases";
+type BulkAction = "" | "delete" | "update" | "archive" | "move";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
 
@@ -101,10 +95,13 @@ export default function TestCasesPage() {
   const [suiteCasesLoading, setSuiteCasesLoading] = useState(false);
   const [suiteCasesError, setSuiteCasesError] = useState<string | null>(null);
   const [suiteCasesPage, setSuiteCasesPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [loading, setLoading] = useState(true);
+
   const [isAddSuiteModalOpen, setIsAddSuiteModalOpen] = useState(false);
   const [newSuiteName, setNewSuiteName] = useState("");
   const [isCreatingSuite, setIsCreatingSuite] = useState(false);
+
   const [panelMode, setPanelMode] = useState<PanelMode>("closed");
   const [panelTab, setPanelTab] = useState<PanelTab>("overview");
   const [panelTestcaseId, setPanelTestcaseId] = useState<string | null>(null);
@@ -113,6 +110,7 @@ export default function TestCasesPage() {
   const [panelError, setPanelError] = useState<string | null>(null);
   const [panelSuccess, setPanelSuccess] = useState<string | null>(null);
   const [submitAction, setSubmitAction] = useState<"create" | "create-next">("create");
+
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
@@ -128,6 +126,7 @@ export default function TestCasesPage() {
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("TC");
   const [panelJiraIssueKey, setPanelJiraIssueKey] = useState("");
   const [panelJiraUrl, setPanelJiraUrl] = useState("");
+
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [bulkAction, setBulkAction] = useState<BulkAction>("");
   const [isBulkActionModalOpen, setIsBulkActionModalOpen] = useState(false);
@@ -135,18 +134,26 @@ export default function TestCasesPage() {
   const [bulkError, setBulkError] = useState<string | null>(null);
   const [bulkStatus, setBulkStatus] = useState("Draft");
   const [bulkPriority, setBulkPriority] = useState("P2");
+  const [bulkTargetSuiteId, setBulkTargetSuiteId] = useState("");
+
   const [deleteSuiteId, setDeleteSuiteId] = useState<string | null>(null);
   const [deleteSuiteSaving, setDeleteSuiteSaving] = useState(false);
+
+  const [isRenameSuiteModalOpen, setIsRenameSuiteModalOpen] = useState(false);
+  const [renameSuiteId, setRenameSuiteId] = useState<string | null>(null);
+  const [renameSuiteInputValue, setRenameSuiteInputValue] = useState("");
+  const [isRenamingSuite, setIsRenamingSuite] = useState(false);
+
   const [suiteSearch, setSuiteSearch] = useState("");
   const [suiteStatusFilter, setSuiteStatusFilter] = useState("all");
   const [suitePriorityFilter, setSuitePriorityFilter] = useState("all");
   const [suiteTypeFilter, setSuiteTypeFilter] = useState("all");
-  const [allCasesSuiteFilter, setAllCasesSuiteFilter] = useState("all");
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
-  const [viewMode, setViewMode] = useState<ViewMode>("bySuites");
+
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isImportExportMenuOpen, setIsImportExportMenuOpen] = useState(false);
   const importExportMenuRef = useRef<HTMLDivElement>(null);
+
   const loadData = useCallback(async () => {
     const [suiteList, project] = await Promise.all([
       listSuites(projectId),
@@ -185,7 +192,6 @@ export default function TestCasesPage() {
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
   const areAllCasesSelected =
     selectedSuiteCases.length > 0 && selectedSuiteCases.every((tc) => selectedCaseIdSet.has(tc.id));
-  const totalSuiteCount = visibleSuites.length;
   const repositoryCaseCount = useMemo(
     () => visibleSuites.reduce((sum, suite) => sum + suite.testCaseCount, 0),
     [visibleSuites]
@@ -195,12 +201,9 @@ export default function TestCasesPage() {
     suiteStatusFilter !== "all",
     suitePriorityFilter !== "all",
     suiteTypeFilter !== "all",
-    viewMode === "allCases" && allCasesSuiteFilter !== "all",
     activeJiraIssueKey !== "",
   ].filter(Boolean).length;
-  const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / PAGE_SIZE));
-  const pageStart = suiteCasesTotal === 0 ? 0 : (suiteCasesPage - 1) * PAGE_SIZE + 1;
-  const pageEnd = suiteCasesTotal === 0 ? 0 : Math.min(suiteCasesTotal, suiteCasesPage * PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / pageSize));
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -223,35 +226,23 @@ export default function TestCasesPage() {
   useEffect(() => {
     setSuiteCasesPage(1);
   }, [
-    viewMode,
     activeSuiteId,
-    allCasesSuiteFilter,
     debouncedSuiteSearch,
     suiteStatusFilter,
     suitePriorityFilter,
     suiteTypeFilter,
     activeJiraIssueKey,
+    pageSize,
   ]);
 
   const loadSelectedSuiteCases = useCallback(async (pageOverride?: number) => {
-    if (viewMode === "bySuites" && !activeSuiteId) {
-      setSuiteCases([]);
-      setSuiteCasesTotal(0);
-      setSuiteCasesError(null);
-      return;
-    }
     setSuiteCasesLoading(true);
     setSuiteCasesError(null);
     try {
       const { list, total } = await listTestCases(projectId, {
-        limit: PAGE_SIZE,
-        offset: ((pageOverride ?? suiteCasesPage) - 1) * PAGE_SIZE,
-        suiteId:
-          viewMode === "bySuites"
-            ? activeSuiteId ?? undefined
-            : allCasesSuiteFilter === "all"
-              ? undefined
-              : allCasesSuiteFilter,
+        limit: pageSize,
+        offset: ((pageOverride ?? suiteCasesPage) - 1) * pageSize,
+        suiteId: activeSuiteId ?? undefined,
         status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
         priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
         type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
@@ -261,7 +252,7 @@ export default function TestCasesPage() {
       setSuiteCases(list);
       setSuiteCasesTotal(total);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to load suite test cases.";
+      const message = err instanceof Error ? err.message : "Failed to load test cases.";
       setSuiteCasesError(message);
       setSuiteCases([]);
       setSuiteCasesTotal(0);
@@ -269,9 +260,7 @@ export default function TestCasesPage() {
       setSuiteCasesLoading(false);
     }
   }, [
-    viewMode,
     activeSuiteId,
-    allCasesSuiteFilter,
     debouncedSuiteSearch,
     projectId,
     suiteCasesPage,
@@ -279,14 +268,8 @@ export default function TestCasesPage() {
     suiteStatusFilter,
     suiteTypeFilter,
     activeJiraIssueKey,
+    pageSize,
   ]);
-
-  useEffect(() => {
-    if (activeJiraIssueKey) {
-      setViewMode("allCases");
-      setAllCasesSuiteFilter("all");
-    }
-  }, [activeJiraIssueKey]);
 
   useEffect(() => {
     void loadSelectedSuiteCases();
@@ -346,7 +329,7 @@ export default function TestCasesPage() {
     setPanelTestcaseId(null);
     setPanelMode("create");
     setPanelTab("overview");
-    resetForm(viewMode === "allCases" ? null : activeSuiteId);
+    resetForm(activeSuiteId);
   }
 
   async function openCreatePanelForSuite(targetSuiteId: string) {
@@ -384,17 +367,8 @@ export default function TestCasesPage() {
     setSuiteStatusFilter("all");
     setSuitePriorityFilter("all");
     setSuiteTypeFilter("all");
-    setAllCasesSuiteFilter("all");
     setSuiteCasesPage(1);
     if (activeJiraIssueKey) router.replace(`/projects/${projectId}/testcases`);
-  }
-
-  function handleViewModeChange(nextMode: ViewMode) {
-    setViewMode(nextMode);
-    setSelectedCaseIds([]);
-    if (nextMode === "allCases" && activeSuiteId) {
-      router.replace(`/projects/${projectId}/testcases`);
-    }
   }
 
   function addStep() {
@@ -430,14 +404,13 @@ export default function TestCasesPage() {
     setSelectedCaseIds(selectedSuiteCases.map((tc) => tc.id));
   }
 
-  function openBulkActionModal(action: BulkAction) {
-    if (!action || selectedCaseIds.length === 0) return;
-    if (action === "update") {
-      const firstSelected = selectedSuiteCases.find((tc) => selectedCaseIdSet.has(tc.id));
-      setBulkStatus(firstSelected?.status || "Draft");
-      setBulkPriority(firstSelected?.priority || "P2");
-    }
+  function openBulkActionModal() {
+    if (selectedCaseIds.length === 0) return;
+    setBulkAction("");
     setBulkError(null);
+    setBulkTargetSuiteId("");
+    setBulkStatus("Draft");
+    setBulkPriority("P2");
     setIsBulkActionModalOpen(true);
   }
 
@@ -446,6 +419,7 @@ export default function TestCasesPage() {
     setIsBulkActionModalOpen(false);
     setBulkError(null);
     setBulkAction("");
+    setBulkTargetSuiteId("");
   }
 
   async function handleBulkActionConfirm() {
@@ -463,6 +437,11 @@ export default function TestCasesPage() {
           status: bulkStatus,
           priority: bulkPriority,
         });
+      } else if (bulkAction === "move") {
+        await bulkUpdateTestCases(projectId, {
+          testcaseIds: selectedCaseIds,
+          suiteId: bulkTargetSuiteId || undefined,
+        });
       }
       const refreshPanelTestcaseId = panelTestcaseId && selectedCaseIdSet.has(panelTestcaseId) ? panelTestcaseId : null;
       await refreshData();
@@ -474,6 +453,7 @@ export default function TestCasesPage() {
       setSelectedCaseIds([]);
       setIsBulkActionModalOpen(false);
       setBulkAction("");
+      setBulkTargetSuiteId("");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to apply bulk action.";
       setBulkError(message);
@@ -496,11 +476,23 @@ export default function TestCasesPage() {
     }
   }
 
-  async function handleRenameSuite(suiteId: string, currentName: string) {
-    const name = window.prompt("Rename suite", currentName);
-    if (!name?.trim() || name.trim() === currentName) return;
-    await updateSuite(suiteId, { name: name.trim() });
-    await refreshData();
+  function handleRenameSuite(suiteId: string, currentName: string) {
+    setRenameSuiteId(suiteId);
+    setRenameSuiteInputValue(currentName);
+    setIsRenameSuiteModalOpen(true);
+  }
+
+  async function handleRenameSuiteConfirm() {
+    if (!renameSuiteId || !renameSuiteInputValue.trim() || isRenamingSuite) return;
+    setIsRenamingSuite(true);
+    try {
+      await updateSuite(renameSuiteId, { name: renameSuiteInputValue.trim() });
+      setIsRenameSuiteModalOpen(false);
+      setRenameSuiteId(null);
+      await refreshData();
+    } finally {
+      setIsRenamingSuite(false);
+    }
   }
 
   async function handleDeleteSuiteConfirm(mode: "deleteTestcases" | "moveToDefault") {
@@ -586,7 +578,7 @@ export default function TestCasesPage() {
         setPanelSuccess("Test case created successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
-          resetForm(suiteId || (viewMode === "allCases" ? null : activeSuiteId));
+          resetForm(suiteId || activeSuiteId);
         } else {
           await openViewPanel(created.id);
         }
@@ -622,175 +614,269 @@ export default function TestCasesPage() {
 
   return (
     <main className="px-6 py-6">
-      <ListWorkspaceLayout
-        header={
-          <PageHeader
-            title="Test case repository"
-            subtitle="Organize suites, curate test cases, and move from repository review into execution with a cleaner operational workspace."
-            actions={
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-card)]">
+      <div className="w-full">
+        {/* Page header */}
+        <PageHeader
+          title="Test case repository"
+          subtitle="Organize suites, curate test cases, and move from review into execution."
+          actions={
+            <div className="flex flex-wrap items-center gap-2">
+              <div ref={importExportMenuRef} className="relative">
+                <Button
+                  variant="secondary"
+                  onClick={() => setIsImportExportMenuOpen((v) => !v)}
+                  className="flex items-center gap-1.5"
+                >
+                  Import / Export
+                  <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </Button>
+                {isImportExportMenuOpen && (
+                  <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsImportModalOpen(true);
+                        setIsImportExportMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    >
+                      Import test cases
+                    </button>
+                    <div className="my-1 border-t border-[var(--border)]" />
+                    <a
+                      href={getExportUrl(projectId, "csv")}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() => setIsImportExportMenuOpen(false)}
+                      className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    >
+                      Export as CSV
+                    </a>
+                    <a
+                      href={getExportUrl(projectId, "xlsx")}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() => setIsImportExportMenuOpen(false)}
+                      className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    >
+                      Export as Excel
+                    </a>
+                    <div className="my-1 border-t border-[var(--border)]" />
+                    <a
+                      href={getTemplateUrl(projectId, "csv")}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() => setIsImportExportMenuOpen(false)}
+                      className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    >
+                      Download CSV template
+                    </a>
+                    <a
+                      href={getTemplateUrl(projectId, "xlsx")}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() => setIsImportExportMenuOpen(false)}
+                      className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    >
+                      Download Excel template
+                    </a>
+                  </div>
+                )}
+              </div>
+            </div>
+          }
+        />
+
+        {loading ? (
+          <p className="mt-5 text-[var(--muted)]">Loading...</p>
+        ) : (
+          <div className="mt-5 flex items-start gap-4">
+            {/* ── Suite sidebar ── */}
+            <aside className="w-60 shrink-0 sticky top-6">
+              <nav className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)]">
+                {/* Header: label + add-suite button */}
+                <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2.5">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">
+                    Suites
+                    {visibleSuites.length > 0 && (
+                      <span className="ml-1.5 font-normal normal-case text-[var(--muted)]">
+                        ({visibleSuites.length})
+                      </span>
+                    )}
+                  </p>
                   <button
                     type="button"
-                    onClick={() => handleViewModeChange("bySuites")}
-                    className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
-                      viewMode === "bySuites"
-                        ? "bg-[var(--brand-surface)] text-[var(--brand-primary)]"
-                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                    }`}
+                    title="Add suite"
+                    onClick={() => setIsAddSuiteModalOpen(true)}
+                    className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--brand-primary)]"
                   >
-                    By Suites
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleViewModeChange("allCases")}
-                    className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
-                      viewMode === "allCases"
-                        ? "bg-[var(--brand-surface)] text-[var(--brand-primary)]"
-                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                    }`}
-                  >
-                    All Test Cases
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
+                    </svg>
                   </button>
                 </div>
-                <div ref={importExportMenuRef} className="relative">
-                  <Button
-                    variant="secondary"
-                    onClick={() => setIsImportExportMenuOpen((v) => !v)}
-                    className="flex items-center gap-1.5"
+
+                {/* All test cases */}
+                <div className="p-1.5">
+                  <button
+                    type="button"
+                    onClick={() => router.push(`/projects/${projectId}/testcases`)}
+                    className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition-colors ${
+                      !activeSuiteId
+                        ? "bg-[var(--brand-soft)] font-medium text-[var(--brand-primary)]"
+                        : "text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                    }`}
                   >
-                    Import / Export
-                    <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                    </svg>
-                  </Button>
-                  {isImportExportMenuOpen && (
-                    <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
+                    <span>All test cases</span>
+                    <span className={`text-xs ${!activeSuiteId ? "text-[var(--brand-primary)] opacity-70" : "text-[var(--muted)]"}`}>
+                      {repositoryCaseCount}
+                    </span>
+                  </button>
+                </div>
+
+                <div className="border-t border-[var(--border)]" />
+
+                {/* Suite list — scrollable */}
+                <div className="max-h-[calc(100vh-280px)] overflow-y-auto p-1.5">
+                  {visibleSuites.length === 0 ? (
+                    <div className="px-3 py-4 text-center">
+                      <p className="text-xs text-[var(--muted)]">No suites yet</p>
                       <button
                         type="button"
-                        onClick={() => {
-                          setIsImportModalOpen(true);
-                          setIsImportExportMenuOpen(false);
-                        }}
-                        className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+                        onClick={() => setIsAddSuiteModalOpen(true)}
+                        className="mt-2 text-xs text-[var(--brand-primary)] hover:underline"
                       >
-                        Import Test Cases
+                        Create your first suite
                       </button>
-                      <div className="my-1 border-t border-[var(--border)]" />
-                      <a
-                        href={getExportUrl(projectId, "csv")}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={() => setIsImportExportMenuOpen(false)}
-                        className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
-                      >
-                        Export as CSV
-                      </a>
-                      <a
-                        href={getExportUrl(projectId, "xlsx")}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={() => setIsImportExportMenuOpen(false)}
-                        className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
-                      >
-                        Export as Excel
-                      </a>
-                      <div className="my-1 border-t border-[var(--border)]" />
-                      <a
-                        href={getTemplateUrl(projectId, "csv")}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={() => setIsImportExportMenuOpen(false)}
-                        className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
-                      >
-                        Download CSV Template
-                      </a>
-                      <a
-                        href={getTemplateUrl(projectId, "xlsx")}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={() => setIsImportExportMenuOpen(false)}
-                        className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
-                      >
-                        Download Excel Template
-                      </a>
                     </div>
+                  ) : (
+                    visibleSuites.map((suite) => {
+                      const isActive = activeSuiteId === suite.id;
+                      return (
+                        <div
+                          key={suite.id}
+                          className={`group rounded-lg transition-colors ${
+                            isActive
+                              ? "bg-[var(--brand-soft)]"
+                              : "hover:bg-[var(--surface-secondary)]"
+                          }`}
+                        >
+                          {/* Name row */}
+                          <div className="flex items-start gap-2 px-2 pt-2 pb-1">
+                            <IconFolders
+                              size={14}
+                              stroke={1.75}
+                              className={`mt-0.5 shrink-0 ${isActive ? "text-[var(--brand-primary)]" : "text-[var(--muted)]"}`}
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)
+                              }
+                              className={`min-w-0 flex-1 break-words text-left text-sm font-medium leading-snug ${
+                                isActive ? "text-[var(--brand-primary)]" : "text-[var(--foreground)]"
+                              }`}
+                            >
+                              {suite.name}
+                            </button>
+                            {/* Count → hidden on hover, replaced by actions */}
+                            <span className={`shrink-0 text-xs group-hover:hidden ${isActive ? "text-[var(--brand-primary)] opacity-60" : "text-[var(--muted)]"}`}>
+                              {suite.testCaseCount}
+                            </span>
+                            {/* Actions — shown on hover instead of count */}
+                            <div className="hidden shrink-0 items-center group-hover:flex">
+                              <button
+                                type="button"
+                                title="Add test case"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void openCreatePanelForSuite(suite.id);
+                                }}
+                                className="flex h-6 w-6 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--brand-primary)]"
+                              >
+                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
+                                </svg>
+                              </button>
+                              <button
+                                type="button"
+                                title="Rename suite"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRenameSuite(suite.id, suite.name);
+                                }}
+                                className="flex h-6 w-6 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)]"
+                              >
+                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                </svg>
+                              </button>
+                              <button
+                                type="button"
+                                title="Delete suite"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDeleteSuiteId(suite.id);
+                                }}
+                                className="flex h-6 w-6 items-center justify-center rounded text-[var(--error)] hover:bg-[var(--surface)] hover:opacity-80"
+                              >
+                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+                          {/* Bottom padding to keep rows from feeling cramped */}
+                          <div className="pb-1.5" />
+                        </div>
+                      );
+                    })
                   )}
                 </div>
-                <Button variant="secondary" onClick={() => setIsAddSuiteModalOpen(true)}>
-                  Add Suite
-                </Button>
-                <Button
-                  onClick={() => { void openCreatePanel(); }}
-                  disabled={viewMode === "bySuites" && !activeSuiteId}
-                  title={viewMode === "bySuites" && !activeSuiteId ? "Open a suite first to create a case inside it." : undefined}
-                >
-                  Add Test Case
-                </Button>
-              </div>
-            }
-          />
-        }
-      >
-        {loading ? (
-          <p className="text-[var(--muted)]">Loading suites...</p>
-        ) : viewMode === "bySuites" && activeSuiteId && !selectedSuite ? (
-          <EmptyStateBlock
-            title="Suite not found"
-            description="The suite you're looking for doesn't exist."
-            action={
-              <Link href={`/projects/${projectId}/testcases`} className="text-[var(--brand-primary)] hover:underline">
-                Back to suites
-              </Link>
-            }
-          />
-        ) : viewMode === "allCases" || (viewMode === "bySuites" && activeSuiteId && selectedSuite) ? (
-          <section className="mt-2 space-y-4">
-            <Card className="p-4">
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  {viewMode === "bySuites" && selectedSuite ? (
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => router.push(`/projects/${projectId}/testcases`)}
-                    >
-                      Back to suites
-                    </Button>
-                  ) : null}
-                  {selectedCaseIds.length > 0 ? (
-                    <>
-                      <Select
-                        value={bulkAction}
-                        onChange={(e) => setBulkAction(e.target.value as BulkAction)}
-                        className="h-9 w-auto min-w-[140px]"
-                      >
-                        <option value="">Bulk action</option>
-                        <option value="delete">Delete</option>
-                        <option value="update">Update</option>
-                        <option value="archive">Archive</option>
-                      </Select>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => openBulkActionModal(bulkAction)}
-                        disabled={!bulkAction}
-                      >
-                        Apply to selection
-                      </Button>
-                    </>
-                  ) : null}
+              </nav>
+            </aside>
+
+            {/* ── Main content ── */}
+            <div className="min-w-0 flex-1 space-y-3">
+              {/* Toolbar */}
+              <Card className="overflow-hidden p-0">
+                {/* Action row */}
+                <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedCaseIds.length > 0 ? (
+                      <>
+                        <span className="text-sm font-medium text-[var(--foreground)]">
+                          {selectedCaseIds.length} selected
+                        </span>
+                        <Button size="sm" variant="secondary" onClick={openBulkActionModal}>
+                          Bulk actions
+                        </Button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedCaseIds([])}
+                          className="text-xs text-[var(--muted)] hover:text-[var(--foreground)]"
+                        >
+                          Clear selection
+                        </button>
+                      </>
+                    ) : (
+                      <p className="text-sm font-medium text-[var(--foreground)]">
+                        {activeSuiteId
+                          ? (selectedSuite?.name ?? "Suite")
+                          : "All test cases"}
+                      </p>
+                    )}
+                  </div>
                   <Button size="sm" onClick={() => { void openCreatePanel(); }}>
-                    Add test case
+                    + Add test case
                   </Button>
                 </div>
-              </div>
-            </Card>
 
-            <div className="space-y-3">
-              <Card className="p-3">
-                <div className={`flex flex-wrap items-center gap-2 ${viewMode === "allCases" ? "" : ""}`}>
-                  <div className={viewMode === "allCases" ? "min-w-[180px] flex-[2]" : "min-w-[160px] flex-[2]"}>
+                {/* Filter row */}
+                <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] bg-[var(--background)] px-4 py-2.5">
+                  <div className="min-w-[180px] flex-[2]">
                     <Input
                       type="text"
                       value={suiteSearch}
@@ -799,54 +885,93 @@ export default function TestCasesPage() {
                       className="h-8 text-sm"
                     />
                   </div>
-                  {viewMode === "allCases" && (
-                    <Select
-                      value={allCasesSuiteFilter}
-                      onChange={(e) => setAllCasesSuiteFilter(e.target.value)}
-                      className="h-8 min-w-[120px] flex-1 text-sm"
-                    >
-                      <option value="all">All suites</option>
-                      {visibleSuites.map((suite) => (
-                        <option key={suite.id} value={suite.id}>
-                          {suite.name}
-                        </option>
-                      ))}
-                    </Select>
-                  )}
-                  <Select value={suiteTypeFilter} onChange={(e) => setSuiteTypeFilter(e.target.value)} className="h-8 min-w-[110px] flex-1 text-sm">
+                  <Select
+                    value={suiteTypeFilter}
+                    onChange={(e) => setSuiteTypeFilter(e.target.value)}
+                    className="h-8 min-w-[110px] flex-1 text-sm"
+                  >
                     <option value="all">All types</option>
                     {TESTCASE_TYPES.map((option) => (
                       <option key={option} value={option}>{option}</option>
                     ))}
                   </Select>
-                  <Select value={suiteStatusFilter} onChange={(e) => setSuiteStatusFilter(e.target.value)} className="h-8 min-w-[120px] flex-1 text-sm">
+                  <Select
+                    value={suiteStatusFilter}
+                    onChange={(e) => setSuiteStatusFilter(e.target.value)}
+                    className="h-8 min-w-[120px] flex-1 text-sm"
+                  >
                     <option value="all">All statuses</option>
                     {TESTCASE_STATUSES.map((option) => (
                       <option key={option} value={option}>{option}</option>
                     ))}
                   </Select>
-                  <Select value={suitePriorityFilter} onChange={(e) => setSuitePriorityFilter(e.target.value)} className="h-8 min-w-[110px] flex-1 text-sm">
+                  <Select
+                    value={suitePriorityFilter}
+                    onChange={(e) => setSuitePriorityFilter(e.target.value)}
+                    className="h-8 min-w-[110px] flex-1 text-sm"
+                  >
                     <option value="all">All priorities</option>
                     {TESTCASE_PRIORITIES.map((option) => (
                       <option key={option} value={option}>{option}</option>
                     ))}
                   </Select>
-                  {activeFilterCount > 0 ? (
-                    <StatusChip tone="warning">
-                      {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"}
-                    </StatusChip>
-                  ) : null}
-                  {activeJiraIssueKey ? (
-                    <StatusChip tone="info">
+                  {suiteStatusFilter !== "all" && (
+                    <button
+                      type="button"
+                      onClick={() => setSuiteStatusFilter("all")}
+                      className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2.5 py-0.5 text-xs font-medium text-[var(--brand-primary)] hover:opacity-80"
+                    >
+                      {suiteStatusFilter}
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {suitePriorityFilter !== "all" && (
+                    <button
+                      type="button"
+                      onClick={() => setSuitePriorityFilter("all")}
+                      className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2.5 py-0.5 text-xs font-medium text-[var(--brand-primary)] hover:opacity-80"
+                    >
+                      {suitePriorityFilter}
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {suiteTypeFilter !== "all" && (
+                    <button
+                      type="button"
+                      onClick={() => setSuiteTypeFilter("all")}
+                      className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2.5 py-0.5 text-xs font-medium text-[var(--brand-primary)] hover:opacity-80"
+                    >
+                      {suiteTypeFilter}
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {activeJiraIssueKey && (
+                    <button
+                      type="button"
+                      onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                      className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] px-2.5 py-0.5 text-xs font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                    >
                       Jira: {activeJiraIssueKey}
-                    </StatusChip>
-                  ) : null}
-                  <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="h-8 shrink-0">
-                    Clear
-                  </Button>
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {activeFilterCount > 0 && (
+                    <Button variant="secondary" size="sm" onClick={clearSuiteFilters} className="h-8 shrink-0">
+                      Clear all
+                    </Button>
+                  )}
                 </div>
               </Card>
 
+              {/* Content */}
               {suiteCasesError ? (
                 <p className="rounded-xl border border-[var(--error-border)] bg-[var(--error-soft)] p-4 text-sm text-[var(--error-foreground)]">
                   {suiteCasesError}
@@ -858,7 +983,18 @@ export default function TestCasesPage() {
               ) : suiteCasesTotal === 0 ? (
                 <EmptyStateBlock
                   title="No test cases found"
-                  description="No test cases match your current criteria."
+                  description={
+                    activeFilterCount > 0
+                      ? "No test cases match your current filters."
+                      : activeSuiteId
+                        ? "This suite has no test cases yet."
+                        : "No test cases in this project yet."
+                  }
+                  action={
+                    <Button size="sm" onClick={() => { void openCreatePanel(); }}>
+                      + Add test case
+                    </Button>
+                  }
                 />
               ) : (
                 <>
@@ -875,11 +1011,33 @@ export default function TestCasesPage() {
                     onOpenRow={openViewPanel}
                   />
 
+                  {/* Pagination */}
                   <Card className="flex items-center justify-between px-4 py-3 text-sm">
                     <span className="text-[var(--muted)]">
-                      Showing {pageStart}-{pageEnd} of {suiteCasesTotal} on page {suiteCasesPage} of {totalPages}
+                      <span className="font-medium text-[var(--foreground)]">{suiteCasesTotal}</span>{" "}
+                      {suiteCasesTotal === 1 ? "result" : "results"}
+                      {totalPages > 1 && (
+                        <>
+                          {" · "}page{" "}
+                          <span className="font-medium text-[var(--foreground)]">{suiteCasesPage}</span>{" "}
+                          of{" "}
+                          <span className="font-medium text-[var(--foreground)]">{totalPages}</span>
+                        </>
+                      )}
                     </span>
                     <div className="flex items-center gap-2">
+                      <Select
+                        value={pageSize}
+                        onChange={(e) => {
+                          setPageSize(Number(e.target.value));
+                          setSuiteCasesPage(1);
+                        }}
+                        className="h-8 text-sm"
+                      >
+                        {PAGE_SIZE_OPTIONS.map((n) => (
+                          <option key={n} value={n}>{n} / page</option>
+                        ))}
+                      </Select>
                       <Button
                         variant="secondary"
                         size="sm"
@@ -892,9 +1050,7 @@ export default function TestCasesPage() {
                         variant="secondary"
                         size="sm"
                         onClick={() =>
-                          setSuiteCasesPage((prev) =>
-                            prev >= totalPages ? prev : prev + 1
-                          )
+                          setSuiteCasesPage((prev) => (prev >= totalPages ? prev : prev + 1))
                         }
                         disabled={suiteCasesPage >= totalPages || suiteCasesLoading}
                       >
@@ -905,71 +1061,11 @@ export default function TestCasesPage() {
                 </>
               )}
             </div>
-
-          </section>
-        ) : visibleSuites.length === 0 ? (
-          <EmptyStateBlock
-            title="No suites yet"
-            description="No suites in this folder yet."
-            action={
-              <Button variant="secondary" onClick={() => setIsAddSuiteModalOpen(true)}>
-                Add Suite
-              </Button>
-            }
-          />
-        ) : (
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {visibleSuites.map((suite) => (
-              <Card key={suite.id} className="p-3">
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => router.push(`/projects/${projectId}/testcases?suiteId=${suite.id}`)}
-                    className="min-w-0 flex-1 truncate text-left text-sm font-semibold text-[var(--foreground)] hover:text-[var(--brand-primary)]"
-                  >
-                    {suite.name}
-                  </button>
-                  <StatusChip tone={suite.testCaseCount > 0 ? "confidenceHigh" : "neutral"}>
-                    {suite.testCaseCount}
-                  </StatusChip>
-                  <button
-                    type="button"
-                    title="Add test case"
-                    onClick={() => { void openCreatePanelForSuite(suite.id); }}
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[var(--brand-primary)] text-white transition-opacity hover:opacity-80"
-                  >
-                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    title="Rename suite"
-                    onClick={() => handleRenameSuite(suite.id, suite.name)}
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                  >
-                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    title="Delete suite"
-                    onClick={() => setDeleteSuiteId(suite.id)}
-                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--error)] hover:bg-[var(--surface-secondary)] hover:opacity-80"
-                  >
-                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                    </svg>
-                  </button>
-                </div>
-              </Card>
-            ))}
           </div>
         )}
-      </ListWorkspaceLayout>
+      </div>
 
-      {/* Detail panel — page-level so it works from suite grid and case table views */}
+      {/* ── Detail panel ── */}
       {panelMode !== "closed" && (
         <div className="fixed inset-0 z-40">
           <button
@@ -1297,7 +1393,7 @@ export default function TestCasesPage() {
         </div>
       )}
 
-      {/* Add Suite Modal */}
+      {/* ── Add Suite Modal ── */}
       <Modal
         open={isAddSuiteModalOpen}
         onClose={() => {
@@ -1305,7 +1401,7 @@ export default function TestCasesPage() {
           setIsAddSuiteModalOpen(false);
           setNewSuiteName("");
         }}
-        title="Add Suite"
+        title="Add suite"
       >
         <p className="text-sm text-[var(--muted)]">Create a new suite in the repository.</p>
         <Field className="mt-4">
@@ -1342,11 +1438,11 @@ export default function TestCasesPage() {
         </div>
       </Modal>
 
-      {/* Delete Suite Modal */}
+      {/* ── Delete Suite Modal ── */}
       <Modal
         open={!!deleteSuiteId}
         onClose={() => { if (!deleteSuiteSaving) setDeleteSuiteId(null); }}
-        title="Delete Suite"
+        title="Delete suite"
       >
         <p className="text-sm text-[var(--muted)]">
           This suite contains test cases. What would you like to do with them?
@@ -1358,12 +1454,8 @@ export default function TestCasesPage() {
             onClick={() => void handleDeleteSuiteConfirm("moveToDefault")}
             className="w-full rounded-lg border border-[var(--border)] px-4 py-3 text-left hover:bg-[var(--surface-secondary)] disabled:opacity-50"
           >
-            <span className="block text-sm font-medium text-[var(--foreground)]">
-              Delete suite only
-            </span>
-            <span className="mt-0.5 block text-xs text-[var(--muted)]">
-              Move all test cases to the Default Suite
-            </span>
+            <span className="block text-sm font-medium text-[var(--foreground)]">Delete suite only</span>
+            <span className="mt-0.5 block text-xs text-[var(--muted)]">Move all test cases to the Default Suite</span>
           </button>
           <button
             type="button"
@@ -1371,12 +1463,8 @@ export default function TestCasesPage() {
             onClick={() => void handleDeleteSuiteConfirm("deleteTestcases")}
             className="w-full rounded-lg border border-[var(--error)] px-4 py-3 text-left hover:bg-[var(--surface-secondary)] disabled:opacity-50"
           >
-            <span className="block text-sm font-medium text-[var(--error)]">
-              Delete suite and all test cases
-            </span>
-            <span className="mt-0.5 block text-xs text-[var(--muted)]">
-              Permanently delete the suite and all its test cases
-            </span>
+            <span className="block text-sm font-medium text-[var(--error)]">Delete suite and all test cases</span>
+            <span className="mt-0.5 block text-xs text-[var(--muted)]">Permanently delete the suite and all its test cases</span>
           </button>
         </div>
         {deleteSuiteSaving && (
@@ -1393,59 +1481,141 @@ export default function TestCasesPage() {
         </div>
       </Modal>
 
-      {/* Bulk Action Modal */}
+      {/* ── Bulk Action Modal ── */}
       <Modal
-        open={isBulkActionModalOpen && !!bulkAction}
+        open={isBulkActionModalOpen}
         onClose={closeBulkActionModal}
-        title={
-          bulkAction === "delete" ? "Delete test cases" : bulkAction === "archive" ? "Archive test cases" : "Update test cases"
-        }
+        title="Bulk actions"
       >
         <p className="text-sm text-[var(--muted)]">
-          {selectedCaseIds.length} selected test case{selectedCaseIds.length === 1 ? "" : "s"} will be updated.
+          <span className="font-medium text-[var(--foreground)]">{selectedCaseIds.length}</span>{" "}
+          test case{selectedCaseIds.length === 1 ? "" : "s"} selected
         </p>
-        {bulkAction === "delete" && (
-          <p className="mt-3 rounded-lg border border-[var(--error)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--error)]">
-            This action permanently deletes the selected test cases.
-          </p>
+
+        <Field className="mt-4">
+          <FieldLabel>Action</FieldLabel>
+          <Select
+            value={bulkAction}
+            onChange={(e) => setBulkAction(e.target.value as BulkAction)}
+          >
+            <option value="">Select an action…</option>
+            <option value="move">Move to suite</option>
+            <option value="update">Update status / priority</option>
+            <option value="archive">Archive</option>
+            <option value="delete">Delete</option>
+          </Select>
+        </Field>
+
+        {bulkAction === "move" && (
+          <Field className="mt-4">
+            <FieldLabel>Target suite</FieldLabel>
+            <Select
+              value={bulkTargetSuiteId}
+              onChange={(e) => setBulkTargetSuiteId(e.target.value)}
+            >
+              <option value="">Unassigned (no suite)</option>
+              {suites.map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </Select>
+          </Field>
         )}
+
         {bulkAction === "update" && (
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="mt-4 grid grid-cols-2 gap-3">
             <Field>
               <FieldLabel>Status</FieldLabel>
               <Select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)}>
-                <option value="Draft">Draft</option>
-                <option value="In Review">In Review</option>
-                <option value="Approved">Approved</option>
-                <option value="Deprecated">Deprecated</option>
-                <option value="Archived">Archived</option>
+                {TESTCASE_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
               </Select>
             </Field>
             <Field>
               <FieldLabel>Priority</FieldLabel>
               <Select value={bulkPriority} onChange={(e) => setBulkPriority(e.target.value)}>
-                <option value="P0">P0</option>
-                <option value="P1">P1</option>
-                <option value="P2">P2</option>
-                <option value="P3">P3</option>
+                {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
               </Select>
             </Field>
           </div>
         )}
+
+        {bulkAction === "archive" && (
+          <p className="mt-4 rounded-lg border border-[var(--warning)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--warning)]">
+            All selected test cases will be archived.
+          </p>
+        )}
+
+        {bulkAction === "delete" && (
+          <p className="mt-4 rounded-lg border border-[var(--error)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--error)]">
+            This permanently deletes the selected test cases. This action cannot be undone.
+          </p>
+        )}
+
         {bulkError && (
           <p className="mt-3 rounded-lg border border-[var(--error)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--error)]">
             {bulkError}
           </p>
         )}
+
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="secondary" onClick={closeBulkActionModal} disabled={bulkSaving}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={() => void handleBulkActionConfirm()} disabled={bulkSaving}>
+          <Button
+            variant={bulkAction === "delete" ? "destructive" : "primary"}
+            onClick={() => void handleBulkActionConfirm()}
+            disabled={!bulkAction || bulkSaving}
+          >
             {bulkSaving ? "Applying..." : "Confirm"}
           </Button>
         </div>
       </Modal>
+
+      {/* ── Rename Suite Modal ── */}
+      <Modal
+        open={isRenameSuiteModalOpen}
+        onClose={() => {
+          if (isRenamingSuite) return;
+          setIsRenameSuiteModalOpen(false);
+          setRenameSuiteId(null);
+        }}
+        title="Rename suite"
+      >
+        <Field className="mt-4">
+          <FieldLabel>Suite name</FieldLabel>
+          <Input
+            type="text"
+            value={renameSuiteInputValue}
+            onChange={(e) => setRenameSuiteInputValue(e.target.value)}
+            placeholder="Enter suite name"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void handleRenameSuiteConfirm();
+            }}
+            autoFocus
+          />
+        </Field>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (isRenamingSuite) return;
+              setIsRenameSuiteModalOpen(false);
+              setRenameSuiteId(null);
+            }}
+            disabled={isRenamingSuite}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => void handleRenameSuiteConfirm()}
+            disabled={!renameSuiteInputValue.trim() || isRenamingSuite}
+          >
+            {isRenamingSuite ? "Saving..." : "Save"}
+          </Button>
+        </div>
+      </Modal>
+
+      {/* ── Import Modal ── */}
       <ImportTestCasesModal
         projectId={projectId}
         open={isImportModalOpen}

@@ -41,7 +41,7 @@ export default function WorkspaceIntegrationsPage() {
   const providerValue = newProvider === "custom" ? newCustomProvider.trim().toLowerCase() : newProvider;
   const modelOptions =
     newProvider === "anthropic"
-      ? ["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]
+      ? ["claude-sonnet-4-6", "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022"]
       : newProvider === "openai"
         ? ["gpt-4o", "gpt-4.1", "gpt-4.1-mini"]
         : [];
@@ -75,19 +75,21 @@ export default function WorkspaceIntegrationsPage() {
     setMessage(null);
     setError(null);
     try {
+      const isKnownProvider = ["openai", "anthropic"].includes(providerValue);
       await createWorkspaceAiKey({
         name: newName.trim(),
         provider: providerValue,
         apiKey: newApiKey.trim(),
         defaultModel: newDefaultModel.trim() === "custom" ? undefined : newDefaultModel.trim() || undefined,
         baseUrl: newBaseUrl.trim() || undefined,
-        authHeaderName: newAuthHeaderName.trim() || undefined,
-        authScheme: newAuthScheme.trim(),
+        // Only send auth overrides for custom providers — known providers use well-defined SDK defaults
+        authHeaderName: isKnownProvider ? undefined : (newAuthHeaderName.trim() || undefined),
+        authScheme: isKnownProvider ? undefined : (newAuthScheme.trim() || undefined),
       });
       setNewName("");
       setNewCustomProvider("");
       setNewApiKey("");
-      setNewDefaultModel(newProvider === "anthropic" ? "claude-sonnet-4-20250514" : "gpt-4o");
+      setNewDefaultModel(newProvider === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o");
       setNewBaseUrl("");
       setNewAuthHeaderName("Authorization");
       setNewAuthScheme("Bearer");
@@ -221,7 +223,7 @@ export default function WorkspaceIntegrationsPage() {
                 onChange={(e) => {
                   const next = e.target.value;
                   setNewProvider(next);
-                  setNewDefaultModel(next === "anthropic" ? "claude-sonnet-4-20250514" : next === "openai" ? "gpt-4o" : "");
+                  setNewDefaultModel(next === "anthropic" ? "claude-sonnet-4-6" : next === "openai" ? "gpt-4o" : "");
                 }}
                 disabled={saving}
               >

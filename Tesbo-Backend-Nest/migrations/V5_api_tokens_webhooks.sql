@@ -1,4 +1,4 @@
-﻿-- API tokens (personal or project-scoped)
+-- API tokens (personal or project-scoped)
 CREATE TABLE api_tokens (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID REFERENCES users(id) ON DELETE CASCADE,

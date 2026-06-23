@@ -1,4 +1,4 @@
-﻿
+
 ALTER TABLE tesbo_report_cases
     ADD COLUMN IF NOT EXISTS full_title VARCHAR(1024),
     ADD COLUMN IF NOT EXISTS error_message TEXT,

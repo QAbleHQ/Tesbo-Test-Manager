@@ -4,6 +4,10 @@ export type { ButtonProps } from "@/components/ui/Button";
 export { Card, CardHeader, CardTitle, CardBody, CardFooter } from "@/components/ui/Card";
 export { default as StatusChip } from "@/components/ui/StatusChip";
 export type { StatusChipProps } from "@/components/ui/StatusChip";
+export { default as StatusBadge } from "@/components/ui/StatusBadge";
+export type { StatusBadgeProps, TestStatus } from "@/components/ui/StatusBadge";
+export { default as PriorityBadge } from "@/components/ui/PriorityBadge";
+export type { PriorityBadgeProps, Priority } from "@/components/ui/PriorityBadge";
 export { default as Modal } from "@/components/ui/Modal";
 export { default as EmptyStateBlock } from "@/components/ui/EmptyStateBlock";
 

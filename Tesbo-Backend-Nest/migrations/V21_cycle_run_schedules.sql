@@ -1,4 +1,4 @@
-﻿
+
 CREATE TABLE IF NOT EXISTS cycle_run_schedules (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

@@ -1,6 +1,19 @@
 import type { Metadata } from "next";
+import localFont from "next/font/local";
 import "./globals.css";
 import { THEME_STORAGE_KEY } from "@/lib/theme";
+
+const inter = localFont({
+  src: "../public/fonts/inter-variable.woff2",
+  variable: "--font-inter",
+  display: "swap",
+});
+
+const jetbrainsMono = localFont({
+  src: "../public/fonts/jetbrains-mono-variable.woff2",
+  variable: "--font-jetbrains-mono",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
   title: "Tesbo Test Manager",
@@ -37,7 +50,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>

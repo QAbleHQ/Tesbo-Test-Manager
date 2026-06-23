@@ -1,4 +1,4 @@
-﻿CREATE TABLE IF NOT EXISTS automation_runs (
+CREATE TABLE IF NOT EXISTS automation_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     cycle_id UUID NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'running',
