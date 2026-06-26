@@ -139,7 +139,7 @@ function LoginForm() {
         </p>
         <p className="text-center text-xs text-[var(--muted-soft)]">
           <Link href="/privacy-policy" className="hover:underline">
-            Privacy Policy
+            Privacy Policyyy
           </Link>{" "}
           ·{" "}
           <Link href="/terms-and-conditions" className="hover:underline">
