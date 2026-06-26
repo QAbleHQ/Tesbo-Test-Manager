@@ -12,14 +12,15 @@ pipeline {
     }
 
     environment {
-        // App server where stage.tesbo.io runs (Docker + repo live here).
         STAGE_SERVER_HOST = '208.87.133.122'
         STAGE_SERVER_USER = 'root'
+        APP_DIR           = '/root/Tesbo-Test-Manager/Tesbo-Test-Manager'
         DEPLOY_SCRIPT     = '/usr/local/bin/tesbo-stage-deploy.sh'
         DEPLOY_LOG        = '/var/log/tesbo-stage-deploy.log'
         STAGE_URL         = 'https://stage.tesbo.io'
-        // Jenkins credential ID for SSH private key (Manage Jenkins → Credentials).
         STAGE_SSH_CREDS   = 'tesbo-stage-ssh'
+        // Jenkins → Manage Jenkins → Managed files (Config File Provider).
+        STAGE_ENV_CONFIG  = 'tesbo-test-manager-stage-env'
     }
 
     stages {
@@ -32,13 +33,18 @@ pipeline {
                 }
             }
             steps {
-                echo "Jenkins → SSH → ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST} → ${STAGE_URL}"
-                sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                            ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST} \\
-                            '${DEPLOY_SCRIPT}'
-                    """
+                echo "Deploy ${STAGE_URL} via ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST}"
+                configFileProvider([configFile(fileId: "${STAGE_ENV_CONFIG}", targetLocation: '.env')]) {
+                    sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
+                        sh """
+                            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
+                                .env ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST}:${APP_DIR}/.env
+
+                            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
+                                ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST} \\
+                                '${DEPLOY_SCRIPT}'
+                        """
+                    }
                 }
             }
         }
