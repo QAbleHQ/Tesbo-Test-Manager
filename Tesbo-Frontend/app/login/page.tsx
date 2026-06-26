@@ -138,7 +138,7 @@ function LoginForm() {
           {otpMode ? "We will send a one-time code to your email." : "Use the password created during initial setup."}
         </p>
         <p className="text-center text-xs text-[var(--muted-soft)]">
-          <Link href="/privacy-policyyy" className="hover:underline">
+          <Link href="/privacy-policy" className="hover:underline">
             Privacy Policy
           </Link>{" "}
           ·{" "}
