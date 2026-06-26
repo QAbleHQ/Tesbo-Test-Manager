@@ -12,13 +12,8 @@ pipeline {
     }
 
     environment {
-        // Credential IDs only — no hosts, paths, or secrets in Git.
-        STAGE_SSH_CREDS  = 'tesbo-stage-ssh'
         STAGE_ENV_CONFIG = 'tesbo-test-manager-stage-env'
-        STAGE_SSH_TARGET = credentials('tesbo-stage-ssh-target')
-        STAGE_APP_DIR    = credentials('tesbo-stage-app-dir')
-        STAGE_DEPLOY_CMD = credentials('tesbo-stage-deploy-script')
-        STAGE_DEPLOY_LOG = credentials('tesbo-stage-deploy-log')
+        APP_DIR          = '/root/Tesbo-Test-Manager/Tesbo-Test-Manager'
     }
 
     stages {
@@ -31,18 +26,12 @@ pipeline {
                 }
             }
             steps {
-                echo 'Deploying Tesbo stage environment...'
+                echo 'Deploying Tesbo stage (same server — no SSH)...'
                 configFileProvider([configFile(fileId: "${STAGE_ENV_CONFIG}", targetLocation: '.env')]) {
-                    sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
-                        sh """
-                            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                                .env ${STAGE_SSH_TARGET}:${STAGE_APP_DIR}/.env
-
-                            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                                ${STAGE_SSH_TARGET} \\
-                                '${STAGE_DEPLOY_CMD}'
-                        """
-                    }
+                    sh """
+                        sudo cp .env ${APP_DIR}/.env
+                        sudo /usr/local/bin/tesbo-stage-deploy.sh
+                    """
                 }
             }
         }
@@ -68,13 +57,7 @@ pipeline {
             echo 'Stage deploy completed successfully.'
         }
         failure {
-            sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
-                sh """
-                    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                        ${STAGE_SSH_TARGET} \\
-                        'tail -60 ${STAGE_DEPLOY_LOG} || true'
-                """
-            }
+            sh "sudo bash -c 'cd ${APP_DIR} && docker-compose logs --tail=60 backend frontend || true'"
         }
     }
 }
