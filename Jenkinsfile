@@ -12,15 +12,13 @@ pipeline {
     }
 
     environment {
-        STAGE_SERVER_HOST = '208.87.133.122'
-        STAGE_SERVER_USER = 'root'
-        APP_DIR           = '/root/Tesbo-Test-Manager/Tesbo-Test-Manager'
-        DEPLOY_SCRIPT     = '/usr/local/bin/tesbo-stage-deploy.sh'
-        DEPLOY_LOG        = '/var/log/tesbo-stage-deploy.log'
-        STAGE_URL         = 'https://stage.tesbo.io'
-        STAGE_SSH_CREDS   = 'tesbo-stage-ssh'
-        // Jenkins → Manage Jenkins → Managed files (Config File Provider).
-        STAGE_ENV_CONFIG  = 'tesbo-test-manager-stage-env'
+        // Credential IDs only — no hosts, paths, or secrets in Git.
+        STAGE_SSH_CREDS  = 'tesbo-stage-ssh'
+        STAGE_ENV_CONFIG = 'tesbo-test-manager-stage-env'
+        STAGE_SSH_TARGET = credentials('tesbo-stage-ssh-target')
+        STAGE_APP_DIR    = credentials('tesbo-stage-app-dir')
+        STAGE_DEPLOY_CMD = credentials('tesbo-stage-deploy-script')
+        STAGE_DEPLOY_LOG = credentials('tesbo-stage-deploy-log')
     }
 
     stages {
@@ -33,16 +31,16 @@ pipeline {
                 }
             }
             steps {
-                echo "Deploy ${STAGE_URL} via ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST}"
+                echo 'Deploying Tesbo stage environment...'
                 configFileProvider([configFile(fileId: "${STAGE_ENV_CONFIG}", targetLocation: '.env')]) {
                     sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
                         sh """
                             scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                                .env ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST}:${APP_DIR}/.env
+                                .env ${STAGE_SSH_TARGET}:${STAGE_APP_DIR}/.env
 
                             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                                ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST} \\
-                                '${DEPLOY_SCRIPT}'
+                                ${STAGE_SSH_TARGET} \\
+                                '${STAGE_DEPLOY_CMD}'
                         """
                     }
                 }
@@ -67,14 +65,14 @@ pipeline {
 
     post {
         success {
-            echo "Live updated: ${STAGE_URL}"
+            echo 'Stage deploy completed successfully.'
         }
         failure {
             sshagent(credentials: ["${STAGE_SSH_CREDS}"]) {
                 sh """
                     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-                        ${STAGE_SERVER_USER}@${STAGE_SERVER_HOST} \\
-                        'tail -60 ${DEPLOY_LOG} || true'
+                        ${STAGE_SSH_TARGET} \\
+                        'tail -60 ${STAGE_DEPLOY_LOG} || true'
                 """
             }
         }
