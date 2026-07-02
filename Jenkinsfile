@@ -47,20 +47,10 @@ pipeline {
                     ssh -F "${SSH_CONFIG}" ${REMOTE_HOST} "
                       set -e
                       cd '${REMOTE_APP_DIR}'
-                      docker compose up --build -d
+                      docker compose up --build -d --wait --wait-timeout 300
                       docker compose ps
                       curl -fsS http://127.0.0.1:1011/health
-                      for i in \$(seq 1 30); do
-                        if curl -fsS -o /dev/null http://127.0.0.1:1010/; then
-                          echo Frontend is ready
-                          exit 0
-                        fi
-                        echo Waiting for frontend... attempt \$i/30
-                        sleep 5
-                      done
-                      echo Frontend did not become ready in time
-                      docker compose logs --tail=40 frontend || true
-                      exit 1
+                      curl -fsS -o /dev/null http://127.0.0.1:1010/
                     "
                 '''
             }
