@@ -616,6 +616,47 @@ export class LegacyController {
     throw new Error("Attachment content unavailable");
   }
 
+  /**
+   * Mints a short-lived link the embedded Playwright trace viewer can read.
+   *
+   * The viewer is trace.playwright.dev running inside an iframe: it fetches the .zip itself, from
+   * the browser, cross-origin and without credentials, so it cannot use the download route above.
+   * This hands back a signed token instead; /api/public/trace/:token below is what redeems it.
+   */
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/trace-link")
+  createExecutionTraceLink(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.createExecutionTraceLink(cycleId, req.userId, executionId, attachmentId);
+  }
+
+  /**
+   * Serves one trace archive to a holder of a valid link. Unauthenticated by design — see
+   * createExecutionTraceLink in the service for why, and for what keeps the grant narrow.
+   *
+   * The bytes are streamed from storage rather than redirected to a presigned URL: the fetch comes
+   * from a third-party origin, so the response needs CORS headers we control, and a private bucket
+   * has none. Evidence is capped at MAX_EVIDENCE_FILE_SIZE (25 MB by default), so buffering one
+   * trace is bounded.
+   */
+  @Get("/api/public/trace/:token")
+  async publicTrace(@Res() res: Response, @Param("token") token: string) {
+    const trace = await this.legacy.getPublicTraceContent(token);
+    // The viewer is a fixed, known origin, so it is named rather than wildcarded. No credentials
+    // are involved either way — the token is the authorization.
+    res.setHeader("Access-Control-Allow-Origin", "https://trace.playwright.dev");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Content-Type", "application/zip");
+    // attachment, never inline: nothing served from this route may be rendered by a browser.
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(trace.fileName)}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(trace.buffer);
+  }
+
   @Post("/api/cycles/:cycleId/executions/bulk-assign")
   bulkAssign(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
     return this.legacy.bulkAssignExecutions(cycleId, req.userId, body);

@@ -3434,6 +3434,40 @@ export async function listExecutionEvidence(
   );
 }
 
+/*
+ * Playwright trace viewing.
+ *
+ * A trace .zip is not something a browser can open; the thing that renders it is Playwright's own
+ * web app at trace.playwright.dev, which runs wholly in the visitor's browser and fetches the
+ * archive itself — cross-origin, with no cookies. So the ordinary evidence download URL is no use
+ * to it (session-authorized, and it redirects to a private presigned URL). These mint a short-lived
+ * signed link instead and turn it into the viewer URL.
+ *
+ * The trace bytes go from our API to the person's own browser. trace.playwright.dev uploads
+ * nothing and stores nothing — it is a static page — but the link it is handed does grant access to
+ * that one archive until it expires, which is why the token is scoped to a single attachment and
+ * lives for an hour rather than indefinitely.
+ */
+export async function createExecutionTraceLink(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ token: string; expiresAt: string }> {
+  return api<{ token: string; expiresAt: string }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-link`
+  );
+}
+
+/** The URL the viewer fetches: our API, redeeming the signed token, with CORS for that one origin. */
+export function publicTraceUrl(token: string): string {
+  return `${API_BASE}/api/public/trace/${token}`;
+}
+
+/** Playwright's hosted viewer, pointed at a trace of ours. Used for both the iframe and the tab. */
+export function playwrightTraceViewerUrl(traceUrl: string): string {
+  return `https://trace.playwright.dev/?trace=${encodeURIComponent(traceUrl)}`;
+}
+
 export async function uploadExecutionEvidence(
   cycleId: string,
   executionId: string,

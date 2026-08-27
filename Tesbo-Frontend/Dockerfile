@@ -31,9 +31,6 @@ COPY --from=deps --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --from=deps --chown=node:node /app/public ./public
 COPY --from=deps --chown=node:node /app/.next ./.next
-COPY --from=deps --chown=node:node /app/instrumentation.mjs ./instrumentation.mjs
-
-ENV NODE_OPTIONS="--import ./instrumentation.mjs"
 
 USER node
 
