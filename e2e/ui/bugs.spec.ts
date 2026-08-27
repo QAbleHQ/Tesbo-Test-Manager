@@ -412,6 +412,104 @@ test.describe("bug priority", () => {
 });
 
 /*
+ * Bug "Assign to" — "[Test Runs] Unable to assign test cases for execution". Bugs had no assignee
+ * concept before this; the field lives on the report/edit forms next to Severity/Priority. The
+ * membership rule and clear-vs-omit semantics are covered in api/bugs.spec.ts; this is what the
+ * person filling in the form actually sees.
+ */
+test.describe("bug assignee", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  let selfUserId: string;
+  let selfLabel: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+    const me = await (await api.get("/api/auth/me")).json();
+    selfUserId = me.userId;
+    const members = await (await api.get(`/api/projects/${projectId}/members`)).json();
+    const self = members.find((m: { userId: string }) => m.userId === selfUserId);
+    selfLabel = self.name || self.email;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-24 the report form offers Assign to, defaulting to Unassigned, and it persists", { tag: '@tesbo.testId("TES-TC-1917")' }, async ({ page }) => {
+    const title = `E2E Assignee Report ${uniqueSuffix()}`;
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "Report Bug" }).first().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+    const assign = page.getByLabel("Assign to");
+    await expect(assign).toBeVisible();
+    await expect(assign).toHaveValue("");
+    await assign.selectOption({ label: selfLabel });
+
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await page.getByRole("button", { name: "Report Bug" }).last().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created.assigneeId).toBe(selfUserId);
+  });
+
+  test("BUG-U-25 the report form saves unassigned when no assignee is picked", { tag: '@tesbo.testId("TES-TC-1918")' }, async ({ page }) => {
+    const title = `E2E Assignee Report Unassigned ${uniqueSuffix()}`;
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "Report Bug" }).first().click();
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await page.getByRole("button", { name: "Report Bug" }).last().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created.assigneeId).toBeNull();
+  });
+
+  test("BUG-U-26 the edit form changes the assignee and can clear it back to Unassigned", { tag: '@tesbo.testId("TES-TC-1919")' }, async ({ page }) => {
+    const title = `E2E Assignee Edit ${uniqueSuffix()}`;
+    const bug = await createBug(api, projectId, { title, severity: "Medium" });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    const assign = page.getByLabel("Assign to");
+    await expect(assign).toHaveValue("");
+    await assign.selectOption({ label: selfLabel });
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    let after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(after.assigneeId).toBe(selfUserId);
+
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByLabel("Assign to")).toHaveValue(selfUserId);
+    await page.getByLabel("Assign to").selectOption("");
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(after.assigneeId).toBeNull();
+  });
+});
+
+/*
  * The status filter's consistency across Board and List — dev commit cdcd5dd, ported here when the
  * two branches' bugs specs were merged.
  *

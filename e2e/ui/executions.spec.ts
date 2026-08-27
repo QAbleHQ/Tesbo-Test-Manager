@@ -185,6 +185,83 @@ test.describe("auto bug-filing on Failed", () => {
   });
 });
 
+/*
+ * "[Test Runs] Unable to assign test cases for execution" — the editable "Assign to" control.
+ *
+ * Before this change, assignee was read-only everywhere in the UI, and even when set through the
+ * API it was silently wiped by the next status change or Save (see api/executions.spec.ts). These
+ * cover the same regression at the UI layer, through the controls a person actually uses.
+ */
+test.describe("assigning a test execution", () => {
+  test("assigning via the run drawer persists, and a status-only Save does not clear it", { tag: '@tesbo.testId("TES-TC-1915")' }, async ({ page }) => {
+    const title = `UI Assignee Drawer Case ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+
+      const assignSelect = page.getByRole("combobox", { name: "Assigned to" });
+      await expect(assignSelect).toBeVisible();
+      await assignSelect.selectOption(me.userId);
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterAssign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterAssign.assigneeId).toBe(me.userId);
+
+      // Re-open and Save again with only a status change — the drawer always resends the
+      // current selection, but this pins that a plain status edit elsewhere in the product
+      // (the inline dropdown) must not silently clear what was just assigned.
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("combobox", { name: "Assigned to" })).toHaveValue(me.userId);
+      await page.getByRole("button", { name: "Passed", exact: true }).first().click();
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterStatus] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterStatus.status).toBe("Passed");
+      expect(afterStatus.assigneeId, "a status change from the drawer must not clear the assignee").toBe(me.userId);
+
+      // Unassign via the drawer's "Unassigned" option.
+      await page.getByText(testcase.title).first().click();
+      await page.getByRole("combobox", { name: "Assigned to" }).selectOption("");
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterUnassign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterUnassign.assigneeId).toBeNull();
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("the full-page execute view also offers Assigned to, and persists it", { tag: '@tesbo.testId("TES-TC-1916")' }, async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Assignee Full Page ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+      const assignSelect = page.getByRole("combobox", { name: "Assigned to" });
+      await expect(assignSelect).toBeVisible();
+      await assignSelect.selectOption(me.userId);
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await page.waitForURL(`**/projects/${ctx.projectId}/cycles/${cycle.id}`);
+
+      const [after] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(after.assigneeId).toBe(me.userId);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
 test.describe("removing cases from a run", () => {
   /*
    * Basecamp 10199377404 — "[Test Run] Count does not match when deleted test cases from run". The

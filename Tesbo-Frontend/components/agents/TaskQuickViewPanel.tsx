@@ -307,7 +307,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
-                  <p className="mt-1 text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{source.detail}</p>
                 </div>
               ))}
               {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">No source summary recorded.</p>}

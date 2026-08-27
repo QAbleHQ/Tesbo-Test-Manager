@@ -6,14 +6,42 @@ type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
 type ApiErrorBody = { error?: string; detail?: string; errors?: { field?: string; message?: string }[] };
 
+/**
+ * A response with no `error`/`errors` body is never something the endpoint chose to say to a
+ * user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
+ * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
+ * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
+ * the entire message — this is the friendly sentence for that case, keyed off the status class.
+ */
+function genericStatusMessage(status: number): string {
+  if (status === 401) return "Your session has expired. Please sign in again.";
+  if (status === 403) return "You don't have permission to do this.";
+  if (status === 404) return "That could not be found. It may have been deleted or moved.";
+  if (status === 409) return "This couldn't be saved because it conflicts with a recent change. Refresh and try again.";
+  if (status === 429) return "Too many requests. Please wait a moment and try again.";
+  if (status >= 500) return "Something went wrong on our end. Please try again.";
+  return "Something went wrong. Please try again.";
+}
+
 function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
-    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || String(status);
+    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  const msg = body.error || String(status);
+  const msg = body.error || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
+}
+
+function isNetworkFetchError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : "Network request failed";
+  return (
+    msg === "Failed to fetch" ||
+    msg === "Load failed" ||
+    msg.includes("NetworkError") ||
+    msg.includes("network")
+  );
 }
 
 async function fetchWithNetworkErrorMessage(
@@ -23,18 +51,21 @@ async function fetchWithNetworkErrorMessage(
   try {
     return await fetch(input, init);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Network request failed";
-    const looksLikeCorsOrNetwork =
-      msg === "Failed to fetch" ||
-      msg === "Load failed" ||
-      msg.includes("NetworkError") ||
-      msg.includes("network");
-    if (looksLikeCorsOrNetwork) {
+    if (!isNetworkFetchError(e)) throw e instanceof Error ? e : new Error(String(e));
+    // A browser keep-alive connection left idle past the server/proxy's keep-alive window fails
+    // on the next write before any bytes reach the server — the request was never delivered, so
+    // retrying once (a fresh connection) is safe even for a POST body. `init.body` here is always
+    // an already-serialized JSON string (see `api()` below), never a one-shot stream, so it can be
+    // resent. This is what a manual page refresh already did to "fix" the error; automate that one
+    // retry instead of surfacing it.
+    try {
+      return await fetch(input, init);
+    } catch (e2) {
+      const msg = e2 instanceof Error ? e2.message : "Network request failed";
       throw new Error(
         `${msg} — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL, HTTPS, and that the backend allows this page’s origin in CORS_ALLOWED_ORIGINS.`
       );
     }
-    throw e instanceof Error ? e : new Error(String(e));
   }
 }
 
@@ -2079,7 +2110,7 @@ export async function listCycleExecutions(cycleId: string): Promise<ExecutionIte
   return api(`/api/cycles/${cycleId}/executions`);
 }
 
-export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
+export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string | null; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
@@ -2218,6 +2249,9 @@ export interface BugItem {
   reportedBy: string | null;
   reporterName: string;
   reporterEmail: string;
+  assigneeId: string | null;
+  assigneeName: string | null;
+  assigneeType?: "user" | "agent" | null;
   integrationProvider: "JIRA" | "LINEAR" | null;
   integrationIssueKey: string | null;
   betterbugsUrl: string | null;
@@ -2245,6 +2279,8 @@ export async function createBug(projectId: string, data: {
   externalUrl?: string;
   severity?: BugSeverity;
   priority?: BugPriority | null;
+  // null/omitted both mean unassigned on create; there is no "clear" distinction to make yet.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -2261,6 +2297,8 @@ export async function updateBug(bugId: string, data: {
   severity?: BugSeverity;
   // null clears it back to untriaged; omitted leaves the stored value alone.
   priority?: BugPriority | null;
+  // null clears the assignee; omitted leaves the stored value alone.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;

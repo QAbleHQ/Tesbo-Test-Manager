@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
 import { testAddress } from "../utils/env";
+import { literal, scalar } from "../utils/psql";
 import {
   detachUserByEmail,
   loginAs,
@@ -7,6 +8,7 @@ import {
   rbacSuiteSkipReason,
   resetRbacMembership,
   seedFixtureUser,
+  setProjectRole,
   storedProjectRole,
   type RbacTenant,
 } from "../utils/rbac-tenant";
@@ -220,6 +222,98 @@ test.describe("project access", () => {
     });
     expect(res.status()).toBe(400);
     expect(storedProjectRole(tenant!.mainProjectId, tenant!.owner.userId)).toBe("owner");
+  });
+
+  // ─── Assignment cascade on removal ─────────────────────────────────────────
+  /*
+   * "[Test Runs] Unable to assign test cases for execution" edge case: a member removed from a
+   * project must not leave executions/bugs still pointing at them as assignee. That assignment would
+   * be dangling — visible, but to nobody who can act on it. removeProjectMember clears both in the
+   * same transaction as the membership delete.
+   */
+  test("removing a project member clears their execution and bug assignments in that project", { tag: '@tesbo.testId("TES-TC-1912")' }, async () => {
+    const stamp = Date.now();
+    const testcase = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+        data: { title: `E2E Cascade Case ${stamp}` },
+      })
+    ).json();
+    const cycle = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles`, { data: { name: `E2E Cascade Run ${stamp}` } })
+    ).json();
+    await asOwner.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const [execution] = await (await asOwner.get(`/api/cycles/${cycle.id}/executions`)).json();
+    await asOwner.patch(`/api/cycles/${cycle.id}/executions/${execution.id}`, { data: { assigneeId: tenant!.qa.userId } });
+
+    const bug = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Cascade Bug ${stamp}`, assigneeId: tenant!.qa.userId },
+      })
+    ).json();
+
+    try {
+      expect(scalar(`SELECT assignee_id FROM executions WHERE id = ${literal(execution.id)};`)).toBe(tenant!.qa.userId);
+      expect(scalar(`SELECT assignee_id FROM bugs WHERE id = ${literal(bug.id)};`)).toBe(tenant!.qa.userId);
+
+      const removed = await asOwner.delete("/api/workspace/project-access", {
+        data: { projectId: tenant!.mainProjectId, userId: tenant!.qa.userId },
+        failOnStatusCode: false,
+      });
+      expect(removed.ok(), await removed.text()).toBeTruthy();
+
+      expect(
+        scalar(`SELECT COALESCE(assignee_id::text, 'null') FROM executions WHERE id = ${literal(execution.id)};`),
+        "the execution must not still point at a member who was just removed",
+      ).toBe("null");
+      expect(
+        scalar(`SELECT COALESCE(assignee_id::text, 'null') FROM bugs WHERE id = ${literal(bug.id)};`),
+        "the bug must not still point at a member who was just removed",
+      ).toBe("null");
+    } finally {
+      resetRbacMembership(tenant!);
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("removing a member with no assignments is a no-op, not an error", { tag: '@tesbo.testId("TES-TC-1913")' }, async () => {
+    const res = await asOwner.delete("/api/workspace/project-access", {
+      data: { projectId: tenant!.mainProjectId, userId: tenant!.qa.userId },
+      failOnStatusCode: false,
+    });
+    try {
+      expect(res.ok(), await res.text()).toBeTruthy();
+    } finally {
+      resetRbacMembership(tenant!);
+    }
+  });
+
+  test("the cascade is scoped to the removed project — an assignment in a different project survives", { tag: '@tesbo.testId("TES-TC-1914")' }, async () => {
+    // qa is a member of mainProjectId only by default; grant secondProjectId too so an assignment
+    // there exists to prove it's untouched by a removal scoped to mainProjectId.
+    setProjectRole(tenant!.secondProjectId, tenant!.qa.userId, "qa_engineer");
+    const bug = await (
+      await asOwner.post(`/api/projects/${tenant!.secondProjectId}/bugs`, {
+        data: { title: `E2E Cascade Cross-Project Bug ${Date.now()}`, assigneeId: tenant!.qa.userId },
+      })
+    ).json();
+
+    try {
+      const removed = await asOwner.delete("/api/workspace/project-access", {
+        data: { projectId: tenant!.mainProjectId, userId: tenant!.qa.userId },
+        failOnStatusCode: false,
+      });
+      expect(removed.ok(), await removed.text()).toBeTruthy();
+
+      expect(
+        scalar(`SELECT assignee_id FROM bugs WHERE id = ${literal(bug.id)};`),
+        "removing a member from Project A must not clear their assignment in Project B",
+      ).toBe(tenant!.qa.userId);
+    } finally {
+      resetRbacMembership(tenant!);
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
   });
 
   // ─── Malformed and cross-tenant input ──────────────────────────────────────

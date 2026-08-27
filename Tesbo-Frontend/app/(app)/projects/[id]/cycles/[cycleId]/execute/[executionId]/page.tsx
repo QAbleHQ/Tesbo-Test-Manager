@@ -7,9 +7,10 @@ import {
   authMe,
   listCycleExecutions,
   updateExecution,
+  listProjectMembers,
   type ExecutionItem,
 } from "@/lib/api";
-import { Button, StatusChip, Input, PageLoader, Textarea } from "@/components/ui";
+import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
 
@@ -62,6 +63,8 @@ export default function ExecutionDetailPage() {
   const [actualResult, setActualResult] = useState("");
   const [defectKey, setDefectKey] = useState("");
   const [defectUrl, setDefectUrl] = useState("");
+  const [assigneeId, setAssigneeId] = useState("");
+  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -79,11 +82,13 @@ export default function ExecutionDetailPage() {
             setActualResult(e.actualResult || "");
             setDefectKey(e.defectKey || "");
             setDefectUrl(e.defectUrl || "");
+            setAssigneeId(e.assigneeId || "");
           }
         })
         .catch(() => router.replace("/projects"));
+      listProjectMembers(projectId).then(setMembers).catch(() => {});
     });
-  }, [cycleId, executionId, router]);
+  }, [cycleId, executionId, projectId, router]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -94,6 +99,7 @@ export default function ExecutionDetailPage() {
         actualResult,
         defectKey: defectKey || undefined,
         defectUrl: defectUrl || undefined,
+        assigneeId: assigneeId || null,
       });
       router.push(`/projects/${projectId}/cycles/${cycleId}`);
       router.refresh();
@@ -205,6 +211,28 @@ export default function ExecutionDetailPage() {
                 );
               })}
             </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
+              Assigned to
+            </label>
+            <Select value={assigneeId} onChange={(e) => setAssigneeId(e.target.value)} aria-label="Assigned to">
+              <option value="">Unassigned</option>
+              {members.map((m) => (
+                <option key={m.userId} value={m.userId}>
+                  {m.name || m.email}
+                </option>
+              ))}
+              {/* Current assignee not among this project's members — an AI agent or a stale row.
+                  Keep it visible as a disabled option rather than silently showing "Unassigned",
+                  which would clear a real assignment on Save. */}
+              {assigneeId && !members.some((m) => m.userId === assigneeId) && (
+                <option value={assigneeId} disabled>
+                  Unknown assignee (not a project member)
+                </option>
+              )}
+            </Select>
           </div>
 
           <div>
