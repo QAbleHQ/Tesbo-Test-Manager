@@ -208,6 +208,15 @@ describe("Zyra reply guards", () => {
       expect(out).toContain("fewer cases");
     });
 
+    it("maps the current 'no testcase drafts' salvage-exhausted message the same as a JSON failure", () => {
+      // normalizeAiDrafts throws this once strict-parse -> repair -> per-object salvage all yield
+      // zero drafts (see extractAiDraftCandidates) — it replaced the old blunt "invalid JSON" message,
+      // and the classifier regex must recognize it too or this falls through to the generic cause.
+      const out = statics().zyraFailureReply(attempt, "AI testcase generation returned no testcase drafts", false);
+      expect(out).toContain("came back incomplete");
+      expect(out).toContain("fewer cases");
+    });
+
     it("maps a rate limit to waiting, not to changing the request", () => {
       const out = statics().zyraFailureReply(attempt, "429 Too Many Requests", false);
       expect(out).toContain("rate-limiting");

@@ -12111,7 +12111,7 @@ export class LegacyService implements OnModuleInit {
 
   private static zyraFailureCause(detail: string): { cause: string; advice: string } {
     const text = String(detail || "").toLowerCase();
-    if (/json|parse|truncat|unterminated|unexpected token/.test(text)) {
+    if (/json|parse|truncat|unterminated|unexpected token|no testcase drafts|no drafts/.test(text)) {
       return {
         cause: "the AI's answer came back incomplete, so I couldn't read the test cases out of it",
         advice: "asking for fewer cases at a time usually fixes this — try \"generate 5\" and I'll build on it"
