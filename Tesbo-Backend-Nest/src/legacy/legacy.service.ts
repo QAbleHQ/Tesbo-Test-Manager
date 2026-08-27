@@ -209,6 +209,7 @@ type ZyraChatProjectSnapshot = {
   knowledgeTitles: string[];
   suites: Array<{ id: string; name: string; testCaseCount: number }>;
   testcaseCount: number;
+  unassignedTestCaseCount: number;
   linkedJiraTestcaseCount: number;
   jiraConnected: boolean;
   jiraProjectCount: number;
@@ -9003,6 +9004,10 @@ export class LegacyService implements OnModuleInit {
       "",
       `Existing suites (use these names/ids for move_to_suite; reuse an existing suite instead of duplicating it). "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" is where your own unfiled drafts are staged — its count is how many test cases you have generated that nobody has filed yet, so use it when asked how many you have created:`,
       projectSnapshot.suites.length ? projectSnapshot.suites.map((s) => `${s.name} (id: ${s.id}, ${s.testCaseCount} testcase(s))`).join("\n") : "No suites yet.",
+      projectSnapshot.unassignedTestCaseCount > 0
+        ? `Unassigned (no suite) (${projectSnapshot.unassignedTestCaseCount} testcase(s)) — not attached to any suite above.`
+        : "",
+      `The total test case count for this project is ${projectSnapshot.testcaseCount}, equal to the suite counts above plus Unassigned. ALWAYS include the Unassigned row in any suite-wise or per-suite breakdown you give — never report a breakdown whose rows sum to less than the total without accounting for the difference.`,
       "",
       "Most recently generated batch (already saved to the repository; use move_to_suite with fromLastPlan=true to reference all of these together):",
       lastCompletedPlanCount ? `${lastCompletedPlanCount} testcase(s) tracked from the last generation batch in this session.` : "No tracked batch yet in this session — nothing has been generated and saved here, so there is no batch to move or file.",
@@ -12322,6 +12327,10 @@ export class LegacyService implements OnModuleInit {
       ].filter(Boolean),
       suites,
       testcaseCount: Number(testcases.rows[0]?.testcase_count || 0),
+      // suites only sums testcases with a suite_id (see projectSuiteSummaries' JOIN), so testcases
+      // sitting outside any suite are otherwise invisible to the model — it would see a total that
+      // doesn't match the sum of the per-suite breakdown, with no explanation for the gap.
+      unassignedTestCaseCount: Math.max(0, Number(testcases.rows[0]?.testcase_count || 0) - suites.reduce((sum, suite) => sum + suite.testCaseCount, 0)),
       linkedJiraTestcaseCount: Number(testcases.rows[0]?.linked_jira_testcase_count || 0),
       jiraConnected: Boolean((status as Body).connected),
       jiraProjectCount: normalizeJsonArray((status as Body).connectedProjects).length,
