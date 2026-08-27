@@ -7,14 +7,13 @@ import {
   authMe,
   getWorkspace,
   getIntegrationConfig,
-  getIntegrationAuthUrl,
   isSyncRunActive,
-  INTEGRATION_RETURN_PROJECT_KEY,
   type IntegrationProvider,
 } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
+import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
 
 interface RemoteItem {
   id: string;
@@ -60,7 +59,6 @@ export function ProjectIntegrationMapping({
   const [loading, setLoading] = useState(true);
   const [canManage, setCanManage] = useState(false);
   const [oauthConfigured, setOauthConfigured] = useState(false);
-  const [connecting, setConnecting] = useState(false);
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
   const [remoteItems, setRemoteItems] = useState<RemoteItem[]>([]);
   // Exactly one remote project/team per Tesbo project, so this is a single id rather than a Set.
@@ -102,18 +100,19 @@ export function ProjectIntegrationMapping({
     loadData();
   }, [loadData]);
 
-  async function handleConnect() {
-    setConnecting(true);
-    setMessage(null);
-    try {
-      sessionStorage.setItem(INTEGRATION_RETURN_PROJECT_KEY, projectId);
-      const { url } = await getIntegrationAuthUrl(provider);
-      window.location.href = url;
-    } catch (err) {
-      setMessage({ type: "error", text: err instanceof Error ? err.message : `Failed to initiate ${label} authentication.` });
-      setConnecting(false);
-    }
-  }
+  const handleConnected = useCallback(() => {
+    setMessage({ type: "success", text: `${label} connected.` });
+    void loadData();
+  }, [label, loadData]);
+
+  const { connect, phase: connectPhase, error: connectError } = useIntegrationOAuthConnect(provider, handleConnected);
+  const connecting = connectPhase === "opening" || connectPhase === "waiting";
+  const connectHint =
+    connectPhase === "blocked"
+      ? "Your browser blocked the popup — allow popups for this site and try again."
+      : connectPhase === "timeout"
+        ? "This took too long and the request may have expired. Try again."
+        : connectError;
 
   async function handleSaveMapping() {
     setSaving(true);
@@ -173,9 +172,14 @@ export function ProjectIntegrationMapping({
                 <p className="mt-1 text-sm text-[var(--muted)]">
                   Connect {label} for this workspace, then pick which {remoteUnitLabel.toLowerCase()} feeds this project — right here, in one flow.
                 </p>
-                <Button type="button" onClick={handleConnect} disabled={connecting} className="mt-4">
-                  {connecting ? "Connecting..." : `Connect ${label}`}
+                <Button type="button" onClick={connect} disabled={connecting} className="mt-4">
+                  {connectPhase === "opening"
+                    ? "Redirecting…"
+                    : connectPhase === "waiting"
+                      ? "Waiting for you to finish in the new tab…"
+                      : `Connect ${label}`}
                 </Button>
+                {connectHint && <p className="mt-2 text-xs text-[var(--error-foreground)]">{connectHint}</p>}
               </>
             ) : (
               <>

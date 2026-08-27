@@ -1291,6 +1291,55 @@ Stated rather than glossed:
   by construction; the end-to-end proof is a stage run with `E2E_ENV=stage`.
 
 
+## 6e. Jira/Linear "Connect" — the new-tab OAuth redesign (2026-08-27)
+
+Not a wave (no coverage-percentage claim, `coverage:gate` not re-run for this) — just recording
+what [ui/integrations.spec.ts](../e2e/ui/integrations.spec.ts) does and doesn't reach, per §4's
+"record findings, not just tests."
+
+The connect flow (`Tesbo-Frontend/lib/useIntegrationOAuthConnect.ts` +
+`Tesbo-Frontend/app/integrations/callback`) was rebuilt to open OAuth in its own tab instead of a
+same-tab redirect, fixing a reported bug where the callback page's "Go Back" button (`router.back()`)
+sent a failed connection into Atlassian's own consent page instead of back into Tesbo — a direct
+consequence of the old same-tab navigation chain putting that page in browser history ahead of ours.
+
+**Covered (INT-U-01 through INT-U-06), against mocked `/api/workspace/integrations/jira/*`
+responses — no real Jira, no DB write, safe on account A:**
+- Connect opens a new tab and the triggering tab never navigates away; the button disables for the
+  duration (the actual double-click defense — the hook's internal named-window reuse is a second,
+  untested-at-e2e-level backstop behind it).
+- A blocked popup (`window.open` returns `null`) shows an inline, actionable error with no
+  same-tab fallback.
+- A successful callback in the popup tab is picked up by the original tab with no manual reload.
+- The popup closing before finishing is a silent cancel — idle button, no error.
+- The specific deadlock-breaker: a success the popup never broadcasts (BroadcastChannel deleted on
+  that page) is still caught the instant the popup closes, via the confirm-poll.
+- A failed callback shows the specific reason, offers Try Again / Close this tab, and — the literal
+  regression test — offers no button that routes back into the OAuth provider's page.
+
+**Documented out of scope, not silently skipped:**
+- Atlassian's/Linear's real consent screen, including the reported Cancel-button spinner bug
+  itself — third-party DOM, unreachable from here.
+- Real browser popup-blocker heuristics. Chromium under Playwright doesn't enforce the same
+  synchronous-user-gesture blocking a real browser does, so INT-U-02 proves the fallback UI, not
+  that `window.open()` firing before the `await` is what avoids triggering the block in the first
+  place — that ordering is a code-review-verified property of `useIntegrationOAuthConnect.ts`.
+- Real single-use-code replay against Atlassian's/Linear's actual token endpoint — same gap
+  `api/integrations.spec.ts` already documents for other outbound calls.
+- The single-exchange `useRef` guard's actual reason for existing (Next's dev-only React Strict
+  Mode double-invoking effects) isn't exercised — these specs run against a prod build. INT-U-03
+  and INT-U-05 assert the callback POST fires exactly once per normal visit as a baseline
+  regression check, but that doesn't prove the guard specifically. There is no unit-test harness in
+  `Tesbo-Frontend/package.json` (no jest/vitest/RTL) to add one to.
+- The 10-minute wait timeout (mirrors the backend's `OAUTH_STATE_TTL_MS`) is not exercised by
+  waiting it out; it's a plain constant in `useIntegrationOAuthConnect.ts`, not currently
+  test-overridable.
+- Two different tabs racing a Connect click for the same provider (the named popup window can be
+  stolen/re-navigated by the second) is a documented, accepted residual risk in the hook's own
+  comments, not something this spec forces.
+- `ProjectIntegrationMapping.tsx` drives the identical flow through the same shared hook and is
+  not independently re-tested here.
+
 ## 7. Working across threads
 
 1. **Claim a wave here before starting it** — add your session and the date to the status table.
