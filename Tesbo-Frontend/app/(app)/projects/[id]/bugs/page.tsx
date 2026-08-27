@@ -506,10 +506,12 @@ export default function BugsPage() {
     }));
   }, [filtered]);
 
-  /* stats */
-  const openCount = bugs.filter(
-    (b) => b.status === "Open" || b.status === "Reopened"
-  ).length;
+  /*
+   * Header stats must match the board's own per-status columns below them — the board treats
+   * "Open" and "Reopened" as distinct columns, so the header's "open" count previously summing
+   * both (Open + Reopened) showed a number no column on the board actually displayed.
+   */
+  const openCount = bugs.filter((b) => b.status === "Open").length;
   const closedCount = bugs.filter((b) => b.status === "Closed").length;
 
   /* reset create modal state */

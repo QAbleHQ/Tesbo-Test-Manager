@@ -586,3 +586,102 @@ test.describe("bugs — status filter and search consistency across Board and Li
     }
   });
 });
+
+/*
+ * The "X open · Y closed · Z total" line under the page title. `openCount` used to be
+ * `status === "Open" || status === "Reopened"`, so a project with 1 Open + 1 Reopened bug read
+ * "2 open" while the Kanban board directly below it — which gives Reopened its own column — showed
+ * only 1 card under "Open". Same page, two different definitions of "open" a few pixels apart. Fixed
+ * to count "Open" literally, matching the board's own column exactly.
+ */
+test.describe("bugs — header status counts", () => {
+  let api: APIRequestContext;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+  });
+
+  test.afterAll(async () => {
+    if (api) await api.dispose();
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The header subtitle, matched by its fixed " · " shape rather than exact numbers. */
+  function headerStats(page: Page): Locator {
+    return page.getByText(/^\d+ open · \d+ closed · \d+ total$/);
+  }
+
+  test("BUG-U-21 a Reopened bug is not folded into the open count", async ({ page }) => {
+    const project = await createProject(api);
+    const suffix = uniqueSuffix();
+    await createBug(api, project.id, { title: `E2E Header Open ${suffix}`, severity: "Medium" });
+    await createBug(api, project.id, {
+      title: `E2E Header Reopened ${suffix}`,
+      severity: "Medium",
+      status: "Reopened",
+    });
+    await createBug(api, project.id, {
+      title: `E2E Header InProgress ${suffix}`,
+      severity: "Medium",
+      status: "In Progress",
+    });
+    await createBug(api, project.id, {
+      title: `E2E Header Closed ${suffix}`,
+      severity: "Medium",
+      status: "Closed",
+    });
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+
+      // The regression itself: 1 Open + 1 Reopened must read "1 open", not "2 open".
+      await expect(headerStats(page)).toHaveText("1 open · 1 closed · 4 total");
+
+      const openColumn = page
+        .getByRole("heading", { name: "Open", exact: true })
+        .locator("xpath=ancestor::div[contains(@class,'min-w-')][1]");
+      const reopenedColumn = page
+        .getByRole("heading", { name: "Reopened", exact: true })
+        .locator("xpath=ancestor::div[contains(@class,'min-w-')][1]");
+      await expect(openColumn.getByText("1", { exact: true })).toBeVisible();
+      await expect(reopenedColumn.getByText("1", { exact: true })).toBeVisible();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("BUG-U-22 a project with no bugs shows all-zero counts", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+      await expect(headerStats(page)).toHaveText("0 open · 0 closed · 0 total");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("BUG-U-23 the header keeps counting the whole project while a status filter narrows the board", async ({ page }) => {
+    const project = await createProject(api);
+    const suffix = uniqueSuffix();
+    await createBug(api, project.id, { title: `E2E Header Filter Open ${suffix}`, severity: "Medium" });
+    const inProgress = await createBug(api, project.id, {
+      title: `E2E Header Filter InProgress ${suffix}`,
+      severity: "Medium",
+      status: "In Progress",
+    });
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+      await expect(headerStats(page)).toHaveText("1 open · 0 closed · 2 total");
+
+      // Narrowing the board to one status must not shrink the header's project-wide totals.
+      await page.getByLabel("Filter by status").selectOption("Open");
+      await expect(page.getByText(inProgress.title, { exact: true })).toHaveCount(0);
+      await expect(headerStats(page)).toHaveText("1 open · 0 closed · 2 total");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+});

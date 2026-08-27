@@ -810,7 +810,7 @@ export interface ZyraTask {
   linearIssueKeys: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
-  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string }>;
+  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
   tokenUsage: { input: number; output: number; total: number };
   createdAt: string;
   updatedAt: string;
@@ -2521,12 +2521,6 @@ export async function getProjectDashboardSummary(projectId: string): Promise<Pro
 // project, syncing, and browsing tickets stays project-scoped, mirrored per provider below.
 
 export type IntegrationProvider = "jira" | "linear";
-
-// A same-tab redirect to Jira/Linear and back can't carry query params through the OAuth
-// provider, so we stash which project to return to here before leaving, and the callback page
-// (app/integrations/callback) picks it back up to land the user straight back on that project's
-// mapping screen instead of the generic workspace integrations page.
-export const INTEGRATION_RETURN_PROJECT_KEY = "tesbo:integrationReturnProjectId";
 
 /**
  * Read-only view of how the deployment is configured for this provider. Credentials come from the

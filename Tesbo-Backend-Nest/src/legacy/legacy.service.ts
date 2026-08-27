@@ -209,6 +209,7 @@ type ZyraChatProjectSnapshot = {
   knowledgeTitles: string[];
   suites: Array<{ id: string; name: string; testCaseCount: number }>;
   testcaseCount: number;
+  unassignedTestCaseCount: number;
   linkedJiraTestcaseCount: number;
   jiraConnected: boolean;
   jiraProjectCount: number;
@@ -9154,6 +9155,10 @@ export class LegacyService implements OnModuleInit {
       "",
       `Existing suites (use these names/ids for move_to_suite; reuse an existing suite instead of duplicating it). "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" is where your own unfiled drafts are staged — its count is how many test cases you have generated that nobody has filed yet, so use it when asked how many you have created:`,
       projectSnapshot.suites.length ? projectSnapshot.suites.map((s) => `${s.name} (id: ${s.id}, ${s.testCaseCount} testcase(s))`).join("\n") : "No suites yet.",
+      projectSnapshot.unassignedTestCaseCount > 0
+        ? `Unassigned (no suite) (${projectSnapshot.unassignedTestCaseCount} testcase(s)) — not attached to any suite above.`
+        : "",
+      `The total test case count for this project is ${projectSnapshot.testcaseCount}, equal to the suite counts above plus Unassigned. ALWAYS include the Unassigned row in any suite-wise or per-suite breakdown you give — never report a breakdown whose rows sum to less than the total without accounting for the difference.`,
       "",
       "Most recently generated batch (already saved to the repository; use move_to_suite with fromLastPlan=true to reference all of these together):",
       lastCompletedPlanCount ? `${lastCompletedPlanCount} testcase(s) tracked from the last generation batch in this session.` : "No tracked batch yet in this session — nothing has been generated and saved here, so there is no batch to move or file.",
@@ -10295,9 +10300,15 @@ export class LegacyService implements OnModuleInit {
       [projectId]
     );
     if (!allocation.rows[0]) throw new BadRequestException({ error: "Zyra is inactive. Allocate an OpenAI or Claude key to this project first." });
+    // `kind: "feedback"` is the explicit marker the frontend's Feedback tab filters on (see
+    // isFeedbackActivity in TaskQuickViewPanel.tsx) — this is the only activity_log entry that
+    // carries a reviewer's actual words rather than a status/process narration. Rows written
+    // before this field existed have no `kind`; the frontend falls back to matching this exact
+    // title for those, so old feedback still shows up correctly.
     const feedbackActivity = [{
       actor: "user",
       stage: "todo",
+      kind: "feedback",
       title: "Review feedback submitted",
       detail: [
         feedbackText,
@@ -11142,14 +11153,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private normalizeAiDrafts(raw: unknown, requestedCount: number): Body[] {
-    let parsed: unknown;
-    try {
-      const text = typeof raw === "string" ? this.extractJsonPayload(raw) : raw;
-      parsed = typeof text === "string" ? JSON.parse(text) : text;
-    } catch {
-      throw new BadRequestException({ error: "AI testcase generation returned invalid JSON" });
-    }
-    const candidates = Array.isArray(parsed) ? parsed : normalizeJsonArray((parsed as Body)?.drafts);
+    const candidates = this.extractAiDraftCandidates(raw);
     if (!candidates.length) throw new BadRequestException({ error: "AI testcase generation returned no testcase drafts" });
     return candidates.slice(0, requestedCount).map((item, index) => {
       const draft = item as Body;
@@ -11163,6 +11167,54 @@ export class LegacyService implements OnModuleInit {
         tags
       };
     });
+  }
+
+  // Strict parse -> repaired parse (same repair parseModelJson uses for chat replies, since
+  // models produce the same "almost valid JSON" here — an unescaped quote or literal newline
+  // inside a long stepsJson/expectedSummary string) -> per-object salvage. The salvage step
+  // matters on its own: a response cut off mid-array by a token limit is not fixable by
+  // re-escaping characters, but the complete draft objects earlier in the array still are.
+  // Only when every strategy yields zero drafts does the caller see "no testcase drafts" —
+  // one bad character (or a truncated final entry) no longer fails the whole batch.
+  private extractAiDraftCandidates(raw: unknown): unknown[] {
+    if (typeof raw !== "string") {
+      return Array.isArray(raw) ? raw : normalizeJsonArray((raw as Body)?.drafts);
+    }
+    const text = this.extractJsonPayload(raw);
+    if (!text) return [];
+    for (const attempt of [text, this.repairLooseJson(text)]) {
+      try {
+        const parsed = JSON.parse(attempt);
+        const list = Array.isArray(parsed) ? parsed : normalizeJsonArray((parsed as Body)?.drafts);
+        if (list.length) return list;
+      } catch { /* fall through to per-object salvage */ }
+    }
+    return this.salvageDraftObjects(text);
+  }
+
+  // Walks the "drafts" (or top-level) array and parses each top-level {...} entry on its own,
+  // keeping whichever ones are complete/valid and dropping only the broken one — which is
+  // always at most the final entry when the cause is truncation.
+  private salvageDraftObjects(text: string): unknown[] {
+    const arrayStart = text.indexOf("[");
+    if (arrayStart < 0) return [];
+    const drafts: unknown[] = [];
+    let index = arrayStart + 1;
+    while (index < text.length) {
+      while (index < text.length && /[\s,]/.test(text[index])) index += 1;
+      if (text[index] !== "{") break;
+      const objectText = this.extractBalancedJson(text.slice(index));
+      if (!objectText) break; // truncated mid-object — nothing further is recoverable
+      try {
+        drafts.push(JSON.parse(objectText));
+      } catch {
+        try {
+          drafts.push(JSON.parse(this.repairLooseJson(objectText)));
+        } catch { /* drop this one malformed draft, keep the rest */ }
+      }
+      index += objectText.length;
+    }
+    return drafts;
   }
 
   private extractJsonPayload(raw: string): string {
@@ -12059,7 +12111,7 @@ export class LegacyService implements OnModuleInit {
 
   private static zyraFailureCause(detail: string): { cause: string; advice: string } {
     const text = String(detail || "").toLowerCase();
-    if (/json|parse|truncat|unterminated|unexpected token/.test(text)) {
+    if (/json|parse|truncat|unterminated|unexpected token|no testcase drafts|no drafts/.test(text)) {
       return {
         cause: "the AI's answer came back incomplete, so I couldn't read the test cases out of it",
         advice: "asking for fewer cases at a time usually fixes this — try \"generate 5\" and I'll build on it"
@@ -12473,6 +12525,10 @@ export class LegacyService implements OnModuleInit {
       ].filter(Boolean),
       suites,
       testcaseCount: Number(testcases.rows[0]?.testcase_count || 0),
+      // suites only sums testcases with a suite_id (see projectSuiteSummaries' JOIN), so testcases
+      // sitting outside any suite are otherwise invisible to the model — it would see a total that
+      // doesn't match the sum of the per-suite breakdown, with no explanation for the gap.
+      unassignedTestCaseCount: Math.max(0, Number(testcases.rows[0]?.testcase_count || 0) - suites.reduce((sum, suite) => sum + suite.testCaseCount, 0)),
       linkedJiraTestcaseCount: Number(testcases.rows[0]?.linked_jira_testcase_count || 0),
       jiraConnected: Boolean((status as Body).connected),
       jiraProjectCount: normalizeJsonArray((status as Body).connectedProjects).length,
