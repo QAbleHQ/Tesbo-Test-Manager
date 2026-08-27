@@ -101,6 +101,7 @@ test.describe("zyra / agents (UI)", () => {
     drafts?: Array<Record<string, unknown>>;
     projectId?: string;
     context?: string;
+    sources?: Array<{ type: string; title: string; detail: string }>;
   }
 
   /** Writes a completed Zyra task straight into the table, drafts and all. Returns its id. */
@@ -118,7 +119,9 @@ test.describe("zyra / agents (UI)", () => {
       { title: "Sign in with a wrong password", priority: "P2", preconditions: "", steps: [] },
     ];
     const activity = JSON.stringify([{ type: "picked_up", title: "Picked up task", detail: userStory }]);
-    const sources = JSON.stringify([{ type: "knowledge_document", title: "Auth notes", detail: "Seeded source" }]);
+    const sources = JSON.stringify(
+      options.sources ?? [{ type: "knowledge_document", title: "Auth notes", detail: "Seeded source" }],
+    );
 
     exec(
       `INSERT INTO ai_generation_requests
@@ -736,5 +739,158 @@ test.describe("zyra / agents (UI)", () => {
     await panel.getByRole("button", { name: /^Activity/ }).click();
     await expect(panel.getByText("Cover the locked-account case too"), "Activity still carries the full history, feedback included").toBeVisible();
     await expect(panel.getByText("Picked up task")).toBeVisible();
+  });
+
+  // ─── Sources tab: label and formatting ─────────────────────────────────────
+
+  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test for [Agents-Tasks] "User context" in the Task Details view: the source label
+     * had to read "User Story Context", not "User context", and the detail text — pulled from a
+     * multi-paragraph Jira description — had to keep its line breaks rather than rendering as one
+     * flattened paragraph. The real generation flow that builds this source can't be driven end to
+     * end here (see the file header — no AI provider is configured for this suite), so the source is
+     * seeded the way aiGenerate leaves it and this asserts the panel renders it correctly.
+     */
+    const userStory = stamp("Context story");
+    const context = "Line one of the story\nLine two of the story\nLine three";
+    seedTask({ userStory, sources: [{ type: "context", title: "User Story Context", detail: context }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    const title = panel.getByRole("heading", { name: "User Story Context", level: 3 });
+    await expect(title).toBeVisible();
+    await expect(panel.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
+
+    const sourceCard = panel.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail, "the detail paragraph must preserve line breaks visually, not collapse them").toHaveCSS("white-space", "pre-wrap");
+    expect(await detail.textContent()).toBe(context);
+  });
+
+  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+    browser,
+  }) => {
+    const context = "Line one of the story\nLine two of the story\nLine three";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: context }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    await expect(title).toBeVisible();
+    await expect(page.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
+
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail).toHaveCSS("white-space", "pre-wrap");
+    expect(await detail.textContent()).toBe(context);
+  });
+
+  test("ZYU-32 a source with no line breaks in its detail still renders correctly", async ({ browser }) => {
+    // Guard against a regression the other way: whitespace-pre-wrap must not visually alter
+    // single-line detail text (extra wrapping, stray whitespace) — only multi-line text is affected.
+    const single = "A single line of context with no breaks at all";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: single }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail).toBeVisible();
+    expect(await detail.textContent()).toBe(single);
+  });
+
+  // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─
+
+  test("ZYU-33 a transport-level failure on save is retried once instead of surfacing to the user", async ({ browser }) => {
+    /*
+     * Regression test for intermittent "Failed to fetch — browser blocked or could not reach the
+     * API" reports on Zyra staging. RCA: browsers refuse to silently retry a POST/PATCH written
+     * into a keep-alive connection the server already closed while idle (nginx's default
+     * keepalive_timeout, 75s, is shorter than the gaps a real chat session leaves between
+     * requests) — fetch() throws a transport TypeError instead, which used to reach the user
+     * verbatim. A page refresh "fixed" it only because it opened a fresh connection. lib/api.ts's
+     * fetchWithNetworkErrorMessage now retries exactly once on that error class before surfacing
+     * anything, since the failed write never reached the server in the first place.
+     *
+     * Settings save (PATCH .../agents/zyra/settings) stands in for the chat POST here because it
+     * needs no AI key (see file header) and already has an observable persisted side effect
+     * (ZYU-06/07). route.abort("failed") reproduces the exact browser-level failure — Chromium
+     * surfaces it to fetch() as `TypeError: Failed to fetch`, the same string production code
+     * matches on.
+     */
+    const page = await open(browser, "/agents/zyra/settings");
+    const settingsPath = `/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`;
+
+    let patchAttempts = 0;
+    // Matched by pathname predicate, not a glob: the frontend posts to the backend's own origin
+    // while the page is served from the frontend's, and a relative glob is resolved against
+    // baseURL — see NAV-B-07 in navigation.spec.ts for the same gotcha.
+    await page.route(
+      (url) => url.pathname === settingsPath,
+      async (route) => {
+        if (route.request().method() !== "PATCH") {
+          await route.continue();
+          return;
+        }
+        patchAttempts++;
+        if (patchAttempts === 1) {
+          await route.abort("failed");
+        } else {
+          await route.continue();
+        }
+      },
+    );
+
+    const knowledgeBase = page.getByRole("switch").nth(1);
+    await knowledgeBase.click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+
+    await expect(page.getByText("All changes saved.")).toBeVisible();
+    await expect(page.getByText(/Failed to fetch|browser blocked or could not reach the API/)).toHaveCount(0);
+    expect(patchAttempts, "the first attempt fails and the client retries exactly once").toBe(2);
+
+    await page.reload();
+    await expect(
+      page.getByRole("switch").nth(1),
+      "the retried request actually persisted the change, not just the UI's optimism",
+    ).not.toBeChecked();
+  });
+
+  test("ZYU-34 a failure that survives the retry still reaches the user", async ({ browser }) => {
+    // The other half of ZYU-33: a genuinely dead backend (both attempts fail) must not be silently
+    // swallowed — the user still needs to see it, just after one automatic retry rather than zero.
+    const page = await open(browser, "/agents/zyra/settings");
+    const settingsPath = `/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`;
+
+    let patchAttempts = 0;
+    await page.route(
+      (url) => url.pathname === settingsPath,
+      async (route) => {
+        if (route.request().method() !== "PATCH") {
+          await route.continue();
+          return;
+        }
+        patchAttempts++;
+        await route.abort("failed");
+      },
+    );
+
+    const knowledgeBase = page.getByRole("switch").nth(1);
+    await knowledgeBase.click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+
+    await expect(page.getByText(/browser blocked or could not reach the API/)).toBeVisible();
+    expect(patchAttempts, "still only one retry, not an unbounded loop").toBe(2);
   });
 });

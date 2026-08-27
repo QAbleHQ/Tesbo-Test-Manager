@@ -70,6 +70,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     exec(`DELETE FROM zyra_chat_messages WHERE session_id IN (SELECT id FROM zyra_chat_sessions WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id IN (${projects});`);
     exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
   }
 
@@ -1115,5 +1116,101 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     // The task-created entry seedTask() itself never writes (activity_log defaults to '[]') stays
     // absent either way — this only asserts the two entries this test seeded.
     expect(activities).toHaveLength(2);
+  });
+
+  // ─── Task creation: sources / context label & formatting ──────────────────
+
+  /** Allocates a throwaway AI key to the tenant's main project via the real routes. */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E key ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-not-a-real-key" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating an AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  test("ZYR-A-41 a task created with context surfaces it as a 'User Story Context' source with line breaks intact", async () => {
+    /*
+     * Regression test for [Agents-Tasks] "User context" in the Task Details view: the source label
+     * had to read "User Story Context" (not "User context"), and the detail text had to keep its
+     * original line breaks instead of arriving pre-flattened — the frontend renders it with
+     * `whitespace-pre-wrap`, which only helps if the stored string still has the newlines in it.
+     *
+     * Unlike full generation (no AI provider is configured for this suite — see the file header),
+     * aiGenerate builds and stores source_summary and returns the created task BEFORE it fires the
+     * background generation job, so this half of the flow is reachable through the real route once
+     * a key is allocated — the background call is left to fail on its own and does not affect the
+     * response asserted here.
+     */
+    await allocateFakeAiKey();
+
+    const context = 'As a registered user, I want to create a new post.\n\nAcceptance Criteria:\nUser can access a "New Post" option\nPost requires a title and body';
+    const res = await asOwner.post(url("/agents/zyra/tasks"), {
+      data: { userStory: `E2E story ${Date.now()}`, context },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `creating the task — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    const sources = body.task.sources as Array<{ type: string; title: string; detail: string }>;
+
+    const contextSource = sources.find((s) => s.type === "context");
+    expect(contextSource, "no context source was recorded").toBeTruthy();
+    expect(contextSource!.title).toBe("User Story Context");
+    expect(contextSource!.title).not.toBe("User context");
+    expect(contextSource!.detail).toBe(context);
+    expect(contextSource!.detail.split("\n").length, "line breaks were flattened out of the stored detail").toBeGreaterThan(1);
+
+    // Reading the task back goes through the same formatAiTask() mapping the UI calls when opening
+    // the Sources tab — assert there too, not just on the create response.
+    const fetchRes = await asOwner.get(url(`/agents/zyra/tasks/${body.generationRequestId}`), { failOnStatusCode: false });
+    expect(fetchRes.status()).toBe(200);
+    const fetched = await fetchRes.json();
+    const fetchedContext = (fetched.sources as Array<{ type: string; title: string }>).find((s) => s.type === "context");
+    expect(fetchedContext?.title).toBe("User Story Context");
+  });
+
+  test("ZYR-A-42 task source labelling handles edge-case context: whitespace-only, absent, and over the 320-char cap", async () => {
+    await allocateFakeAiKey();
+
+    // Whitespace-only context must not produce a phantom "User Story Context" source — the backend
+    // trims before deciding whether context was supplied at all.
+    const blank = await asOwner.post(url("/agents/zyra/tasks"), {
+      data: { userStory: `E2E story blank ${Date.now()}`, context: "   \n\t  " },
+      failOnStatusCode: false,
+    });
+    expect(blank.status(), `creating the task — ${await blank.text()}`).toBe(201);
+    const blankSources = (await blank.json()).task.sources as Array<{ type: string }>;
+    expect(blankSources.find((s) => s.type === "context"), "whitespace-only context produced a source anyway").toBeUndefined();
+
+    // No context field at all — same absence.
+    const none = await asOwner.post(url("/agents/zyra/tasks"), {
+      data: { userStory: `E2E story none ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(none.status(), `creating the task — ${await none.text()}`).toBe(201);
+    const noneSources = (await none.json()).task.sources as Array<{ type: string }>;
+    expect(noneSources.find((s) => s.type === "context")).toBeUndefined();
+
+    // A context past the 320-char storage cap keeps its label and its line breaks up to the cut.
+    const longLine = "A".repeat(50);
+    const longContext = Array.from({ length: 10 }, (_, i) => `${longLine} ${i}`).join("\n");
+    expect(longContext.length).toBeGreaterThan(320);
+    const long = await asOwner.post(url("/agents/zyra/tasks"), {
+      data: { userStory: `E2E story long ${Date.now()}`, context: longContext },
+      failOnStatusCode: false,
+    });
+    expect(long.status(), `creating the task — ${await long.text()}`).toBe(201);
+    const longSource = ((await long.json()).task.sources as Array<{ type: string; title: string; detail: string }>).find(
+      (s) => s.type === "context",
+    );
+    expect(longSource?.title).toBe("User Story Context");
+    expect(longSource?.detail).toBe(longContext.slice(0, 320));
+    expect(longSource?.detail.length).toBe(320);
   });
 });

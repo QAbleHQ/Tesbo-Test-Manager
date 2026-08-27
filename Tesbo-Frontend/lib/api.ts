@@ -16,6 +16,16 @@ function formatApiError(status: number, body: ApiErrorBody): string {
   return msg;
 }
 
+function isNetworkFetchError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : "Network request failed";
+  return (
+    msg === "Failed to fetch" ||
+    msg === "Load failed" ||
+    msg.includes("NetworkError") ||
+    msg.includes("network")
+  );
+}
+
 async function fetchWithNetworkErrorMessage(
   input: string,
   init: RequestInit
@@ -23,18 +33,21 @@ async function fetchWithNetworkErrorMessage(
   try {
     return await fetch(input, init);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Network request failed";
-    const looksLikeCorsOrNetwork =
-      msg === "Failed to fetch" ||
-      msg === "Load failed" ||
-      msg.includes("NetworkError") ||
-      msg.includes("network");
-    if (looksLikeCorsOrNetwork) {
+    if (!isNetworkFetchError(e)) throw e instanceof Error ? e : new Error(String(e));
+    // A browser keep-alive connection left idle past the server/proxy's keep-alive window fails
+    // on the next write before any bytes reach the server — the request was never delivered, so
+    // retrying once (a fresh connection) is safe even for a POST body. `init.body` here is always
+    // an already-serialized JSON string (see `api()` below), never a one-shot stream, so it can be
+    // resent. This is what a manual page refresh already did to "fix" the error; automate that one
+    // retry instead of surfacing it.
+    try {
+      return await fetch(input, init);
+    } catch (e2) {
+      const msg = e2 instanceof Error ? e2.message : "Network request failed";
       throw new Error(
         `${msg} — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL, HTTPS, and that the backend allows this page’s origin in CORS_ALLOWED_ORIGINS.`
       );
     }
-    throw e instanceof Error ? e : new Error(String(e));
   }
 }
 

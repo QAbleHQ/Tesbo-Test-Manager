@@ -7,17 +7,28 @@ export function escapeHtml(value: string): string {
 }
 
 // Flattens Atlassian Document Format (the shape Jira returns for descriptions and comment
-// bodies) down to plain text. ADF is a recursive {type, content[], text} tree; we only care
-// about the leaf text and enough structure to keep paragraphs on separate lines.
-export function jiraDescriptionToText(value: unknown): string {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.map(jiraDescriptionToText).filter(Boolean).join("\n");
-  if (typeof value !== "object") return String(value);
+// bodies) down to plain text. ADF is a recursive {type, content[], text} tree; we keep block
+// nodes (paragraphs, list items, headings, ...) on separate lines while concatenating the
+// inline runs *within* a block (text split across bold/italic/link marks, mentions, etc.)
+// directly, so a mid-sentence mark doesn't inject a spurious line break.
+const ADF_INLINE_CONTAINER_TYPES = new Set(["paragraph", "heading", "codeBlock"]);
 
-  const node = value as Record<string, any>;
-  const parts: string[] = [];
-  if (typeof node.text === "string") parts.push(node.text);
-  if (Array.isArray(node.content)) parts.push(jiraDescriptionToText(node.content));
-  return parts.filter(Boolean).join(node.type === "paragraph" ? "\n" : " ");
+function adfNodeToText(node: unknown): string {
+  if (!node) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(adfNodeToText).filter(Boolean).join("\n");
+  if (typeof node !== "object") return String(node);
+
+  const record = node as Record<string, any>;
+  if (record.type === "hardBreak") return "\n";
+  if (typeof record.text === "string") return record.text;
+  if (Array.isArray(record.content)) {
+    const separator = ADF_INLINE_CONTAINER_TYPES.has(record.type) ? "" : "\n";
+    return record.content.map(adfNodeToText).filter(Boolean).join(separator);
+  }
+  return "";
+}
+
+export function jiraDescriptionToText(value: unknown): string {
+  return adfNodeToText(value).trim();
 }

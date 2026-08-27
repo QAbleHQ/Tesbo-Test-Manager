@@ -10014,7 +10014,7 @@ export class LegacyService implements OnModuleInit {
     ];
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
-      ...(context ? [{ type: "context", title: "User context", detail: context.slice(0, 320) }] : []),
+      ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
       ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Selected Jira ticket queued for Zyra." })),
       ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Selected Linear ticket queued for Zyra." }))
     ];
@@ -10161,7 +10161,7 @@ export class LegacyService implements OnModuleInit {
       const tokenOutput = aiResult.usage.output || estimateTokens(JSON.stringify(drafts));
       const sourceSummary = [
         { type: "story", title: "User story", detail: story.slice(0, 320) },
-        ...(context ? [{ type: "context", title: "User context", detail: context.slice(0, 320) }] : []),
+        ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
         ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: item.content.slice(0, 320) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
