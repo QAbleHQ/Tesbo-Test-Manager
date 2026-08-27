@@ -20,10 +20,6 @@ import {
   IconDeviceDesktop,
   IconDownload,
   IconFilterOff,
-  IconLayoutGrid,
-  IconLayoutSidebarLeftCollapse,
-  IconLayoutSidebarLeftExpand,
-  IconList,
   IconPlayerPlay,
   IconPlus,
   IconRefresh,
@@ -46,7 +42,6 @@ import {
   listSuites,
   listProjectMembers,
   listPlans,
-  listTestRuns,
   getProject,
   toggleTestRunShare,
   createBug,
@@ -63,7 +58,6 @@ import {
   type BugSeverity,
   type BugPriority,
   type IssueSearchResult,
-  type TestRunListItem,
 } from "@/lib/api";
 import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
@@ -74,7 +68,6 @@ import TrackingDestinationField, { type TrackingDestination } from "@/components
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { useTopBarSlots } from "@/components/TopBarSlots";
-import { readStoredValue, writeStoredValue } from "@/lib/storage";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -93,7 +86,6 @@ const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
 type RunTab = (typeof RUN_TABS)[number];
 const PAGE_SIZE = 10;
 import { avatarColor } from "@/lib/avatarColors";
-const PANEL_STORAGE_KEY = "tesbo_run_switcher_panel";
 
 /* ───── Status tone helpers ───── */
 function statusToTone(status: string) {
@@ -115,19 +107,6 @@ function runStatusToTone(status: string) {
     Planning: "warning",
   };
   return map[status] ?? "neutral";
-}
-
-function runStatusDotColor(status: string): string {
-  const map: Record<string, string> = {
-    Completed: "var(--success)",
-    "In Progress": "var(--info)",
-    Planning: "var(--warning)",
-  };
-  return map[status] ?? "var(--muted-soft)";
-}
-
-function StatusDot({ color }: { color: string }) {
-  return <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: color }} />;
 }
 
 /* ───── Step parsing (for the test case detail panel) ───── */
@@ -439,9 +418,6 @@ export default function TestRunDetailPage() {
   const [memberNames, setMemberNames] = useState<Record<string, string>>({});
   const [planNames, setPlanNames] = useState<Record<string, string>>({});
   const [projectName, setProjectName] = useState("");
-  const [allRuns, setAllRuns] = useState<TestRunListItem[]>([]);
-
-  const [runPanelOpen, setRunPanelOpen] = useState(true);
 
   /* test cases table: tab filter, search, pagination */
   const [activeTab, setActiveTab] = useState<RunTab>("All");
@@ -510,47 +486,17 @@ export default function TestRunDetailPage() {
   const [bugBetterbugsUrl, setBugBetterbugsUrl] = useState("");
   const [bugSaving, setBugSaving] = useState(false);
   const load = useCallback(() => {
-    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId), getProject(projectId), listTestRuns(projectId)])
-      .then(([r, e, project, runsList]) => {
+    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId), getProject(projectId)])
+      .then(([r, e, project]) => {
         setRun(r);
         setExecutions(e);
         setShareEnabled(r.shareEnabled ?? false);
         setShareToken(r.shareToken ?? null);
         setProjectName(String(project.name || ""));
-        setAllRuns(runsList);
       })
       .catch(() => router.replace(`/projects/${projectId}/cycles`))
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
-
-  /*
-   * Re-reads the run list the left panel's per-run counts come from.
-   *
-   * Basecamp 10199377404 — "[Test Run] Count does not match when deleted test cases from run". The
-   * removal handlers filtered `executions` locally, which is what the detail's Total and table render,
-   * but `allRuns` was only ever fetched by load() on mount. Its `totalCases` therefore kept the
-   * pre-delete number, so the panel showed 11 beside a run whose own Total said 10.
-   *
-   * Refetched rather than decremented locally: removing cases also moves the run's status buckets, and
-   * the server already computes all of them off live execution rows (listCycles). handleAddCases calls
-   * the full load() for the same reason.
-   */
-  const refreshRunList = useCallback(async () => {
-    try {
-      setAllRuns(await listTestRuns(projectId));
-    } catch {
-      // The panel's counts are secondary to the removal that just succeeded — a failed refresh must
-      // not present itself as a failed delete.
-    }
-  }, [projectId]);
-
-  function toggleRunPanel() {
-    setRunPanelOpen((prev) => {
-      const next = !prev;
-      writeStoredValue(PANEL_STORAGE_KEY, next ? "open" : "closed");
-      return next;
-    });
-  }
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
@@ -559,8 +505,6 @@ export default function TestRunDetailPage() {
 
 
   useEffect(() => {
-    const saved = readStoredValue(PANEL_STORAGE_KEY);
-    if (saved === "closed") setRunPanelOpen(false);
     authMe().then((me) => {
       if (!me) {
         router.replace("/login");
@@ -857,8 +801,6 @@ export default function TestRunDetailPage() {
         next.delete(testcaseId);
         return next;
       });
-      // The left panel's count for this run is now one behind.
-      await refreshRunList();
     } catch (err) {
       // Was a bare `// ignore`: a removal that failed left the row on screen with no explanation, so
       // it read as an unresponsive button.
@@ -879,7 +821,6 @@ export default function TestRunDetailPage() {
       setSelectedRunCaseIds(new Set());
       setBulkRemoveError(null);
       setBulkRemoveOpen(false);
-      await refreshRunList();
     } catch (err) {
       setBulkRemoveError(err instanceof Error ? err.message : "Failed to remove the selected test cases.");
     } finally {
@@ -1027,7 +968,7 @@ export default function TestRunDetailPage() {
     // Full-bleed, full-height workspace: `tc-fullbleed` drops the wrapping .tesbo-page's
     // centered 1280px cap so this fills the content region below the 3.5rem TopBar,
     // matching the Test Plan detail workspace pattern.
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col p-4" style={{ height: "calc(100vh - 3.5rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&
@@ -1103,7 +1044,7 @@ export default function TestRunDetailPage() {
           )}
 
         {/* Page header: title + status + owner + description + meta */}
-        <div className="mb-3 shrink-0 pl-4">
+        <div className="mb-3 shrink-0">
           <div className="flex flex-wrap items-center gap-2.5">
             <RunAvatar name={run.name} size={28} />
             <h1 className="text-[20px] font-semibold leading-tight tracking-[-0.02em] text-[var(--foreground)]">{run.name}</h1>
@@ -1145,93 +1086,11 @@ export default function TestRunDetailPage() {
           </div>
         </div>
 
-        {/* Body: runs switcher panel + detail content */}
-        <div className="flex min-h-0 flex-1 overflow-hidden rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]">
-          {/* ── Runs switcher panel ── */}
-          <aside className={`flex shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] transition-[width] duration-150 ${runPanelOpen ? "w-[220px]" : "w-[38px]"}`}>
-            <div className={`flex h-10 shrink-0 items-center border-b border-[var(--border)] px-3 ${runPanelOpen ? "justify-between" : "justify-center"}`}>
-              {runPanelOpen && (
-                <p className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-[var(--ink-600)]">
-                  <IconLayoutGrid size={14} stroke={1.75} className="text-[var(--accent-light)]" />
-                  Runs
-                  <span className="rounded-full bg-[var(--brand-soft)] px-1.5 py-px font-mono text-[10px] font-normal normal-case text-[var(--accent-light)]">
-                    {allRuns.length}
-                  </span>
-                </p>
-              )}
-              <div className="flex items-center gap-0.5">
-                {runPanelOpen && (
-                  <button
-                    type="button"
-                    title="New test run"
-                    onClick={() => router.push(`/projects/${projectId}/cycles?create=1`)}
-                    className="flex h-6 w-6 items-center justify-center rounded text-[var(--muted)] transition-colors hover:bg-[var(--brand-soft)] hover:text-[var(--accent-light)]"
-                  >
-                    <IconPlus size={14} stroke={2.5} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  title={runPanelOpen ? "Collapse runs" : "Show runs"}
-                  onClick={toggleRunPanel}
-                  className="flex h-6 w-6 items-center justify-center rounded text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                >
-                  {runPanelOpen ? <IconLayoutSidebarLeftCollapse size={14} stroke={1.75} /> : <IconLayoutSidebarLeftExpand size={14} stroke={1.75} />}
-                </button>
-              </div>
-            </div>
-
-            {runPanelOpen && (
-              <div className="min-h-0 flex-1 overflow-y-auto p-2">
-                <button
-                  type="button"
-                  onClick={() => router.push(`/projects/${projectId}/cycles`)}
-                  className="mb-1 flex h-8 w-full items-center justify-between rounded-[6px] px-2 text-left text-[13px] text-[var(--ink-600)] transition-colors hover:bg-[var(--surface-secondary)]"
-                >
-                  <span className="flex items-center gap-1.5"><IconList size={14} stroke={1.75} className="text-[var(--muted)]" />All runs</span>
-                  <span className="font-mono text-[11px] text-[var(--muted)]">{allRuns.length}</span>
-                </button>
-
-                <div className="mx-1 my-1.5 h-px bg-[var(--border)]" />
-
-                {allRuns.map((r) => {
-                  const isActive = r.id === cycleId;
-                  return (
-                    <button
-                      key={r.id}
-                      type="button"
-                      onClick={() => router.push(`/projects/${projectId}/cycles/${r.id}`)}
-                      className={`mb-0.5 flex h-8 w-full items-center gap-2 rounded-[6px] px-2 text-left transition-colors ${isActive ? "bg-[var(--brand-soft)]" : "hover:bg-[var(--surface-secondary)]"}`}
-                    >
-                      <StatusDot color={runStatusDotColor(r.status)} />
-                      <span className={`min-w-0 flex-1 truncate text-[12.5px] ${isActive ? "font-medium text-[var(--accent-light)]" : "text-[var(--ink-600)]"}`}>
-                        {r.name}
-                      </span>
-                      <span
-                        data-testid="run-list-count"
-                        data-run-id={r.id}
-                        className={`shrink-0 font-mono text-[11px] ${isActive ? "text-[var(--accent-light)] opacity-70" : "text-[var(--muted)]"}`}
-                      >
-                        {r.totalCases}
-                      </span>
-                    </button>
-                  );
-                })}
-
-                <button
-                  type="button"
-                  onClick={() => router.push(`/projects/${projectId}/cycles?create=1`)}
-                  className="mt-2 flex h-8 w-full items-center gap-1.5 rounded-[6px] border border-dashed border-[var(--border)] px-2 text-[12px] text-[var(--muted)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
-                >
-                  <IconPlus size={13} stroke={1.75} />
-                  New test run
-                </button>
-              </div>
-            )}
-          </aside>
-
-          {/* ── Detail content ── */}
-          <div className="min-h-0 flex-1 overflow-y-auto p-6">
+        {/* Body: detail content.
+            The runs switcher panel that used to sit to the left of this was removed — a run detail
+            already reaches its siblings through the "Test Runs" breadcrumb and the sidebar's Runs
+            entry, and the ~220px it held now goes to the test cases table. */}
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6">
             {/* Stat pills + progress */}
             <section className="mb-5 rounded-[10px] border border-[var(--border)] p-5">
               <div className="flex flex-wrap items-center gap-3">
@@ -1503,7 +1362,6 @@ export default function TestRunDetailPage() {
             </div>
           )}
             </div>
-          </div>
         </div>
       </div>
 

@@ -506,6 +506,142 @@ test.describe("attachments", () => {
     expect(attachmentRows(tenant!)).toHaveLength(0);
   });
 
+  // ─── Trace links (the embedded Playwright trace viewer) ────────────────────
+  //
+  // A trace is shown in place by Playwright's own viewer (trace.playwright.dev) in an iframe. That
+  // viewer runs in the visitor's browser and fetches the .zip itself, cross-origin and without
+  // credentials, so it cannot use the session-authorized download route above. These cases cover the
+  // signed grant that replaces it, and — since the route it unlocks takes no session at all — they
+  // are as much about what the grant refuses as what it allows.
+
+  function traceLinkUrl(attachmentId: string, cycle = cycleId, execution = executionId): string {
+    return `/api/cycles/${cycle}/executions/${execution}/attachments/${attachmentId}/trace-link`;
+  }
+
+  function zipFile(name = `trace-${Date.now()}.zip`): UploadFile {
+    // Real zip magic bytes, so nothing downstream can be passing it for a different reason.
+    return { name, mimeType: "application/zip", body: Buffer.from("PK\u0003\u0004 e2e trace archive", "utf-8") };
+  }
+
+  async function uploadTrace(): Promise<{ attachmentId: string; file: UploadFile }> {
+    const file = zipFile();
+    const res = await upload(asQa, executionUploadUrl(), [file]);
+    expect(res.ok(), `trace upload failed: ${res.status()} ${await res.text()}`).toBeTruthy();
+    const rows = attachmentRows(tenant!);
+    expect(rows).toHaveLength(1);
+    return { attachmentId: rows[0].id, file };
+  }
+
+  test("a trace attachment yields a link the viewer can fetch without a session", async () => {
+    const { attachmentId, file } = await uploadTrace();
+
+    const minted = await asQa.get(traceLinkUrl(attachmentId), { failOnStatusCode: false });
+    expect(minted.ok(), `minting failed: ${minted.status()} ${await minted.text()}`).toBeTruthy();
+    const { token, expiresAt } = await minted.json();
+    expect(token, "the viewer is given a token, never a storage path").toBeTruthy();
+    expect(String(token)).not.toContain("executions/");
+    expect(new Date(expiresAt).getTime(), "a trace grant has to expire").toBeGreaterThan(Date.now());
+
+    // Redeemed anonymously: this is the whole point — the fetch comes from trace.playwright.dev,
+    // which has no cookie of ours to send.
+    const served = await anon.get(`/api/public/trace/${token}`, { failOnStatusCode: false });
+    expect(served.ok(), `redeeming failed: ${served.status()} ${await served.text()}`).toBeTruthy();
+    expect(Buffer.from(await served.body()).equals(file.body), "the archive must arrive byte-for-byte").toBeTruthy();
+
+    const headers = served.headers();
+    expect(headers["content-type"]).toContain("application/zip");
+    // Without this exact header the viewer's cross-origin fetch fails and the iframe sits empty.
+    expect(headers["access-control-allow-origin"]).toBe("https://trace.playwright.dev");
+    // Still a download, never something a browser will render — the rule the rest of this file keeps.
+    expect(headers["content-disposition"]).toContain("attachment");
+  });
+
+  test("a trace link is refused for evidence that is not a trace", async () => {
+    const res = await upload(asQa, executionUploadUrl(), [pngFile(`shot-${Date.now()}.png`)]);
+    expect(res.ok()).toBeTruthy();
+    const attachmentId = attachmentRows(tenant!)[0].id;
+
+    /*
+     * The narrowness of the grant is the security property, not a nicety: the public route takes no
+     * session, so if a link could be minted for arbitrary evidence, any attachment in the workspace
+     * would be reachable by URL alone. A zip cannot be rendered as markup by a browser; an .html or
+     * .svg served from a URL with no session could be.
+     */
+    const minted = await asQa.get(traceLinkUrl(attachmentId), { failOnStatusCode: false });
+    expect(minted.status()).toBe(400);
+    expect(await minted.text()).toMatch(/not a playwright trace/i);
+  });
+
+  test("a tampered, malformed or unknown trace token is refused", async () => {
+    const { attachmentId } = await uploadTrace();
+    const { token } = await (await asQa.get(traceLinkUrl(attachmentId))).json();
+
+    const [payload, signature] = String(token).split(".");
+    // Same payload, one character of the signature changed — the case a signature check exists for.
+    const forgedSignature = `${payload}.${signature.slice(0, -1)}${signature.slice(-1) === "A" ? "B" : "A"}`;
+    // A valid signature over a payload naming a different attachment is not obtainable, but an
+    // attacker can certainly re-encode the payload and hope it is trusted unverified.
+    const swapped = Buffer.from(JSON.stringify({ a: attachmentId, e: executionId, t: Date.now() })).toString("base64url");
+    const forgedPayload = `${swapped}.${signature}`;
+
+    for (const bad of [forgedSignature, forgedPayload, "not-a-token", `${payload}.`, payload]) {
+      const res = await anon.get(`/api/public/trace/${bad}`, { failOnStatusCode: false });
+      expect(res.status(), `token "${bad.slice(0, 24)}…" should be refused`).toBe(404);
+    }
+  });
+
+  test("minting a trace link needs access to the run", async () => {
+    const { attachmentId } = await uploadTrace();
+
+    const anonRes = await anon.get(traceLinkUrl(attachmentId), { failOnStatusCode: false });
+    expect([400, 401, 403], "an anonymous caller must not mint a trace link").toContain(anonRes.status());
+
+    const guestRes = await asGuest.get(traceLinkUrl(attachmentId), { failOnStatusCode: false });
+    expect([403, 404], "a workspace member with no project access must not mint one").toContain(guestRes.status());
+  });
+
+  test("a trace link cannot be minted for another execution's evidence", async () => {
+    const { attachmentId } = await uploadTrace();
+
+    // A second run in the same project, so the only thing separating the two is the scoping check.
+    const suffix = Date.now();
+    const testcase = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+        data: { title: `E2E Trace Scope Case ${suffix}` },
+      })
+    ).json();
+    const otherCycle = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles`, { data: { name: `E2E Trace Scope Run ${suffix}` } })
+    ).json();
+    try {
+      await asOwner.post(`/api/cycles/${otherCycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      const otherExecutions = await (await asOwner.get(`/api/cycles/${otherCycle.id}/executions`)).json();
+
+      const res = await asOwner.get(traceLinkUrl(attachmentId, otherCycle.id, otherExecutions[0].id), {
+        failOnStatusCode: false,
+      });
+      expect(res.status(), "an attachment id must not cross to another execution").toBe(404);
+    } finally {
+      await asOwner.delete(`/api/cycles/${otherCycle.id}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${testcase.id}`, {
+        failOnStatusCode: false,
+      });
+    }
+  });
+
+  test("a trace link stops working once the evidence is gone", async () => {
+    const { attachmentId } = await uploadTrace();
+    const { token } = await (await asQa.get(traceLinkUrl(attachmentId))).json();
+    expect((await anon.get(`/api/public/trace/${token}`, { failOnStatusCode: false })).ok()).toBeTruthy();
+
+    // The grant outlives the row it names, so redemption has to re-check rather than trust the
+    // signature alone.
+    purgeAttachments(tenant!);
+
+    const afterDelete = await anon.get(`/api/public/trace/${token}`, { failOnStatusCode: false });
+    expect(afterDelete.status(), "a link to deleted evidence must stop resolving").toBe(404);
+  });
+
   // ─── Authorization ─────────────────────────────────────────────────────────
 
   test("uploading needs a session", { tag: '@tesbo.testId("TES-TC-10")' }, async () => {

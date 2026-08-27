@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnvironmentFile } from "./env-file";
+export { loadedEnvironment } from "./env-file";
 
 /*
  * Applied before anything below is read.
@@ -61,10 +62,28 @@ function rootEnv(): Record<string, string> {
   return rootEnvCache;
 }
 
-// Prefers an explicit E2E_-prefixed override (the only workable option against a remote target),
-// then the value already in this process's environment, then the local stack's own .env.
+/*
+ * Prefers an explicit E2E_-prefixed override (the only workable option against a remote target),
+ * then the value already in this process's environment, then the local stack's own .env.
+ *
+ * Against a REMOTE target only the E2E_-prefixed form is accepted. The unprefixed names are the
+ * local stack's own — a shell that has sourced the repo-root .env carries DATABASE_URL and the
+ * STRIPE_* set for :1021, and before this guard those were inherited by a run pointed at stage.
+ * The result is the failure mode CLAUDE.md's database rule exists to prevent, in its worst form:
+ * dbControlAvailable() returns true, every SQL fixture lands in the LOCAL database, and the
+ * assertions run against stage — so the fixtures are invisible and the failures look like product
+ * bugs. (A wrong Stripe webhook secret is milder: a confusing 400 instead of a clean skip.)
+ *
+ * scripts/e2e-stage.sh already `unset`s these before launching. That only protects the runs that go
+ * through it; this protects `npx playwright test` too, which is the whole point of E2E_ENV.
+ */
 function backendValue(key: string): string {
-  return process.env[`E2E_${key}`] ?? process.env[key] ?? rootEnv()[key] ?? "";
+  // An exported-but-empty variable is "not configured" too, and must not shadow the next source.
+  // `??` alone steps past undefined but not "", which is how an empty E2E_DATABASE_URL used to
+  // silence the repo-root .env and dark-skip every DB-backed spec.
+  const first = (...values: (string | undefined)[]) => values.find((v) => v) ?? "";
+  if (!targetIsLocal) return first(process.env[`E2E_${key}`]);
+  return first(process.env[`E2E_${key}`], process.env[key], rootEnv()[key]);
 }
 
 /*
@@ -101,6 +120,9 @@ export const env = {
   apiBaseUrl,
   webBaseUrl,
   ci: !!process.env.CI,
+
+  /** The environment file in effect: "local", "stage", … or null when none was found. */
+  environment: loadEnvironmentFile().name,
 
   /*
    * Whether the stack under test is this machine's docker-compose stack.

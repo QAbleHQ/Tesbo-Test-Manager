@@ -196,8 +196,12 @@ test.describe("removing cases from a run", () => {
    * filtered the local `executions` array (which drives the body) but `allRuns` (which drives the
    * panel badge) was only ever fetched by load() on mount, so the badge kept the pre-delete number.
    *
-   * Asserted against the badge AND the body together, because either number alone looked correct — it
-   * was only their disagreement that was wrong.
+   * The panel has since been removed from the run detail screen altogether: it duplicated navigation
+   * the screen already has (the "Test Runs" breadcrumb, the sidebar's Runs entry) while taking ~220px
+   * of width from the table the screen exists to show. So this test was updated rather than replaced —
+   * it now owns both ends of that change. The badge half became its opposite (the panel and its
+   * controls must be absent, and the table must occupy the width they held), and the half that still
+   * has a UI — the run body's own count following a removal, and the server agreeing — is unchanged.
    */
   async function setUpCycleWithCases(count: number) {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -220,7 +224,7 @@ test.describe("removing cases from a run", () => {
     return { cycle, testcaseIds };
   }
 
-  test("the run panel's count follows a removal, and never disagrees with the run's own Total", { tag: '@tesbo.testId("TES-TC-999")' }, async ({
+  test("the run detail shows no runs switcher panel, and its own count follows a removal", { tag: '@tesbo.testId("TES-TC-999")' }, async ({
     page,
   }) => {
     const { cycle, testcaseIds } = await setUpCycleWithCases(3);
@@ -228,12 +232,31 @@ test.describe("removing cases from a run", () => {
     try {
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
 
-      const badge = page.locator(`[data-testid="run-list-count"][data-run-id="${cycle.id}"]`);
       // The count beside the "Test Cases" heading — the run body's own number.
       const bodyCount = page.getByRole("heading", { name: "Test Cases" }).locator("+ span");
 
-      await expect(badge, "the run panel shows no count for this run").toHaveText("3");
       await expect(bodyCount).toHaveText("3");
+
+      // ── The runs switcher panel is gone ──
+      // Its per-run count badge (this testid only ever existed inside it), its "All runs" back-link
+      // and its collapse toggle are all absent.
+      await expect(page.locator('[data-testid="run-list-count"]')).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "All runs" })).toHaveCount(0);
+      await expect(page.getByTitle("Collapse runs")).toHaveCount(0);
+      await expect(page.getByTitle("Show runs")).toHaveCount(0);
+
+      // And the table has the width the panel held. Asserted as geometry rather than a class name
+      // because ~220px of horizontal space is precisely what was removed: the run's h1 marks the left
+      // edge of the content region, and with the panel present the table started past the panel's full
+      // width. Now only the card's own padding separates them.
+      const titleBox = await page.getByRole("heading", { level: 1 }).boundingBox();
+      const tableBox = await page.getByRole("table").boundingBox();
+      expect(titleBox, "the run title did not render").not.toBeNull();
+      expect(tableBox, "the test cases table did not render").not.toBeNull();
+      expect(
+        tableBox!.x - titleBox!.x,
+        "the test cases table still starts well right of the run header — a left panel is taking that width",
+      ).toBeLessThan(80);
 
       // Remove one case through the row's own control, the way the reporter did. The control only
       // appears on hover (opacity-0 until group-hover), so the row is hovered first.
@@ -242,13 +265,8 @@ test.describe("removing cases from a run", () => {
       await firstRow.hover();
       await firstRow.getByTitle("Remove from test run").click();
 
-      // The body drops to 2 — that half always worked.
+      // The body drops to 2.
       await expect(bodyCount).toHaveText("2", { timeout: 15_000 });
-      // And the panel badge follows it. This is the assertion that failed before the fix.
-      await expect(
-        badge,
-        "the run panel's count did not follow the removal — it disagrees with the run's own Total",
-      ).toHaveText("2");
 
       // Persisted, not just repainted: the server agrees the run now holds 2.
       const listed = await (await api.get(`/api/projects/${ctx.projectId}/cycles`)).json();
@@ -458,17 +476,108 @@ test.describe("execution evidence and automation provenance", () => {
       // Retries are a flakiness signal even on a result that eventually passed.
       await expect(page.getByText("2 retries")).toBeVisible();
 
-      // Evidence, grouped by kind: the screenshot renders inline, the trace is a named download.
+      // Evidence, grouped by kind: the screenshot renders inline, the trace gets its own viewer.
       await expect(page.getByText("Evidence")).toBeVisible();
       await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
       await expect(page.getByText("cart-trace.zip")).toBeVisible();
 
-      // The download link points at the route that did not exist before this card.
-      const traceLink = page.getByRole("link", { name: /cart-trace\.zip/ });
-      await expect(traceLink).toHaveAttribute(
+      /*
+       * A trace used to be a named download link, and this assertion pinned that presentation. It
+       * is now the viewer card below (a .zip in the Downloads folder needs `npx playwright
+       * show-trace` to be worth anything), so the expectation moved with the product — the archive
+       * itself is still one click away, which is what this checks.
+       */
+      const traceDownload = page.getByRole("link", { name: /Download \.zip/ });
+      await expect(traceDownload).toHaveAttribute(
         "href",
         new RegExp(`/api/cycles/${runId}/executions/[0-9a-f-]{36}/attachments/[0-9a-f-]{36}/download$`),
       );
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("opening a result fetches its evidence once, and stops", async ({ page }) => {
+    /*
+     * The regression for a drawer that never left "Loading evidence…".
+     *
+     * ExecutionEvidencePanel took its onCountChange prop as a dependency of the fetch callback, and
+     * this drawer passes an inline arrow that calls setExecutions(prev => prev.map(...)) — a new
+     * array every time. So reporting the count re-rendered the parent, which produced a new
+     * callback, a new `load`, and a re-fired effect: fetch, report, re-render, fetch, for as long as
+     * the drawer stayed open. Evidence did appear, for the few milliseconds between one fetch
+     * resolving and the next starting, which is why the assertions above pass either way and this
+     * one is about the request count instead.
+     *
+     * Counted rather than timed: "still loading after N seconds" would only ever be flaky, while a
+     * second request to the same endpoint is the defect itself, unambiguously.
+     */
+    const { runId, testcase } = await seedAutomatedRun("loop");
+    try {
+      const evidenceRequests: string[] = [];
+      page.on("request", (request) => {
+        // The list endpoint only — the download/trace-link calls the panel makes are legitimate.
+        if (/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/.test(request.url())) {
+          evidenceRequests.push(request.url());
+        }
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+
+      // The panel has to have actually loaded before a count of its requests means anything.
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      // Long enough for the loop to have made many more: each iteration was one round trip.
+      await page.waitForTimeout(3000);
+      expect(
+        evidenceRequests.length,
+        `the drawer refetched evidence ${evidenceRequests.length} times; it must settle after one`,
+      ).toBe(1);
+
+      // And it settled showing the evidence, not the spinner.
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+      await expect(page.getByText("Evidence")).toBeVisible();
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("a trace opens in the viewer, in place and in a new tab", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("trace");
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+
+      const card = page.getByTestId("trace-viewer");
+      await expect(card).toBeVisible();
+      await expect(card.getByText("Playwright Trace")).toBeVisible();
+      await expect(card.getByText("cart-trace.zip")).toBeVisible();
+
+      /*
+       * Both controls point at Playwright's hosted viewer, loaded with a signed link back to our
+       * own API — the viewer fetches the archive itself, cross-origin and without cookies, so a
+       * session-authorized download URL would be no use to it.
+       */
+      const newTab = card.getByTestId("trace-open-tab");
+      await expect(newTab).toBeVisible();
+      const href = await newTab.getAttribute("href");
+      expect(href).toContain("https://trace.playwright.dev/?trace=");
+      expect(decodeURIComponent(href ?? ""), "the viewer must be handed the public trace route").toMatch(
+        /\/api\/public\/trace\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+      );
+      await expect(newTab).toHaveAttribute("target", "_blank");
+
+      // In place: the iframe is only mounted once asked for, so the drawer stays cheap to open.
+      await expect(page.getByTestId("trace-iframe")).toHaveCount(0);
+      await card.getByTestId("trace-view").click();
+      const frame = page.getByTestId("trace-iframe");
+      await expect(frame).toBeVisible();
+      await expect(frame).toHaveAttribute("src", href ?? "");
+
+      await card.getByTestId("trace-close").click();
+      await expect(page.getByTestId("trace-iframe")).toHaveCount(0);
     } finally {
       await cleanUp(runId, testcase.id);
     }

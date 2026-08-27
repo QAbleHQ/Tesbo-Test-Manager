@@ -12,11 +12,14 @@ import { TesboClient, type ResultBody } from "./client";
 import { detectRunSource } from "./ci";
 import { extractCaseId, tesboTag } from "./tag";
 import { resolveConfig } from "./config";
+import { readConfigFile } from "./file-config";
 
 export { tesboTag } from "./tag";
 export { TesboClient } from "./client";
 export { detectRunSource } from "./ci";
 export { resolveConfig, normalizeBaseUrl, maskToken } from "./config";
+export { readConfigFile, writeConfigFile, configFilePath, CONFIG_FILENAME } from "./file-config";
+export type { FileConfig } from "./file-config";
 export type { TesboConfigInput, ResolvedTesboConfig, ConfigResolution } from "./config";
 
 /**
@@ -179,7 +182,7 @@ export default class TesboReporter implements Reporter {
      * report, so silently reporting nothing and exiting 0 hides their typo indefinitely. Only the
      * genuinely-unconfigured case is allowed to degrade quietly.
      */
-    const resolution = resolveConfig(this.options);
+    const resolution = resolveConfig(this.options, process.env, readConfigFile());
     if (resolution.state === "incomplete" || resolution.state === "invalid") {
       throw new Error(`[tesbo] ${resolution.message}`);
     }

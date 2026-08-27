@@ -28,6 +28,13 @@ import {
   resolveConfig,
   type ResolvedTesboConfig
 } from "./config";
+import {
+  CONFIG_FILENAME,
+  configFilePath,
+  detectsDotenv,
+  readConfigFile,
+  writeConfigFile
+} from "./file-config";
 
 /** Exit codes, so a script wrapping this can tell the two failures apart. */
 const EXIT_OK = 0;
@@ -170,22 +177,23 @@ function printResolved(config: ResolvedTesboConfig, notes: string[]): void {
   for (const note of notes) console.log(`\n  note: ${note}`);
 }
 
-function printConfigSnippet(config: ResolvedTesboConfig): void {
+function printConfigSnippet(config: ResolvedTesboConfig, tokenInFile: boolean): void {
   console.log(`
-Add the reporter to playwright.config.ts — the two non-secret values belong in version control:
+Name the reporter in playwright.config.ts. This is the only edit it needs, ever — re-running init
+rewrites ${CONFIG_FILENAME}, not this file:
 
   reporter: [
     ['list'],
-    ['@tesbox/playwright-reporter', {
-      baseUrl: '${config.baseUrl}',
-      projectId: '${config.projectId}',
-      environment: 'staging',
-    }],
+    ['@tesbox/playwright-reporter'],
   ]
 
-Keep the token out of the repo and in the environment instead:
+${
+  tokenInFile
+    ? `All three values are in ${CONFIG_FILENAME}.`
+    : `${CONFIG_FILENAME} holds the server and project. Keep the token in the environment:
 
-  ${ENV_TOKEN}=${maskToken(config.token)}
+  ${ENV_TOKEN}=${maskToken(config.token)}`
+}
 
 Then tag each test with the case it validates:
 
@@ -194,19 +202,32 @@ Then tag each test with the case it validates:
 }
 
 /**
- * Offers to persist the token, and checks it will not be committed.
+ * Offers to persist the token to `.env`, and refuses to pretend that worked.
  *
- * The gitignore check is not decoration: writing a live credential into a tracked file is the one
- * irreversible mistake this command could cause, and it is silent until the push lands.
+ * Two checks, both with a concrete failure behind them:
+ *
+ * - **Is `.env` gitignored?** Writing a live credential into a tracked file is the one irreversible
+ *   mistake this command could cause, and it is silent until the push lands.
+ * - **Does anything here load `.env`?** Playwright does not read it. Without a loader the file is
+ *   written, chmodded and reported as a success — and the reporter still sees nothing. That is the
+ *   same silent-success failure this SDK exists to refuse, so it is stated before the offer.
  */
 async function maybeWriteEnv(asker: Asker, config: ResolvedTesboConfig): Promise<void> {
   const envPath = path.resolve(process.cwd(), ".env");
   const exists = fs.existsSync(envPath);
   const current = exists ? fs.readFileSync(envPath, "utf-8") : "";
 
-  if (new RegExp(`^\\s*${ENV_TOKEN}=`, "m").test(current)) {
+  if (new RegExp(`^\s*${ENV_TOKEN}=`, "m").test(current)) {
     console.log(`\n${ENV_TOKEN} is already set in ${envPath} — leaving it alone.`);
     return;
+  }
+
+  if (!detectsDotenv()) {
+    console.warn(
+      `\n  NOTE: nothing in this project appears to load .env, and Playwright does not read it by\n` +
+        `  itself, so a token written there would be ignored. Either add "import 'dotenv/config'" to\n` +
+        `  playwright.config.ts, or set ${ENV_TOKEN} in your shell or CI secrets instead.`
+    );
   }
 
   if (!(await asker.confirm(`\nWrite ${ENV_TOKEN} to ${envPath}?`))) {
@@ -229,6 +250,68 @@ async function maybeWriteEnv(asker: Asker, config: ResolvedTesboConfig): Promise
   console.log(`Wrote ${ENV_TOKEN} to ${envPath}.`);
 }
 
+/**
+ * Whether `tesbo.config.json` would be committed if the token went into it.
+ *
+ * Only a literal entry counts. Matching loosely — any line mentioning "tesbo", say — would report a
+ * token as safely ignored when it is not, and that mistake is unrecoverable once pushed.
+ *
+ * **Leading whitespace does not count**, verified against git itself: git treats the spaces as part
+ * of the pattern, so `  tesbo.config.json` ignores nothing and the file is committed. Accepting it
+ * here would produce exactly the false "it's ignored" this function exists to prevent. Trailing
+ * whitespace *is* accepted, because git strips it. `\r` too, for a CRLF checkout.
+ */
+export function configFileIsGitIgnored(cwd: string = process.cwd()): boolean {
+  try {
+    const text = fs.readFileSync(path.resolve(cwd, ".gitignore"), "utf-8");
+    return new RegExp(`^/?${CONFIG_FILENAME.replace(/\./g, "\\.")}[ \t\r]*$`, "m").test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Persists the server and project to `tesbo.config.json`, and asks where the token should live.
+ *
+ * The token defaults to the environment because a credential in a tracked file stays in git history
+ * after it is rotated and travels with every clone and fork. Putting it in the file is a deliberate,
+ * stated choice — reasonable for a private repository, which is why it is offered — and never the
+ * quiet default for whoever installs this package next.
+ */
+async function persistConfig(asker: Asker, config: ResolvedTesboConfig): Promise<{ tokenInFile: boolean }> {
+  let tokenInFile = false;
+
+  if (await asker.confirm(`\nStore the token in ${CONFIG_FILENAME} too, instead of the environment?`)) {
+    if (configFileIsGitIgnored()) {
+      tokenInFile = true;
+    } else {
+      console.warn(
+        `\n  WARNING: ${CONFIG_FILENAME} is not in .gitignore, so the token will be committed and will\n` +
+          `  remain in git history after you rotate it. Fine for a private repo if that is your call.`
+      );
+      tokenInFile = await asker.confirm("  Store it there anyway?");
+    }
+  }
+
+  const written = writeConfigFile(
+    {
+      baseUrl: config.baseUrl,
+      projectId: config.projectId,
+      // undefined removes the key, so answering "no" also cleans up a token an earlier run stored.
+      token: tokenInFile ? config.token : undefined
+    },
+    { cwd: process.cwd() }
+  );
+
+  console.log(
+    `\nWrote ${written.path}${written.hasToken ? " (mode 600 — it holds the token)" : ""}.\n` +
+      `Re-running init rewrites this file, so changing the server or project needs no other edit.`
+  );
+
+  if (!tokenInFile) await maybeWriteEnv(asker, config);
+  return { tokenInFile };
+}
+
 /* ─────────────────────────────── commands ─────────────────────────────── */
 
 /**
@@ -240,7 +323,9 @@ async function maybeWriteEnv(asker: Asker, config: ResolvedTesboConfig): Promise
 async function doctor(): Promise<number> {
   console.log(`tesbo-playwright doctor (v${version()})\n`);
 
-  let resolution = resolveConfig();
+  const fileConfig = readConfigFile();
+  if (fileConfig.path && !fileConfig.error) console.log(`Using ${fileConfig.path}\n`);
+  let resolution = resolveConfig({}, process.env, fileConfig);
 
   if (resolution.state !== "ok") {
     /*
@@ -263,20 +348,23 @@ async function doctor(): Promise<number> {
       return EXIT_NOT_CONFIGURED;
     }
 
+    // Same seeding as init: the file supplies a default for anything the environment does not.
+    const seed = (key: "baseUrl" | "projectId" | "token", envName: string): string | undefined =>
+      process.env[envName] ?? fileConfig.values[key];
     const asker = createAsker();
     try {
       const baseUrl = await asker.ask(
         `  ${ENV_BASE_URL} (the API host, or paste the MCP URL from Project → Settings → API & MCP)`,
-        { default: process.env[ENV_BASE_URL] }
+        { default: seed("baseUrl", ENV_BASE_URL) }
       );
       // Parsed immediately so a pasted MCP URL can supply the project id as its default below,
       // rather than making the person find the same uuid twice.
       const parsed = baseUrl ? normalizeBaseUrl(baseUrl) : null;
       const projectId = await asker.ask(`  ${ENV_PROJECT_ID}`, {
-        default: parsed?.inferredProjectId ?? process.env[ENV_PROJECT_ID]
+        default: parsed?.inferredProjectId ?? seed("projectId", ENV_PROJECT_ID)
       });
-      const token = await asker.ask(`  ${ENV_TOKEN}`, { default: process.env[ENV_TOKEN], secret: true });
-      resolution = resolveConfig({ baseUrl, projectId, token });
+      const token = await asker.ask(`  ${ENV_TOKEN}`, { default: seed("token", ENV_TOKEN), secret: true });
+      resolution = resolveConfig({ baseUrl, projectId, token }, process.env, fileConfig);
     } finally {
       asker.close();
     }
@@ -321,19 +409,29 @@ async function init(): Promise<number> {
   }
 
   console.log(`Find all three under Project → Settings → API & MCP in Tesbo.\n`);
+  // Seeded from the file as well as the environment, so re-running to change one value does not mean
+  // retyping the other two.
+  const fileConfig = readConfigFile();
+  if (fileConfig.error) {
+    console.error(fileConfig.error);
+    return EXIT_NOT_CONFIGURED;
+  }
+  const seed = (key: "baseUrl" | "projectId" | "token", envName: string): string | undefined =>
+    process.env[envName] ?? fileConfig.values[key];
   const asker = createAsker();
   let resolution;
+  let persisted = { tokenInFile: false };
   try {
     const baseUrl = await asker.ask(`  ${ENV_BASE_URL} (or paste the MCP URL)`, {
-      default: process.env[ENV_BASE_URL]
+      default: seed("baseUrl", ENV_BASE_URL)
     });
     const parsed = baseUrl ? normalizeBaseUrl(baseUrl) : null;
     const projectId = await asker.ask(`  ${ENV_PROJECT_ID}`, {
-      default: parsed?.inferredProjectId ?? process.env[ENV_PROJECT_ID]
+      default: parsed?.inferredProjectId ?? seed("projectId", ENV_PROJECT_ID)
     });
-    const token = await asker.ask(`  ${ENV_TOKEN}`, { default: process.env[ENV_TOKEN], secret: true });
+    const token = await asker.ask(`  ${ENV_TOKEN}`, { default: seed("token", ENV_TOKEN), secret: true });
 
-    resolution = resolveConfig({ baseUrl, projectId, token });
+    resolution = resolveConfig({ baseUrl, projectId, token }, process.env, fileConfig);
     if (resolution.state !== "ok") {
       console.error(`\n${resolution.message}`);
       return EXIT_NOT_CONFIGURED;
@@ -348,12 +446,12 @@ async function init(): Promise<number> {
     }
     console.log(`  OK — ${outcome.detail}.`);
 
-    await maybeWriteEnv(asker, resolution.config);
+    persisted = await persistConfig(asker, resolution.config);
   } finally {
     asker.close();
   }
 
-  printConfigSnippet(resolution.config);
+  printConfigSnippet(resolution.config, persisted.tokenInFile);
   return EXIT_OK;
 }
 
@@ -391,9 +489,16 @@ async function main(): Promise<number> {
   return EXIT_NOT_CONFIGURED;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((error) => {
-    console.error(`[tesbo] ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(EXIT_VERIFY_FAILED);
-  });
+/*
+ * Guarded so the module can be imported by its own tests. Without this, `require("./cli")` runs the
+ * CLI — which under `node --test` means a test file importing it would parse argv, prompt, and exit
+ * the runner.
+ */
+if (require.main === module) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((error) => {
+      console.error(`[tesbo] ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(EXIT_VERIFY_FAILED);
+    });
+}

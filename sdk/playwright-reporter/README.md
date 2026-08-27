@@ -15,11 +15,15 @@ npm install --save-dev @tesbox/playwright-reporter
 ## Set it up
 
 You need three values, all on **Project → Settings → API & MCP** in Tesbo. The CLI asks for them,
-checks they work together, and prints the config to paste:
+checks they work together, and writes them to `tesbo.config.json`:
 
 ```bash
 npx @tesbox/playwright-reporter init
 ```
+
+Re-run it whenever the server or project changes — it rewrites that file in place, so
+`playwright.config.ts` is a one-time edit. The token stays out of the file by default; `init` offers
+`.env` instead, and will put it in the JSON if you ask, saying first whether that file is gitignored.
 
 To check an existing setup — including inside CI, where it prompts for nothing and just reports:
 
@@ -56,6 +60,10 @@ export default defineConfig({
 
 Create the token in Tesbo under **Project → Settings → API & MCP**. It needs the `write` scope, and
 it is scoped to one project — a token issued for project A cannot report into project B.
+
+Values resolve in this order — inline options, then environment variables, then
+`tesbo.config.json`. The file is last so a CI secret always beats a committed value. A malformed file
+fails at collection time rather than degrading to "unconfigured".
 
 | Variable | Purpose |
 |---|---|
@@ -115,6 +123,26 @@ alternative is a result silently attached to the wrong case.
 3. **On failure**, screenshots, video and the trace are attached as evidence.
 4. **At the end**, the run is closed with a summary, and Tesbo reconciles it against what it actually
    stored — any disagreement is printed, which is the only place a dropped result is visible.
+
+## What you have to add
+
+Nothing inside your test code beyond the tag — no import, no fixture, no `await`, no flush, no global
+setup. The reporter reads Playwright's own tags and annotations; opening the run, posting results,
+retrying and closing all happen in lifecycle hooks Playwright calls itself.
+
+The one prerequisite that is easy to miss: **evidence needs Playwright's capture enabled.** The
+reporter uploads what Playwright produces, it does not capture anything itself, so with
+`screenshot`/`video`/`trace` off a failed test reports status and error text and no evidence.
+
+```ts
+use: { screenshot: 'only-on-failure', video: 'retain-on-failure', trace: 'on-first-retry' }
+```
+
+Your own `testInfo.attach()` calls need a `path`; an inline `body` has no file on disk and is skipped.
+
+Workers, `fullyParallel` and `retries` need no configuration. Sharding converges on one run on the six
+detected CI providers; on any other, each shard opens its own run and the key cannot yet be set
+manually.
 
 ## Untagged tests
 

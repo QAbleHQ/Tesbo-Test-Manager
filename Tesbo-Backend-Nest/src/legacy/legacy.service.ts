@@ -546,6 +546,58 @@ function verifyOAuthState(raw: string, provider: IntegrationProvider, organizati
   }
 }
 
+/*
+ * Short-lived, unauthenticated links to one Playwright trace.
+ *
+ * The trace viewer is Playwright's own web app (trace.playwright.dev). It runs entirely in the
+ * viewer's browser and reads the .zip with a plain cross-origin `fetch` — no cookies, no custom
+ * headers (verified in its bundled service worker: `new HttpReader(url, { mode: "cors",
+ * preventHeadRequest: true })`, so there is no HEAD, no Range request and therefore no preflight).
+ *
+ * That rules out the ordinary evidence download route, which authorizes with the session cookie
+ * and 302s to a private presigned S3 URL: a third-party origin fetching it sends no credentials and
+ * gets a 401, and the bucket is not public. Hence this token — the caller proves project access
+ * once, over the authenticated route, and receives a signed grant that stands alone for TTL.
+ *
+ * The grant is deliberately narrow: it names a single attachment, it expires, and the route that
+ * redeems it re-checks that the file really is a zip. It is a capability URL for exactly one trace
+ * archive, which is why nothing that could be rendered as markup can ever travel through it.
+ */
+const TRACE_LINK_TTL_MS = 60 * 60 * 1000;
+
+function traceLinkKey(): Buffer {
+  // Derived rather than reused, for the same reason oauthStateKey() is: a trace signature must not
+  // become an oracle against the key protecting stored integration tokens.
+  return createHash("sha256").update(`tesbo:trace-link:${process.env.SECRETS_ENCRYPTION_KEY || ""}`).digest();
+}
+
+function signTraceLink(attachmentId: string, executionId: string): string {
+  const payload = Buffer.from(JSON.stringify({ a: attachmentId, e: executionId, t: Date.now() })).toString("base64url");
+  const signature = createHmac("sha256", traceLinkKey()).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+/** Throws NotFound — never a 400 — so a tampered token is indistinguishable from a missing file. */
+function verifyTraceLink(raw: string): { attachmentId: string; executionId: string } {
+  const invalid = () => new NotFoundException({ error: "This trace link is no longer valid" });
+  const parts = String(raw || "").split(".");
+  if (parts.length !== 2) throw invalid();
+
+  const expected = Buffer.from(createHmac("sha256", traceLinkKey()).update(parts[0]).digest("base64url"));
+  const actual = Buffer.from(parts[1]);
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw invalid();
+
+  let claims: Body;
+  try {
+    claims = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+  } catch {
+    throw invalid();
+  }
+  if (!Number.isFinite(Number(claims.t)) || Date.now() - Number(claims.t) > TRACE_LINK_TTL_MS) throw invalid();
+  if (!isUuid(claims.a) || !isUuid(claims.e)) throw invalid();
+  return { attachmentId: String(claims.a), executionId: String(claims.e) };
+}
+
 // ─── AI provider catalog ─────────────────────────────────────────────────────
 // Adding a provider is a registry entry, not a new branch. Request code dispatches
 // on `wire` alone, and three wires cover everything we support:
@@ -5074,6 +5126,83 @@ export class LegacyService implements OnModuleInit {
     return { ...access, mimeType, originalFileName: file.file_name, inline: safeInline };
   }
 
+  /**
+   * True for a Playwright trace archive.
+   *
+   * Checked at both ends of the trace link — when one is minted and again when it is redeemed —
+   * because it is the whole reason the public route is safe. Evidence is attacker-supplied content;
+   * a zip cannot be rendered as markup by a browser, so serving one from a URL that carries no
+   * session cannot become the stored-XSS hole that inline .html evidence would be.
+   */
+  private static isTraceArchive(file: Body): boolean {
+    if (file?.evidence_kind === "trace") return true;
+    const type = String(file?.content_type || "").toLowerCase();
+    if (type === "application/zip" || type === "application/x-zip-compressed") return true;
+    return String(file?.file_name || "").toLowerCase().endsWith(".zip");
+  }
+
+  /**
+   * Mints a short-lived link to one trace, for the embedded Playwright trace viewer.
+   *
+   * Authorization happens here and only here: same project-membership check the download route
+   * makes, and the same scoping of an attachment id to its own execution, so a token can never be
+   * minted for evidence the caller could not already download.
+   */
+  async createExecutionTraceLink(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    await this.requireProjectAccess(uid, String(execution.project_id));
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3`,
+      [attachmentId, executionId, execution.project_id]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    // A pointed message rather than a bare 404: asking for a trace link for a screenshot is a
+    // caller bug, and one that would otherwise look like the file had gone missing.
+    if (!LegacyService.isTraceArchive(file)) {
+      throw new BadRequestException({ error: "This attachment is not a Playwright trace" });
+    }
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    return {
+      token: signTraceLink(String(file.id), executionId),
+      expiresAt: new Date(Date.now() + TRACE_LINK_TTL_MS).toISOString()
+    };
+  }
+
+  /**
+   * Redeems a trace link. No session is involved — the signature is the authorization — so every
+   * check that matters happened when the token was minted, and the two that still matter here are
+   * re-run: the signature (with its TTL) and the file still being a zip.
+   */
+  async getPublicTraceContent(token: string) {
+    const claims = verifyTraceLink(token);
+    const res = await this.db.query(
+      `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2`,
+      [claims.attachmentId, claims.executionId]
+    );
+    const file = res.rows[0];
+    // Deleted since the link was minted, or never a trace: both answer the same way, since the
+    // holder of a bare token is owed no detail about what is on the other side of it.
+    if (!file || !LegacyService.isTraceArchive(file)) {
+      throw new NotFoundException({ error: "This trace link is no longer valid" });
+    }
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    return { buffer: await this.storage.getBuffer(file.storage_path), fileName: String(file.file_name) };
+  }
+
   async listExecutionAttachments(cycleId: string, userId: string | null | undefined, executionId: string) {
     const uid = this.requireUser(userId);
     const execution = await this.executionOwner(cycleId, executionId);
@@ -8744,11 +8873,17 @@ export class LegacyService implements OnModuleInit {
     const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
 
-    await this.db.query(
+    // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
+    // only stable identifier for the turn: seeding off the message text instead would give two
+    // identical messages in one session the same deterministic trace id, collapsing both turns
+    // into one trace.
+    const userMessageRes = await this.db.query(
       `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status)
-       VALUES ($1,$2,$3,'user',$4,'sent')`,
+       VALUES ($1,$2,$3,'user',$4,'sent')
+       RETURNING id`,
       [sessionId, projectId, uid, message]
     );
+    const userMessageId = String(userMessageRes.rows[0]?.id ?? "");
 
     // A paused plan (stopped by the user, or paused after a batch failure) can be picked
     // back up with a plain "continue" — resolved before any other decision-making so it
@@ -8766,7 +8901,7 @@ export class LegacyService implements OnModuleInit {
       await this.db.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
     }
 
-    const decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message);
+    const decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId);
     const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
     const activity = [
       { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -8882,7 +9017,13 @@ export class LegacyService implements OnModuleInit {
   // of its own previous turns actually persisted testcases (see zyraTranscript) — and what the
   // system does with the answer is validated, capability-gated, and reconciled against reality
   // (applyZyraChatOperations, reconcileZyraReply). The model decides; it never writes.
-  private async buildZyraChatDecision(projectId: string, userId: string, sessionId: string, message: string): Promise<ZyraChatDecision> {
+  private async buildZyraChatDecision(
+    projectId: string,
+    userId: string,
+    sessionId: string,
+    message: string,
+    userMessageId?: string
+  ): Promise<ZyraChatDecision> {
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
     const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes] = await Promise.all([
@@ -8920,7 +9061,17 @@ export class LegacyService implements OnModuleInit {
 
     // Opened once the gathered context exists, so the trace carries what Zyra actually read rather
     // than only what it later claims to have read.
-    const trace = await startZyraTurn({ messageId: `${sessionId}:${message}`, sessionId, projectId, userId, message });
+    // The trace id is createTraceId(zyra_chat_messages.id), so a support report ("Zyra did the
+    // wrong thing on this message") maps to its trace by recomputing the id from the row — no
+    // trace_id column and no backfill. Falls back to the session only for the callers that have
+    // no message row of their own.
+    const trace = await startZyraTurn({
+      messageId: userMessageId || `${sessionId}:${Date.now()}`,
+      sessionId,
+      projectId,
+      userId,
+      message
+    });
     recordJiraContext(trace, {
       extracted: jiraKeyResolution.extracted,
       validated: jiraKeyResolution.keys,
