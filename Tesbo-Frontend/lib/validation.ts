@@ -187,6 +187,18 @@ export function validateEvidenceFile(file: { name: string; size: number }): stri
   return null;
 }
 
+// Mirrors Tesbo-Backend-Nest/src/legacy/legacy.service.ts — SUITE_NAME_MAX_LENGTH, enforced in
+// createSuite / updateSuite. Matches the suites.name VARCHAR(255) column width exactly (unlike
+// PROJECT_NAME_MAX_LENGTH, there's no tighter product-chosen cap here).
+export const SUITE_NAME_MAX_LENGTH = 255;
+
+export function validateSuiteName(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "Suite name is required";
+  if (trimmed.length > SUITE_NAME_MAX_LENGTH) return `Suite name must be at most ${SUITE_NAME_MAX_LENGTH} characters`;
+  return "";
+}
+
 // Test run environments (project settings > Test Environments) are stored inside the project's
 // free-form settings JSONB, with no column width and no backend validation at all — these are a
 // product-level cap picked here, matching the other short-label fields (KB_FOLDER_NAME_MAX_LENGTH).

@@ -130,4 +130,48 @@ test.describe("test suite CRUD", () => {
     });
     expect(getRes.status()).toBe(404);
   });
+
+  /*
+   * The suites.name column is VARCHAR(255); validateBoundedField (legacy.service.ts) rejects
+   * an over-length name with a 400 before the INSERT/UPDATE, rather than letting Postgres raise
+   * 22001 as an unhandled 500. That check already existed but had no coverage of its own — the
+   * UI's inline error display (ui/testcases.spec.ts) surfaces this exact message verbatim, so
+   * this pins the contract the frontend fix depends on.
+   */
+  // No @tesbo.testId tag: minting one would require a matching case to already exist in the
+  // live Tesbo project (see docs/playwright-integration.md), which this change doesn't create.
+  test("rejects a suite name over 255 characters on both create and rename, and never writes it", async ({
+    request,
+  }) => {
+    const overLong = "x".repeat(256);
+
+    const createRes = await request.post(`/api/projects/${ctx.projectId}/suites`, {
+      data: { name: overLong },
+      failOnStatusCode: false,
+    });
+    expect(createRes.status()).toBe(400);
+    expect((await createRes.json()).error).toBe("Suite name must be at most 255 characters");
+
+    const suite = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, {
+        data: { name: `E2E Suite Name Length ${Date.now()}` },
+      })
+    ).json();
+
+    try {
+      const renameRes = await request.patch(`/api/suites/${suite.id}`, {
+        data: { name: overLong },
+        failOnStatusCode: false,
+      });
+      expect(renameRes.status()).toBe(400);
+      expect((await renameRes.json()).error).toBe("Suite name must be at most 255 characters");
+
+      // The rejected rename never reached the row.
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/suites`);
+      const unchanged = (await listRes.json()).find((s: { id: string }) => s.id === suite.id);
+      expect(unchanged.name).not.toBe(overLong);
+    } finally {
+      await request.delete(`/api/suites/${suite.id}`, { failOnStatusCode: false });
+    }
+  });
 });

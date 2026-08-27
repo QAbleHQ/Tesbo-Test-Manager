@@ -62,6 +62,8 @@ import {
   StatusChip,
   Field,
   FieldLabel,
+  FieldError,
+  FieldHint,
 } from "@/components/ui";
 import ImportTestCasesModal from "@/components/ImportTestCasesModal";
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
@@ -69,6 +71,7 @@ import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilte
 import { getConfiguredDefaultValue, validateCustomFieldValues } from "@/components/customFields/customFieldTypes";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { toTsv } from "@/lib/tsv";
+import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
 
 // 500 is the server's per-request ceiling (listTestCases clamps `limit`), so it is the largest
 // page we can offer. Paired with "select all matching" below, a 500-case suite no longer has to
@@ -173,6 +176,7 @@ export default function TestCasesPage() {
   const [newSuiteName, setNewSuiteName] = useState("");
   const [newSuiteParentId, setNewSuiteParentId] = useState("");
   const [isCreatingSuite, setIsCreatingSuite] = useState(false);
+  const [newSuiteNameError, setNewSuiteNameError] = useState("");
   const [expandedSuiteIds, setExpandedSuiteIds] = useState<Set<string>>(new Set());
 
   const [panelMode, setPanelMode] = useState<PanelMode>("closed");
@@ -228,6 +232,7 @@ export default function TestCasesPage() {
   const [renameSuiteId, setRenameSuiteId] = useState<string | null>(null);
   const [renameSuiteInputValue, setRenameSuiteInputValue] = useState("");
   const [isRenamingSuite, setIsRenamingSuite] = useState(false);
+  const [renameSuiteError, setRenameSuiteError] = useState("");
 
   const [suiteSearch, setSuiteSearch] = useState("");
   const [suiteStatusFilter, setSuiteStatusFilter] = useState("all");
@@ -751,6 +756,7 @@ export default function TestCasesPage() {
   function openAddSuiteModal(parentId?: string) {
     setNewSuiteName("");
     setNewSuiteParentId(parentId ?? "");
+    setNewSuiteNameError("");
     setIsAddSuiteModalOpen(true);
   }
 
@@ -764,16 +770,23 @@ export default function TestCasesPage() {
   }
 
   async function handleCreateSuite() {
-    const name = newSuiteName.trim();
-    if (!name || isCreatingSuite) return;
+    if (isCreatingSuite) return;
+    const nameError = validateSuiteName(newSuiteName);
+    if (nameError) {
+      setNewSuiteNameError(nameError);
+      return;
+    }
     setIsCreatingSuite(true);
+    setNewSuiteNameError("");
     try {
-      const created = await createSuite(projectId, { name, parentId: newSuiteParentId || undefined });
+      const created = await createSuite(projectId, { name: newSuiteName.trim(), parentId: newSuiteParentId || undefined });
       if (created.parentId) setExpandedSuiteIds((prev) => new Set(prev).add(created.parentId as string));
       setNewSuiteName("");
       setNewSuiteParentId("");
       setIsAddSuiteModalOpen(false);
       await refreshData();
+    } catch (err) {
+      setNewSuiteNameError(err instanceof Error ? err.message : "Failed to create suite.");
     } finally {
       setIsCreatingSuite(false);
     }
@@ -782,17 +795,26 @@ export default function TestCasesPage() {
   function handleRenameSuite(suiteId: string, currentName: string) {
     setRenameSuiteId(suiteId);
     setRenameSuiteInputValue(currentName);
+    setRenameSuiteError("");
     setIsRenameSuiteModalOpen(true);
   }
 
   async function handleRenameSuiteConfirm() {
-    if (!renameSuiteId || !renameSuiteInputValue.trim() || isRenamingSuite) return;
+    if (!renameSuiteId || isRenamingSuite) return;
+    const nameError = validateSuiteName(renameSuiteInputValue);
+    if (nameError) {
+      setRenameSuiteError(nameError);
+      return;
+    }
     setIsRenamingSuite(true);
+    setRenameSuiteError("");
     try {
       await updateSuite(renameSuiteId, { name: renameSuiteInputValue.trim() });
       setIsRenameSuiteModalOpen(false);
       setRenameSuiteId(null);
       await refreshData();
+    } catch (err) {
+      setRenameSuiteError(err instanceof Error ? err.message : "Failed to rename suite.");
     } finally {
       setIsRenamingSuite(false);
     }
@@ -2075,6 +2097,7 @@ export default function TestCasesPage() {
           if (isCreatingSuite) return;
           setIsAddSuiteModalOpen(false);
           setNewSuiteName("");
+          setNewSuiteNameError("");
         }}
         title="Add suite"
       >
@@ -2084,13 +2107,26 @@ export default function TestCasesPage() {
           <Input
             type="text"
             value={newSuiteName}
-            onChange={(e) => setNewSuiteName(e.target.value)}
+            onChange={(e) => {
+              setNewSuiteName(e.target.value);
+              if (newSuiteNameError && !validateSuiteName(e.target.value)) setNewSuiteNameError("");
+            }}
             placeholder="Enter suite name"
+            maxLength={SUITE_NAME_MAX_LENGTH}
             onKeyDown={(e) => {
               if (e.key === "Enter") void handleCreateSuite();
             }}
             autoFocus
           />
+          {newSuiteNameError ? (
+            <FieldError>{newSuiteNameError}</FieldError>
+          ) : (
+            newSuiteName.length >= SUITE_NAME_MAX_LENGTH && (
+              <FieldHint className="text-[var(--warning-foreground)]">
+                Suite name can&rsquo;t exceed {SUITE_NAME_MAX_LENGTH} characters.
+              </FieldHint>
+            )
+          )}
         </Field>
         <Field className="mt-4">
           <FieldLabel>Parent suite</FieldLabel>
@@ -2108,6 +2144,7 @@ export default function TestCasesPage() {
               if (isCreatingSuite) return;
               setIsAddSuiteModalOpen(false);
               setNewSuiteName("");
+              setNewSuiteNameError("");
             }}
           >
             Cancel
@@ -2282,6 +2319,7 @@ export default function TestCasesPage() {
           if (isRenamingSuite) return;
           setIsRenameSuiteModalOpen(false);
           setRenameSuiteId(null);
+          setRenameSuiteError("");
         }}
         title="Rename suite"
       >
@@ -2290,13 +2328,26 @@ export default function TestCasesPage() {
           <Input
             type="text"
             value={renameSuiteInputValue}
-            onChange={(e) => setRenameSuiteInputValue(e.target.value)}
+            onChange={(e) => {
+              setRenameSuiteInputValue(e.target.value);
+              if (renameSuiteError && !validateSuiteName(e.target.value)) setRenameSuiteError("");
+            }}
             placeholder="Enter suite name"
+            maxLength={SUITE_NAME_MAX_LENGTH}
             onKeyDown={(e) => {
               if (e.key === "Enter") void handleRenameSuiteConfirm();
             }}
             autoFocus
           />
+          {renameSuiteError ? (
+            <FieldError>{renameSuiteError}</FieldError>
+          ) : (
+            renameSuiteInputValue.length >= SUITE_NAME_MAX_LENGTH && (
+              <FieldHint className="text-[var(--warning-foreground)]">
+                Suite name can&rsquo;t exceed {SUITE_NAME_MAX_LENGTH} characters.
+              </FieldHint>
+            )
+          )}
         </Field>
         <div className="mt-5 flex justify-end gap-2">
           <Button
@@ -2305,6 +2356,7 @@ export default function TestCasesPage() {
               if (isRenamingSuite) return;
               setIsRenameSuiteModalOpen(false);
               setRenameSuiteId(null);
+              setRenameSuiteError("");
             }}
             disabled={isRenamingSuite}
           >

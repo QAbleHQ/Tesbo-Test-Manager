@@ -6,11 +6,29 @@ type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
 type ApiErrorBody = { error?: string; detail?: string; errors?: { field?: string; message?: string }[] };
 
+/**
+ * A response with no `error`/`errors` body is never something the endpoint chose to say to a
+ * user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
+ * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
+ * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
+ * the entire message — this is the friendly sentence for that case, keyed off the status class.
+ */
+function genericStatusMessage(status: number): string {
+  if (status === 401) return "Your session has expired. Please sign in again.";
+  if (status === 403) return "You don't have permission to do this.";
+  if (status === 404) return "That could not be found. It may have been deleted or moved.";
+  if (status === 409) return "This couldn't be saved because it conflicts with a recent change. Refresh and try again.";
+  if (status === 429) return "Too many requests. Please wait a moment and try again.";
+  if (status >= 500) return "Something went wrong on our end. Please try again.";
+  return "Something went wrong. Please try again.";
+}
+
 function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
-    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || String(status);
+    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  const msg = body.error || String(status);
+  const msg = body.error || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
