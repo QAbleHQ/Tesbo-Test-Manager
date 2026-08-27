@@ -27,6 +27,10 @@ next-dev*.log
 !*.env.example
 
 # Secrets and credentials
+# tesbo.config.json is what `npx @tesbox/playwright-reporter init` writes, and it carries a project
+# API token with write scope. The SDK creates it 0600 for that reason; committing it would publish
+# the credential regardless of its permissions.
+tesbo.config.json
 infra/kubernetes/**/secret.yaml
 infra/kubernetes/base/registry-secret.yaml
 *.pem

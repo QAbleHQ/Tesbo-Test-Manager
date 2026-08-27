@@ -18,17 +18,26 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 E2E="$REPO/e2e"
-STAGE_ENV="$E2E/stage.env"
 WORKERS="${WORKERS:-10}"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# e2e/environments/stage.env is the current home — the same file `E2E_ENV=stage npx playwright test`
+# reads, so the two ways of aiming a run at stage cannot drift apart. e2e/stage.env is where this
+# lived before there were environment files; still honoured so an un-migrated checkout keeps working.
+if [ -f "$E2E/environments/stage.env" ]; then
+  STAGE_ENV="$E2E/environments/stage.env"
+else
+  STAGE_ENV="$E2E/stage.env"
+  [ -f "$STAGE_ENV" ] && echo "note: using the legacy $STAGE_ENV — move it to e2e/environments/stage.env" >&2
+fi
 
 if [ "$#" -eq 0 ]; then
   echo "usage: scripts/e2e-stage.sh <spec> [<spec>...] [-g 'TC-042']" >&2
   die "name the specs to run. A bare full-suite run against stage must be asked for explicitly."
 fi
 
-[ -f "$STAGE_ENV" ] || die "no $STAGE_ENV — copy e2e/stage.env.example to e2e/stage.env and fill it in."
+[ -f "$STAGE_ENV" ] || die "no $STAGE_ENV — copy e2e/environments/stage.env.example to e2e/environments/stage.env and fill it in."
 
 # The local stack's values must not leak into a remote run. utils/env.ts falls back to
 # process.env.DATABASE_URL, so a shell that has sourced the repo-root .env would point the psql

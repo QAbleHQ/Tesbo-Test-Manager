@@ -1,6 +1,6 @@
 {
   "name": "@tesbox/playwright-reporter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Report Playwright test results into Tesbo, linked to test cases by tesbo.testId() tag",
   "license": "Apache-2.0",
   "main": "dist/index.js",

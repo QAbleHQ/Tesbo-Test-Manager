@@ -56,6 +56,47 @@ The seeded user and its "E2E Smoke Project" persist across runs (the docker volu
 wiped), so re-runs reuse the same account/project rather than accumulating new ones. Test
 cases created by tests delete themselves at the end of the test.
 
+## Choosing an environment
+
+One file per environment under [`environments/`](environments/), selected with `E2E_ENV`. Nothing
+else changes — the specs, the helpers and `playwright.config.ts` all resolve their target through
+[`utils/env.ts`](utils/env.ts), which loads the selected file before the first value is read.
+
+```bash
+npx playwright test                       # local  — environments/local.env (the default)
+E2E_ENV=stage npx playwright test         # stage  — environments/stage.env
+E2E_ENV=stage npx playwright test regression/
+E2E_ENV_FILE=/secrets/qa.env npx playwright test    # or name the file outright
+
+npm run test:stage                        # the same thing, spelled as a script
+```
+
+Every run prints what it resolved before the first test, so a misdirected run is visible
+immediately rather than forty lines into a `global-setup` stack trace:
+
+```
+e2e environment: stage — environments/stage.env
+  api:      https://api-app-stage.tesbo.io
+  web:      https://app-stage.tesbo.io
+  account:  testing.staging105070@mailinator.com
+  database: not configured — SQL-fixture specs will skip themselves
+  provision: off — tenants must already exist
+```
+
+Three rules worth knowing:
+
+- **`process.env` beats the file.** CI injects credentials as environment variables and the
+  committed file supplies only the non-secret remainder. It also lets you override one value for a
+  single run without editing anything.
+- **`KEY=` means "not configured"**, not "the empty string" — the loader skips those lines, so
+  whatever fallback sits behind them still applies.
+- **A named environment that doesn't exist is a hard error**, never a silent fall-back to
+  localhost. The *default* (`local`) is the one exception: if `environments/local.env` is absent,
+  the built-in defaults apply and nothing fails.
+
+Real `.env` files are gitignored; each environment ships a committed `.env.example`. Never commit a
+password or a connection string.
+
 ## Running against the stage environment
 
 Stage is https://app-stage.tesbo.io with its API at https://api-app-stage.tesbo.io. The specs
@@ -66,19 +107,21 @@ handle all three:
 1. **Tenants must already exist.** `global-setup.ts` fails the whole run if it cannot log in as
    account A or account B. On a local stack it creates them by scraping the signup OTP out of
    `docker compose logs`; there is no container log to read on stage, so both accounts have to be
-   signed up by hand first and their credentials put in `e2e/stage.env`.
+   signed up by hand first and their credentials put in `e2e/environments/stage.env`.
 2. **The SQL-fixture specs skip by default.** `utils/psql.ts` refuses to guess a database, so
    `dbControlAvailable()` is false and every suite that arranges state through SQL skips itself
    (~29 spec files). Setting `E2E_DATABASE_URL` to stage's own connection string unlocks them —
    the local postgres container is only transport for the `psql` binary, so a hosted URL is
    reachable — at the cost of real writes to the stage database. The runner requires
    `E2E_STAGE_DB_WRITES_ACK=yes` on top of it for that reason.
-3. **Stage is shared.** Stripe write tests are refused outright, the local stack's `DATABASE_URL`
-   and `STRIPE_*` are scrubbed from the environment so they cannot leak into a remote run, and the
-   runner refuses any host that does not look like a stage host.
+3. **Stage is shared.** Stripe write tests are refused outright, and the runner refuses any host
+   that does not look like a stage host. The local stack's `DATABASE_URL` and `STRIPE_*` cannot
+   leak into a remote run: `utils/env.ts` accepts only the `E2E_`-prefixed form once the target is
+   not localhost, so this holds for a plain `E2E_ENV=stage npx playwright test` too, not just for
+   runs that go through the script.
 
 ```bash
-cp e2e/stage.env.example e2e/stage.env    # then fill in the stage accounts
+cp e2e/environments/stage.env.example e2e/environments/stage.env   # then fill in the accounts
 scripts/e2e-stage.sh api/health.spec.ts api/testcases.spec.ts
 ```
 

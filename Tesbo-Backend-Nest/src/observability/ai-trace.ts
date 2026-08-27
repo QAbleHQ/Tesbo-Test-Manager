@@ -27,10 +27,24 @@ const logger = new Logger("AiTrace");
 /** Langfuse caps propagated metadata values at 200 chars and drops non-strings silently. */
 const META_MAX = 200;
 
+/*
+ * Trace-level OTel attribute keys, mirroring LangfuseOtelSpanAttributes in @langfuse/core.
+ *
+ * Duplicated as literals because every record* function below is synchronous and the SDK is
+ * ESM-only behind a dynamic import. startZyraTurn asserts these against the real enum on each
+ * boot, so an SDK rename shows up as a log line rather than as silently unattributed traces.
+ */
+const TRACE_SESSION_ID = "session.id";
+const TRACE_USER_ID = "user.id";
+const TRACE_NAME = "langfuse.trace.name";
+
 export interface TurnHandle {
   /** Null when tracing is off, or when the SDK failed to produce a span. */
   readonly span: unknown | null;
   readonly traceId: string | null;
+  /** Restamped onto every child span, the way propagateAttributes would. See stampTraceIdentity. */
+  readonly sessionId?: string | null;
+  readonly userId?: string | null;
 }
 
 const NO_TURN: TurnHandle = { span: null, traceId: null };
@@ -44,7 +58,24 @@ type Observation = {
   update: (attrs: Record<string, unknown>) => unknown;
   end: () => void;
   startObservation: (name: string, attrs: Record<string, unknown>, opts: { asType: string }) => Observation;
+  /** The wrapped OTel span. Public on LangfuseBaseObservation; the only way to reach trace-level keys. */
+  readonly otelSpan?: { setAttribute: (key: string, value: string) => unknown };
 };
+
+/**
+ * Stamps session/user onto one span.
+ *
+ * Applied to the root AND to every child, because that is what `propagateAttributes` does — it
+ * puts the keys on every span in scope. Verified against the instance: a child span left
+ * unstamped comes back from `/api/public/v2/observations` with `sessionId: ""`, so relying on
+ * the root alone would make session grouping depend on which observation the trace record is
+ * assembled from.
+ */
+function stampTraceIdentity(span: Observation | null | undefined, turn: TurnHandle): void {
+  if (!span?.otelSpan) return;
+  if (turn.sessionId) span.otelSpan.setAttribute(TRACE_SESSION_ID, turn.sessionId);
+  if (turn.userId) span.otelSpan.setAttribute(TRACE_USER_ID, turn.userId);
+}
 
 /**
  * Opens the trace for one Zyra chat turn.
@@ -65,8 +96,7 @@ export async function startZyraTurn(ctx: {
 }): Promise<TurnHandle> {
   if (!isTracingEnabled()) return NO_TURN;
   try {
-    const { startObservation, createTraceId, updateActiveObservation } = await import("@langfuse/tracing");
-    void updateActiveObservation;
+    const { startObservation, createTraceId, LangfuseOtelSpanAttributes } = await import("@langfuse/tracing");
     const traceId = await createTraceId(ctx.messageId);
     const span = startObservation(
       "zyra.chat.turn",
@@ -83,7 +113,38 @@ export async function startZyraTurn(ctx: {
       },
       { asType: "agent", parentSpanContext: { traceId, spanId: "0000000000000001", traceFlags: 1 } }
     ) as unknown as Observation;
-    return { span, traceId };
+
+    /*
+     * Trace-level identity. Without these three keys the trace still lands, but Langfuse's
+     * Sessions and Users pages are empty and the traces list shows an unnamed row — which is
+     * indistinguishable from "tracing isn't working".
+     *
+     * `sessionId` in observation metadata does NOT do this. Sessions are keyed off the OTel
+     * attribute `session.id` (LangfuseOtelSpanAttributes.TRACE_SESSION_ID); metadata is a
+     * separate, purely descriptive blob.
+     *
+     * `propagateAttributes()` is the documented route, but it wraps a function scope and this
+     * module deliberately hands back a handle instead — see the header. Setting the keys on the
+     * span reaches the same attributes.
+     *
+     * Only identifiers and a constant name go here. Trace-level input/output would ALSO be a
+     * plain span attribute and would therefore bypass the mask hook (langfuse.ts, §mask): the
+     * message text stays on the observation, where masking applies.
+     */
+    const expected: Array<[string, string]> = [
+      [LangfuseOtelSpanAttributes.TRACE_SESSION_ID, TRACE_SESSION_ID],
+      [LangfuseOtelSpanAttributes.TRACE_USER_ID, TRACE_USER_ID],
+      [LangfuseOtelSpanAttributes.TRACE_NAME, TRACE_NAME]
+    ];
+    for (const [fromSdk, local] of expected) {
+      if (fromSdk !== local) logger.warn(`Langfuse renamed a trace attribute: expected "${local}", SDK says "${fromSdk}".`);
+    }
+
+    const turn: TurnHandle = { span, traceId, sessionId: ctx.sessionId, userId: ctx.userId ?? null };
+    stampTraceIdentity(span, turn);
+    span.otelSpan?.setAttribute(TRACE_NAME, "zyra.chat.turn");
+
+    return turn;
   } catch (err) {
     logger.warn(`startZyraTurn failed: ${err instanceof Error ? err.message : err}`);
     return NO_TURN;
@@ -141,6 +202,7 @@ export function recordJiraContext(
       },
       { asType: "tool" }
     );
+    stampTraceIdentity(child, turn);
     child.end();
   } catch (err) {
     logger.warn(`recordJiraContext failed: ${err instanceof Error ? err.message : err}`);
@@ -194,6 +256,7 @@ export function recordKnowledgeContext(
       },
       { asType: "retriever" }
     );
+    stampTraceIdentity(child, turn);
     child.end();
   } catch (err) {
     logger.warn(`recordKnowledgeContext failed: ${err instanceof Error ? err.message : err}`);
@@ -217,6 +280,7 @@ export function recordExistingCoverage(turn: TurnHandle, data: { searchTerms: st
       },
       { asType: "span" }
     );
+    stampTraceIdentity(child, turn);
     child.end();
   } catch (err) {
     logger.warn(`recordExistingCoverage failed: ${err instanceof Error ? err.message : err}`);
@@ -250,6 +314,7 @@ export function recordGeneration(
       },
       { asType: "generation" }
     );
+    stampTraceIdentity(child, turn);
     child.end();
   } catch (err) {
     logger.warn(`recordGeneration failed: ${err instanceof Error ? err.message : err}`);

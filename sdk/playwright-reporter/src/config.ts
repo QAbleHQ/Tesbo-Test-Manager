@@ -12,6 +12,8 @@
  */
 
 /** The three values, as a caller may pass them inline. Each falls back to its env var. */
+import { CONFIG_FILENAME, NO_FILE_CONFIG, type FileConfig } from "./file-config";
+
 export interface TesboConfigInput {
   projectId?: string;
   token?: string;
@@ -138,17 +140,39 @@ export function normalizeBaseUrl(raw: string): BaseUrlNormalization {
  * self-hosted install regardless. Requiring it explicitly turns a silent 404 storm into a message
  * before the first test runs.
  */
-export function resolveConfig(input: TesboConfigInput = {}, env: NodeJS.ProcessEnv = process.env): ConfigResolution {
-  const pick = (inline: string | undefined, name: string): string | undefined => {
-    const value = inline ?? env[name];
-    return value && value.trim() ? value.trim() : undefined;
+export function resolveConfig(
+  input: TesboConfigInput = {},
+  env: NodeJS.ProcessEnv = process.env,
+  /*
+   * Defaults to "no file" rather than reading the disk, so a caller — and every test — gets a pure
+   * function unless it deliberately opts in. The reporter and the CLI both pass `readConfigFile()`,
+   * which is what keeps doctor validating the same resolution the reporter performs.
+   */
+  file: FileConfig = NO_FILE_CONFIG
+): ConfigResolution {
+  // A file that exists but cannot be parsed is never treated as absent: whoever wrote it meant to
+  // configure reporting, and degrading to "unconfigured" would report nothing and still exit 0.
+  if (file.error) return { state: "invalid", message: file.error };
+
+  const fromFile: string[] = [];
+  const pick = (inline: string | undefined, name: string, key: keyof TesboConfigInput): string | undefined => {
+    const direct = inline ?? env[name];
+    if (direct && direct.trim()) return direct.trim();
+    const fileValue = file.values[key];
+    if (fileValue && fileValue.trim()) {
+      fromFile.push(name);
+      return fileValue.trim();
+    }
+    return undefined;
   };
 
-  const rawBaseUrl = pick(input.baseUrl, ENV_BASE_URL);
-  let projectId = pick(input.projectId, ENV_PROJECT_ID);
-  const token = pick(input.token, ENV_TOKEN);
+  const rawBaseUrl = pick(input.baseUrl, ENV_BASE_URL, "baseUrl");
+  let projectId = pick(input.projectId, ENV_PROJECT_ID, "projectId");
+  const token = pick(input.token, ENV_TOKEN, "token");
 
   const notes: string[] = [];
+  // Said out loud so a value nobody remembers setting is traceable to the file that supplies it.
+  if (fromFile.length) notes.push(`${fromFile.join(", ")} read from ${CONFIG_FILENAME}.`);
   let baseUrl: string | undefined;
 
   if (rawBaseUrl) {
@@ -180,7 +204,7 @@ export function resolveConfig(input: TesboConfigInput = {}, env: NodeJS.ProcessE
       state: "unconfigured",
       message:
         `not configured — ${ENV_BASE_URL}, ${ENV_PROJECT_ID} and ${ENV_TOKEN} are all unset, so results ` +
-        `will not be reported. Run "npx @tesbox/playwright-reporter doctor" to set them up, or pass ` +
+        `will not be reported. Run "npx @tesbox/playwright-reporter init" to set them up, or pass ` +
         `enabled: false to silence this.`
     };
   }

@@ -9,10 +9,6 @@ Nothing about your suite changes except the reporter list and the tags. Your tes
 as they did, and a Tesbo outage cannot fail them — see
 [It will not break your pipeline](#it-will-not-break-your-pipeline).
 
-> **Availability.** The package is not on the public npm registry yet. Until it is published, install
-> it from this repository — see [Install from source](#appendix--install-from-source). Every other
-> step is identical.
-
 ---
 
 ## What happens on a run
@@ -80,8 +76,25 @@ project UUID is read out of it, so one paste configures two of the three values.
 npx @tesbox/playwright-reporter init
 ```
 
-`init` asks for all three values, checks they actually work together, offers to write the token to
-`.env` (warning you first if `.env` is not in `.gitignore`), and prints the config block to paste.
+`init` asks for all three values, checks they actually work together, and writes them to
+**`tesbo.config.json`** in the current directory:
+
+```json
+{
+  "baseUrl": "https://api-app.tesbo.io",
+  "projectId": "41dba2a2-a60b-4917-8d63-9f8a86986703"
+}
+```
+
+Re-run `init` any time to change the server or project — it rewrites that file in place, so there is
+nothing to re-paste and no second reporter entry appended to your config.
+
+**Where the token goes is your choice.** By default it stays out of the file and `init` offers to put
+it in `.env` instead. It can go in `tesbo.config.json` too — reasonable for a private repository — and
+`init` will say plainly whether that file is gitignored before it writes a credential into it. A token
+in a tracked file remains in git history after you rotate it, so the default is the environment.
+
+Add `tesbo.config.json` to `.gitignore` if you choose to keep the token in it.
 
 To check an existing setup instead — including in CI, where it prompts for nothing and just reports:
 
@@ -127,8 +140,30 @@ export default defineConfig({
 Keep `['list']` (or whichever reporter you already use). The Tesbo reporter adds to your reporter
 list; it does not replace your console output.
 
-Every option can come from its environment variable instead, so a config with no Tesbo block at all
-still works if the three variables are set.
+If you ran `init`, the values are already in `tesbo.config.json` and this is all you need:
+
+```ts
+  reporter: [
+    ['list'],
+    ['@tesbox/playwright-reporter'],
+  ]
+```
+
+That makes `playwright.config.ts` a one-time edit — later changes go to the JSON file, not here.
+
+### Where each value can come from
+
+Highest precedence first. The file is last on purpose: a CI runner's secret must beat a value someone
+committed months ago.
+
+| Source | Example |
+| --- | --- |
+| Inline reporter options | `['@tesbox/playwright-reporter', { baseUrl: '…' }]` |
+| Environment variables | `TESBO_BASE_URL`, `TESBO_PROJECT_ID`, `TESBO_API_TOKEN` |
+| `tesbo.config.json` | `{ "baseUrl": "…", "projectId": "…", "token": "…" }` |
+
+A malformed `tesbo.config.json` is a hard failure at collection time, not a silent fallback to
+"unconfigured" — whoever wrote the file meant to report.
 
 ## Step 5 — Tag each test with the case it validates
 
@@ -185,6 +220,75 @@ with their results; open a failed case to see the error message and its evidence
 
 **Read those `[tesbo]` lines.** Because the reporter cannot fail your suite, they are the only place
 a problem is visible — a lost request, an unknown case id, or a storage quota that dropped evidence.
+
+---
+
+## What you have to add — the complete list
+
+**Nothing inside your test code beyond the tag.** There is no import, no fixture, no `await`, no
+flush call, and no global setup or teardown. The reporter reads Playwright's own `tags` and
+`annotations`, and everything else — opening the run, posting each result live, retrying transient
+failures, draining in-flight requests and closing the run — happens in reporter lifecycle hooks that
+Playwright calls itself.
+
+So the whole footprint in a project is:
+
+| Where | What | Required? |
+| --- | --- | --- |
+| `playwright.config.ts` | the reporter entry | **Yes** |
+| `tesbo.config.json`, env vars, or inline options | the three values | **Yes** |
+| each spec | `{ tag: '@tesbo.testId("TES-1042")' }` | **Yes**, per test you want reported |
+| `playwright.config.ts` → `use` | `screenshot` / `video` / `trace` capture | Only if you want evidence |
+
+### Evidence needs Playwright's capture turned on
+
+This is the one that catches people out. The reporter uploads the attachments **Playwright produces**
+— it does not capture anything itself. If your config has capture off, a failed test reports its
+status and error message with no screenshot, video or trace, and nothing is broken.
+
+```ts
+export default defineConfig({
+  use: {
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+    trace: 'on-first-retry',
+  },
+  reporter: [['list'], ['@tesbox/playwright-reporter']],
+});
+```
+
+### Your own attachments need a file on disk
+
+`testInfo.attach()` with a `body` is skipped — there is no file to read. Use `path`:
+
+```ts
+// uploaded
+await testInfo.attach('response', { path: '/tmp/response.json', contentType: 'application/json' });
+
+// ignored — an inline body has no file on disk
+await testInfo.attach('response', { body: JSON.stringify(data), contentType: 'application/json' });
+```
+
+Recognised by extension only: `png`/`jpg`/`jpeg`/`webp` → screenshot, `mp4`/`webm`/`mov` → video,
+`zip` → trace, `txt`/`log`/`json`/`md`/`xml` → log. Anything else is skipped silently.
+
+### Nothing to do for parallelism, retries or sharding
+
+- **Workers and `fullyParallel`** need no configuration. Each result posts as its test finishes,
+  without blocking the next one.
+- **`retries`** works as it is: a retried test re-posts, the last attempt stands, and `retryCount`
+  records how many there were.
+- **Sharding** converges on a single run automatically on GitHub Actions, GitLab CI, Jenkins,
+  CircleCI, Azure Pipelines and Bitbucket Pipelines, because the shards derive a shared idempotency
+  key from the CI environment. **On any other CI provider each shard opens its own run**, and there is
+  currently no option to supply that key yourself — so if you shard on an unsupported provider,
+  expect one run per shard.
+
+### Nothing is written to disk
+
+Results are held only as pending requests in memory, never spooled to a file. `Ctrl-C` still closes
+the run as `incomplete`, so it says outright that results are missing; a `SIGKILL` loses whatever was
+in flight, and the reconciliation line at close is what reveals it.
 
 ---
 
@@ -285,27 +389,28 @@ asked it to.
 | `This API token is not scoped to this project` | The token belongs to another project. Mint one under this project's settings |
 | `requires the "write" scope` | The token has `read` only. Reporting results needs both |
 | `N test(s) not linked to Tesbo` | Expected while adopting. Those tests have no tag and were not reported |
+| A failed test has no screenshot, video or trace | Playwright's capture is off in your config. The reporter uploads what Playwright produces; it does not capture anything itself |
+| An attachment you added never appears | `testInfo.attach()` with a `body` has no file on disk and is skipped. Use `path` |
+| A sharded CI run produced one run per shard | The provider is not one of the six detected, so the shards have no shared idempotency key |
+| A token written to `.env` has no effect | Playwright does not load `.env`. Add `import 'dotenv/config'` to `playwright.config.ts`, or set the variable in your shell or CI secrets. `init` warns when it detects no loader |
+| `tesbo.config.json is not valid JSON` | The file exists but cannot be parsed. Fixed by re-running `init`, which rewrites it |
 | Tesbo's stored counts differ from this run's | Some result posts were lost. This line is the only place that is visible — treat it as real |
 
 `doctor` diagnoses the first six directly, and is the fastest first move for any of them.
 
 ---
 
-## Appendix — install from source
+## Appendix — build from source
 
-Until the package is published to npm, build it from this repository and install the tarball into
-your Playwright project:
+To run a local build instead of the published package:
 
 ```bash
 # in this repository
 cd sdk/playwright-reporter
-npm install
-npm run build
-npm pack                      # produces tesbo-playwright-reporter-<version>.tgz
+npm install && npm run build && npm pack   # -> tesbox-playwright-reporter-<version>.tgz
 
 # in your Playwright project
-npm install --save-dev /path/to/tesbo-playwright-reporter-<version>.tgz
+npm install --save-dev /path/to/tesbox-playwright-reporter-<version>.tgz
 ```
 
-Everything from [Step 2](#step-2--collect-your-three-values) onward is unchanged. The `npx
-@tesbox/playwright-reporter` commands become `npx tesbo-playwright` once installed locally.
+Everything from [Step 2](#step-2--collect-your-three-values) onward is unchanged.
