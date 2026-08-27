@@ -810,7 +810,7 @@ export interface ZyraTask {
   linearIssueKeys: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
-  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string }>;
+  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
   tokenUsage: { input: number; output: number; total: number };
   createdAt: string;
   updatedAt: string;

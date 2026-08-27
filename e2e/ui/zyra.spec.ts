@@ -174,6 +174,18 @@ test.describe("zyra / agents (UI)", () => {
     );
   }
 
+  /** Appends a "Review feedback submitted" entry the way zyraFeedback writes one, `kind` and all. */
+  function seedFeedbackActivity(taskId: string, detail: string): void {
+    exec(
+      "UPDATE ai_generation_requests SET activity_log = activity_log || " +
+        `${literal(
+          JSON.stringify([
+            { actor: "user", stage: "todo", kind: "feedback", title: "Review feedback submitted", detail, createdAt: new Date().toISOString() },
+          ]),
+        )}::jsonb WHERE id = ${literal(taskId)};`,
+    );
+  }
+
   // ─── The agent picker ──────────────────────────────────────────────────────
 
   test("ZYU-01 the agent picker offers Zyra and marks the two planned agents unavailable", { tag: '@tesbo.testId("TES-TC-1086")' }, async ({
@@ -672,5 +684,57 @@ test.describe("zyra / agents (UI)", () => {
 
     await expect(page.getByText("failed", { exact: true })).toBeVisible({ timeout: 9000 });
     await expect(page.getByText("E2E simulated provider timeout while this page was open")).toBeVisible();
+  });
+
+  // ─── The quick-view panel's Feedback tab (fix for "Feedback and Activity sections
+  // display similar content") ─────────────────────────────────────────────────
+
+  test("ZYU-28 the quick-view panel's Feedback tab says so when a task has no feedback, even though Activity has entries", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test: the Feedback tab used to render the whole activity_log verbatim, so it was
+     * never actually empty — it just duplicated whatever Activity showed. seedTask()'s default
+     * activity_log entry is status/process narration ("Picked up task"), not reviewer feedback, so
+     * a correct Feedback tab must show its own empty state here while Activity still lists it.
+     */
+    const userStory = stamp("No feedback story");
+    seedTask({ userStory });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Feedback/ }).click();
+    await expect(panel.getByText("No feedback yet.")).toBeVisible();
+    await expect(panel.getByText("Picked up task"), "the empty state must not be the whole activity log in disguise").toHaveCount(0);
+
+    await panel.getByRole("button", { name: /^Activity/ }).click();
+    await expect(panel.getByText("Picked up task"), "Activity keeps the full history unfiltered").toBeVisible();
+  });
+
+  test("ZYU-29 the quick-view panel's Feedback tab shows only the reviewer's submitted feedback, not status activity", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Feedback story");
+    const taskId = seedTask({ userStory });
+    seedFeedbackActivity(taskId, "Cover the locked-account case too");
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    // The tab count is the filtered count, not the raw activity_log length (2 entries seeded).
+    await expect(panel.getByRole("button", { name: "Feedback (1)" })).toBeVisible();
+    await panel.getByRole("button", { name: /^Feedback/ }).click();
+    await expect(panel.getByText("Cover the locked-account case too")).toBeVisible();
+    await expect(panel.getByText("Picked up task"), "a status entry must not leak into Feedback").toHaveCount(0);
+
+    await expect(panel.getByRole("button", { name: "Activity (2)" })).toBeVisible();
+    await panel.getByRole("button", { name: /^Activity/ }).click();
+    await expect(panel.getByText("Cover the locked-account case too"), "Activity still carries the full history, feedback included").toBeVisible();
+    await expect(panel.getByText("Picked up task")).toBeVisible();
   });
 });

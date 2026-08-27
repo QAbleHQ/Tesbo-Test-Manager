@@ -51,6 +51,7 @@ const TASK_STATUS_LABELS: Record<string, string> = {
   todo: "Pending",
   in_progress: "In Progress",
   in_review: "In Review",
+  failed: "Failed",
   done: "Done",
 };
 
@@ -528,7 +529,7 @@ export default function ZyraTaskDetailPage() {
           {task.activities.map((activity, index) => (
             <div key={`${activity.title}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {activity.stage.replaceAll("_", " ")}</span>
+                <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {(activity.stage || "").replaceAll("_", " ")}</span>
                 <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}</span>
               </div>
               <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{activity.title}</h3>

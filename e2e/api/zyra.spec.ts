@@ -1071,4 +1071,49 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     ).filter((entry: { title: string }) => entry.title === "Closed task");
     expect(closedEntries.length, "a race between two closes must not be recorded twice").toBe(1);
   });
+
+  // ─── Feedback vs. activity (fix for "Feedback and Activity sections display similar
+  // content") ─────────────────────────────────────────────────────────────────
+
+  test("ZYR-A-39 the task read distinguishes the feedback entry from status/process activity via `kind`", async () => {
+    /*
+     * Regression test for the Task Details panel showing identical content under "Feedback" and
+     * "Activity" — both tabs rendered the same flat activity_log. zyraFeedback now tags the one
+     * entry that carries a reviewer's actual words with `kind: "feedback"` (see the comment above
+     * feedbackActivity in zyraFeedback); every other entry in the log is status/process narration
+     * and must NOT carry that marker. The live feedback route can't be driven end-to-end here (see
+     * the file header — no AI provider is configured for this suite, and zyraFeedback only writes
+     * the entry once it gets past the allocation check), so this seeds the log the same way the
+     * fixed backend leaves it and proves the GET route passes `kind` through unmangled — the exact
+     * contract TaskQuickViewPanel's isFeedbackActivity filter depends on.
+     */
+    const taskId = seedTask({ status: "in_review" });
+    exec(
+      "UPDATE ai_generation_requests SET activity_log = activity_log || " +
+        `${literal(
+          JSON.stringify([
+            { actor: "agent", stage: "in_progress", title: "Picked up task", detail: "Zyra moved this task from Todo to In Progress.", createdAt: new Date().toISOString() },
+            { actor: "user", stage: "todo", kind: "feedback", title: "Review feedback submitted", detail: "Cover the locked-account case too", createdAt: new Date().toISOString() },
+          ]),
+        )}::jsonb WHERE id = ${literal(taskId)};`,
+    );
+
+    const res = await asOwner.get(url(`/agents/zyra/tasks/${taskId}`), { failOnStatusCode: false });
+    expect(res.status(), `reading the task — ${await res.text()}`).toBe(200);
+    const task = await res.json();
+    const activities = task.activities as Array<{ title: string; detail: string; kind?: string }>;
+
+    const feedbackEntries = activities.filter((a) => a.kind === "feedback");
+    expect(feedbackEntries.length, "exactly the one reviewer-authored entry is marked as feedback").toBe(1);
+    expect(feedbackEntries[0].title).toBe("Review feedback submitted");
+    expect(feedbackEntries[0].detail).toContain("Cover the locked-account case too");
+
+    const statusEntry = activities.find((a) => a.title === "Picked up task");
+    expect(statusEntry, "the seeded status entry is still present").toBeTruthy();
+    expect(statusEntry?.kind, "a status/process entry must not be misclassified as feedback").not.toBe("feedback");
+
+    // The task-created entry seedTask() itself never writes (activity_log defaults to '[]') stays
+    // absent either way — this only asserts the two entries this test seeded.
+    expect(activities).toHaveLength(2);
+  });
 });

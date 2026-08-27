@@ -36,10 +36,20 @@ export function latestFailureDetail(activities: ZyraTask["activities"]): string 
   return null;
 }
 
+// The activity log is one flat timeline that also backs the Activity tab, but only a reviewer's
+// actual submitted words belong under "Feedback" — everything else in it (picked up, read
+// sources, generated drafts, closed, saved...) is status/process narration. The backend marks
+// the one entry that is genuine feedback with `kind: "feedback"`; rows written before that field
+// existed carry no `kind`, so entries are also matched by their fixed title as a fallback.
+export function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
+  return activity.kind === "feedback" || activity.title === "Review feedback submitted";
+}
+
 const TASK_STATUS_LABELS: Record<string, string> = {
   todo: "Pending",
   in_progress: "In Progress",
   in_review: "In Review",
+  failed: "Failed",
   done: "Done",
 };
 
@@ -124,7 +134,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const normalizedStatus = normalizeTaskStatus(task.taskStatus);
   const done = normalizedStatus === "done";
   const failed = normalizedStatus === "failed";
-  const failureDetail = failed ? latestFailureDetail(task.activities) : null;
+  // Defensive: activity_log is a jsonb array server-side and should always arrive as one, but a
+  // malformed or missing value here must render an empty list rather than throw.
+  const activities = Array.isArray(task.activities) ? task.activities : [];
+  const feedbackActivities = activities.filter(isFeedbackActivity);
+  const failureDetail = failed ? latestFailureDetail(activities) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
   const draftsTsv = toTsv(
     ["Title", "Priority", "Preconditions", "Steps", "Expected Result", "Tags"],
@@ -153,9 +167,9 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
   const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
     { key: "testcases", label: "Test cases", count: task.drafts.length },
-    { key: "feedback", label: "Feedback" },
+    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
     { key: "sources", label: "Sources", count: task.sources.length },
-    { key: "activity", label: "Activity", count: task.activities.length },
+    { key: "activity", label: "Activity", count: activities.length },
   ];
 
   return createPortal(
@@ -259,7 +273,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
           {activeTab === "feedback" && (
             <div className="flex flex-col gap-3">
-              {task.activities.map((activity, index) => {
+              {feedbackActivities.map((activity, index) => {
                 const isAgent = activity.actor === "agent";
                 return (
                   <div
@@ -283,7 +297,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   </div>
                 );
               })}
-              {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+              {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
             </div>
           )}
 
@@ -302,11 +316,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
           {activeTab === "activity" && (
             <div className="flex flex-col gap-2.5">
-              {task.activities.map((activity, index) => (
+              {activities.map((activity, index) => (
                 <div key={`${task.id}-activity-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      {activity.actor} · {activity.stage.replaceAll("_", " ")}
+                      {activity.actor} · {(activity.stage || "").replaceAll("_", " ")}
                     </span>
                     <span className="font-mono text-[11px] text-[var(--muted-soft)]">
                       {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
@@ -316,7 +330,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{activity.detail}</p>
                 </div>
               ))}
-              {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+              {activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
             </div>
           )}
         </div>
