@@ -1,6 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test } from "@playwright/test";
+import { expect, test, type APIRequestContext } from "@playwright/test";
+import {
+  loginAs,
+  provisionRbacTenant,
+  rbacSuiteSkipReason,
+  resetRbacMembership,
+  type RbacTenant,
+} from "../utils/rbac-tenant";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -411,5 +418,151 @@ test.describe("linking a bug fails the execution", () => {
     expect(res.status(), await res.text()).toBeLessThan(300);
     const bug = await res.json();
     await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+  });
+});
+
+/*
+ * Bug assignee — "[Test Runs] Unable to assign test cases for execution".
+ *
+ * Bugs had no assignee concept at all before this. Mirrors executions.assignee_id's design and its
+ * membership rule: the assignee has to be a member of the bug's own project, or the bug becomes work
+ * nobody who holds it can actually open.
+ *
+ * Its own tenant (unlike the rest of this file) because these tests need a workspace member who is
+ * deliberately NOT a project member, to prove that rejection — account A's shared fixture has no
+ * such user to reach for.
+ */
+test.describe("bug assignee", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("bugs-assignee");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+  });
+
+  test.afterAll(async () => {
+    if (tenant) resetRbacMembership(tenant);
+    await asOwner?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  test("a bug can be created with an assignee, and it survives the list endpoint", { tag: '@tesbo.testId("TES-TC-1905")' }, async () => {
+    const created = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug Assignee ${Date.now()}`, assigneeId: tenant!.qa.userId },
+      })
+    ).json();
+    try {
+      expect(created.assigneeId).toBe(tenant!.qa.userId);
+      expect(created.assigneeName, "the display name has to come back too, not just the id").toBeTruthy();
+
+      const listed = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`)).json();
+      const found = listed.find((b: { id: string }) => b.id === created.id);
+      expect(found.assigneeId).toBe(tenant!.qa.userId);
+    } finally {
+      await asOwner.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a bug created with no assignee is unassigned, not an error", { tag: '@tesbo.testId("TES-TC-1906")' }, async () => {
+    const created = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug No Assignee ${Date.now()}` },
+      })
+    ).json();
+    try {
+      expect(created.assigneeId).toBeNull();
+    } finally {
+      await asOwner.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("creating with a non-member assignee is refused, and no bug is left behind", { tag: '@tesbo.testId("TES-TC-1907")' }, async () => {
+    const before = (await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`)).json()).length;
+
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `E2E Bug Bad Assignee ${Date.now()}`, assigneeId: tenant!.guest.userId },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `assigning a non-member on create answered ${res.status()}`).toBeGreaterThanOrEqual(400);
+
+    const after = (await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`)).json()).length;
+    expect(after, "a refused assignee must reject the whole create, not leave an unassigned bug behind").toBe(before);
+  });
+
+  test("assigneeId can be set, cleared via null, and an omitted key leaves it alone", { tag: '@tesbo.testId("TES-TC-1908")' }, async () => {
+    const bug = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug Assignee Edit ${Date.now()}` },
+      })
+    ).json();
+
+    try {
+      const set = await (
+        await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.manager.userId } })
+      ).json();
+      expect(set.assigneeId).toBe(tenant!.manager.userId);
+
+      // Omitting the field leaves it alone — the same COALESCE contract priority already has.
+      const untouched = await (
+        await asOwner.patch(`/api/bugs/${bug.id}`, { data: { title: `${bug.title} v2` } })
+      ).json();
+      expect(untouched.assigneeId).toBe(tenant!.manager.userId);
+
+      // An explicit null clears it, which COALESCE alone could never express.
+      const cleared = await (await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: null } })).json();
+      expect(cleared.assigneeId).toBeNull();
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("updating to a non-member assignee is refused, and the previous value survives", { tag: '@tesbo.testId("TES-TC-1909")' }, async () => {
+    const bug = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug Assignee Reject ${Date.now()}`, assigneeId: tenant!.qa.userId },
+      })
+    ).json();
+
+    try {
+      const res = await asOwner.patch(`/api/bugs/${bug.id}`, {
+        data: { assigneeId: tenant!.guest.userId },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `assigning a non-member on update answered ${res.status()}`).toBeGreaterThanOrEqual(400);
+
+      const after = await (await asOwner.get(`/api/bugs/${bug.id}`)).json();
+      expect(after.assigneeId, "a refused reassignment must not overwrite the existing assignee").toBe(tenant!.qa.userId);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a malformed assigneeId is refused by name, and stores nothing", { tag: '@tesbo.testId("TES-TC-1910")' }, async () => {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `E2E Bug Bad Assignee Format ${Date.now()}`, assigneeId: "not-a-uuid" },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(404);
+  });
+
+  test("a project with a single member can assign a bug to themself", { tag: '@tesbo.testId("TES-TC-1911")' }, async () => {
+    // Boundary: the owner is the only member of secondProjectId in this fixture.
+    const created = await (
+      await asOwner.post(`/api/projects/${tenant!.secondProjectId}/bugs`, {
+        data: { title: `E2E Bug Self Assign ${Date.now()}`, assigneeId: tenant!.owner.userId },
+      })
+    ).json();
+    try {
+      expect(created.assigneeId).toBe(tenant!.owner.userId);
+    } finally {
+      await asOwner.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
   });
 });

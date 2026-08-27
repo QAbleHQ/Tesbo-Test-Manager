@@ -16,6 +16,7 @@ import {
   deleteBugAttachment,
   getBugAttachmentDownloadUrl,
   listTestRuns,
+  listProjectMembers,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -395,6 +396,7 @@ export default function BugsPage() {
      mandatory when there's actually something to pick, so reporting a bug is never blocked
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
+  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -409,6 +411,7 @@ export default function BugsPage() {
   const [createEvidenceMode, setCreateEvidenceMode] = useState<EvidenceMode>("FILES");
   const [createStagedFiles, setCreateStagedFiles] = useState<File[]>([]);
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
+  const [createAssigneeId, setCreateAssigneeId] = useState("");
   const [creating, setCreating] = useState(false);
 
   /* edit modal */
@@ -426,6 +429,7 @@ export default function BugsPage() {
   const [editAttachments, setEditAttachments] = useState<BugAttachment[]>([]);
   const [editBetterbugsUrl, setEditBetterbugsUrl] = useState("");
   const [editStatus, setEditStatus] = useState("");
+  const [editAssigneeId, setEditAssigneeId] = useState("");
   const [saving, setSaving] = useState(false);
   /*
    * Basecamp 10226296533: createBug/updateBug succeeded, uploadBugAttachments then threw, and the
@@ -463,6 +467,7 @@ export default function BugsPage() {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
+    listProjectMembers(projectId).then(setMembers).catch(() => {});
   }, [projectId]);
 
   /* filtered list */
@@ -529,6 +534,7 @@ export default function BugsPage() {
     setCreateEvidenceMode("FILES");
     setCreateStagedFiles([]);
     setCreateBetterbugsUrl("");
+    setCreateAssigneeId("");
   }
 
   /* create */
@@ -543,6 +549,7 @@ export default function BugsPage() {
         description: createDesc.trim(),
         severity: createSeverity,
         priority: createPriority || null,
+        assigneeId: createAssigneeId || null,
         externalUrl: selfLogged ? createUrl.trim() : undefined,
         integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
         integrationIssueKey: null,
@@ -592,6 +599,7 @@ export default function BugsPage() {
     setEditAttachments(bug.attachments);
     setEditBetterbugsUrl(bug.betterbugsUrl || "");
     setEditStatus(bug.status);
+    setEditAssigneeId(bug.assigneeId || "");
   }
 
   /* remove an already-uploaded attachment from the bug being edited */
@@ -613,6 +621,7 @@ export default function BugsPage() {
         status: editStatus,
         severity: editSeverity,
         priority: editPriority || null,
+        assigneeId: editAssigneeId || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
         integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
         integrationIssueKey: null,
@@ -1190,7 +1199,7 @@ export default function BugsPage() {
               placeholder="Steps to reproduce, expected vs actual behavior…"
             />
           </Field>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <Field>
               <FieldLabel>Severity</FieldLabel>
               <Select value={createSeverity} onChange={(e) => setCreateSeverity(e.target.value as BugSeverity)}>
@@ -1214,6 +1223,21 @@ export default function BugsPage() {
                 {BUG_PRIORITIES.map((p) => (
                   <option key={p} value={p}>
                     {p}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Assign to</FieldLabel>
+              <Select
+                value={createAssigneeId}
+                onChange={(e) => setCreateAssigneeId(e.target.value)}
+                aria-label="Assign to"
+              >
+                <option value="">Unassigned</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>
+                    {m.name || m.email}
                   </option>
                 ))}
               </Select>
@@ -1378,6 +1402,29 @@ export default function BugsPage() {
                   {p}
                 </option>
               ))}
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel>Assign to</FieldLabel>
+            <Select
+              value={editAssigneeId}
+              onChange={(e) => setEditAssigneeId(e.target.value)}
+              aria-label="Assign to"
+            >
+              <option value="">Unassigned</option>
+              {members.map((m) => (
+                <option key={m.userId} value={m.userId}>
+                  {m.name || m.email}
+                </option>
+              ))}
+              {/* Current assignee not among this project's members — an AI agent or a stale row.
+                  Kept visible as a disabled option so Save doesn't silently clear a real
+                  assignment nobody touched. */}
+              {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
+                <option value={editAssigneeId} disabled>
+                  {editBug?.assigneeName || "Unknown assignee"} (not a project member)
+                </option>
+              )}
             </Select>
           </Field>
           <div className="flex justify-end gap-2 pt-2">

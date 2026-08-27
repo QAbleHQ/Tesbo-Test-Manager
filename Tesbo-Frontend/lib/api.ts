@@ -2092,7 +2092,7 @@ export async function listCycleExecutions(cycleId: string): Promise<ExecutionIte
   return api(`/api/cycles/${cycleId}/executions`);
 }
 
-export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
+export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string | null; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
@@ -2231,6 +2231,9 @@ export interface BugItem {
   reportedBy: string | null;
   reporterName: string;
   reporterEmail: string;
+  assigneeId: string | null;
+  assigneeName: string | null;
+  assigneeType?: "user" | "agent" | null;
   integrationProvider: "JIRA" | "LINEAR" | null;
   integrationIssueKey: string | null;
   betterbugsUrl: string | null;
@@ -2258,6 +2261,8 @@ export async function createBug(projectId: string, data: {
   externalUrl?: string;
   severity?: BugSeverity;
   priority?: BugPriority | null;
+  // null/omitted both mean unassigned on create; there is no "clear" distinction to make yet.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -2274,6 +2279,8 @@ export async function updateBug(bugId: string, data: {
   severity?: BugSeverity;
   // null clears it back to untriaged; omitted leaves the stored value alone.
   priority?: BugPriority | null;
+  // null clears the assignee; omitted leaves the stored value alone.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;

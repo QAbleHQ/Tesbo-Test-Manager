@@ -2412,7 +2412,27 @@ export class LegacyService implements OnModuleInit {
       if (Number(ownerCount.rows[0].count) <= 1) throw new BadRequestException({ error: "Cannot remove the last project owner" });
     }
 
-    await this.db.query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2", [projectId, targetUserId]);
+    /*
+     * "[Test Runs] Unable to assign test cases for execution" edge case: a member removed from the
+     * project must not leave executions/bugs still pointing at them as assignee — that assignment
+     * would be dangling (visible, but to no one who can act on it). Cleared in the same transaction
+     * as the membership delete so a failure partway through never leaves one without the other.
+     * Scoped by project_id so removing someone from this project doesn't touch their assignments in
+     * a different one.
+     */
+    await this.db.transaction(async (client) => {
+      await client.query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2", [projectId, targetUserId]);
+      await client.query(
+        `UPDATE executions e SET assignee_id = NULL, updated_at = now()
+           FROM cycle_items ci JOIN cycles c ON c.id = ci.cycle_id
+          WHERE e.cycle_item_id = ci.id AND c.project_id = $1 AND e.assignee_id = $2 AND e.deleted_at IS NULL`,
+        [projectId, targetUserId]
+      );
+      await client.query(`UPDATE bugs SET assignee_id = NULL, updated_at = now() WHERE project_id = $1 AND assignee_id = $2`, [
+        projectId,
+        targetUserId
+      ]);
+    });
     await this.logProjectActivity(projectId, uid, "project_member_removed", "project_member", targetUserId, target.rows[0].email, { role: targetRole });
   }
 
@@ -4486,8 +4506,30 @@ export class LegacyService implements OnModuleInit {
      * is not data worth keeping — the bug itself, and its link, are what survive.
      */
     const clearsDefect = typeof body.status === "string" && body.status !== "" && body.status !== "Failed";
+    /*
+     * "[Test Runs] Unable to assign test cases for execution": assignee_id used to be written
+     * unconditionally as `body.assigneeId ?? null`, so any PATCH that didn't mention it — every
+     * status-change and every quick-view Save — silently wiped whatever assignee bulkAssignExecutions
+     * had just set. Same explicit-clear convention as clearsDefect/clearsPriority: key absent leaves
+     * the column alone (COALESCE), key sent as null/"" clears it on purpose.
+     */
+    const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
+    let assigneeId: string | null = null;
+    if (body.assigneeId !== undefined && body.assigneeId !== null && body.assigneeId !== "") {
+      assigneeId = String(body.assigneeId);
+      if (!isUuid(assigneeId)) throw new NotFoundException({ error: "Assignee not found" });
+      const member = await this.db.query(
+        "SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2",
+        [before.rows[0].project_id, assigneeId]
+      );
+      if (!member.rows[0]) {
+        throw new BadRequestException({ error: "The assignee must be a member of this project" });
+      }
+    }
     const res = await this.db.query(
-      `UPDATE executions SET status=COALESCE($2,status), assignee_id=$3, actual_result=COALESCE($4,actual_result),
+      `UPDATE executions SET status=COALESCE($2,status),
+       assignee_id=CASE WHEN $9::boolean THEN NULL ELSE COALESCE($3,assignee_id) END,
+       actual_result=COALESCE($4,actual_result),
        executed_at=CASE WHEN $2 IS NULL THEN executed_at ELSE now() END,
        defect_key=CASE WHEN $8::boolean THEN NULL ELSE COALESCE($5,defect_key) END,
        defect_url=CASE WHEN $8::boolean THEN NULL ELSE COALESCE($6,defect_url) END,
@@ -4497,12 +4539,13 @@ export class LegacyService implements OnModuleInit {
       [
         executionId,
         body.status || null,
-        body.assigneeId ?? null,
+        assigneeId,
         body.actualResult || null,
         body.defectKey || null,
         body.defectUrl || null,
         uid,
-        clearsDefect
+        clearsDefect,
+        clearsAssignee
       ]
     );
     await this.logProjectActivity(
@@ -4518,10 +4561,12 @@ export class LegacyService implements OnModuleInit {
 
   private bugSelect(where: string): string {
     return `
-      SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email, links.items AS links,
+      SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
+             ap.display_name AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
       LEFT JOIN users u ON u.id = b.reported_by
+      LEFT JOIN actor_profiles ap ON ap.id = b.assignee_id
       LEFT JOIN LATERAL (
         SELECT json_agg(json_build_object(
           'id', bl.id,
@@ -4728,6 +4773,22 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
+  /**
+   * The assignee a caller asked for, refused as caller error when they aren't a member of this
+   * project. Mirrors bulkAssignExecutions' membership check so bugs and executions share one rule:
+   * work assigned to someone who cannot open the project is work nobody can action, and it also
+   * closes the cross-tenant case — a real user id from a different project fails the same way as
+   * one that doesn't exist.
+   */
+  private async parseBugAssignee(projectId: string, assigneeId: unknown): Promise<string | null> {
+    if (assigneeId === undefined || assigneeId === null || assigneeId === "") return null;
+    const id = String(assigneeId);
+    if (!isUuid(id)) throw new NotFoundException({ error: "Assignee not found" });
+    const member = await this.db.query("SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2", [projectId, id]);
+    if (!member.rows[0]) throw new BadRequestException({ error: "The assignee must be a member of this project" });
+    return id;
+  }
+
   async createBug(projectId: string, userId: string | null | undefined, body: Body) {
     // A link is required whenever the project actually has test cases/runs to link to — enforced
     // client-side (the UI only lets the field be empty when there's nothing to pick). An empty
@@ -4737,11 +4798,12 @@ export class LegacyService implements OnModuleInit {
     const links = await this.sanitizeBugLinks(projectId, normalizeJsonArray(body.links));
     const severity = this.parseBugSeverity(body.severity);
     const priority = this.parseBugPriority(body.priority);
+    const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
 
     const bugId = await this.db.transaction(async (client) => {
       const res = await client.query(
-        `INSERT INTO bugs (project_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        `INSERT INTO bugs (project_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
         [
           projectId,
           links[0]?.executionId || null,
@@ -4756,7 +4818,8 @@ export class LegacyService implements OnModuleInit {
           userId || null,
           body.integrationProvider || null,
           body.integrationIssueKey || null,
-          body.betterbugsUrl || null
+          body.betterbugsUrl || null,
+          assigneeId
         ]
       );
       const id = res.rows[0].id;
@@ -4789,7 +4852,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   async updateBug(userId: string | null | undefined, bugId: string, body: Body) {
-    await this.requireBugAccess(userId, bugId);
+    const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
     // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
     if (body.severity) this.parseBugSeverity(body.severity);
@@ -4802,11 +4865,18 @@ export class LegacyService implements OnModuleInit {
      */
     const clearsPriority = body.priority === null || body.priority === "";
     const priority = this.parseBugPriority(body.priority);
+    // Same explicit-clear convention as priority, and the same membership check as createBug/
+    // updateExecution — an assignee who isn't a member of this bug's project is refused, not just
+    // hidden from the picker.
+    const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
+    const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=COALESCE($6,severity), priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
-       betterbugs_url=COALESCE($9,betterbugs_url), updated_at=now() WHERE id=$1`,
+       betterbugs_url=COALESCE($9,betterbugs_url),
+       assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
+       updated_at=now() WHERE id=$1`,
       [
         bugId,
         body.title || null,
@@ -4818,7 +4888,9 @@ export class LegacyService implements OnModuleInit {
         body.integrationIssueKey || null,
         body.betterbugsUrl || null,
         clearsPriority,
-        priority
+        priority,
+        clearsAssignee,
+        assigneeId
       ]
     );
     if (Array.isArray(body.links)) {

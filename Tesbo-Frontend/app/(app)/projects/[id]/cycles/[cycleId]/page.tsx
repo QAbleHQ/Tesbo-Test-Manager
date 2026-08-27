@@ -416,6 +416,7 @@ export default function TestRunDetailPage() {
   const [bulkRemoveError, setBulkRemoveError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [memberNames, setMemberNames] = useState<Record<string, string>>({});
+  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [planNames, setPlanNames] = useState<Record<string, string>>({});
   const [projectName, setProjectName] = useState("");
 
@@ -451,6 +452,7 @@ export default function TestRunDetailPage() {
   const [panelActualResult, setPanelActualResult] = useState("");
   const [panelDefectKey, setPanelDefectKey] = useState("");
   const [panelDefectUrl, setPanelDefectUrl] = useState("");
+  const [panelAssigneeId, setPanelAssigneeId] = useState("");
   const [panelSaving, setPanelSaving] = useState(false);
 
   /* sharing state */
@@ -512,7 +514,10 @@ export default function TestRunDetailPage() {
       }
       load();
       listProjectMembers(projectId)
-        .then((members) => setMemberNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"]))))
+        .then((members) => {
+          setMembers(members);
+          setMemberNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
+        })
         .catch(() => {});
       listPlans(projectId)
         .then((plans) => setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name]))))
@@ -694,6 +699,7 @@ export default function TestRunDetailPage() {
     setPanelActualResult(exec.actualResult || "");
     setPanelDefectKey(exec.defectKey || "");
     setPanelDefectUrl(exec.defectUrl || "");
+    setPanelAssigneeId(exec.assigneeId || "");
   }
 
   function closeExecutionPanel() {
@@ -709,11 +715,12 @@ export default function TestRunDetailPage() {
         actualResult: panelActualResult,
         defectKey: panelDefectKey || undefined,
         defectUrl: panelDefectUrl || undefined,
+        assigneeId: panelAssigneeId || null,
       });
       setExecutions((prev) =>
         prev.map((e) =>
           e.id === panelExecution.id
-            ? { ...e, status: panelStatus, actualResult: panelActualResult, defectKey: panelDefectKey, defectUrl: panelDefectUrl }
+            ? { ...e, status: panelStatus, actualResult: panelActualResult, defectKey: panelDefectKey, defectUrl: panelDefectUrl, assigneeId: panelAssigneeId || null }
             : e
         )
       );
@@ -2059,6 +2066,29 @@ export default function TestRunDetailPage() {
                     );
                   })}
                 </div>
+              </div>
+
+              {/* Assignee */}
+              <div>
+                <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Assigned to</label>
+                <Select value={panelAssigneeId} onChange={(e) => setPanelAssigneeId(e.target.value)} aria-label="Assigned to">
+                  <option value="">Unassigned</option>
+                  {members.map((m) => (
+                    <option key={m.userId} value={m.userId}>
+                      {m.name || m.email}
+                    </option>
+                  ))}
+                  {/* The current assignee may be someone this fetch didn't return — an AI agent
+                      (executions can be assigned to Zyra outside this UI) or a project member row
+                      that dropped out of `members` for some other reason. Surfacing it as a disabled
+                      option keeps the true current value visible instead of silently defaulting to
+                      "Unassigned", which would clear a real assignment on the next Save. */}
+                  {panelAssigneeId && !members.some((m) => m.userId === panelAssigneeId) && (
+                    <option value={panelAssigneeId} disabled>
+                      {memberNames[panelAssigneeId] || "Unknown assignee"} (not a project member)
+                    </option>
+                  )}
+                </Select>
               </div>
 
               {/* Actual result */}

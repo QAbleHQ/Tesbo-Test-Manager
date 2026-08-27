@@ -224,6 +224,45 @@ test.describe("execution bulk operations, schedules and share links", () => {
     expect(executionStatuses(cycleId).every((s) => s === "Untested")).toBe(true);
   });
 
+  // ─── Single-execution assignment (the reported bug + its membership gap) ──
+
+  test("EXO-A-08 a single-execution PATCH also refuses a non-member assignee", { tag: '@tesbo.testId("TES-TC-1903")' }, async () => {
+    // Unlike bulk-assign (EXO-A-05), the single-execution PATCH used to skip this check entirely —
+    // it would accept any UUID as assignee_id with no membership validation at all.
+    const { cycleId, executionIds } = await seedRun(1);
+    const res = await asOwner.patch(`/api/cycles/${cycleId}/executions/${executionIds[0]}`, {
+      data: { assigneeId: tenant!.guest.userId },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `assigning a non-member via PATCH answered ${res.status()}`).toBeGreaterThanOrEqual(400);
+    expect(
+      scalar(`SELECT assignee_id FROM executions WHERE id = ${literal(executionIds[0])};`) || null,
+    ).toBeNull();
+  });
+
+  test("EXO-A-09 a status-only PATCH does not clear an assignee set via bulk-assign", { tag: '@tesbo.testId("TES-TC-1904")' }, async () => {
+    // The reported bug, reached through the bulk-assign entry point instead of a direct PATCH: assign
+    // via bulk-assign, then touch status only, the way the run detail screen's inline dropdown does.
+    const { cycleId, executionIds } = await seedRun(1);
+    await asOwner.post(`/api/cycles/${cycleId}/executions/bulk-assign`, {
+      data: { executionIds, assigneeId: tenant!.qa.userId },
+      failOnStatusCode: false,
+    });
+    expect(scalar(`SELECT assignee_id FROM executions WHERE id = ${literal(executionIds[0])};`)).toBe(
+      tenant!.qa.userId,
+    );
+
+    const res = await asOwner.patch(`/api/cycles/${cycleId}/executions/${executionIds[0]}`, {
+      data: { status: "Passed" },
+      failOnStatusCode: false,
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    expect(
+      scalar(`SELECT assignee_id FROM executions WHERE id = ${literal(executionIds[0])};`),
+      "a status-only PATCH must not clear an assignee set moments earlier",
+    ).toBe(tenant!.qa.userId);
+  });
+
   // ─── Schedules ────────────────────────────────────────────────────────────
 
   test("EXO-A-07 a created schedule is listed for its project", { tag: '@tesbo.testId("TES-TC-180")' }, async () => {

@@ -86,7 +86,11 @@ export type RbacTenantKind =
   // Zyra chat ↔ repository consistency. Separate from "zyra" because api/zyra.spec.ts owns that
   // tenant and these tests delete test cases out from under a stored transcript, which would change
   // what that file's assertions see.
-  | "zyra-chat";
+  | "zyra-chat"
+  // Bug assignee membership checks ("[Test Runs] Unable to assign test cases for execution"). Needs
+  // a user who is in the workspace but not a project member (guest) to prove the assignee has to be
+  // a member of the bug's own project, the same rule executions.assignee_id already enforces.
+  | "bugs-assignee";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";
