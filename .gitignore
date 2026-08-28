@@ -27,10 +27,19 @@ next-dev*.log
 !*.env.example
 
 # Secrets and credentials
-# tesbo.config.json is what `npx @tesbox/playwright-reporter init` writes, and it carries a project
-# API token with write scope. The SDK creates it 0600 for that reason; committing it would publish
-# the credential regardless of its permissions.
-tesbo.config.json
+#
+# e2e/tesbo.config.json is deliberately NOT ignored. It is what `npx @tesbox/playwright-reporter
+# init` writes, and it carries baseUrl, projectId and a project API token. The first two are not
+# secrets and the SDK's README says to commit them; the token is, and it is committed here as an
+# accepted, deliberate decision (2026-08-28) so that every CI runner has all three values with no
+# credential plumbing — the alternative, two-of-three, is the SDK's `incomplete` state and fails the
+# run at collection time.
+#
+# What that costs, so a future reader can weigh it rather than rediscover it: the token has `write`
+# scope on project 41dba2a2-a60b-4917-8d63-9f8a86986703 only, it cannot read another project, and
+# rotating it (Project -> Settings -> API & MCP) does not remove it from this repo's history. If the
+# repo is ever opened up, rotate first. Precedence is inline options, then env, then this file, so
+# a runner that sets TESBO_API_TOKEN still overrides the committed value without editing anything.
 infra/kubernetes/**/secret.yaml
 infra/kubernetes/base/registry-secret.yaml
 *.pem

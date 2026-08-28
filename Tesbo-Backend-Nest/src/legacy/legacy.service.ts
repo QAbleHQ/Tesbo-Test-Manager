@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, forwardRef,
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import archiver from "archiver";
 import pdfParse from "pdf-parse";
 import * as mammoth from "mammoth";
@@ -7307,7 +7307,10 @@ export class LegacyService implements OnModuleInit {
   static readonly KB_PLAINTEXT_EXTENSIONS = new Set([
     "txt", "md", "csv", "json", "xml", "yaml", "yml", "sql", "html", "css", "js", "ts", "java", "py"
   ]);
-  static readonly KB_SPREADSHEET_EXTENSIONS = new Set(["xls", "xlsx"]);
+  // exceljs only reads the Open XML .xlsx format — legacy binary .xls is not supported, the same
+  // limitation mammoth has for .doc below. .xls stays in KB_ALLOWED_EXTENSIONS so the upload still
+  // succeeds; it just contributes no extracted text to Zyra's context.
+  static readonly KB_SPREADSHEET_EXTENSIONS = new Set(["xlsx"]);
   static readonly KB_PDF_EXTENSIONS = new Set(["pdf"]);
   // mammoth only reads the Open XML .docx format — legacy binary .doc is not supported.
   static readonly KB_DOCX_EXTENSIONS = new Set(["docx"]);
@@ -7321,6 +7324,24 @@ export class LegacyService implements OnModuleInit {
   static readonly KB_EXTRACTED_TEXT_LIMIT = 20000;
   static readonly KB_TESSDATA_PATH = process.env.TESSDATA_PATH || "/app/tessdata";
 
+  // exceljs models a row as a sparse array, so cells are read positionally up to the sheet's column
+  // count rather than by iterating only the cells that exist — otherwise a row with a gap in the
+  // middle would shift every later column one to the left.
+  private static worksheetToCsv(sheet: ExcelJS.Worksheet): string {
+    const lines: string[] = [];
+    sheet.eachRow({ includeEmpty: true }, (row) => {
+      const cells: string[] = [];
+      for (let column = 1; column <= sheet.columnCount; column += 1) {
+        // `.text` flattens every shape a cell value can take — rich text, a hyperlink, a formula's
+        // cached result, a date — into the string a reader would see in Excel.
+        const text = row.getCell(column).text ?? "";
+        cells.push(/[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
+      }
+      lines.push(cells.join(","));
+    });
+    return lines.join("\n");
+  }
+
   // Best-effort text extraction so Zyra's knowledge-base context can include file contents,
   // not just file names. Runs synchronously in the upload request — everything here is local
   // CPU/WASM work with no network call. Audio/video transcription is handled separately
@@ -7331,9 +7352,10 @@ export class LegacyService implements OnModuleInit {
         return buffer.toString("utf8").slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
       if (LegacyService.KB_SPREADSHEET_EXTENSIONS.has(ext)) {
-        const workbook = XLSX.read(buffer, { type: "buffer" });
-        const text = workbook.SheetNames
-          .map((name) => `Sheet: ${name}\n${XLSX.utils.sheet_to_csv(workbook.Sheets[name])}`)
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(buffer);
+        const text = workbook.worksheets
+          .map((sheet) => `Sheet: ${sheet.name}\n${LegacyService.worksheetToCsv(sheet)}`)
           .join("\n\n");
         return text.slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
