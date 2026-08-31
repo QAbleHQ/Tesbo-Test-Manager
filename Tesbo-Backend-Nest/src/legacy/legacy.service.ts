@@ -4573,7 +4573,7 @@ export class LegacyService implements OnModuleInit {
   private bugSelect(where: string): string {
     return `
       SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
-             ap.display_name AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
+             COALESCE(ap.display_name, ap.email) AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
       LEFT JOIN users u ON u.id = b.reported_by
@@ -4638,6 +4638,14 @@ export class LegacyService implements OnModuleInit {
     if (query.cycleId) {
       values.push(query.cycleId);
       filters.push(`b.cycle_id = $${values.length}`);
+    }
+    // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
+    // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
+    if (query.assigneeId === "unassigned") {
+      filters.push("b.assignee_id IS NULL");
+    } else if (query.assigneeId) {
+      values.push(query.assigneeId);
+      filters.push(`b.assignee_id = $${values.length}`);
     }
     const res = await this.db.query(`${this.bugSelect(filters.join(" AND "))} ORDER BY b.created_at DESC`, values);
     return res.rows.map((row) => ({

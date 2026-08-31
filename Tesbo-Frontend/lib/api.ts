@@ -2261,10 +2261,14 @@ export interface BugItem {
   updatedAt: string;
 }
 
-export async function listBugs(projectId: string, params?: { status?: string; cycleId?: string }): Promise<BugItem[]> {
+export async function listBugs(
+  projectId: string,
+  params?: { status?: string; cycleId?: string; assigneeId?: string }
+): Promise<BugItem[]> {
   const sp = new URLSearchParams();
   if (params?.status) sp.set("status", params.status);
   if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
   const query = sp.toString();
   return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
 }
