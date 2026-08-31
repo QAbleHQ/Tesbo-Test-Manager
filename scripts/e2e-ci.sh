@@ -102,7 +102,17 @@ export API_BASE_URL WEB_BASE_URL CI=1
 
 # ─── Dependencies ────────────────────────────────────────────────────────────
 cd "$E2E"
-[ -d node_modules ] || npm ci --no-audit --no-fund
+# Unconditionally, never `[ -d node_modules ] ||`. A CI agent's workspace is persistent, so the
+# directory left by the previous build always exists and that guard skips the install for exactly
+# the case that needs it: a dependency ADDED since that build. It is not a hypothetical — nightlies
+# #3 and #4 (2026-08-27, 2026-08-28) both died in 74s, because `@tesbox/playwright-reporter` had
+# landed on dev and playwright.config.ts imports it at module scope. The config could not load, so
+# `--list` printed nothing, and the selection guard below reported "0 tests" with no reason given.
+#
+# `npm ci` is the right command precisely because it is unconditional: it deletes node_modules and
+# installs the lockfile exactly, so the tree always matches package-lock.json. Its cost on a warm
+# npm cache is seconds; a silently stale tree costs a night's run.
+npm ci --no-audit --no-fund
 # Chromium only — the ui project is the sole browser project (playwright.config.ts). --with-deps is
 # what pulls the shared libraries a bare container lacks.
 #
@@ -123,8 +133,19 @@ else
   SPECS=(${E2E_SPECS:-regression/})
 fi
 
-SELECTED="$(npx playwright test "${SPECS[@]}" --list 2>/dev/null | tail -1 || true)"
-TOTAL="$(npx playwright test --list 2>/dev/null | tail -1 || true)"
+# stderr is KEPT, not sent to /dev/null. `--list` writes its count to stdout and any collection
+# error to stderr, so discarding stderr turns "the config could not be loaded" into an empty
+# variable and a downstream message about a mistyped path. That is what two nightlies looked like:
+# the log said "selection resolved to 0 tests" and never once said "Cannot find module".
+LIST_ERR="$(mktemp)"
+trap 'rm -f "$LIST_ERR"' EXIT
+# `grep '^Total: '`, not `tail -1`. playwright.config.ts prints an environment banner to stdout as it
+# loads, so when collection fails AFTER the config body has run, the last line of stdout is a banner
+# line rather than nothing — and a guard testing for empty output would wave it through. Selecting
+# the count line by shape means "no Total line" reliably identifies a failed listing whatever noise
+# preceded it, which is the invariant that actually holds.
+SELECTED="$(npx playwright test "${SPECS[@]}" --list 2>"$LIST_ERR" | grep -E '^Total: ' | tail -1 || true)"
+TOTAL="$(npx playwright test --list 2>/dev/null | grep -E '^Total: ' | tail -1 || true)"
 
 # Can the selection be counted at all yet?
 #
@@ -163,7 +184,19 @@ echo "────────────────────────�
 # something; see COUNTABLE above.
 if [ "$COUNTABLE" = "yes" ]; then
   case "$SELECTED" in
-    *"Total: 0 "*|"") die "selection resolved to 0 tests. That is a failed selection, not a pass." ;;
+    *"Total: 0 "*|"")
+      # An empty $SELECTED and a literal "Total: 0 tests" are different failures and must not read
+      # the same. Empty means --list produced no stdout at all, i.e. collection never got as far as
+      # counting — a missing dependency, a config that throws, a syntax error. The reason is in
+      # $LIST_ERR and is the single most useful line in the build log, so print it before dying.
+      if [ -z "$SELECTED" ] && [ -s "$LIST_ERR" ]; then
+        echo "--- playwright --list failed; its output follows ---" >&2
+        head -20 "$LIST_ERR" >&2
+        echo "----------------------------------------------------" >&2
+        die "the Playwright config could not be loaded, so no tests could be selected (see above)."
+      fi
+      die "selection resolved to 0 tests. That is a failed selection, not a pass."
+      ;;
   esac
 fi
 

@@ -18,7 +18,7 @@ import {
 } from "@nestjs/common";
 import { FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
@@ -114,24 +114,38 @@ export class LegacyController {
     ].join("\n");
   }
 
-  private sendWorkbook(
+  // exceljs writes whatever it is handed, and a plain object or an array would land as a formula or
+  // rich-text cell rather than a value. Numbers, booleans and dates have to stay typed — a real 0
+  // must survive as the number 0 (see longRow) — so only those pass through untouched; null and
+  // undefined become an empty cell, and anything else is stringified.
+  private cellValue(value: unknown): ExcelJS.CellValue {
+    if (value == null) return null;
+    if (typeof value === "number" || typeof value === "boolean" || value instanceof Date) return value;
+    return String(value);
+  }
+
+  private async sendWorkbook(
     res: Response,
     fileName: string,
     sheetName: string,
     rows: Record<string, unknown>[],
     headers?: string[]
   ) {
-    const workbook = XLSX.utils.book_new();
-    // The header list is passed explicitly wherever the caller knows it: json_to_sheet otherwise
-    // derives the columns from the first row's keys, so exporting a project with no test cases
-    // produced a workbook with no header row at all — a blank sheet with nothing to fill in, while
-    // the CSV export of the same project still emitted its headers.
-    const worksheet = XLSX.utils.json_to_sheet(rows, headers ? { header: headers } : undefined);
-    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
-    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet(sheetName);
+    // The header list is passed explicitly wherever the caller knows it: deriving the columns from
+    // the first row's keys means exporting a project with no test cases produces a workbook with no
+    // header row at all — a blank sheet with nothing to fill in, while the CSV export of the same
+    // project still emits its headers.
+    const columns = headers ?? Object.keys(rows[0] ?? {});
+    worksheet.addRow(columns);
+    for (const row of rows) {
+      worksheet.addRow(columns.map((column) => this.cellValue(row[column])));
+    }
+    const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-    res.send(buffer);
+    res.send(Buffer.from(buffer));
   }
 
   @Post("/api/onboarding/workspace")
@@ -805,7 +819,7 @@ export class LegacyController {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
     const rows = await this.legacy.exportTestCases(projectId, definitions);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
-    this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
+    await this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
   }
 
   @Get("/api/projects/:projectId/testcases/import/template")
@@ -839,7 +853,7 @@ export class LegacyController {
     ];
     const headers = Object.keys(rows[0]);
     if (format === "xlsx") {
-      this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
+      await this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
       return;
     }
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -949,7 +963,7 @@ export class LegacyController {
       res.send(this.rowsToCsv(headers, rows));
       return;
     }
-    this.sendWorkbook(res, `${fileName}.xlsx`, REPORT_VIEW_SHEET_NAMES[typedView], rows, headers);
+    await this.sendWorkbook(res, `${fileName}.xlsx`, REPORT_VIEW_SHEET_NAMES[typedView], rows, headers);
   }
 
   private longRow(section: string, label: string, metric: string, value: unknown): Record<string, unknown> {

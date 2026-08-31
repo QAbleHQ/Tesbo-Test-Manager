@@ -1,19 +1,7 @@
 import path from "node:path";
 import { defineConfig, devices, type ReporterDescription } from "@playwright/test";
-import { readConfigFile } from "@tesbox/playwright-reporter";
 import { env, loadedEnvironment } from "./utils/env";
 
-/*
- * tesbo.config.json, read once here for the same reason the reporter reads it: it is the lowest
- * rung of the reporter's precedence chain (inline options, then environment, then this file), so
- * the inline options below have to know whether it supplies a value before they hardcode one.
- *
- * __dirname rather than the reporter's process.cwd() default: `npx playwright test` is always run
- * from e2e/ today, but a run launched from the repo root would otherwise resolve a different file
- * here than the reporter resolves at onBegin, and the two disagreeing is precisely the silent
- * misconfiguration this block exists to prevent.
- */
-const tesboFileConfig = readConfigFile(__dirname);
 
 /*
  * Which environment this run is aimed at, printed before the first test.
@@ -69,24 +57,21 @@ export default defineConfig({
   /*
    * This suite reports its own results back into Tesbo — the product it tests.
    *
-   * baseUrl and projectId live here rather than in the environment on purpose: neither is a secret,
-   * and a self-hosted install has to carry its own API host in version control anyway. The
-   * credential does not — the token comes from TESBO_API_TOKEN or from the gitignored
-   * e2e/tesbo.config.json, and is never committed.
+   * All three values the reporter needs — baseUrl, projectId, token — come from the committed
+   * e2e/tesbo.config.json, which is what `npx @tesbox/playwright-reporter init` writes. Nothing is
+   * passed inline here on purpose. Inline options are the TOP of the reporter's precedence chain
+   * (inline, then environment, then the file), so a value written here could never be overridden by
+   * the file or by a CI secret — and that is exactly how a stage run once reported into a local
+   * instance that was not even running.
    *
-   * baseUrl is the **API** host (:1021 for this stack, not the frontend's :1020). Pointing it at the
-   * web app fails silently: every ingest call 404s, the reporter logs rather than throws, and the
-   * run stays green with nothing recorded.
+   * This block used to carry a hardcoded `http://localhost:1021` fallback, its own
+   * TESBO_REPORTER_* environment names, and a four-clause `enabled` gate, none of which exist in
+   * the SDK. That divergence is what made this repo a bad template for anyone integrating
+   * Playwright with Tesbo, and it is deliberately gone: what remains is the shape the SDK's README
+   * documents, so a normal project can copy it verbatim.
    *
-   * With none of the three values set the reporter warns once and stays out of the way, so a
-   * checkout with no token still runs an ordinary suite. Setting *some* of them is a hard failure at
-   * collection time, because a run that quietly reported nothing looks exactly like one that
-   * succeeded.
-   *
-   * All three may also come from e2e/tesbo.config.json, which is what `npx @tesbox/playwright-reporter
-   * init` writes. It is the lowest rung of the precedence chain, so anything set here inline or in
-   * the environment still wins — see the comments on each value below, which is where forgetting
-   * that has actually bitten.
+   * To point a run somewhere else, set TESBO_BASE_URL / TESBO_PROJECT_ID / TESBO_API_TOKEN in the
+   * environment — those beat the file without editing anything.
    */
   reporter: [
     ["list"],
@@ -95,58 +80,18 @@ export default defineConfig({
       "@tesbox/playwright-reporter",
       {
         /*
-         * Deliberately NOT env.apiBaseUrl. This is where results are *reported to*, which is not
-         * the same question as which deployment is *under test* — an E2E_ENV=stage run still wants
-         * its results in the local instance unless someone says otherwise, and pointing it at stage
-         * with a projectId that only exists locally would 404 every ingest call silently.
-         *
-         * The `? undefined :` is load-bearing, not defensive. Inline options are the *top* of the
-         * reporter's precedence chain, so a value written here unconditionally can never be
-         * overridden by tesbo.config.json — which is the whole file's purpose. A hardcoded
-         * localhost:1021 meant a stage run whose tesbo.config.json named the stage API still
-         * reported to the local instance, or to nothing at all when it was not running. So each
-         * value is supplied here only when nothing further down the chain supplies one; the
-         * localhost default still applies to a checkout with no tesbo.config.json, unchanged.
+         * Recorded on the run so results from a laptop are filterable apart from CI's, which now
+         * matters: the committed config points every checkout at the same Tesbo project, so a local
+         * `scripts/e2e-run.sh` reports there too. `env.environment` is the E2E_ENV file in effect —
+         * "local", "stage" — and "staging" is the fallback when no environment file was loaded.
          */
-        baseUrl:
-          process.env.TESBO_REPORTER_BASE_URL ??
-          (tesboFileConfig.values.baseUrl ? undefined : "http://localhost:1021"),
-        projectId:
-          process.env.TESBO_REPORTER_PROJECT_ID ??
-          (tesboFileConfig.values.projectId
-            ? undefined
-            : "41dba2a2-a60b-4917-8d63-9f8a86986703"),
-        environment: process.env.TESBO_REPORTER_ENVIRONMENT ?? env.environment ?? "staging",
+        environment: env.environment ?? "staging",
         /*
-         * Why this gate is not optional.
-         *
-         * Committing two of the three values puts the reporter in its `incomplete` state whenever
-         * the token is absent, and `incomplete` throws in onBegin — by design, because somebody who
-         * configured two of three meant to report, and silently reporting nothing would hide the
-         * typo. That is the right default for a suite whose config lives entirely in the
-         * environment; here it would mean every token-less run of this suite dies before its first
-         * test, which is not a price a local `scripts/e2e-run.sh` should pay.
-         *
-         * So: off locally when there is no token — the run behaves exactly as it did before this
-         * reporter existed — and deliberately still on in CI, where a missing credential is a
-         * misconfiguration that has to be loud rather than quietly unreported.
-         *
-         * A token in tesbo.config.json counts. It did not, and that cost a whole stage run: on
-         * 2026-08-27 a 95-test stage run reported nothing at all, because the gate consulted only
-         * process.env while the token that `init` had written sat in e2e/tesbo.config.json — and
-         * environments/stage.env ships TESBO_API_TOKEN= empty on purpose, so the env var could
-         * never satisfy it. The reporter printed not one line, because a disabled reporter returns
-         * from onBegin before it resolves any configuration.
-         *
-         * `error` is here for the same reason `incomplete` throws: a tesbo.config.json that exists
-         * but cannot be parsed must reach the reporter so it can say so, rather than being filtered
-         * out by a gate that reads only its values.
+         * The one escape hatch. The SDK's `enabled` option has no environment variable of its own,
+         * and without this there is no way to run the suite without reporting now that every
+         * checkout carries a working token. TESBO_REPORTER_ENABLED=0 turns it off.
          */
-        enabled:
-          Boolean(process.env.TESBO_API_TOKEN?.trim()) ||
-          Boolean(tesboFileConfig.values.token) ||
-          Boolean(tesboFileConfig.error) ||
-          env.ci,
+        enabled: process.env.TESBO_REPORTER_ENABLED !== "0",
       },
     ],
   ],
