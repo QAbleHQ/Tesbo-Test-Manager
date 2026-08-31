@@ -543,6 +543,40 @@ test.describe("zyra / agents (UI)", () => {
 
     // The chip updates in place to the Title Case label, not the raw "done"/"accepted" token.
     await expect(page.getByText("Done", { exact: true })).toBeVisible();
+
+    // Regression: the button used to stay mounted-but-disabled once done, so a closed task
+    // still showed an actionable-looking "Close task" button. It must be gone, not greyed out.
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-26 a task that is already done never shows a Close task button, on either surface", async ({ browser }) => {
+    // Covers the initial-render path, not just the transition covered by ZYU-17: a task can
+    // load already-done (e.g. "accepted" from a Jira sync), and the button must never mount.
+    const userStory = stamp("Already done story");
+    const taskId = seedTask({ userStory, status: "done" });
+
+    const fullPage = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(fullPage.getByText("Done", { exact: true })).toBeVisible();
+    await expect(fullPage.getByRole("button", { name: "Close task" })).toHaveCount(0);
+
+    const boardPage = await open(browser, "/agents/tasks");
+    await boardPage.getByRole("tab", { name: "Kanban board" }).click();
+    const cardContainer = boardPage.locator("button", { has: boardPage.getByText(userStory) });
+    await cardContainer.click();
+    const panel = boardPage.locator(".slide-in-right");
+    await expect(panel.getByText(userStory)).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-27 a task synced back as 'accepted' is treated as done for the Close task button too", async ({ browser }) => {
+    // normalizeTaskStatus() maps the Jira-sync status "accepted" to "done" for the chip and the
+    // disabled state alike — confirm the button-hiding fix keys off that same normalization,
+    // not a literal `=== "done"` check that a raw "accepted" row would slip past.
+    const taskId = seedTask({ status: "accepted" });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(page.getByText("Done", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
   });
 
   // ─── Authorization ─────────────────────────────────────────────────────────

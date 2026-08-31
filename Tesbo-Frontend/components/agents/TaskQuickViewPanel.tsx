@@ -344,9 +344,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           >
             View full task
           </Link>
-          <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={done || working}>
-            {working ? "Closing…" : "Close task"}
-          </Button>
+          {!done && (
+            <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={working}>
+              {working ? "Closing…" : "Close task"}
+            </Button>
+          )}
         </div>
       </div>
     </>,

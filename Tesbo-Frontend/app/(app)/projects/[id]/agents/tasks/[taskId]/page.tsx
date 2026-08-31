@@ -369,7 +369,9 @@ export default function ZyraTaskDetailPage() {
             )}
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={done || working}>Close task</Button>
+            {!done && (
+              <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>Close task</Button>
+            )}
             <Button variant="confidence" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>Save selected</Button>
           </div>
         </div>
