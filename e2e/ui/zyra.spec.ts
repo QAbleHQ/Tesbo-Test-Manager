@@ -844,6 +844,149 @@ test.describe("zyra / agents (UI)", () => {
     expect(await detail.textContent()).toBe(single);
   });
 
+  // ─── Sources tab: Knowledge Base Markdown rendering (KAN-6 report) ─────────
+  //
+  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }` — only that type
+  // goes through renderMarkdown (lib/markdown.ts, shared with the Zyra chat page); every other
+  // source type keeps rendering as literal whitespace-pre-wrap text, which is what ZYU-30/31/32
+  // above depend on. Real generation can't be driven end to end in this suite (see file header —
+  // no AI provider is configured), so these seed a `knowledge_base` source directly, the same way
+  // the context/story sources above are seeded, and assert on what the panel/page render from it.
+
+  test("ZYU-34 the quick-view panel's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const userStory = stamp("KB markdown story");
+    const detail =
+      "# Search Forum Posts\n\nAs a user, I want to **carefully** review existing posts.\n\nAcceptance Criteria:\n- Search bar is available\n- Results are sortable";
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KAN-6: Search Forum Posts", detail }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.getByRole("heading", { name: "Search Forum Posts", level: 1 })).toBeVisible();
+    await expect(panel.locator("strong", { hasText: "carefully" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Search bar is available" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Results are sortable" })).toBeVisible();
+
+    await expect(
+      panel.getByText("# Search Forum Posts", { exact: true }),
+      "the raw markdown symbol must not be shown as literal text",
+    ).toHaveCount(0);
+    await expect(panel.getByText("**carefully**", { exact: false })).toHaveCount(0);
+  });
+
+  test("ZYU-35 the task detail page's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const detail = "## Description\n\nUse `filters` to narrow **results**.\n- item a\n- item b";
+    const taskId = seedTask({ sources: [{ type: "knowledge_base", title: "KB doc", detail }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Description", level: 2 })).toBeVisible();
+    await expect(page.locator("strong", { hasText: "results" })).toBeVisible();
+    await expect(page.locator(".inline-code", { hasText: "filters" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item a" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item b" })).toBeVisible();
+
+    await expect(page.getByText("## Description", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-36 a Knowledge Base source displays its complete content, not cut off at the old 320-character limit", async ({
+    browser,
+  }) => {
+    // Regression test for the reported truncation ("...so t"): source.detail used to be hard-cut
+    // at 320 characters with no word-boundary awareness. legacy.service.ts now applies a much
+    // larger, word-safe cap (truncateAtWordBoundary) upstream of this point, so content within
+    // that cap must render in full here — this proves the panel itself performs no additional
+    // client-side clipping of what it's given.
+    const tail = "the final sentence must remain fully visible and unclipped";
+    const filler = "Paragraph text describing the feature in detail. ".repeat(10); // > 320 chars
+    const userStory = stamp("KB long content story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `${filler}${tail}` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(tail, { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-37 Knowledge Base content with a long unbroken token wraps inside the panel instead of overflowing it", async ({
+    browser,
+  }) => {
+    // whitespace-pre-wrap alone does not break an unspaced token (a URL, an id) — only
+    // overflow-wrap does. Regression guard for the fixed max-w-[520px] quick-view panel.
+    const longToken = `https://example.com/${"a".repeat(120)}`;
+    const userStory = stamp("KB long token story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `See ${longToken} for details.` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(longToken, { exact: false })).toBeVisible();
+
+    const scrollArea = panel.locator(".overflow-y-auto");
+    const { scrollWidth, clientWidth } = await scrollArea.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    }));
+    expect(scrollWidth, "a long token must wrap, not push the content area into horizontal overflow").toBeLessThanOrEqual(
+      clientWidth + 1,
+    );
+  });
+
+  test("ZYU-38 Knowledge Base content containing HTML-like text is escaped, not rendered as markup", async ({ browser }) => {
+    const marker = `xss-marker-${Date.now()}`;
+    const userStory = stamp("KB injection story");
+    seedTask({
+      userStory,
+      sources: [{ type: "knowledge_base", title: "KB doc", detail: `<img src=x onerror="window.__zyraXss='${marker}'">` }],
+    });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.locator("img")).toHaveCount(0);
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraXss);
+    expect(injected, "the markdown renderer escapes HTML before parsing, so this must never execute").toBeUndefined();
+    await expect(panel.getByText("<img", { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-39 a non-Knowledge-Base source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
+    // Locks the type gate in TaskQuickViewPanel/the task detail page: only `knowledge_base`
+    // sources go through renderMarkdown. Every other type (context, story, jira, linear,
+    // existing_testcase) must keep rendering as literal pre-wrap text — ZYU-30/31/32 depend on
+    // that for `context`, and this pins it against the Markdown-looking text a real Jira
+    // description or user story can plausibly contain (e.g. a literal "- " bullet in prose).
+    const raw = "# Not a heading\n**not bold** and a - bullet look-alike";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: raw }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Not a heading" })).toHaveCount(0);
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    expect(await detail.textContent()).toBe(raw);
+  });
+
   // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─
 
   test("ZYU-33 a transport-level failure on save is retried once instead of surfacing to the user", async ({ browser }) => {

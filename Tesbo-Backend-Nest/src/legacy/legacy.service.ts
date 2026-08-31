@@ -447,6 +447,17 @@ function normalizeJsonArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
 }
 
+// Caps text for display without cutting mid-word/mid-sentence: trims back to the last
+// whitespace before maxLength and marks the cut with an ellipsis. A plain `.slice(0, n)`
+// reads as a bug (e.g. "...so t") rather than an intentional preview.
+function truncateAtWordBoundary(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const cut = value.slice(0, maxLength);
+  const lastBoundary = cut.lastIndexOf(" ");
+  const trimmed = lastBoundary > maxLength * 0.6 ? cut.slice(0, lastBoundary) : cut;
+  return `${trimmed.trimEnd()}…`;
+}
+
 // Renders a stored custom field value into the human-readable form used by CSV/XLSX
 // export (option ids resolved to their current labels, multi-select joined with ", ").
 function formatCustomFieldExportValue(definition: CustomFieldDefinitionDto, raw: unknown): string {
@@ -10256,7 +10267,7 @@ export class LegacyService implements OnModuleInit {
       const sourceSummary = [
         { type: "story", title: "User story", detail: story.slice(0, 320) },
         ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: item.content.slice(0, 320) })),
+        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: truncateAtWordBoundary(item.content, 1500) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))

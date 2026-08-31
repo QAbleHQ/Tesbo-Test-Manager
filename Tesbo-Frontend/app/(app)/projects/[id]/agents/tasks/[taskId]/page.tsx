@@ -21,6 +21,7 @@ import {
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
+import { renderMarkdown } from "@/lib/markdown";
 
 type SaveMode = "existing" | "new";
 type DetailTab = "testcases" | "activities" | "sources";
@@ -551,7 +552,14 @@ export default function ZyraTaskDetailPage() {
               <div key={`${source.type}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
                 <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                 <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{source.title}</h3>
-                <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{source.detail}</p>
+                {source.type === "knowledge_base" ? (
+                  <div
+                    className="zyra-prose zyra-prose-compact break-words mt-1 text-sm text-[var(--muted)]"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
+                  />
+                ) : (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-sm text-[var(--muted)]">{source.detail}</p>
+                )}
               </div>
             ))
           )}
