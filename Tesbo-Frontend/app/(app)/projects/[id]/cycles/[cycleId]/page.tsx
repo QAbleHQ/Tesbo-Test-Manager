@@ -59,6 +59,7 @@ import {
   type BugPriority,
   type IssueSearchResult,
 } from "@/lib/api";
+import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import IssuePickerModal from "@/components/IssuePickerModal";
@@ -923,9 +924,12 @@ export default function TestRunDetailPage() {
     return { total, passed, failed, skipped, blocked, pending };
   }, [executions]);
 
-  // null (rendered as "—") for a run with zero cases, so an empty run is never shown as a
-  // misleading "0% pass rate" — mirrors the Test Runs list summary tile's zero-case handling.
-  const passRate = stats.total ? Math.round((stats.passed / stats.total) * 100) : null;
+  // Pass Rate = Passed / (Passed + Failed + Blocked) — Skipped is neither a pass nor a fail, so it
+  // is excluded from this ratio the same way the Test Plan page excludes it. This used to divide by
+  // stats.total (every case, including Untested/Retest), which is what made this page read 30% for
+  // a run the Test Plan page read as 43% for. Execution Progress (below) is the total-based metric.
+  const passRate = computePassRate(stats);
+  const executionProgress = computeExecutionProgress(stats, stats.total);
 
   /* ───── Test cases table: tab counts, filter, search, pagination ───── */
   const tabCounts = useMemo(() => {
@@ -1108,11 +1112,11 @@ export default function TestRunDetailPage() {
                 <StatPill icon={<IconCircleDashed size={13} />} label="Skipped" value={stats.skipped} tone="skipped" />
                 <StatPill icon={<IconClock size={13} />} label="Pending" value={stats.pending} />
 
-                <div className="min-w-[160px] flex-1">
+                <div className="min-w-[220px] flex-1">
                   <div className="mb-1.5 flex items-center justify-between">
-                    <span className="text-[12px] text-[var(--muted-soft)]">Progress</span>
-                    <span className="text-[12px] font-semibold" style={{ color: "var(--success-foreground)" }}>
-                      {passRate !== null ? `${passRate}% pass rate` : "No cases executed yet"}
+                    <span className="text-[12px] text-[var(--muted-soft)]">Execution Progress</span>
+                    <span className="text-[12px] font-semibold" style={{ color: "var(--info-foreground)" }}>
+                      {stats.total ? `${executionProgress}% executed` : "No cases in this run"}
                     </span>
                   </div>
                   <RunProgressBar
@@ -1123,6 +1127,12 @@ export default function TestRunDetailPage() {
                     pending={stats.pending}
                     total={stats.total}
                   />
+                  <div className="mt-1.5 flex items-center justify-between">
+                    <span className="text-[12px] text-[var(--muted-soft)]">Pass Rate</span>
+                    <span className="text-[12px] font-semibold" style={{ color: "var(--success-foreground)" }}>
+                      {passRate !== null ? `${passRate}%` : "No cases executed yet"}
+                    </span>
+                  </div>
                 </div>
               </div>
             </section>

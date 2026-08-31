@@ -7,6 +7,7 @@ import {
 } from "@tabler/icons-react";
 import { Card } from "@/components/ui";
 import type { PlanListItem } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 
 export type PlanStatus = "active" | "draft";
 
@@ -78,14 +79,14 @@ export function OwnerAvatar({ name, seed }: { name: string; seed?: string | null
 
 function PassRateBar({ passed, failed, blocked }: { passed: number; failed: number; blocked: number }) {
   const total = passed + failed + blocked;
-  const pct = total ? Math.round((passed / total) * 100) : 0;
+  const pct = computePassRate({ passed, failed, blocked });
   const width = (n: number) => `${total ? (n / total) * 100 : 0}%`;
   return (
     <div>
       <div className="mb-1.5 flex items-center justify-between">
         <span className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Pass rate</span>
-        <span className="font-mono text-[12px] font-semibold" style={{ color: total ? passRateColor(pct) : "var(--muted-soft)" }}>
-          {total ? `${pct}%` : "No runs"}
+        <span className="font-mono text-[12px] font-semibold" style={{ color: pct !== null ? passRateColor(pct) : "var(--muted-soft)" }}>
+          {pct !== null ? `${pct}%` : "No runs"}
         </span>
       </div>
       <div className="flex h-[5px] gap-0.5 overflow-hidden rounded-full bg-[var(--surface-secondary)]">

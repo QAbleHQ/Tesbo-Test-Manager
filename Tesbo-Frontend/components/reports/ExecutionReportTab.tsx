@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { IconChartBar, IconTable } from "@tabler/icons-react";
 import { Input, Select } from "@/components/ui";
 import type { ExecutionReportRow, SuiteNode } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 import { DonutChart, StackedBarChart, Legend, STATUS_COLORS, STATUS_KEYS } from "./charts";
 import { MetricCard, LoadingBlock } from "./shared";
 
@@ -169,7 +170,11 @@ export function ExecutionReportTab({
                     ) : (
                       <>
                         {rows.map((row) => {
-                          const passRate = row.total > 0 ? ((row.Passed / row.total) * 100).toFixed(1) : "0.0";
+                          // Passed / (Passed + Failed + Blocked) — Untested/Retest/Skipped are
+                          // excluded from this denominator, matching every other Pass Rate in the
+                          // app (lib/executionMetrics). This used to divide by row.total, which
+                          // includes those statuses and read lower than the rest of the product.
+                          const passRate = computePassRate({ passed: row.Passed, failed: row.Failed, blocked: row.Blocked });
                           return (
                             <tr key={row.groupId} className="hover:bg-[var(--surface-secondary)]">
                               <td className="px-4 py-2.5 text-[13px] font-medium text-[var(--foreground)]">{row.groupName}</td>
@@ -177,18 +182,35 @@ export function ExecutionReportTab({
                                 <td key={s} className="px-3 py-2.5 text-center text-[13px] text-[var(--muted)]">{row[s] || 0}</td>
                               ))}
                               <td className="px-3 py-2.5 text-center text-[13px] font-semibold text-[var(--foreground)]">{row.total}</td>
-                              <td className="px-3 py-2.5 text-center text-[13px] font-semibold" style={{ color: Number(passRate) >= 80 ? "var(--status-pass-text)" : Number(passRate) >= 50 ? "var(--status-blocked-text)" : "var(--status-fail-text)" }}>
-                                {passRate}%
+                              <td
+                                className="px-3 py-2.5 text-center text-[13px] font-semibold"
+                                style={{
+                                  color:
+                                    passRate === null
+                                      ? "var(--muted-soft)"
+                                      : passRate >= 80
+                                      ? "var(--status-pass-text)"
+                                      : passRate >= 50
+                                      ? "var(--status-blocked-text)"
+                                      : "var(--status-fail-text)"
+                                }}
+                              >
+                                {passRate !== null ? `${passRate}%` : "—"}
                               </td>
                             </tr>
                           );
                         })}
-                        <tr className="bg-[var(--surface-secondary)] font-semibold">
-                          <td className="px-4 py-2.5 text-[13px] text-[var(--foreground)]">Total</td>
-                          {STATUS_KEYS.map((s) => <td key={s} className="px-3 py-2.5 text-center text-[13px] text-[var(--muted)]">{totals[s]}</td>)}
-                          <td className="px-3 py-2.5 text-center text-[13px] text-[var(--foreground)]">{totals.total}</td>
-                          <td className="px-3 py-2.5 text-center text-[13px]">{totals.total > 0 ? `${((totals.Passed / totals.total) * 100).toFixed(1)}%` : "0.0%"}</td>
-                        </tr>
+                        {(() => {
+                          const totalPassRate = computePassRate({ passed: totals.Passed, failed: totals.Failed, blocked: totals.Blocked });
+                          return (
+                            <tr className="bg-[var(--surface-secondary)] font-semibold">
+                              <td className="px-4 py-2.5 text-[13px] text-[var(--foreground)]">Total</td>
+                              {STATUS_KEYS.map((s) => <td key={s} className="px-3 py-2.5 text-center text-[13px] text-[var(--muted)]">{totals[s]}</td>)}
+                              <td className="px-3 py-2.5 text-center text-[13px] text-[var(--foreground)]">{totals.total}</td>
+                              <td className="px-3 py-2.5 text-center text-[13px]">{totalPassRate !== null ? `${totalPassRate}%` : "—"}</td>
+                            </tr>
+                          );
+                        })()}
                       </>
                     )}
                   </tbody>

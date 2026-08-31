@@ -188,6 +188,32 @@ test.describe("project dashboard — the stat cards", () => {
     }
   });
 
+  test("DSH-U-09b Execution progress is its own card, separate from Pass rate", { tag: '@tesbo.testId("TES-TC-731-1")' }, async ({ page }) => {
+    /*
+     * "[Test Runs] Pass Rate is Inconsistent Between Test Run Summary and Details" — Execution
+     * Progress (how much of the project has any recorded result, Skipped included) and Pass Rate
+     * (how much of what settled came back green, Skipped excluded) answer different questions and
+     * must never be shown as one number. Skipped is chosen deliberately: it moves the two cards in
+     * opposite directions from a run with nothing but Passed/Failed cases.
+     */
+    const project = await createProject(api);
+    try {
+      // 1 Passed, 1 Skipped, 1 Untested: the one settled case passed (100% pass rate), but only
+      // 2 of the 3 cases have any result at all (67% execution progress) — the two cards disagree
+      // on purpose here, which is the point.
+      await seedRun(api, project.id, { statuses: ["Passed", "Skipped", "Untested"], status: "Completed" });
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBe(100);
+      expect(summary.executionProgress.value).toBe(67);
+
+      await page.goto(`/projects/${project.id}/dashboard`);
+      expect(await statValue(statCard(page, "Pass rate"))).toBe("100%");
+      expect(await statValue(statCard(page, "Execution progress"))).toBe("67%");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-U-10 the trend chip is absent until both comparison windows have executions", { tag: '@tesbo.testId("TES-TC-732")' }, async ({
     page,
   }) => {

@@ -305,18 +305,24 @@ test.describe("test plans — list, search and empty states", () => {
  *
  * The tiles carry no role or test id — a label div above a value paragraph — so the panel is read
  * whole and parsed, the same way the card's case count is asserted absent above. Whitespace is
- * stripped first, which turns the panel into "Overallprogress50%Total2Passed1...".
+ * stripped first, which turns the panel into "Overallprogress50%Passrate100%Total2Passed1...".
+ *
+ * `percent` is Execution Progress (executed/total); `passRate` is the separate Passed/(Passed+
+ * Failed+Blocked) figure added beside it for "[Test Runs] Pass Rate is Inconsistent Between Test
+ * Run Summary and Details" — the two used to be a single conflated number.
  */
-async function progressPanel(page: Page): Promise<{ percent: number; tiles: Record<string, number> }> {
+async function progressPanel(page: Page): Promise<{ percent: number; passRate: number | null; tiles: Record<string, number> }> {
   const section = page.locator("section").filter({ hasText: "Overall progress" }).first();
   await expect(section).toBeVisible();
   const text = ((await section.textContent()) ?? "").replace(/\s+/g, "");
   const percent = Number(text.match(/Overallprogress(\d+)%/)?.[1]);
+  const passRateMatch = text.match(/Passrate(\d+)%/);
+  const passRate = passRateMatch ? Number(passRateMatch[1]) : null;
   const tiles: Record<string, number> = {};
   for (const label of ["Total", "Passed", "Failed", "Blocked", "Skipped", "Untested"]) {
     tiles[label] = Number(text.match(new RegExp(`${label}(\\d+)`))?.[1]);
   }
-  return { percent, tiles };
+  return { percent, passRate, tiles };
 }
 
 /**
@@ -552,7 +558,7 @@ test.describe("test plans — the plan detail progress panel", () => {
       });
 
       await page.goto(`/projects/${project.id}/plans/${plan.id}`);
-      const { percent, tiles } = await progressPanel(page);
+      const { percent, passRate, tiles } = await progressPanel(page);
 
       // 8 cases across the two runs: 2 passed, 1 failed, 1 blocked, 1 skipped, 3 untested (Retest
       // counts with untested), so 5 of 8 are settled.
@@ -567,6 +573,9 @@ test.describe("test plans — the plan detail progress panel", () => {
         "the tiles do not add up to Total",
       ).toBe(tiles.Total);
       expect(percent, "the header percentage is not executed/total").toBe(63);
+      // Pass Rate = Passed / (Passed + Failed + Blocked) = 2 / 4 = 50%. Skipped (1) sits outside
+      // this ratio even though it counts toward the 63% execution progress above.
+      expect(passRate, "the header pass rate is not passed/(passed+failed+blocked)").toBe(50);
 
       // Both runs are listed, and each row's own case count is part of the header's Total.
       const rowA = runRow(page, runA.name);

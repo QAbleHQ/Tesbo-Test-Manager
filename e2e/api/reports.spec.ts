@@ -709,6 +709,44 @@ test.describe("reports overview", () => {
     }
   });
 
+  test("RPT-A-30b Skipped is executed but not settled, and Retest is neither", { tag: '@tesbo.testId("TES-TC-490-1")' }, async () => {
+    /*
+     * Before the fix, this endpoint's "executed" counted anything that was not literally Untested
+     * — which meant a Retest case (no settled result at all) counted as executed, and a Skipped
+     * case counted toward the pass-rate denominator as if it were a missed pass. Both silently
+     * dragged the reported pass rate down for a run whose visible results hadn't changed.
+     */
+    const run = await seedRun(asOwner, fixture.projectId, { name: `E2E Reports Skip Retest Run ${Date.now()}` });
+    try {
+      await addRunCases(asOwner, run.id, [
+        fixture.cases.flaky.id,
+        fixture.cases.stable.id,
+        fixture.cases.lowFlake.id,
+        fixture.cases.untestedP1.id,
+      ]);
+      const executions = await listRunExecutions(asOwner, run.id);
+      const setStatus = (testcaseId: string, status: string) => {
+        const execution = executions.find((e) => e.testcaseId === testcaseId)!;
+        return asOwner.patch(`/api/cycles/${run.id}/executions/${execution.id}`, { data: { status } });
+      };
+      await setStatus(fixture.cases.flaky.id, "Passed");
+      await setStatus(fixture.cases.stable.id, "Skipped");
+      await setStatus(fixture.cases.lowFlake.id, "Retest");
+      // untestedP1 stays Untested.
+
+      const body = await getJson(asOwner, `/api/projects/${fixture.projectId}/reports/overview`);
+      const row = body.passRateTrend.find((p: any) => p.name === run.name);
+      expect(row.total).toBe(4);
+      // Retest and Untested are not executed; Passed and Skipped are.
+      expect(row.executed).toBe(2);
+      expect(row.executionProgress).toBe(50);
+      // Passed / (Passed + Failed + Blocked) = 1/1 = 100% — Skipped never reaches this ratio.
+      expect(row.passRate).toBe(100);
+    } finally {
+      await asOwner.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("RPT-A-31 the trend delta compares the newest run in the window against the oldest", { tag: '@tesbo.testId("TES-TC-491")' }, async () => {
     const body = await getJson(asOwner, `/api/projects/${fixture.projectId}/reports/overview`);
     const rated = body.passRateTrend.filter((p: any) => p.passRate !== null);

@@ -10,6 +10,7 @@ import {
   IconPlayerPlay,
   IconBug,
   IconRosetteDiscountCheck,
+  IconGauge,
   IconCircleHalf2,
   IconTrendingUp,
   IconTrendingDown,
@@ -263,7 +264,7 @@ export default function ProjectDashboardPage() {
       }
     >
       {/* Primary stats */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-5">
         <StatCard
           href={`/projects/${projectId}/testcases`}
           icon={<IconFileText size={18} stroke={1.75} />}
@@ -315,6 +316,31 @@ export default function ProjectDashboardPage() {
                 <div className="h-full rounded-full" style={{ width: `${summary.passRate.value}%`, background: "var(--success)" }} />
               </ThinBar>
             ) : undefined
+          }
+        />
+
+        {/*
+          * A distinct metric from Pass rate above: this is how much of the project's execution
+          * history has a result at all (Passed+Failed+Blocked+Skipped / total), while Pass rate is
+          * how much of what was actually run came back green. Basecamp report: the two used to be
+          * conflated on the Test Run and Test Plan pages, so they get their own tile here too.
+          */}
+        <StatCard
+          href={`/projects/${projectId}/cycles`}
+          icon={<IconGauge size={18} stroke={1.75} />}
+          iconBg="var(--info-soft)"
+          iconColor="var(--info-foreground)"
+          value={
+            <>
+              {summary.executionProgress.value}
+              <span className="text-[16px] font-medium text-[var(--muted)]">%</span>
+            </>
+          }
+          label="Execution progress"
+          bar={
+            <ThinBar>
+              <div className="h-full rounded-full" style={{ width: `${summary.executionProgress.value}%`, background: "var(--info)" }} />
+            </ThinBar>
           }
         />
 

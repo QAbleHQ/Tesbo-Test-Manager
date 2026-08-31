@@ -33,6 +33,7 @@ import {
   type TestRunListItem,
   type TestEnvironmentSetting,
 } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 import {
   Button,
   Input,
@@ -279,21 +280,24 @@ export default function TestRunsPage() {
     return sorted;
   }, [runs, statusFilter, sortBy]);
 
-  // Pass Rate = passed / totalCases (all assigned cases), the same denominator as the "X / Y cases"
-  // fraction on each run card and the Test Run Details page — so the three numbers always reconcile.
-  // Scoped to visibleRuns so the tiles match whatever status filter is applied below them.
+  // Pass Rate = Passed / (Passed + Failed + Blocked) across every visible run, matching the Test
+  // Run Details and Test Plan pages (lib/executionMetrics) — this used to divide by totalCases
+  // (every case, including Untested/Skipped), which disagreed with both of those pages.
+  // Scoped to visibleRuns so the tile matches whatever status filter is applied below it.
   const summary = useMemo(() => {
     const totalRuns = visibleRuns.length;
     const inProgress = visibleRuns.filter((r) => r.status === "In Progress").length;
-    let totalCases = 0;
-    let totalPassed = 0;
+    let passed = 0;
+    let failed = 0;
+    let blocked = 0;
     let openFailures = 0;
     for (const r of visibleRuns) {
-      totalCases += r.totalCases;
-      totalPassed += r.passed;
+      passed += r.passed;
+      failed += r.failed;
+      blocked += r.blocked;
       openFailures += r.failed;
     }
-    const passRate = totalCases > 0 ? Math.round((totalPassed / totalCases) * 100) : null;
+    const passRate = computePassRate({ passed, failed, blocked });
     return { totalRuns, inProgress, passRate, openFailures };
   }, [visibleRuns]);
 

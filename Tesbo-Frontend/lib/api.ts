@@ -698,7 +698,8 @@ export interface ProjectOverview extends ProjectSummary {
   teamMembers: { userId: string; name: string }[];
   lastActivityAt: string | null;
   status: "setup_required" | "configured" | "active";
-  runCounts: { passed: number; failed: number; blocked: number; total: number } | null;
+  runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
   currentPassRate: number | null;
 }
 
@@ -1832,6 +1833,9 @@ export interface PlanProgress {
   skipped: number;
   untested: number;
   executed: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
+  passRate: number | null;
+  /** (Passed + Failed + Blocked + Skipped) / totalCases. */
   completionPercent: number;
 }
 
@@ -2454,7 +2458,15 @@ export interface CyclePassRatePoint {
   name: string;
   createdAt: string;
   total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  /** Passed + Failed + Blocked + Skipped (Untested/Retest excluded). */
   executed: number;
+  /** (executed / total) * 100. */
+  executionProgress: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has settled. */
   passRate: number | null;
 }
 
@@ -2462,6 +2474,8 @@ export interface CyclePassRatePoint {
 export interface SuiteHealthRow {
   suiteName: string;
   executed: number;
+  skipped: number;
+  executionProgress: number;
   passedPct: number;
   failedPct: number;
   blockedPct: number;
@@ -2547,6 +2561,7 @@ export function getReportsExportUrl(
 export interface ProjectDashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
+  executionProgress: { value: number };
   openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
