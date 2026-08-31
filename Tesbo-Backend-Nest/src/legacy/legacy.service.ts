@@ -8830,9 +8830,13 @@ export class LegacyService implements OnModuleInit {
     const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
+      // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
+      // only ever reflects the task-board flow. The ledger is written by every provider call Zyra
+      // makes, chat included, so this total is real usage rather than the permanent 0 a chat-only
+      // project used to see. See V87_zyra_token_usage.sql / recordZyraTokenUsage.
       this.db.query<{ total: string }>(
-        "SELECT COALESCE(SUM(token_total), 0) AS total FROM ai_generation_requests WHERE project_id = $1 AND agent_name = ANY($2::text[])",
-        [projectId, ZYRA_AGENT_NAMES]
+        "SELECT COALESCE(SUM(token_total), 0) AS total FROM zyra_token_usage WHERE project_id = $1",
+        [projectId]
       ),
       this.db.query(
         `SELECT id, requested_by, provider, model, user_story, acceptance_criteria, custom_prompt, style,
@@ -8985,6 +8989,37 @@ export class LegacyService implements OnModuleInit {
       [projectId]
     );
     return Number(res.rows[0]?.count || 0);
+  }
+
+  /**
+   * Logs one provider call's worth of tokens to the zyra_token_usage ledger, backing the "Token
+   * usage" tile on Zyra settings (zyraAgent()). Deliberately INSERT-only and a single standalone
+   * statement — never combined with another write in one transaction, so it can't introduce a
+   * lock-ordering hazard, and a new row's server-generated id never contends with any other
+   * transaction's held locks. This is observability, not the critical path: a failure here is
+   * logged and swallowed, never allowed to fail the chat reply or generation the caller is waiting
+   * on that made the provider call in the first place.
+   */
+  private async recordZyraTokenUsage(
+    projectId: string,
+    source: "task_generate" | "task_regenerate" | "chat_router" | "chat_generate" | "chat_plan" | "chat_tool_finalize",
+    provider: string,
+    model: string,
+    usage: { input?: number; output?: number; total?: number }
+  ): Promise<void> {
+    const input = Number(usage.input || 0);
+    const output = Number(usage.output || 0);
+    const total = Number(usage.total || input + output);
+    if (!total) return;
+    try {
+      await this.db.query(
+        `INSERT INTO zyra_token_usage (project_id, source, provider, model, token_input, token_output, token_total)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [projectId, source, provider || "unknown", model || "unknown", input, output, total]
+      );
+    } catch (err) {
+      this.logger.warn(`zyra token usage not recorded (${source}, project ${projectId}): ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   async zyraTask(projectId: string, userId: string | null | undefined, taskId: string) {
@@ -9406,6 +9441,9 @@ export class LegacyService implements OnModuleInit {
       const raw = providerWire(provider) === "anthropic"
         ? await this.zyraChatWithAnthropic(key, model, context, message)
         : await this.zyraChatWithOpenAi(key, model, context, message);
+      // Real provider usage (raw.__zyraUsage) rather than the estimateTokens() guess the Langfuse
+      // trace below still uses for its own, separate purpose.
+      await this.recordZyraTokenUsage(projectId, "chat_router", provider, model, raw.__zyraUsage || {});
       const modelIntent = this.intentFromZyraModelAction(raw.action, raw.actionType);
       // The router call itself: the prompt the model saw and the structured decision it returned.
       // Recorded before dispatch so a decision that is later overridden by a capability gate is
@@ -9426,6 +9464,7 @@ export class LegacyService implements OnModuleInit {
       if (modelIntent === "jira_pending_testcases") {
         const toolDecision = await this.analyzeZyraJiraTestcaseCoverage(projectId);
         return this.finalizeZyraToolDecisionWithAi({
+          projectId,
           key,
           provider,
           model,
@@ -9472,6 +9511,10 @@ export class LegacyService implements OnModuleInit {
           // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
           // after the router already succeeded.
           const detail = this.extractAiErrorMessage(err);
+          // The failed attempt's provider response, if one arrived, was still billed — see
+          // generateZyraWithOpenAi/Anthropic's zyraUsage on the thrown error.
+          const failedUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+          if (failedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, failedUsage);
           await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: detail, stage: "generation" });
 
           const routedSuiteForTurn = this.routedZyraSuite(raw, projectSnapshot.suites);
@@ -9531,6 +9574,8 @@ export class LegacyService implements OnModuleInit {
             };
           } catch (retryErr) {
             const retryDetail = this.extractAiErrorMessage(retryErr);
+            const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+            if (retryFailedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, retryFailedUsage);
             await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", {
               message: retryDetail,
               stage: "generation_retry"
@@ -9823,6 +9868,10 @@ export class LegacyService implements OnModuleInit {
         testcaseRange: params.testcaseRange
       }
     });
+    // This one function backs every chat-driven "create" call: the first turn, the first batch of
+    // an exhaustive plan (startZyraChatPlan), and every subsequent background batch
+    // (continueZyraChatPlan's loop) — instrumenting it once covers all three.
+    await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, aiResult.usage);
     await this.rememberZyraTurn({
       projectId: params.projectId,
       userId: params.userId,
@@ -9954,6 +10003,7 @@ export class LegacyService implements OnModuleInit {
     let scenarios: string[] = [];
     try {
       scenarios = await this.planZyraChatScenarios({
+        projectId: params.projectId,
         provider: params.provider,
         model: params.model,
         key: params.key,
@@ -10064,6 +10114,10 @@ export class LegacyService implements OnModuleInit {
 
       const doneCount = Number(plan.doneCount || 0);
       const totalCount = Number(plan.totalCount || 0);
+      // Hoisted so the catch block below can still record tokens from a billed-but-unparsed
+      // response even though provider/model are only known once the allocation resolves.
+      let provider = "unknown";
+      let model = "unknown";
       try {
         const allocation = await this.zyraAiAllocation(projectId);
         if (!allocation.key) {
@@ -10077,8 +10131,8 @@ export class LegacyService implements OnModuleInit {
           await this.clearZyraChatPlan(sessionId);
           return;
         }
-        const provider = String(allocation.key.provider || "openai").toLowerCase();
-        const model = normalizeProviderModel(provider, allocation.key.default_model);
+        provider = String(allocation.key.provider || "openai").toLowerCase();
+        model = normalizeProviderModel(provider, allocation.key.default_model);
         const originalMessage = String(plan.originalMessage || "");
         const jiraIssueKeys = normalizeJsonArray(plan.jiraIssueKeys).map(String);
         // Re-read the sources for every batch: existing coverage grows as earlier batches land, so
@@ -10139,6 +10193,10 @@ export class LegacyService implements OnModuleInit {
         );
       } catch (err) {
         const detail = this.extractAiErrorMessage(err);
+        // A batch whose provider response arrived (and was billed) but failed to parse still
+        // carries its usage on the thrown error — see generateZyraWithOpenAi/Anthropic.
+        const batchUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+        if (batchUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, batchUsage);
         // Pause rather than discard: remainingScenarios/doneCount are unchanged (this batch
         // never succeeded), so "continue" — or resumeZyraChatPlan — can retry from here later.
         await this.postZyraPlanMessage(projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], []);
@@ -10163,6 +10221,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async finalizeZyraToolDecisionWithAi(params: {
+    projectId: string;
     key: Body;
     provider: string;
     model: string;
@@ -10187,6 +10246,7 @@ export class LegacyService implements OnModuleInit {
     const raw = providerWire(params.provider) === "anthropic"
       ? await this.zyraChatWithAnthropic(params.key, params.model, finalizePrompt, params.message)
       : await this.zyraChatWithOpenAi(params.key, params.model, finalizePrompt, params.message);
+    await this.recordZyraTokenUsage(params.projectId, "chat_tool_finalize", params.provider, params.model, raw.__zyraUsage || {});
     return {
       reply: this.sanitizeZyraReply(raw.reply, String(params.toolDecision.reply || "")),
       reasoningSummary: String(raw.reasoningSummary || params.toolDecision.reasoningSummary || "").slice(0, 1500),
@@ -10302,6 +10362,11 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async processZyraTask(projectId: string, taskId: string, options: { userId: string; knowledgeItemIds?: string[] }) {
+    // Hoisted out of the try block (rather than left as a `const` inside it) so the catch block
+    // below can still name the provider/model when logging tokens from a response that arrived
+    // and was billed but failed to parse.
+    let provider = "unknown";
+    let model = "unknown";
     try {
       const taskRes = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
       const task = taskRes.rows[0];
@@ -10349,8 +10414,8 @@ export class LegacyService implements OnModuleInit {
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
       const testcaseRange = String((projectSettings as Body).testcaseRange || "1-10");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
-      const provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
-      const model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
+      provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
+      model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
       const knowledge = await this.knowledgeSnapshot(projectId, options.knowledgeItemIds || []);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
@@ -10401,6 +10466,11 @@ export class LegacyService implements OnModuleInit {
          WHERE id = $1 AND project_id = $2 AND task_status = 'in_progress' RETURNING id`,
         [taskId, projectId, drafts.length, JSON.stringify(drafts), tokenInput, tokenOutput, tokenInput + tokenOutput, JSON.stringify(sourceSummary), JSON.stringify(activity)]
       );
+      // Logged regardless of whether the row above actually applied (see the rowCount===0 branch
+      // below) — the provider call happened and was billed either way; only whether the app kept
+      // the resulting drafts is conditional. recordZyraTokenUsage never throws (see its own
+      // try/catch), so awaiting it here cannot turn a logging hiccup into a failed task.
+      await this.recordZyraTokenUsage(projectId, "task_generate", provider, model, aiResult.usage);
       if (successRes.rowCount === 0) {
         // The user closed/saved/resubmitted the task while generation was still running. Their
         // action already reflects the current truth, so don't resurrect it into 'in_review' or
@@ -10446,6 +10516,14 @@ export class LegacyService implements OnModuleInit {
         : "";
       const detail = providerDetail && providerDetail !== summary ? `${summary} (${providerDetail})` : summary;
       this.logger.error(`Zyra task ${taskId} (project ${projectId}) failed: ${detail}`, error instanceof Error ? error.stack : undefined);
+      // A provider response that arrived (and was billed) but failed to parse into usable drafts
+      // carries its usage on the thrown error (see generateZyraWithOpenAi/Anthropic) — without
+      // this, those tokens would silently vanish, which is exactly how 4 of the task-board's
+      // 'failed' rows ended up with token_total=0 despite a real provider call having happened.
+      const zyraUsage = (error as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+      if (zyraUsage) {
+        await this.recordZyraTokenUsage(projectId, "task_generate", provider, model, zyraUsage);
+      }
       // task_status used to revert to 'todo' here — identical to a task that was never started,
       // so a failed generation was indistinguishable from a queued one anywhere the Kanban board
       // reads task_status. 'failed' is a dedicated terminal state the UI can badge distinctly.
@@ -10577,6 +10655,9 @@ export class LegacyService implements OnModuleInit {
         projectId,
         input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
       });
+      // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
+      // branch) — the provider call happened and was billed either way.
+      await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
@@ -10673,6 +10754,12 @@ export class LegacyService implements OnModuleInit {
         : "";
       const detail = providerDetail && providerDetail !== summary ? `${summary} (${providerDetail})` : summary;
       this.logger.error(`Zyra task ${taskId} (project ${projectId}) feedback regeneration failed: ${detail}`, error instanceof Error ? error.stack : undefined);
+      // See processZyraTask's identical check: a response that arrived and was billed but failed
+      // to parse still carries its usage on the thrown error.
+      const zyraUsage = (error as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+      if (zyraUsage) {
+        await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, zyraUsage);
+      }
       // markZyraTaskFailed only marks 'failed' if the row is still 'todo'/'in_progress' — if a
       // concurrent close/save already moved it on, that action wins and this only leaves a note.
       await this.markZyraTaskFailed(projectId, taskId, detail);
@@ -11611,7 +11698,11 @@ export class LegacyService implements OnModuleInit {
       const text = normalizeJsonArray(data.content).map((item: Body) => item?.text || "").join("\n");
       const parsed = this.parseModelJson(text, []);
       if (!parsed) throw new Error("Anthropic returned no parseable JSON.");
-      return parsed;
+      const usage = data.usage || {};
+      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+      const input = Number(usage.input_tokens || 0) + cached;
+      const output = Number(usage.output_tokens || 0);
+      return { ...parsed, __zyraUsage: { input, output, total: input + output } };
     }
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
     const res = await fetch(providerChatUrl(provider, key.base_url, model), {
@@ -11636,7 +11727,8 @@ export class LegacyService implements OnModuleInit {
     const content = String(data.choices?.[0]?.message?.content || "{}");
     const parsed = this.parseModelJson(content, []);
     if (!parsed) throw new Error("OpenAI returned no parseable JSON.");
-    return parsed;
+    const usage = data.usage || {};
+    return { ...parsed, __zyraUsage: { input: Number(usage.prompt_tokens || 0), output: Number(usage.completion_tokens || 0), total: Number(usage.total_tokens || 0) } };
   }
 
   // Plans a todo list of distinct scenarios to cover for an exhaustive ("all possible cases")
@@ -11644,6 +11736,7 @@ export class LegacyService implements OnModuleInit {
   // labels, never full testcase detail — so it can never hit the same output-token ceiling
   // that a single "generate 50 full testcases" call did.
   private async planZyraChatScenarios(params: {
+    projectId: string;
     provider: string;
     model: string;
     key: Body;
@@ -11665,6 +11758,7 @@ export class LegacyService implements OnModuleInit {
       `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List up to ${params.maxScenarios} scenarios, ordered from most to least important. No markdown, no commentary.`
     ].join("\n");
     const parsed = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, userPrompt);
+    await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, parsed.__zyraUsage || {});
     const scenarios = normalizeJsonArray(parsed.scenarios).map((item) => String(item || "").trim()).filter(Boolean);
     return scenarios.slice(0, params.maxScenarios);
   }
@@ -11712,15 +11806,25 @@ export class LegacyService implements OnModuleInit {
       });
     }
     const content = body.choices?.[0]?.message?.content;
-    const usage = body.usage || {};
+    const rawUsage = body.usage || {};
+    const usage = {
+      input: Number(rawUsage.prompt_tokens || 0),
+      output: Number(rawUsage.completion_tokens || 0),
+      total: Number(rawUsage.total_tokens || 0),
+      cached: Number(rawUsage.prompt_tokens_details?.cached_tokens || 0)
+    };
+    // The provider already billed for this response by the time we're parsing it, so a parse
+    // failure below must not lose that — attach the usage we already have to the thrown error
+    // instead of letting normalizeAiDrafts's exception discard it (see zyraUsage callers).
+    let drafts: Body[];
+    try {
+      drafts = this.normalizeAiDrafts(content, params.input.requestedCount);
+    } catch (err) {
+      throw Object.assign(err instanceof Error ? err : new Error(String(err)), { zyraUsage: usage });
+    }
     return {
-      drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
-      usage: {
-        input: Number(usage.prompt_tokens || 0),
-        output: Number(usage.completion_tokens || 0),
-        total: Number(usage.total_tokens || 0),
-        cached: Number(usage.prompt_tokens_details?.cached_tokens || 0)
-      },
+      drafts,
+      usage,
       requestId: response.headers.get("x-request-id") || undefined
     };
   }
@@ -11780,13 +11884,22 @@ export class LegacyService implements OnModuleInit {
         continue;
       }
       const content = normalizeJsonArray(body.content).map((item) => item?.text || "").join("\n").trim();
-      const usage = body.usage || {};
-      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
-      const input = Number(usage.input_tokens || 0) + cached;
-      const output = Number(usage.output_tokens || 0);
+      const rawUsage = body.usage || {};
+      const cached = Number(rawUsage.cache_read_input_tokens || 0) + Number(rawUsage.cache_creation_input_tokens || 0);
+      const input = Number(rawUsage.input_tokens || 0) + cached;
+      const output = Number(rawUsage.output_tokens || 0);
+      const usage = { input, output, total: input + output, cached };
+      // See generateZyraWithOpenAi: the response is already billed, so a parse failure below must
+      // still surface these tokens to the caller via zyraUsage on the thrown error.
+      let drafts: Body[];
+      try {
+        drafts = this.normalizeAiDrafts(content, params.input.requestedCount);
+      } catch (err) {
+        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { zyraUsage: usage });
+      }
       return {
-        drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
-        usage: { input, output, total: input + output, cached },
+        drafts,
+        usage,
         requestId: response.headers.get("request-id") || undefined
       };
     }
@@ -11880,11 +11993,15 @@ export class LegacyService implements OnModuleInit {
     }
     const data = await res.json() as Body;
     const content = String(data.choices?.[0]?.message?.content || "{}");
+    // Real provider usage, not the estimateTokens() guess callers used to fall back to — this was
+    // sitting right here in the response and being thrown away.
+    const usage = data.usage || {};
+    const zyraUsage = { input: Number(usage.prompt_tokens || 0), output: Number(usage.completion_tokens || 0), total: Number(usage.total_tokens || 0) };
     const parsed = this.parseModelJson(content);
-    if (parsed) return parsed;
+    if (parsed) return { ...parsed, __zyraUsage: zyraUsage };
     // AI returned prose instead of JSON — surface it as a plain answer so the
     // user sees the actual message rather than a SyntaxError string.
-    return { reply: content.trim().slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [] };
+    return { reply: content.trim().slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [], __zyraUsage: zyraUsage };
   }
 
   private async zyraChatWithAnthropic(key: Body, model: string, context: string, message: string): Promise<Body> {
@@ -11922,11 +12039,17 @@ export class LegacyService implements OnModuleInit {
       }
       const data = await res.json() as Body;
       const rawText = normalizeJsonArray(data.content).map((item) => item?.text || "").join("\n").trim();
+      // Real provider usage, not the estimateTokens() guess callers used to fall back to — this was
+      // sitting right here in the response and being thrown away.
+      const usage = data.usage || {};
+      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+      const zyraUsage = { input: Number(usage.input_tokens || 0) + cached, output: Number(usage.output_tokens || 0), total: 0 };
+      zyraUsage.total = zyraUsage.input + zyraUsage.output;
       const parsed = this.parseModelJson(rawText || "{}");
-      if (parsed) return parsed;
+      if (parsed) return { ...parsed, __zyraUsage: zyraUsage };
       // AI returned prose instead of JSON — surface it as a plain answer so the
       // user sees the actual message rather than a SyntaxError string.
-      return { reply: rawText.slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [] };
+      return { reply: rawText.slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [], __zyraUsage: zyraUsage };
     }
     throw new Error(`Claude chat failed: ${lastStatus || "No compatible model was accepted."}`);
   }

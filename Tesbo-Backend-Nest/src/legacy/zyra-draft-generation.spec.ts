@@ -31,12 +31,36 @@ function makeLegacy(): LegacyService {
 
 type DraftOut = { title: string; preconditions: string; stepsJson: string; expectedSummary: string; priority: string; tags: string[] };
 
+type GenerationInput = {
+  story: string; context: string; acceptanceCriteria: string; feedback: string;
+  knowledge: Array<{ title: string; content: string }>;
+  jira: Array<{ key: string; summary: string; description: string }>;
+  linear: Array<{ key: string; summary: string; description: string }>;
+  existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string }>;
+  requestedCount: number;
+  testcaseRange?: string;
+};
+
 // normalizeAiDrafts is private implementation detail — reached here directly for the same
 // reason as zyra-response-parsing.spec.ts: this is a text-in/text-out contract test against the
 // exact malformed shapes a model has been observed to emit, with no provider round trip.
 type Internals = {
   normalizeAiDrafts: (raw: unknown, requestedCount: number) => DraftOut[];
+  generateZyraWithOpenAi: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
+  generateZyraWithAnthropic: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
 };
+
+const emptyInput = (): GenerationInput => ({
+  story: "As a user I want to sign in",
+  context: "",
+  acceptanceCriteria: "",
+  feedback: "",
+  knowledge: [],
+  jira: [],
+  linear: [],
+  existingTestcases: [],
+  requestedCount: 5
+});
 
 function internals(svc: LegacyService): Internals {
   return svc as unknown as Internals;
@@ -116,5 +140,66 @@ describe("Zyra testcase draft generation — malformed model output", () => {
     });
     const drafts = internals(svc).normalizeAiDrafts(raw, 2);
     expect(drafts).toHaveLength(2);
+  });
+});
+
+// A response with no recoverable draft (the previous describe block) is still a BILLED provider
+// call — the tokens were spent before "still throws when the output holds no recoverable draft at
+// all" fires. Without this, that usage silently vanished: it's exactly why 4 of the task-board's
+// 'failed' rows in production carry token_total=0 despite a real provider call having happened
+// (see recordZyraTokenUsage / the zyraUsage property on the thrown error in legacy.service.ts).
+describe("Zyra provider call wrappers — usage survives a parse failure", () => {
+  let svc: LegacyService;
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("OpenAI: a billed response with no usable drafts still attaches usage to the thrown error", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        choices: [{ message: { content: "Here is a plain answer with no JSON." } }],
+        usage: { prompt_tokens: 800, completion_tokens: 50, total_tokens: 850 }
+      })
+    }) as unknown as typeof fetch;
+
+    await expect(
+      internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: emptyInput() })
+    ).rejects.toMatchObject({ zyraUsage: { input: 800, output: 50, total: 850 } });
+  });
+
+  it("Anthropic: a billed response with no usable drafts still attaches usage to the thrown error", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        content: [{ type: "text", text: "Here is a plain answer with no JSON." }],
+        usage: { input_tokens: 900, output_tokens: 60 }
+      })
+    }) as unknown as typeof fetch;
+
+    await expect(
+      internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: emptyInput() })
+    ).rejects.toMatchObject({ zyraUsage: { input: 900, output: 60, total: 960 } });
+  });
+
+  it("OpenAI: a successful, parseable response is unaffected — usage still comes back on the result, not just on failure", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "Sign in works", stepsJson: "[]" }] }) } }],
+        usage: { prompt_tokens: 400, completion_tokens: 120, total_tokens: 520 }
+      })
+    }) as unknown as typeof fetch;
+
+    const result = await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: emptyInput() });
+    expect(result).toMatchObject({ usage: { input: 400, output: 120, total: 520 } });
   });
 });

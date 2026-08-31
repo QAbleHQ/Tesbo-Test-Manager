@@ -69,6 +69,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
     exec(`DELETE FROM zyra_chat_messages WHERE session_id IN (SELECT id FROM zyra_chat_sessions WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM zyra_token_usage WHERE project_id IN (${projects});`);
     exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
@@ -946,6 +947,81 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const after = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
     expect(after.status(), `a non-uuid audit row broke the agent — ${await after.text()}`).toBe(200);
     expect(Number((await after.json()).testcasesCreated), "a non-uuid audit row changed the count").toBe(before);
+  });
+
+  // ─── The agent's "Token usage" tile ─────────────────────────────────────────
+
+  /** A ledger row, written directly — see seedTask()'s comment for why: no live model is called here. */
+  function seedTokenUsage(
+    source: "task_generate" | "task_regenerate" | "chat_router" | "chat_generate" | "chat_plan" | "chat_tool_finalize",
+    total: number,
+    projectId = tenant!.mainProjectId,
+  ): void {
+    const input = Math.floor(total / 2);
+    const output = total - input;
+    exec(
+      "INSERT INTO zyra_token_usage (project_id, source, provider, model, token_input, token_output, token_total) VALUES (" +
+        `${literal(projectId)}, ${literal(source)}, 'openai', 'gpt-4o-mini', ${input}, ${output}, ${total});`,
+    );
+  }
+
+  const tokenUsageTotal = async (api: APIRequestContext = asOwner, projectId?: string): Promise<number> => {
+    const res = await api.get(url("/agents/zyra", projectId), { failOnStatusCode: false });
+    expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+    return Number((await res.json()).tokenUsage?.total);
+  };
+
+  test("ZYR-A-34 token usage sums chat-sourced calls, not just the task board", { tag: '@tesbo.testId("TES-TC-1096")' }, async () => {
+    /*
+     * The bug this regresses: zyraAgent() used to SUM(token_total) over ai_generation_requests, a
+     * table only the task-board draft flow (aiGenerate/processZyraTask) ever writes. Every AI call
+     * Zyra's chat makes — the router decision, chat-driven generation, an exhaustive-plan batch, the
+     * Jira-coverage tool finalizer — spent real provider tokens that were never persisted anywhere
+     * this endpoint read, so a project used only through chat (the primary surface, reached from
+     * this same settings page's "Open Zyra chat") showed a permanent 0 no matter how much was spent.
+     *
+     * zyraAgent() now sums zyra_token_usage instead, written by every one of those call sites (see
+     * recordZyraTokenUsage). Asserted as a delta from a baseline for the same reason ZYR-A-31 is:
+     * a re-run against the persistent volume may not start from zero.
+     */
+    const baseline = await tokenUsageTotal();
+
+    seedTokenUsage("chat_router", 120);
+    expect(await tokenUsageTotal(), "a chat router call was not counted").toBe(baseline + 120);
+
+    seedTokenUsage("chat_generate", 4500);
+    expect(await tokenUsageTotal(), "chat-driven generation was not counted").toBe(baseline + 4620);
+
+    seedTokenUsage("chat_plan", 80);
+    seedTokenUsage("chat_tool_finalize", 60);
+    expect(await tokenUsageTotal(), "the exhaustive-plan and Jira-tool call sources were not counted").toBe(baseline + 4760);
+
+    // The task-board sources still count too — this is additive, not a replacement of one blind
+    // spot with another.
+    seedTokenUsage("task_generate", 300);
+    seedTokenUsage("task_regenerate", 150);
+    expect(await tokenUsageTotal(), "task-board sources regressed").toBe(baseline + 5210);
+  });
+
+  test("ZYR-A-35 a project with no recorded usage reads 0, not an error", { tag: '@tesbo.testId("TES-TC-1097")' }, async () => {
+    // The new workspace / never-used-Zyra baseline. COALESCE(SUM(...), 0) over zero rows must not
+    // surface as NULL or a 500 — this is the state every project starts in.
+    const res = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect(res.status(), `reading a project with no usage — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(body.tokenUsage, "tokenUsage is missing from the agent payload").toBeDefined();
+    expect(Number(body.tokenUsage.total)).toBe(0);
+  });
+
+  test("ZYR-A-36 token usage is scoped per project — a second tenant's spend never leaks in", { tag: '@tesbo.testId("TES-TC-1098")' }, async () => {
+    // Same account, its own second project: proves the SUM is filtered by project_id, not just
+    // organization_id — the cheapest way to catch a dropped WHERE clause.
+    const before = await tokenUsageTotal(asOwner, tenant!.secondProjectId);
+    seedTokenUsage("chat_generate", 999, tenant!.mainProjectId);
+    expect(
+      await tokenUsageTotal(asOwner, tenant!.secondProjectId),
+      "usage recorded against the main project leaked into a sibling project's total",
+    ).toBe(before);
   });
 
   // ─── Generation failure surfaces as a distinct status ──────────────────────
