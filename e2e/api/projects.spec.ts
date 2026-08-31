@@ -238,6 +238,7 @@ test.describe("project dashboard summary", () => {
       expect(summary).toEqual({
         testCases: { total: 0, addedThisWeek: 0 },
         passRate: { value: null, deltaThisWeek: null },
+        executionProgress: { value: 0 },
         openBugs: { total: 0, bySeverity: { Critical: 0, High: 0, Medium: 0, Low: 0 } },
         coverage: { pct: null, totalRequirements: 0 },
         plans: 0,
@@ -310,6 +311,41 @@ test.describe("project dashboard summary", () => {
       await seedRun(api, project.id, { statuses: ["Untested", "Untested", "Untested"] });
 
       expect((await getDashboard(api, project.id)).passRate.value).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06b Skipped is excluded from the pass rate denominator but counted in execution progress", { tag: '@tesbo.testId("TES-TC-416-1")' }, async () => {
+    /*
+     * The reported defect's own numbers: 3 Passed, 2 Failed, 2 Blocked, 1 Skipped, 2 Untested.
+     * Test Run Details used to read 3/10 = 30% (dividing by every case) while the Test Plan page
+     * read 3/7 = 43% (dividing by the settled cases). Pass Rate = Passed / (Passed+Failed+Blocked)
+     * = 3/7 = 43% is correct; Execution Progress counts the Skipped case as "done" even though it
+     * carries no verdict, so it is 8/10 = 80%, a different number answering a different question.
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBe(43);
+      expect(summary.executionProgress.value).toBe(80);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06c a run that is entirely Skipped reports no pass rate but full execution progress", { tag: '@tesbo.testId("TES-TC-416-2")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBeNull();
+      expect(summary.executionProgress.value).toBe(100);
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -614,7 +650,7 @@ test.describe("projects overview", () => {
     teamMembers: { userId: string; name: string }[];
     lastActivityAt: string | null;
     status: "setup_required" | "configured" | "active";
-    runCounts: { passed: number; failed: number; blocked: number; total: number } | null;
+    runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
     currentPassRate: number | null;
   };
 
@@ -755,6 +791,50 @@ test.describe("projects overview", () => {
       const entry = await overviewFor(project.id);
       expect(entry.currentPassRate, "an unexecuted run displaced the last executed one").toBe(100);
       expect(entry.runCounts!.total).toBe(2);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-12 the pass rate excludes Skipped from the denominator, matching Test Run Details and Test Plan", { tag: '@tesbo.testId("TES-TC-1198")' }, async () => {
+    /*
+     * The exact numbers from the reported defect: a run with 3 Passed, 2 Failed, 2 Blocked, 1
+     * Skipped and 2 Untested read 30% (3 of 10 total cases) on Test Run Details and 43% (3 of the
+     * 7 settled cases) on the Test Plan page. Passed / (Passed + Failed + Blocked) = 3/7 = 43% is
+     * the one correct answer, and this project-list card is a third surface that has to agree —
+     * runCounts.skipped is exposed precisely so a caller can tell the 1 Skipped case apart from
+     * the 2 still-Untested ones instead of both being silently folded into "not counted".
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.total).toBe(10);
+      expect(entry.runCounts!.passed).toBe(3);
+      expect(entry.runCounts!.failed).toBe(2);
+      expect(entry.runCounts!.blocked).toBe(2);
+      expect(entry.runCounts!.skipped).toBe(1);
+      expect(entry.currentPassRate).toBe(43);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-13 a run that is entirely Skipped reports no pass rate rather than 0%", { tag: '@tesbo.testId("TES-TC-1199")' }, async () => {
+    // Skipped is neither a pass nor a fail — a run with nothing but Skipped cases has no settled
+    // verdict, so this must read "—" (null), the same as an all-Untested run, not 0%.
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.skipped).toBe(2);
+      expect(entry.currentPassRate).toBeNull();
     } finally {
       await deleteProjects(api, [project.id]);
     }

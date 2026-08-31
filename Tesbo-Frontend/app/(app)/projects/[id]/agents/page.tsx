@@ -65,17 +65,17 @@ const futureAgents: Array<{
 
 const ACTIVE_TASK_STATUSES = new Set(["todo", "in_progress", "in_review"]);
 
-function formatRelativeTime(iso: string): string {
-  const ts = new Date(iso).getTime();
-  if (Number.isNaN(ts)) return "just now";
-  const diffMs = Date.now() - ts;
-  const minute = 60_000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
-  if (diffMs < minute) return "just now";
-  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m ago`;
-  if (diffMs < day) return `${Math.floor(diffMs / hour)}h ago`;
-  return `${Math.floor(diffMs / day)}d ago`;
+// Absolute date only — this card must not read "Nd ago" again (it used to go stale
+// silently whenever activity came from Zyra chat instead of the task board; see
+// `agent.lastUsedAt` on the backend, which now accounts for both). This formatter is local
+// to the Agents tab card; the Conversations list on the Zyra chat screen has its own
+// `formatTime` and is intentionally left on its existing "24 Aug, 08:08 pm" format.
+function formatLastUsedDate(iso: string): string | null {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${day}/${month}/${date.getFullYear()}`;
 }
 
 /*
@@ -94,11 +94,7 @@ function deriveZyraStats(tasks: ZyraTask[], testcasesCreated: number) {
     decided.length > 0
       ? Math.round((decided.filter((t) => t.taskStatus === "accepted").length / decided.length) * 100)
       : null;
-  const lastActivityAt = tasks.reduce<string | null>((latest, t) => {
-    if (!latest) return t.updatedAt;
-    return new Date(t.updatedAt).getTime() > new Date(latest).getTime() ? t.updatedAt : latest;
-  }, null);
-  return { testsGenerated, activeTasks, approvalRate, lastActivityAt };
+  return { testsGenerated, activeTasks, approvalRate };
 }
 
 export default function AgentsPage() {
@@ -214,8 +210,16 @@ export default function AgentsPage() {
 
             <div className="mt-4 flex items-center justify-between border-t border-[var(--border-subtle)] pt-3">
               <span className="flex items-center gap-1.5 text-[11px] text-[var(--muted-soft)]">
-                <IconClock size={13} stroke={1.75} />
-                {stats.lastActivityAt ? `Used ${formatRelativeTime(stats.lastActivityAt)}` : "Not used yet"}
+                {(() => {
+                  const lastUsedDate = state.agent.lastUsedAt ? formatLastUsedDate(state.agent.lastUsedAt) : null;
+                  if (!lastUsedDate) return null;
+                  return (
+                    <>
+                      <IconClock size={13} stroke={1.75} />
+                      {`Last used on ${lastUsedDate}`}
+                    </>
+                  );
+                })()}
               </span>
               <span className="inline-flex items-center gap-1 text-[12px] font-medium text-[var(--accent-light)] group-hover:text-[var(--accent-light)]">
                 Open agent

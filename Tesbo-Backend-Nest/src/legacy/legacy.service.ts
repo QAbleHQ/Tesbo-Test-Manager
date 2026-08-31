@@ -447,6 +447,17 @@ function normalizeJsonArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
 }
 
+// Caps text for display without cutting mid-word/mid-sentence: trims back to the last
+// whitespace before maxLength and marks the cut with an ellipsis. A plain `.slice(0, n)`
+// reads as a bug (e.g. "...so t") rather than an intentional preview.
+function truncateAtWordBoundary(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const cut = value.slice(0, maxLength);
+  const lastBoundary = cut.lastIndexOf(" ");
+  const trimmed = lastBoundary > maxLength * 0.6 ? cut.slice(0, lastBoundary) : cut;
+  return `${trimmed.trimEnd()}…`;
+}
+
 // Renders a stored custom field value into the human-readable form used by CSV/XLSX
 // export (option ids resolved to their current labels, multi-select joined with ", ").
 function formatCustomFieldExportValue(definition: CustomFieldDefinitionDto, raw: unknown): string {
@@ -2101,6 +2112,7 @@ export class LegacyService implements OnModuleInit {
         passed: number;
         failed: number;
         blocked: number;
+        skipped: number;
         untested: number;
       }>(
         `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
@@ -2153,7 +2165,15 @@ export class LegacyService implements OnModuleInit {
       const testCaseCount = caseCounts.get(id) ?? 0;
       const lastActivityAt = lastActivity.get(id) ?? null;
       const run = runByProject.get(id);
-      const executed = run ? Math.max(0, run.total_cases - run.untested) : 0;
+      const metrics = run
+        ? LegacyService.computeExecutionMetrics({
+            passed: run.passed,
+            failed: run.failed,
+            blocked: run.blocked,
+            skipped: run.skipped,
+            totalCases: run.total_cases
+          })
+        : null;
       return {
         ...project,
         testCaseCount,
@@ -2163,10 +2183,12 @@ export class LegacyService implements OnModuleInit {
         // An empty project needs setting up; one with cases but no activity is configured but idle.
         status: testCaseCount === 0 ? "setup_required" : lastActivityAt ? "active" : "configured",
         runCounts:
-          run && executed > 0
-            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, total: run.total_cases }
+          run && metrics && metrics.executed > 0
+            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, skipped: run.skipped, total: run.total_cases }
             : null,
-        currentPassRate: run && executed > 0 ? Math.round((run.passed / executed) * 100) : null
+        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A run that is nothing
+        // but Skipped cases has no settled verdict, so this is null (rendered as "—"), not 0%.
+        currentPassRate: metrics ? metrics.passRate : null
       };
     });
   }
@@ -3845,6 +3867,44 @@ export class LegacyService implements OnModuleInit {
               COUNT(e.id) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
               COUNT(e.id) FILTER (WHERE e.status IN ('Untested', 'Retest'))::int AS untested`;
 
+  /**
+   * The one formula for "Pass Rate" and "Execution Progress", used by every endpoint that reports
+   * either number (plans, cycles, projects list, dashboard, reports). Before this existed each
+   * caller reimplemented its own division, and they disagreed on two things: whether a Skipped case
+   * belongs in the denominator, and whether Retest counts as executed. That produced, for the exact
+   * same run, a Test Run Details page reading 30% and a Test Plan page reading 43%.
+   *
+   * - Pass Rate = Passed / (Passed + Failed + Blocked). A case that was deliberately Skipped has no
+   *   pass/fail verdict, so it is excluded from both sides of this ratio — it neither helps nor hurts
+   *   the rate. null when nothing has a settled verdict yet, so an all-pending or all-skipped run
+   *   renders as "—" rather than a misleading 0%.
+   * - Execution Progress = (Passed + Failed + Blocked + Skipped) / Total. Skipped IS counted here: it
+   *   is a deliberate outcome, not work still to do, so it belongs in "how much of this run is done".
+   * - Retest is never executed for either metric — it belongs with Untested (see the comment on
+   *   EXECUTION_BUCKET_COUNTS), so callers must not add it into passed/failed/blocked/skipped.
+   */
+  private static computeExecutionMetrics(counts: {
+    passed: number;
+    failed: number;
+    blocked: number;
+    skipped: number;
+    totalCases: number;
+  }): { executed: number; pending: number; passRate: number | null; executionProgress: number } {
+    const passed = counts.passed || 0;
+    const failed = counts.failed || 0;
+    const blocked = counts.blocked || 0;
+    const skipped = counts.skipped || 0;
+    const totalCases = counts.totalCases || 0;
+    const settled = passed + failed + blocked;
+    const executed = settled + skipped;
+    return {
+      executed,
+      pending: Math.max(0, totalCases - executed),
+      passRate: settled > 0 ? Math.round((passed / settled) * 100) : null,
+      executionProgress: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0
+    };
+  }
+
   async listPlansForUser(userId: string | null | undefined, projectId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.listPlans(projectId);
@@ -4026,7 +4086,7 @@ export class LegacyService implements OnModuleInit {
     const blocked = Number(row.blocked) || 0;
     const skipped = Number(row.skipped) || 0;
     const untested = Number(row.untested) || 0;
-    const executed = passed + failed + blocked + skipped;
+    const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
     return {
       runCount: Number(row.run_count) || 0,
       totalCases,
@@ -4035,8 +4095,9 @@ export class LegacyService implements OnModuleInit {
       blocked,
       skipped,
       untested,
-      executed,
-      completionPercent: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0
+      executed: metrics.executed,
+      passRate: metrics.passRate,
+      completionPercent: metrics.executionProgress
     };
   }
 
@@ -4562,7 +4623,7 @@ export class LegacyService implements OnModuleInit {
   private bugSelect(where: string): string {
     return `
       SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
-             ap.display_name AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
+             COALESCE(ap.display_name, ap.email) AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
       LEFT JOIN users u ON u.id = b.reported_by
@@ -4627,6 +4688,14 @@ export class LegacyService implements OnModuleInit {
     if (query.cycleId) {
       values.push(query.cycleId);
       filters.push(`b.cycle_id = $${values.length}`);
+    }
+    // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
+    // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
+    if (query.assigneeId === "unassigned") {
+      filters.push("b.assignee_id IS NULL");
+    } else if (query.assigneeId) {
+      values.push(query.assigneeId);
+      filters.push(`b.assignee_id = $${values.length}`);
     }
     const res = await this.db.query(`${this.bugSelect(filters.join(" AND "))} ORDER BY b.created_at DESC`, values);
     return res.rows.map((row) => ({
@@ -5557,57 +5626,90 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async cyclePassRateSeries(projectId: string, limit: number) {
-    const res = await this.db.query<{ id: string; name: string; created_at: string; total: number; passed: number; executed: number }>(
+    const res = await this.db.query<{
+      id: string;
+      name: string;
+      created_at: string;
+      total_cases: number;
+      passed: number;
+      failed: number;
+      blocked: number;
+      skipped: number;
+    }>(
       `SELECT c.id, c.name, c.created_at,
-              COUNT(ci.id)::int AS total,
-              COUNT(*) FILTER (WHERE e.status = 'Passed')::int AS passed,
-              COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status <> 'Untested')::int AS executed
+              ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE c.project_id = $1
        GROUP BY c.id
        ORDER BY c.created_at ASC`,
       [projectId]
     );
     const rows = res.rows.slice(-limit);
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      createdAt: r.created_at,
-      total: Number(r.total) || 0,
-      executed: Number(r.executed) || 0,
-      passRate: Number(r.executed) > 0 ? Math.round((Number(r.passed) / Number(r.executed)) * 100) : null
-    }));
+    return rows.map((r) => {
+      const passed = Number(r.passed) || 0;
+      const failed = Number(r.failed) || 0;
+      const blocked = Number(r.blocked) || 0;
+      const skipped = Number(r.skipped) || 0;
+      const totalCases = Number(r.total_cases) || 0;
+      const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
+      return {
+        id: r.id,
+        name: r.name,
+        createdAt: r.created_at,
+        total: totalCases,
+        passed,
+        failed,
+        blocked,
+        skipped,
+        executed: metrics.executed,
+        executionProgress: metrics.executionProgress,
+        passRate: metrics.passRate
+      };
+    });
   }
 
   private async suiteHealth(projectId: string) {
-    const res = await this.db.query<{ suite_name: string; passed: string; failed: string; blocked: string; skipped: string; executed: string }>(
+    const res = await this.db.query<{
+      suite_name: string;
+      total_cases: string;
+      passed: string;
+      failed: string;
+      blocked: string;
+      skipped: string;
+    }>(
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
-              COUNT(*) FILTER (WHERE e.status = 'Passed')::int AS passed,
-              COUNT(*) FILTER (WHERE e.status = 'Failed')::int AS failed,
-              COUNT(*) FILTER (WHERE e.status = 'Blocked')::int AS blocked,
-              COUNT(*) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
-              COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status <> 'Untested')::int AS executed
+              ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
        LEFT JOIN suites s ON s.id = t.suite_id
        LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
        LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.project_id = t.project_id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
     );
     return res.rows.map((r) => {
-      const executed = Number(r.executed) || 0;
-      const pct = (n: number) => (executed > 0 ? Math.round((n / executed) * 100) : 0);
+      const passed = Number(r.passed) || 0;
+      const failed = Number(r.failed) || 0;
+      const blocked = Number(r.blocked) || 0;
+      const skipped = Number(r.skipped) || 0;
+      const totalCases = Number(r.total_cases) || 0;
+      const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
+      // Percentages of settled cases (Passed+Failed+Blocked), matching Pass Rate everywhere else —
+      // Skipped is neither a pass nor a fail, so it does not dilute these three.
+      const settled = passed + failed + blocked;
+      const pct = (n: number) => (settled > 0 ? Math.round((n / settled) * 100) : 0);
       return {
         suiteName: r.suite_name,
-        executed,
-        passedPct: pct(Number(r.passed) || 0),
-        failedPct: pct(Number(r.failed) || 0),
-        blockedPct: pct(Number(r.blocked) || 0)
+        executed: metrics.executed,
+        skipped,
+        executionProgress: metrics.executionProgress,
+        passedPct: pct(passed),
+        failedPct: pct(failed),
+        blockedPct: pct(blocked)
       };
     });
   }
@@ -5814,13 +5916,14 @@ export class LegacyService implements OnModuleInit {
       ),
       // Compares the pass rate of executions recorded in the last 7 days against the 7 days
       // before that, so the dashboard's "+N% this week" badge reflects real execution activity
-      // rather than an all-time trend.
-      this.db.query<{ passed_recent: string; executed_recent: string; passed_prior: string; executed_prior: string }>(
+      // rather than an all-time trend. Settled statuses only (Passed/Failed/Blocked) — matching
+      // computeExecutionMetrics' Pass Rate, Skipped and Retest are not part of this denominator.
+      this.db.query<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
         `SELECT
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '7 days')::int AS passed_recent,
-           COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status NOT IN ('Untested', 'Retest') AND e.executed_at >= now() - interval '7 days')::int AS executed_recent,
+           COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '7 days')::int AS settled_recent,
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS passed_prior,
-           COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status NOT IN ('Untested', 'Retest') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS executed_prior
+           COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS settled_prior
          FROM executions e
          JOIN cycle_items ci ON ci.id = e.cycle_item_id
          JOIN cycles c ON c.id = ci.cycle_id
@@ -5835,18 +5938,19 @@ export class LegacyService implements OnModuleInit {
     }
     const openBugsTotal = Object.values(bySeverity).reduce((a, b) => a + b, 0);
 
-    // Retest leaves the denominator alongside Untested. A case sent back for retest has no settled
-    // result, so counting it as executed-but-not-passed silently dragged the headline pass rate down
-    // while changing nothing visible on the run itself.
-    const unsettled = (counts.executionStatus.Untested || 0) + (counts.executionStatus.Retest || 0);
-    const executed = counts.executionTotal - unsettled;
-    const passRateValue = executed > 0 ? Math.round(((counts.executionStatus.Passed || 0) / executed) * 100) : null;
+    const metrics = LegacyService.computeExecutionMetrics({
+      passed: counts.executionStatus.Passed || 0,
+      failed: counts.executionStatus.Failed || 0,
+      blocked: counts.executionStatus.Blocked || 0,
+      skipped: counts.executionStatus.Skipped || 0,
+      totalCases: counts.executionTotal
+    });
 
     const w = passRateWindows.rows[0];
-    const recentExecuted = Number(w?.executed_recent || 0);
-    const priorExecuted = Number(w?.executed_prior || 0);
-    const recentRate = recentExecuted > 0 ? (Number(w!.passed_recent) / recentExecuted) * 100 : null;
-    const priorRate = priorExecuted > 0 ? (Number(w!.passed_prior) / priorExecuted) * 100 : null;
+    const recentSettled = Number(w?.settled_recent || 0);
+    const priorSettled = Number(w?.settled_prior || 0);
+    const recentRate = recentSettled > 0 ? (Number(w!.passed_recent) / recentSettled) * 100 : null;
+    const priorRate = priorSettled > 0 ? (Number(w!.passed_prior) / priorSettled) * 100 : null;
     const passRateDeltaThisWeek = recentRate !== null && priorRate !== null ? Math.round(recentRate - priorRate) : null;
 
     const totalRequirements = requirements.all.total;
@@ -5855,7 +5959,8 @@ export class LegacyService implements OnModuleInit {
 
     return {
       testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
-      passRate: { value: passRateValue, deltaThisWeek: passRateDeltaThisWeek },
+      passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
+      executionProgress: { value: metrics.executionProgress },
       openBugs: { total: openBugsTotal, bySeverity },
       coverage: { pct: coveragePct, totalRequirements },
       plans: counts.planCount,
@@ -8722,7 +8827,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       this.db.query<{ total: string }>(
@@ -8738,16 +8843,36 @@ export class LegacyService implements OnModuleInit {
          WHERE project_id = $1 AND agent_name = ANY($2::text[])
          ORDER BY updated_at DESC LIMIT 50`,
         [projectId, ZYRA_AGENT_NAMES]
+      ),
+      // Restricted to sessions that actually hold a message, matching has_messages in
+      // zyraChatSessions above: opening the chat auto-creates an empty session to type into
+      // (ZYU-26/27), and that alone must not read as "last used" any more than an
+      // ai_generation_requests row would before a user asked for anything.
+      this.db.query<{ last_used: string | null }>(
+        `SELECT MAX(s.updated_at) AS last_used
+           FROM zyra_chat_sessions s
+          WHERE s.project_id = $1
+            AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
+        [projectId]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
     const key = allocation.key;
+    // Draft tasks (task-board flow) and chat sessions each carry their own activity
+    // timestamp, and only one of the two moves depending on which mode was used — see
+    // zyraCreatedTestcaseCount above for the same split. "Last used" is whichever is newer.
+    const lastTaskActivity = tasks.rows[0]?.updated_at as string | undefined;
+    const lastChatActivity = chatActivity.rows[0]?.last_used ?? undefined;
+    const lastUsedAt = [lastTaskActivity, lastChatActivity]
+      .filter((v): v is string => Boolean(v))
+      .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null;
     return {
       agent: {
         name: ZYRA_AGENT_NAME,
         role: "AI testcase generation agent",
         active: Boolean(key),
-        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason
+        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason,
+        lastUsedAt
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5),
@@ -10256,7 +10381,7 @@ export class LegacyService implements OnModuleInit {
       const sourceSummary = [
         { type: "story", title: "User story", detail: story.slice(0, 320) },
         ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: item.content.slice(0, 320) })),
+        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: truncateAtWordBoundary(item.content, 1500) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))

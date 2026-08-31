@@ -11,6 +11,7 @@ import {
   listProjectMembers,
   type PlanListItem,
 } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 import {
   Button,
   Input,
@@ -97,10 +98,11 @@ function PlanSortMenu({ sortBy, onSortChange }: { sortBy: SortBy; onSortChange: 
   );
 }
 
-function overallPassRate(plans: PlanListItem[]): number {
+function overallPassRate(plans: PlanListItem[]): number | null {
   const passed = plans.reduce((sum, p) => sum + p.passed, 0);
-  const executed = plans.reduce((sum, p) => sum + p.passed + p.failed + p.blocked, 0);
-  return executed ? Math.round((passed / executed) * 100) : 0;
+  const failed = plans.reduce((sum, p) => sum + p.failed, 0);
+  const blocked = plans.reduce((sum, p) => sum + p.blocked, 0);
+  return computePassRate({ passed, failed, blocked });
 }
 
 export default function PlansPage() {
@@ -347,7 +349,7 @@ export default function PlansPage() {
             <div className="flex items-center gap-2 rounded-[7px] border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5">
               <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: "var(--status-pass-dot)" }} />
               <div>
-                <div className="text-[13px] font-semibold leading-tight text-[var(--foreground)]">{passRate}%</div>
+                <div className="text-[13px] font-semibold leading-tight text-[var(--foreground)]">{passRate !== null ? `${passRate}%` : "—"}</div>
                 <div className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Overall pass rate</div>
               </div>
             </div>

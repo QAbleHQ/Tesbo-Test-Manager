@@ -224,6 +224,78 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("heading", { name: "Zyra", level: 1 })).toBeVisible();
   });
 
+  test("ZYU-40 the Agents card shows nothing until used, then an absolute last-used date, and the chat sidebar's own timestamps are untouched", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test. The Agents picker card used to read "Used Nd ago" and go stale whenever the
+     * activity was through chat rather than the task board (see api/zyra.spec.ts ZYR-A-43/44 for the
+     * backend half). The card now shows nothing at all in that footer slot until Zyra has actually
+     * been used — no "Not used yet" placeholder either — and once used reads "Last used on
+     * DD/MM/YYYY"; this pins both states and that it never regresses back to a relative "…ago"
+     * string.
+     *
+     * The Zyra chat screen's own "Conversations" sidebar renders each session's timestamp with its
+     * own long-standing `formatTime` (e.g. "Aug 24, 08:08 PM") and was explicitly asked NOT to change
+     * — pinned here too, on the same seeded session, so a future edit to the card's date logic can't
+     * silently leak into the sidebar.
+     */
+    // Same selector convention as ZYU-02: the whole card is one <button>, and its accessible name is
+    // the concatenation of everything visible inside it — heading, role text, description, chips,
+    // and the "Last used on …" footer this test cares about.
+    const agentCard = (page: Page) => page.getByRole("button", { name: /Zyra the Test Generator/ });
+    const lastUsedText = (page: Page) => agentCard(page).getByText(/^(Last used on|Not used|Used) /);
+
+    // Nothing used yet — the footer slot must render no last-used text of any kind.
+    const cleanPage = await open(browser, "/agents");
+    await expect(agentCard(cleanPage)).toBeVisible();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Auto-creates one empty session to type into — must NOT make the card show a last-used date,
+    // the same boundary ZYU-26/27 pin for the sidebar's own "0 sessions" / hasMessages reporting.
+    await open(browser, "/agents/zyra");
+    await cleanPage.reload();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Give that session an actual message, the same way ZYU-26 does — direct insert, since no AI
+    // provider is configured for this tenant (file header) to drive a real send.
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(sessionId, "opening the chat did not auto-create a session").toBeTruthy();
+    exec(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES ` +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Write me some test cases', 'sent');`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    await cleanPage.reload();
+    const usedLabel = agentCard(cleanPage).getByText(/^Last used on \d{2}\/\d{2}\/\d{4}$/);
+    await expect(usedLabel).toBeVisible();
+    await expect(agentCard(cleanPage).getByText(/ago$/)).toHaveCount(0);
+
+    // The date is DD/MM/YYYY and within a day of "now" either side of a UTC/local boundary — not
+    // asserted against an exact string, since the browser's and the DB's timezone need not match.
+    const labelText = (await usedLabel.textContent())!;
+    const [, dd, mm, yyyy] = labelText.match(/(\d{2})\/(\d{2})\/(\d{4})/)!;
+    const shown = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+    const today = new Date();
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const dayDiff = Math.abs(shown.getTime() - todayMidnight.getTime()) / 86_400_000;
+    expect(dayDiff, `"${labelText}" is not close to today's date`).toBeLessThanOrEqual(1);
+
+    // The chat screen's own "Conversations" sidebar timestamp is untouched by this fix — still its
+    // pre-existing locale format, not DD/MM/YYYY.
+    const chatPage = await open(browser, "/agents/zyra");
+    const sidebarRow = chatPage.locator("aside button").first();
+    await expect(sidebarRow).toBeVisible();
+    const sidebarTimestamp = (await sidebarRow.locator("span").nth(1).textContent()) ?? "";
+    expect(sidebarTimestamp, "the chat sidebar's own timestamp regressed to DD/MM/YYYY").not.toMatch(
+      /^\d{2}\/\d{2}\/\d{4}$/,
+    );
+    expect(sidebarTimestamp.trim().length, "the sidebar row lost its timestamp entirely").toBeGreaterThan(0);
+  });
+
   // ─── The unconfigured-provider state, which is most workspaces ─────────────
 
   test("ZYU-03 the chat says the provider is not connected and points at where to fix it", { tag: '@tesbo.testId("TES-TC-1088")' }, async ({
@@ -543,6 +615,40 @@ test.describe("zyra / agents (UI)", () => {
 
     // The chip updates in place to the Title Case label, not the raw "done"/"accepted" token.
     await expect(page.getByText("Done", { exact: true })).toBeVisible();
+
+    // Regression: the button used to stay mounted-but-disabled once done, so a closed task
+    // still showed an actionable-looking "Close task" button. It must be gone, not greyed out.
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-26 a task that is already done never shows a Close task button, on either surface", async ({ browser }) => {
+    // Covers the initial-render path, not just the transition covered by ZYU-17: a task can
+    // load already-done (e.g. "accepted" from a Jira sync), and the button must never mount.
+    const userStory = stamp("Already done story");
+    const taskId = seedTask({ userStory, status: "done" });
+
+    const fullPage = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(fullPage.getByText("Done", { exact: true })).toBeVisible();
+    await expect(fullPage.getByRole("button", { name: "Close task" })).toHaveCount(0);
+
+    const boardPage = await open(browser, "/agents/tasks");
+    await boardPage.getByRole("tab", { name: "Kanban board" }).click();
+    const cardContainer = boardPage.locator("button", { has: boardPage.getByText(userStory) });
+    await cardContainer.click();
+    const panel = boardPage.locator(".slide-in-right");
+    await expect(panel.getByText(userStory)).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-27 a task synced back as 'accepted' is treated as done for the Close task button too", async ({ browser }) => {
+    // normalizeTaskStatus() maps the Jira-sync status "accepted" to "done" for the chip and the
+    // disabled state alike — confirm the button-hiding fix keys off that same normalization,
+    // not a literal `=== "done"` check that a raw "accepted" row would slip past.
+    const taskId = seedTask({ status: "accepted" });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(page.getByText("Done", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
   });
 
   // ─── Authorization ─────────────────────────────────────────────────────────
@@ -808,6 +914,149 @@ test.describe("zyra / agents (UI)", () => {
     const detail = sourceCard.locator("p");
     await expect(detail).toBeVisible();
     expect(await detail.textContent()).toBe(single);
+  });
+
+  // ─── Sources tab: Knowledge Base Markdown rendering (KAN-6 report) ─────────
+  //
+  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }` — only that type
+  // goes through renderMarkdown (lib/markdown.ts, shared with the Zyra chat page); every other
+  // source type keeps rendering as literal whitespace-pre-wrap text, which is what ZYU-30/31/32
+  // above depend on. Real generation can't be driven end to end in this suite (see file header —
+  // no AI provider is configured), so these seed a `knowledge_base` source directly, the same way
+  // the context/story sources above are seeded, and assert on what the panel/page render from it.
+
+  test("ZYU-34 the quick-view panel's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const userStory = stamp("KB markdown story");
+    const detail =
+      "# Search Forum Posts\n\nAs a user, I want to **carefully** review existing posts.\n\nAcceptance Criteria:\n- Search bar is available\n- Results are sortable";
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KAN-6: Search Forum Posts", detail }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.getByRole("heading", { name: "Search Forum Posts", level: 1 })).toBeVisible();
+    await expect(panel.locator("strong", { hasText: "carefully" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Search bar is available" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Results are sortable" })).toBeVisible();
+
+    await expect(
+      panel.getByText("# Search Forum Posts", { exact: true }),
+      "the raw markdown symbol must not be shown as literal text",
+    ).toHaveCount(0);
+    await expect(panel.getByText("**carefully**", { exact: false })).toHaveCount(0);
+  });
+
+  test("ZYU-35 the task detail page's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const detail = "## Description\n\nUse `filters` to narrow **results**.\n- item a\n- item b";
+    const taskId = seedTask({ sources: [{ type: "knowledge_base", title: "KB doc", detail }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Description", level: 2 })).toBeVisible();
+    await expect(page.locator("strong", { hasText: "results" })).toBeVisible();
+    await expect(page.locator(".inline-code", { hasText: "filters" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item a" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item b" })).toBeVisible();
+
+    await expect(page.getByText("## Description", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-36 a Knowledge Base source displays its complete content, not cut off at the old 320-character limit", async ({
+    browser,
+  }) => {
+    // Regression test for the reported truncation ("...so t"): source.detail used to be hard-cut
+    // at 320 characters with no word-boundary awareness. legacy.service.ts now applies a much
+    // larger, word-safe cap (truncateAtWordBoundary) upstream of this point, so content within
+    // that cap must render in full here — this proves the panel itself performs no additional
+    // client-side clipping of what it's given.
+    const tail = "the final sentence must remain fully visible and unclipped";
+    const filler = "Paragraph text describing the feature in detail. ".repeat(10); // > 320 chars
+    const userStory = stamp("KB long content story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `${filler}${tail}` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(tail, { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-37 Knowledge Base content with a long unbroken token wraps inside the panel instead of overflowing it", async ({
+    browser,
+  }) => {
+    // whitespace-pre-wrap alone does not break an unspaced token (a URL, an id) — only
+    // overflow-wrap does. Regression guard for the fixed max-w-[520px] quick-view panel.
+    const longToken = `https://example.com/${"a".repeat(120)}`;
+    const userStory = stamp("KB long token story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `See ${longToken} for details.` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(longToken, { exact: false })).toBeVisible();
+
+    const scrollArea = panel.locator(".overflow-y-auto");
+    const { scrollWidth, clientWidth } = await scrollArea.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    }));
+    expect(scrollWidth, "a long token must wrap, not push the content area into horizontal overflow").toBeLessThanOrEqual(
+      clientWidth + 1,
+    );
+  });
+
+  test("ZYU-38 Knowledge Base content containing HTML-like text is escaped, not rendered as markup", async ({ browser }) => {
+    const marker = `xss-marker-${Date.now()}`;
+    const userStory = stamp("KB injection story");
+    seedTask({
+      userStory,
+      sources: [{ type: "knowledge_base", title: "KB doc", detail: `<img src=x onerror="window.__zyraXss='${marker}'">` }],
+    });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.locator("img")).toHaveCount(0);
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraXss);
+    expect(injected, "the markdown renderer escapes HTML before parsing, so this must never execute").toBeUndefined();
+    await expect(panel.getByText("<img", { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-39 a non-Knowledge-Base source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
+    // Locks the type gate in TaskQuickViewPanel/the task detail page: only `knowledge_base`
+    // sources go through renderMarkdown. Every other type (context, story, jira, linear,
+    // existing_testcase) must keep rendering as literal pre-wrap text — ZYU-30/31/32 depend on
+    // that for `context`, and this pins it against the Markdown-looking text a real Jira
+    // description or user story can plausibly contain (e.g. a literal "- " bullet in prose).
+    const raw = "# Not a heading\n**not bold** and a - bullet look-alike";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: raw }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Not a heading" })).toHaveCount(0);
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    expect(await detail.textContent()).toBe(raw);
   });
 
   // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─

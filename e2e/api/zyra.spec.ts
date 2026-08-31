@@ -79,10 +79,30 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   }
 
   /** A chat session, created through the product's own route. */
-  async function createSession(title = `E2E session ${Date.now()}`, api: APIRequestContext = asOwner): Promise<any> {
-    const res = await api.post(url("/agents/zyra/chat/sessions"), { data: { title }, failOnStatusCode: false });
+  async function createSession(
+    title = `E2E session ${Date.now()}`,
+    api: APIRequestContext = asOwner,
+    projectId?: string,
+  ): Promise<any> {
+    const res = await api.post(url("/agents/zyra/chat/sessions", projectId), { data: { title }, failOnStatusCode: false });
     expect(res.status(), `creating a chat session — ${await res.text()}`).toBe(201);
     return res.json();
+  }
+
+  /*
+   * Writes a user message directly into a session and bumps its updated_at, the way the real send
+   * path does once it gets past the point of no return (legacy.service.ts sendZyraChatMessage,
+   * ~9048-9049) — arranged through Postgres, the same rule seedTask() and ZYR-A-31's
+   * markCreatedByZyra follow, because driving this through the live route would depend on how far a
+   * "no AI provider configured" reply gets before failing, which the last-used tests below aren't
+   * about.
+   */
+  function markChatUsed(sessionId: string, projectId = tenant!.mainProjectId): void {
+    exec(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES ` +
+        `(${literal(sessionId)}, ${literal(projectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Write me some test cases', 'sent');`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
   }
 
   /**
@@ -1212,5 +1232,76 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(longSource?.title).toBe("User Story Context");
     expect(longSource?.detail).toBe(longContext.slice(0, 320));
     expect(longSource?.detail.length).toBe(320);
+  });
+
+  // ─── The agent's "last used" timestamp ─────────────────────────────────────
+
+  test("ZYR-A-43 the agent reports no last-used date until Zyra is actually used, then the more recent of chat or the task board", async () => {
+    /*
+     * Regression test. The Agents screen tile derived "last used" (rendered as "Used Nd ago")
+     * purely from ai_generation_requests — the task-board draft flow — so a workspace that only
+     * ever talked to Zyra through chat kept reporting the same stale date forever, exactly like
+     * ZYR-A-31's "0 tests generated" before that counter was fixed to read both modes. lastUsedAt
+     * is now the newer of the task board's latest updated_at and a chat session's, and a session
+     * with no message in it (auto-created just by opening the chat — see ZYU-26/27) must not count,
+     * the same way an unused session is excluded from has_messages.
+     */
+    const readAgent = async (): Promise<{ lastUsedAt: string | null }> => {
+      const res = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+      expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+      const body = await res.json();
+      expect(body.agent, "the agent payload carries no agent object").toBeTruthy();
+      return body.agent;
+    };
+    // Nothing used yet: purge() ran in beforeEach/afterEach, so this project starts clean.
+    const before = await readAgent();
+    expect(before.lastUsedAt, "a project with no Zyra activity reported a last-used date").toBeNull();
+
+    // Opening the chat alone (an empty, message-less session) must not count as usage.
+    const emptySession = await createSession("Zyra chat");
+    const stillNone = await readAgent();
+    expect(stillNone.lastUsedAt, "an empty auto-created chat session counted as 'last used'").toBeNull();
+
+    // Actually sending a chat message is usage.
+    markChatUsed(emptySession.id);
+    const afterChat = await readAgent();
+    expect(afterChat.lastUsedAt, "a real chat message did not update last-used").not.toBeNull();
+    const chatSeenAt = scalar(`SELECT updated_at::text FROM zyra_chat_sessions WHERE id = ${literal(emptySession.id)};`);
+    expect(new Date(afterChat.lastUsedAt!).getTime()).toBe(new Date(chatSeenAt).getTime());
+
+    // Backdate the chat activity, then use the task board — the newer of the two must win.
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() - interval '10 days' WHERE id = ${literal(emptySession.id)};`);
+    const taskId = seedTask();
+    const afterTask = await readAgent();
+    const taskSeenAt = scalar(`SELECT updated_at::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    expect(
+      new Date(afterTask.lastUsedAt!).getTime(),
+      "a more recent task-board update did not take over from an older chat timestamp",
+    ).toBe(new Date(taskSeenAt).getTime());
+
+    // Backdate the task too, so the (still newer) chat activity wins back.
+    exec(`UPDATE ai_generation_requests SET updated_at = now() - interval '20 days' WHERE id = ${literal(taskId)};`);
+    const afterBothOld = await readAgent();
+    expect(
+      new Date(afterBothOld.lastUsedAt!).getTime(),
+      "the more recent activity (chat, 10 days back) should still win over an older task-board update",
+    ).toBe(new Date(chatSeenAt).getTime());
+  });
+
+  test("ZYR-A-44 a second project's Zyra activity is not reflected in this project's last-used date", async () => {
+    // Cross-project isolation for the same field ZYR-A-43 exercises: a used chat session in the
+    // second project must not leak into the main project's lastUsedAt, the same boundary ZYR-A-05
+    // pins for the underlying rows themselves.
+    const before = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect((await before.json()).agent.lastUsedAt).toBeNull();
+
+    const otherSession = await createSession("Zyra chat", asOwner, tenant!.secondProjectId);
+    markChatUsed(otherSession.id, tenant!.secondProjectId);
+
+    const after = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect(
+      (await after.json()).agent.lastUsedAt,
+      "a chat message sent in the second project changed the main project's last-used date",
+    ).toBeNull();
   });
 });

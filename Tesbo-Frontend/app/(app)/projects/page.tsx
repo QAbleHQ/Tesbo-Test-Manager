@@ -39,7 +39,7 @@ import {
 } from "@/lib/validation";
 import { avatarColor } from "@/lib/avatarColors";
 
-type RunCounts = { passed: number; failed: number; blocked: number; total: number };
+type RunCounts = { passed: number; failed: number; blocked: number; skipped: number; total: number };
 type ProjectStatus = "active" | "configured" | "setup_required";
 
 /*

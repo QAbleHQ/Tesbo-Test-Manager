@@ -27,6 +27,7 @@ import {
   type ReportsTrends,
   type SuiteNode,
 } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { PageLoader } from "@/components/ui";
 import { ReportsNav, type ReportView } from "@/components/reports/ReportsNav";
@@ -175,14 +176,16 @@ export default function ReportsPage() {
   }, [auth, activeView, projectId]);
 
   const headerStats = useMemo(() => {
+    // Summed from each cycle's raw Passed/Failed/Blocked counts rather than re-deriving from the
+    // already-rounded per-cycle passRate — reconstructing "passed" as round(passRate% * executed)
+    // and re-dividing compounds rounding error across every run in the trend.
     let passRate: number | null = null;
     if (overview) {
-      const withRate = overview.passRateTrend.filter((p) => p.passRate !== null && p.executed > 0);
-      const totalExecuted = withRate.reduce((sum, p) => sum + p.executed, 0);
-      if (totalExecuted > 0) {
-        const totalPassed = withRate.reduce((sum, p) => sum + Math.round(((p.passRate as number) / 100) * p.executed), 0);
-        passRate = Math.round((totalPassed / totalExecuted) * 100);
-      }
+      const totals = overview.passRateTrend.reduce(
+        (acc, p) => ({ passed: acc.passed + p.passed, failed: acc.failed + p.failed, blocked: acc.blocked + p.blocked }),
+        { passed: 0, failed: 0, blocked: 0 }
+      );
+      passRate = computePassRate(totals);
     }
     let coverage: number | null = null;
     if (insights) {
