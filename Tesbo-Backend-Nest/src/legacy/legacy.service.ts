@@ -7458,7 +7458,12 @@ export class LegacyService implements OnModuleInit {
       }
       if (LegacyService.KB_SPREADSHEET_EXTENSIONS.has(ext)) {
         const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.load(buffer);
+        // exceljs's own index.d.ts is a module, so its unwrapped `declare interface Buffer
+        // extends ArrayBuffer {}` fallback (for consumers without @types/node) shadows the
+        // real Buffer only inside that file — `load()`'s parameter type is that local,
+        // permanently-incompatible stub, not Node's Buffer, so no cast to `Buffer` can ever
+        // satisfy it. `any` is required to bypass the structural check entirely.
+        await workbook.xlsx.load(buffer as any);
         const text = workbook.worksheets
           .map((sheet) => `Sheet: ${sheet.name}\n${LegacyService.worksheetToCsv(sheet)}`)
           .join("\n\n");
