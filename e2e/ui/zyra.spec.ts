@@ -224,6 +224,78 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("heading", { name: "Zyra", level: 1 })).toBeVisible();
   });
 
+  test("ZYU-40 the Agents card shows nothing until used, then an absolute last-used date, and the chat sidebar's own timestamps are untouched", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test. The Agents picker card used to read "Used Nd ago" and go stale whenever the
+     * activity was through chat rather than the task board (see api/zyra.spec.ts ZYR-A-43/44 for the
+     * backend half). The card now shows nothing at all in that footer slot until Zyra has actually
+     * been used — no "Not used yet" placeholder either — and once used reads "Last used on
+     * DD/MM/YYYY"; this pins both states and that it never regresses back to a relative "…ago"
+     * string.
+     *
+     * The Zyra chat screen's own "Conversations" sidebar renders each session's timestamp with its
+     * own long-standing `formatTime` (e.g. "Aug 24, 08:08 PM") and was explicitly asked NOT to change
+     * — pinned here too, on the same seeded session, so a future edit to the card's date logic can't
+     * silently leak into the sidebar.
+     */
+    // Same selector convention as ZYU-02: the whole card is one <button>, and its accessible name is
+    // the concatenation of everything visible inside it — heading, role text, description, chips,
+    // and the "Last used on …" footer this test cares about.
+    const agentCard = (page: Page) => page.getByRole("button", { name: /Zyra the Test Generator/ });
+    const lastUsedText = (page: Page) => agentCard(page).getByText(/^(Last used on|Not used|Used) /);
+
+    // Nothing used yet — the footer slot must render no last-used text of any kind.
+    const cleanPage = await open(browser, "/agents");
+    await expect(agentCard(cleanPage)).toBeVisible();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Auto-creates one empty session to type into — must NOT make the card show a last-used date,
+    // the same boundary ZYU-26/27 pin for the sidebar's own "0 sessions" / hasMessages reporting.
+    await open(browser, "/agents/zyra");
+    await cleanPage.reload();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Give that session an actual message, the same way ZYU-26 does — direct insert, since no AI
+    // provider is configured for this tenant (file header) to drive a real send.
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(sessionId, "opening the chat did not auto-create a session").toBeTruthy();
+    exec(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES ` +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Write me some test cases', 'sent');`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    await cleanPage.reload();
+    const usedLabel = agentCard(cleanPage).getByText(/^Last used on \d{2}\/\d{2}\/\d{4}$/);
+    await expect(usedLabel).toBeVisible();
+    await expect(agentCard(cleanPage).getByText(/ago$/)).toHaveCount(0);
+
+    // The date is DD/MM/YYYY and within a day of "now" either side of a UTC/local boundary — not
+    // asserted against an exact string, since the browser's and the DB's timezone need not match.
+    const labelText = (await usedLabel.textContent())!;
+    const [, dd, mm, yyyy] = labelText.match(/(\d{2})\/(\d{2})\/(\d{4})/)!;
+    const shown = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+    const today = new Date();
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const dayDiff = Math.abs(shown.getTime() - todayMidnight.getTime()) / 86_400_000;
+    expect(dayDiff, `"${labelText}" is not close to today's date`).toBeLessThanOrEqual(1);
+
+    // The chat screen's own "Conversations" sidebar timestamp is untouched by this fix — still its
+    // pre-existing locale format, not DD/MM/YYYY.
+    const chatPage = await open(browser, "/agents/zyra");
+    const sidebarRow = chatPage.locator("aside button").first();
+    await expect(sidebarRow).toBeVisible();
+    const sidebarTimestamp = (await sidebarRow.locator("span").nth(1).textContent()) ?? "";
+    expect(sidebarTimestamp, "the chat sidebar's own timestamp regressed to DD/MM/YYYY").not.toMatch(
+      /^\d{2}\/\d{2}\/\d{4}$/,
+    );
+    expect(sidebarTimestamp.trim().length, "the sidebar row lost its timestamp entirely").toBeGreaterThan(0);
+  });
+
   // ─── The unconfigured-provider state, which is most workspaces ─────────────
 
   test("ZYU-03 the chat says the provider is not connected and points at where to fix it", { tag: '@tesbo.testId("TES-TC-1088")' }, async ({

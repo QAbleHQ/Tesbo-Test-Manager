@@ -8741,7 +8741,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       this.db.query<{ total: string }>(
@@ -8757,16 +8757,36 @@ export class LegacyService implements OnModuleInit {
          WHERE project_id = $1 AND agent_name = ANY($2::text[])
          ORDER BY updated_at DESC LIMIT 50`,
         [projectId, ZYRA_AGENT_NAMES]
+      ),
+      // Restricted to sessions that actually hold a message, matching has_messages in
+      // zyraChatSessions above: opening the chat auto-creates an empty session to type into
+      // (ZYU-26/27), and that alone must not read as "last used" any more than an
+      // ai_generation_requests row would before a user asked for anything.
+      this.db.query<{ last_used: string | null }>(
+        `SELECT MAX(s.updated_at) AS last_used
+           FROM zyra_chat_sessions s
+          WHERE s.project_id = $1
+            AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
+        [projectId]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
     const key = allocation.key;
+    // Draft tasks (task-board flow) and chat sessions each carry their own activity
+    // timestamp, and only one of the two moves depending on which mode was used — see
+    // zyraCreatedTestcaseCount above for the same split. "Last used" is whichever is newer.
+    const lastTaskActivity = tasks.rows[0]?.updated_at as string | undefined;
+    const lastChatActivity = chatActivity.rows[0]?.last_used ?? undefined;
+    const lastUsedAt = [lastTaskActivity, lastChatActivity]
+      .filter((v): v is string => Boolean(v))
+      .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null;
     return {
       agent: {
         name: ZYRA_AGENT_NAME,
         role: "AI testcase generation agent",
         active: Boolean(key),
-        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason
+        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason,
+        lastUsedAt
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5),

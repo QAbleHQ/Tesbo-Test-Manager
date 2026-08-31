@@ -860,6 +860,7 @@ export interface ZyraAgentState {
     role: string;
     active: boolean;
     activationReason: string;
+    lastUsedAt: string | null;
   };
   settings: { testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities };
   aiKey: {
