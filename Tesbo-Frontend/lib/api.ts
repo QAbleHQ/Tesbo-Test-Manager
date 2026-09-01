@@ -652,6 +652,12 @@ export async function removeWorkspaceProjectAccess(data: { projectId: string; us
 // Projects
 export type ProjectType = "tesbox";
 
+/** `color`/`glyph` null means "not overridden" — the card falls back to the generated placeholder. */
+export interface ProjectIcon {
+  color: string | null;
+  glyph: string | null;
+}
+
 export interface ProjectSummary {
   id: string;
   key: string;
@@ -660,6 +666,7 @@ export interface ProjectSummary {
   projectType: ProjectType;
   role: string;
   createdAt: string;
+  icon: ProjectIcon | null;
 }
 
 export async function listProjects(): Promise<ProjectSummary[]> {
@@ -715,7 +722,13 @@ export interface CreateProjectResponse {
   createdAt: string;
 }
 
-export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<CreateProjectResponse> {
+export async function createProject(data: {
+  key?: string;
+  name: string;
+  description?: string;
+  projectType?: ProjectType;
+  icon?: { color?: string | null; glyph?: string | null } | null;
+}): Promise<CreateProjectResponse> {
   return api<CreateProjectResponse>("/api/projects", { method: "POST", body: data });
 }
 
@@ -723,7 +736,15 @@ export async function getProject(id: string): Promise<Record<string, unknown>> {
   return api<Record<string, unknown>>(`/api/projects/${id}`);
 }
 
-export async function updateProject(id: string, data: { name?: string; description?: string; settings?: string }): Promise<void> {
+export async function updateProject(
+  id: string,
+  data: {
+    name?: string;
+    description?: string;
+    settings?: string;
+    icon?: { color?: string | null; glyph?: string | null } | null;
+  }
+): Promise<void> {
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
 }
 

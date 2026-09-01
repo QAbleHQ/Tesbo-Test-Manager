@@ -357,6 +357,68 @@ const PROJECT_NAME_MIN_LENGTH = 3;
 const PROJECT_NAME_MAX_LENGTH = 30;
 const PROJECT_DESCRIPTION_MAX_LENGTH = 500;
 
+// Mirrors AVATAR_COLORS in Tesbo-Frontend/lib/avatarColors.ts. Every swatch there is chosen to clear
+// WCAG AA (4.5:1) under white text, so the project icon picker is restricted to this exact palette
+// rather than accepting arbitrary hex — the same reasoning that keeps user/team avatars off free-form
+// colors. Two copies (frontend picker, backend guard) rather than a shared package, same as
+// PROJECT_NAME_MAX_LENGTH above; keep them in sync if the palette ever changes.
+const PROJECT_ICON_COLORS = ["#7C5FCC", "#4C5FD5", "#1F7A3D", "#1D7FA8", "#A85F06", "#D83A3A"];
+
+// A custom glyph replaces the auto-derived initial on a project's colored badge — meant for one
+// emoji or a couple of typed letters, not a label. Grapheme-counted rather than length-counted so a
+// single emoji built from multiple code points (a ZWJ sequence, a skin-tone modifier) still counts
+// as one character instead of being rejected as "too long".
+const PROJECT_ICON_GLYPH_MAX_GRAPHEMES = 2;
+const PROJECT_ICON_GLYPH_MAX_LENGTH = 16;
+
+function countGraphemes(value: string): number {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  let count = 0;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  for (const _ of segmenter.segment(value)) count++;
+  return count;
+}
+
+type ProjectIcon = { color: string | null; glyph: string | null };
+
+/**
+ * Validates the optional `icon` override on create/update. `undefined` means the field was not
+ * sent at all — leave whatever is stored alone. `null`, or `{ color: null, glyph: null }`, is how a
+ * caller explicitly clears back to the generated placeholder (deterministic color + first initial).
+ */
+function validateProjectIcon(raw: unknown): ProjectIcon | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return { color: null, glyph: null };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BadRequestException({ error: "icon must be an object with color and/or glyph" });
+  }
+  const body = raw as Body;
+  let color: string | null = null;
+  if (body.color !== undefined && body.color !== null && String(body.color).trim() !== "") {
+    const candidate = String(body.color).trim();
+    const match = PROJECT_ICON_COLORS.find((c) => c.toLowerCase() === candidate.toLowerCase());
+    if (!match) throw new BadRequestException({ error: "Icon color must be one of the supported palette colors" });
+    color = match;
+  }
+  let glyph: string | null = null;
+  if (body.glyph !== undefined && body.glyph !== null) {
+    const trimmed = String(body.glyph).trim();
+    if (trimmed) {
+      if (/[\u0000-\u001F\u007F]/.test(trimmed)) {
+        throw new BadRequestException({ error: "Icon glyph contains unsupported characters" });
+      }
+      if (trimmed.length > PROJECT_ICON_GLYPH_MAX_LENGTH || countGraphemes(trimmed) > PROJECT_ICON_GLYPH_MAX_GRAPHEMES) {
+        throw new BadRequestException({ error: `Icon glyph must be at most ${PROJECT_ICON_GLYPH_MAX_GRAPHEMES} characters` });
+      }
+      // Uppercased the same way a project key is: toUpperCase() is a no-op on an emoji or digit, so
+      // this only ever changes letters. Normalized server-side too, not just in the picker, so a
+      // caller posting directly to the API gets the same badge convention as the UI.
+      glyph = trimmed.toUpperCase();
+    }
+  }
+  return { color, glyph };
+}
+
 /** Shared by createProject/updateProject. `name`/`description` undefined means "not being changed". */
 function validateProjectFields(name: string | undefined, description: string | undefined): void {
   if (name !== undefined) {
@@ -2044,14 +2106,23 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT p.id, p.key, p.name, COALESCE(p.description, '') AS description,
               COALESCE(p.project_type, 'tesbox') AS project_type,
-              COALESCE(pm.role, 'member') AS role, p.created_at
+              COALESCE(pm.role, 'member') AS role, p.created_at, p.settings
        FROM projects p
        JOIN project_members pm ON pm.project_id = p.id
        WHERE pm.user_id = $1 AND p.organization_id = $2 AND p.archived_at IS NULL
        ORDER BY p.created_at DESC`,
       [uid, workspace.id]
     );
-    return res.rows.map(toCamel);
+    return res.rows.map((row) => {
+      const camelRow = toCamel(row);
+      // Raw settings is an internal implementation detail (also carries testcaseIdPrefix,
+      // testRunEnvironments, zyraAgent, …) — only the icon override is a card-list concern, so pull
+      // just that out and drop the rest rather than leaking the whole blob to this list endpoint.
+      const icon = parseSettings(row.settings).icon as ProjectIcon | undefined;
+      camelRow.icon = icon && (icon.color || icon.glyph) ? { color: icon.color ?? null, glyph: icon.glyph ?? null } : null;
+      delete camelRow.settings;
+      return camelRow;
+    });
   }
 
   /**
@@ -2198,6 +2269,7 @@ export class LegacyService implements OnModuleInit {
     const name = String(body.name || "").trim();
     validateProjectFields(name, body.description != null ? String(body.description) : undefined);
     validateProjectKey(body.key != null ? String(body.key) : undefined);
+    const icon = validateProjectIcon(body.icon);
     const workspace = await this.workspace(uid);
     // Creating a project is an administrative act, not part of authoring or executing tests. The
     // projects list hides the button from a QA Engineer, but that is presentation — the rule has to
@@ -2205,7 +2277,7 @@ export class LegacyService implements OnModuleInit {
     if (this.normalizeRole(workspace.role) === "qa_engineer")
       throw new ForbiddenException({ error: "Only the workspace owner, admin, or manager can create projects" });
     await this.planLimits.assertCanCreateProject(workspace.id);
-    const res = await this.insertProjectWithUniqueKey(workspace.id, uid, name, body);
+    const res = await this.insertProjectWithUniqueKey(workspace.id, uid, name, body, icon);
     await this.logProjectActivity(res.id, uid, "project_created", "project", res.id, res.name, {});
     return toCamel(res);
   }
@@ -2223,21 +2295,24 @@ export class LegacyService implements OnModuleInit {
    * them. The retry exists because two concurrent creates can both read the same free key: rather
    * than fail the second caller, re-derive and try again.
    */
-  private async insertProjectWithUniqueKey(organizationId: string, uid: string, name: string, body: Body) {
+  private async insertProjectWithUniqueKey(organizationId: string, uid: string, name: string, body: Body, icon?: ProjectIcon) {
     // An explicit key was already validated (validateProjectKey) against the real 32-character
     // column width — sanitize it the same way but do NOT also run it through projectKey()'s
     // 16-character UX slice, or a caller-chosen key gets silently shortened just like the bug
     // this validation exists to catch. Only the name-derived fallback keeps that shorter budget.
     const explicitKey = body.key != null ? sanitizeKey(String(body.key)) : "";
     const requestedBase = explicitKey || projectKey(name);
+    // No icon chosen stores an empty settings object, same as before this field existed, so a
+    // project created without one still falls back to the deterministic color + initial on read.
+    const settingsJson = icon && (icon.color || icon.glyph) ? JSON.stringify({ icon }) : "{}";
     for (let attempt = 1; ; attempt++) {
       const key = await this.nextFreeProjectKey(organizationId, requestedBase);
       try {
         return await this.db.transaction(async (client) => {
           const project = await client.query(
-            `INSERT INTO projects (organization_id, key, name, description, project_type)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, key, name, project_type, created_at`,
-            [organizationId, key, name, body.description || "", body.projectType || "tesbox"]
+            `INSERT INTO projects (organization_id, key, name, description, project_type, settings)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id, key, name, project_type, created_at`,
+            [organizationId, key, name, body.description || "", body.projectType || "tesbox", settingsJson]
           );
           await client.query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')", [
             project.rows[0].id,
@@ -2316,6 +2391,7 @@ export class LegacyService implements OnModuleInit {
     const name = body.name !== undefined ? String(body.name).trim() : undefined;
     const description = body.description !== undefined ? String(body.description) : undefined;
     validateProjectFields(name, description);
+    const icon = validateProjectIcon(body.icon);
     await this.db.query(
       `UPDATE projects SET
        name = COALESCE($2, name),
@@ -2325,6 +2401,16 @@ export class LegacyService implements OnModuleInit {
        WHERE id = $1`,
       [id, name ?? null, description ?? null, body.settings ? JSON.stringify(body.settings) : null]
     );
+    if (icon !== undefined) {
+      // A targeted jsonb_set rather than a read-modify-write of the whole settings blob, so an icon
+      // change can't race a concurrent save of testcaseIdPrefix/testRunEnvironments (or vice versa)
+      // and silently drop whichever one lost the race.
+      await this.db.query(
+        `UPDATE projects SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{icon}', $2::jsonb, true), updated_at = now()
+         WHERE id = $1`,
+        [id, JSON.stringify(icon)]
+      );
+    }
   }
 
   // Membership alone is not enough to reconfigure a project. Every neighbouring administrative
