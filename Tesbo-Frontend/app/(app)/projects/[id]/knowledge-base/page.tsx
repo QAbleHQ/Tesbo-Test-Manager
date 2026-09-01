@@ -43,15 +43,14 @@ import {
   searchKnowledgeBase,
   getKnowledgeBaseSummary,
   getKnowledgeFolderExportUrl,
-  getKnowledgeDocumentSyncEvents,
   type KnowledgeFolderTreeNode,
   type KnowledgeItem,
   type KnowledgeBreadcrumbEntry,
   type KnowledgeFile,
   type KnowledgeBaseSummary,
-  type KnowledgeDocumentSyncEvent,
 } from "@/lib/api";
 import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
+import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
@@ -240,52 +239,12 @@ function formatDate(value: string): string {
   return date.toLocaleDateString();
 }
 
-/** The popover's own content — pure display, no positioning/open-state concerns of its own. */
-function ChangeHistoryContent({ projectId, documentId }: { projectId: string; documentId: string }) {
-  const [state, setState] = useState<{ loading: boolean; events: KnowledgeDocumentSyncEvent[]; error: boolean }>({
-    loading: true,
-    events: [],
-    error: false,
-  });
-
-  useEffect(() => {
-    let cancelled = false;
-    getKnowledgeDocumentSyncEvents(projectId, documentId)
-      .then((res) => {
-        if (!cancelled) setState({ loading: false, events: res.events, error: false });
-      })
-      .catch(() => {
-        if (!cancelled) setState({ loading: false, events: [], error: true });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectId, documentId]);
-
-  return (
-    <div className="w-[240px] px-3 py-2">
-      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Change history</div>
-      {state.loading ? (
-        <div className="py-1 text-[12px] text-[var(--muted)]">Loading…</div>
-      ) : state.error ? (
-        <div className="py-1 text-[12px] text-[var(--error-foreground)]">Couldn&apos;t load change history.</div>
-      ) : state.events.length === 0 ? (
-        <div className="py-1 text-[12px] text-[var(--muted)]">No change history recorded yet.</div>
-      ) : (
-        <ul className="max-h-[200px] space-y-2 overflow-auto">
-          {state.events.map((event) => (
-            <li key={event.id} className="text-[12px] leading-snug">
-              <div className="font-medium text-[var(--foreground)]">
-                {event.eventType === "created" ? "Added" : "Updated"} · {formatDate(event.createdAt)}
-              </div>
-              {event.changedSummary && <div className="text-[var(--muted)]">{event.changedSummary}</div>}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), Math.max(min, max));
 }
+
+const CHANGE_HISTORY_POPOVER_WIDTH = 280;
+const CHANGE_HISTORY_VIEWPORT_MARGIN = 8;
 
 /**
  * The info icon on a synced (mirror) row, plus its popover — opens on hover OR click (unlike
@@ -299,7 +258,11 @@ function ChangeHistoryContent({ projectId, documentId }: { projectId: string; do
  *  - No native hover (touch, or a click via keyboard) still works: click toggles independently of
  *    hover, and an outside click/Escape closes it for the caller with no "mouse leaves" to fire.
  *  - Positioned via a fixed-position portal (same technique as Menu.tsx) so the table's own
- *    `overflow-auto` wrapper can never clip it.
+ *    `overflow-auto` wrapper can never clip it, AND kept fully on-screen: horizontally clamped
+ *    against the actual (measured) popover width, and flipped above the trigger when there isn't
+ *    room below — re-measured via ResizeObserver whenever the content's size changes (loading ->
+ *    loaded, or paging), not just once at open time, since a fixed guess at open time would still
+ *    crop once real content replaced the "Loading…" placeholder or a page's row count changed.
  */
 function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; documentId: string }) {
   const [open, setOpen] = useState(false);
@@ -318,8 +281,13 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
   const openNow = useCallback(() => {
     cancelClose();
     if (triggerRef.current) {
+      // A rough first position from the trigger alone, so something renders immediately instead
+      // of waiting a frame — the effect below corrects it against the panel's real size.
       const rect = triggerRef.current.getBoundingClientRect();
-      setPosition({ top: rect.bottom + 4, left: rect.left });
+      setPosition({
+        top: rect.bottom + 4,
+        left: clamp(rect.left, CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerWidth - CHANGE_HISTORY_POPOVER_WIDTH - CHANGE_HISTORY_VIEWPORT_MARGIN)
+      });
     }
     setOpen(true);
   }, [cancelClose]);
@@ -346,6 +314,47 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("mousedown", onMouseDown);
+    };
+  }, [open]);
+
+  // Re-clamps against the panel's actual rendered size — width can only shrink the trigger-based
+  // guess above on tiny viewports, but height genuinely varies (loading vs. N rows vs. pager), so
+  // this is what makes "never crops off-screen" hold for every content state, not just the guess.
+  useEffect(() => {
+    if (!open) return;
+    const trigger = triggerRef.current;
+    const panel = panelRef.current;
+    if (!trigger || !panel) return;
+
+    function reposition() {
+      if (!trigger || !panel) return;
+      const triggerRect = trigger.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const width = panelRect.width || CHANGE_HISTORY_POPOVER_WIDTH;
+      const height = panelRect.height;
+
+      const left = clamp(triggerRect.left, CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerWidth - width - CHANGE_HISTORY_VIEWPORT_MARGIN);
+
+      let top = triggerRect.bottom + 4;
+      if (top + height > window.innerHeight - CHANGE_HISTORY_VIEWPORT_MARGIN) {
+        const above = triggerRect.top - 4 - height;
+        // Flip above the trigger when there's room; otherwise pin to the bottom of the viewport
+        // rather than let it run off either edge.
+        top = above >= CHANGE_HISTORY_VIEWPORT_MARGIN ? above : Math.max(CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerHeight - height - CHANGE_HISTORY_VIEWPORT_MARGIN);
+      }
+
+      setPosition((prev) => (prev && prev.top === top && prev.left === left ? prev : { top, left }));
+    }
+
+    reposition();
+    const observer = new ResizeObserver(reposition);
+    observer.observe(panel);
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
     };
   }, [open]);
 
@@ -378,10 +387,10 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
               ref={panelRef}
               onMouseEnter={cancelClose}
               onMouseLeave={scheduleClose}
-              style={{ position: "fixed", top: position.top, left: position.left }}
-              className="z-50 rounded-[8px] border border-[var(--border)] bg-[var(--surface-overlay)] shadow-[var(--shadow-elevated)]"
+              style={{ position: "fixed", top: position.top, left: position.left, width: CHANGE_HISTORY_POPOVER_WIDTH }}
+              className="z-50 rounded-[8px] border border-[var(--border)] bg-[var(--surface-overlay)] px-3 py-2.5 shadow-[var(--shadow-elevated)]"
             >
-              <ChangeHistoryContent projectId={projectId} documentId={documentId} />
+              <ChangeHistoryList projectId={projectId} documentId={documentId} />
             </div>,
             document.body
           )

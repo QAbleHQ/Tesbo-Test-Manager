@@ -788,12 +788,53 @@ test.describe("integrations — Jira and Linear", () => {
 
     const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
     expect(res.status()).toBe(200);
-    const events = (await res.json()).events;
-    expect(events).toHaveLength(3);
+    const body = await res.json();
+    expect(body.events).toHaveLength(3);
     // Newest first: the last-seeded "Description updated." row leads.
-    expect(events[0].eventType).toBe("updated");
-    expect(events[0].changedSummary).toBe("Description updated.");
-    expect(events[2].eventType).toBe("created");
-    expect(events[2].changedSummary).toBeNull();
+    expect(body.events[0].eventType).toBe("updated");
+    expect(body.events[0].changedSummary).toBe("Description updated.");
+    expect(body.events[2].eventType).toBe("created");
+    expect(body.events[2].changedSummary).toBeNull();
+    // Fewer than a page's worth (default limit 5) — nothing more to page to.
+    expect(body.hasMore).toBe(false);
+  });
+
+  test("INT-A-32 the timeline paginates 5 per page, newest first, stable across pages", { tag: '@tesbo.testId("TES-TC-256")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-6", "E2E-71: Long timeline");
+    // 7 events, oldest to newest, so the newest ("v7") is what page 1 must lead with.
+    for (let i = 1; i <= 7; i++) seedSyncEvent(doc, "updated", `v${i}`);
+
+    const firstPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=0`))).json();
+    expect(firstPage.events).toHaveLength(5);
+    expect(firstPage.hasMore, "5 shown out of 7 total — there must be a next page").toBe(true);
+    expect(firstPage.events.map((e: any) => e.changedSummary)).toEqual(["v7", "v6", "v5", "v4", "v3"]);
+
+    const secondPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=5`))).json();
+    expect(secondPage.events).toHaveLength(2);
+    expect(secondPage.hasMore, "exactly the remainder — no third page").toBe(false);
+    expect(secondPage.events.map((e: any) => e.changedSummary)).toEqual(["v2", "v1"]);
+
+    // Pages don't overlap or drop a row between them.
+    const allSummaries = [...firstPage.events, ...secondPage.events].map((e: any) => e.changedSummary);
+    expect(allSummaries).toEqual(["v7", "v6", "v5", "v4", "v3", "v2", "v1"]);
+
+    // Past the end is an empty page with nothing further, not an error.
+    const beyond = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=500`), { failOnStatusCode: false });
+    expect(beyond.status()).toBe(200);
+    const beyondBody = await beyond.json();
+    expect(beyondBody.events).toEqual([]);
+    expect(beyondBody.hasMore).toBe(false);
+  });
+
+  test("INT-A-33 malformed limit/offset fall back to defaults instead of a 500", { tag: '@tesbo.testId("TES-TC-257")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-7", "E2E-72: Bad pagination input");
+    seedSyncEvent(doc, "created", null);
+
+    for (const qs of ["limit=abc&offset=abc", "limit=-5", "offset=-1", "limit=2.7", "limit=0", "limit=100000"]) {
+      const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?${qs}`), { failOnStatusCode: false });
+      expect(res.status(), `${qs} answered ${res.status()}: ${await res.text()}`).toBe(200);
+      const body = await res.json();
+      expect(Array.isArray(body.events), `${qs} — events was ${JSON.stringify(body)}`).toBe(true);
+    }
   });
 });

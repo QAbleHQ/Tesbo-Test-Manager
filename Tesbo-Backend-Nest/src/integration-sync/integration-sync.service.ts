@@ -407,10 +407,20 @@ export class IntegrationSyncService {
     );
   }
 
+  /**
+   * Paginated, newest-first — 5 events per page in the popover. Fetches one extra row beyond the
+   * page size rather than a separate COUNT(*): the (limit+1)-th row's presence is `hasMore`, and is
+   * trimmed off before returning, so paging costs one query instead of two.
+   */
   async listSyncEventsForDocument(
     documentId: string,
-    limit = 20
-  ): Promise<Array<{ id: string; eventType: string; changedSummary: string | null; createdAt: string; triggeredByName: string | null }>> {
+    limit = 5,
+    offset = 0
+  ): Promise<{
+    events: Array<{ id: string; eventType: string; changedSummary: string | null; createdAt: string; triggeredByName: string | null }>;
+    hasMore: boolean;
+  }> {
+    const boundedLimit = Math.max(1, Math.min(50, limit));
     const res = await this.db.query<Row>(
       `SELECT e.id, e.event_type, e.changed_summary, e.created_at,
               COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS triggered_by_name
@@ -418,15 +428,19 @@ export class IntegrationSyncService {
        LEFT JOIN users u ON u.id = e.triggered_by
        WHERE e.document_id = $1
        ORDER BY e.created_at DESC
-       LIMIT $2`,
-      [documentId, Math.max(1, Math.min(50, limit))]
+       LIMIT $2 OFFSET $3`,
+      [documentId, boundedLimit + 1, Math.max(0, offset)]
     );
-    return res.rows.map((row) => ({
-      id: String(row.id),
-      eventType: String(row.event_type),
-      changedSummary: row.changed_summary ? String(row.changed_summary) : null,
-      createdAt: new Date(row.created_at).toISOString(),
-      triggeredByName: row.triggered_by_name ? String(row.triggered_by_name) : null
-    }));
+    const hasMore = res.rows.length > boundedLimit;
+    return {
+      events: res.rows.slice(0, boundedLimit).map((row) => ({
+        id: String(row.id),
+        eventType: String(row.event_type),
+        changedSummary: row.changed_summary ? String(row.changed_summary) : null,
+        createdAt: new Date(row.created_at).toISOString(),
+        triggeredByName: row.triggered_by_name ? String(row.triggered_by_name) : null
+      })),
+      hasMore
+    };
   }
 }

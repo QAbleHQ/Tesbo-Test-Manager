@@ -3154,9 +3154,14 @@ export interface KnowledgeDocumentSyncEvent {
 
 export function getKnowledgeDocumentSyncEvents(
   projectId: string,
-  documentId: string
-): Promise<{ events: KnowledgeDocumentSyncEvent[] }> {
-  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events`);
+  documentId: string,
+  page: { limit?: number; offset?: number } = {}
+): Promise<{ events: KnowledgeDocumentSyncEvent[]; hasMore: boolean }> {
+  const sp = new URLSearchParams();
+  if (page.limit != null) sp.set("limit", String(page.limit));
+  if (page.offset != null) sp.set("offset", String(page.offset));
+  const qs = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events${qs ? `?${qs}` : ""}`);
 }
 
 export function updateKnowledgeDocument(

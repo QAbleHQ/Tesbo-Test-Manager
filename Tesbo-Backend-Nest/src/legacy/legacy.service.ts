@@ -7116,13 +7116,16 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(doc), syncedByName, breadcrumb };
   }
 
-  // Powers the Knowledge Base info-icon popover: this document's full add/update timeline. Only
-  // meaningful for a synced mirror, but reuses the same project-access + existence check as every
-  // other KB document route rather than special-casing on source_provider.
-  async getKnowledgeDocumentSyncEvents(projectId: string, userId: string | null | undefined, documentId: string) {
+  // Powers the Knowledge Base info-icon popover: this document's add/update timeline, 5 events per
+  // page (newest first) so a ticket synced nightly for a year doesn't dump hundreds of rows into a
+  // small popup. Only meaningful for a synced mirror, but reuses the same project-access +
+  // existence check as every other KB document route rather than special-casing on source_provider.
+  async getKnowledgeDocumentSyncEvents(projectId: string, userId: string | null | undefined, documentId: string, query: Body = {}) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     await this.kbDocument(projectId, documentId);
-    return { events: await this.integrationSync.listSyncEventsForDocument(documentId) };
+    const limit = pageNumber(query.limit, 5, 1, 20);
+    const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    return this.integrationSync.listSyncEventsForDocument(documentId, limit, offset);
   }
 
   // Display name for the person whose Sync click last rewrote a mirrored document.
