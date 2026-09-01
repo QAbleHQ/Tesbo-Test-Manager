@@ -18,7 +18,7 @@ import { PageHeader, StandardPageLayout } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
 
 const columns = [
-  { key: "todo", label: "Pending", dot: "var(--muted-soft)" },
+  { key: "todo", label: "To Do", dot: "var(--muted-soft)" },
   { key: "in_progress", label: "In Progress", dot: "var(--warning)" },
   { key: "in_review", label: "In Review", dot: "var(--accent-light)" },
   { key: "failed", label: "Failed", dot: "var(--error)" },
