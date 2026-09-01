@@ -401,6 +401,66 @@ test.describe("projects list — creating a project", () => {
     expect(rendered).not.toContain("E2E Smoke Project");
     expect(otherTenantProjects.every((p: { name: string }) => p.name !== "E2E Smoke Project")).toBe(true);
   });
+
+  test("a chosen color and glyph render as the project's badge instead of the generated one", async ({ page }) => {
+    const name = `E2E UI Icon ${uniqueSuffix()}`;
+    let projectId: string | undefined;
+    try {
+      await page.goto("/projects");
+      await openCreateModal(page);
+      const form = createForm(page);
+      await form.locator("#create-name").fill(name);
+      await form.getByRole("button", { name: "Icon color #1F7A3D" }).click();
+      await form.getByRole("textbox", { name: "Custom icon letter or emoji" }).fill("Z");
+      await form.getByRole("button", { name: "Create project", exact: true }).click();
+
+      await page.waitForURL(/\/dashboard$/);
+      projectId = page.url().split("/projects/")[1].split("/")[0];
+
+      const created = await (await api.get(`/api/projects/${projectId}`)).json();
+      expect(created.settings.icon).toEqual({ color: "#1F7A3D", glyph: "Z" });
+
+      const card = await gotoProjectsAndFind(page, name);
+      await expect(card).toContainText("Z");
+      const badgeColor = await card.locator("div").first().evaluate((el) => getComputedStyle(el).backgroundColor);
+      expect(badgeColor).toBe("rgb(31, 122, 61)"); // #1F7A3D
+    } finally {
+      await deleteProjects(api, [projectId]);
+    }
+  });
+
+  test("an icon glyph is capped at 2 characters and forced to uppercase as you type", async ({ page }) => {
+    await page.goto("/projects");
+    await openCreateModal(page);
+    const form = createForm(page);
+    const glyphInput = form.getByRole("textbox", { name: "Custom icon letter or emoji" });
+
+    // Typed lowercase and past the limit — the field truncates to 2 graphemes and uppercases
+    // live, rather than accepting the input and only complaining on submit.
+    await glyphInput.pressSequentially("abc", { delay: 20 });
+    await expect(glyphInput).toHaveValue("AB");
+  });
+
+  test("a lowercase glyph is normalized to uppercase on create", async ({ page }) => {
+    const name = `E2E UI Icon Lowercase ${uniqueSuffix()}`;
+    let projectId: string | undefined;
+    try {
+      await page.goto("/projects");
+      await openCreateModal(page);
+      const form = createForm(page);
+      await form.locator("#create-name").fill(name);
+      await form.getByRole("textbox", { name: "Custom icon letter or emoji" }).fill("q");
+      await form.getByRole("button", { name: "Create project", exact: true }).click();
+
+      await page.waitForURL(/\/dashboard$/);
+      projectId = page.url().split("/projects/")[1].split("/")[0];
+
+      const created = await (await api.get(`/api/projects/${projectId}`)).json();
+      expect(created.settings.icon.glyph).toBe("Q");
+    } finally {
+      await deleteProjects(api, [projectId]);
+    }
+  });
 });
 
 test.describe("projects list — access and the empty state", () => {

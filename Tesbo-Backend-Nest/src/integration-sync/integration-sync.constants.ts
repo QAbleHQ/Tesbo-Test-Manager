@@ -31,3 +31,24 @@ export const DECISION_PROMPT_CHAR_BUDGET = 12000;
 
 // Folder created (lazily, on first successful sync) to hold everything a provider owns.
 export const PROVIDER_FOLDER_NAMES: Record<string, string> = { jira: "Jira", linear: "Linear" };
+
+// ── Nightly cron ──
+
+// One orchestrator job per provider, so a Jira-side outage can never block Linear's nightly run
+// (or vice versa) and each has its own independent BullMQ Job Scheduler.
+export const INTEGRATION_SYNC_NIGHTLY_JIRA_JOB = "nightly-sync-jira";
+export const INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB = "nightly-sync-linear";
+export const INTEGRATION_SYNC_NIGHTLY_JIRA_SCHEDULER_ID = "integration-sync-nightly-jira";
+export const INTEGRATION_SYNC_NIGHTLY_LINEAR_SCHEDULER_ID = "integration-sync-nightly-linear";
+
+// Midnight IST, every night. No per-organization timezone exists anywhere in this schema, so this
+// is a single global fire time rather than one derived per workspace.
+export const NIGHTLY_SYNC_CRON = "0 0 * * *";
+export const NIGHTLY_SYNC_TZ = "Asia/Kolkata";
+
+// Subtracted from the previous successful run's started_at before using it as the incremental
+// "updated >=" cursor. Guards against a ticket that changed a few seconds before the previous run
+// started but hadn't yet landed in the provider's search index at that moment — without this, the
+// next incremental run's cursor would sit after that ticket's real updated timestamp and skip it
+// forever. The cost is a handful of redundant (cheap, hash-gated no-op) re-fetches per run.
+export const NIGHTLY_SYNC_SINCE_BUFFER_MINUTES = 10;

@@ -79,6 +79,44 @@ export function validateProjectKey(value: string): string {
   return "";
 }
 
+// Mirrors Tesbo-Backend-Nest/src/legacy/legacy.service.ts's validateProjectIcon. A custom glyph
+// replaces the auto-derived initial on a project's colored badge, so it's meant for one emoji or a
+// couple of typed letters — grapheme-counted (not code-unit length) so a single emoji built from
+// several code points (a ZWJ sequence, a skin-tone modifier) still counts as one character.
+export const PROJECT_ICON_GLYPH_MAX_GRAPHEMES = 2;
+const PROJECT_ICON_GLYPH_MAX_LENGTH = 16;
+
+function graphemes(value: string): string[] {
+  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    return Array.from(segmenter.segment(value), (s) => s.segment);
+  }
+  return Array.from(value);
+}
+
+function countGraphemes(value: string): number {
+  return graphemes(value).length;
+}
+
+/**
+ * Truncates as the user types, so the input can never exceed the limit in the first place — the
+ * inline validation error below is then only reachable via a paste/programmatic fill, not normal
+ * typing.
+ */
+export function truncateProjectIconGlyph(value: string): string {
+  return graphemes(value).slice(0, PROJECT_ICON_GLYPH_MAX_GRAPHEMES).join("");
+}
+
+export function validateProjectIconGlyph(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return ""; // blank clears the override — falls back to the generated initial
+  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return "Icon glyph contains unsupported characters";
+  if (trimmed.length > PROJECT_ICON_GLYPH_MAX_LENGTH || countGraphemes(trimmed) > PROJECT_ICON_GLYPH_MAX_GRAPHEMES) {
+    return `Icon glyph must be at most ${PROJECT_ICON_GLYPH_MAX_GRAPHEMES} characters`;
+  }
+  return "";
+}
+
 // Mirrors Tesbo-Backend-Nest/src/legacy/legacy.service.ts — LegacyService.KB_ALLOWED_EXTENSIONS,
 // the FilesInterceptor("files", 10, ...) file-count limit, and KB_MAX_UPLOAD_SIZE (itself driven
 // by the MAX_UPLOAD_SIZE env var, currently 50MB). Keep all three in sync with the backend.

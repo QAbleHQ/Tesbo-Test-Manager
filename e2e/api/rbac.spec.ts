@@ -414,6 +414,25 @@ test.describe("role-based permissions", () => {
     }
   });
 
+  test("a QA engineer cannot change a project's icon", async () => {
+    // Same gate as the rename above — updateProjectForUser refuses qa_engineer for the whole
+    // request body, icon included, before any field-level validation runs.
+    const throwaway = await createThrowawayProject(asOwner);
+    try {
+      setProjectRole(throwaway.id, tenant!.qa.userId, "qa_engineer");
+      const res = await asQa.patch(`/api/projects/${throwaway.id}`, {
+        data: { icon: { color: "#1F7A3D", glyph: "Q" } },
+        failOnStatusCode: false,
+      });
+      expect(res.status()).toBe(403);
+
+      const after = await (await asOwner.get(`/api/projects/${throwaway.id}`)).json();
+      expect(after.settings?.icon ?? null).toBeNull();
+    } finally {
+      await asOwner.delete(`/api/projects/${throwaway.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("a QA engineer cannot archive a project", { tag: '@tesbo.testId("TES-TC-454")' }, async () => {
     // By consistency, as above. This one is the more damaging half: deleteProjectForUser archives
     // the project and every child record hangs off it.

@@ -21,6 +21,7 @@ import {
   IconFolders,
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
+  IconInfoCircle,
 } from "@tabler/icons-react";
 import {
   authMe,
@@ -49,6 +50,7 @@ import {
   type KnowledgeBaseSummary,
 } from "@/lib/api";
 import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
+import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
@@ -235,6 +237,166 @@ function formatDate(value: string): string {
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return "Today";
   return date.toLocaleDateString();
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), Math.max(min, max));
+}
+
+const CHANGE_HISTORY_POPOVER_WIDTH = 280;
+const CHANGE_HISTORY_VIEWPORT_MARGIN = 8;
+
+/**
+ * The info icon on a synced (mirror) row, plus its popover — opens on hover OR click (unlike
+ * Menu.tsx's row-action dropdowns, which are deliberately click-only, so this is its own small
+ * component rather than a Menu usage that would need hover bolted onto every other Menu in the
+ * app too).
+ *
+ * Edge cases handled:
+ *  - Moving the cursor from the icon onto the popover itself must not close it — the close is
+ *    delayed and cancelled if the pointer lands on either the trigger or the panel.
+ *  - No native hover (touch, or a click via keyboard) still works: click toggles independently of
+ *    hover, and an outside click/Escape closes it for the caller with no "mouse leaves" to fire.
+ *  - Positioned via a fixed-position portal (same technique as Menu.tsx) so the table's own
+ *    `overflow-auto` wrapper can never clip it, AND kept fully on-screen: horizontally clamped
+ *    against the actual (measured) popover width, and flipped above the trigger when there isn't
+ *    room below — re-measured via ResizeObserver whenever the content's size changes (loading ->
+ *    loaded, or paging), not just once at open time, since a fixed guess at open time would still
+ *    crop once real content replaced the "Loading…" placeholder or a page's row count changed.
+ */
+function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; documentId: string }) {
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  }, []);
+
+  const openNow = useCallback(() => {
+    cancelClose();
+    if (triggerRef.current) {
+      // A rough first position from the trigger alone, so something renders immediately instead
+      // of waiting a frame — the effect below corrects it against the panel's real size.
+      const rect = triggerRef.current.getBoundingClientRect();
+      setPosition({
+        top: rect.bottom + 4,
+        left: clamp(rect.left, CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerWidth - CHANGE_HISTORY_POPOVER_WIDTH - CHANGE_HISTORY_VIEWPORT_MARGIN)
+      });
+    }
+    setOpen(true);
+  }, [cancelClose]);
+
+  const scheduleClose = useCallback(() => {
+    cancelClose();
+    closeTimer.current = setTimeout(() => setOpen(false), 200);
+  }, [cancelClose]);
+
+  useEffect(() => cancelClose, [cancelClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    function onMouseDown(e: MouseEvent) {
+      const target = e.target as Node;
+      if (triggerRef.current?.contains(target) || panelRef.current?.contains(target)) return;
+      setOpen(false);
+    }
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("mousedown", onMouseDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("mousedown", onMouseDown);
+    };
+  }, [open]);
+
+  // Re-clamps against the panel's actual rendered size — width can only shrink the trigger-based
+  // guess above on tiny viewports, but height genuinely varies (loading vs. N rows vs. pager), so
+  // this is what makes "never crops off-screen" hold for every content state, not just the guess.
+  useEffect(() => {
+    if (!open) return;
+    const trigger = triggerRef.current;
+    const panel = panelRef.current;
+    if (!trigger || !panel) return;
+
+    function reposition() {
+      if (!trigger || !panel) return;
+      const triggerRect = trigger.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const width = panelRect.width || CHANGE_HISTORY_POPOVER_WIDTH;
+      const height = panelRect.height;
+
+      const left = clamp(triggerRect.left, CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerWidth - width - CHANGE_HISTORY_VIEWPORT_MARGIN);
+
+      let top = triggerRect.bottom + 4;
+      if (top + height > window.innerHeight - CHANGE_HISTORY_VIEWPORT_MARGIN) {
+        const above = triggerRect.top - 4 - height;
+        // Flip above the trigger when there's room; otherwise pin to the bottom of the viewport
+        // rather than let it run off either edge.
+        top = above >= CHANGE_HISTORY_VIEWPORT_MARGIN ? above : Math.max(CHANGE_HISTORY_VIEWPORT_MARGIN, window.innerHeight - height - CHANGE_HISTORY_VIEWPORT_MARGIN);
+      }
+
+      setPosition((prev) => (prev && prev.top === top && prev.left === left ? prev : { top, left }));
+    }
+
+    reposition();
+    const observer = new ResizeObserver(reposition);
+    observer.observe(panel);
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+    };
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        title="Change history"
+        aria-label="Change history"
+        onMouseEnter={openNow}
+        onMouseLeave={scheduleClose}
+        onFocus={openNow}
+        onBlur={scheduleClose}
+        onClick={(e) => {
+          // Always opens rather than toggling: hover already opens it, so a click landing right
+          // after a hover-triggered open (same synchronous event sequence a real click produces)
+          // must never read stale state and immediately close what the hover just opened.
+          // Closing is handled by mouseleave, an outside click, or Escape instead.
+          e.stopPropagation();
+          openNow();
+        }}
+        className="flex items-center rounded p-0.5 text-[var(--muted-soft)] hover:bg-[var(--surface-tertiary)] hover:text-[var(--muted)]"
+      >
+        <IconInfoCircle size={14} stroke={1.75} />
+      </button>
+      {open && position && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              ref={panelRef}
+              onMouseEnter={cancelClose}
+              onMouseLeave={scheduleClose}
+              style={{ position: "fixed", top: position.top, left: position.left, width: CHANGE_HISTORY_POPOVER_WIDTH }}
+              className="z-50 rounded-[8px] border border-[var(--border)] bg-[var(--surface-overlay)] px-3 py-2.5 shadow-[var(--shadow-elevated)]"
+            >
+              <ChangeHistoryList projectId={projectId} documentId={documentId} />
+            </div>,
+            document.body
+          )
+        : null}
+    </>
+  );
 }
 
 function itemIcon(item: KnowledgeItem) {
@@ -1413,6 +1575,7 @@ function KnowledgeBasePageInner() {
                       <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Type</th>
                       {searchQuery && <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Folder path</th>}
                       <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Updated by</th>
+                      <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Added on</th>
                       <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Last updated</th>
                       <th className="px-4 py-2.5 text-left font-medium text-[var(--muted-soft)]">Size</th>
                       <th className="px-4 py-2.5 text-right font-medium text-[var(--muted-soft)]">Actions</th>
@@ -1468,7 +1631,15 @@ function KnowledgeBasePageInner() {
                               ? `${syncedFrom} integration${syncedBy ? ` · synced by ${syncedBy}` : ""}`
                               : (item as { updatedByName?: string }).updatedByName || "—"}
                           </td>
-                          <td className="px-4 py-2.5 text-[var(--muted)]">{formatDate((item as { updatedAt: string }).updatedAt)}</td>
+                          <td className="px-4 py-2.5 text-[var(--muted)]">{formatDate((item as { createdAt: string }).createdAt)}</td>
+                          <td className="px-4 py-2.5 text-[var(--muted)]">
+                            <div className="flex items-center gap-1">
+                              <span>{formatDate((item as { updatedAt: string }).updatedAt)}</span>
+                              {/* Only a synced mirror has a change timeline to show — a
+                                  human-authored doc gets no icon rather than an empty popover. */}
+                              {syncedFrom && <ChangeHistoryTrigger projectId={projectId} documentId={item.id} />}
+                            </div>
+                          </td>
                           {/*
                             * Basecamp 10199231000 — folders (and documents) rendered a bare "—" here.
                             * A folder now reports the total bytes of every file beneath it at any depth,

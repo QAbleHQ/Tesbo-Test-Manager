@@ -2,6 +2,9 @@ export type SyncProvider = "jira" | "linear";
 
 export type SyncRunStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
 
+// 'manual' = the Sync button; 'nightly' = the scheduler. See V88.
+export type SyncTriggerSource = "manual" | "nightly";
+
 // Sub-step shown verbatim in the UI, so a user watching a slow sync can tell "still pulling
 // tickets from Jira" apart from "building documents" apart from "indexing for Zyra".
 export type SyncRunStage =
@@ -18,6 +21,10 @@ export interface SyncRunJobPayload {
   projectId: string;
   provider: SyncProvider;
   triggeredBy: string | null;
+  /** Defaults to "manual" at every existing call site — new field, old behavior unchanged. */
+  triggerSource?: SyncTriggerSource;
+  /** ISO timestamp. When set, only tickets updated at/after this instant are fetched. */
+  since?: string | null;
 }
 
 export interface SyncTicketJobPayload {
