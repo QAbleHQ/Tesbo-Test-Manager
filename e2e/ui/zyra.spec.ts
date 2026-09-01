@@ -89,10 +89,98 @@ test.describe("zyra / agents (UI)", () => {
     // off by one test stays off for the next one and for the next run against the same volume.
     // Dropping the key restores the built-in defaults (every capability on, the default range).
     exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id IN (${projects});`);
+    // Fixtures for the "Create Zyra task" modal tests below: an allocated (fake) AI key, so
+    // state.agent.active is true and the modal's Create task button is enabled; Knowledge Base
+    // documents used to exercise the Acceptance Criteria split; and a Jira connection + ticket
+    // used to prove the ticket picker stays gone even when Jira genuinely is connected.
+    exec(
+      `DELETE FROM knowledge_document_versions WHERE document_id IN (SELECT id FROM knowledge_documents WHERE project_id IN (${projects}));`,
+    );
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
+    exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(
+      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+    );
   }
 
   function stamp(label: string): string {
     return `E2E ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  }
+
+  // ─── Fixtures for the "Create Zyra task" modal (Jira picker removal, Acceptance Criteria) ──
+
+  /**
+   * The board's Create task button is disabled whenever state.agent.active is false (see ZYU-05),
+   * which is this tenant's default so no test here accidentally drives a real model. Allocating a
+   * fake key flips that flag without ever being submitted against a real provider — every modal
+   * test below only reads/writes form fields and never clicks the final "Create task" submit.
+   */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E key ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-not-a-real-key" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating an AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const t = tenant!;
+    const existing = scalar(
+      `SELECT id FROM knowledge_folders WHERE project_id = ${literal(t.mainProjectId)} AND is_root = true;`,
+    );
+    if (existing) return existing;
+    // Same backfill api/knowledge-base.spec.ts relies on: is_root rows are only ever written by
+    // project creation, so a fixture project missing one (KB-A-00's defect) gets one here instead.
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(t.organizationId)}, ${literal(t.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_folders WHERE project_id = ${literal(t.mainProjectId)} AND is_root = true;`,
+    );
+  }
+
+  /** Creates a Knowledge Base document via the real API, the same content the picker will read. */
+  async function createKnowledgeDoc(body: Record<string, unknown>): Promise<{ id: string; title: string }> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", ...body },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `creating knowledge doc ${JSON.stringify(body)} — ${await res.text()}`).toBe(201);
+    return res.json();
+  }
+
+  /** Seeds a real Jira connection + ticket, so "the picker is gone" is proven with Jira actually connected. */
+  function seedFakeJiraConnection(): void {
+    const t = tenant!;
+    exec(
+      `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+        `VALUES (${literal(t.organizationId)}, 'jira', 'e2e-zyra-ui', 'https://e2e-zyra-ui.invalid', 'e2e', '', now() + interval '365 days') ` +
+        `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+    );
+    const connectionId = scalar(
+      `SELECT id FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+    );
+    exec(
+      `INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status) ` +
+        `VALUES (${literal(t.mainProjectId)}, ${literal(connectionId)}, 'ZYE-1', 'ZYE-1', 'Seeded Jira ticket', 'Story', 'Open') ` +
+        `ON CONFLICT DO NOTHING;`,
+    );
+  }
+
+  /** Opens the board and the "Create Zyra task" modal, returning its locator. */
+  async function openCreateModal(browser: Browser): Promise<{ page: Page; dialog: Locator }> {
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("button", { name: "Create task" }).click();
+    return { page, dialog: modal(page, "Create Zyra task") };
   }
 
   interface SeedOptions {
@@ -332,6 +420,200 @@ test.describe("zyra / agents (UI)", () => {
     // The gate is on the control, not only in the API: a workspace with no key cannot start a task
     // it has no way to finish.
     await expect(page.getByRole("button", { name: "Create task" })).toBeDisabled();
+  });
+
+  // ─── The "Create Zyra task" modal: no Jira picker, a dedicated Acceptance Criteria field ───
+  //
+  // Regression coverage for a reported bug (a Jira ticket's Acceptance Criteria landed mixed into
+  // Context) and a follow-up ask (drop the Jira ticket picker from this modal entirely — Jira and
+  // Linear tickets already mirror into the Knowledge Base as documents via
+  // IntegrationSyncDocumentBuilder, so nothing is lost by only offering Knowledge Base here).
+  //
+  // page.tsx's splitAcceptanceCriteria/resolveDocumentText run entirely client-side against
+  // knowledgeItems already loaded by listKnowledgeDocuments — no AI call is involved, so these
+  // tests never need to submit the form, only read back the Story/Context/Acceptance Criteria
+  // textareas after picking a document from the "Knowledge Base docs and notes" select.
+
+  test("ZYU-50 the modal has no Jira ticket picker, and none appears even when Jira is genuinely connected", async ({ browser }) => {
+    await allocateFakeAiKey();
+    seedFakeJiraConnection();
+
+    const { page, dialog } = await openCreateModal(browser);
+    await expect(dialog).toBeVisible();
+
+    // The primary fields are still there...
+    await expect(dialog.getByPlaceholder("As a user, I want...")).toBeVisible();
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toBeVisible();
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toBeVisible();
+
+    // ...but no Jira selection surface of any kind, despite a real jira_tickets row existing for
+    // this project and a connected integration_connections row for this org.
+    await expect(dialog.getByText("Jira tickets", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText("Select ticket...", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText("ZYE-1", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText(/^Linear/)).toHaveCount(0);
+  });
+
+  test("ZYU-51 selecting a Knowledge Base document maps its Acceptance Criteria section to a dedicated field, not Context", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Login KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentText:
+        "## Description\n\nUsers should be able to log in with email and password.\n\n" +
+        "Acceptance Criteria:\nShows an error on a wrong password\nRedirects to the dashboard on success",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const story = dialog.getByPlaceholder("As a user, I want...");
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(story).toHaveValue(new RegExp(title));
+    await expect(context).toHaveValue(/Users should be able to log in/);
+    await expect(context).not.toHaveValue(/wrong password/);
+    await expect(acceptanceCriteria).toHaveValue(/Shows an error on a wrong password/);
+    await expect(acceptanceCriteria).toHaveValue(/Redirects to the dashboard on success/);
+  });
+
+  test("ZYU-52 a Knowledge Base document with no Acceptance Criteria section leaves the field empty and puts everything in Context", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Plain KB doc");
+    await createKnowledgeDoc({ title, contentText: "Just a plain note with no special sections at all." });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toHaveValue(
+      /Just a plain note/,
+    );
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toHaveValue("");
+  });
+
+  test("ZYU-53 an Acceptance Criteria heading stops at the next heading, not swallowing later sections", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Headed KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentText:
+        "## Description\n\nDo the thing well.\n\n## Acceptance Criteria\n\nCase one applies\nCase two applies\n\n" +
+        "## Comments\n\nNothing noteworthy yet.",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(acceptanceCriteria).toHaveValue(/Case one applies/);
+    await expect(acceptanceCriteria).toHaveValue(/Case two applies/);
+    await expect(acceptanceCriteria).not.toHaveValue(/Nothing noteworthy yet/);
+    await expect(context).toHaveValue(/Do the thing well/);
+    await expect(context).toHaveValue(/Nothing noteworthy yet/);
+    await expect(context).not.toHaveValue(/Case one applies/);
+  });
+
+  test("ZYU-54 a document with content only in contentHtml (no contentText) still populates Context and Acceptance Criteria", async ({
+    browser,
+  }) => {
+    // Regression guard for a silent-failure edge case: contentText is the plain-text render kept
+    // in sync by the editor, but it can be unset (a document written straight through the API, or
+    // an older row) while contentHtml still holds the real content. Selecting such a document must
+    // not quietly leave Context empty.
+    await allocateFakeAiKey();
+    const title = stamp("HTML-only KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentHtml: "<p>Do the thing well.</p><p>Acceptance Criteria:</p><ul><li>Case one</li><li>Case two</li></ul>",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(context).toHaveValue(/Do the thing well/);
+    await expect(context).not.toHaveValue(/Case one/);
+    await expect(acceptanceCriteria).toHaveValue(/Case one/);
+    await expect(acceptanceCriteria).toHaveValue(/Case two/);
+    // And no raw HTML leaked into either field.
+    await expect(context).not.toHaveValue(/<p>|<li>/);
+    await expect(acceptanceCriteria).not.toHaveValue(/<p>|<li>/);
+  });
+
+  test("ZYU-55 a document with no content at all does not crash the modal and still contributes its title to Story", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Empty KB doc");
+    await createKnowledgeDoc({ title });
+
+    const { page, dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    await expect(dialog.getByPlaceholder("As a user, I want...")).toHaveValue(new RegExp(title));
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toHaveValue("");
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toHaveValue("");
+    // The modal, and the page under it, are still fully responsive.
+    await expect(dialog.getByRole("button", { name: "Create task" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Zyra", exact: false })).toBeVisible();
+  });
+
+  test("ZYU-56 removing a selected document's chip and reselecting it does not duplicate its content", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Reselect KB doc");
+    await createKnowledgeDoc({ title, contentText: "Some unique reselection content." });
+
+    const { dialog } = await openCreateModal(browser);
+    const select = dialog.getByRole("combobox");
+    await select.selectOption({ label: `${title} - general` });
+
+    const chip = dialog.getByRole("button", { name: new RegExp(`^${title}`) });
+    await expect(chip).toBeVisible();
+    await chip.click(); // removes it from the selected-items chips, but not from the text fields
+
+    await select.selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const value = await context.inputValue();
+    const occurrences = value.split("Some unique reselection content.").length - 1;
+    expect(occurrences, `content was duplicated in Context:\n${value}`).toBe(1);
+  });
+
+  test("ZYU-57 selecting two Knowledge Base documents combines both into Context, and only the one with a section into Acceptance Criteria", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const titleA = stamp("Multi KB doc A");
+    const titleB = stamp("Multi KB doc B");
+    await createKnowledgeDoc({
+      title: titleA,
+      contentText: "Doc A body text.\n\nAcceptance Criteria:\nOnly doc A has this bullet",
+    });
+    await createKnowledgeDoc({ title: titleB, contentText: "Doc B body text with no special section." });
+
+    const { dialog } = await openCreateModal(browser);
+    const select = dialog.getByRole("combobox");
+    await select.selectOption({ label: `${titleA} - general` });
+    await select.selectOption({ label: `${titleB} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(context).toHaveValue(/Doc A body text/);
+    await expect(context).toHaveValue(/Doc B body text/);
+    await expect(context).not.toHaveValue(/Only doc A has this bullet/);
+    await expect(acceptanceCriteria).toHaveValue(/Only doc A has this bullet/);
   });
 
   // ─── Settings that are ours, not the model's ───────────────────────────────

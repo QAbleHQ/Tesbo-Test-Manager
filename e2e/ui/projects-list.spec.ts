@@ -964,6 +964,84 @@ test.describe("projects list — the grid/list toggle", () => {
       await deleteProjects(api, [project.id]);
     }
   });
+
+  /*
+   * Basecamp-reported: grid cards gave no visual feedback on hover — no shadow/border/background
+   * change, nothing signalling the card was clickable. The fix lives in globals.css's
+   * `a.group:hover > .tesbo-card` rule (see the comment on that rule for why it isn't a Tailwind
+   * hover: utility) plus `cursor-pointer` on the wrapping <a>. This locks in the actual painted
+   * effect via computed styles, not just that hovering doesn't throw.
+   */
+  test("PRJ-V-11 a grid card shows hover feedback, resets on mouse-out, and stays clickable", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      const card = await gotoProjectsAndFind(page, project.name);
+      const surface = card.locator(".tesbo-card").first();
+
+      await expect(card).toHaveCSS("cursor", "pointer");
+
+      const baseline = {
+        background: await surface.evaluate((el) => getComputedStyle(el).backgroundColor),
+        border: await surface.evaluate((el) => getComputedStyle(el).borderColor),
+        shadow: await surface.evaluate((el) => getComputedStyle(el).boxShadow),
+      };
+
+      await card.hover();
+      // At least one of background/border/shadow must change — that's the whole point of the fix.
+      await expect
+        .poll(async () => {
+          const hovered = {
+            background: await surface.evaluate((el) => getComputedStyle(el).backgroundColor),
+            border: await surface.evaluate((el) => getComputedStyle(el).borderColor),
+            shadow: await surface.evaluate((el) => getComputedStyle(el).boxShadow),
+          };
+          return (
+            hovered.background !== baseline.background ||
+            hovered.border !== baseline.border ||
+            hovered.shadow !== baseline.shadow
+          );
+        })
+        .toBe(true);
+
+      // Moving away is not a stuck hover: the card returns to its resting appearance.
+      await page.mouse.move(0, 0);
+      await expect
+        .poll(async () => surface.evaluate((el) => getComputedStyle(el).backgroundColor))
+        .toBe(baseline.background);
+
+      await card.click();
+      await page.waitForURL(`**/projects/${project.id}/dashboard`);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PRJ-V-12 hovering one grid card leaves a sibling card's resting style untouched", async ({ page }) => {
+    const a = await createProject(api);
+    const b = await createProject(api);
+    try {
+      await page.goto("/projects");
+      const cardA = await gotoProjectsAndFind(page, a.name);
+      const cardB = projectCard(page, b.name);
+      await expect(cardB).toBeVisible();
+      const surfaceA = cardA.locator(".tesbo-card").first();
+      const surfaceB = cardB.locator(".tesbo-card").first();
+
+      // Same unhovered styling on every card — a consistency check, not just a hover check.
+      const restingA = await surfaceA.evaluate((el) => getComputedStyle(el).backgroundColor);
+      const restingB = await surfaceB.evaluate((el) => getComputedStyle(el).backgroundColor);
+      expect(restingA).toBe(restingB);
+
+      await cardA.hover();
+      await expect
+        .poll(async () => surfaceA.evaluate((el) => getComputedStyle(el).backgroundColor))
+        .not.toBe(restingA);
+      // B never received the hover, so it must still read exactly as it did at rest.
+      expect(await surfaceB.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe(restingB);
+    } finally {
+      await deleteProjects(api, [a.id, b.id]);
+    }
+  });
 });
 
 /*

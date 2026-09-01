@@ -90,6 +90,13 @@ interface Props {
 export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly, onCountChange }: Props) {
   const [files, setFiles] = useState<ExecutionEvidence[]>([]);
   const [loading, setLoading] = useState(true);
+  /*
+   * Whether the panel has completed at least one fetch (success or failure) for this
+   * cycleId/executionId. Gates the full-panel "Loading evidence…" placeholder to the very first
+   * load only — see the note above `load` for why every later call also flips `loading` back to
+   * true and would otherwise tear the already-rendered grid down and rebuild it.
+   */
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -125,6 +132,7 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
       setError("Couldn't load evidence for this result.");
     } finally {
       setLoading(false);
+      setHasLoaded(true);
     }
   }, [cycleId, executionId]);
 
@@ -207,7 +215,10 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
         </p>
       )}
 
-      {loading ? (
+      {loading && !hasLoaded ? (
+        // Only the very first fetch shows this placeholder. A later refetch — after an upload, or
+        // a retry following an error — must not tear down evidence that is already on screen just
+        // to show the same text again; see the note on `hasLoaded` above.
         <p className="text-[12.5px] text-[var(--muted)]">Loading evidence…</p>
       ) : files.length === 0 ? (
         <p className="text-[12.5px] text-[var(--muted)]">

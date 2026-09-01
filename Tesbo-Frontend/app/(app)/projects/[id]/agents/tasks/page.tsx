@@ -7,11 +7,8 @@ import { IconSparkles } from "@tabler/icons-react";
 import {
   authMe,
   createZyraTask,
-  getJiraStatus,
   getZyraAgent,
   listKnowledgeDocuments,
-  listJiraTickets,
-  type JiraTicket,
   type KnowledgeDocument,
   type ZyraAgentState,
   type ZyraTask,
@@ -21,7 +18,7 @@ import { PageHeader, StandardPageLayout } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
 
 const columns = [
-  { key: "todo", label: "Pending", dot: "var(--muted-soft)" },
+  { key: "todo", label: "To Do", dot: "var(--muted-soft)" },
   { key: "in_progress", label: "In Progress", dot: "var(--warning)" },
   { key: "in_review", label: "In Review", dot: "var(--accent-light)" },
   { key: "failed", label: "Failed", dot: "var(--error)" },
@@ -30,17 +27,73 @@ const columns = [
 
 type TaskView = "tasks" | "kanban";
 
+function htmlToPlainText(html: string): string {
+  // The knowledge-base editor only ever produces rich-text markup (paragraphs, lists, headings,
+  // inline marks) — never <script>/<style> — so a generic tag strip is all this needs.
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * `contentText` is the plain-text render kept in sync by the editor and by integration sync, but a
+ * handful of paths (a brand-new blank document, an older row from before contentText existed) can
+ * leave it null while contentHtml still holds the real content. Falling back to it means selecting
+ * a document never silently yields empty Context just because that one column is unset.
+ */
+function resolveDocumentText(item: KnowledgeDocument): string {
+  if (item.contentText?.trim()) return item.contentText;
+  if (item.contentHtml?.trim()) return htmlToPlainText(item.contentHtml);
+  return "";
+}
+
+/**
+ * Knowledge Base documents mirror Jira/Linear tickets as flattened markdown (see
+ * IntegrationSyncDocumentBuilder), so an "Acceptance Criteria" section arrives as a plain line
+ * inside the text rather than its own field. Splits that section out so a selected doc's
+ * acceptance criteria land in a dedicated field instead of getting mixed into Context.
+ */
+function splitAcceptanceCriteria(text: string): { body: string; acceptanceCriteria: string } {
+  const lines = text.split("\n");
+  const markerIndex = lines.findIndex((line) => {
+    const normalized = line.trim().replace(/^#+\s*/, "").replace(/:$/, "").trim().toLowerCase();
+    return normalized === "acceptance criteria";
+  });
+  if (markerIndex === -1) return { body: text, acceptanceCriteria: "" };
+
+  let endIndex = lines.length;
+  for (let i = markerIndex + 1; i < lines.length; i++) {
+    if (/^#+\s/.test(lines[i].trim())) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  const acceptanceCriteria = lines.slice(markerIndex + 1, endIndex).join("\n").trim();
+  if (!acceptanceCriteria) return { body: text, acceptanceCriteria: "" };
+
+  const body = [...lines.slice(0, markerIndex), ...lines.slice(endIndex)].join("\n").trim();
+  return { body, acceptanceCriteria };
+}
+
 export default function ZyraTasksPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
   const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>([]);
-  const [jiraEnabled, setJiraEnabled] = useState(false);
   const [story, setStory] = useState("");
   const [context, setContext] = useState("");
-  const [selectedJiraKeys, setSelectedJiraKeys] = useState<string[]>([]);
+  const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [selectedKnowledgeItemIds, setSelectedKnowledgeItemIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
@@ -60,20 +113,10 @@ export default function ZyraTasksPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [agentState, jiraStatus] = await Promise.all([
-        getZyraAgent(projectId),
-        getJiraStatus(projectId).catch(() => ({ connected: false })),
-      ]);
+      const agentState = await getZyraAgent(projectId);
       setState(agentState);
       const kb = await listKnowledgeDocuments(projectId).catch(() => ({ list: [], total: 0 }));
       setKnowledgeItems(kb.list || []);
-      setJiraEnabled(jiraStatus.connected === true);
-      if (jiraStatus.connected) {
-        const tickets = await listJiraTickets(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
-        setJiraTickets(tickets.list || []);
-      } else {
-        setJiraTickets([]);
-      }
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load agent tasks.");
@@ -89,7 +132,7 @@ export default function ZyraTasksPage() {
     });
   }, [loadData, router]);
 
-  // Refreshes just the task list (cheaper than loadData, which also re-pulls Jira/knowledge-base
+  // Refreshes just the task list (cheaper than loadData, which also re-pulls knowledge-base
   // data). Zyra picks up and finishes tasks asynchronously server-side, so without this the board
   // only ever reflected that after a manual reload.
   const refreshTasks = useCallback(async () => {
@@ -137,13 +180,13 @@ export default function ZyraTasksPage() {
       await createZyraTask(projectId, {
         story,
         context,
-        jiraIssueKeys: selectedJiraKeys,
+        acceptanceCriteria,
         knowledgeItemIds: selectedKnowledgeItemIds,
         count: state?.settings.testcaseCount,
       });
       setStory("");
       setContext("");
-      setSelectedJiraKeys([]);
+      setAcceptanceCriteria("");
       setSelectedKnowledgeItemIds([]);
       setCreateOpen(false);
       setMessage("Task created in Todo. Zyra will pick it up and move it to In Progress.");
@@ -155,29 +198,36 @@ export default function ZyraTasksPage() {
     }
   }
 
-  function handleSelectJiraTicket(key: string) {
-    if (!key || selectedJiraKeys.includes(key)) return;
-    const ticket = jiraTickets.find((item) => item.jiraIssueKey === key);
-    setSelectedJiraKeys((prev) => [...prev, key]);
-    if (!ticket) return;
-
-    const title = `${ticket.jiraIssueKey}: ${ticket.summary}`.trim();
-    const description = [ticket.description, ticket.status ? `Status: ${ticket.status}` : "", ticket.priority ? `Priority: ${ticket.priority}` : ""]
-      .filter(Boolean)
-      .join("\n\n");
+  function handleSelectKnowledgeItem(id: string) {
+    if (!id || selectedKnowledgeItemIds.includes(id)) return;
+    const item = knowledgeItems.find((candidate) => candidate.id === id);
+    setSelectedKnowledgeItemIds((prev) => [...prev, id]);
+    if (!item) return;
 
     setStory((prev) => {
-      if (!prev.trim()) return title;
-      if (prev.includes(ticket.jiraIssueKey) || prev.includes(ticket.summary)) return prev;
-      return `${prev.trim()}\n\n${title}`;
+      if (!prev.trim()) return item.title;
+      if (prev.includes(item.title)) return prev;
+      return `${prev.trim()}\n\n${item.title}`;
     });
+
+    const { body, acceptanceCriteria: extractedCriteria } = splitAcceptanceCriteria(resolveDocumentText(item));
+
     setContext((prev) => {
-      if (!description.trim()) return prev;
-      const block = `Jira ${ticket.jiraIssueKey}\n${description}`;
+      if (!body.trim()) return prev;
+      const block = `${item.title}\n${body}`;
       if (!prev.trim()) return block;
-      if (prev.includes(ticket.jiraIssueKey)) return prev;
+      if (prev.includes(item.title)) return prev;
       return `${prev.trim()}\n\n${block}`;
     });
+
+    if (extractedCriteria) {
+      setAcceptanceCriteria((prev) => {
+        const block = `${item.title}\n${extractedCriteria}`;
+        if (!prev.trim()) return block;
+        if (prev.includes(item.title)) return prev;
+        return `${prev.trim()}\n\n${block}`;
+      });
+    }
   }
 
   if (loading || !state) {
@@ -367,35 +417,21 @@ export default function ZyraTasksPage() {
               <Textarea value={context} onChange={(event) => setContext(event.target.value)} rows={5} placeholder="Business rules, edge cases, acceptance notes..." />
             </Field>
           </div>
-          {jiraEnabled && (
-            <Field>
-              <FieldLabel>Jira tickets</FieldLabel>
-              <Select value="" onChange={(event) => handleSelectJiraTicket(event.target.value)}>
-                <option value="">Select ticket...</option>
-                {jiraTickets.map((ticket) => (
-                  <option key={ticket.id} value={ticket.jiraIssueKey}>{ticket.jiraIssueKey} - {ticket.summary}</option>
-                ))}
-              </Select>
-              {selectedJiraKeys.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {selectedJiraKeys.map((key) => (
-                    <button type="button" key={key} onClick={() => setSelectedJiraKeys((prev) => prev.filter((item) => item !== key))} className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]">
-                      {key} x
-                    </button>
-                  ))}
-                </div>
-              )}
-            </Field>
-          )}
+          <Field>
+            <FieldLabel>Acceptance Criteria</FieldLabel>
+            <Textarea
+              value={acceptanceCriteria}
+              onChange={(event) => setAcceptanceCriteria(event.target.value)}
+              rows={4}
+              placeholder="Given ..., when ..., then ..."
+            />
+          </Field>
           {knowledgeItems.length > 0 && (
             <Field>
               <FieldLabel>Knowledge Base docs and notes</FieldLabel>
               <Select
                 value=""
-                onChange={(event) => {
-                  const id = event.target.value;
-                  if (id && !selectedKnowledgeItemIds.includes(id)) setSelectedKnowledgeItemIds((prev) => [...prev, id]);
-                }}
+                onChange={(event) => handleSelectKnowledgeItem(event.target.value)}
               >
                 <option value="">Select knowledge...</option>
                 {knowledgeItems.map((item) => (
