@@ -3143,6 +3143,22 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
+// The info-icon popover on a synced (mirror) row: this ticket's add/update timeline.
+export interface KnowledgeDocumentSyncEvent {
+  id: string;
+  eventType: "created" | "updated";
+  changedSummary: string | null;
+  createdAt: string;
+  triggeredByName: string | null;
+}
+
+export function getKnowledgeDocumentSyncEvents(
+  projectId: string,
+  documentId: string
+): Promise<{ events: KnowledgeDocumentSyncEvent[] }> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events`);
+}
+
 export function updateKnowledgeDocument(
   projectId: string,
   documentId: string,

@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { IntegrationSyncClient } from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
@@ -10,10 +11,13 @@ import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.buil
 import { IntegrationSyncService } from "./integration-sync.service";
 import {
   INTEGRATION_SYNC_CONCURRENCY,
+  INTEGRATION_SYNC_NIGHTLY_JIRA_JOB,
+  INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB,
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
   INTEGRATION_SYNC_TICKET_JOB,
   MAX_TICKETS_PER_RUN,
+  NIGHTLY_SYNC_SINCE_BUFFER_MINUTES,
   PROVIDER_FOLDER_NAMES
 } from "./integration-sync.constants";
 import { RemoteComment, RemoteTicket, SyncProvider, SyncRunJobPayload, SyncTicketJobPayload } from "./integration-sync.types";
@@ -73,7 +77,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
     private readonly client: IntegrationSyncClient,
     private readonly builder: IntegrationSyncDocumentBuilder,
     private readonly decisions: IntegrationSyncDecisions,
-    private readonly ragIngestion: RagIngestionService
+    private readonly ragIngestion: RagIngestionService,
+    private readonly planLimits: PlanLimitsService
   ) {
     super();
   }
@@ -81,13 +86,38 @@ export class IntegrationSyncProcessor extends WorkerHost {
   async process(job: Job): Promise<void> {
     if (job.name === INTEGRATION_SYNC_RUN_JOB) return this.processRun(job.data as SyncRunJobPayload);
     if (job.name === INTEGRATION_SYNC_TICKET_JOB) return this.processTicket(job.data as SyncTicketJobPayload);
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_JIRA_JOB) return this.processNightlyOrchestrator("jira");
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB) return this.processNightlyOrchestrator("linear");
     this.logger.warn(`Unknown integration-sync job name: ${job.name}`);
+  }
+
+  // ── Nightly orchestrator: one per provider, fans out into the same sync-run job every other
+  // trigger uses, so logging, dedup, and error handling are all shared rather than reimplemented. ──
+
+  private async processNightlyOrchestrator(provider: SyncProvider): Promise<void> {
+    const targets = await this.runs.listNightlySyncTargets(provider);
+    for (const target of targets) {
+      try {
+        const lastStart = await this.runs.getLastSuccessfulRunStart(target.projectId, provider);
+        const since = lastStart ? new Date(lastStart.getTime() - NIGHTLY_SYNC_SINCE_BUFFER_MINUTES * 60_000).toISOString() : null;
+        await this.runs.startRun(target.organizationId, target.projectId, provider, null, target.remoteKey, {
+          triggerSource: "nightly",
+          since
+        });
+      } catch (err) {
+        // One tenant's failure (revoked token, transient DB error) must never abort the rest of
+        // the night's run for everyone else.
+        this.logger.warn(
+          `Nightly ${provider} sync failed to start for project ${target.projectId}: ${err instanceof Error ? err.message : err}`
+        );
+      }
+    }
   }
 
   // ── Coordinator: page the provider, upsert tickets, fan out document jobs ──
 
   private async processRun(payload: SyncRunJobPayload): Promise<void> {
-    const { runId, organizationId, projectId, provider, triggeredBy } = payload;
+    const { runId, organizationId, projectId, provider, triggeredBy, since } = payload;
     const config = TICKET_TABLES[provider];
 
     try {
@@ -124,13 +154,18 @@ export class IntegrationSyncProcessor extends WorkerHost {
       };
 
       const { truncated } = provider === "jira"
-        ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage)
-        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage);
+        ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
+        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since);
 
       await this.runs.setTotals(runId, queued.length);
 
       if (!queued.length) {
-        await this.runs.finishRun(runId, `No tickets found in ${remote.remote_key}.`);
+        // An incremental (nightly) run finding nothing means "nothing changed since last time",
+        // not "this project is empty" — a full run reports the latter as before.
+        await this.runs.finishRun(
+          runId,
+          since ? `No changes in ${remote.remote_key} since the last sync.` : `No tickets found in ${remote.remote_key}.`
+        );
         return;
       }
 
@@ -270,6 +305,45 @@ export class IntegrationSyncProcessor extends WorkerHost {
     }
 
     const mirror = this.builder.buildMirror(ticket, comments, decisionSummary);
+
+    // Compare against what's already in the Knowledge Base *before* writing anything: an
+    // unattended nightly sync must never touch a document (bump updated_at, re-embed, log an
+    // event) when nothing the reader can see actually changed. "Updated" is stripped from the
+    // comparison because it's derived from the provider's own updated timestamp, which is by
+    // definition newer on every ticket an incremental fetch returns at all — comparing it as-is
+    // would make every fetched ticket look "changed" even when every other field is identical.
+    const stripVolatileMeta = (text: string) => text.replace(/^- \*\*Updated:\*\*.*$/m, "");
+    const existingDoc = await this.db.query<{ id: string; content_text: string; title: string }>(
+      `SELECT id, content_text, title FROM knowledge_documents
+       WHERE project_id = $1 AND source_provider = $2 AND source_external_id = $3 AND source_role = 'mirror' AND is_deleted = false`,
+      [projectId, provider, ticket.issueId]
+    );
+    const previousDoc = existingDoc.rows[0];
+    const contentChanged =
+      previousDoc?.content_text == null ||
+      stripVolatileMeta(previousDoc.content_text) !== stripVolatileMeta(mirror.markdown) ||
+      previousDoc.title !== mirror.title;
+
+    if (!contentChanged) {
+      await this.runs.recordTicketResult(runId, { processed: 1 });
+      return;
+    }
+
+    // Checked only once we know a write is actually needed — an unattended nightly sync must
+    // never silently fill a workspace's storage with nobody having clicked anything. Skips just
+    // this ticket (tallied as failed, so the run still reaches 100% and settles on 'partial'
+    // rather than hanging) rather than aborting the whole run.
+    const incomingBytes = Buffer.byteLength(mirror.markdown, "utf8") + Buffer.byteLength(mirror.html, "utf8");
+    const storageCheck = await this.planLimits.checkStorageAvailable(organizationId, incomingBytes);
+    if (!storageCheck.allowed) {
+      this.logger.warn(`Storage limit reached for ${ticket.issueKey} in run ${runId}: ${storageCheck.reason}`);
+      await this.db
+        .query("UPDATE integration_sync_runs SET error = COALESCE(error, $2), updated_at = now() WHERE id = $1", [runId, storageCheck.reason])
+        .catch(() => undefined);
+      await this.runs.recordTicketResult(runId, { processed: 1, failed: 1 });
+      return;
+    }
+
     const upserted = await this.db.query<{ id: string; inserted: boolean }>(
       `INSERT INTO knowledge_documents (
          organization_id, project_id, folder_id, title, content_text, content_html, document_type, status,
@@ -300,6 +374,16 @@ export class IntegrationSyncProcessor extends WorkerHost {
       void this.ragIngestion
         .enqueueEmbedding({ organizationId, projectId, sourceType: "document", sourceId: mirrorDoc.id, reason: "updated" })
         .catch(() => undefined);
+      await this.runs
+        .recordSyncEvent(
+          mirrorDoc.id,
+          runId,
+          mirrorDoc.inserted ? "created" : "updated",
+          provider,
+          this.summarizeChanges(previousDoc?.content_text ?? null, mirror.markdown),
+          triggeredBy
+        )
+        .catch((err) => this.logger.warn(`Failed to record sync event for ${ticket.issueKey}: ${err instanceof Error ? err.message : err}`));
     }
 
     await this.runs.recordTicketResult(runId, {
@@ -316,6 +400,31 @@ export class IntegrationSyncProcessor extends WorkerHost {
     if (!raw) return [];
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
     return Array.isArray(parsed) ? (parsed as RemoteComment[]) : [];
+  }
+
+  /**
+   * Short, human-readable "what changed" line for the Knowledge Base info-icon popover — deliberately
+   * a summary of which sections moved, not a full diff, per the "keep it minimal and small" ask.
+   * `oldContent` is null for a brand-new document.
+   */
+  private summarizeChanges(oldContent: string | null, newContent: string): string {
+    if (oldContent === null) return "Added from sync.";
+    const oldSections = new Map(oldContent.split("\n\n").map((section) => [this.sectionLabel(section), section]));
+    const changedLabels: string[] = [];
+    for (const section of newContent.split("\n\n")) {
+      const label = this.sectionLabel(section);
+      if (oldSections.get(label) !== section) changedLabels.push(label);
+    }
+    return changedLabels.length ? `${changedLabels.join(", ")} updated.` : "Updated from sync.";
+  }
+
+  private sectionLabel(section: string): string {
+    const firstLine = (section.split("\n")[0] || "").trim();
+    const heading = firstLine.match(/^#{1,6}\s+(.*)$/);
+    if (heading) return heading[1].trim();
+    // The title line ("# KEY: summary") and the meta block (Status/Type/Priority/...) have no
+    // "## " heading of their own — label them explicitly so the summary reads naturally.
+    return firstLine.startsWith("# ") ? "Title" : "Details";
   }
 
   @OnWorkerEvent("failed")

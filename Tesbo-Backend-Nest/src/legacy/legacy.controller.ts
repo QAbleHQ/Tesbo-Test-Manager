@@ -1373,6 +1373,11 @@ export class LegacyController {
     return this.legacy.getKnowledgeDocument(projectId, req.userId, documentId);
   }
 
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId/sync-events")
+  getKnowledgeDocumentSyncEvents(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.getKnowledgeDocumentSyncEvents(projectId, req.userId, documentId);
+  }
+
   @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/move")
   moveKnowledgeDocument(
     @Req() req: AuthenticatedRequest,

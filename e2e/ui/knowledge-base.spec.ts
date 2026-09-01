@@ -199,6 +199,38 @@ test.describe("knowledge base (UI)", () => {
     );
   }
 
+  /**
+   * A mirrored (Jira/Linear) document exactly as a real sync would leave it — seeded directly since
+   * producing one for real means a live Jira/Linear call, which this suite cannot make (see
+   * api/integrations.spec.ts's file-level note). `createdAt`/`updatedAt` are given explicit,
+   * distinct values so "Added on" and "Last updated" can be told apart in the rendered table instead
+   * of both coincidentally reading "Today".
+   */
+  function seedMirrorDocument(title: string, externalId: string, createdDaysAgo: number, updatedDaysAgo: number): string {
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only, created_at, updated_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(title)}, ` +
+        "'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', 'published', 'jira', " +
+        `${literal(externalId)}, 'mirror', true, now() - interval '${createdDaysAgo} days', now() - interval '${updatedDaysAgo} days');`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND source_external_id = ${literal(externalId)} AND source_role = 'mirror';`,
+    );
+  }
+
+  function seedSyncEvent(documentId: string, eventType: "created" | "updated", changedSummary: string | null): void {
+    exec(
+      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary) VALUES (" +
+        `${literal(documentId)}, 'jira', ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)});`,
+    );
+  }
+
+  /** The row's info-icon trigger (Change history) — present only on a synced (mirror) row. */
+  function changeHistoryTrigger(page: Page, name: string): Locator {
+    return row(page, name).getByRole("button", { name: "Change history" });
+  }
+
   // ─── The primary flow ──────────────────────────────────────────────────────
 
   test("KBU-01 a folder is created from the New menu and appears in the table and the tree", { tag: '@tesbo.testId("TES-TC-1000")' }, async ({
@@ -1082,5 +1114,82 @@ test.describe("knowledge base (UI)", () => {
       scalar(`SELECT name FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(ownersFolder)};`),
       "the refused rename must not have been persisted",
     ).toBe(ownersFolder);
+  });
+
+  // ─── Nightly sync cron follow-through: "Added on", "Last updated", and the change-history popover ──
+
+  test("KBU-35 a synced row shows distinct Added on / Last updated dates, its icon sits in Last updated, and a plain row has no icon", { tag: '@tesbo.testId("TES-TC-254")' }, async ({ browser }) => {
+    const mirrorTitle = stamp("E2E-80: Synced ticket");
+    seedMirrorDocument(mirrorTitle, "kbu-added-on-1", 5, 0);
+
+    const plainTitle = stamp("Plain human document");
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, document_type, status) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(plainTitle)}, 'not synced', 'general', 'draft');`,
+    );
+
+    const page = await openKb(browser);
+    await expect(page.getByRole("columnheader", { name: "Added on" })).toBeVisible();
+
+    const mirrorRow = row(page, mirrorTitle);
+    await expect(mirrorRow).toBeVisible();
+    const cells = await mirrorRow.getByRole("cell").allTextContents();
+    // Name, Type, Updated by, Added on, Last updated, Size, Actions (no search query active, so
+    // the Folder path column is absent) — Added on (created 5 days ago) must read differently from
+    // Last updated (touched moments ago), not just coincidentally both say "Today".
+    expect(cells[3]).not.toContain("Today");
+    expect(cells[4]).toContain("Today");
+
+    // The icon lives in the Last updated cell, not Type — assert it directly rather than just
+    // "somewhere in the row", since that's the exact placement that was reported wrong.
+    const lastUpdatedCell = mirrorRow.getByRole("cell").nth(4);
+    await expect(lastUpdatedCell.getByRole("button", { name: "Change history" })).toBeVisible();
+    await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Change history" })).toHaveCount(0);
+
+    // A synced row gets the info icon; a plain, human-authored row does not — there is no change
+    // timeline to show for it.
+    await expect(changeHistoryTrigger(page, mirrorTitle)).toBeVisible();
+    await expect(changeHistoryTrigger(page, plainTitle)).toHaveCount(0);
+  });
+
+  test("KBU-36 the change-history popover opens on hover as well as click, and lists the timeline newest first", { tag: '@tesbo.testId("TES-TC-255")' }, async ({ browser }) => {
+    const title = stamp("E2E-81: Has history");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-2", 5, 0);
+    seedSyncEvent(documentId, "created", null);
+    seedSyncEvent(documentId, "updated", "Status: To Do -> In Progress updated.");
+
+    const page = await openKb(browser);
+    const panel = menuPanel(page);
+
+    // Hovering, not clicking, must open it — this is the behavior that was reported broken.
+    await changeHistoryTrigger(page, title).hover();
+    await expect(panel.getByText("Change history")).toBeVisible();
+    await expect(panel.getByText("Status: To Do -> In Progress updated.")).toBeVisible();
+    await expect(panel.getByText("Added", { exact: false }).first()).toBeVisible();
+
+    // Moving onto the popover itself (not away from the row) must not close it.
+    await panel.hover();
+    await expect(panel).toBeVisible();
+
+    // Moving away closes it again.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).hover();
+    await expect(panel).not.toBeVisible();
+
+    // Click opens it too, independent of hover (covers touch/keyboard users with no real hover).
+    await changeHistoryTrigger(page, title).click();
+    await expect(menuPanel(page).getByText("Change history")).toBeVisible();
+
+    // An outside click closes it — the only way a tap-only device can dismiss it.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).click();
+    await expect(menuPanel(page)).toHaveCount(0);
+
+    // A document with no change history recorded (e.g. one mirrored before this feature shipped)
+    // shows a plain empty state rather than an error or a blank popup.
+    const untracked = stamp("E2E-82: No history recorded");
+    seedMirrorDocument(untracked, "kbu-added-on-3", 1, 1);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await changeHistoryTrigger(page, untracked).hover();
+    await expect(menuPanel(page).getByText("No change history recorded yet.")).toBeVisible();
   });
 });

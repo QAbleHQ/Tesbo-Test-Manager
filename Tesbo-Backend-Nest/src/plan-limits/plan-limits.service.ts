@@ -364,6 +364,16 @@ export class PlanLimitsService {
     });
   }
 
+  /**
+   * Non-throwing sibling of assertIntegrationAllowed (same relationship as checkStorageAvailable
+   * vs assertStorageAvailable above) — for the nightly sync scheduler, which needs to silently skip
+   * a provider for a workspace rather than fail a request.
+   */
+  async isIntegrationAllowed(organizationId: string, provider: string): Promise<boolean> {
+    const { effectivePlan } = await this.getEntitlement(organizationId);
+    return effectivePlan === "pro" || LAUNCH_ALLOWED_INTEGRATIONS.has(provider);
+  }
+
   async getUsageSummary(organizationId: string): Promise<PlanUsageSummary> {
     const { plan, effectivePlan, inGracePeriod, graceEndsAt } = await this.getEntitlement(organizationId);
     const [projectCount, storageUsedBytes] = await Promise.all([

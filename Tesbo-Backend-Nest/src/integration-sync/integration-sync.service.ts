@@ -2,13 +2,16 @@ import { InjectQueue } from "@nestjs/bullmq";
 import { Injectable, Logger } from "@nestjs/common";
 import { Queue } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import {
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
   INTEGRATION_SYNC_TICKET_JOB,
   PROVIDER_FOLDER_NAMES
 } from "./integration-sync.constants";
-import { SyncProvider, SyncRunJobPayload, SyncRunStage, SyncTicketJobPayload } from "./integration-sync.types";
+import { SyncProvider, SyncRunJobPayload, SyncRunStage, SyncTicketJobPayload, SyncTriggerSource } from "./integration-sync.types";
+
+type Row = Record<string, any>;
 
 export interface SyncRunView {
   id: string;
@@ -45,7 +48,8 @@ export class IntegrationSyncService {
 
   constructor(
     @InjectQueue(INTEGRATION_SYNC_QUEUE) private readonly queue: Queue,
-    private readonly db: DatabaseService
+    private readonly db: DatabaseService,
+    private readonly planLimits: PlanLimitsService
   ) {}
 
   // ── Producer ──
@@ -61,8 +65,11 @@ export class IntegrationSyncService {
     projectId: string,
     provider: SyncProvider,
     triggeredBy: string | null,
-    remoteProjectKey: string | null
+    remoteProjectKey: string | null,
+    options?: { triggerSource?: SyncTriggerSource; since?: string | null }
   ): Promise<{ run: SyncRunView; alreadyRunning: boolean }> {
+    const triggerSource: SyncTriggerSource = options?.triggerSource || "manual";
+    const since = options?.since ?? null;
     const connection = await this.db.query<{ id: string }>(
       "SELECT id FROM integration_connections WHERE organization_id = $1 AND provider = $2",
       [organizationId, provider]
@@ -70,14 +77,14 @@ export class IntegrationSyncService {
 
     try {
       const inserted = await this.db.query<{ id: string }>(
-        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, triggered_by, status, stage)
-         VALUES ($1, $2, $3, $4, $5, $6, 'queued', 'queued')
+        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, triggered_by, trigger_source, status, stage)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 'queued')
          RETURNING id`,
-        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy]
+        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource]
       );
       const runId = inserted.rows[0].id;
 
-      const payload: SyncRunJobPayload = { runId, organizationId, projectId, provider, triggeredBy };
+      const payload: SyncRunJobPayload = { runId, organizationId, projectId, provider, triggeredBy, triggerSource, since };
       await this.queue.add(INTEGRATION_SYNC_RUN_JOB, payload, {
         jobId: `run-${runId}`,
         // One attempt only. A retry would re-page the whole provider backlog, and the run row
@@ -329,5 +336,97 @@ export class IntegrationSyncService {
         .add(INTEGRATION_SYNC_RUN_JOB, payload, { jobId: `run-${run.id}`, attempts: 1, removeOnComplete: { count: 200 }, removeOnFail: { count: 200 } })
         .catch((err) => this.logger.warn(`Failed to resume sync run ${run.id}: ${err instanceof Error ? err.message : err}`));
     }
+  }
+
+  // ── Nightly cron ──
+
+  /**
+   * The incremental cursor for a project+provider: the start time of its most recent successful
+   * (succeeded or partial) run, regardless of who triggered it — a 3pm manual Sync means tonight's
+   * run only needs tickets updated after 3pm. 'failed' runs are deliberately excluded so a
+   * transient failure night never causes the following run to silently skip the missed window.
+   * Returns null when there is no prior successful run (first-ever sync for this project+provider).
+   */
+  async getLastSuccessfulRunStart(projectId: string, provider: SyncProvider): Promise<Date | null> {
+    const res = await this.db.query<{ started_at: string | null }>(
+      `SELECT MAX(started_at) AS started_at FROM integration_sync_runs
+       WHERE project_id = $1 AND provider = $2 AND status IN ('succeeded', 'partial')`,
+      [projectId, provider]
+    );
+    const startedAt = res.rows[0]?.started_at;
+    return startedAt ? new Date(startedAt) : null;
+  }
+
+  /**
+   * Every (organization, project, remote key) the nightly scheduler should sync tonight for one
+   * provider: an enabled mapping backed by a live connection. A disconnected workspace's
+   * integration_connections row is deleted outright (see legacy.service.ts's disconnect flow), so
+   * it drops out of this join with no extra "still connected" check needed. Linear is additionally
+   * filtered through plan entitlement — Jira is unaffected since the Launch plan includes it.
+   */
+  async listNightlySyncTargets(
+    provider: SyncProvider
+  ): Promise<Array<{ organizationId: string; projectId: string; remoteKey: string }>> {
+    const mappingTable = provider === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const remoteKeyCol = provider === "jira" ? "jira_project_key" : "linear_team_key";
+    const res = await this.db.query<{ organization_id: string; project_id: string; remote_key: string }>(
+      `SELECT ic.organization_id, m.project_id, m.${remoteKeyCol} AS remote_key
+       FROM ${mappingTable} m
+       JOIN integration_connections ic ON ic.id = m.${provider === "jira" ? "jira_connection_id" : "integration_connection_id"}
+       WHERE m.enabled = true AND ic.provider = $1`,
+      [provider]
+    );
+
+    const targets = res.rows.map((row) => ({
+      organizationId: String(row.organization_id),
+      projectId: String(row.project_id),
+      remoteKey: String(row.remote_key)
+    }));
+    if (provider !== "linear") return targets;
+
+    const allowed: typeof targets = [];
+    for (const target of targets) {
+      if (await this.planLimits.isIntegrationAllowed(target.organizationId, "linear")) allowed.push(target);
+    }
+    return allowed;
+  }
+
+  /** Append-only log backing the Knowledge Base info-icon popover. Never updated or deleted. */
+  async recordSyncEvent(
+    documentId: string,
+    runId: string,
+    eventType: "created" | "updated",
+    provider: SyncProvider,
+    changedSummary: string | null,
+    triggeredBy: string | null
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO knowledge_document_sync_events (document_id, run_id, provider, event_type, changed_summary, triggered_by)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [documentId, runId, provider, eventType, changedSummary, triggeredBy]
+    );
+  }
+
+  async listSyncEventsForDocument(
+    documentId: string,
+    limit = 20
+  ): Promise<Array<{ id: string; eventType: string; changedSummary: string | null; createdAt: string; triggeredByName: string | null }>> {
+    const res = await this.db.query<Row>(
+      `SELECT e.id, e.event_type, e.changed_summary, e.created_at,
+              COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS triggered_by_name
+       FROM knowledge_document_sync_events e
+       LEFT JOIN users u ON u.id = e.triggered_by
+       WHERE e.document_id = $1
+       ORDER BY e.created_at DESC
+       LIMIT $2`,
+      [documentId, Math.max(1, Math.min(50, limit))]
+    );
+    return res.rows.map((row) => ({
+      id: String(row.id),
+      eventType: String(row.event_type),
+      changedSummary: row.changed_summary ? String(row.changed_summary) : null,
+      createdAt: new Date(row.created_at).toISOString(),
+      triggeredByName: row.triggered_by_name ? String(row.triggered_by_name) : null
+    }));
   }
 }
