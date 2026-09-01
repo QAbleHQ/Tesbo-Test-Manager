@@ -237,6 +237,35 @@ test.describe("bugs list — controls and filters", () => {
     expect(deleteColor, "delete should be distinguishable from edit by colour").not.toBe(editColor);
   });
 
+  test("BUG-U-27 the board card's edit and delete controls are labelled and legibly sized", async ({ page }) => {
+    // Same defect as BUG-U-06, on the other view: the card's actions were a 14px glyph in a ~22px
+    // box, hidden until hover, with no aria-label — reported again as "icon size is very small
+    // not visible properly" because Board, not List, is what a project lands on by default.
+    await page.getByRole("button", { name: "Board", exact: true }).click();
+    const card = page.locator('[role="button"]').filter({ hasText: "E2E Low sev bug" }).first();
+    await card.hover();
+
+    const edit = card.getByRole("button", { name: "Edit bug" });
+    const del = card.getByRole("button", { name: "Delete bug" });
+
+    await expect(edit).toBeVisible();
+    await expect(del).toBeVisible();
+
+    for (const control of [edit, del]) {
+      const box = await control.boundingBox();
+      expect(box, "an icon control with no box is not on screen").toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(28);
+      expect(box!.width).toBeGreaterThanOrEqual(28);
+      const svg = control.locator("svg").first();
+      const svgBox = await svg.boundingBox();
+      expect(svgBox!.height, "the glyph itself has to be big enough to read").toBeGreaterThanOrEqual(17);
+    }
+
+    const editColor = await edit.evaluate((el) => getComputedStyle(el).color);
+    const deleteColor = await del.evaluate((el) => getComputedStyle(el).color);
+    expect(deleteColor, "delete should be distinguishable from edit by colour").not.toBe(editColor);
+  });
+
   test("BUG-U-07 a long title is clamped and carries its full text as a tooltip", { tag: '@tesbo.testId("TES-TC-1317")' }, async ({ page }) => {
     const title = page.locator("td span[title]").filter({ hasText: "E2E long bug title" }).first();
     await expect(title).toBeVisible();
