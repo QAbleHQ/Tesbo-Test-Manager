@@ -276,16 +276,6 @@ function LoginForm() {
             </Link>
           </p>
         )}
-
-        <p className="mt-6 text-center text-xs text-[var(--muted-soft)]">
-          <Link href="/privacy-policy" className="hover:underline">
-            Privacy Policy
-          </Link>{" "}
-          ·{" "}
-          <Link href="/terms-and-conditions" className="hover:underline">
-            Terms and Conditions
-          </Link>
-        </p>
       </div>
     </AuthSplitShell>
   );
