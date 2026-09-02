@@ -59,13 +59,6 @@ const PANEL_STORAGE_KEY = "tesbo_plan_switcher_panel";
 
 /* ───── Helpers ───── */
 
-function toPriority(raw: string | null): Priority {
-  if (raw === "P0") return "critical";
-  if (raw === "P1") return "high";
-  if (raw === "P3") return "low";
-  return "medium";
-}
-
 function toTestStatus(raw: string | null): TestStatus {
   const map: Record<string, TestStatus> = {
     Passed: "pass",
@@ -889,7 +882,7 @@ export default function PlanDetailPage() {
                                   )}
                                 </td>
                                 <td className="px-4 py-2.5 text-[var(--foreground)]">{isSuite ? (item.suiteName ?? "Unknown suite") : (item.tcTitle ?? "Untitled test case")}</td>
-                                <td className="px-4 py-2.5">{isSuite ? <span className="text-[var(--muted-soft)]">—</span> : <PriorityBadge priority={toPriority(item.tcPriority)} />}</td>
+                                <td className="px-4 py-2.5">{isSuite || !item.tcPriority ? <span className="text-[var(--muted-soft)]">—</span> : <PriorityBadge priority={item.tcPriority as Priority} />}</td>
                                 <td className="px-4 py-2.5">{isSuite ? <span className="text-[var(--muted-soft)]">—</span> : <StatusBadge status={toTestStatus(item.lastStatus)} />}</td>
                                 <td className="px-4 py-2.5 text-center">
                                   <button

@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
 import { closeZyraTask, type ZyraTask } from "@/lib/api";
-import { Button, CopyButton, StatusChip } from "@/components/ui";
+import { Button, CopyButton, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -57,13 +57,6 @@ const TASK_STATUS_LABELS: Record<string, string> = {
 export function taskStatusLabel(status: string): string {
   const normalized = normalizeTaskStatus(status);
   return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
-}
-
-function priorityTone(priority: string): "error" | "warning" | "confidenceHigh" | "neutral" {
-  if (priority === "P0") return "error";
-  if (priority === "P1") return "warning";
-  if (priority === "P2") return "confidenceHigh";
-  return "neutral";
 }
 
 function firstStepText(stepsJson: string): string | null {
@@ -260,7 +253,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 return (
                   <div key={`${task.id}-draft-${index}`} className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
                     <div className="mb-1.5 flex items-center gap-2">
-                      <StatusChip tone={priorityTone(draft.priority)}>{draft.priority}</StatusChip>
+                      <PriorityBadge priority={draft.priority as Priority} />
                       {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
                     </div>
                     <div className="text-[13px] font-medium leading-snug text-[var(--foreground)]">{draft.title}</div>

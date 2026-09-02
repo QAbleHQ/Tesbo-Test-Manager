@@ -33,6 +33,8 @@ import {
   Textarea,
   Select,
   StatusChip,
+  PriorityBadge,
+  SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
 import { avatarColor } from "@/lib/avatarColors";
@@ -52,16 +54,9 @@ const BUG_SEVERITIES: BugSeverity[] = ["Critical", "High", "Medium", "Low"];
  */
 const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
 
-const PRIORITY_TONE: Record<BugPriority, "error" | "warning" | "info" | "neutral"> = {
-  P0: "error",
-  P1: "warning",
-  P2: "info",
-  P3: "neutral",
-};
-
 function BugPriorityBadge({ priority }: { priority: BugPriority | null }) {
   if (!priority) return <span className="text-xs text-[var(--muted-soft)]">—</span>;
-  return <StatusChip tone={PRIORITY_TONE[priority]}>{priority}</StatusChip>;
+  return <PriorityBadge priority={priority} />;
 }
 
 /* ───── Assignee avatar ─────
@@ -117,13 +112,6 @@ const STATUS_COLOR: Record<string, string> = {
   Closed: "var(--success)",
 };
 
-const SEVERITY_TONE: Record<BugSeverity, "error" | "warning" | "neutral" | "success"> = {
-  Critical: "error",
-  High: "warning",
-  Medium: "neutral",
-  Low: "success",
-};
-
 /* ───── Status badge ───── */
 function BugStatusBadge({ status }: { status: string }) {
   return (
@@ -133,7 +121,7 @@ function BugStatusBadge({ status }: { status: string }) {
 
 /* ───── Severity badge ───── */
 function BugSeverityBadge({ severity }: { severity: BugSeverity }) {
-  return <StatusChip tone={SEVERITY_TONE[severity]}>{severity}</StatusChip>;
+  return <SeverityBadge severity={severity} />;
 }
 
 /* ───── View toggle buttons ───── */
