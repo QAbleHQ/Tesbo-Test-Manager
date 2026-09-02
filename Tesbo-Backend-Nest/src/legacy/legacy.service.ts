@@ -10783,10 +10783,16 @@ export class LegacyService implements OnModuleInit {
     const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
     try {
-      const knowledge = await this.knowledgeSnapshot(projectId);
-      const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
-      const linear = await this.linearSnapshot(projectId, linearIssueKeys);
-      const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
+      // These four snapshots are independent reads (knowledge base, Jira, Linear, existing
+      // testcases) — gathering them concurrently instead of one after another cuts this stage's
+      // wall time down to the slowest of the four instead of their sum, without changing what any
+      // of them return. The request still awaits the full pipeline before responding, same as before.
+      const [knowledge, jira, linear, existingTestcases] = await Promise.all([
+        this.knowledgeSnapshot(projectId),
+        this.jiraSnapshot(projectId, jiraIssueKeys),
+        this.linearSnapshot(projectId, linearIssueKeys),
+        this.existingTestcaseSnapshot(projectId, story, context)
+      ]);
       const aiResult = await this.generateZyraWithProvider({
         provider,
         model,
@@ -11381,28 +11387,33 @@ export class LegacyService implements OnModuleInit {
       values.push(selected);
       filter += ` AND (id = ANY($${values.length}::uuid[]) OR title = 'Zyra AI Memory')`;
     }
-    const res = await this.db.query(
-      `SELECT title, content_text FROM knowledge_documents
-       WHERE ${filter}
-       ORDER BY CASE WHEN title = 'Zyra AI Memory' THEN 0 ELSE 1 END, updated_at DESC
-       LIMIT 12`,
-      values
-    );
+    // knowledgeItemIds selection (task generation) only ever names documents (see the frontend
+    // picker), so an explicit selection should stay document-only rather than pulling in files —
+    // skip firing the files query at all in that case, rather than firing and discarding it.
+    const [res, filesRes] = await Promise.all([
+      this.db.query(
+        `SELECT title, content_text FROM knowledge_documents
+         WHERE ${filter}
+         ORDER BY CASE WHEN title = 'Zyra AI Memory' THEN 0 ELSE 1 END, updated_at DESC
+         LIMIT 12`,
+        values
+      ),
+      selected.length
+        ? Promise.resolve({ rows: [] as any[] })
+        : this.db.query(
+            `SELECT original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files
+             WHERE project_id = $1 AND is_deleted = false
+             ORDER BY updated_at DESC
+             LIMIT 8`,
+            [projectId]
+          )
+    ]);
     const documents = res.rows.map((row) => ({
       title: row.title || "Knowledge base item",
       content: String(row.content_text || "").slice(0, 1500)
     }));
-    // knowledgeItemIds selection (task generation) only ever names documents (see the frontend
-    // picker), so an explicit selection should stay document-only rather than pulling in files.
     if (selected.length) return documents;
 
-    const filesRes = await this.db.query(
-      `SELECT original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files
-       WHERE project_id = $1 AND is_deleted = false
-       ORDER BY updated_at DESC
-       LIMIT 8`,
-      [projectId]
-    );
     const files = filesRes.rows.map((row) => ({
       title: row.original_file_name || "Uploaded file",
       content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status)
@@ -11609,12 +11620,16 @@ export class LegacyService implements OnModuleInit {
       jiraConnected = Boolean(connection);
       if (connection) {
         const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
-        for (const key of missingKeys) {
+        // Fetched concurrently rather than one key at a time — each key is an independent Jira
+        // HTTP round trip plus its own upsert, so N sequential round trips were paying N times the
+        // latency of a single one for no benefit; byKey.set is safe here since Node's event loop
+        // never interleaves the synchronous portions of these callbacks.
+        await Promise.all(missingKeys.map(async (key) => {
           const issue = await this.jiraFetch<Body>(
             `${baseUrl}/rest/api/3/issue/${encodeURIComponent(key)}?fields=summary,description,issuetype,status,priority,assignee,reporter,labels,created,updated`,
             { headers }
           ).catch(() => null);
-          if (!issue) continue;
+          if (!issue) return;
           const fields = (issue.fields || {}) as Body;
           const summary = String(fields.summary || "");
           const description = jiraDescriptionToText(fields.description);
@@ -11657,7 +11672,7 @@ export class LegacyService implements OnModuleInit {
               `${connection.site_url}/browse/${issue.key || key}`
             ]
           ).catch(() => undefined);
-        }
+        }));
       }
     }
 
