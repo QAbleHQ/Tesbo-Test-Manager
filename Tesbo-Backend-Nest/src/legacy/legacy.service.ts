@@ -11976,7 +11976,11 @@ export class LegacyService implements OnModuleInit {
       const value = chars.join("").trim();
       if (value) salvaged[field] = value;
     }
-    return Object.keys(salvaged).length ? salvaged : null;
+    if (!Object.keys(salvaged).length) return null;
+    // Marks the fragment as recovered rather than a clean parse, so callers (and reconcileZyraReply)
+    // can tell that action/operations/testcases were lost to truncation, not genuinely absent.
+    salvaged.salvaged = true;
+    return salvaged;
   }
 
   // Strict parse → repaired parse → textual field salvage. Returns null only when the text
@@ -12857,7 +12861,13 @@ export class LegacyService implements OnModuleInit {
    * to say a mutation happened.
    */
   private static readonly ZYRA_COMPLETION_CLAIM =
-    /\b(created|added|generated and saved|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed|moved|staged|drafted|proposed)\b/i;
+    /\b(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b/i;
+
+  // A reply that already admits nothing happened — "Nothing was saved", "No test cases were
+  // created", "could not create/save" — must not be wrapped a second time; the completion-claim
+  // guard below exists to add an honest correction, not to stack one on top of an honest refusal.
+  private static readonly ZYRA_ALREADY_DISCLOSED =
+    /\b(nothing was (saved|changed|created|written)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added)|could\s+not\s+(create|save|generate|archive|update|add)|generation\s+is\s+(turned\s+off|disabled|off))\b/i;
 
   private reconcileZyraReply(decision: ZyraChatDecision, applied: { testcases: Body[]; activity: Body[] }): string {
     /*
@@ -12874,9 +12884,13 @@ export class LegacyService implements OnModuleInit {
      * The correction goes FIRST, before the model's prose, so the two are read in the right order.
      */
     if (decision.actionType === "answer") {
-      if (!applied.testcases.length && LegacyService.ZYRA_COMPLETION_CLAIM.test(decision.reply)) {
+      if (
+        !applied.testcases.length &&
+        LegacyService.ZYRA_COMPLETION_CLAIM.test(decision.reply) &&
+        !LegacyService.ZYRA_ALREADY_DISCLOSED.test(decision.reply)
+      ) {
         return [
-          "⚠️ **Nothing was changed in the repository by this message.** Anything described below as created, saved or archived was not carried out — I only described it.",
+          "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.",
           "",
           "Ask me to go ahead and I'll make the change and show you the affected test cases.",
           "",
