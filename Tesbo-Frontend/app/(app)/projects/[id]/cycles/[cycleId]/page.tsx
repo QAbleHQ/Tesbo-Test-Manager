@@ -60,7 +60,7 @@ import {
   type IssueSearchResult,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
-import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer } from "@/components/ui";
+import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer, PriorityBadge, type Priority } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import IssuePickerModal from "@/components/IssuePickerModal";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
@@ -254,14 +254,6 @@ function formatDate(iso: string): string {
   const ts = new Date(iso).getTime();
   if (Number.isNaN(ts)) return "—";
   return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-}
-
-/* ───── Priority / status color helpers ───── */
-function priorityColor(priority: string): string {
-  if (priority === "P0") return "var(--error-foreground)";
-  if (priority === "P1") return "var(--warning-foreground)";
-  if (priority === "P2") return "var(--info-foreground)";
-  return "var(--muted-soft)";
 }
 
 /* The neutral ("Untested") palette — also the fallback in execSelectStyle for any status the
@@ -1272,12 +1264,7 @@ export default function TestRunDetailPage() {
                           </button>
                         </td>
                         <td className="px-5 py-3">
-                          <span className="inline-flex items-center gap-1.5">
-                            <span className="h-1.5 w-1.5 rounded-full" style={{ background: priorityColor(e.priority) }} />
-                            <span className="font-mono text-[11.5px] font-semibold" style={{ color: priorityColor(e.priority) }}>
-                              {e.priority || "—"}
-                            </span>
-                          </span>
+                          {e.priority ? <PriorityBadge priority={e.priority as Priority} /> : <span className="text-[12.5px] text-[var(--muted-soft)]">—</span>}
                         </td>
                         <td className="px-5 py-3 text-[12.5px] text-[var(--muted)]">{e.type || "—"}</td>
                         <td className="px-5 py-3">
@@ -1563,7 +1550,7 @@ export default function TestRunDetailPage() {
                         <td className="px-3 py-2 text-sm text-[var(--foreground)] truncate max-w-xs">
                           {tc.title}
                         </td>
-                        <td className="px-3 py-2 text-xs text-[var(--muted)]">{tc.priority}</td>
+                        <td className="px-3 py-2"><PriorityBadge priority={tc.priority as Priority} /></td>
                         <td className="px-3 py-2 text-xs text-[var(--muted)]">{tc.type}</td>
                         <td className="px-3 py-2">
                           <span className={`text-xs ${
@@ -1993,12 +1980,7 @@ export default function TestRunDetailPage() {
             <div className="flex-1 space-y-5 overflow-y-auto p-5">
               {/* Meta row */}
               <div className="flex flex-wrap items-center gap-4 text-[12.5px]">
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="h-1.5 w-1.5 rounded-full" style={{ background: priorityColor(panelExecution.priority) }} />
-                  <span className="font-mono font-semibold" style={{ color: priorityColor(panelExecution.priority) }}>
-                    {panelExecution.priority || "—"}
-                  </span>
-                </span>
+                {panelExecution.priority ? <PriorityBadge priority={panelExecution.priority as Priority} /> : <span className="text-[var(--muted-soft)]">—</span>}
                 <span className="text-[var(--muted)]">{panelExecution.type || "—"}</span>
                 {panelExecution.assigneeId && memberNames[panelExecution.assigneeId] && (
                   <span className="flex items-center gap-1.5 text-[var(--muted)]">
