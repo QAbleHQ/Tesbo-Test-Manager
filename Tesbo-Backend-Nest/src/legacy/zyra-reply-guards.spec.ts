@@ -95,10 +95,10 @@ describe("Zyra reply guards", () => {
         answer("Created test cases covering the key knowledge-base items."),
         nothingApplied
       );
-      expect(out).toContain("Nothing was changed in the repository");
+      expect(out).toContain("Nothing was saved");
       // The model's prose is kept below the correction, as it is for a partial application.
       expect(out).toContain("Created test cases covering the key knowledge-base items.");
-      expect(out.indexOf("Nothing was changed")).toBeLessThan(out.indexOf("Created test cases"));
+      expect(out.indexOf("Nothing was saved")).toBeLessThan(out.indexOf("Created test cases"));
     });
 
     it("corrects a claim that test cases were archived", () => {
@@ -106,7 +106,7 @@ describe("Zyra reply guards", () => {
         answer("Archived PRO-TC-124 and TES-TC-1 as duplicates."),
         nothingApplied
       );
-      expect(out).toContain("Nothing was changed in the repository");
+      expect(out).toContain("Nothing was saved");
     });
 
     it("corrects the passive form", () => {
@@ -114,7 +114,7 @@ describe("Zyra reply guards", () => {
         answer("The 4 test cases have been saved to the Login suite."),
         nothingApplied
       );
-      expect(out).toContain("Nothing was changed in the repository");
+      expect(out).toContain("Nothing was saved");
     });
 
     it("leaves a proposal alone — a question is not a claim", () => {

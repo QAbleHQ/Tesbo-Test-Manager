@@ -13,6 +13,22 @@ import { SyncProvider, SyncRunJobPayload, SyncRunStage, SyncTicketJobPayload, Sy
 
 type Row = Record<string, any>;
 
+/**
+ * Today's calendar date in NIGHTLY_SYNC_TZ ("Asia/Kolkata"), as a plain YYYY-MM-DD string.
+ *
+ * Computed in application code and stored, rather than derived in SQL via
+ * `date_trunc('day', created_at AT TIME ZONE 'Asia/Kolkata')` — Postgres marks `AT TIME ZONE` on a
+ * timestamptz as STABLE, not IMMUTABLE (the IANA tz database can change), so it can't appear in an
+ * index expression at all; `idx_integration_sync_runs_nightly_cycle` (V90) originally tried exactly
+ * that and failed to create with "functions in index expression must be marked IMMUTABLE".
+ *
+ * The fixed +5:30 shift is safe specifically because Asia/Kolkata has never observed DST since 1945
+ * and India has no plans to introduce it — this would NOT be a valid shortcut for a zone with DST.
+ */
+function nightlyCycleDate(): string {
+  return new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 export interface SyncRunView {
   id: string;
   provider: string;
@@ -75,12 +91,17 @@ export class IntegrationSyncService {
       [organizationId, provider]
     );
 
+    // NULL for a manual run — idx_integration_sync_runs_nightly_cycle (V90) only covers
+    // trigger_source = 'nightly', and a unique index never treats two NULLs as colliding, so manual
+    // rows are unaffected either way.
+    const cycleDate = triggerSource === "nightly" ? nightlyCycleDate() : null;
+
     try {
       const inserted = await this.db.query<{ id: string }>(
-        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, triggered_by, trigger_source, status, stage)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 'queued')
+        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, triggered_by, trigger_source, nightly_cycle_date, status, stage)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', 'queued')
          RETURNING id`,
-        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource]
+        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate]
       );
       const runId = inserted.rows[0].id;
 
@@ -97,6 +118,22 @@ export class IntegrationSyncService {
       const run = await this.getRun(runId);
       return { run: run as SyncRunView, alreadyRunning: false };
     } catch (err) {
+      // Two distinct unique constraints can reject this insert. idx_integration_sync_runs_active
+      // (a run already queued/running for this project+provider) is the pre-existing double-click
+      // guard, checked below for any trigger source. idx_integration_sync_runs_nightly_cycle (V90)
+      // is nightly-only and has no status filter — it exists because the "active" index can't catch
+      // a nightly re-fire that lands *after* the first nightly run for the day already finished
+      // (observed: a container restart caused the scheduler to fire a second, unscheduled time
+      // hours after the legitimate midnight-IST run). Either way, the caller gets back the run that
+      // already represents this cycle instead of a raw DB error.
+      if (triggerSource === "nightly") {
+        const existing = await this.getLatestNightlyRunToday(projectId, provider);
+        if (existing) {
+          this.logger.warn(`Nightly ${provider} sync for project ${projectId} already ran this cycle (run ${existing.id}) — duplicate trigger suppressed.`);
+          return { run: existing, alreadyRunning: true };
+        }
+        throw err;
+      }
       const existing = await this.getLatestRun(projectId, provider);
       if (existing && (existing.status === "queued" || existing.status === "running")) {
         return { run: existing, alreadyRunning: true };
@@ -208,6 +245,19 @@ export class IntegrationSyncService {
     const res = await this.db.query(
       `${IntegrationSyncService.RUN_SELECT} WHERE r.project_id = $1 AND r.provider = $2 ORDER BY r.created_at DESC LIMIT 1`,
       [projectId, provider]
+    );
+    return res.rows[0] ? this.toView(res.rows[0]) : null;
+  }
+
+  /** The nightly run already recorded for today's cycle (idx_integration_sync_runs_nightly_cycle,
+   *  V90), if any — matched on the same stored nightly_cycle_date startRun writes, not a SQL-side
+   *  timezone expression (see nightlyCycleDate's comment for why). */
+  private async getLatestNightlyRunToday(projectId: string, provider: SyncProvider): Promise<SyncRunView | null> {
+    const res = await this.db.query(
+      `${IntegrationSyncService.RUN_SELECT}
+       WHERE r.project_id = $1 AND r.provider = $2 AND r.trigger_source = 'nightly' AND r.nightly_cycle_date = $3
+       ORDER BY r.created_at DESC LIMIT 1`,
+      [projectId, provider, nightlyCycleDate()]
     );
     return res.rows[0] ? this.toView(res.rows[0]) : null;
   }

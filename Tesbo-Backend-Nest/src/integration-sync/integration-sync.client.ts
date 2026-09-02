@@ -2,13 +2,39 @@ import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { decryptSecret, encryptSecret } from "../common/crypto.util";
 import { jiraDescriptionToText } from "../common/integration-text.util";
-import { COMMENTS_PER_TICKET, JIRA_PAGE_SIZE, LINEAR_PAGE_SIZE, MAX_TICKETS_PER_RUN } from "./integration-sync.constants";
+import {
+  COMMENTS_PER_TICKET,
+  JIRA_PAGE_SIZE,
+  JIRA_TOKEN_REFRESH_RETRY_DELAY_MS,
+  LINEAR_PAGE_SIZE,
+  MAX_TICKETS_PER_RUN,
+  PROVIDER_FOLDER_NAMES
+} from "./integration-sync.constants";
 import { RemoteComment, RemoteTicket, SyncProvider } from "./integration-sync.types";
 
 type Row = Record<string, any>;
 
 function asArray(value: unknown): Row[] {
   return Array.isArray(value) ? (value as Row[]) : [];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Thrown when a Jira connection's token cannot be made valid — authorization was revoked/expired,
+ * or this deployment has no Jira OAuth app configured. Distinguishing this from the raw provider
+ * HTTP error is the point: without it, a stale/unrefreshable token flows straight into a real Jira
+ * API call, which 401s, and that raw body (e.g. `jira request failed (401): {"code":401,...}`)
+ * propagates verbatim into the run's `error` field and onto the screen (SyncStatusPanel.tsx renders
+ * `run.error` as-is).
+ */
+export class IntegrationConnectionInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IntegrationConnectionInvalidError";
+  }
 }
 
 /**
@@ -43,24 +69,34 @@ export class IntegrationSyncClient {
   private async refreshJiraToken(connection: Row): Promise<Row> {
     const clientId = (process.env.JIRA_CLIENT_ID || "").trim();
     const clientSecret = (process.env.JIRA_CLIENT_SECRET || "").trim();
-    // Without deployment credentials there's nothing to refresh with. Hand back the stale
-    // connection so the caller fails on the actual API 401 with a provider-shaped error,
-    // rather than throwing a confusing config error mid-sync.
-    if (!clientId || !clientSecret) return connection;
+    if (!clientId || !clientSecret) {
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} sync is not configured for this workspace.`);
+    }
 
-    const res = await fetch("https://auth.atlassian.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: decryptSecret(String(connection.refresh_token || ""))
-      })
-    });
-    if (!res.ok) {
-      this.logger.warn(`Jira token refresh failed (${res.status}) for connection ${connection.id}`);
-      return connection;
+    const attempt = () =>
+      fetch("https://auth.atlassian.com/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: decryptSecret(String(connection.refresh_token || ""))
+        })
+      }).catch(() => null);
+
+    // One retry, unconditional on the failure shape: a cold-start network blip right after a
+    // container restart and a genuinely revoked refresh token both land here, and the retry is
+    // cheap enough that it isn't worth distinguishing Atlassian's error taxonomy to skip it — a
+    // revoked token just fails the same way again a second later.
+    let res = await attempt();
+    if (!res?.ok) {
+      await sleep(JIRA_TOKEN_REFRESH_RETRY_DELAY_MS);
+      res = await attempt();
+    }
+    if (!res?.ok) {
+      this.logger.warn(`Jira token refresh failed (${res ? res.status : "network error"}) for connection ${connection.id} after retry`);
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} needs to be reconnected to this workspace.`);
     }
     const token = (await res.json()) as Row;
     const accessToken = encryptSecret(String(token.access_token || ""));

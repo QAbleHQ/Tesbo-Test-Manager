@@ -54,6 +54,7 @@ export class IntegrationSyncModule implements OnModuleInit {
         { pattern: NIGHTLY_SYNC_CRON, tz: NIGHTLY_SYNC_TZ },
         { name: INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, data: {} }
       )
+      .then(() => this.logger.log(`Nightly Jira sync scheduler registered (${NIGHTLY_SYNC_CRON} ${NIGHTLY_SYNC_TZ}).`))
       .catch((err) => this.logger.warn(`Failed to register nightly Jira sync scheduler: ${err instanceof Error ? err.message : err}`));
 
     await this.queue
@@ -62,6 +63,7 @@ export class IntegrationSyncModule implements OnModuleInit {
         { pattern: NIGHTLY_SYNC_CRON, tz: NIGHTLY_SYNC_TZ },
         { name: INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB, data: {} }
       )
+      .then(() => this.logger.log(`Nightly Linear sync scheduler registered (${NIGHTLY_SYNC_CRON} ${NIGHTLY_SYNC_TZ}).`))
       .catch((err) => this.logger.warn(`Failed to register nightly Linear sync scheduler: ${err instanceof Error ? err.message : err}`));
   }
 }

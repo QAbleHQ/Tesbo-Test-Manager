@@ -177,18 +177,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
     <>
       <div role="presentation" className="fixed inset-0 z-40" onClick={onClose} />
       <div className="slide-in-right fixed right-0 top-0 z-50 flex h-screen w-full max-w-[520px] flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
-        {/* Header */}
-        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--border)] p-5">
-          <div className="min-w-0">
-            <div className="mb-1.5 flex items-center gap-2">
-              <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
-              <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
-            </div>
-            <h2 className="line-clamp-2 text-[15px] font-semibold leading-snug text-[var(--foreground)]">{task.userStory}</h2>
-            {failureDetail && (
-              <p className="mt-1.5 line-clamp-2 text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
-            )}
-            {task.context && <p className="mt-1.5 text-[13px] leading-relaxed text-[var(--muted)]">{task.context}</p>}
+        {/* Header — kept slim and always visible so the close control never scrolls out of reach */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
+            <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
           </div>
           <button
             type="button"
@@ -198,6 +191,18 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           >
             <IconX size={16} stroke={1.75} />
           </button>
+        </div>
+
+        {/* Title + description — a long user story or context (e.g. pulled in from a Knowledge
+            Base doc) must never push the stats/tabs/footer below out of view, so this block is
+            height-capped and scrolls internally instead of growing without bound. The scrollbar
+            is hidden (no-scrollbar) so a short description still looks like plain static text. */}
+        <div className="no-scrollbar max-h-[35vh] shrink-0 overflow-y-auto border-b border-[var(--border)] p-5">
+          <h2 className="break-words text-[15px] font-semibold leading-snug text-[var(--foreground)]">{task.userStory}</h2>
+          {failureDetail && (
+            <p className="mt-1.5 break-words text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
+          )}
+          {task.context && <p className="mt-1.5 break-words whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--muted)]">{task.context}</p>}
         </div>
 
         {/* Stats row */}

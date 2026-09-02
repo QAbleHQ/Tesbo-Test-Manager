@@ -93,6 +93,9 @@ test.describe("integrations — Jira and Linear", () => {
     exec(`DELETE FROM jira_project_mappings WHERE project_id IN (${projects});`);
     exec(`DELETE FROM linear_project_mappings WHERE project_id IN (${projects});`);
     exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)};`);
+    // Was missing entirely until the nightly-sync dedup fix (V90) added tests that seed rows here —
+    // without it, seeded runs from one test could leak into the next.
+    exec(`DELETE FROM integration_sync_runs WHERE project_id IN (${projects});`);
     // knowledge_document_sync_events cascades off knowledge_documents (ON DELETE CASCADE), so
     // deleting the seeded mirror documents is enough to clear both.
     exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
@@ -128,6 +131,31 @@ test.describe("integrations — Jira and Linear", () => {
     return scalar(
       `SELECT id FROM knowledge_documents WHERE project_id = ${literal(projectId ?? tenant!.mainProjectId)} ` +
         `AND source_provider = ${literal(provider)} AND source_external_id = ${literal(externalId)} AND source_role = 'mirror';`,
+    );
+  }
+
+  /**
+   * A row of `integration_sync_runs`, as a completed (or failed) sync would have left it —
+   * seeded directly for the same "no real Jira/Linear call" reason as the fixtures above. Used to
+   * pin the nightly-sync dedup fix (V90) and the clean-reconnect-message fix on the read side
+   * (sync-status/sync-history), without needing to reproduce either defect through a real sync.
+   */
+  function seedSyncRun(
+    provider: "jira" | "linear",
+    fields: { status?: string; triggerSource?: "manual" | "nightly"; error?: string | null; remoteProjectKey?: string; projectId?: string } = {},
+  ): string {
+    const status = fields.status ?? "failed";
+    const projectId = fields.projectId ?? tenant!.mainProjectId;
+    exec(
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, error, remote_project_key, started_at, finished_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, ${literal(status)}, ` +
+        `${literal(status === "failed" ? "failed" : "done")}, ${literal(fields.triggerSource ?? "nightly")}, ` +
+        `${fields.error === undefined ? "NULL" : literal(fields.error)}, ${fields.remoteProjectKey ? literal(fields.remoteProjectKey) : "NULL"}, ` +
+        "now(), now());",
+    );
+    return scalar(
+      `SELECT id FROM integration_sync_runs WHERE project_id = ${literal(projectId)} AND provider = ${literal(provider)} ` +
+        "ORDER BY created_at DESC LIMIT 1;",
     );
   }
 
@@ -836,5 +864,48 @@ test.describe("integrations — Jira and Linear", () => {
       const body = await res.json();
       expect(Array.isArray(body.events), `${qs} — events was ${JSON.stringify(body)}`).toBe(true);
     }
+  });
+
+  // ─── Nightly sync dedup (V90) and the clean reconnect message ───────────────
+  //
+  // The orchestrator's own trigger is a cron tick, not an HTTP route — see the file header note —
+  // so neither defect from the 2026-09-02 incident (a duplicate nightly fire; a raw provider 401
+  // leaking through) is reproduced here. That's IntegrationSyncService.spec.ts's and
+  // IntegrationSyncClient.spec.ts's job. What belongs here is the real read path: given the rows
+  // those write-side fixes actually produce, does the real HTTP + auth + Postgres path deliver them
+  // correctly to the screen.
+
+  test("INT-A-34 sync-status and sync-history surface the clean reconnect message, never a raw provider error", { tag: '@tesbo.testId("TES-TC-258")' }, async () => {
+    seedSyncRun("jira", { status: "failed", error: "Jira needs to be reconnected to this workspace." });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status()).toBe(200);
+    const statusBody = await status.json();
+    expect(statusBody.run?.error).toBe("Jira needs to be reconnected to this workspace.");
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status()).toBe(200);
+    const historyBody = await history.json();
+    expect(historyBody.runs[0]?.error).toBe("Jira needs to be reconnected to this workspace.");
+
+    // Pins the literal shape of the reported bug: a raw provider body must never reach either route.
+    const rendered = JSON.stringify([statusBody, historyBody]);
+    expect(rendered).not.toContain('"code":401');
+    expect(rendered).not.toContain("Unauthorized");
+  });
+
+  test("INT-A-35 sync-status and sync-history stay well-formed with more than one same-day nightly run recorded", { tag: '@tesbo.testId("TES-TC-259")' }, async () => {
+    // A pre-fix workspace can already carry duplicate nightly rows from the incident, or a residual
+    // edge case can still slip one through — either way, the read side must not assume at most one.
+    seedSyncRun("jira", { status: "failed", error: "jira request failed (401): {\"code\":401,\"message\":\"Unauthorized\"}" });
+    seedSyncRun("jira", { status: "succeeded", error: null });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status()).toBe(200);
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status()).toBe(200);
+    const historyBody = await history.json();
+    expect(historyBody.runs.length).toBeGreaterThanOrEqual(2);
   });
 });

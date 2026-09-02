@@ -68,6 +68,8 @@ test.describe("zyra chat ↔ repository consistency", () => {
     const project = literal(tenant!.mainProjectId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ZCC-A-06 seeds a chat-staged review batch, the only test in this file that writes here.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM suites WHERE project_id = ${project};`);
   }
@@ -238,6 +240,50 @@ test.describe("zyra chat ↔ repository consistency", () => {
         failOnStatusCode: false,
       });
     }
+  });
+
+  test("ZCC-A-06 a proposed (not-yet-saved) row never carries a real id until the batch is saved", async () => {
+    /*
+     * The invariant this whole file pins — "a turn never advertises a case the repository does not
+     * have" (see ZCC-A-01/02) — is judged purely by whether testcases[].id is truthy. A staged
+     * create proposal (applyZyraChatOperations, once it stops writing straight to `testcases` and
+     * stages via ai_generation_requests instead) has no id yet by construction, so it already
+     * satisfies that invariant. This pins the construction itself: a "proposed-create" row is
+     * seeded with id null exactly the way the real staging code builds one (chatDraftRow), and its
+     * advertised-ness must stay false until an actual Save creates the real row.
+     */
+    const sessionId = await newSession("E2E ZCC staged proposal");
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', 'Zyra chat proposal', 1, 1, ` +
+        `${literal(JSON.stringify([{ opType: "create", draft: { suiteId: null, title: "Staged, not saved", description: "", preconditions: "", stepsJson: "[]", priority: "P2" }, reason: "" }]))}::jsonb, ` +
+        "'Zyra the Test Generator', 'in_review', " +
+        `${literal(sessionId)});`,
+    );
+    const reviewRequestId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        "'I have drafted 1 test case for your review.', 'completed', " +
+        `${literal(JSON.stringify([{ id: null, title: "Staged, not saved", action: "proposed-create", draftIndex: 0, reviewRequestId }]))}::jsonb, '[]'::jsonb, ${literal(reviewRequestId)});`,
+    );
+
+    const { messages } = await readSession(sessionId);
+    const turn = messages.find((m) => m.role === "assistant")!;
+    expect(advertised(turn), "a staged-not-saved proposal must not be advertised as a real, saved case").toEqual([]);
+    expect(liveCaseCount(), "nothing should exist in the repository yet").toBe(0);
+
+    // Once actually saved, the repository (not this stale message snapshot) is what the review
+    // panel re-fetches from — that live re-fetch is exercised in e2e/ui/zyra.spec.ts ZYU-67.
+    const saved = await asOwner.post(
+      `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${reviewRequestId}/save`,
+      { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false },
+    );
+    expect(saved.status(), `saving the staged proposal — ${await saved.text()}`).toBe(201);
+    expect(liveCaseCount(), "saving the proposal must create the real test case").toBe(1);
   });
 
   test("ZCC-A-05 the session read is refused to a caller with no access to the project", { tag: '@tesbo.testId("TES-TC-983")' }, async () => {

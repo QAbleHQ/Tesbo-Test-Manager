@@ -52,3 +52,9 @@ export const NIGHTLY_SYNC_TZ = "Asia/Kolkata";
 // next incremental run's cursor would sit after that ticket's real updated timestamp and skip it
 // forever. The cost is a handful of redundant (cheap, hash-gated no-op) re-fetches per run.
 export const NIGHTLY_SYNC_SINCE_BUFFER_MINUTES = 10;
+
+// A refresh call to Atlassian can land in a cold-start window (e.g. right after a container
+// restart, before outbound networking is fully ready) and fail transiently. One retry after this
+// delay absorbs that without masking a genuinely revoked/expired authorization, which still fails
+// the same way after the retry.
+export const JIRA_TOKEN_REFRESH_RETRY_DELAY_MS = 1000;
