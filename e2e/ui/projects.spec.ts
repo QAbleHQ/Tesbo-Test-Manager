@@ -42,6 +42,46 @@ test.describe("project settings", () => {
     }
   });
 
+  test("a user can set a project's icon from settings, and clear it back to automatic", async ({ page }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+
+    try {
+      const suffix = Date.now().toString().slice(-8);
+      const name = `UI Icon Settings Project ${suffix}`;
+      const created = await (
+        await api.post("/api/projects", { data: { name, key: `E2EUIICON${suffix}` } })
+      ).json();
+      projectId = created.id;
+
+      await page.goto(`/projects/${projectId}/settings`);
+      await page.getByRole("button", { name: "Icon color #4C5FD5" }).click();
+      await page.getByRole("textbox", { name: "Custom icon letter or emoji" }).fill("Q");
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Project settings saved.")).toBeVisible();
+
+      const afterSet = await (await api.get(`/api/projects/${projectId}`)).json();
+      expect(afterSet.settings.icon).toEqual({ color: "#4C5FD5", glyph: "Q" });
+
+      // Reloading re-derives the picker's state from what was actually persisted, not from
+      // whatever the form happened to hold in memory.
+      await page.reload();
+      await expect(page.getByRole("button", { name: "Icon color #4C5FD5" })).toHaveAttribute("aria-pressed", "true");
+      await expect(page.getByRole("textbox", { name: "Custom icon letter or emoji" })).toHaveValue("Q");
+
+      await page.getByRole("button", { name: "Automatic color" }).click();
+      await page.getByRole("textbox", { name: "Custom icon letter or emoji" }).fill("");
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Project settings saved.")).toBeVisible();
+
+      const afterClear = await (await api.get(`/api/projects/${projectId}`)).json();
+      expect(afterClear.settings.icon).toEqual({ color: null, glyph: null });
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
   test("the delete confirmation blocks a mismatched name and only deletes on an exact match", { tag: '@tesbo.testId("TES-TC-806")' }, async ({
     page,
   }) => {

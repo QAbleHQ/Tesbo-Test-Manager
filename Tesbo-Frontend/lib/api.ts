@@ -652,6 +652,12 @@ export async function removeWorkspaceProjectAccess(data: { projectId: string; us
 // Projects
 export type ProjectType = "tesbox";
 
+/** `color`/`glyph` null means "not overridden" — the card falls back to the generated placeholder. */
+export interface ProjectIcon {
+  color: string | null;
+  glyph: string | null;
+}
+
 export interface ProjectSummary {
   id: string;
   key: string;
@@ -660,6 +666,7 @@ export interface ProjectSummary {
   projectType: ProjectType;
   role: string;
   createdAt: string;
+  icon: ProjectIcon | null;
 }
 
 export async function listProjects(): Promise<ProjectSummary[]> {
@@ -698,7 +705,8 @@ export interface ProjectOverview extends ProjectSummary {
   teamMembers: { userId: string; name: string }[];
   lastActivityAt: string | null;
   status: "setup_required" | "configured" | "active";
-  runCounts: { passed: number; failed: number; blocked: number; total: number } | null;
+  runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
   currentPassRate: number | null;
 }
 
@@ -714,7 +722,13 @@ export interface CreateProjectResponse {
   createdAt: string;
 }
 
-export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<CreateProjectResponse> {
+export async function createProject(data: {
+  key?: string;
+  name: string;
+  description?: string;
+  projectType?: ProjectType;
+  icon?: { color?: string | null; glyph?: string | null } | null;
+}): Promise<CreateProjectResponse> {
   return api<CreateProjectResponse>("/api/projects", { method: "POST", body: data });
 }
 
@@ -722,7 +736,15 @@ export async function getProject(id: string): Promise<Record<string, unknown>> {
   return api<Record<string, unknown>>(`/api/projects/${id}`);
 }
 
-export async function updateProject(id: string, data: { name?: string; description?: string; settings?: string }): Promise<void> {
+export async function updateProject(
+  id: string,
+  data: {
+    name?: string;
+    description?: string;
+    settings?: string;
+    icon?: { color?: string | null; glyph?: string | null } | null;
+  }
+): Promise<void> {
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
 }
 
@@ -860,6 +882,7 @@ export interface ZyraAgentState {
     role: string;
     active: boolean;
     activationReason: string;
+    lastUsedAt: string | null;
   };
   settings: { testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities };
   aiKey: {
@@ -1831,6 +1854,9 @@ export interface PlanProgress {
   skipped: number;
   untested: number;
   executed: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
+  passRate: number | null;
+  /** (Passed + Failed + Blocked + Skipped) / totalCases. */
   completionPercent: number;
 }
 
@@ -2261,10 +2287,14 @@ export interface BugItem {
   updatedAt: string;
 }
 
-export async function listBugs(projectId: string, params?: { status?: string; cycleId?: string }): Promise<BugItem[]> {
+export async function listBugs(
+  projectId: string,
+  params?: { status?: string; cycleId?: string; assigneeId?: string }
+): Promise<BugItem[]> {
   const sp = new URLSearchParams();
   if (params?.status) sp.set("status", params.status);
   if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
   const query = sp.toString();
   return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
 }
@@ -2449,7 +2479,15 @@ export interface CyclePassRatePoint {
   name: string;
   createdAt: string;
   total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  /** Passed + Failed + Blocked + Skipped (Untested/Retest excluded). */
   executed: number;
+  /** (executed / total) * 100. */
+  executionProgress: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has settled. */
   passRate: number | null;
 }
 
@@ -2457,6 +2495,8 @@ export interface CyclePassRatePoint {
 export interface SuiteHealthRow {
   suiteName: string;
   executed: number;
+  skipped: number;
+  executionProgress: number;
   passedPct: number;
   failedPct: number;
   blockedPct: number;
@@ -2542,6 +2582,7 @@ export function getReportsExportUrl(
 export interface ProjectDashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
+  executionProgress: { value: number };
   openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
@@ -3100,6 +3141,27 @@ export function getKnowledgeDocument(
   documentId: string
 ): Promise<KnowledgeDocument & { breadcrumb: KnowledgeBreadcrumbEntry[] }> {
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
+}
+
+// The info-icon popover on a synced (mirror) row: this ticket's add/update timeline.
+export interface KnowledgeDocumentSyncEvent {
+  id: string;
+  eventType: "created" | "updated";
+  changedSummary: string | null;
+  createdAt: string;
+  triggeredByName: string | null;
+}
+
+export function getKnowledgeDocumentSyncEvents(
+  projectId: string,
+  documentId: string,
+  page: { limit?: number; offset?: number } = {}
+): Promise<{ events: KnowledgeDocumentSyncEvent[]; hasMore: boolean }> {
+  const sp = new URLSearchParams();
+  if (page.limit != null) sp.set("limit", String(page.limit));
+  if (page.offset != null) sp.set("offset", String(page.offset));
+  const qs = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events${qs ? `?${qs}` : ""}`);
 }
 
 export function updateKnowledgeDocument(

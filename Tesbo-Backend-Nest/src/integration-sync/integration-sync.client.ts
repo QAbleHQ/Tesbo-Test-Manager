@@ -97,11 +97,23 @@ export class IntegrationSyncClient {
    * Pages through every issue in a Jira project, newest-updated first, invoking `onPage` per
    * page so the caller can upsert incrementally and report progress before the whole backlog
    * is in memory. Stops at MAX_TICKETS_PER_RUN.
+   *
+   * `sinceIso`, when given, narrows the JQL to `updated >= sinceIso` — the nightly scheduler's
+   * incremental fetch. Manual Sync never passes it, so its full-resync behavior is unchanged.
    */
-  async fetchJiraTickets(connection: Row, projectKey: string, onPage: (tickets: RemoteTicket[]) => Promise<void>): Promise<{ total: number; truncated: boolean }> {
+  async fetchJiraTickets(
+    connection: Row,
+    projectKey: string,
+    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    sinceIso?: string | null
+  ): Promise<{ total: number; truncated: boolean }> {
     const { baseUrl, headers } = this.jiraAuth(connection);
     const siteUrl = String(connection.site_url || "").replace(/\/$/, "");
-    const jql = `project = "${projectKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" ORDER BY updated DESC`;
+    const escapedKey = projectKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    // Jira JQL date literals don't take a full ISO instant, only "yyyy-MM-dd HH:mm" — truncate to
+    // the minute, which only widens the window (never narrows it past what sinceIso intended).
+    const sinceClause = sinceIso ? ` AND updated >= "${new Date(sinceIso).toISOString().slice(0, 16).replace("T", " ")}"` : "";
+    const jql = `project = "${escapedKey}"${sinceClause} ORDER BY updated DESC`;
     let nextPageToken: string | undefined;
     let total = 0;
 
@@ -191,14 +203,39 @@ export class IntegrationSyncClient {
     return payload.data as T;
   }
 
-  async fetchLinearTickets(connection: Row, teamId: string, onPage: (tickets: RemoteTicket[]) => Promise<void>): Promise<{ total: number; truncated: boolean }> {
+  /**
+   * `sinceIso`, when given, adds a `filter: { updatedAt: { gte } }` clause — the nightly
+   * scheduler's incremental fetch. Manual Sync never passes it, so its full-resync behavior
+   * (page through every issue in the team) is unchanged.
+   */
+  async fetchLinearTickets(
+    connection: Row,
+    teamId: string,
+    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    sinceIso?: string | null
+  ): Promise<{ total: number; truncated: boolean }> {
     let cursor: string | null = null;
     let total = 0;
-
-    for (;;) {
-      const data = await this.linearGraphQL<Row>(
-        connection,
-        `query TeamIssues($teamId: String!, $first: Int!, $after: String) {
+    // Built as two distinct query strings (rather than one query with a nullable filter variable)
+    // so an unset sinceIso can never risk Linear interpreting `gte: null` as "match nothing" —
+    // manual Sync's full-resync query is byte-for-byte what it was before this change.
+    const query = sinceIso
+      ? `query TeamIssues($teamId: String!, $first: Int!, $after: String, $since: DateTimeOrDuration!) {
+           team(id: $teamId) {
+             issues(first: $first, after: $after, orderBy: updatedAt, filter: { updatedAt: { gte: $since } }) {
+               nodes {
+                 id identifier title description url createdAt updatedAt
+                 state { name }
+                 priorityLabel
+                 assignee { name }
+                 creator { name }
+                 labels { nodes { name } }
+               }
+               pageInfo { hasNextPage endCursor }
+             }
+           }
+         }`
+      : `query TeamIssues($teamId: String!, $first: Int!, $after: String) {
            team(id: $teamId) {
              issues(first: $first, after: $after, orderBy: updatedAt) {
                nodes {
@@ -212,8 +249,13 @@ export class IntegrationSyncClient {
                pageInfo { hasNextPage endCursor }
              }
            }
-         }`,
-        { teamId, first: LINEAR_PAGE_SIZE, after: cursor }
+         }`;
+
+    for (;;) {
+      const data = await this.linearGraphQL<Row>(
+        connection,
+        query,
+        sinceIso ? { teamId, first: LINEAR_PAGE_SIZE, after: cursor, since: sinceIso } : { teamId, first: LINEAR_PAGE_SIZE, after: cursor }
       );
 
       const issues = asArray(data?.team?.issues?.nodes);

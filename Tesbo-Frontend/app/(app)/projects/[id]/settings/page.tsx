@@ -21,6 +21,7 @@ import {
   listCustomFieldDefinitions,
   type JiraConnection,
   type LinearConnection,
+  type ProjectIcon,
   type TestEnvironmentSetting,
 } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -37,16 +38,33 @@ import {
   FieldLabel,
   PageLoader,
 } from "@/components/ui";
+import { ProjectIconPicker, type ProjectIconValue } from "@/components/ProjectIconPicker";
+import { avatarColor } from "@/lib/avatarColors";
 import {
   PROJECT_DESCRIPTION_MAX_LENGTH,
   PROJECT_NAME_MAX_LENGTH,
   ENVIRONMENT_NAME_MAX_LENGTH,
   ENVIRONMENT_URL_MAX_LENGTH,
   validateProjectDescription,
+  validateProjectIconGlyph,
   validateProjectName,
   validateEnvironmentName,
   validateEnvironmentUrl,
 } from "@/lib/validation";
+
+const EMPTY_ICON: ProjectIconValue = { color: null, glyph: null };
+
+function extractProjectIcon(raw: unknown): ProjectIcon | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const icon = (raw as { icon?: unknown }).icon;
+  if (!icon || typeof icon !== "object" || Array.isArray(icon)) return null;
+  const color = (icon as { color?: unknown }).color;
+  const glyph = (icon as { glyph?: unknown }).glyph;
+  return {
+    color: typeof color === "string" ? color : null,
+    glyph: typeof glyph === "string" ? glyph : null,
+  };
+}
 
 type ProjectSettingsPayload = {
   ai?: {
@@ -94,6 +112,8 @@ export default function ProjectSettingsPage() {
   const [description, setDescription] = useState("");
   const [nameError, setNameError] = useState("");
   const [descriptionError, setDescriptionError] = useState("");
+  const [icon, setIcon] = useState<ProjectIconValue>(EMPTY_ICON);
+  const [iconGlyphError, setIconGlyphError] = useState("");
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("");
   const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
@@ -242,6 +262,8 @@ export default function ProjectSettingsPage() {
         const parsedSettings = parseProjectSettings(p.settings);
         setTestcaseIdPrefix(normalizeTestcaseIdPrefix(String(parsedSettings.testcaseIdPrefix || p.key || "TC")));
         setTestRunEnvironments(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
+        const savedIcon = extractProjectIcon(parsedSettings);
+        setIcon({ color: savedIcon?.color ?? null, glyph: savedIcon?.glyph ?? null });
       }).catch(() => router.replace("/projects"));
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
@@ -265,6 +287,11 @@ export default function ProjectSettingsPage() {
     const descriptionValidationError = validateProjectDescription(description);
     if (descriptionValidationError) {
       setDescriptionError(descriptionValidationError);
+      return;
+    }
+    const iconGlyphValidationError = validateProjectIconGlyph(icon.glyph ?? "");
+    if (iconGlyphValidationError) {
+      setIconGlyphError(iconGlyphValidationError);
       return;
     }
     setSaving(true);
@@ -301,12 +328,15 @@ export default function ProjectSettingsPage() {
         name,
         description,
         settings: JSON.stringify(nextSettings),
+        icon: { color: icon.color, glyph: icon.glyph?.trim() || null },
       });
       const refreshed = await getProject(projectId);
       setProject(refreshed);
       const refreshedSettings = parseProjectSettings(refreshed.settings);
       setTestcaseIdPrefix(normalizeTestcaseIdPrefix(String(refreshedSettings.testcaseIdPrefix || refreshed.key || "TC")));
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
+      const savedIcon = extractProjectIcon(refreshedSettings);
+      setIcon({ color: savedIcon?.color ?? null, glyph: savedIcon?.glyph ?? null });
       setNewEnvironmentName("");
       setNewEnvironmentUrl("");
       setMessage("Project settings saved.");
@@ -557,6 +587,15 @@ export default function ProjectSettingsPage() {
                   />
                   {descriptionError && <FieldError>{descriptionError}</FieldError>}
                 </Field>
+                <ProjectIconPicker
+                  value={icon}
+                  onChange={setIcon}
+                  fallbackColor={avatarColor(projectId)}
+                  fallbackGlyph={name.trim().charAt(0).toUpperCase() || "P"}
+                  glyphError={iconGlyphError}
+                  onGlyphErrorChange={setIconGlyphError}
+                  disabled={saving}
+                />
                 <Field>
                   <FieldLabel>Test case ID prefix</FieldLabel>
                   <Input

@@ -68,14 +68,29 @@ function statPillValue(page: Page, label: string): Locator {
     .locator("xpath=following-sibling::span[1]");
 }
 
+/**
+ * The Execution Progress / Pass Rate value on the Test Run Details page, by its label. The two are
+ * rendered as separate rows (label span, value span as its sibling) since the fix for "[Test Runs]
+ * Pass Rate is Inconsistent Between Test Run Summary and Details" split what used to be one
+ * conflated "X% pass rate" line into these two distinct metrics.
+ */
+function runMetricValue(page: Page, label: "Execution Progress" | "Pass Rate"): Locator {
+  return page.getByText(label, { exact: true }).locator("xpath=following-sibling::span[1]");
+}
+
 test.describe("Test Runs — Pass Rate and Skipped consistency", () => {
-  test("the per-run card and the Run Details page reconcile the same Pass Rate, and Skipped is visible on both", { tag: '@tesbo.testId("TES-TC-1329")' }, async ({
+  test("the Run Details page reports Pass Rate and Execution Progress as two distinct numbers", { tag: '@tesbo.testId("TES-TC-1329")' }, async ({
     page,
   }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
-    // Reproduces the reported case exactly: 25 total cases, only 5 passed. The old summary tile
-    // divided by executed cases only (20) and read 25%; the Run Details page divided by every
-    // assigned case (25) and read 20%. Both must now read 20%.
+    /*
+     * Reproduces "[Test Runs] Pass Rate is Inconsistent Between Test Run Summary and Details":
+     * this run's Test Run Details page used to read Passed/Total = 5/25 = 20%, while a Test Plan
+     * built on the same run read Passed/(Passed+Failed+Blocked) = 5/15 = 33%. Pass Rate is now
+     * always the second formula everywhere, and Execution Progress — (Passed+Failed+Blocked+
+     * Skipped)/Total = 20/25 = 80% — is its own, separately labelled number rather than being
+     * folded into "pass rate".
+     */
     const statuses = [
       ...Array(5).fill("Passed"),
       ...Array(5).fill("Failed"),
@@ -103,14 +118,15 @@ test.describe("Test Runs — Pass Rate and Skipped consistency", () => {
       await expect(statPillValue(page, "Blocked")).toHaveText("5");
       await expect(statPillValue(page, "Skipped")).toHaveText("5");
       await expect(statPillValue(page, "Pending")).toHaveText("5");
-      await expect(page.getByText("20% pass rate")).toBeVisible();
+      await expect(runMetricValue(page, "Execution Progress")).toHaveText("80% executed");
+      await expect(runMetricValue(page, "Pass Rate")).toHaveText("33%");
     } finally {
       await cleanUpRun(api, cycleId, testcaseIds);
       await api.dispose();
     }
   });
 
-  test("a run where every case is Skipped shows 0% pass rate, not NaN, with Skipped counted correctly", { tag: '@tesbo.testId("TES-TC-1330")' }, async ({
+  test("a run where every case is Skipped shows no pass rate but full execution progress, never NaN", { tag: '@tesbo.testId("TES-TC-1330")' }, async ({
     page,
   }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -125,7 +141,11 @@ test.describe("Test Runs — Pass Rate and Skipped consistency", () => {
       await expect(card).toContainText("5 / 5 cases");
 
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
-      await expect(page.getByText("0% pass rate")).toBeVisible();
+      // Skipped is neither a pass nor a fail — nothing has settled, so Pass Rate reads "no cases
+      // executed" (not 0%, which would claim every case was run and failed). Execution Progress is
+      // a real 100%: every case in the run has an outcome, even though none of them settled.
+      await expect(runMetricValue(page, "Execution Progress")).toHaveText("100% executed");
+      await expect(page.getByText("No cases executed yet")).toBeVisible();
       await expect(statPillValue(page, "Skipped")).toHaveText("5");
     } finally {
       await cleanUpRun(api, cycleId, testcaseIds);
@@ -154,7 +174,7 @@ test.describe("Test Runs — Pass Rate and Skipped consistency", () => {
     }
   });
 
-  test("the summary Pass Rate tile is passed over total cases for the currently filtered runs, not passed over executed cases across every run", { tag: '@tesbo.testId("TES-TC-1332")' }, async ({
+  test("the summary Pass Rate tile is Passed over settled cases for the currently filtered runs, matching the Test Plan formula", { tag: '@tesbo.testId("TES-TC-1332")' }, async ({
     page,
   }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -171,14 +191,17 @@ test.describe("Test Runs — Pass Rate and Skipped consistency", () => {
       // Computed from a live snapshot of exactly the runs the "Planning" filter shows, taken
       // right after the page's own data has settled, so the expected value tracks whatever else
       // is concurrently Planning in this shared project rather than assuming this fixture is the
-      // only one — the point being tested is the formula (passed / totalCases), not a fixed number.
-      const runs: Array<{ status: string; passed: number; totalCases: number }> = await (
+      // only one — the point being tested is the formula (Passed / (Passed+Failed+Blocked), the
+      // same one the Test Plan page uses), not a fixed number.
+      const runs: Array<{ status: string; passed: number; failed: number; blocked: number }> = await (
         await api.get(`/api/projects/${ctx.projectId}/cycles`)
       ).json();
       const planningRuns = runs.filter((r) => r.status === "Planning");
       const totalPassed = planningRuns.reduce((sum, r) => sum + r.passed, 0);
-      const totalCases = planningRuns.reduce((sum, r) => sum + r.totalCases, 0);
-      const expectedPassRate = totalCases > 0 ? Math.round((totalPassed / totalCases) * 100) : null;
+      const totalFailed = planningRuns.reduce((sum, r) => sum + r.failed, 0);
+      const totalBlocked = planningRuns.reduce((sum, r) => sum + r.blocked, 0);
+      const settled = totalPassed + totalFailed + totalBlocked;
+      const expectedPassRate = settled > 0 ? Math.round((totalPassed / settled) * 100) : null;
 
       await expect(statTileValue(page, "Total Runs")).toHaveText(String(planningRuns.length));
       await expect(statTileValue(page, "Pass Rate")).toHaveText(

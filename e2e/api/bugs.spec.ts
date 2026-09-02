@@ -8,6 +8,7 @@ import {
   resetRbacMembership,
   type RbacTenant,
 } from "../utils/rbac-tenant";
+import { exec, literal } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -563,6 +564,70 @@ test.describe("bug assignee", () => {
       expect(created.assigneeId).toBe(tenant!.owner.userId);
     } finally {
       await asOwner.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /*
+   * The assignee could be set and read back, but nothing let a caller ask "which bugs are assigned to
+   * X" or "which have nobody" — the gap behind the report that assignment "isn't available": it was,
+   * but nothing surfaced it. "unassigned" is its own sentinel value (not an omitted/empty param,
+   * which means "no filter") because IS NULL has to be reachable as a deliberate choice.
+   */
+  test("listBugs filters by assigneeId, and by the unassigned sentinel", async () => {
+    const suffix = Date.now();
+    const assigned = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug Filter Assigned ${suffix}`, assigneeId: tenant!.qa.userId },
+      })
+    ).json();
+    const unassigned = await (
+      await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title: `E2E Bug Filter Unassigned ${suffix}` },
+      })
+    ).json();
+
+    try {
+      const byAssignee = await (
+        await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+          params: { assigneeId: tenant!.qa.userId },
+        })
+      ).json();
+      expect(byAssignee.some((b: { id: string }) => b.id === assigned.id), "the assignee's own bug must be included").toBeTruthy();
+      expect(byAssignee.some((b: { id: string }) => b.id === unassigned.id), "an unassigned bug must not match a real assignee").toBeFalsy();
+
+      const unassignedOnly = await (
+        await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`, { params: { assigneeId: "unassigned" } })
+      ).json();
+      expect(unassignedOnly.some((b: { id: string }) => b.id === unassigned.id), "the unassigned bug must match the sentinel").toBeTruthy();
+      expect(unassignedOnly.some((b: { id: string }) => b.id === assigned.id), "an assigned bug must not match \"unassigned\"").toBeFalsy();
+    } finally {
+      await asOwner.delete(`/api/bugs/${assigned.id}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/bugs/${unassigned.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /*
+   * bugSelect already did COALESCE(u.name, u.email) for the REPORTER; the assignee join
+   * (actor_profiles.display_name) had no such fallback, and users.name is nullable. Once
+   * assigneeName is rendered directly in the UI, an email-only signup would have read as "Unknown
+   * assignee" despite being a completely valid assignment. Found while adding that display, fixed
+   * to match reporter_name's existing COALESCE.
+   */
+  test("an assignee with no display name set falls back to their email, not a blank name", async () => {
+    exec(`UPDATE users SET name = NULL WHERE id = ${literal(tenant!.qa.userId)}`);
+    try {
+      const created = await (
+        await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+          data: { title: `E2E Bug Nameless Assignee ${Date.now()}`, assigneeId: tenant!.qa.userId },
+        })
+      ).json();
+      try {
+        expect(created.assigneeName).toBe(tenant!.qa.email);
+      } finally {
+        await asOwner.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+      }
+    } finally {
+      exec(`UPDATE users SET name = ${literal(`E2E bugs-assignee QA`)} WHERE id = ${literal(tenant!.qa.userId)}`);
     }
   });
 });

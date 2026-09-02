@@ -621,6 +621,140 @@ test.describe("execution evidence and automation provenance", () => {
     }
   });
 
+  /*
+   * "[Test Runs] Evidence section flickers while loading in Test Case Detail View."
+   *
+   * The loop above is fixed and pinned by the previous test, but `load()` still unconditionally set
+   * `loading` back to true on every call, including the refetch that follows every upload — and
+   * never cleared `files` first. So each refetch tore the already-rendered evidence back down to the
+   * "Loading evidence…" placeholder (with the header's stale count still showing above it) and then
+   * rebuilt it, every single time evidence was added. Fixed by only showing that placeholder before
+   * the panel's first fetch has completed; a later refetch now leaves whatever is already on screen
+   * in place until the new data actually arrives.
+   *
+   * Each of the three specs below holds the post-upload GET open with page.route so the assertions
+   * land while that refetch is actually in flight, rather than racing a real one.
+   */
+  test("uploading more evidence keeps what's already shown, instead of flashing back to the loading placeholder", async ({
+    page,
+  }) => {
+    const { runId, testcase } = await seedAutomatedRun("upload-no-flicker");
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "extra-note.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second file"),
+      });
+
+      // The refetch triggered by the upload is held open by the route above. While it's in flight,
+      // the evidence already on screen (and the upload's own progress state) must stay put.
+      await expect(page.getByText("Uploading…")).toBeVisible();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      await expect(page.getByText("extra-note.txt")).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+      expect(getCount, "expected exactly one refetch after the upload").toBe(2);
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("uploading the first piece of evidence for a result with none does not flash the loading placeholder", async ({
+    page,
+  }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Evidence First Upload ${Date.now()}`);
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "first-shot.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      });
+
+      // Empty-state edge case of the same defect: the "No evidence attached" message must stay put
+      // through the refetch too, rather than flashing to the loading placeholder in between.
+      await expect(page.getByText("Uploading…")).toBeVisible();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      await expect(page.getByRole("img", { name: "first-shot.png" })).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText(/No evidence attached/)).toHaveCount(0);
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("a failed refresh after upload keeps existing evidence visible and reports the error, without flickering", async ({
+    page,
+  }) => {
+    const { runId, testcase } = await seedAutomatedRun("upload-refresh-error");
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) {
+            await route.fulfill({
+              status: 500,
+              contentType: "application/json",
+              body: JSON.stringify({ error: "boom" }),
+            });
+            return;
+          }
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      // The upload itself (a plain POST) still succeeds; only the follow-up GET that refreshes the
+      // list fails, which is the case this error-handling path exists for.
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "extra-note.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second file"),
+      });
+
+      await expect(page.getByText("Couldn't load evidence for this result.")).toBeVisible({ timeout: 10_000 });
+      // A failed refresh must not discard evidence that was already showing.
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
   test("a trace opens in the viewer, in place and in a new tab", async ({ page }) => {
     const { runId, testcase } = await seedAutomatedRun("trace");
     try {

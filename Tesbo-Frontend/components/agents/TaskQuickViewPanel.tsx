@@ -7,6 +7,7 @@ import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
 import { closeZyraTask, type ZyraTask } from "@/lib/api";
 import { Button, CopyButton, StatusChip } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
+import { renderMarkdown } from "@/lib/markdown";
 
 export const JIRA_BADGE_CLASS =
   "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
@@ -307,7 +308,14 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
-                  <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  {source.type === "knowledge_base" ? (
+                    <div
+                      className="zyra-prose zyra-prose-compact break-words mt-1 text-[12px] text-[var(--muted)]"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
+                    />
+                  ) : (
+                    <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  )}
                 </div>
               ))}
               {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">No source summary recorded.</p>}
@@ -344,9 +352,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           >
             View full task
           </Link>
-          <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={done || working}>
-            {working ? "Closing…" : "Close task"}
-          </Button>
+          {!done && (
+            <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={working}>
+              {working ? "Closing…" : "Close task"}
+            </Button>
+          )}
         </div>
       </div>
     </>,

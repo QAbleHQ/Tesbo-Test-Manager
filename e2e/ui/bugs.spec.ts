@@ -536,6 +536,104 @@ test.describe("bug assignee", () => {
     after = await (await api.get(`/api/bugs/${bug.id}`)).json();
     expect(after.assigneeId).toBeNull();
   });
+
+  /*
+   * Assignment itself worked (BUG-U-24/25/26 above); nothing shown it back once set. That gap is
+   * what the "assign bug to project members should be available" report actually meant — the field
+   * existed, but you had to re-open Edit to see who a bug was assigned to.
+   */
+  test("BUG-U-27 the list shows who a bug is assigned to, and Unassigned when there isn't one", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Display Assigned ${suffix}`;
+    const unassignedTitle = `E2E Assignee Display Unassigned ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+
+    const assignedRow = page.locator("tbody tr").filter({ hasText: assignedTitle });
+    await expect(assignedRow.getByText(selfLabel, { exact: true })).toBeVisible();
+
+    const unassignedRow = page.locator("tbody tr").filter({ hasText: unassignedTitle });
+    await expect(unassignedRow.getByText("Unassigned", { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-28 the bug details modal shows the assignee", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const title = `E2E Assignee Modal ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title, severity: "Medium", assigneeId: selfUserId },
+    });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(page.getByText("Assigned To", { exact: true })).toBeVisible();
+    await expect(page.getByText(selfLabel, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-29 the kanban card shows the assignee's avatar", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const title = `E2E Assignee Kanban ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title, severity: "Medium", assigneeId: selfUserId },
+    });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    const card = page.locator('[role="button"]').filter({ hasText: title }).first();
+    await expect(card.getByTitle(selfLabel)).toBeVisible();
+  });
+
+  test("BUG-U-30 the assignee filter narrows to that person, Unassigned narrows to bugs with none, and both clear back", async ({
+    page,
+  }) => {
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Filter Assigned ${suffix}`;
+    const unassignedTitle = `E2E Assignee Filter Unassigned ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+
+    const filter = page.getByLabel("Filter by assignee");
+    await filter.selectOption({ label: selfLabel });
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(unassignedTitle, { exact: true })).toHaveCount(0);
+
+    await filter.selectOption("unassigned");
+    await expect(page.getByText(unassignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(assignedTitle, { exact: true })).toHaveCount(0);
+
+    await filter.selectOption("");
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(unassignedTitle, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-31 the assignee filter is available on the board too", async ({ page }) => {
+    // Same `filtered` list feeds the board's columns as every other filter on this page
+    // (BUG-U-09/20) — an assignee filter that only existed in List would leave Board silently
+    // narrowed after a view switch, with no control there to see or clear it.
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Filter Board ${suffix}`;
+    const unassignedTitle = `E2E Assignee Filter Board Other ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    const filter = page.getByLabel("Filter by assignee");
+    await expect(filter).toBeVisible();
+    await filter.selectOption({ label: selfLabel });
+    await expect(page.getByText(unassignedTitle, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
+  });
 });
 
 /*

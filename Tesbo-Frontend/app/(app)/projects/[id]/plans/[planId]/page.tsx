@@ -48,6 +48,7 @@ import {
   type TestRunListItem,
   type TestEnvironmentSetting,
 } from "@/lib/api";
+import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { Button, StatusChip, StatusBadge, PriorityBadge, Input, PageLoader, Select, Field, FieldLabel, type TestStatus, type Priority } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -355,7 +356,6 @@ export default function PlanDetailPage() {
     const blocked = sum((r) => r.blocked);
     const skipped = sum((r) => r.skipped);
     const untested = sum((r) => r.untested);
-    const executed = passed + failed + blocked + skipped;
     return {
       ...(progress ?? ({} as PlanProgress)),
       runCount: runs.length,
@@ -365,7 +365,8 @@ export default function PlanDetailPage() {
       blocked,
       skipped,
       untested,
-      completionPercent: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0,
+      passRate: computePassRate({ passed, failed, blocked }),
+      completionPercent: computeExecutionProgress({ passed, failed, blocked, skipped }, totalCases),
     };
   }, [runs, progress]);
 
@@ -664,10 +665,21 @@ export default function PlanDetailPage() {
               {derivedProgress && total > 0 && (
                 <section className="mb-5 rounded-[10px] border border-[var(--border)] p-5">
                   <div className="mb-3 flex items-center justify-between">
-                    <span className="text-[13px] font-medium text-[var(--muted)]">Overall progress</span>
-                    <span className="font-mono text-[24px] font-bold tracking-tight" style={{ color: pctColor(derivedProgress.completionPercent) }}>
-                      {derivedProgress.completionPercent}%
-                    </span>
+                    <div>
+                      <span className="text-[13px] font-medium text-[var(--muted)]">Overall progress</span>
+                      <div className="font-mono text-[24px] font-bold tracking-tight" style={{ color: pctColor(derivedProgress.completionPercent) }}>
+                        {derivedProgress.completionPercent}%
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[13px] font-medium text-[var(--muted)]">Pass rate</span>
+                      <div
+                        className="font-mono text-[24px] font-bold tracking-tight"
+                        style={{ color: derivedProgress.passRate !== null ? pctColor(derivedProgress.passRate) : "var(--muted-soft)" }}
+                      >
+                        {derivedProgress.passRate !== null ? `${derivedProgress.passRate}%` : "—"}
+                      </div>
+                    </div>
                   </div>
                   <SegmentedBar passed={derivedProgress.passed} failed={derivedProgress.failed} blocked={derivedProgress.blocked} skipped={derivedProgress.skipped} untested={derivedProgress.untested} total={total} />
                   <div className="mt-4 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-6">
@@ -776,8 +788,8 @@ export default function PlanDetailPage() {
                         // Executed is spelled out the same way the header's completionPercent is
                         // (passed + failed + blocked + skipped), rather than total - untested, so a
                         // run's percentage and the plan's are the same arithmetic on the same rows.
-                        const runExecuted = run.passed + run.failed + run.blocked + run.skipped;
-                        const runPercent = runTotal > 0 ? Math.round((runExecuted / runTotal) * 100) : 0;
+                        const runProgress = computeExecutionProgress(run, runTotal);
+                        const runPassRate = computePassRate(run);
                         return (
                           <div key={run.id} className="rounded-[10px] border border-[var(--border)] bg-[var(--background)] p-4 transition-colors hover:border-[var(--brand-primary)]">
                             <div className="flex items-start justify-between gap-3">
@@ -795,9 +807,12 @@ export default function PlanDetailPage() {
                                 </div>
                               </Link>
                               <div className="ml-2 flex shrink-0 items-center gap-2">
-                                <span className="font-mono text-[16px] font-bold" style={{ color: runTotal > 0 ? pctColor(runPercent) : "var(--muted-soft)" }}>
-                                  {runPercent}%
-                                </span>
+                                <div className="text-right">
+                                  <div className="font-mono text-[16px] font-bold" style={{ color: runTotal > 0 ? pctColor(runProgress) : "var(--muted-soft)" }}>
+                                    {runProgress}%
+                                  </div>
+                                  <div className="text-[10px] text-[var(--muted-soft)]">executed</div>
+                                </div>
                                 <button
                                   onClick={() => handleDissociate(run.id)}
                                   title="Unlink from plan"
@@ -818,6 +833,9 @@ export default function PlanDetailPage() {
                                   {run.blocked > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-blocked-dot)" />{run.blocked} blocked</span>}
                                   {run.skipped > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-skipped-dot)" />{run.skipped} skipped</span>}
                                   {run.untested > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-notrun-dot)" />{run.untested} untested</span>}
+                                  {runPassRate !== null && (
+                                    <span className="ml-auto text-[11px] font-medium text-[var(--muted)]">{runPassRate}% pass rate</span>
+                                  )}
                                 </div>
                               </div>
                             )}

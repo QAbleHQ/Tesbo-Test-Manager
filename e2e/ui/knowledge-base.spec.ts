@@ -199,6 +199,38 @@ test.describe("knowledge base (UI)", () => {
     );
   }
 
+  /**
+   * A mirrored (Jira/Linear) document exactly as a real sync would leave it — seeded directly since
+   * producing one for real means a live Jira/Linear call, which this suite cannot make (see
+   * api/integrations.spec.ts's file-level note). `createdAt`/`updatedAt` are given explicit,
+   * distinct values so "Added on" and "Last updated" can be told apart in the rendered table instead
+   * of both coincidentally reading "Today".
+   */
+  function seedMirrorDocument(title: string, externalId: string, createdDaysAgo: number, updatedDaysAgo: number): string {
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only, created_at, updated_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(title)}, ` +
+        "'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', 'published', 'jira', " +
+        `${literal(externalId)}, 'mirror', true, now() - interval '${createdDaysAgo} days', now() - interval '${updatedDaysAgo} days');`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND source_external_id = ${literal(externalId)} AND source_role = 'mirror';`,
+    );
+  }
+
+  function seedSyncEvent(documentId: string, eventType: "created" | "updated", changedSummary: string | null): void {
+    exec(
+      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary) VALUES (" +
+        `${literal(documentId)}, 'jira', ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)});`,
+    );
+  }
+
+  /** The row's info-icon trigger (Change history) — present only on a synced (mirror) row. */
+  function changeHistoryTrigger(page: Page, name: string): Locator {
+    return row(page, name).getByRole("button", { name: "Change history" });
+  }
+
   // ─── The primary flow ──────────────────────────────────────────────────────
 
   test("KBU-01 a folder is created from the New menu and appears in the table and the tree", { tag: '@tesbo.testId("TES-TC-1000")' }, async ({
@@ -1082,5 +1114,194 @@ test.describe("knowledge base (UI)", () => {
       scalar(`SELECT name FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(ownersFolder)};`),
       "the refused rename must not have been persisted",
     ).toBe(ownersFolder);
+  });
+
+  // ─── Nightly sync cron follow-through: "Added on", "Last updated", and the change-history popover ──
+
+  test("KBU-35 a synced row shows distinct Added on / Last updated dates, its icon sits in Last updated, and a plain row has no icon", { tag: '@tesbo.testId("TES-TC-254")' }, async ({ browser }) => {
+    const mirrorTitle = stamp("E2E-80: Synced ticket");
+    seedMirrorDocument(mirrorTitle, "kbu-added-on-1", 5, 0);
+
+    const plainTitle = stamp("Plain human document");
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, document_type, status) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(plainTitle)}, 'not synced', 'general', 'draft');`,
+    );
+
+    const page = await openKb(browser);
+    await expect(page.getByRole("columnheader", { name: "Added on" })).toBeVisible();
+
+    const mirrorRow = row(page, mirrorTitle);
+    await expect(mirrorRow).toBeVisible();
+    const cells = await mirrorRow.getByRole("cell").allTextContents();
+    // Name, Type, Updated by, Added on, Last updated, Size, Actions (no search query active, so
+    // the Folder path column is absent) — Added on (created 5 days ago) must read differently from
+    // Last updated (touched moments ago), not just coincidentally both say "Today".
+    expect(cells[3]).not.toContain("Today");
+    expect(cells[4]).toContain("Today");
+
+    // The icon lives in the Last updated cell, not Type — assert it directly rather than just
+    // "somewhere in the row", since that's the exact placement that was reported wrong.
+    const lastUpdatedCell = mirrorRow.getByRole("cell").nth(4);
+    await expect(lastUpdatedCell.getByRole("button", { name: "Change history" })).toBeVisible();
+    await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Change history" })).toHaveCount(0);
+
+    // A synced row gets the info icon; a plain, human-authored row does not — there is no change
+    // timeline to show for it.
+    await expect(changeHistoryTrigger(page, mirrorTitle)).toBeVisible();
+    await expect(changeHistoryTrigger(page, plainTitle)).toHaveCount(0);
+  });
+
+  test("KBU-36 the change-history popover opens on hover as well as click, and lists the timeline newest first", { tag: '@tesbo.testId("TES-TC-255")' }, async ({ browser }) => {
+    const title = stamp("E2E-81: Has history");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-2", 5, 0);
+    seedSyncEvent(documentId, "created", null);
+    seedSyncEvent(documentId, "updated", "Status: To Do -> In Progress updated.");
+
+    const page = await openKb(browser);
+    const panel = menuPanel(page);
+
+    // Hovering, not clicking, must open it — this is the behavior that was reported broken.
+    await changeHistoryTrigger(page, title).hover();
+    await expect(panel.getByText("Change history")).toBeVisible();
+    await expect(panel.getByText("Status: To Do -> In Progress updated.")).toBeVisible();
+    await expect(panel.getByText("Added", { exact: false }).first()).toBeVisible();
+
+    // Moving onto the popover itself (not away from the row) must not close it.
+    await panel.hover();
+    await expect(panel).toBeVisible();
+
+    // Moving away closes it again.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).hover();
+    await expect(panel).not.toBeVisible();
+
+    // Click opens it too, independent of hover (covers touch/keyboard users with no real hover).
+    await changeHistoryTrigger(page, title).click();
+    await expect(menuPanel(page).getByText("Change history")).toBeVisible();
+
+    // An outside click closes it — the only way a tap-only device can dismiss it.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).click();
+    await expect(menuPanel(page)).toHaveCount(0);
+
+    // A document with no change history recorded (e.g. one mirrored before this feature shipped)
+    // shows a plain empty state rather than an error or a blank popup.
+    const untracked = stamp("E2E-82: No history recorded");
+    seedMirrorDocument(untracked, "kbu-added-on-3", 1, 1);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await changeHistoryTrigger(page, untracked).hover();
+    await expect(menuPanel(page).getByText("No change history recorded yet.")).toBeVisible();
+  });
+
+  test("KBU-37 the popover paginates 5 per page with calendar/clock icons in DD/MM/YYYY 12-hour format, and never crops off-screen", { tag: '@tesbo.testId("TES-TC-258")' }, async ({ browser }) => {
+    const title = stamp("E2E-83: Long timeline");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-4", 3, 0);
+    for (let i = 1; i <= 7; i++) seedSyncEvent(documentId, "updated", `Change ${i}`);
+
+    const page = await openKb(browser);
+    // Narrow enough that the table's right-hand columns — where the icon now lives, in Last
+    // updated — crowd the screen edge, the exact layout the cropping was reported against.
+    await page.setViewportSize({ width: 700, height: 720 });
+
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel).toBeVisible();
+
+    // Never off-screen on any edge, regardless of where the trigger sits in the row.
+    const viewport = page.viewportSize();
+    await expect(async () => {
+      const box = await panel.boundingBox();
+      expect(box, "the popover must report a real bounding box").not.toBeNull();
+      if (!box || !viewport) return;
+      expect(box.x, "popover left edge is off-screen").toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width, "popover right edge overflows the viewport").toBeLessThanOrEqual(viewport.width);
+      expect(box.y, "popover top edge is off-screen").toBeGreaterThanOrEqual(0);
+      expect(box.y + box.height, "popover bottom edge overflows the viewport").toBeLessThanOrEqual(viewport.height);
+    }).toPass();
+
+    // Calendar and clock icons (Tabler icons render as inline <svg>) on every entry.
+    const firstEntry = panel.locator("li").first();
+    await expect(firstEntry.locator("svg")).toHaveCount(2);
+
+    // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — the seeded events are `now()`, so today's date must
+    // render in exactly that format, and the time must carry a literal AM/PM marker.
+    const now = new Date();
+    const expectedDate = `${String(now.getDate()).padStart(2, "0")}/${String(now.getMonth() + 1).padStart(2, "0")}/${now.getFullYear()}`;
+    await expect(firstEntry).toContainText(expectedDate);
+    await expect(firstEntry).toContainText(/\d{2}:\d{2}:\d{2} (AM|PM)/);
+
+    // Page 1 of a 7-event timeline: exactly 5 rows, newest ("Change 7") first, Next enabled and
+    // Previous disabled — there is nowhere earlier to go from the first page.
+    await expect(panel.locator("li")).toHaveCount(5);
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+    const nextButton = panel.getByRole("button", { name: "Next" });
+    const previousButton = panel.getByRole("button", { name: "Previous" });
+    await expect(previousButton).toBeDisabled();
+    await expect(nextButton).toBeEnabled();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+
+    await nextButton.click();
+    // Page 2: the remaining 2 (oldest) rows, Next now disabled — nothing further to page to.
+    await expect(panel.getByText("Page 2")).toBeVisible();
+    await expect(panel.locator("li")).toHaveCount(2);
+    await expect(panel.getByText("Change 1", { exact: false })).toBeVisible();
+    await expect(nextButton).toBeDisabled();
+    await expect(previousButton).toBeEnabled();
+
+    await previousButton.click();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+  });
+
+  test("KBU-38 a synced document's View history shows the change timeline with date/time/who, not a version list — a plain document is unaffected", { tag: '@tesbo.testId("TES-TC-260")' }, async ({ browser }) => {
+    const mirrorTitle = stamp("E2E-84: View history mirror");
+    const documentId = seedMirrorDocument(mirrorTitle, "kbu-view-history-1", 2, 0);
+    seedSyncEvent(documentId, "updated", "Description updated.");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+
+    // The modal is titled "Change history" for a mirror, not "Version history" — same distinction
+    // as the info-icon popover, since a mirror has no manually saved versions to list.
+    const changeHistoryDialog = modal(page, "Change history");
+    await expect(changeHistoryDialog).toBeVisible();
+    await expect(changeHistoryDialog.getByText("Description updated.")).toBeVisible();
+    // No triggering user was seeded (a nightly-style event) — labelled explicitly, not blank.
+    await expect(changeHistoryDialog.getByText("Nightly sync", { exact: false })).toBeVisible();
+    // Calendar + clock icons, and the DD/MM/YYYY + 12-hour time format, same as the popover.
+    await expect(changeHistoryDialog.locator("li").first().locator("svg")).toHaveCount(2);
+    await expect(changeHistoryDialog).toContainText(/\d{2}:\d{2}:\d{2} (AM|PM)/);
+    // "Restore" only makes sense against a manually saved version — never offered for a mirror.
+    await expect(changeHistoryDialog.getByRole("button", { name: "Restore" })).toHaveCount(0);
+    // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
+    await page.keyboard.press("Escape");
+
+    // A second mirror with no sync-event rows (e.g. synced before this feature existed) gets the
+    // same empty state as the popover, not a misleading "No earlier versions yet."
+    const untrackedTitle = stamp("E2E-85: View history mirror, no events");
+    const untrackedId = seedMirrorDocument(untrackedTitle, "kbu-view-history-2", 1, 1);
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${untrackedId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    await expect(modal(page, "Change history").getByText("No change history recorded yet.")).toBeVisible();
+    // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
+    await page.keyboard.press("Escape");
+
+    // A regular, human-authored document is entirely unaffected: still "Version history", still
+    // the plain empty state, since it has never been saved yet either.
+    const created = await api.post(kbUrl("/documents"), { data: { title: stamp("Plain doc"), folderId: rootFolderId } });
+    expect(created.status()).toBe(201);
+    const plainDocumentId = (await created.json()).id;
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${plainDocumentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const versionDialog = modal(page, "Version history");
+    await expect(versionDialog).toBeVisible();
+    await expect(versionDialog.getByText("No earlier versions yet.")).toBeVisible();
   });
 });

@@ -69,6 +69,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
     exec(`DELETE FROM zyra_chat_messages WHERE session_id IN (SELECT id FROM zyra_chat_sessions WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM zyra_token_usage WHERE project_id IN (${projects});`);
     exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
@@ -79,10 +80,30 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   }
 
   /** A chat session, created through the product's own route. */
-  async function createSession(title = `E2E session ${Date.now()}`, api: APIRequestContext = asOwner): Promise<any> {
-    const res = await api.post(url("/agents/zyra/chat/sessions"), { data: { title }, failOnStatusCode: false });
+  async function createSession(
+    title = `E2E session ${Date.now()}`,
+    api: APIRequestContext = asOwner,
+    projectId?: string,
+  ): Promise<any> {
+    const res = await api.post(url("/agents/zyra/chat/sessions", projectId), { data: { title }, failOnStatusCode: false });
     expect(res.status(), `creating a chat session — ${await res.text()}`).toBe(201);
     return res.json();
+  }
+
+  /*
+   * Writes a user message directly into a session and bumps its updated_at, the way the real send
+   * path does once it gets past the point of no return (legacy.service.ts sendZyraChatMessage,
+   * ~9048-9049) — arranged through Postgres, the same rule seedTask() and ZYR-A-31's
+   * markCreatedByZyra follow, because driving this through the live route would depend on how far a
+   * "no AI provider configured" reply gets before failing, which the last-used tests below aren't
+   * about.
+   */
+  function markChatUsed(sessionId: string, projectId = tenant!.mainProjectId): void {
+    exec(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES ` +
+        `(${literal(sessionId)}, ${literal(projectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Write me some test cases', 'sent');`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
   }
 
   /**
@@ -928,6 +949,81 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(Number((await after.json()).testcasesCreated), "a non-uuid audit row changed the count").toBe(before);
   });
 
+  // ─── The agent's "Token usage" tile ─────────────────────────────────────────
+
+  /** A ledger row, written directly — see seedTask()'s comment for why: no live model is called here. */
+  function seedTokenUsage(
+    source: "task_generate" | "task_regenerate" | "chat_router" | "chat_generate" | "chat_plan" | "chat_tool_finalize",
+    total: number,
+    projectId = tenant!.mainProjectId,
+  ): void {
+    const input = Math.floor(total / 2);
+    const output = total - input;
+    exec(
+      "INSERT INTO zyra_token_usage (project_id, source, provider, model, token_input, token_output, token_total) VALUES (" +
+        `${literal(projectId)}, ${literal(source)}, 'openai', 'gpt-4o-mini', ${input}, ${output}, ${total});`,
+    );
+  }
+
+  const tokenUsageTotal = async (api: APIRequestContext = asOwner, projectId?: string): Promise<number> => {
+    const res = await api.get(url("/agents/zyra", projectId), { failOnStatusCode: false });
+    expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+    return Number((await res.json()).tokenUsage?.total);
+  };
+
+  test("ZYR-A-34 token usage sums chat-sourced calls, not just the task board", { tag: '@tesbo.testId("TES-TC-1096")' }, async () => {
+    /*
+     * The bug this regresses: zyraAgent() used to SUM(token_total) over ai_generation_requests, a
+     * table only the task-board draft flow (aiGenerate/processZyraTask) ever writes. Every AI call
+     * Zyra's chat makes — the router decision, chat-driven generation, an exhaustive-plan batch, the
+     * Jira-coverage tool finalizer — spent real provider tokens that were never persisted anywhere
+     * this endpoint read, so a project used only through chat (the primary surface, reached from
+     * this same settings page's "Open Zyra chat") showed a permanent 0 no matter how much was spent.
+     *
+     * zyraAgent() now sums zyra_token_usage instead, written by every one of those call sites (see
+     * recordZyraTokenUsage). Asserted as a delta from a baseline for the same reason ZYR-A-31 is:
+     * a re-run against the persistent volume may not start from zero.
+     */
+    const baseline = await tokenUsageTotal();
+
+    seedTokenUsage("chat_router", 120);
+    expect(await tokenUsageTotal(), "a chat router call was not counted").toBe(baseline + 120);
+
+    seedTokenUsage("chat_generate", 4500);
+    expect(await tokenUsageTotal(), "chat-driven generation was not counted").toBe(baseline + 4620);
+
+    seedTokenUsage("chat_plan", 80);
+    seedTokenUsage("chat_tool_finalize", 60);
+    expect(await tokenUsageTotal(), "the exhaustive-plan and Jira-tool call sources were not counted").toBe(baseline + 4760);
+
+    // The task-board sources still count too — this is additive, not a replacement of one blind
+    // spot with another.
+    seedTokenUsage("task_generate", 300);
+    seedTokenUsage("task_regenerate", 150);
+    expect(await tokenUsageTotal(), "task-board sources regressed").toBe(baseline + 5210);
+  });
+
+  test("ZYR-A-35 a project with no recorded usage reads 0, not an error", { tag: '@tesbo.testId("TES-TC-1097")' }, async () => {
+    // The new workspace / never-used-Zyra baseline. COALESCE(SUM(...), 0) over zero rows must not
+    // surface as NULL or a 500 — this is the state every project starts in.
+    const res = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect(res.status(), `reading a project with no usage — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(body.tokenUsage, "tokenUsage is missing from the agent payload").toBeDefined();
+    expect(Number(body.tokenUsage.total)).toBe(0);
+  });
+
+  test("ZYR-A-36 token usage is scoped per project — a second tenant's spend never leaks in", { tag: '@tesbo.testId("TES-TC-1098")' }, async () => {
+    // Same account, its own second project: proves the SUM is filtered by project_id, not just
+    // organization_id — the cheapest way to catch a dropped WHERE clause.
+    const before = await tokenUsageTotal(asOwner, tenant!.secondProjectId);
+    seedTokenUsage("chat_generate", 999, tenant!.mainProjectId);
+    expect(
+      await tokenUsageTotal(asOwner, tenant!.secondProjectId),
+      "usage recorded against the main project leaked into a sibling project's total",
+    ).toBe(before);
+  });
+
   // ─── Generation failure surfaces as a distinct status ──────────────────────
 
   test("ZYR-A-33 a generation failure is a distinct 'failed' status, not a silent revert to the queue", async () => {
@@ -1212,5 +1308,76 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(longSource?.title).toBe("User Story Context");
     expect(longSource?.detail).toBe(longContext.slice(0, 320));
     expect(longSource?.detail.length).toBe(320);
+  });
+
+  // ─── The agent's "last used" timestamp ─────────────────────────────────────
+
+  test("ZYR-A-43 the agent reports no last-used date until Zyra is actually used, then the more recent of chat or the task board", async () => {
+    /*
+     * Regression test. The Agents screen tile derived "last used" (rendered as "Used Nd ago")
+     * purely from ai_generation_requests — the task-board draft flow — so a workspace that only
+     * ever talked to Zyra through chat kept reporting the same stale date forever, exactly like
+     * ZYR-A-31's "0 tests generated" before that counter was fixed to read both modes. lastUsedAt
+     * is now the newer of the task board's latest updated_at and a chat session's, and a session
+     * with no message in it (auto-created just by opening the chat — see ZYU-26/27) must not count,
+     * the same way an unused session is excluded from has_messages.
+     */
+    const readAgent = async (): Promise<{ lastUsedAt: string | null }> => {
+      const res = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+      expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+      const body = await res.json();
+      expect(body.agent, "the agent payload carries no agent object").toBeTruthy();
+      return body.agent;
+    };
+    // Nothing used yet: purge() ran in beforeEach/afterEach, so this project starts clean.
+    const before = await readAgent();
+    expect(before.lastUsedAt, "a project with no Zyra activity reported a last-used date").toBeNull();
+
+    // Opening the chat alone (an empty, message-less session) must not count as usage.
+    const emptySession = await createSession("Zyra chat");
+    const stillNone = await readAgent();
+    expect(stillNone.lastUsedAt, "an empty auto-created chat session counted as 'last used'").toBeNull();
+
+    // Actually sending a chat message is usage.
+    markChatUsed(emptySession.id);
+    const afterChat = await readAgent();
+    expect(afterChat.lastUsedAt, "a real chat message did not update last-used").not.toBeNull();
+    const chatSeenAt = scalar(`SELECT updated_at::text FROM zyra_chat_sessions WHERE id = ${literal(emptySession.id)};`);
+    expect(new Date(afterChat.lastUsedAt!).getTime()).toBe(new Date(chatSeenAt).getTime());
+
+    // Backdate the chat activity, then use the task board — the newer of the two must win.
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() - interval '10 days' WHERE id = ${literal(emptySession.id)};`);
+    const taskId = seedTask();
+    const afterTask = await readAgent();
+    const taskSeenAt = scalar(`SELECT updated_at::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    expect(
+      new Date(afterTask.lastUsedAt!).getTime(),
+      "a more recent task-board update did not take over from an older chat timestamp",
+    ).toBe(new Date(taskSeenAt).getTime());
+
+    // Backdate the task too, so the (still newer) chat activity wins back.
+    exec(`UPDATE ai_generation_requests SET updated_at = now() - interval '20 days' WHERE id = ${literal(taskId)};`);
+    const afterBothOld = await readAgent();
+    expect(
+      new Date(afterBothOld.lastUsedAt!).getTime(),
+      "the more recent activity (chat, 10 days back) should still win over an older task-board update",
+    ).toBe(new Date(chatSeenAt).getTime());
+  });
+
+  test("ZYR-A-44 a second project's Zyra activity is not reflected in this project's last-used date", async () => {
+    // Cross-project isolation for the same field ZYR-A-43 exercises: a used chat session in the
+    // second project must not leak into the main project's lastUsedAt, the same boundary ZYR-A-05
+    // pins for the underlying rows themselves.
+    const before = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect((await before.json()).agent.lastUsedAt).toBeNull();
+
+    const otherSession = await createSession("Zyra chat", asOwner, tenant!.secondProjectId);
+    markChatUsed(otherSession.id, tenant!.secondProjectId);
+
+    const after = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect(
+      (await after.json()).agent.lastUsedAt,
+      "a chat message sent in the second project changed the main project's last-used date",
+    ).toBeNull();
   });
 });

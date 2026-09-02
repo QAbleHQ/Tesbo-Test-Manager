@@ -357,6 +357,68 @@ const PROJECT_NAME_MIN_LENGTH = 3;
 const PROJECT_NAME_MAX_LENGTH = 30;
 const PROJECT_DESCRIPTION_MAX_LENGTH = 500;
 
+// Mirrors AVATAR_COLORS in Tesbo-Frontend/lib/avatarColors.ts. Every swatch there is chosen to clear
+// WCAG AA (4.5:1) under white text, so the project icon picker is restricted to this exact palette
+// rather than accepting arbitrary hex — the same reasoning that keeps user/team avatars off free-form
+// colors. Two copies (frontend picker, backend guard) rather than a shared package, same as
+// PROJECT_NAME_MAX_LENGTH above; keep them in sync if the palette ever changes.
+const PROJECT_ICON_COLORS = ["#7C5FCC", "#4C5FD5", "#1F7A3D", "#1D7FA8", "#A85F06", "#D83A3A"];
+
+// A custom glyph replaces the auto-derived initial on a project's colored badge — meant for one
+// emoji or a couple of typed letters, not a label. Grapheme-counted rather than length-counted so a
+// single emoji built from multiple code points (a ZWJ sequence, a skin-tone modifier) still counts
+// as one character instead of being rejected as "too long".
+const PROJECT_ICON_GLYPH_MAX_GRAPHEMES = 2;
+const PROJECT_ICON_GLYPH_MAX_LENGTH = 16;
+
+function countGraphemes(value: string): number {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  let count = 0;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  for (const _ of segmenter.segment(value)) count++;
+  return count;
+}
+
+type ProjectIcon = { color: string | null; glyph: string | null };
+
+/**
+ * Validates the optional `icon` override on create/update. `undefined` means the field was not
+ * sent at all — leave whatever is stored alone. `null`, or `{ color: null, glyph: null }`, is how a
+ * caller explicitly clears back to the generated placeholder (deterministic color + first initial).
+ */
+function validateProjectIcon(raw: unknown): ProjectIcon | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return { color: null, glyph: null };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BadRequestException({ error: "icon must be an object with color and/or glyph" });
+  }
+  const body = raw as Body;
+  let color: string | null = null;
+  if (body.color !== undefined && body.color !== null && String(body.color).trim() !== "") {
+    const candidate = String(body.color).trim();
+    const match = PROJECT_ICON_COLORS.find((c) => c.toLowerCase() === candidate.toLowerCase());
+    if (!match) throw new BadRequestException({ error: "Icon color must be one of the supported palette colors" });
+    color = match;
+  }
+  let glyph: string | null = null;
+  if (body.glyph !== undefined && body.glyph !== null) {
+    const trimmed = String(body.glyph).trim();
+    if (trimmed) {
+      if (/[\u0000-\u001F\u007F]/.test(trimmed)) {
+        throw new BadRequestException({ error: "Icon glyph contains unsupported characters" });
+      }
+      if (trimmed.length > PROJECT_ICON_GLYPH_MAX_LENGTH || countGraphemes(trimmed) > PROJECT_ICON_GLYPH_MAX_GRAPHEMES) {
+        throw new BadRequestException({ error: `Icon glyph must be at most ${PROJECT_ICON_GLYPH_MAX_GRAPHEMES} characters` });
+      }
+      // Uppercased the same way a project key is: toUpperCase() is a no-op on an emoji or digit, so
+      // this only ever changes letters. Normalized server-side too, not just in the picker, so a
+      // caller posting directly to the API gets the same badge convention as the UI.
+      glyph = trimmed.toUpperCase();
+    }
+  }
+  return { color, glyph };
+}
+
 /** Shared by createProject/updateProject. `name`/`description` undefined means "not being changed". */
 function validateProjectFields(name: string | undefined, description: string | undefined): void {
   if (name !== undefined) {
@@ -445,6 +507,17 @@ function estimateTokens(value: string): number {
 
 function normalizeJsonArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
+}
+
+// Caps text for display without cutting mid-word/mid-sentence: trims back to the last
+// whitespace before maxLength and marks the cut with an ellipsis. A plain `.slice(0, n)`
+// reads as a bug (e.g. "...so t") rather than an intentional preview.
+function truncateAtWordBoundary(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const cut = value.slice(0, maxLength);
+  const lastBoundary = cut.lastIndexOf(" ");
+  const trimmed = lastBoundary > maxLength * 0.6 ? cut.slice(0, lastBoundary) : cut;
+  return `${trimmed.trimEnd()}…`;
 }
 
 // Renders a stored custom field value into the human-readable form used by CSV/XLSX
@@ -2033,14 +2106,23 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT p.id, p.key, p.name, COALESCE(p.description, '') AS description,
               COALESCE(p.project_type, 'tesbox') AS project_type,
-              COALESCE(pm.role, 'member') AS role, p.created_at
+              COALESCE(pm.role, 'member') AS role, p.created_at, p.settings
        FROM projects p
        JOIN project_members pm ON pm.project_id = p.id
        WHERE pm.user_id = $1 AND p.organization_id = $2 AND p.archived_at IS NULL
        ORDER BY p.created_at DESC`,
       [uid, workspace.id]
     );
-    return res.rows.map(toCamel);
+    return res.rows.map((row) => {
+      const camelRow = toCamel(row);
+      // Raw settings is an internal implementation detail (also carries testcaseIdPrefix,
+      // testRunEnvironments, zyraAgent, …) — only the icon override is a card-list concern, so pull
+      // just that out and drop the rest rather than leaking the whole blob to this list endpoint.
+      const icon = parseSettings(row.settings).icon as ProjectIcon | undefined;
+      camelRow.icon = icon && (icon.color || icon.glyph) ? { color: icon.color ?? null, glyph: icon.glyph ?? null } : null;
+      delete camelRow.settings;
+      return camelRow;
+    });
   }
 
   /**
@@ -2101,6 +2183,7 @@ export class LegacyService implements OnModuleInit {
         passed: number;
         failed: number;
         blocked: number;
+        skipped: number;
         untested: number;
       }>(
         `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
@@ -2153,7 +2236,15 @@ export class LegacyService implements OnModuleInit {
       const testCaseCount = caseCounts.get(id) ?? 0;
       const lastActivityAt = lastActivity.get(id) ?? null;
       const run = runByProject.get(id);
-      const executed = run ? Math.max(0, run.total_cases - run.untested) : 0;
+      const metrics = run
+        ? LegacyService.computeExecutionMetrics({
+            passed: run.passed,
+            failed: run.failed,
+            blocked: run.blocked,
+            skipped: run.skipped,
+            totalCases: run.total_cases
+          })
+        : null;
       return {
         ...project,
         testCaseCount,
@@ -2163,10 +2254,12 @@ export class LegacyService implements OnModuleInit {
         // An empty project needs setting up; one with cases but no activity is configured but idle.
         status: testCaseCount === 0 ? "setup_required" : lastActivityAt ? "active" : "configured",
         runCounts:
-          run && executed > 0
-            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, total: run.total_cases }
+          run && metrics && metrics.executed > 0
+            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, skipped: run.skipped, total: run.total_cases }
             : null,
-        currentPassRate: run && executed > 0 ? Math.round((run.passed / executed) * 100) : null
+        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A run that is nothing
+        // but Skipped cases has no settled verdict, so this is null (rendered as "—"), not 0%.
+        currentPassRate: metrics ? metrics.passRate : null
       };
     });
   }
@@ -2176,6 +2269,7 @@ export class LegacyService implements OnModuleInit {
     const name = String(body.name || "").trim();
     validateProjectFields(name, body.description != null ? String(body.description) : undefined);
     validateProjectKey(body.key != null ? String(body.key) : undefined);
+    const icon = validateProjectIcon(body.icon);
     const workspace = await this.workspace(uid);
     // Creating a project is an administrative act, not part of authoring or executing tests. The
     // projects list hides the button from a QA Engineer, but that is presentation — the rule has to
@@ -2183,7 +2277,7 @@ export class LegacyService implements OnModuleInit {
     if (this.normalizeRole(workspace.role) === "qa_engineer")
       throw new ForbiddenException({ error: "Only the workspace owner, admin, or manager can create projects" });
     await this.planLimits.assertCanCreateProject(workspace.id);
-    const res = await this.insertProjectWithUniqueKey(workspace.id, uid, name, body);
+    const res = await this.insertProjectWithUniqueKey(workspace.id, uid, name, body, icon);
     await this.logProjectActivity(res.id, uid, "project_created", "project", res.id, res.name, {});
     return toCamel(res);
   }
@@ -2201,21 +2295,24 @@ export class LegacyService implements OnModuleInit {
    * them. The retry exists because two concurrent creates can both read the same free key: rather
    * than fail the second caller, re-derive and try again.
    */
-  private async insertProjectWithUniqueKey(organizationId: string, uid: string, name: string, body: Body) {
+  private async insertProjectWithUniqueKey(organizationId: string, uid: string, name: string, body: Body, icon?: ProjectIcon) {
     // An explicit key was already validated (validateProjectKey) against the real 32-character
     // column width — sanitize it the same way but do NOT also run it through projectKey()'s
     // 16-character UX slice, or a caller-chosen key gets silently shortened just like the bug
     // this validation exists to catch. Only the name-derived fallback keeps that shorter budget.
     const explicitKey = body.key != null ? sanitizeKey(String(body.key)) : "";
     const requestedBase = explicitKey || projectKey(name);
+    // No icon chosen stores an empty settings object, same as before this field existed, so a
+    // project created without one still falls back to the deterministic color + initial on read.
+    const settingsJson = icon && (icon.color || icon.glyph) ? JSON.stringify({ icon }) : "{}";
     for (let attempt = 1; ; attempt++) {
       const key = await this.nextFreeProjectKey(organizationId, requestedBase);
       try {
         return await this.db.transaction(async (client) => {
           const project = await client.query(
-            `INSERT INTO projects (organization_id, key, name, description, project_type)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, key, name, project_type, created_at`,
-            [organizationId, key, name, body.description || "", body.projectType || "tesbox"]
+            `INSERT INTO projects (organization_id, key, name, description, project_type, settings)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id, key, name, project_type, created_at`,
+            [organizationId, key, name, body.description || "", body.projectType || "tesbox", settingsJson]
           );
           await client.query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner')", [
             project.rows[0].id,
@@ -2294,6 +2391,7 @@ export class LegacyService implements OnModuleInit {
     const name = body.name !== undefined ? String(body.name).trim() : undefined;
     const description = body.description !== undefined ? String(body.description) : undefined;
     validateProjectFields(name, description);
+    const icon = validateProjectIcon(body.icon);
     await this.db.query(
       `UPDATE projects SET
        name = COALESCE($2, name),
@@ -2303,6 +2401,16 @@ export class LegacyService implements OnModuleInit {
        WHERE id = $1`,
       [id, name ?? null, description ?? null, body.settings ? JSON.stringify(body.settings) : null]
     );
+    if (icon !== undefined) {
+      // A targeted jsonb_set rather than a read-modify-write of the whole settings blob, so an icon
+      // change can't race a concurrent save of testcaseIdPrefix/testRunEnvironments (or vice versa)
+      // and silently drop whichever one lost the race.
+      await this.db.query(
+        `UPDATE projects SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{icon}', $2::jsonb, true), updated_at = now()
+         WHERE id = $1`,
+        [id, JSON.stringify(icon)]
+      );
+    }
   }
 
   // Membership alone is not enough to reconfigure a project. Every neighbouring administrative
@@ -3845,6 +3953,44 @@ export class LegacyService implements OnModuleInit {
               COUNT(e.id) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
               COUNT(e.id) FILTER (WHERE e.status IN ('Untested', 'Retest'))::int AS untested`;
 
+  /**
+   * The one formula for "Pass Rate" and "Execution Progress", used by every endpoint that reports
+   * either number (plans, cycles, projects list, dashboard, reports). Before this existed each
+   * caller reimplemented its own division, and they disagreed on two things: whether a Skipped case
+   * belongs in the denominator, and whether Retest counts as executed. That produced, for the exact
+   * same run, a Test Run Details page reading 30% and a Test Plan page reading 43%.
+   *
+   * - Pass Rate = Passed / (Passed + Failed + Blocked). A case that was deliberately Skipped has no
+   *   pass/fail verdict, so it is excluded from both sides of this ratio — it neither helps nor hurts
+   *   the rate. null when nothing has a settled verdict yet, so an all-pending or all-skipped run
+   *   renders as "—" rather than a misleading 0%.
+   * - Execution Progress = (Passed + Failed + Blocked + Skipped) / Total. Skipped IS counted here: it
+   *   is a deliberate outcome, not work still to do, so it belongs in "how much of this run is done".
+   * - Retest is never executed for either metric — it belongs with Untested (see the comment on
+   *   EXECUTION_BUCKET_COUNTS), so callers must not add it into passed/failed/blocked/skipped.
+   */
+  private static computeExecutionMetrics(counts: {
+    passed: number;
+    failed: number;
+    blocked: number;
+    skipped: number;
+    totalCases: number;
+  }): { executed: number; pending: number; passRate: number | null; executionProgress: number } {
+    const passed = counts.passed || 0;
+    const failed = counts.failed || 0;
+    const blocked = counts.blocked || 0;
+    const skipped = counts.skipped || 0;
+    const totalCases = counts.totalCases || 0;
+    const settled = passed + failed + blocked;
+    const executed = settled + skipped;
+    return {
+      executed,
+      pending: Math.max(0, totalCases - executed),
+      passRate: settled > 0 ? Math.round((passed / settled) * 100) : null,
+      executionProgress: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0
+    };
+  }
+
   async listPlansForUser(userId: string | null | undefined, projectId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.listPlans(projectId);
@@ -4026,7 +4172,7 @@ export class LegacyService implements OnModuleInit {
     const blocked = Number(row.blocked) || 0;
     const skipped = Number(row.skipped) || 0;
     const untested = Number(row.untested) || 0;
-    const executed = passed + failed + blocked + skipped;
+    const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
     return {
       runCount: Number(row.run_count) || 0,
       totalCases,
@@ -4035,8 +4181,9 @@ export class LegacyService implements OnModuleInit {
       blocked,
       skipped,
       untested,
-      executed,
-      completionPercent: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0
+      executed: metrics.executed,
+      passRate: metrics.passRate,
+      completionPercent: metrics.executionProgress
     };
   }
 
@@ -4562,7 +4709,7 @@ export class LegacyService implements OnModuleInit {
   private bugSelect(where: string): string {
     return `
       SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
-             ap.display_name AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
+             COALESCE(ap.display_name, ap.email) AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
       LEFT JOIN users u ON u.id = b.reported_by
@@ -4627,6 +4774,14 @@ export class LegacyService implements OnModuleInit {
     if (query.cycleId) {
       values.push(query.cycleId);
       filters.push(`b.cycle_id = $${values.length}`);
+    }
+    // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
+    // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
+    if (query.assigneeId === "unassigned") {
+      filters.push("b.assignee_id IS NULL");
+    } else if (query.assigneeId) {
+      values.push(query.assigneeId);
+      filters.push(`b.assignee_id = $${values.length}`);
     }
     const res = await this.db.query(`${this.bugSelect(filters.join(" AND "))} ORDER BY b.created_at DESC`, values);
     return res.rows.map((row) => ({
@@ -5557,57 +5712,90 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async cyclePassRateSeries(projectId: string, limit: number) {
-    const res = await this.db.query<{ id: string; name: string; created_at: string; total: number; passed: number; executed: number }>(
+    const res = await this.db.query<{
+      id: string;
+      name: string;
+      created_at: string;
+      total_cases: number;
+      passed: number;
+      failed: number;
+      blocked: number;
+      skipped: number;
+    }>(
       `SELECT c.id, c.name, c.created_at,
-              COUNT(ci.id)::int AS total,
-              COUNT(*) FILTER (WHERE e.status = 'Passed')::int AS passed,
-              COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status <> 'Untested')::int AS executed
+              ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE c.project_id = $1
        GROUP BY c.id
        ORDER BY c.created_at ASC`,
       [projectId]
     );
     const rows = res.rows.slice(-limit);
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      createdAt: r.created_at,
-      total: Number(r.total) || 0,
-      executed: Number(r.executed) || 0,
-      passRate: Number(r.executed) > 0 ? Math.round((Number(r.passed) / Number(r.executed)) * 100) : null
-    }));
+    return rows.map((r) => {
+      const passed = Number(r.passed) || 0;
+      const failed = Number(r.failed) || 0;
+      const blocked = Number(r.blocked) || 0;
+      const skipped = Number(r.skipped) || 0;
+      const totalCases = Number(r.total_cases) || 0;
+      const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
+      return {
+        id: r.id,
+        name: r.name,
+        createdAt: r.created_at,
+        total: totalCases,
+        passed,
+        failed,
+        blocked,
+        skipped,
+        executed: metrics.executed,
+        executionProgress: metrics.executionProgress,
+        passRate: metrics.passRate
+      };
+    });
   }
 
   private async suiteHealth(projectId: string) {
-    const res = await this.db.query<{ suite_name: string; passed: string; failed: string; blocked: string; skipped: string; executed: string }>(
+    const res = await this.db.query<{
+      suite_name: string;
+      total_cases: string;
+      passed: string;
+      failed: string;
+      blocked: string;
+      skipped: string;
+    }>(
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
-              COUNT(*) FILTER (WHERE e.status = 'Passed')::int AS passed,
-              COUNT(*) FILTER (WHERE e.status = 'Failed')::int AS failed,
-              COUNT(*) FILTER (WHERE e.status = 'Blocked')::int AS blocked,
-              COUNT(*) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
-              COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status <> 'Untested')::int AS executed
+              ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
        LEFT JOIN suites s ON s.id = t.suite_id
        LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
        LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.project_id = t.project_id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
     );
     return res.rows.map((r) => {
-      const executed = Number(r.executed) || 0;
-      const pct = (n: number) => (executed > 0 ? Math.round((n / executed) * 100) : 0);
+      const passed = Number(r.passed) || 0;
+      const failed = Number(r.failed) || 0;
+      const blocked = Number(r.blocked) || 0;
+      const skipped = Number(r.skipped) || 0;
+      const totalCases = Number(r.total_cases) || 0;
+      const metrics = LegacyService.computeExecutionMetrics({ passed, failed, blocked, skipped, totalCases });
+      // Percentages of settled cases (Passed+Failed+Blocked), matching Pass Rate everywhere else —
+      // Skipped is neither a pass nor a fail, so it does not dilute these three.
+      const settled = passed + failed + blocked;
+      const pct = (n: number) => (settled > 0 ? Math.round((n / settled) * 100) : 0);
       return {
         suiteName: r.suite_name,
-        executed,
-        passedPct: pct(Number(r.passed) || 0),
-        failedPct: pct(Number(r.failed) || 0),
-        blockedPct: pct(Number(r.blocked) || 0)
+        executed: metrics.executed,
+        skipped,
+        executionProgress: metrics.executionProgress,
+        passedPct: pct(passed),
+        failedPct: pct(failed),
+        blockedPct: pct(blocked)
       };
     });
   }
@@ -5814,13 +6002,14 @@ export class LegacyService implements OnModuleInit {
       ),
       // Compares the pass rate of executions recorded in the last 7 days against the 7 days
       // before that, so the dashboard's "+N% this week" badge reflects real execution activity
-      // rather than an all-time trend.
-      this.db.query<{ passed_recent: string; executed_recent: string; passed_prior: string; executed_prior: string }>(
+      // rather than an all-time trend. Settled statuses only (Passed/Failed/Blocked) — matching
+      // computeExecutionMetrics' Pass Rate, Skipped and Retest are not part of this denominator.
+      this.db.query<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
         `SELECT
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '7 days')::int AS passed_recent,
-           COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status NOT IN ('Untested', 'Retest') AND e.executed_at >= now() - interval '7 days')::int AS executed_recent,
+           COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '7 days')::int AS settled_recent,
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS passed_prior,
-           COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status NOT IN ('Untested', 'Retest') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS executed_prior
+           COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS settled_prior
          FROM executions e
          JOIN cycle_items ci ON ci.id = e.cycle_item_id
          JOIN cycles c ON c.id = ci.cycle_id
@@ -5835,18 +6024,19 @@ export class LegacyService implements OnModuleInit {
     }
     const openBugsTotal = Object.values(bySeverity).reduce((a, b) => a + b, 0);
 
-    // Retest leaves the denominator alongside Untested. A case sent back for retest has no settled
-    // result, so counting it as executed-but-not-passed silently dragged the headline pass rate down
-    // while changing nothing visible on the run itself.
-    const unsettled = (counts.executionStatus.Untested || 0) + (counts.executionStatus.Retest || 0);
-    const executed = counts.executionTotal - unsettled;
-    const passRateValue = executed > 0 ? Math.round(((counts.executionStatus.Passed || 0) / executed) * 100) : null;
+    const metrics = LegacyService.computeExecutionMetrics({
+      passed: counts.executionStatus.Passed || 0,
+      failed: counts.executionStatus.Failed || 0,
+      blocked: counts.executionStatus.Blocked || 0,
+      skipped: counts.executionStatus.Skipped || 0,
+      totalCases: counts.executionTotal
+    });
 
     const w = passRateWindows.rows[0];
-    const recentExecuted = Number(w?.executed_recent || 0);
-    const priorExecuted = Number(w?.executed_prior || 0);
-    const recentRate = recentExecuted > 0 ? (Number(w!.passed_recent) / recentExecuted) * 100 : null;
-    const priorRate = priorExecuted > 0 ? (Number(w!.passed_prior) / priorExecuted) * 100 : null;
+    const recentSettled = Number(w?.settled_recent || 0);
+    const priorSettled = Number(w?.settled_prior || 0);
+    const recentRate = recentSettled > 0 ? (Number(w!.passed_recent) / recentSettled) * 100 : null;
+    const priorRate = priorSettled > 0 ? (Number(w!.passed_prior) / priorSettled) * 100 : null;
     const passRateDeltaThisWeek = recentRate !== null && priorRate !== null ? Math.round(recentRate - priorRate) : null;
 
     const totalRequirements = requirements.all.total;
@@ -5855,7 +6045,8 @@ export class LegacyService implements OnModuleInit {
 
     return {
       testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
-      passRate: { value: passRateValue, deltaThisWeek: passRateDeltaThisWeek },
+      passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
+      executionProgress: { value: metrics.executionProgress },
       openBugs: { total: openBugsTotal, bySeverity },
       coverage: { pct: coveragePct, totalRequirements },
       plans: counts.planCount,
@@ -6925,6 +7116,18 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(doc), syncedByName, breadcrumb };
   }
 
+  // Powers the Knowledge Base info-icon popover: this document's add/update timeline, 5 events per
+  // page (newest first) so a ticket synced nightly for a year doesn't dump hundreds of rows into a
+  // small popup. Only meaningful for a synced mirror, but reuses the same project-access +
+  // existence check as every other KB document route rather than special-casing on source_provider.
+  async getKnowledgeDocumentSyncEvents(projectId: string, userId: string | null | undefined, documentId: string, query: Body = {}) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.kbDocument(projectId, documentId);
+    const limit = pageNumber(query.limit, 5, 1, 20);
+    const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    return this.integrationSync.listSyncEventsForDocument(documentId, limit, offset);
+  }
+
   // Display name for the person whose Sync click last rewrote a mirrored document.
   private async kbSyncedByName(userId: unknown): Promise<string | null> {
     if (!userId) return null;
@@ -7353,7 +7556,12 @@ export class LegacyService implements OnModuleInit {
       }
       if (LegacyService.KB_SPREADSHEET_EXTENSIONS.has(ext)) {
         const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.load(buffer);
+        // exceljs's own index.d.ts is a module, so its unwrapped `declare interface Buffer
+        // extends ArrayBuffer {}` fallback (for consumers without @types/node) shadows the
+        // real Buffer only inside that file — `load()`'s parameter type is that local,
+        // permanently-incompatible stub, not Node's Buffer, so no cast to `Buffer` can ever
+        // satisfy it. `any` is required to bypass the structural check entirely.
+        await workbook.xlsx.load(buffer as any);
         const text = workbook.worksheets
           .map((sheet) => `Sheet: ${sheet.name}\n${LegacyService.worksheetToCsv(sheet)}`)
           .join("\n\n");
@@ -8722,12 +8930,16 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
+      // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
+      // only ever reflects the task-board flow. The ledger is written by every provider call Zyra
+      // makes, chat included, so this total is real usage rather than the permanent 0 a chat-only
+      // project used to see. See V87_zyra_token_usage.sql / recordZyraTokenUsage.
       this.db.query<{ total: string }>(
-        "SELECT COALESCE(SUM(token_total), 0) AS total FROM ai_generation_requests WHERE project_id = $1 AND agent_name = ANY($2::text[])",
-        [projectId, ZYRA_AGENT_NAMES]
+        "SELECT COALESCE(SUM(token_total), 0) AS total FROM zyra_token_usage WHERE project_id = $1",
+        [projectId]
       ),
       this.db.query(
         `SELECT id, requested_by, provider, model, user_story, acceptance_criteria, custom_prompt, style,
@@ -8738,16 +8950,36 @@ export class LegacyService implements OnModuleInit {
          WHERE project_id = $1 AND agent_name = ANY($2::text[])
          ORDER BY updated_at DESC LIMIT 50`,
         [projectId, ZYRA_AGENT_NAMES]
+      ),
+      // Restricted to sessions that actually hold a message, matching has_messages in
+      // zyraChatSessions above: opening the chat auto-creates an empty session to type into
+      // (ZYU-26/27), and that alone must not read as "last used" any more than an
+      // ai_generation_requests row would before a user asked for anything.
+      this.db.query<{ last_used: string | null }>(
+        `SELECT MAX(s.updated_at) AS last_used
+           FROM zyra_chat_sessions s
+          WHERE s.project_id = $1
+            AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
+        [projectId]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
     const key = allocation.key;
+    // Draft tasks (task-board flow) and chat sessions each carry their own activity
+    // timestamp, and only one of the two moves depending on which mode was used — see
+    // zyraCreatedTestcaseCount above for the same split. "Last used" is whichever is newer.
+    const lastTaskActivity = tasks.rows[0]?.updated_at as string | undefined;
+    const lastChatActivity = chatActivity.rows[0]?.last_used ?? undefined;
+    const lastUsedAt = [lastTaskActivity, lastChatActivity]
+      .filter((v): v is string => Boolean(v))
+      .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null;
     return {
       agent: {
         name: ZYRA_AGENT_NAME,
         role: "AI testcase generation agent",
         active: Boolean(key),
-        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason
+        activationReason: key ? "Workspace AI key allocated to this project." : allocation.reason,
+        lastUsedAt
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5),
@@ -8860,6 +9092,37 @@ export class LegacyService implements OnModuleInit {
       [projectId]
     );
     return Number(res.rows[0]?.count || 0);
+  }
+
+  /**
+   * Logs one provider call's worth of tokens to the zyra_token_usage ledger, backing the "Token
+   * usage" tile on Zyra settings (zyraAgent()). Deliberately INSERT-only and a single standalone
+   * statement — never combined with another write in one transaction, so it can't introduce a
+   * lock-ordering hazard, and a new row's server-generated id never contends with any other
+   * transaction's held locks. This is observability, not the critical path: a failure here is
+   * logged and swallowed, never allowed to fail the chat reply or generation the caller is waiting
+   * on that made the provider call in the first place.
+   */
+  private async recordZyraTokenUsage(
+    projectId: string,
+    source: "task_generate" | "task_regenerate" | "chat_router" | "chat_generate" | "chat_plan" | "chat_tool_finalize",
+    provider: string,
+    model: string,
+    usage: { input?: number; output?: number; total?: number }
+  ): Promise<void> {
+    const input = Number(usage.input || 0);
+    const output = Number(usage.output || 0);
+    const total = Number(usage.total || input + output);
+    if (!total) return;
+    try {
+      await this.db.query(
+        `INSERT INTO zyra_token_usage (project_id, source, provider, model, token_input, token_output, token_total)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [projectId, source, provider || "unknown", model || "unknown", input, output, total]
+      );
+    } catch (err) {
+      this.logger.warn(`zyra token usage not recorded (${source}, project ${projectId}): ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   async zyraTask(projectId: string, userId: string | null | undefined, taskId: string) {
@@ -9281,6 +9544,9 @@ export class LegacyService implements OnModuleInit {
       const raw = providerWire(provider) === "anthropic"
         ? await this.zyraChatWithAnthropic(key, model, context, message)
         : await this.zyraChatWithOpenAi(key, model, context, message);
+      // Real provider usage (raw.__zyraUsage) rather than the estimateTokens() guess the Langfuse
+      // trace below still uses for its own, separate purpose.
+      await this.recordZyraTokenUsage(projectId, "chat_router", provider, model, raw.__zyraUsage || {});
       const modelIntent = this.intentFromZyraModelAction(raw.action, raw.actionType);
       // The router call itself: the prompt the model saw and the structured decision it returned.
       // Recorded before dispatch so a decision that is later overridden by a capability gate is
@@ -9301,6 +9567,7 @@ export class LegacyService implements OnModuleInit {
       if (modelIntent === "jira_pending_testcases") {
         const toolDecision = await this.analyzeZyraJiraTestcaseCoverage(projectId);
         return this.finalizeZyraToolDecisionWithAi({
+          projectId,
           key,
           provider,
           model,
@@ -9347,6 +9614,10 @@ export class LegacyService implements OnModuleInit {
           // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
           // after the router already succeeded.
           const detail = this.extractAiErrorMessage(err);
+          // The failed attempt's provider response, if one arrived, was still billed — see
+          // generateZyraWithOpenAi/Anthropic's zyraUsage on the thrown error.
+          const failedUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+          if (failedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, failedUsage);
           await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: detail, stage: "generation" });
 
           const routedSuiteForTurn = this.routedZyraSuite(raw, projectSnapshot.suites);
@@ -9406,6 +9677,8 @@ export class LegacyService implements OnModuleInit {
             };
           } catch (retryErr) {
             const retryDetail = this.extractAiErrorMessage(retryErr);
+            const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+            if (retryFailedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, retryFailedUsage);
             await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", {
               message: retryDetail,
               stage: "generation_retry"
@@ -9698,6 +9971,10 @@ export class LegacyService implements OnModuleInit {
         testcaseRange: params.testcaseRange
       }
     });
+    // This one function backs every chat-driven "create" call: the first turn, the first batch of
+    // an exhaustive plan (startZyraChatPlan), and every subsequent background batch
+    // (continueZyraChatPlan's loop) — instrumenting it once covers all three.
+    await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, aiResult.usage);
     await this.rememberZyraTurn({
       projectId: params.projectId,
       userId: params.userId,
@@ -9829,6 +10106,7 @@ export class LegacyService implements OnModuleInit {
     let scenarios: string[] = [];
     try {
       scenarios = await this.planZyraChatScenarios({
+        projectId: params.projectId,
         provider: params.provider,
         model: params.model,
         key: params.key,
@@ -9939,6 +10217,10 @@ export class LegacyService implements OnModuleInit {
 
       const doneCount = Number(plan.doneCount || 0);
       const totalCount = Number(plan.totalCount || 0);
+      // Hoisted so the catch block below can still record tokens from a billed-but-unparsed
+      // response even though provider/model are only known once the allocation resolves.
+      let provider = "unknown";
+      let model = "unknown";
       try {
         const allocation = await this.zyraAiAllocation(projectId);
         if (!allocation.key) {
@@ -9952,8 +10234,8 @@ export class LegacyService implements OnModuleInit {
           await this.clearZyraChatPlan(sessionId);
           return;
         }
-        const provider = String(allocation.key.provider || "openai").toLowerCase();
-        const model = normalizeProviderModel(provider, allocation.key.default_model);
+        provider = String(allocation.key.provider || "openai").toLowerCase();
+        model = normalizeProviderModel(provider, allocation.key.default_model);
         const originalMessage = String(plan.originalMessage || "");
         const jiraIssueKeys = normalizeJsonArray(plan.jiraIssueKeys).map(String);
         // Re-read the sources for every batch: existing coverage grows as earlier batches land, so
@@ -10014,6 +10296,10 @@ export class LegacyService implements OnModuleInit {
         );
       } catch (err) {
         const detail = this.extractAiErrorMessage(err);
+        // A batch whose provider response arrived (and was billed) but failed to parse still
+        // carries its usage on the thrown error — see generateZyraWithOpenAi/Anthropic.
+        const batchUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+        if (batchUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, batchUsage);
         // Pause rather than discard: remainingScenarios/doneCount are unchanged (this batch
         // never succeeded), so "continue" — or resumeZyraChatPlan — can retry from here later.
         await this.postZyraPlanMessage(projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], []);
@@ -10038,6 +10324,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async finalizeZyraToolDecisionWithAi(params: {
+    projectId: string;
     key: Body;
     provider: string;
     model: string;
@@ -10062,6 +10349,7 @@ export class LegacyService implements OnModuleInit {
     const raw = providerWire(params.provider) === "anthropic"
       ? await this.zyraChatWithAnthropic(params.key, params.model, finalizePrompt, params.message)
       : await this.zyraChatWithOpenAi(params.key, params.model, finalizePrompt, params.message);
+    await this.recordZyraTokenUsage(params.projectId, "chat_tool_finalize", params.provider, params.model, raw.__zyraUsage || {});
     return {
       reply: this.sanitizeZyraReply(raw.reply, String(params.toolDecision.reply || "")),
       reasoningSummary: String(raw.reasoningSummary || params.toolDecision.reasoningSummary || "").slice(0, 1500),
@@ -10177,6 +10465,11 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async processZyraTask(projectId: string, taskId: string, options: { userId: string; knowledgeItemIds?: string[] }) {
+    // Hoisted out of the try block (rather than left as a `const` inside it) so the catch block
+    // below can still name the provider/model when logging tokens from a response that arrived
+    // and was billed but failed to parse.
+    let provider = "unknown";
+    let model = "unknown";
     try {
       const taskRes = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
       const task = taskRes.rows[0];
@@ -10224,8 +10517,8 @@ export class LegacyService implements OnModuleInit {
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
       const testcaseRange = String((projectSettings as Body).testcaseRange || "1-10");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
-      const provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
-      const model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
+      provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
+      model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
       const knowledge = await this.knowledgeSnapshot(projectId, options.knowledgeItemIds || []);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
@@ -10256,7 +10549,7 @@ export class LegacyService implements OnModuleInit {
       const sourceSummary = [
         { type: "story", title: "User story", detail: story.slice(0, 320) },
         ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: item.content.slice(0, 320) })),
+        ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: truncateAtWordBoundary(item.content, 1500) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
@@ -10276,6 +10569,11 @@ export class LegacyService implements OnModuleInit {
          WHERE id = $1 AND project_id = $2 AND task_status = 'in_progress' RETURNING id`,
         [taskId, projectId, drafts.length, JSON.stringify(drafts), tokenInput, tokenOutput, tokenInput + tokenOutput, JSON.stringify(sourceSummary), JSON.stringify(activity)]
       );
+      // Logged regardless of whether the row above actually applied (see the rowCount===0 branch
+      // below) — the provider call happened and was billed either way; only whether the app kept
+      // the resulting drafts is conditional. recordZyraTokenUsage never throws (see its own
+      // try/catch), so awaiting it here cannot turn a logging hiccup into a failed task.
+      await this.recordZyraTokenUsage(projectId, "task_generate", provider, model, aiResult.usage);
       if (successRes.rowCount === 0) {
         // The user closed/saved/resubmitted the task while generation was still running. Their
         // action already reflects the current truth, so don't resurrect it into 'in_review' or
@@ -10321,6 +10619,14 @@ export class LegacyService implements OnModuleInit {
         : "";
       const detail = providerDetail && providerDetail !== summary ? `${summary} (${providerDetail})` : summary;
       this.logger.error(`Zyra task ${taskId} (project ${projectId}) failed: ${detail}`, error instanceof Error ? error.stack : undefined);
+      // A provider response that arrived (and was billed) but failed to parse into usable drafts
+      // carries its usage on the thrown error (see generateZyraWithOpenAi/Anthropic) — without
+      // this, those tokens would silently vanish, which is exactly how 4 of the task-board's
+      // 'failed' rows ended up with token_total=0 despite a real provider call having happened.
+      const zyraUsage = (error as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+      if (zyraUsage) {
+        await this.recordZyraTokenUsage(projectId, "task_generate", provider, model, zyraUsage);
+      }
       // task_status used to revert to 'todo' here — identical to a task that was never started,
       // so a failed generation was indistinguishable from a queued one anywhere the Kanban board
       // reads task_status. 'failed' is a dedicated terminal state the UI can badge distinctly.
@@ -10452,6 +10758,9 @@ export class LegacyService implements OnModuleInit {
         projectId,
         input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
       });
+      // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
+      // branch) — the provider call happened and was billed either way.
+      await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
@@ -10548,6 +10857,12 @@ export class LegacyService implements OnModuleInit {
         : "";
       const detail = providerDetail && providerDetail !== summary ? `${summary} (${providerDetail})` : summary;
       this.logger.error(`Zyra task ${taskId} (project ${projectId}) feedback regeneration failed: ${detail}`, error instanceof Error ? error.stack : undefined);
+      // See processZyraTask's identical check: a response that arrived and was billed but failed
+      // to parse still carries its usage on the thrown error.
+      const zyraUsage = (error as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+      if (zyraUsage) {
+        await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, zyraUsage);
+      }
       // markZyraTaskFailed only marks 'failed' if the row is still 'todo'/'in_progress' — if a
       // concurrent close/save already moved it on, that action wins and this only leaves a note.
       await this.markZyraTaskFailed(projectId, taskId, detail);
@@ -11486,7 +11801,11 @@ export class LegacyService implements OnModuleInit {
       const text = normalizeJsonArray(data.content).map((item: Body) => item?.text || "").join("\n");
       const parsed = this.parseModelJson(text, []);
       if (!parsed) throw new Error("Anthropic returned no parseable JSON.");
-      return parsed;
+      const usage = data.usage || {};
+      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+      const input = Number(usage.input_tokens || 0) + cached;
+      const output = Number(usage.output_tokens || 0);
+      return { ...parsed, __zyraUsage: { input, output, total: input + output } };
     }
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
     const res = await fetch(providerChatUrl(provider, key.base_url, model), {
@@ -11511,7 +11830,8 @@ export class LegacyService implements OnModuleInit {
     const content = String(data.choices?.[0]?.message?.content || "{}");
     const parsed = this.parseModelJson(content, []);
     if (!parsed) throw new Error("OpenAI returned no parseable JSON.");
-    return parsed;
+    const usage = data.usage || {};
+    return { ...parsed, __zyraUsage: { input: Number(usage.prompt_tokens || 0), output: Number(usage.completion_tokens || 0), total: Number(usage.total_tokens || 0) } };
   }
 
   // Plans a todo list of distinct scenarios to cover for an exhaustive ("all possible cases")
@@ -11519,6 +11839,7 @@ export class LegacyService implements OnModuleInit {
   // labels, never full testcase detail — so it can never hit the same output-token ceiling
   // that a single "generate 50 full testcases" call did.
   private async planZyraChatScenarios(params: {
+    projectId: string;
     provider: string;
     model: string;
     key: Body;
@@ -11540,6 +11861,7 @@ export class LegacyService implements OnModuleInit {
       `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List up to ${params.maxScenarios} scenarios, ordered from most to least important. No markdown, no commentary.`
     ].join("\n");
     const parsed = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, userPrompt);
+    await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, parsed.__zyraUsage || {});
     const scenarios = normalizeJsonArray(parsed.scenarios).map((item) => String(item || "").trim()).filter(Boolean);
     return scenarios.slice(0, params.maxScenarios);
   }
@@ -11587,15 +11909,25 @@ export class LegacyService implements OnModuleInit {
       });
     }
     const content = body.choices?.[0]?.message?.content;
-    const usage = body.usage || {};
+    const rawUsage = body.usage || {};
+    const usage = {
+      input: Number(rawUsage.prompt_tokens || 0),
+      output: Number(rawUsage.completion_tokens || 0),
+      total: Number(rawUsage.total_tokens || 0),
+      cached: Number(rawUsage.prompt_tokens_details?.cached_tokens || 0)
+    };
+    // The provider already billed for this response by the time we're parsing it, so a parse
+    // failure below must not lose that — attach the usage we already have to the thrown error
+    // instead of letting normalizeAiDrafts's exception discard it (see zyraUsage callers).
+    let drafts: Body[];
+    try {
+      drafts = this.normalizeAiDrafts(content, params.input.requestedCount);
+    } catch (err) {
+      throw Object.assign(err instanceof Error ? err : new Error(String(err)), { zyraUsage: usage });
+    }
     return {
-      drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
-      usage: {
-        input: Number(usage.prompt_tokens || 0),
-        output: Number(usage.completion_tokens || 0),
-        total: Number(usage.total_tokens || 0),
-        cached: Number(usage.prompt_tokens_details?.cached_tokens || 0)
-      },
+      drafts,
+      usage,
       requestId: response.headers.get("x-request-id") || undefined
     };
   }
@@ -11655,13 +11987,22 @@ export class LegacyService implements OnModuleInit {
         continue;
       }
       const content = normalizeJsonArray(body.content).map((item) => item?.text || "").join("\n").trim();
-      const usage = body.usage || {};
-      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
-      const input = Number(usage.input_tokens || 0) + cached;
-      const output = Number(usage.output_tokens || 0);
+      const rawUsage = body.usage || {};
+      const cached = Number(rawUsage.cache_read_input_tokens || 0) + Number(rawUsage.cache_creation_input_tokens || 0);
+      const input = Number(rawUsage.input_tokens || 0) + cached;
+      const output = Number(rawUsage.output_tokens || 0);
+      const usage = { input, output, total: input + output, cached };
+      // See generateZyraWithOpenAi: the response is already billed, so a parse failure below must
+      // still surface these tokens to the caller via zyraUsage on the thrown error.
+      let drafts: Body[];
+      try {
+        drafts = this.normalizeAiDrafts(content, params.input.requestedCount);
+      } catch (err) {
+        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { zyraUsage: usage });
+      }
       return {
-        drafts: this.normalizeAiDrafts(content, params.input.requestedCount),
-        usage: { input, output, total: input + output, cached },
+        drafts,
+        usage,
         requestId: response.headers.get("request-id") || undefined
       };
     }
@@ -11755,11 +12096,15 @@ export class LegacyService implements OnModuleInit {
     }
     const data = await res.json() as Body;
     const content = String(data.choices?.[0]?.message?.content || "{}");
+    // Real provider usage, not the estimateTokens() guess callers used to fall back to — this was
+    // sitting right here in the response and being thrown away.
+    const usage = data.usage || {};
+    const zyraUsage = { input: Number(usage.prompt_tokens || 0), output: Number(usage.completion_tokens || 0), total: Number(usage.total_tokens || 0) };
     const parsed = this.parseModelJson(content);
-    if (parsed) return parsed;
+    if (parsed) return { ...parsed, __zyraUsage: zyraUsage };
     // AI returned prose instead of JSON — surface it as a plain answer so the
     // user sees the actual message rather than a SyntaxError string.
-    return { reply: content.trim().slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [] };
+    return { reply: content.trim().slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [], __zyraUsage: zyraUsage };
   }
 
   private async zyraChatWithAnthropic(key: Body, model: string, context: string, message: string): Promise<Body> {
@@ -11797,11 +12142,17 @@ export class LegacyService implements OnModuleInit {
       }
       const data = await res.json() as Body;
       const rawText = normalizeJsonArray(data.content).map((item) => item?.text || "").join("\n").trim();
+      // Real provider usage, not the estimateTokens() guess callers used to fall back to — this was
+      // sitting right here in the response and being thrown away.
+      const usage = data.usage || {};
+      const cached = Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+      const zyraUsage = { input: Number(usage.input_tokens || 0) + cached, output: Number(usage.output_tokens || 0), total: 0 };
+      zyraUsage.total = zyraUsage.input + zyraUsage.output;
       const parsed = this.parseModelJson(rawText || "{}");
-      if (parsed) return parsed;
+      if (parsed) return { ...parsed, __zyraUsage: zyraUsage };
       // AI returned prose instead of JSON — surface it as a plain answer so the
       // user sees the actual message rather than a SyntaxError string.
-      return { reply: rawText.slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [] };
+      return { reply: rawText.slice(0, 5000), action: "answer", actionType: "answer", operations: [], testcases: [], __zyraUsage: zyraUsage };
     }
     throw new Error(`Claude chat failed: ${lastStatus || "No compatible model was accepted."}`);
   }

@@ -35,6 +35,7 @@ import {
   StatusChip,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
@@ -61,6 +62,44 @@ const PRIORITY_TONE: Record<BugPriority, "error" | "warning" | "info" | "neutral
 function BugPriorityBadge({ priority }: { priority: BugPriority | null }) {
   if (!priority) return <span className="text-xs text-[var(--muted-soft)]">—</span>;
   return <StatusChip tone={PRIORITY_TONE[priority]}>{priority}</StatusChip>;
+}
+
+/* ───── Assignee avatar ─────
+ * Seeded on the assignee's id, not their name, matching the same convention used for executions
+ * (cycles/[cycleId]/page.tsx) so a person keeps the same colour everywhere they're shown assigned.
+ */
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
+}
+
+function MemberAvatar({ name, seed, size = 20 }: { name: string; seed?: string | null; size?: number }) {
+  return (
+    <span
+      className="inline-flex shrink-0 items-center justify-center rounded-full border-2 border-[var(--surface)] font-semibold text-white"
+      style={{ background: avatarColor(seed || name), width: size, height: size, fontSize: size * 0.42 }}
+      title={name}
+    >
+      {getInitials(name)}
+    </span>
+  );
+}
+
+function BugAssignee({ id, name }: { id: string | null; name: string | null }) {
+  if (!id) return <span className="text-xs text-[var(--muted-soft)]">Unassigned</span>;
+  // Assigned, but the join in bugSelect turned up no actor_profiles row (a deleted actor). Still a
+  // real assignment — distinct from Unassigned — just with nothing to render a name or colour from.
+  if (!name) return <span className="text-xs text-[var(--muted-soft)]">Unknown assignee</span>;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <MemberAvatar name={name} seed={id} size={20} />
+      <span className="text-xs text-[var(--muted)] truncate max-w-[120px]" title={name}>
+        {name}
+      </span>
+    </span>
+  );
 }
 const PAGE_SIZE = 15;
 
@@ -240,9 +279,12 @@ function KanbanCard({
         <span className="text-[10px] text-[var(--muted-soft)]">
           {bug.reporterName || bug.reporterEmail || "Unknown"}
         </span>
-        <span className="text-[10px] text-[var(--muted-soft)]">
-          {new Date(bug.createdAt).toLocaleDateString()}
-        </span>
+        <div className="flex items-center gap-1.5">
+          {bug.assigneeId && bug.assigneeName && <MemberAvatar name={bug.assigneeName} seed={bug.assigneeId} size={16} />}
+          <span className="text-[10px] text-[var(--muted-soft)]">
+            {new Date(bug.createdAt).toLocaleDateString()}
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -392,6 +434,9 @@ export default function BugsPage() {
    */
   const [filterSeverity, setFilterSeverity] = useState("");
   const [filterPriority, setFilterPriority] = useState("");
+  /* "" = everyone, "unassigned" = no assignee, otherwise a user id. A sentinel string rather than
+     null/"" for "unassigned" because "" already means "no filter" — the two have to stay distinct. */
+  const [filterAssignee, setFilterAssignee] = useState("");
   const [search, setSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("kanban");
   const [page, setPage] = useState(1);
@@ -485,6 +530,8 @@ export default function BugsPage() {
       if (filterStatus && b.status !== filterStatus) return false;
       if (filterSeverity && b.severity !== filterSeverity) return false;
       if (filterPriority && b.priority !== filterPriority) return false;
+      if (filterAssignee === "unassigned" && b.assigneeId) return false;
+      if (filterAssignee && filterAssignee !== "unassigned" && b.assigneeId !== filterAssignee) return false;
       if (
         term &&
         !b.title.toLowerCase().includes(term) &&
@@ -497,12 +544,24 @@ export default function BugsPage() {
         return false;
       return true;
     });
-  }, [bugs, filterStatus, filterSeverity, filterPriority, search]);
+  }, [bugs, filterStatus, filterSeverity, filterPriority, filterAssignee, search]);
+
+  /* Options for the "Assign to" filter: every project member, plus any bug's current assignee who
+     has since left the project (or is an AI agent, never a member to begin with) — otherwise
+     filtering to that person would offer no way to select them. */
+  const assigneeFilterOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const m of members) seen.set(m.userId, m.name || m.email);
+    for (const b of bugs) {
+      if (b.assigneeId && !seen.has(b.assigneeId)) seen.set(b.assigneeId, b.assigneeName || "Unknown assignee");
+    }
+    return Array.from(seen.entries());
+  }, [members, bugs]);
 
   /* reset page when filters change */
   useEffect(() => {
     setPage(1);
-  }, [filterStatus, filterSeverity, search, viewMode]);
+  }, [filterStatus, filterSeverity, filterAssignee, search, viewMode]);
 
   /* paginated list for list view */
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -760,6 +819,19 @@ export default function BugsPage() {
                   </option>
                 ))}
               </Select>
+              <Select
+                value={filterAssignee}
+                onChange={(e) => setFilterAssignee(e.target.value)}
+                aria-label="Filter by assignee"
+              >
+                <option value="">All Assignees</option>
+                <option value="unassigned">Unassigned</option>
+                {assigneeFilterOptions.map(([id, name]) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </Select>
               <div className="ml-auto">
                 <ViewToggle mode={viewMode} onChange={setViewMode} />
               </div>
@@ -815,6 +887,7 @@ export default function BugsPage() {
                           <th>Test Case</th>
                           <th>Test Run</th>
                           <th>Reporter</th>
+                          <th>Assignee</th>
                           <th>Reported</th>
                           <th className="w-8"></th>
                         </tr>
@@ -922,6 +995,9 @@ export default function BugsPage() {
                               >
                                 {b.reporterName || b.reporterEmail || "—"}
                               </span>
+                            </td>
+                            <td>
+                              <BugAssignee id={b.assigneeId} name={b.assigneeName} />
                             </td>
                             <td className="text-xs text-[var(--muted-soft)] whitespace-nowrap">
                               {new Date(b.createdAt).toLocaleDateString()}
@@ -1110,6 +1186,12 @@ export default function BugsPage() {
                 <span className="text-sm text-[var(--foreground)]">
                   {viewBug.reporterName || viewBug.reporterEmail || "Unknown"}
                 </span>
+              </div>
+              <div>
+                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+                  Assigned To
+                </p>
+                <BugAssignee id={viewBug.assigneeId} name={viewBug.assigneeName} />
               </div>
               <div>
                 <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
