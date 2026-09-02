@@ -288,6 +288,53 @@ test.describe("test plans — list, search and empty states", () => {
       await deleteProjects(api, [project.id]);
     }
   });
+
+  test("PLN-U-15 the toolbar's Clear all resets search and status together", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      // Freshly created plans have no runs, so planStatus() reads both as "draft" (PlanCard.tsx) —
+      // filtering to "active" narrows to zero without a run needing to be seeded first.
+      const wanted = await createPlan(api, project.id, { name: `E2E Toolbar Clear Plan ${uniqueSuffix()}` });
+      const other = await createPlan(api, project.id, { name: `E2E Other Plan ${uniqueSuffix()}` });
+
+      await page.goto(`/projects/${project.id}/plans`);
+      const clearAll = page.getByRole("button", { name: "Clear all" });
+      await expect(clearAll, "no filters applied yet — there is nothing to clear").toBeHidden();
+
+      // Two independent dimensions at once: free text plus the status chip picker.
+      await page.getByPlaceholder("Search plans...").fill("Toolbar Clear");
+      await expect(clearAll).toBeVisible();
+      await page.getByRole("button", { name: "Status" }).click();
+      await page.getByRole("button", { name: /^active$/i }).click();
+      await expect(page.getByText("No test plans found")).toBeVisible();
+
+      await clearAll.click();
+      await expect(page.getByPlaceholder("Search plans...")).toHaveValue("");
+      await expect(planCard(page, wanted.name)).toBeVisible();
+      await expect(planCard(page, other.name)).toBeVisible();
+      await expect(clearAll).toBeHidden();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-U-16 the toolbar Clear all and the empty-state Clear filters link don't collide", async ({ page }) => {
+    // Both can render at once — the empty state and its link show whenever a filter narrows the
+    // list to zero, which is exactly when the toolbar button is also active. Distinct accessible
+    // names ("Clear all" vs "Clear filters") keep the two from being ambiguous to a role query.
+    const project = await createProject(api);
+    try {
+      await createPlan(api, project.id, { name: `E2E Collide Plan ${uniqueSuffix()}` });
+
+      await page.goto(`/projects/${project.id}/plans`);
+      await page.getByPlaceholder("Search plans...").fill(`no plan matches ${uniqueSuffix()}`);
+
+      await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Clear filters" })).toBeVisible();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
 });
 
 /*

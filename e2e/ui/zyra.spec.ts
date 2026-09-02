@@ -753,6 +753,161 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.locator("h2 + p")).toHaveCount(0);
   });
 
+  // ─── The quick-view panel's description block (fix for "Task Details popup is not
+  // scrollable when the user story description is long") ─────────────────────
+  //
+  // Before the fix, task.context rendered unbounded and unscrollable inside the panel's shrink-0
+  // header, so a long description (a common shape once a Knowledge Base doc is pulled in — see
+  // page.tsx's context concatenation) pushed the stats row, tabs, generated drafts, and the
+  // footer's "View full task"/"Close task" controls below the panel's fixed h-screen height, with
+  // no way to scroll down to them. The description now lives in its own height-capped,
+  // internally-scrollable block (the `no-scrollbar` div) below a slim, always-visible top bar.
+
+  test("ZYU-58 a long description does not push the footer's 'View full task' link out of the panel", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Long context story");
+    const longContext = "Flight booking scope detail. ".repeat(400);
+    seedTask({ userStory, context: longContext });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const footerLink = panel.getByRole("link", { name: "View full task" });
+    await expect(footerLink).toBeVisible();
+    // The tabs are reachable too, not just the footer — the whole rest of the panel below the
+    // description must still render, not just its very last control.
+    await expect(panel.getByRole("button", { name: /^Test cases/ })).toBeVisible();
+
+    const panelBox = (await panel.boundingBox())!;
+    const footerBox = (await footerLink.boundingBox())!;
+    expect(
+      footerBox.y + footerBox.height,
+      "the footer link must stay within the panel's own bounds, not be clipped below it",
+    ).toBeLessThanOrEqual(panelBox.y + panelBox.height + 1);
+  });
+
+  test("ZYU-59 a long description scrolls internally within its own capped region, with no visible scrollbar", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Scrollable description story");
+    const longContext = "Booking flow detail line. ".repeat(300);
+    seedTask({ userStory, context: longContext });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    await expect(descriptionBlock).toBeVisible();
+
+    const overflow = await descriptionBlock.evaluate((el) => ({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(overflow.scrollHeight, "the block must actually overflow so there is something to scroll").toBeGreaterThan(
+      overflow.clientHeight,
+    );
+
+    // Scrolling this block moves its own scrollTop, independent of the rest of the panel.
+    await descriptionBlock.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    const scrolledTop = await descriptionBlock.evaluate((el) => el.scrollTop);
+    expect(scrolledTop, "the description block itself must be the thing that scrolls").toBeGreaterThan(0);
+
+    // No visible scrollbar track claiming layout width, despite being scrollable.
+    const scrollbarWidth = await descriptionBlock.evaluate((el) => (el as HTMLElement).offsetWidth - el.clientWidth);
+    expect(scrollbarWidth, "the scrollbar must be visually hidden").toBe(0);
+  });
+
+  test("ZYU-60 a short description does not scroll and shows no scrollbar", async ({ browser }) => {
+    const userStory = stamp("Short story");
+    seedTask({ userStory, context: "Just a short one-line context." });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    const overflow = await descriptionBlock.evaluate((el) => ({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(
+      overflow.scrollHeight,
+      "a short description must not be clipped as though it needed to scroll",
+    ).toBeLessThanOrEqual(overflow.clientHeight);
+
+    await expect(panel.getByRole("link", { name: "View full task" })).toBeVisible();
+  });
+
+  test("ZYU-61 a long unbroken token in the description wraps instead of overflowing the panel horizontally", async ({
+    browser,
+  }) => {
+    const longToken = `https://example.com/${"a".repeat(200)}`;
+    const userStory = stamp("Long token in context story");
+    seedTask({ userStory, context: `See ${longToken} for details.` });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    await expect(descriptionBlock.getByText(longToken, { exact: false })).toBeVisible();
+
+    const overflow = await descriptionBlock.evaluate((el) => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+    expect(
+      overflow.scrollWidth,
+      "a long token must wrap, not push the description block into horizontal overflow",
+    ).toBeLessThanOrEqual(overflow.clientWidth + 1);
+  });
+
+  test("ZYU-62 the description preserves line breaks between combined Knowledge Base sections", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Multiline context story");
+    const context = "Section one detail.\n\nSection two detail.\n\nSection three detail.";
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const contextParagraph = panel.locator("div.no-scrollbar p").last();
+    await expect(contextParagraph).toHaveCSS("white-space", "pre-wrap");
+    expect(await contextParagraph.textContent()).toBe(context);
+  });
+
+  test("ZYU-63 a failed task with a long failure detail still keeps 'Close task' reachable in the footer", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Long failure story");
+    const taskId = seedTask({ userStory, status: "failed" });
+    seedFailureActivity(taskId, "Provider timeout while generating drafts. ".repeat(200));
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const closeButton = panel.getByRole("button", { name: "Close task" });
+    await expect(closeButton).toBeVisible();
+
+    const panelBox = (await panel.boundingBox())!;
+    const closeBox = (await closeButton.boundingBox())!;
+    expect(
+      closeBox.y + closeBox.height,
+      "'Close task' must stay within the panel's own bounds even with a very long failure detail",
+    ).toBeLessThanOrEqual(panelBox.y + panelBox.height + 1);
+  });
+
   test("ZYU-18 a failed task shows a distinct error state on the task window, not a silent 'Pending'", async ({
     browser,
   }) => {

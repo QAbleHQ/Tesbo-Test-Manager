@@ -392,6 +392,16 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   animation: tesbo-slide-in-right 200ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
+/* Scrolls like a normal overflow container but never shows a scrollbar track — used where a
+   region must stay scrollable (e.g. a long description) without looking scrollable. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 /* ── Auth branding-panel decorations (login/signup split shell) ───── */
 @keyframes tesbo-auth-orb-1 {
   0%, 100% { transform: translate(0, 0) scale(1); }
