@@ -97,6 +97,7 @@ interface PreparedImportRow {
   status: string;
   /** Stored on the test case itself, and also the name of the subfolder it goes in. */
   component: string | null;
+  estimatedDuration: string | null;
   suiteName: string;
   componentName: string;
   customFieldValues: Body;
@@ -3401,6 +3402,21 @@ export class LegacyService implements OnModuleInit {
     const component = String(raw?.component ?? "").trim() || null;
     const suiteName = String(raw?.suite ?? "").trim();
 
+    // Reuses the same shape check createTestCase/updateTestCase already enforce, so an import can't
+    // silently accept a duration the rest of the product would reject. Caught here rather than left
+    // to throw: every other rejection in this function returns a per-row error so one bad cell costs
+    // only its own row, not the whole file.
+    let estimatedDuration: string | null;
+    try {
+      estimatedDuration = this.normalizeEstimatedDuration(raw?.estimatedDuration);
+    } catch (error) {
+      const message =
+        error instanceof BadRequestException
+          ? String((error.getResponse() as { error?: string })?.error ?? "Invalid estimated duration")
+          : "Invalid estimated duration";
+      return { rowNumber, error: message };
+    }
+
     // Mirrors the column widths in the testcases and suites tables. A message naming the field beats
     // a driver error naming a constraint.
     const limits: [string, string | null, number][] = [
@@ -3452,6 +3468,7 @@ export class LegacyService implements OnModuleInit {
         type,
         status,
         component,
+        estimatedDuration,
         suiteName,
         componentName: component ?? "",
         customFieldValues,
@@ -3547,19 +3564,21 @@ export class LegacyService implements OnModuleInit {
       severity: row.severity,
       type: row.type,
       status: row.status,
-      component: row.component
+      component: row.component,
+      estimated_duration: row.estimatedDuration
     }));
 
     const inserted = await client.query<Body>(
       `INSERT INTO testcases
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps,
-          test_data, priority, severity, type, status, component, created_by, updated_by)
+          test_data, priority, severity, type, status, component, estimated_duration, created_by, updated_by)
        SELECT $1, v.suite_id, v.external_id, v.title, v.description, v.preconditions, v.postconditions,
-              v.steps, v.test_data, v.priority, v.severity, v.type, v.status, v.component, $2, $2
+              v.steps, v.test_data, v.priority, v.severity, v.type, v.status, v.component,
+              v.estimated_duration, $2, $2
        FROM jsonb_to_recordset($3::jsonb) AS v(
          external_id text, suite_id uuid, title text, description text, preconditions text,
          postconditions text, steps jsonb, test_data text, priority text, severity text,
-         type text, status text, component text)
+         type text, status text, component text, estimated_duration text)
        RETURNING *`,
       [ctx.projectId, ctx.uid, JSON.stringify(payload)]
     );

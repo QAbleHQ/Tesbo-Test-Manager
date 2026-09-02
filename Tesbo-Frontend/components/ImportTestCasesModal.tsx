@@ -387,6 +387,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           status: valueFor("status") || "Draft",
           suite: valueFor("suite"),
           component: valueFor("component") || undefined,
+          estimatedDuration: valueFor("estimatedDuration") || undefined,
           customFieldValues,
         });
       }

@@ -839,6 +839,7 @@ export class LegacyController {
         title: "Example login test",
         description: "Verify a valid user can sign in.",
         preconditions: "User account exists.",
+        postconditions: "User lands on the dashboard with an active session.",
         // "action => expected result" per step, separated by " | " — the expected result after
         // "=>" is optional but importing it this way carries it into each step's Expected Result.
         steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
@@ -848,7 +849,10 @@ export class LegacyController {
         type: "Functional",
         status: "Draft",
         suite: "Authentication",
-        component: "Login"
+        component: "Login",
+        // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
+        // normalizeEstimatedDuration in legacy.service.ts.
+        estimatedDuration: "10m"
       }
     ];
     const headers = Object.keys(rows[0]);

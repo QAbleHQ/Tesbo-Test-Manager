@@ -1488,6 +1488,7 @@ export interface ImportTestCaseRow {
   status?: string;
   suite?: string;
   component?: string;
+  estimatedDuration?: string;
   // definitionId -> already-coerced value. The modal resolves select labels to option ids before
   // sending, since it is the side that loaded the option lists to build the mapping UI.
   customFieldValues?: Record<string, unknown>;
