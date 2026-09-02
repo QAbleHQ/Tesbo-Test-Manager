@@ -229,6 +229,80 @@ test.describe("zyra / agents (UI)", () => {
     );
   }
 
+  interface ChatEntry {
+    opType: "create" | "update" | "archive";
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null };
+    testcaseId?: string;
+    externalId?: string;
+    fields?: Record<string, unknown>;
+  }
+
+  /**
+   * A chat-staged review batch: a chat session, a chat_session_id-linked ai_generation_requests
+   * row (the wrapped {opType, draft|fields} shape — NOT seedTask()'s flat AiGeneratedDraft), and
+   * the assistant chat message that references it via review_request_id, the way a real reply
+   * would once applyZyraChatOperations stages it. Seeded directly for the same reason seedTask()
+   * is: reaching this state through the live chat route needs a model this suite never calls.
+   */
+  function seedChatReviewBatch(options: { status?: string; entries?: ChatEntry[] } = {}): {
+    taskId: string;
+    sessionId: string;
+  } {
+    const t = tenant!;
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const entries: ChatEntry[] = options.entries ?? [
+      {
+        opType: "create",
+        draft: {
+          suiteId: null,
+          title: "Sign in with a valid password",
+          description: "The dashboard opens",
+          preconditions: "The account exists",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the form", expectedResult: "The dashboard opens" }]),
+          priority: "P1",
+        },
+      },
+      { opType: "create", draft: { suiteId: null, title: "Sign in with a wrong password", description: "", preconditions: "", stepsJson: "[]", priority: "P2" } },
+    ];
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', 'Zyra chat proposal', ` +
+        `${entries.length}, ${entries.length}, ${literal(JSON.stringify(entries))}::jsonb, ${literal(ZYRA_AGENT_NAME)}, ` +
+        `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
+    );
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+
+    const rows = entries.map((entry, index) => ({
+      title: entry.draft?.title ?? String(entry.fields?.title ?? "Untitled"),
+      priority: entry.draft?.priority ?? String(entry.fields?.priority ?? "P2"),
+      status: "Draft",
+      type: "Functional",
+      preconditions: entry.draft?.preconditions ?? "",
+      expectedSummary: entry.draft?.description ?? "",
+      stepsJson: entry.draft?.stepsJson ?? "[]",
+      action: entry.opType === "create" ? "proposed-create" : entry.opType === "archive" ? "proposed-archive" : "proposed-update",
+      reason: "",
+      draftIndex: index,
+      reviewRequestId: taskId,
+    }));
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
+        `'I have drafted these test cases for your review.', 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ${literal(taskId)});`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+    return { taskId, sessionId };
+  }
+
   function draftTitles(taskId: string): string[] {
     const raw = scalar(
       `SELECT COALESCE(jsonb_agg(d->>'title'), '[]'::jsonb)::text FROM ai_generation_requests r, jsonb_array_elements(r.generated_payload) d WHERE r.id = ${literal(taskId)};`,
@@ -1578,5 +1652,123 @@ test.describe("zyra / agents (UI)", () => {
 
     await expect(page.getByText(/browser blocked or could not reach the API/)).toBeVisible();
     expect(patchAttempts, "still only one retry, not an unbounded loop").toBe(2);
+  });
+
+  // ─── Review step for Zyra-chat-generated test cases ────────────────────────
+  // Chat no longer writes create/update/archive operations straight to `testcases` — they're
+  // staged (applyZyraChatOperations) and shown in a review panel on the assistant's own message,
+  // the same select/edit/discard/save actions the task board already has. The live chat route
+  // can't drive staging itself (file header — no AI provider configured), so every scenario below
+  // seeds the staged batch and its referencing chat message directly, same rule seedTask() and
+  // seedChatReviewBatch() already establish.
+
+  test("ZYU-64 a chat message with a review batch renders every proposal, all selected by default", async ({ browser }) => {
+    seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Sign in with a valid password")).toBeVisible();
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect(page.getByText(/2 of 2 selected/)).toBeVisible();
+    await expect(page.getByRole("checkbox", { name: "Select proposed test case 1" })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: "Select proposed test case 2" })).toBeChecked();
+    await expect(page.getByRole("button", { name: /Save 2 to repository/ })).toBeEnabled();
+
+    // Unselecting one drops the save button's count and disables nothing else.
+    await page.getByRole("checkbox", { name: "Select proposed test case 1" }).uncheck();
+    await expect(page.getByText(/1 of 2 selected/)).toBeVisible();
+    await expect(page.getByRole("button", { name: /Save 1 to repository/ })).toBeEnabled();
+  });
+
+  test("ZYU-65 discarding a proposed row removes it from the panel and the stored batch", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Sign in with a valid password")).toBeVisible();
+    await page
+      .getByRole("listitem")
+      .filter({ hasText: "Sign in with a valid password" })
+      .getByRole("button", { name: "Discard" })
+      .click();
+
+    await expect(page.getByText("Sign in with a valid password")).toHaveCount(0);
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect
+      .poll(() => draftTitles(taskId), { message: "the discard must persist, not just disappear client-side" })
+      .toEqual(["Sign in with a wrong password"]);
+  });
+
+  test("ZYU-66 editing a proposed row updates what's displayed and what's stored", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
+    await row.getByRole("button", { name: "Edit" }).click();
+    const titleInput = row.getByRole("textbox").first();
+    await titleInput.fill("Sign in with a wrong password — edited");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(page.getByText("Sign in with a wrong password — edited")).toBeVisible();
+    await expect
+      .poll(() => draftTitles(taskId), { message: "the edit must persist, not just render client-side" })
+      .toContain("Sign in with a wrong password — edited");
+  });
+
+  test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {
+    const suiteName = stamp("Chat review suite");
+    const createdSuite = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(createdSuite.status()).toBe(201);
+    const realSuiteId = (await createdSuite.json()).id;
+
+    const draftTitle = stamp("Chat-saved case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: realSuiteId, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    await expect
+      .poll(
+        () =>
+          Number(
+            scalar(
+              `SELECT COUNT(*) FROM testcases t WHERE t.project_id = ${literal(tenant!.mainProjectId)} AND t.suite_id = ${literal(realSuiteId)} AND t.title = ${literal(draftTitle)};`,
+            ),
+          ),
+        { message: "the saved proposal must land in its own suite as a real test case" },
+      )
+      .toBe(1);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYU-68 a review batch already resolved elsewhere shows a read-only note instead of live controls", async ({ browser }) => {
+    seedChatReviewBatch({ status: "done" });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/This batch was already saved or closed/)).toBeVisible();
+    await expect(page.getByRole("checkbox", { name: /Select proposed test case/ })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /Save \d+ to repository/ })).toHaveCount(0);
+  });
+
+  test("ZYU-69 saving only part of a batch leaves the rest visible and actionable, not resolved", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await page.getByRole("checkbox", { name: "Select proposed test case 2" }).uncheck();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    // The unselected draft is still on screen, still checked, still actionable — the batch did not
+    // resolve just because one of its two drafts was saved.
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Discard" })).toBeVisible();
+    await expect
+      .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
+      .toBe("in_review");
   });
 });

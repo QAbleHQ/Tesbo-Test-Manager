@@ -1206,6 +1206,17 @@ export class LegacyController {
     return this.legacy.zyraDeleteDraft(projectId, req.userId, taskId, Number(draftIndex));
   }
 
+  @Patch("/api/projects/:projectId/agents/zyra/tasks/:taskId/drafts/:draftIndex")
+  editZyraDraft(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("draftIndex") draftIndex: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.zyraEditDraft(projectId, req.userId, taskId, Number(draftIndex), body);
+  }
+
   @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/close")
   closeZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
     return this.legacy.zyraCloseTask(projectId, req.userId, taskId);
