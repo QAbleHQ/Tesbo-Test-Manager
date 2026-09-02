@@ -191,6 +191,15 @@ type ZyraChatDecision = {
   testcases: Body[];
 };
 
+// Shape of applyZyraChatOperations' result that the reply-reconciliation path (finalizeZyraChatReply,
+// reconcileZyraReply) reads from. moveBreakdown is the ground-truth per-suite count for whatever
+// move_to_suite operations ran this turn — see zyraMoveBreakdown for how it's computed.
+type ZyraAppliedOperations = {
+  testcases: Body[];
+  activity: Body[];
+  moveBreakdown?: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>;
+};
+
 // What the AI router decided this request is (intentFromZyraModelAction). There is no keyword
 // classifier producing these — the model reads the request in the context of the conversation and
 // the project, and the system dispatches on its answer.
@@ -9779,6 +9788,16 @@ export class LegacyService implements OnModuleInit {
     // A create op that also needs a specific suite should (and already can) set its own
     // suiteId/suiteName directly rather than relying on a same-turn move_to_suite.
     const createdThisTurn: string[] = [];
+    // Per-suite move bookkeeping for the reply's ground-truth breakdown (see reconcileZyraReply /
+    // zyraMoveBreakdownSuffix). Deliberately NOT a running count incremented as each move_to_suite op
+    // executes: if the model puts the same testcase id in two different suites in one turn (a real
+    // classification mistake), an incremented count would double-count it across both suites even
+    // though the row can only end up in one. moveTargetIds collects every id any move op touched this
+    // turn; moveSuites records which suites were targeted (and whether this turn created them); the
+    // actual per-suite counts are read back from the database after the loop, once, so each id is
+    // counted exactly once — under whichever suite it actually landed in.
+    const moveTargetIds = new Set<string>();
+    const moveSuites = new Map<string, { suiteName: string; created: boolean }>();
     // A per-turn ceiling still bounds a model that emits junk, but it used to sit at 10 — below
     // what a single legitimate generation batch produces (chatTestcasePlan allows up to 25), so
     // asking for 15 test cases saved 10 of them and said 15. Truncation is now both rarer and
@@ -9862,6 +9881,13 @@ export class LegacyService implements OnModuleInit {
           ? await this.getProjectSuite(projectId, op.suiteId)
           : await this.resolveOrCreateSuiteByName(projectId, String(op.suiteName));
         if (!suite) continue;
+        // Recorded even when nothing matches below, so a suite the model claimed to move cases into
+        // still shows up in the breakdown as 0 rather than silently disappearing from it.
+        const existingMoveSuite = moveSuites.get(suite.id);
+        moveSuites.set(suite.id, {
+          suiteName: suite.name,
+          created: existingMoveSuite?.created || ("created" in suite && !!suite.created)
+        });
         const targets = await this.resolveZyraMoveTargets(projectId, sessionId, op, suite.id, createdThisTurn);
         if (!targets.length) {
           // resolveOrCreateSuiteByName above may have just created the suite, so bailing silently
@@ -9876,6 +9902,7 @@ export class LegacyService implements OnModuleInit {
           continue;
         }
         const movedIds = targets.map((target) => target.id);
+        for (const id of movedIds) moveTargetIds.add(id);
         await this.db.query(
           "UPDATE testcases SET suite_id = $2, updated_by = $4, updated_at = now() WHERE project_id = $1 AND id = ANY($3::uuid[]) AND deleted_at IS NULL",
           [projectId, suite.id, movedIds, actorId]
@@ -9905,7 +9932,36 @@ export class LegacyService implements OnModuleInit {
         if (typeof tc.draftIndex === "number") tc.reviewRequestId = reviewRequestId;
       }
     }
-    return { testcases, activity, reviewRequestId };
+    const moveBreakdown = await this.zyraMoveBreakdown(projectId, moveSuites, moveTargetIds);
+    return { testcases, activity, reviewRequestId, moveBreakdown };
+  }
+
+  // Ground truth for how many testcases actually ended up in each suite a move_to_suite operation
+  // targeted this turn — read back from the database after every operation has run, rather than
+  // trusting the model's own count of what it moved. See applyZyraChatOperations for why this is a
+  // single read-back query instead of an incremented counter (same-turn overlap correctness).
+  private async zyraMoveBreakdown(
+    projectId: string,
+    moveSuites: Map<string, { suiteName: string; created: boolean }>,
+    moveTargetIds: Set<string>
+  ): Promise<Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>> {
+    if (!moveSuites.size) return [];
+    const counts = new Map<string, number>();
+    if (moveTargetIds.size) {
+      const res = await this.db.query(
+        `SELECT suite_id, count(*)::int AS count FROM testcases
+         WHERE project_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL
+         GROUP BY suite_id`,
+        [projectId, Array.from(moveTargetIds)]
+      ).catch(() => ({ rows: [] as Body[] }));
+      for (const row of res.rows) counts.set(String(row.suite_id), Number(row.count) || 0);
+    }
+    return Array.from(moveSuites.entries()).map(([suiteId, info]) => ({
+      suiteId,
+      suiteName: info.suiteName,
+      created: info.created,
+      count: counts.get(suiteId) || 0
+    }));
   }
 
   private async resolveOrCreateSuiteByName(projectId: string, name: string): Promise<{ id: string; name: string; created: boolean }> {
@@ -12716,8 +12772,15 @@ export class LegacyService implements OnModuleInit {
     // A markdown table needs its separator row (|---|---|) within the first two lines.
     if (!block.slice(0, 2).some((line) => /^\s*\|[\s:|-]+\|\s*$/.test(line))) return false;
     const header = block[0].split("|").map((cell) => cell.trim().toLowerCase()).filter(Boolean);
-    const anchors = ["title", "scenario", "steps", "step", "expected", "test case", "testcase"];
-    const columns = ["title", "scenario", "steps", "step", "expected", "precondition", "preconditions", "priority", "severity", "type", "status", "area", "module", "id", "#", "test case", "testcase"];
+    // Only a column that DEFINES new test content — a title/scenario to run, steps to follow, an
+    // expected outcome, a pre/postcondition — is evidence a table is authoring test cases. "Test
+    // Case(s)" is not: a coverage table cites existing cases by id under exactly that header ("Area
+    // | Test Cases" -> "TTM-TC-1"), so treating it as an anchor misfired on coverage answers, a
+    // per-module breakdown, and a Jira-to-testcase comparison alike — all reference existing rows,
+    // none define new ones. Reference-only columns (priority/status/area/id/"test case" itself) stay
+    // in the secondary count below since authored tables carry them too, but none alone is authorship.
+    const anchors = ["title", "scenario", "steps", "step", "expected", "precondition", "preconditions", "postcondition", "postconditions"];
+    const columns = [...anchors, "priority", "severity", "type", "status", "area", "module", "id", "#", "test case", "testcase"];
     const hasAnchor = header.some((cell) => anchors.some((anchor) => cell.includes(anchor)));
     const matches = header.filter((cell) => columns.some((column) => cell.includes(column))).length;
     return hasAnchor && matches >= 2;
@@ -12725,7 +12788,7 @@ export class LegacyService implements OnModuleInit {
 
   // Everything a reply must satisfy before the user sees it: test cases live only in the table, and
   // no claim of a mutation survives that the system did not actually perform.
-  private finalizeZyraChatReply(decision: ZyraChatDecision, applied: { testcases: Body[]; activity: Body[] }, renderedRows: Body[]): string {
+  private finalizeZyraChatReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations, renderedRows: Body[]): string {
     const reconciled = this.reconcileZyraReply(decision, applied);
     return this.stripZyraTestcaseTables(reconciled, renderedRows.length > 0);
   }
@@ -12903,7 +12966,23 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_ALREADY_DISCLOSED =
     /\b(nothing was (saved|changed|created|written)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added)|could\s+not\s+(create|save|generate|archive|update|add)|generation\s+is\s+(turned\s+off|disabled|off))\b/i;
 
-  private reconcileZyraReply(decision: ZyraChatDecision, applied: { testcases: Body[]; activity: Body[] }): string {
+  // Deterministic per-suite footer built from applied.moveBreakdown (ground truth read back from the
+  // database in zyraMoveBreakdown), appended to every reconcileZyraReply return path. The model's own
+  // prose is never parsed or rewritten to check its counts — that's unreliable free-text matching —
+  // this just states the real numbers underneath, the same "banner alongside the model's words rather
+  // than editing them" pattern the rest of this function already uses.
+  private zyraMoveBreakdownSuffix(moveBreakdown: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }> | undefined): string {
+    if (!moveBreakdown || !moveBreakdown.length) return "";
+    const total = moveBreakdown.reduce((sum, entry) => sum + entry.count, 0);
+    const parts = moveBreakdown.map((entry) => {
+      const label = entry.created ? `${entry.suiteName} (created)` : entry.suiteName;
+      return entry.count > 0 ? `${label}: ${entry.count}` : `${label}: 0 (none matched)`;
+    });
+    return `\n\n📦 **Moved to suites (actual):** ${parts.join(" · ")} — ${total} test case(s) total.`;
+  }
+
+  private reconcileZyraReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations): string {
+    const moveSuffix = this.zyraMoveBreakdownSuffix(applied.moveBreakdown);
     /*
      * An `answer` turn used to return its reply unchecked, on the reasoning that an answer changes
      * nothing so there is nothing to reconcile. That is exactly backwards: an answer changes nothing,
@@ -12929,12 +13008,12 @@ export class LegacyService implements OnModuleInit {
           "Ask me to go ahead and I'll make the change and show you the affected test cases.",
           "",
           decision.reply
-        ].join("\n");
+        ].join("\n") + moveSuffix;
       }
-      return decision.reply;
+      return decision.reply + moveSuffix;
     }
     // Creating an empty suite touches no testcases and is still a complete success.
-    if (decision.operations.length && decision.operations.every((op) => op.type === "create_suite")) return decision.reply;
+    if (decision.operations.length && decision.operations.every((op) => op.type === "create_suite")) return decision.reply + moveSuffix;
 
     // create_suite is the one operation that is not expected to produce a testcase row.
     const requested = decision.operations.filter((op) => op.type !== "create_suite").length;
@@ -12948,7 +13027,7 @@ export class LegacyService implements OnModuleInit {
         `⚠️ Nothing was saved. ${detail} Ask me to generate the test cases and I'll draft them for review in the same step.`,
         "",
         decision.reply
-      ].join("\n");
+      ].join("\n") + moveSuffix;
     }
 
     // create/update/archive no longer write straight to the repository — they're staged for review
@@ -12972,10 +13051,10 @@ export class LegacyService implements OnModuleInit {
           (reasons.length ? ` ${reasons.join(" ")}` : " The rest were not drafted."),
         "",
         decision.reply + reviewHint
-      ].join("\n");
+      ].join("\n") + moveSuffix;
     }
 
-    return decision.reply + reviewHint;
+    return decision.reply + reviewHint + moveSuffix;
   }
 
   private aiUnavailableForZyraChat(existingCount: number, reason = "AI generation was not available for this chat request."): ZyraChatDecision {
