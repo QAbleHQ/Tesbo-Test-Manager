@@ -1162,6 +1162,16 @@ export class LegacyController {
     return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
   }
 
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")
+  continueZyraChatMessage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Param("messageId") messageId: string
+  ) {
+    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId);
+  }
+
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/stop-plan")
   stopZyraChatPlan(
     @Req() req: AuthenticatedRequest,
