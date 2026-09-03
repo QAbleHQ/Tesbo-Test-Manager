@@ -16,7 +16,8 @@ const nextConfig = {
 // without an auth token we still wrap for webpack instrumentation but skip uploads.
 const sentryWebpackPluginOptions = {
   org: "qable",
-  project: "javascript-nextjs",
+  // Must match Sentry project slug (renamed from javascript-nextjs)
+  project: "app-tesbo-stage",
   silent: true,
   disableLogger: true,
   widenClientFileUpload: true,
