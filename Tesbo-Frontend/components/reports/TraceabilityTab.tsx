@@ -2,8 +2,9 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { IconSearch } from "@tabler/icons-react";
-import { StatusChip, PriorityBadge, type Priority } from "@/components/ui";
+import { StatusChip } from "@/components/ui";
 import type { RequirementMatrixRow } from "@/lib/api";
+import { PRIORITY_COLORS } from "./charts";
 import { statusTone, LoadingBlock } from "./shared";
 
 const MATRIX_COLUMNS = [
@@ -148,7 +149,7 @@ export function TraceabilityTab({
                               <span className="whitespace-normal break-words">{group.testcaseTitle}</span>
                             </td>
                             <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top">
-                              {group.priority ? <PriorityBadge priority={group.priority as Priority} /> : <span className="text-[var(--muted-soft)]">—</span>}
+                              <span className="text-[12px] font-medium" style={{ color: PRIORITY_COLORS[group.priority] || "var(--muted-soft)" }}>{group.priority}</span>
                             </td>
                             <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top">
                               <StatusChip tone={statusTone(group.testcaseStatus)}>{group.testcaseStatus || "—"}</StatusChip>

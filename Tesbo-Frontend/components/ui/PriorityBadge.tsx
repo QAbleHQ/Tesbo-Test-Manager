@@ -1,20 +1,24 @@
 import type { HTMLAttributes } from "react";
-import StatusChip, { type StatusChipProps } from "@/components/ui/StatusChip";
+import {
+  IconChevronsUp,
+  IconChevronUp,
+  IconMinus,
+  IconChevronDown,
+} from "@tabler/icons-react";
+import { cx } from "@/components/ui/cx";
 
-export type Priority = "P0" | "P1" | "P2" | "P3";
+export type Priority = "critical" | "high" | "medium" | "low";
 
-/*
- * Basecamp 10259699278 — Test case/bug priority (P0–P3) was rendered three different ways across
- * the Test Case Repository, a Test Run, and the Plans page: a StatusChip fighting its own defaults
- * via `!important` overrides, a hand-rolled dot + monospace text with no chip at all, and (worst)
- * relabelled to word severity levels here on Plans. One StatusChip tone map, used everywhere,
- * keeps a P1 the same shape, size and colour no matter which screen it's read from.
- */
-const PRIORITY_TONE: Record<Priority, StatusChipProps["tone"]> = {
-  P0: "error",
-  P1: "warning",
-  P2: "info",
-  P3: "neutral",
+const priorityConfig: Record<
+  Priority,
+  { label: string; color: string; Icon: React.ComponentType<{ size?: number; stroke?: number; className?: string }> }
+> = {
+  // Theme tokens, not literal hexes: the fixed colours these carried never followed the theme, so
+  // three of the four sat at 1.96–2.23:1 in dark mode, and "High" was unreadable in light too.
+  critical: { label: "Critical", color: "var(--error-foreground)", Icon: IconChevronsUp },
+  high:     { label: "High",     color: "var(--warning-foreground)", Icon: IconChevronUp },
+  medium:   { label: "Medium",   color: "var(--status-notrun-text)", Icon: IconMinus },
+  low:      { label: "Low",      color: "var(--success-foreground)", Icon: IconChevronDown },
 };
 
 export type PriorityBadgeProps = Omit<HTMLAttributes<HTMLSpanElement>, "children"> & {
@@ -22,9 +26,16 @@ export type PriorityBadgeProps = Omit<HTMLAttributes<HTMLSpanElement>, "children
 };
 
 export default function PriorityBadge({ priority, className, ...props }: PriorityBadgeProps) {
+  const { label, color, Icon } = priorityConfig[priority];
+
   return (
-    <StatusChip tone={PRIORITY_TONE[priority]} className={className} {...props}>
-      {priority}
-    </StatusChip>
+    <span
+      className={cx("inline-flex items-center gap-1 text-[12px] font-medium", className)}
+      style={{ color }}
+      {...props}
+    >
+      <Icon size={14} stroke={2} />
+      {label}
+    </span>
   );
 }

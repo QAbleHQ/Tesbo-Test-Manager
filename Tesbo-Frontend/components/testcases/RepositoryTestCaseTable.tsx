@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconColumns } from "@tabler/icons-react";
-import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
+import { StatusChip } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 
@@ -121,6 +121,13 @@ function repoStatusTone(status: string) {
   if (status === "Deprecated") return "error" as const;
   if (status === "Archived") return "neutral" as const;
   return "brand" as const;
+}
+
+function repoPriorityTone(priority: string) {
+  if (priority === "P0") return "error" as const;
+  if (priority === "P1") return "warning" as const;
+  if (priority === "P2") return "confidenceHigh" as const;
+  return "neutral" as const;
 }
 
 function repoAutomationTone(automationStatus: string) {
@@ -525,7 +532,12 @@ export function RepositoryTestCaseTable({
       case "priority":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
-            <PriorityBadge priority={tc.priority as Priority} />
+            <StatusChip
+              tone={repoPriorityTone(tc.priority)}
+              className="max-w-full !rounded-[5px] !px-[7px] !py-[2px] !font-mono !text-[11px] !font-semibold"
+            >
+              <span className={innerTruncate}>{tc.priority}</span>
+            </StatusChip>
           </td>
         );
       case "status":
