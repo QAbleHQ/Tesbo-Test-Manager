@@ -16,6 +16,7 @@ import {
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
   INTEGRATION_SYNC_TICKET_JOB,
+  INTEGRATION_SYNC_WATCHDOG_JOB,
   MAX_TICKETS_PER_RUN,
   NIGHTLY_SYNC_SINCE_BUFFER_MINUTES,
   PROVIDER_FOLDER_NAMES
@@ -88,6 +89,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
     if (job.name === INTEGRATION_SYNC_TICKET_JOB) return this.processTicket(job.data as SyncTicketJobPayload);
     if (job.name === INTEGRATION_SYNC_NIGHTLY_JIRA_JOB) return this.processNightlyOrchestrator("jira");
     if (job.name === INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB) return this.processNightlyOrchestrator("linear");
+    if (job.name === INTEGRATION_SYNC_WATCHDOG_JOB) return this.runs.failStaleRuns();
     this.logger.warn(`Unknown integration-sync job name: ${job.name}`);
   }
 

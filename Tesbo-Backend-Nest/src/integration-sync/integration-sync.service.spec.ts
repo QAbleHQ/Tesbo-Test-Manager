@@ -244,3 +244,104 @@ describe("IntegrationSyncService#startRun — nightly idempotency (V90 regressio
     expect(run.id).toBe("run-active");
   });
 });
+
+/**
+ * Regression coverage for the 2026-09-02/03 incident: a nightly run sat 'running' for 13.5 hours
+ * (total_tickets stuck at 0 the whole time) before a restart's old resume-by-reset logic finally
+ * closed it out. failInterruptedRuns/failStaleRuns replace that with a single atomic UPDATE — no
+ * read-then-write gap to race, and no reliance on BullMQ still holding a specific job.
+ */
+interface FakeStuckRun {
+  id: string;
+  status: string;
+  error: string | null;
+  updated_at: Date;
+}
+
+function makeStuckRunsDb(rows: FakeStuckRun[]) {
+  const query = jest.fn((sql: string, params: unknown[] = []) => {
+    if (sql.includes("UPDATE integration_sync_runs") && sql.includes("make_interval")) {
+      const [maxAgeMinutes, message] = params as [number, string];
+      const cutoff = Date.now() - maxAgeMinutes * 60_000;
+      const matched = rows.filter((r) => (r.status === "queued" || r.status === "running") && r.updated_at.getTime() < cutoff);
+      for (const r of matched) {
+        r.status = "failed";
+        r.error = r.error ?? message; // mirrors COALESCE(error, $2)
+        r.updated_at = new Date();
+      }
+      return Promise.resolve({ rows: matched.map((r) => ({ id: r.id })) });
+    }
+    return Promise.resolve({ rows: [] });
+  });
+  return { db: { query } as unknown as DatabaseService, rows };
+}
+
+function makeServiceForStuckRuns(rows: FakeStuckRun[]) {
+  const { db, rows: store } = makeStuckRunsDb(rows);
+  const queue = { add: jest.fn().mockResolvedValue(undefined) } as unknown as Queue;
+  const service = new IntegrationSyncService(queue, db, {} as unknown as PlanLimitsService);
+  return { service, store };
+}
+
+function minutesAgo(n: number): Date {
+  return new Date(Date.now() - n * 60_000);
+}
+
+describe("IntegrationSyncService#failInterruptedRuns — boot recovery (no more resume-by-reset)", () => {
+  it("fails every queued/running run regardless of how recently it was touched", async () => {
+    const { service, store } = makeServiceForStuckRuns([
+      { id: "run-1", status: "running", error: null, updated_at: minutesAgo(0) },
+      { id: "run-2", status: "queued", error: null, updated_at: minutesAgo(0) }
+    ]);
+
+    await service.failInterruptedRuns();
+
+    expect(store.every((r) => r.status === "failed")).toBe(true);
+    expect(store[0].error).toMatch(/interrupted/i);
+  });
+
+  it("never touches a run that already reached a terminal status", async () => {
+    const { service, store } = makeServiceForStuckRuns([{ id: "run-1", status: "succeeded", error: null, updated_at: minutesAgo(60) }]);
+
+    await service.failInterruptedRuns();
+
+    expect(store[0].status).toBe("succeeded");
+  });
+
+  it("preserves an existing error instead of overwriting it", async () => {
+    const { service, store } = makeServiceForStuckRuns([
+      { id: "run-1", status: "running", error: "Jira needs to be reconnected to this workspace.", updated_at: minutesAgo(0) }
+    ]);
+
+    await service.failInterruptedRuns();
+
+    expect(store[0].error).toBe("Jira needs to be reconnected to this workspace.");
+  });
+
+  it("does not throw when the underlying query fails", async () => {
+    const db = { query: jest.fn().mockRejectedValue(new Error("connection reset")) } as unknown as DatabaseService;
+    const queue = { add: jest.fn() } as unknown as Queue;
+    const service = new IntegrationSyncService(queue, db, {} as unknown as PlanLimitsService);
+
+    await expect(service.failInterruptedRuns()).resolves.toBeUndefined();
+  });
+});
+
+describe("IntegrationSyncService#failStaleRuns — periodic watchdog for a run stuck without a restart", () => {
+  it("fails a run with no progress for longer than the stale threshold", async () => {
+    const { service, store } = makeServiceForStuckRuns([{ id: "run-stale", status: "running", error: null, updated_at: minutesAgo(25) }]);
+
+    await service.failStaleRuns();
+
+    expect(store[0].status).toBe("failed");
+    expect(store[0].error).toMatch(/timed out/i);
+  });
+
+  it("leaves a run that updated recently alone, no matter how large or long-running", async () => {
+    const { service, store } = makeServiceForStuckRuns([{ id: "run-active", status: "running", error: null, updated_at: minutesAgo(5) }]);
+
+    await service.failStaleRuns();
+
+    expect(store[0].status).toBe("running");
+  });
+});
