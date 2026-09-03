@@ -189,6 +189,29 @@ type ZyraChatDecision = {
     reason?: string;
   }>;
   testcases: Body[];
+  // Set only when a provider call genuinely never answered within its budget (see
+  // ZYRA_ROUTER_TIMEOUT_MS/ZYRA_GENERATE_TIMEOUT_MS) — never for a call that answered with an error.
+  // sendZyraChatMessage persists this turn as status 'timed_out' instead of 'completed', and stores
+  // resumeCheckpoint so a later POST .../messages/:messageId/continue can pick the SAME turn back up
+  // — skipping whatever already succeeded — rather than asking the user to repeat themselves or
+  // silently re-running the whole thing (which would double the wait with no more feedback than the
+  // first attempt gave). See continueZyraChatMessage.
+  timedOut?: boolean;
+  resumeCheckpoint?: ZyraResumeCheckpoint;
+};
+
+// What continueZyraChatMessage needs to pick a timed-out turn back up without repeating the work
+// that already finished. "router" means the routing call itself never answered — there is nothing
+// yet to skip, so resuming just retries buildZyraChatDecision from the same user message. "generate"
+// means the router DID resolve an intent/suite/count before the drafting call timed out, so resuming
+// skips the router entirely and calls generateZyraChatCreateDecision directly with the already-routed
+// suite/count — the part of "starting from scratch" this exists to avoid.
+type ZyraResumeCheckpoint = {
+  stage: "router" | "generate";
+  userMessageId: string;
+  message: string;
+  routedSuite?: { id?: string; name?: string } | null;
+  routedCount?: { requestedCount?: unknown; exhaustive?: boolean };
 };
 
 // Shape of applyZyraChatOperations' result that the reply-reconciliation path (finalizeZyraChatReply,
@@ -198,6 +221,7 @@ type ZyraAppliedOperations = {
   testcases: Body[];
   activity: Body[];
   moveBreakdown?: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>;
+  reviewRequestId: string | null;
 };
 
 // What the AI router decided this request is (intentFromZyraModelAction). There is no keyword
@@ -9341,6 +9365,12 @@ export class LegacyService implements OnModuleInit {
     if (existingPlan) {
       await this.db.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
     }
+    // A genuinely new message means the user has moved on from whatever turn timed out earlier in
+    // this session — expire any dangling checkpoint so Continue can no longer resolve to context this
+    // message has superseded. Deliberately scoped to 'timed_out' only: a checkpoint a concurrent
+    // continueZyraChatMessage call has already claimed (status 'resuming') is left alone so that
+    // in-flight resume can still finish and post its own message — see continueZyraChatMessage.
+    await this.db.query("UPDATE zyra_chat_messages SET status = 'expired' WHERE session_id = $1 AND status = 'timed_out'", [sessionId]);
 
     const decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId);
     const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
@@ -9356,10 +9386,36 @@ export class LegacyService implements OnModuleInit {
         [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
       );
     }
+    const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
+    const title = this.compactTitle(message);
+    await this.db.query(
+      "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId, title]
+    );
+    return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+  }
+
+  /*
+   * Shared by sendZyraChatMessage and continueZyraChatMessage — the only two places an assistant
+   * turn is ever written. One place means the column list (and the timed_out/resume_checkpoint
+   * branch) can't drift between a fresh turn and a resumed one.
+   */
+  private async insertZyraAssistantMessage(params: {
+    sessionId: string;
+    projectId: string;
+    uid: string;
+    decision: ZyraChatDecision;
+    applied: ZyraAppliedOperations;
+    testcases: Body[];
+    activity: Body[];
+  }): Promise<Body> {
+    const { sessionId, projectId, uid, decision, applied, testcases, activity } = params;
+    const status = decision.timedOut ? "timed_out" : "completed";
+    const resumeCheckpoint = decision.timedOut && decision.resumeCheckpoint ? JSON.stringify(decision.resumeCheckpoint) : null;
     const assistant = await this.db.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9)
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb)
        RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id`,
       [
         sessionId,
@@ -9368,20 +9424,94 @@ export class LegacyService implements OnModuleInit {
         this.finalizeZyraChatReply(decision, applied, testcases),
         decision.reasoningSummary,
         decision.actionType,
+        status,
         JSON.stringify(testcases),
         JSON.stringify(activity),
-        applied.reviewRequestId || null
+        applied.reviewRequestId || null,
+        resumeCheckpoint
       ]
-    );
-    const title = this.compactTitle(message);
-    await this.db.query(
-      "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
-      [sessionId, projectId, title]
     );
     const item = toCamel(assistant.rows[0]);
     item.testcases = normalizeJsonArray(assistant.rows[0].testcases);
     item.activity = normalizeJsonArray(assistant.rows[0].activity);
-    return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+    return item;
+  }
+
+  /*
+   * Picks a timed-out turn back up. Basecamp-reported symptom: the provider stalled, the request
+   * held open with no reply and no error, indistinguishable from "Zyra doesn't respond" (see
+   * ZYRA_ROUTER_TIMEOUT_MS/ZYRA_GENERATE_TIMEOUT_MS). This is what the chat's Continue button calls.
+   *
+   * Race safety: the UPDATE ... WHERE status = 'timed_out' below is the only thing that decides who
+   * gets to resume a given checkpoint. It is a single atomic statement, so a double-click or two
+   * browser tabs hitting this at once can only have one request see rowCount 1 — the other sees 0 and
+   * is treated as "already resumed" rather than erroring, which is the correct answer for a UI action
+   * a user might reasonably fire twice. sendZyraChatMessage separately expires a checkpoint the moment
+   * the user sends a new message, so Continue can never resolve to a turn the conversation has since
+   * moved past.
+   */
+  async continueZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, messageId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(sessionId) || !isUuid(messageId)) throw new NotFoundException({ error: "Zyra chat message not found" });
+
+    const claim = await this.db.query(
+      `UPDATE zyra_chat_messages SET status = 'resuming'
+       WHERE id = $1 AND session_id = $2 AND project_id = $3 AND status = 'timed_out'
+       RETURNING resume_checkpoint`,
+      [messageId, sessionId, projectId]
+    );
+    if (!claim.rows[0]) {
+      // Not (or no longer) claimable: already resumed by an earlier click, currently being resumed by
+      // a concurrent one, expired by a newer message, or never existed. None of these are errors the
+      // user caused right now — hand back the current session so the UI just reflects reality.
+      const existing = await this.db.query("SELECT 1 FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3", [messageId, sessionId, projectId]);
+      if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
+      return { message: null, session: await this.zyraChatSession(projectId, userId, sessionId) };
+    }
+
+    const checkpoint = (claim.rows[0].resume_checkpoint || {}) as Partial<ZyraResumeCheckpoint>;
+    const resumeMessage = String(checkpoint.message || "");
+    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
+    if (!resumeMessage) {
+      // A checkpoint with no message text is unusable — revert rather than strand it in 'resuming'.
+      await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
+      throw new BadRequestException({ error: "This turn has no context to resume from — send a new message instead." });
+    }
+
+    try {
+      const decision = checkpoint.stage === "generate"
+        ? await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, {
+            routedSuite: checkpoint.routedSuite ?? null,
+            routedCount: checkpoint.routedCount ?? {}
+          })
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId);
+      const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
+      const activity = [
+        { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
+        ...applied.activity
+      ];
+      const testcases = applied.testcases.length ? applied.testcases : decision.testcases;
+      if (decision.actionType === "create" && applied.testcases.length) {
+        const ids = applied.testcases.map((tc) => tc.id).filter(Boolean);
+        await this.db.query(
+          "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
+          [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
+        );
+      }
+      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
+      // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
+      // again. A fresh timeout (decision.timedOut again) instead lands on the NEW message's own
+      // resume_checkpoint, so Continue keeps working across repeated timeouts.
+      await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = $1 AND status = 'resuming'", [messageId]);
+      return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+    } catch (err) {
+      // Anything that throws here (not a timeout — those are caught inside buildZyraChatDecision and
+      // returned as another timed-out decision, not thrown) leaves this checkpoint resumable again
+      // rather than stranding it in 'resuming' forever.
+      await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
+      throw err;
+    }
   }
 
   // Lets the user cut short a batched "all possible cases" plan. A batch already in flight
@@ -9464,7 +9594,12 @@ export class LegacyService implements OnModuleInit {
     userId: string,
     sessionId: string,
     message: string,
-    userMessageId?: string
+    userMessageId?: string,
+    // Set only by continueZyraChatMessage, when the router already resolved this turn to a create
+    // before the drafting call timed out. Its presence skips the router call entirely — that is the
+    // whole point of resuming rather than restarting: the routing decision the user already waited
+    // for is not repeated.
+    resume?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } }
   ): Promise<ZyraChatDecision> {
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
@@ -9568,8 +9703,8 @@ export class LegacyService implements OnModuleInit {
       "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
-      "CRITICAL: there is no draft buffer in this system. Choosing 'create' writes the testcases to the repository immediately as real, openable rows; choosing 'answer' stores NOTHING, however many testcases your reply text lists. So never present testcases as 'ready to save' or 'pending', and never ask 'would you like me to save these?' — if the user wants testcases, choose 'create' now, otherwise do not enumerate them at all.",
-      `What you create is written with status Draft. If the request names a suite it lands there; if it names none it is staged in the "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" suite. So describe what you created as DRAFTED and say where it is staged — do not say "saved" or "filed" for something sitting in the staging suite, and never imply a person has reviewed it.`,
+      "CRITICAL: 'create'/'update'/'archive' operations are STAGED for review, not applied immediately — nothing is inserted, changed, or removed in the repository until the user separately reviews and saves the staged batch. Still emit the operation as soon as you are confident the user wants it — do not add an extra 'would you like me to save these?' round-trip of your own in the chat, the review step already exists downstream and is not yours to gate. But your WORDING must match reality: describe what you produce as DRAFTED/PROPOSED and staged for review — never as 'created', 'saved', 'updated', or 'archived' (all past tense, all claims about work this turn did not do), however many testcases your reply text lists. If the user wants testcases, choose 'create' now; otherwise do not enumerate any as if they existed.",
+      `What you create is staged as a draft pending the user's review — it does not exist in the repository yet. Once saved it lands with status Draft, in the suite the request named, or in "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" if it named none. So say where it WILL be filed once saved, never where it "is" — nothing you create this turn is openable or runnable until the user reviews and saves it.`,
       `"Save them" / "save them to <suite>" AFTER you have already drafted testcases is a move, not a create: emit move_to_suite with fromLastPlan=true and the target suiteName. Re-creating them would duplicate every case. Use the transcript annotations to tell the two apart — if the previous turn saved rows, they exist and must be moved; if it saved nothing, they do not exist yet and 'save them' means create.`,
       "A short confirmation of an offer you made in your previous turn ('yes', 'yes please', 'go ahead', 'do it', 'please start generating', 'save it', 'save them into <suite>') is a create request: choose 'create', and set suiteName/suiteId on the create operation when a suite is named.",
       "Only use move_to_suite for testcases that appear under 'Existing suites'/'Existing testcases' below, or in the most recently generated batch. If the user asks you to save or file testcases that so far only appeared as text in this chat, those testcases DO NOT EXIST yet — choose 'create' with the suite named on the create operation, never move_to_suite.",
@@ -9625,6 +9760,35 @@ export class LegacyService implements OnModuleInit {
       this.zyraTranscript(chronologicalHistory)
     ].join("\n");
 
+    // Resuming a turn whose drafting call already timed out once the router had resolved it — skip
+    // the router call entirely (see the `resume` param doc) and go straight to generation with the
+    // suite/count it already decided. `context` above still gets built even though it goes unused
+    // here; keeping this branch a plain early-return, rather than restructuring the whole function
+    // around it, is what keeps the diff against the non-resume path small enough to trust.
+    if (resume) {
+      if (!capabilities.generation) return this.zyraCapabilityDisabled("generation", existingTestcases.length);
+      return this.zyraHandleChatCreate({
+        projectId,
+        userId,
+        sessionId,
+        provider,
+        model,
+        key,
+        message,
+        userMessageId,
+        knowledgeForChat,
+        existingTestcases,
+        mentionedJiraKeys,
+        projectTestcaseRange,
+        suites: projectSnapshot.suites,
+        conversation: this.zyraTranscript(chronologicalHistory),
+        routedSuite: resume.routedSuite,
+        routedCount: resume.routedCount,
+        mentionedJira,
+        capabilities
+      });
+    }
+
     try {
       const raw = providerWire(provider) === "anthropic"
         ? await this.zyraChatWithAnthropic(key, model, context, message)
@@ -9670,137 +9834,226 @@ export class LegacyService implements OnModuleInit {
       }
       if (modelIntent === "create") {
         if (!capabilities.generation) return this.zyraCapabilityDisabled("generation", existingTestcases.length);
-        // The router picked create but does not author the drafts — generation is its own call with
-        // the full range instructions and draft schema. It gets the conversation so far so a
-        // confirmation ("yes, save those") produces the cases the user was shown, and the suite the
-        // router resolved so they land in it directly.
-        try {
-          const decision = await this.generateZyraChatCreateDecision({
-            projectId,
-            userId,
-            sessionId,
-            provider,
-            model,
-            key,
-            message,
-            knowledge: knowledgeForChat,
-            existingTestcases,
-            jiraIssueKeys: mentionedJiraKeys,
-            projectTestcaseRange,
-            suites: projectSnapshot.suites,
-            conversation: this.zyraTranscript(chronologicalHistory),
-            routedSuite: this.routedZyraSuite(raw, projectSnapshot.suites),
-            routedCount: { requestedCount: raw.requestedCount, exhaustive: raw.exhaustive === true },
-            // Already resolved for this turn — reuse instead of a second lookup.
-            jira: mentionedJira
-          });
-          return this.applyStorageGateToGenerated(decision, capabilities);
-        } catch (err) {
-          // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
-          // after the router already succeeded.
-          const detail = this.extractAiErrorMessage(err);
-          // The failed attempt's provider response, if one arrived, was still billed — see
-          // generateZyraWithOpenAi/Anthropic's zyraUsage on the thrown error.
-          const failedUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
-          if (failedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, failedUsage);
-          await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: detail, stage: "generation" });
-
-          const routedSuiteForTurn = this.routedZyraSuite(raw, projectSnapshot.suites);
-          const attempt = LegacyService.zyraAttemptSummary({
-            requestedCount: Number(raw.requestedCount) || null,
-            knowledgeCount: knowledgeForChat.length,
-            jiraCount: mentionedJira.length,
-            suiteName: routedSuiteForTurn?.name ?? null
-          });
-
-          /*
-           * One retry, with a deliberately different approach rather than the same call again.
-           *
-           * The failure this path sees most is a response that arrived truncated — which is a
-           * function of how much was asked for, so repeating the identical request is the one thing
-           * guaranteed not to help. The retry asks for a small batch instead, and the reply says the
-           * first attempt failed and that this is a narrowed second attempt: a user who asked for 20
-           * and receives 5 is owed the reason, and finding out from the count alone is not that.
-           */
-          try {
-            const retried = await this.generateZyraChatCreateDecision({
-              projectId,
-              userId,
-              sessionId,
-              provider,
-              model,
-              key,
-              message,
-              knowledge: knowledgeForChat,
-              existingTestcases,
-              jiraIssueKeys: mentionedJiraKeys,
-              projectTestcaseRange,
-              suites: projectSnapshot.suites,
-              conversation: this.zyraTranscript(chronologicalHistory),
-              routedSuite: routedSuiteForTurn,
-              routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false },
-              jira: mentionedJira
-            });
-            const gated = this.applyStorageGateToGenerated(retried, capabilities);
-            const { cause } = LegacyService.zyraFailureCause(detail);
-            await this.logProjectActivity(projectId, userId, "zyra_chat_ai_retried", "zyra_chat", sessionId, "Zyra chat", {
-              message: detail,
-              stage: "generation_retry",
-              batch: LegacyService.ZYRA_RETRY_BATCH
-            });
-            return {
-              ...gated,
-              reply: [
-                `⚠️ My first attempt to ${attempt} didn't work — ${cause}.`,
-                `I changed approach and tried again with a smaller batch of ${LegacyService.ZYRA_RETRY_BATCH}. That went through:`,
-                "",
-                gated.reply,
-                "",
-                "Ask me to continue and I'll add the rest in batches this size."
-              ].join("\n"),
-              reasoningSummary: `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
-            };
-          } catch (retryErr) {
-            const retryDetail = this.extractAiErrorMessage(retryErr);
-            const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
-            if (retryFailedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, retryFailedUsage);
-            await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", {
-              message: retryDetail,
-              stage: "generation_retry"
-            });
-            const answer = this.normalizeZyraChatDecision(raw, message, existingTestcases, "answer");
-          /*
-           * The router's own reply is NOT reused here any more.
-           *
-           * Basecamp 10231923903: this used to read `⚠️ I couldn't produce the test cases … nothing
-           * was saved.\n\n${answer.reply}`. On a create turn the router has already written its reply
-           * as though generation would follow — "Created 7 test cases covering passwordless biometric
-           * login…" — so the user was shown a failure and a success, in that order, about the same
-           * request. The 2026-07-31 "degrade to the router's answer" behaviour was right for a
-           * ROUTING failure, where the answer is all there is; after a create routing the answer is
-           * prose about work that did not happen.
-           *
-           * Basecamp 10231965612: the wording is the user's now, not the parser's. `detail` ("AI
-           * testcase generation returned invalid JSON") stays in reasoningSummary and the activity
-           * log, where whoever is debugging it will look — it is not something to put in front of
-           * someone who asked for test cases.
-           */
-            return {
-              ...answer,
-              reply: LegacyService.zyraFailureReply(attempt, retryDetail || detail, true),
-              reasoningSummary: `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${answer.reasoningSummary}`
-            };
-          }
-        }
+        // The router picked create but does not author the drafts — generation is its own call,
+        // handed off to zyraHandleChatCreate (shared with continueZyraChatMessage's resume-from-
+        // generate path, so a timeout here and a timeout on resume are handled identically).
+        return this.zyraHandleChatCreate({
+          projectId,
+          userId,
+          sessionId,
+          provider,
+          model,
+          key,
+          message,
+          userMessageId,
+          knowledgeForChat,
+          existingTestcases,
+          mentionedJiraKeys,
+          projectTestcaseRange,
+          suites: projectSnapshot.suites,
+          conversation: this.zyraTranscript(chronologicalHistory),
+          routedSuite: this.routedZyraSuite(raw, projectSnapshot.suites),
+          routedCount: { requestedCount: raw.requestedCount, exhaustive: raw.exhaustive === true },
+          mentionedJira,
+          capabilities
+        });
       }
       return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
     } catch (err) {
       const errorDetail = this.extractAiErrorMessage(err);
+      if (this.isZyraTimeoutError(err)) {
+        // Nothing was resolved yet — routing itself never answered — so there is nothing to skip on
+        // resume; continueZyraChatMessage just retries buildZyraChatDecision from this same message.
+        recordGeneration(trace, { name: "router", provider, model, input: { message }, errorMessage: "timeout" });
+        endZyraTurn(trace, { reply: "timeout", actionType: "timeout" });
+        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "routing", timeoutMs: LegacyService.ZYRA_ROUTER_TIMEOUT_MS });
+        return this.zyraTimedOutDecision("router", message, userMessageId, existingTestcases.length);
+      }
       recordGeneration(trace, { name: "router", provider, model, input: { message }, errorMessage: errorDetail });
       endZyraTurn(trace, { reply: errorDetail, actionType: "error" });
       await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: errorDetail, stage: "routing" });
       return this.zyraDegradedDecision(message, existingTestcases, errorDetail);
     }
+  }
+
+  /*
+   * Authors the drafts for a routed 'create' turn, and is the single place that decides what happens
+   * when that call fails — shared by the live chat turn (buildZyraChatDecision) and by
+   * continueZyraChatMessage's resume-from-generate path, so "timed out the first time" and "timed out
+   * again on resume" go through identical handling rather than two hand-maintained copies.
+   *
+   * A genuine error (truncated JSON, no usable drafts) still gets the existing one-retry-at-a-smaller-
+   * batch treatment. A TIMEOUT does not: retrying immediately inside the same request would make the
+   * user sit through a second multi-minute wait with no more feedback than the first, which is the
+   * exact complaint this exists to fix. A timeout instead returns immediately with a resumable
+   * checkpoint — the user decides when to wait again, via Continue.
+   */
+  private async zyraHandleChatCreate(params: {
+    projectId: string;
+    userId: string;
+    sessionId: string;
+    provider: string;
+    model: string;
+    key: Body;
+    message: string;
+    userMessageId?: string;
+    knowledgeForChat: Array<{ title: string; content: string }>;
+    existingTestcases: ZyraGenerationInput["existingTestcases"];
+    mentionedJiraKeys: string[];
+    projectTestcaseRange: string;
+    suites: Array<{ id: string; name: string }>;
+    conversation: string;
+    routedSuite: { id?: string; name?: string } | null;
+    routedCount: { requestedCount?: unknown; exhaustive?: boolean };
+    mentionedJira: Array<{ key: string; summary: string; description: string }>;
+    capabilities: ZyraCapabilities;
+  }): Promise<ZyraChatDecision> {
+    const {
+      projectId, userId, sessionId, provider, model, key, message, userMessageId,
+      knowledgeForChat, existingTestcases, mentionedJiraKeys, projectTestcaseRange, suites,
+      conversation, routedSuite, routedCount, mentionedJira, capabilities
+    } = params;
+    try {
+      const decision = await this.generateZyraChatCreateDecision({
+        projectId, userId, sessionId, provider, model, key, message,
+        knowledge: knowledgeForChat, existingTestcases, jiraIssueKeys: mentionedJiraKeys,
+        projectTestcaseRange, suites, conversation, routedSuite, routedCount,
+        // Already resolved for this turn — reuse instead of a second lookup.
+        jira: mentionedJira
+      });
+      return this.applyStorageGateToGenerated(decision, capabilities);
+    } catch (err) {
+      if (this.isZyraTimeoutError(err)) {
+        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
+        return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount });
+      }
+      // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
+      // after the router already succeeded.
+      const detail = this.extractAiErrorMessage(err);
+      // The failed attempt's provider response, if one arrived, was still billed — see
+      // generateZyraWithOpenAi/Anthropic's zyraUsage on the thrown error.
+      const failedUsage = (err as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+      if (failedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, failedUsage);
+      await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: detail, stage: "generation" });
+
+      const attempt = LegacyService.zyraAttemptSummary({
+        requestedCount: Number(routedCount?.requestedCount) || null,
+        knowledgeCount: knowledgeForChat.length,
+        jiraCount: mentionedJira.length,
+        suiteName: routedSuite?.name ?? null
+      });
+
+      /*
+       * One retry, with a deliberately different approach rather than the same call again.
+       *
+       * The failure this path sees most is a response that arrived truncated — which is a
+       * function of how much was asked for, so repeating the identical request is the one thing
+       * guaranteed not to help. The retry asks for a small batch instead, and the reply says the
+       * first attempt failed and that this is a narrowed second attempt: a user who asked for 20
+       * and receives 5 is owed the reason, and finding out from the count alone is not that.
+       */
+      try {
+        const retried = await this.generateZyraChatCreateDecision({
+          projectId, userId, sessionId, provider, model, key, message,
+          knowledge: knowledgeForChat, existingTestcases, jiraIssueKeys: mentionedJiraKeys,
+          projectTestcaseRange, suites, conversation,
+          routedSuite,
+          routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false },
+          jira: mentionedJira
+        });
+        const gated = this.applyStorageGateToGenerated(retried, capabilities);
+        const { cause } = LegacyService.zyraFailureCause(detail);
+        await this.logProjectActivity(projectId, userId, "zyra_chat_ai_retried", "zyra_chat", sessionId, "Zyra chat", {
+          message: detail,
+          stage: "generation_retry",
+          batch: LegacyService.ZYRA_RETRY_BATCH
+        });
+        return {
+          ...gated,
+          reply: [
+            `⚠️ My first attempt to ${attempt} didn't work — ${cause}.`,
+            `I changed approach and tried again with a smaller batch of ${LegacyService.ZYRA_RETRY_BATCH}. That went through:`,
+            "",
+            gated.reply,
+            "",
+            "Ask me to continue and I'll add the rest in batches this size."
+          ].join("\n"),
+          reasoningSummary: `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
+        };
+      } catch (retryErr) {
+        if (this.isZyraTimeoutError(retryErr)) {
+          await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
+          return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, {
+            routedSuite,
+            routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false }
+          });
+        }
+        const retryDetail = this.extractAiErrorMessage(retryErr);
+        const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
+        if (retryFailedUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, retryFailedUsage);
+        await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", {
+          message: retryDetail,
+          stage: "generation_retry"
+        });
+        /*
+         * The router's own reply is NOT reused here any more.
+         *
+         * Basecamp 10231923903: this used to read `⚠️ I couldn't produce the test cases … nothing
+         * was saved.\n\n${answer.reply}`. On a create turn the router has already written its reply
+         * as though generation would follow — "Created 7 test cases covering passwordless biometric
+         * login…" — so the user was shown a failure and a success, in that order, about the same
+         * request. The 2026-07-31 "degrade to the router's answer" behaviour was right for a
+         * ROUTING failure, where the answer is all there is; after a create routing the answer is
+         * prose about work that did not happen.
+         *
+         * Basecamp 10231965612: the wording is the user's now, not the parser's. `detail` ("AI
+         * testcase generation returned invalid JSON") stays in reasoningSummary and the activity
+         * log, where whoever is debugging it will look — it is not something to put in front of
+         * someone who asked for test cases.
+         */
+        return {
+          reply: LegacyService.zyraFailureReply(attempt, retryDetail || detail, true),
+          reasoningSummary: `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
+          actionType: "answer",
+          operations: [],
+          testcases: []
+        };
+      }
+    }
+  }
+
+  /*
+   * The reply for a provider call that genuinely never answered (see ZYRA_ROUTER_TIMEOUT_MS /
+   * ZYRA_GENERATE_TIMEOUT_MS) — sendZyraChatMessage persists this as status 'timed_out' with the
+   * checkpoint attached, rather than 'completed'. It is deliberately NOT phrased as a failure: nothing
+   * is known to be wrong, the call just didn't finish in time, and the reply says exactly that plus
+   * what happens next.
+   */
+  private zyraTimedOutDecision(
+    stage: ZyraResumeCheckpoint["stage"],
+    message: string,
+    userMessageId: string | undefined,
+    existingCount: number,
+    resumeState?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } }
+  ): ZyraChatDecision {
+    return {
+      reply: [
+        "⏱️ I didn't hear back from the AI provider in time — nothing was created or changed, and nothing was lost.",
+        "Click **Continue** below and I'll pick up right where this left off, rather than starting over."
+      ].join(" "),
+      reasoningSummary: `Provider call timed out at stage '${stage}' after ${stage === "router" ? LegacyService.ZYRA_ROUTER_TIMEOUT_MS : LegacyService.ZYRA_GENERATE_TIMEOUT_MS}ms. ${this.defaultReasoningSummary(existingCount)}`,
+      actionType: "answer",
+      operations: [],
+      testcases: [],
+      timedOut: true,
+      resumeCheckpoint: {
+        stage,
+        userMessageId: userMessageId || "",
+        message,
+        routedSuite: resumeState?.routedSuite ?? null,
+        routedCount: resumeState?.routedCount
+      }
+    };
   }
 
   private async applyZyraChatOperations(projectId: string, userId: string | null, sessionId: string, operations: ZyraChatDecision["operations"]) {
@@ -12142,7 +12395,8 @@ export class LegacyService implements OnModuleInit {
           max_tokens: 2000,
           system: [{ type: "text", text: systemPrompt }],
           messages: [{ role: "user", content: userPrompt }]
-        })
+        }),
+        signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_ROUTER_TIMEOUT_MS)
       });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({} as Body)) as Body;
@@ -12171,7 +12425,8 @@ export class LegacyService implements OnModuleInit {
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ]
-      })
+      }),
+      signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_ROUTER_TIMEOUT_MS)
     });
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({} as Body)) as Body;
@@ -12248,7 +12503,8 @@ export class LegacyService implements OnModuleInit {
     const response = await fetch(providerChatUrl(params.provider, params.baseUrl, String(openAiBody.model)), {
       method: "POST",
       headers,
-      body: JSON.stringify(openAiBody)
+      body: JSON.stringify(openAiBody),
+      signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
     });
     const body = await response.json().catch(() => ({} as Body)) as Body;
     if (!response.ok) {
@@ -12324,7 +12580,8 @@ export class LegacyService implements OnModuleInit {
               content: [{ type: "text", text: this.zyraDynamicTaskPrompt(params.input) }]
             }
           ]
-        })
+        }),
+        signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
       });
       const body = await response.json().catch(() => ({} as Body)) as Body;
       if (!response.ok) {
@@ -12439,7 +12696,8 @@ export class LegacyService implements OnModuleInit {
     const res = await fetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers,
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_ROUTER_TIMEOUT_MS)
     });
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({} as Body)) as Body;
@@ -12478,7 +12736,8 @@ export class LegacyService implements OnModuleInit {
       const res = await fetch(chatUrl, {
         method: "POST",
         headers: chatHeaders,
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_ROUTER_TIMEOUT_MS)
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({} as Body)) as Body;
@@ -12682,12 +12941,32 @@ export class LegacyService implements OnModuleInit {
         !saved.length && (actionType === "create" || actionType === "archive" || actionType === "update")
           ? ` [this turn was routed as '${actionType}' but wrote nothing — treat it as a PROPOSAL still awaiting the user's go-ahead; if their next message confirms it, carry it out now]`
           : "";
+      /*
+       * The proposal annotation above only fires for a turn routed create/archive/update — but a gap
+       * analysis routes `answer` (correctly: it changed nothing) and can still end in an offer —
+       * "Would you like me to generate test cases for these gaps?" — that the very next "yes" is
+       * meant to confirm. That routing decision has no antecedent flag at all today, unlike the
+       * create/archive/update case, so it depends entirely on the model re-reading this turn's prose
+       * — which the prompt already asks it to do (see the "confirmation of an offer" rule), but with
+       * no structural nudge behind it the way the proposal annotation gives the other three action
+       * types. This gives it the same nudge, without a keyword router deciding what the confirmation
+       * means — that stays the model's call.
+       */
+      const offer = !saved.length && !proposal && LegacyService.ZYRA_OFFER_PATTERN.test(content)
+        ? " [this turn ended with an offer to act — if the user's next message confirms it (yes, go ahead, please do, do it), work out what was offered and carry it out now]"
+        : "";
       const note = saved.length
         ? `[saved ${saved.length} testcase(s) to the repository${externalIds.length ? `: ${externalIds.join(", ")}` : ""}]`
         : "[saved nothing — any testcases named in this reply do not exist in the repository]";
-      return `assistant ${note}${proposal}: ${content}`;
+      return `assistant ${note}${proposal}${offer}: ${content}`;
     }).join("\n");
   }
+
+  // Deliberately narrow: an offer phrase immediately followed by an action verb and a question mark
+  // within a short window, not "any sentence with a question mark" (which would flag ordinary
+  // clarifying questions like "which module should this cover?" as something to auto-confirm).
+  private static readonly ZYRA_OFFER_PATTERN =
+    /\b(would you like me to|do you want me to|want me to|should i|shall i)\b[^.!?\n]{0,120}\b(generat|creat|add|writ|draft|archiv|remov|delet|updat|chang|mov|assign|organi[sz]e)\w*\b[^.!?\n]{0,120}\?/i;
 
   // Resolve the router's suite against reality: an id only counts if the suite exists, a name is
   // matched case-insensitively to an existing suite, and a genuinely new name is passed through to
@@ -12912,6 +13191,44 @@ export class LegacyService implements OnModuleInit {
 
   /** The narrowed second attempt's batch size — small enough that a truncated response is unlikely. */
   private static readonly ZYRA_RETRY_BATCH = 5;
+
+  /*
+   * Every outbound fetch() to an AI provider used to carry no timeout at all — not here, not in the
+   * frontend's api() helper, not at the nginx layer (24h). A provider that stalls (a half-open TCP
+   * connection, a silent overload with no error) left the request open indefinitely: no reply, no
+   * error banner, the chat's "thinking" spinner running forever. That is indistinguishable from
+   * "Zyra doesn't respond" as reported, and it is the one failure mode nothing else in this file
+   * already turns into a visible outcome — every other path (a 4xx/5xx, malformed JSON, a thrown
+   * exception) is already caught somewhere and answered with a message.
+   *
+   * These are deliberately generous, not a snappy request timeout — cutting a call short at 5-10s
+   * would abort completions that were genuinely still working and turn "slow but fine" into "failed
+   * for no reason", which is worse than the silence it replaces. The router is a small JSON envelope
+   * and normally answers in single-digit seconds; the generation call can legitimately run to a
+   * minute or more for a large batch (max_tokens scales up to 16000 — see generateZyraWithAnthropic).
+   * Both budgets sit well above realistic completion time and still bound the worst case to minutes,
+   * not forever.
+   *
+   * A timeout is NOT treated as just another provider error. buildZyraChatDecision hands it a
+   * ZyraResumeCheckpoint instead of a failure reply, so the turn can be picked back up (see
+   * continueZyraChatMessage) rather than forcing the user to re-ask and pay for the whole context
+   * again.
+   */
+  private static readonly ZYRA_ROUTER_TIMEOUT_MS = 60_000;
+  private static readonly ZYRA_GENERATE_TIMEOUT_MS = 180_000;
+
+  /** A fresh per-attempt budget — a model-candidate fallback loop must not have an earlier candidate's stall eat into the next one's time. */
+  private static zyraProviderSignal(ms: number): AbortSignal {
+    return AbortSignal.timeout(ms);
+  }
+
+  // AbortSignal.timeout() rejects fetch with a DOMException named "TimeoutError"; a caller-driven
+  // AbortController (not used here today, kept for completeness) would surface "AbortError" instead.
+  // Never true for a rejection that came from the provider itself (a 4xx/5xx, malformed JSON) — those
+  // already carry their own message and go through the normal failure path.
+  private isZyraTimeoutError(err: unknown): boolean {
+    return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+  }
 
   private static zyraFailureCause(detail: string): { cause: string; advice: string } {
     const text = String(detail || "").toLowerCase();
