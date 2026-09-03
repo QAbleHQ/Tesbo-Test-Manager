@@ -373,13 +373,14 @@ async function progressPanel(page: Page): Promise<{ percent: number; passRate: n
 }
 
 /**
- * One run's row in the plan's Test runs tab.
+ * One run's row in the plan's Test runs list.
  *
- * Matched on the Tailwind arbitrary-value class the card is built with: the rows carry no role or
- * test id, and every ancestor of the run's name would match a bare "div" filter.
+ * Matched on the shared `Card` component's class — the same card the standalone Runs module list
+ * uses — since the rows carry no role or test id and every ancestor of the run's name would match
+ * a bare "div" filter.
  */
 function runRow(page: Page, name: string): Locator {
-  return page.locator('div[class*="rounded-[10px]"]').filter({ hasText: name }).first();
+  return page.locator("div.tesbo-card").filter({ hasText: name }).first();
 }
 
 test.describe("test plans — the plan detail progress panel", () => {
@@ -422,17 +423,16 @@ test.describe("test plans — the plan detail progress panel", () => {
       expect(panel.tiles.Untested).toBe(1);
       expect(panel.percent).toBe(50);
 
-      // The run the header just counted has to be on the screen.
-      await expect(page.getByText("No runs associated with this plan.")).toHaveCount(0);
+      // The run the header just counted has to be on the screen, and to be the only card listed.
+      await expect(page.getByText(/No test runs/)).toHaveCount(0);
       await expect(page.getByText(run.name, { exact: true })).toBeVisible();
-      await expect(page.getByRole("button", { name: /Test runs/ })).toContainText("1");
+      await expect(page.locator("div.tesbo-card")).toHaveCount(1);
 
-      // And it has to agree with the header: same percentage, same case count.
+      // And it has to agree with the header: same case count, same executed/total split (1 of 2
+      // settled — the row no longer prints its own percentage, matching the Runs module's cards).
       const runCard = runRow(page, run.name);
-      await expect(runCard).toContainText("50%");
-      await expect(runCard).toContainText("2 cases");
+      await expect(runCard).toContainText("1 / 2 cases");
       await expect(runCard).toContainText("1 passed");
-      await expect(runCard).toContainText("1 untested");
     } finally {
       await cleanupRun(api, project.id, run);
       await deleteProjects(api, [project.id]);
@@ -484,28 +484,31 @@ test.describe("test plans — the plan detail progress panel", () => {
       await expect(page.getByText(populated.name, { exact: true })).toBeVisible();
       await expect(page.getByText(empty.name, { exact: true })).toBeVisible();
       await expect(runRow(page, empty.name)).not.toContainText("cases");
-      await expect(page.getByRole("button", { name: /Test runs/ })).toContainText("2");
+      await expect(page.locator("div.tesbo-card")).toHaveCount(2);
     } finally {
       await cleanupRun(api, project.id, empty);
       await cleanupRun(api, project.id, populated);
       await deleteProjects(api, [project.id]);
     }
   });
-  test("PLN-U-10 untested is the same colour on the bar, its legend dot and its tile", { tag: '@tesbo.testId("TES-TC-1050")' }, async ({
+  test("PLN-U-10 untested is a painted segment on the Overall progress bar, not an unpainted gap", { tag: '@tesbo.testId("TES-TC-1050")' }, async ({
     page,
   }) => {
     /*
-     * Basecamp 10213200614 / BetterBugs 6a844249 — "Untested mark color not match on bar". The
-     * reporter circled the run row's grey "6 untested" dot and the pale empty tail of the bar beside
-     * it. One status was wearing three colours: the UNTESTED tile in --status-notrun-*, the legend
-     * dot in --muted-soft, and the bar in --surface-tertiary, because SegmentedBar was never given
-     * untested at all and simply left it unpainted.
+     * Basecamp 10213200614 / BetterBugs 6a844249 — "Untested mark color not match on bar". One
+     * status was wearing three colours across the screen: the UNTESTED tile in --status-notrun-*,
+     * the legend dot in --muted-soft, and the bar in --surface-tertiary, because SegmentedBar was
+     * never given untested at all and simply left it unpainted.
      *
-     * Fails against that code twice over: the bar has 4 segments rather than 5 (their widths summing
-     * to 40%, not 100%), and the dot's colour is --muted-soft rather than the untested colour.
+     * The regression this guards — SegmentedBar rendering an explicit untested segment instead of
+     * leaving it as blank track — lives in the "Overall progress" panel, which this redesign did not
+     * touch. (The per-run row that originally carried this same bar has since been rebuilt to match
+     * the standalone Runs module's card, which never showed a per-row untested breakdown either — so
+     * that instance of the check no longer has a UI surface to run against.)
      *
-     * Colours are read as computed values, not as token names — a var() that resolves to the wrong
-     * thing, or a token quietly redefined, is exactly the failure being guarded.
+     * Fails against the old code twice over: the bar has 4 segments rather than 5 (their widths
+     * summing to 40%, not 100%). Colours are read as computed values, not as token names — a var()
+     * that resolves to the wrong thing, or a token quietly redefined, is exactly what's guarded.
      */
     const project = await createProject(api);
     let run: SeededRun | undefined;
@@ -520,19 +523,19 @@ test.describe("test plans — the plan detail progress panel", () => {
       });
 
       await page.goto(`/projects/${project.id}/plans/${plan.id}`);
-      const card = runRow(page, run.name);
-      await expect(card).toContainText("3 untested");
+      const section = page.locator("section").filter({ hasText: "Overall progress" }).first();
+      await expect(section).toBeVisible();
 
       // The bar's segments, in paint order, with the width each was given.
-      const bar = await card.evaluate((row) => {
-        const track = row.querySelector("div.flex.h-2");
+      const bar = await section.evaluate((sec) => {
+        const track = sec.querySelector("div.flex.h-2");
         if (!track) return null;
         return Array.from(track.children).map((seg) => ({
           color: getComputedStyle(seg).backgroundColor,
           width: (seg as HTMLElement).style.width,
         }));
       });
-      expect(bar, "the run row has no segmented bar").not.toBeNull();
+      expect(bar, "the progress panel has no segmented bar").not.toBeNull();
 
       // Untested is painted, so all five cases are represented and the widths close to 100%.
       // Passed, Blocked and Untested are the three non-zero buckets; Failed and Skipped draw nothing.
@@ -545,23 +548,9 @@ test.describe("test plans — the plan detail progress panel", () => {
       const untestedSegment = bar![bar!.length - 1];
       expect(parseFloat(untestedSegment.width)).toBeCloseTo(60, 1);
 
-      // The legend dot for untested must be that same colour — the reported mismatch.
-      const dotColour = await card.evaluate((row) => {
-        const label = Array.from(row.querySelectorAll("span")).find((el) =>
-          /^\d+ untested$/.test(el.textContent?.trim() ?? ""),
-        );
-        const dot = label?.querySelector("span, i, div");
-        return dot ? getComputedStyle(dot).backgroundColor : null;
-      });
-      expect(dotColour, "no legend dot found beside the untested count").not.toBeNull();
-      expect(
-        dotColour,
-        `the untested dot is ${dotColour} but the bar paints untested ${untestedSegment.color}`,
-      ).toBe(untestedSegment.color);
-
-      // And the UNTESTED stat tile above agrees, so all three readings of one status match.
-      const tileColour = await page.evaluate(() => {
-        const label = Array.from(document.querySelectorAll("div")).find(
+      // The UNTESTED stat tile beside the bar must be painted with that same colour.
+      const tileColour = await section.evaluate((sec) => {
+        const label = Array.from(sec.querySelectorAll("div")).find(
           (d) => d.textContent?.trim().toUpperCase() === "UNTESTED" && d.children.length <= 1,
         );
         return label ? getComputedStyle(label).color : null;
@@ -630,10 +619,10 @@ test.describe("test plans — the plan detail progress panel", () => {
       await expect(rowA).toContainText("4 cases");
       await expect(rowB).toContainText("4 cases");
 
-      // The header must not be able to disagree with a row: each row's percentage is its own
-      // executed/total, and the header is the same arithmetic over both.
-      await expect(rowA, "run A should be 3 of 4 settled").toContainText("75%");
-      await expect(rowB, "run B should be 2 of 4 settled").toContainText("50%");
+      // The header must not be able to disagree with a row: each row's own executed/total split is
+      // part of the same arithmetic the header sums.
+      await expect(rowA, "run A should be 3 of 4 settled").toContainText("3 / 4 cases");
+      await expect(rowB, "run B should be 2 of 4 settled").toContainText("2 / 4 cases");
     } finally {
       await cleanupRun(api, project.id, runB);
       await cleanupRun(api, project.id, runA);
@@ -643,13 +632,14 @@ test.describe("test plans — the plan detail progress panel", () => {
 });
 
 /*
- * The plan header, its Plan items tab and the inline edit form.
+ * The plan header, the removed internal sidebar/Plan items tab, and the inline edit form.
  *
- * Three cards from the same screen: 10221932189 ("Test cases shows incorrect count" — the header
- * chip counted pinned plan_items while the panel below counted the cases in the plan's runs, so a
- * plan running twelve cases announced "0 test cases"), 10221983132 ("Plan items shows 0 count and
- * message 'no planed items'" — accurate, but reading as a bug next to those twelve), and 10221977100
- * ("Edit test plan > field labels are missing").
+ * Two of these cards are from the same screen: 10221932189 ("Test cases shows incorrect count" —
+ * the header chip counted pinned plan_items while the panel below counted the cases in the plan's
+ * runs, so a plan running twelve cases announced "0 test cases") and 10221977100 ("Edit test plan >
+ * field labels are missing"). 10221983132 ("Plan items shows 0 count and message 'no planed items'")
+ * no longer has a UI surface to guard: the Test Plans page restructuring removed the Plan items tab
+ * and the plan-switcher sidebar entirely, so PLN-U-13 below now asserts their absence instead.
  */
 test.describe("test plans — header count, plan items and editing", () => {
   test.skip(skipReason !== null, skipReason ?? "");
@@ -677,7 +667,11 @@ test.describe("test plans — header count, plan items and editing", () => {
     }
   });
 
-  test("PLN-U-13 the empty Plan items tab explains where the plan's cases come from", { tag: '@tesbo.testId("TES-TC-1357")' }, async ({ page }) => {
+  test("PLN-U-13 the plan detail page has no Plan items tab and no internal plans sidebar", { tag: '@tesbo.testId("TES-TC-1357")' }, async ({ page }) => {
+    // Test Plans page restructuring: the page used to be Main Sidebar → Test Plans →
+    // [plan-switcher sidebar + Plan items + Test runs]; it is now just Test Plans → Test Runs, with
+    // the runs list styled like the standalone Runs module. This guards both removals directly, and
+    // that "Test runs" content still renders without any tab navigation.
     const api = await screensApi();
     const project = await createProject(api);
     try {
@@ -685,13 +679,17 @@ test.describe("test plans — header count, plan items and editing", () => {
       await seedRun(api, project.id, { statuses: ["Passed", "Failed"], planId: plan.id });
 
       await page.goto(`/projects/${project.id}/plans/${plan.id}`);
-      await page.getByRole("button", { name: /Plan items/ }).click();
 
-      // The count stays honest — nothing is pinned — but the copy names the other number so the two
-      // no longer read as a contradiction.
-      const empty = page.getByText(/Nothing is pinned to this plan/);
-      await expect(empty).toBeVisible();
-      await expect(empty).toContainText(/\d+ test cases? come from the linked test runs/);
+      await expect(page.getByRole("button", { name: /Plan items/ })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /^Test runs$/ })).toHaveCount(0);
+      await expect(page.getByRole("link", { name: "All plans" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "New test plan" })).toHaveCount(0);
+
+      // Test Runs content is on the page directly, with no tab to click through to reach it. Two
+      // "Create test run" buttons legitimately exist (the page-level action and the section's own),
+      // so this is scoped to at least one being visible rather than a single strict match.
+      await expect(page.getByRole("button", { name: "Create test run" }).first()).toBeVisible();
+      await expect(page.getByRole("button", { name: "Link existing run" })).toBeVisible();
     } finally {
       await deleteProjects(api, [project.id]);
       await api.dispose();
