@@ -130,6 +130,9 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:1011}
         NEXT_PUBLIC_BETTERBUGS_API_KEY: ${NEXT_PUBLIC_BETTERBUGS_API_KEY:-}
         NEXT_PUBLIC_BETTERBUGS_PROJECT_ID: ${NEXT_PUBLIC_BETTERBUGS_PROJECT_ID:-}
+        # Stage only — set DSN + ENVIRONMENT=stage on stage .env; leave empty on prod
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+        NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${NEXT_PUBLIC_SENTRY_ENVIRONMENT:-}
     restart: unless-stopped
     depends_on:
       backend:
