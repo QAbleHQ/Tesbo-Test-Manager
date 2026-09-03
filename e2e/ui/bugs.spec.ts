@@ -305,6 +305,53 @@ test.describe("bugs list — controls and filters", () => {
     await expect(page.getByText("E2E long bug title")).toHaveCount(0);
   });
 
+  test("BUG-U-32 Clear all is hidden with no filters and resets every filter at once", async ({ page }) => {
+    const rows = page.locator("tbody tr");
+    const before = await rows.count();
+    expect(before, "the fixture seeds two bugs of different severities").toBeGreaterThanOrEqual(2);
+
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll, "no filters applied yet — there is nothing to clear").toBeHidden();
+
+    // Two independent filter dimensions at once: a dropdown and free text.
+    await page.getByLabel("Filter by severity").selectOption("Critical");
+    await expect(clearAll).toBeVisible();
+    await page.getByPlaceholder("Search bugs…").fill("E2E long bug title");
+    await expect(rows).toHaveCount(1);
+
+    await clearAll.click();
+    await expect(page.getByLabel("Filter by severity")).toHaveValue("");
+    await expect(page.getByPlaceholder("Search bugs…")).toHaveValue("");
+    await expect(rows).toHaveCount(before);
+    await expect(clearAll).toBeHidden();
+  });
+
+  test("BUG-U-33 Clear all resets filters identically on the board view", async ({ page }) => {
+    // Same `filtered` list feeds both views (BUG-U-09/BUG-U-14) — Clear all must not be a
+    // List-only control.
+    await page.getByRole("button", { name: "Board", exact: true }).click();
+    await page.getByLabel("Filter by severity").selectOption("Low");
+    await expect(page.getByText("E2E long bug title")).toHaveCount(0);
+
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll).toBeVisible();
+    await clearAll.click();
+    await expect(page.getByLabel("Filter by severity")).toHaveValue("");
+    await expect(page.getByText("E2E long bug title")).toBeVisible();
+  });
+
+  test("BUG-U-35 whitespace-only search still counts as an active filter", async ({ page }) => {
+    // A lone space is truthy but filters nothing visible — Clear all still has to appear and clear it,
+    // rather than the button's own "is anything active" check silently trimming it away.
+    await page.getByPlaceholder("Search bugs…").fill("   ");
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll).toBeVisible();
+
+    await clearAll.click();
+    await expect(page.getByPlaceholder("Search bugs…")).toHaveValue("");
+    await expect(clearAll).toBeHidden();
+  });
+
   test("BUG-U-10 the edit modal scrolls to its own footer instead of the page behind it", { tag: '@tesbo.testId("TES-TC-1320")' }, async ({ page }) => {
     /*
      * Basecamp 10217828537 — "Bug edit pop up is not scrollable thus not able to update bug". Fixed
@@ -613,6 +660,26 @@ test.describe("bug assignee", () => {
     await filter.selectOption("");
     await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
     await expect(page.getByText(unassignedTitle, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-34 Clear all resets the Unassigned sentinel, not just a real assignee", async ({ page }) => {
+    // "unassigned" is a sentinel string distinct from "" (no filter) — Clear all has to reset it
+    // back to "", not leave it stuck on the sentinel.
+    const suffix = uniqueSuffix();
+    const unassignedTitle = `E2E Assignee Clear All ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const rows = page.locator("tbody tr");
+    const before = await rows.count();
+
+    await page.getByLabel("Filter by assignee").selectOption("unassigned");
+    await expect(rows.count()).resolves.toBeLessThan(before);
+
+    await page.getByRole("button", { name: "Clear all" }).click();
+    await expect(page.getByLabel("Filter by assignee")).toHaveValue("");
+    await expect(rows).toHaveCount(before);
   });
 
   test("BUG-U-31 the assignee filter is available on the board too", async ({ page }) => {

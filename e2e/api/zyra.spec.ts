@@ -142,6 +142,57 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     );
   }
 
+  /**
+   * A chat-staged review batch, written directly — same "arrange through Postgres" rule as
+   * seedTask, since applyZyraChatOperations (which builds one for real) needs a live model this
+   * suite deliberately never calls (file header).
+   *
+   * Entries use the wrapped {opType, draft|fields} shape zyraSave/zyraEditDraft/zyraDeleteDraft
+   * expect once a row carries chat_session_id (legacy.service.ts applyZyraChatOperations) — NOT
+   * the flat AiGeneratedDraft shape seedTask()'s Task-board rows use.
+   */
+  function seedChatReviewTask(options: { status?: string; entries?: Array<Record<string, unknown>> } = {}): {
+    taskId: string;
+    sessionId: string;
+  } {
+    const t = tenant!;
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review session');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const entries = options.entries ?? [
+      {
+        opType: "create",
+        draft: {
+          suiteId: null,
+          title: `E2E chat draft ${Date.now()}`,
+          description: "",
+          preconditions: "",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "open the app", expectedResult: "it opens" }]),
+          priority: "P2",
+          type: "Functional",
+          status: "Draft",
+        },
+        reason: "",
+      },
+    ];
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
+        "requested_count, generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', ` +
+        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ` +
+        `${literal(JSON.stringify(entries))}::jsonb, 'Zyra the Test Generator', ` +
+        `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
+    );
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    return { taskId, sessionId };
+  }
+
   /** Every project-scoped Zyra route, for the authorization sweeps. */
   function zyraRoutes(
     api: APIRequestContext,
@@ -191,6 +242,10 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       [
         "DELETE tasks/:id/drafts/:index",
         () => api.delete(url(`/agents/zyra/tasks/${ids.taskId}/drafts/0`, projectId), opts),
+      ],
+      [
+        "PATCH tasks/:id/drafts/:index",
+        () => api.patch(url(`/agents/zyra/tasks/${ids.taskId}/drafts/0`, projectId), { data: { title: "probe" }, ...opts }),
       ],
       ["POST tasks/:id/close", () => api.post(url(`/agents/zyra/tasks/${ids.taskId}/close`, projectId), { data: {}, ...opts })],
       [
@@ -1379,5 +1434,336 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       (await after.json()).agent.lastUsedAt,
       "a chat message sent in the second project changed the main project's last-used date",
     ).toBeNull();
+  });
+
+  // ─── Review step for Zyra-chat-generated test cases ────────────────────────
+  // Chat's create/update/archive operations no longer write straight to `testcases` — they're
+  // staged on a chat_session_id-linked ai_generation_requests row (applyZyraChatOperations) and
+  // only committed by these same tasks/:id/{drafts/:index,save,close} routes seedTask()'s tests
+  // above already exercise for the Task board. The live chat route can't drive this itself (file
+  // header — no AI provider configured), so every scenario below arranges the staged row directly,
+  // the same rule seedTask() already established.
+
+  test("ZYR-A-45 a chat-staged batch never appears on the task board's own list", async () => {
+    const boardTaskId = seedTask();
+    const { taskId: chatTaskId } = seedChatReviewTask();
+
+    const res = await asOwner.get(url("/agents/zyra"), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    const boardIds = (body.tasks as Array<{ id: string }>).map((t) => t.id);
+    expect(boardIds, "the task board must still list its own generation requests").toContain(boardTaskId);
+    expect(
+      boardIds,
+      "a chat-staged batch (wrapped {opType,...} payload) would render with blank fields on the task board",
+    ).not.toContain(chatTaskId);
+
+    // Still reachable by id — it's a review batch, not a hidden/broken row.
+    const direct = await asOwner.get(url(`/agents/zyra/tasks/${chatTaskId}`), { failOnStatusCode: false });
+    expect(direct.status()).toBe(200);
+  });
+
+  test("ZYR-A-46 editing a pending chat-staged create draft updates its fields, not just the task-board shape", async () => {
+    const { taskId } = seedChatReviewTask();
+    const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+      data: { title: "Edited via review", priority: "P0", preconditions: "Signed in", description: "Sees the edited result" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `editing a chat draft — ${await res.text()}`).toBe(200);
+
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored[0].draft.title).toBe("Edited via review");
+    expect(stored[0].draft.priority).toBe("P0");
+    expect(stored[0].draft.preconditions).toBe("Signed in");
+    expect(stored[0].draft.description).toBe("Sees the edited result");
+    expect(stored[0].opType).toBe("create");
+  });
+
+  test("ZYR-A-47 editing a pending update/archive proposal only changes the staged fields — the real test case is untouched", async () => {
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: `E2E chat proposal target ${Date.now()}`, priority: "P2" },
+      failOnStatusCode: false,
+    });
+    expect(created.status()).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const { taskId } = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { priority: "P1" }, reason: "" }],
+      });
+      const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+        data: { priority: "P0" },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `editing an update proposal — ${await res.text()}`).toBe(200);
+
+      const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(stored[0].fields.priority).toBe("P0");
+      expect(
+        scalar(`SELECT priority FROM testcases WHERE id = ${literal(testcaseId)};`),
+        "editing the proposal must not touch the real test case before Save",
+      ).toBe("P2");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-48 an overlong edit is refused before it reaches the stored draft", async () => {
+    const { taskId } = seedChatReviewTask();
+    const before = scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+      data: { title: "x".repeat(600) },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `an overlong title — ${await res.text()}`).toBe(400);
+    expect(
+      scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`),
+      "a refused edit changed the stored draft",
+    ).toBe(before);
+  });
+
+  test("ZYR-A-49 an invalid draft index on edit is refused rather than corrupting the payload", async () => {
+    const { taskId } = seedChatReviewTask();
+    const before = scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    for (const index of ["9", "-1", "notanumber"]) {
+      const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/${index}`), {
+        data: { title: "probe" },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `draft index "${index}" answered ${res.status()}: ${await res.text()}`).toBeLessThan(500);
+    }
+    expect(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe(before);
+  });
+
+  test("ZYR-A-50 an edit is refused once the batch is no longer in_review", async () => {
+    const { taskId } = seedChatReviewTask({ status: "done" });
+    const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+      data: { title: "too late" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `editing a resolved batch — ${await res.text()}`).toBe(409);
+  });
+
+  test("ZYR-A-51 saving a chat-staged create draft writes a real test case into its own suite, tagged and audited as zyra_chat", async () => {
+    const suite = await asOwner.post(url("/suites"), { data: { name: `E2E zyra chat suite ${Date.now()}` }, failOnStatusCode: false });
+    expect(suite.status()).toBe(201);
+    const suiteId = (await suite.json()).id;
+    const draftTitle = `E2E chat created ${Date.now()}`;
+    const { taskId } = seedChatReviewTask({
+      entries: [{ opType: "create", draft: { suiteId, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P1", type: "Functional", status: "Draft" }, reason: "" }],
+    });
+
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving a chat-staged create — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    expect(body.savedCount).toBe(1);
+
+    const row = scalar(`SELECT suite_id FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`);
+    expect(row, "the draft's own suiteId must be respected, not left unassigned").toBe(suiteId);
+    const testcaseId = scalar(`SELECT id FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`);
+    const auditSource = scalar(
+      `SELECT diff->>'source' FROM audit_logs WHERE action = 'zyra_created' AND entity_id = ${literal(testcaseId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(auditSource, "a chat-saved case must be audited with source zyra_chat, same as chat's own direct writes").toBe("zyra_chat");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYR-A-52 saving a chat-staged update proposal applies the change to the real test case", async () => {
+    const created = await asOwner.post(url("/testcases"), { data: { title: `E2E update target ${Date.now()}`, priority: "P2" }, failOnStatusCode: false });
+    const testcaseId = (await created.json()).id;
+    try {
+      const { taskId } = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { priority: "P0", title: "Updated via chat review" }, reason: "" }],
+      });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving a chat-staged update — ${await res.text()}`).toBe(201);
+      expect(scalar(`SELECT priority FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("P0");
+      expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Updated via chat review");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-53 saving a chat-staged archive proposal archives the real test case", async () => {
+    const created = await asOwner.post(url("/testcases"), { data: { title: `E2E archive target ${Date.now()}` }, failOnStatusCode: false });
+    const testcaseId = (await created.json()).id;
+    try {
+      const { taskId } = seedChatReviewTask({
+        entries: [{ opType: "archive", testcaseId, externalId: "E2E-1", fields: { status: "Archived" }, reason: "" }],
+      });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving a chat-staged archive — ${await res.text()}`).toBe(201);
+      expect(scalar(`SELECT status FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Archived");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-54 saving only part of a mixed batch leaves the rest staged for a later Save, instead of closing the whole batch", async () => {
+    const other = await asOwner.post(url("/testcases"), { data: { title: `E2E untouched by partial save ${Date.now()}`, priority: "P3" }, failOnStatusCode: false });
+    const otherId = (await other.json()).id;
+    try {
+      const createTitle = `E2E partial-save create ${Date.now()}`;
+      const { taskId } = seedChatReviewTask({
+        entries: [
+          { opType: "create", draft: { suiteId: null, title: createTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+          { opType: "archive", testcaseId: otherId, externalId: "E2E-2", fields: { status: "Archived" }, reason: "" },
+        ],
+      });
+
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving one of two staged drafts — ${await res.text()}`).toBe(201);
+      const body = await res.json();
+      expect(body.savedCount).toBe(1);
+      expect(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(createTitle)};`)).toBe("1");
+      expect(scalar(`SELECT status FROM testcases WHERE id = ${literal(otherId)};`), "the unselected archive must not have run").not.toBe("Archived");
+
+      // The batch stays open — this is what distinguishes a chat-staged batch from a Task-board one.
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+      const remaining = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].opType).toBe("archive");
+
+      // And the remaining draft is still fully actionable.
+      const secondSave = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(secondSave.status(), `saving the remaining draft — ${await secondSave.text()}`).toBe(201);
+      expect(scalar(`SELECT status FROM testcases WHERE id = ${literal(otherId)};`)).toBe("Archived");
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+    } finally {
+      await asOwner.delete(url(`/testcases/${otherId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-55 an explicitly empty selection saves nothing and leaves the batch in review", async () => {
+    const { taskId } = seedChatReviewTask();
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [] }, failOnStatusCode: false });
+    expect(res.status(), `an explicit empty selection — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    expect(body.savedCount, "an explicitly empty selection must not fall back to saving everything").toBe(0);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    expect(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)};`)).toBe("0");
+  });
+
+  test("ZYR-A-56 omitting the selection entirely saves the whole batch, for back-compat", async () => {
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title: `E2E omit-selection A ${Date.now()}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+        { opType: "create", draft: { suiteId: null, title: `E2E omit-selection B ${Date.now()}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+      ],
+    });
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    expect(res.status(), `an omitted selection — ${await res.text()}`).toBe(201);
+    expect((await res.json()).savedCount).toBe(2);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYR-A-57 a stale update target aborts the whole batch, including a valid create selected alongside it", async () => {
+    const target = await asOwner.post(url("/testcases"), { data: { title: `E2E stale target ${Date.now()}` }, failOnStatusCode: false });
+    const targetId = (await target.json()).id;
+    const deleted = await asOwner.delete(url(`/testcases/${targetId}`), { failOnStatusCode: false });
+    expect(deleted.ok()).toBeTruthy();
+
+    const createTitle = `E2E should-not-be-created ${Date.now()}`;
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title: createTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+        { opType: "update", testcaseId: targetId, externalId: "E2E-3", fields: { priority: "P0" }, reason: "" },
+      ],
+    });
+
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0, 1] }, failOnStatusCode: false });
+    expect(res.status(), `saving alongside a deleted target — ${await res.text()}`).toBe(409);
+    const body = await res.json();
+    expect(body.staleDraftIndexes).toEqual([1]);
+    expect(
+      scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(createTitle)};`),
+      "the whole batch must roll back — a stale sibling draft must not let a valid create through",
+    ).toBe("0");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+  });
+
+  test("ZYR-A-58 two concurrent saves of the same batch don't create the test case twice", async () => {
+    const createTitle = `E2E concurrent save ${Date.now()}`;
+    const { taskId } = seedChatReviewTask({
+      entries: [{ opType: "create", draft: { suiteId: null, title: createTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" }],
+    });
+
+    const [a, b] = await Promise.all([
+      asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false }),
+      asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false }),
+    ]);
+    expect(a.status(), `first concurrent save — ${await a.text()}`).toBeLessThan(500);
+    expect(b.status(), `second concurrent save — ${await b.text()}`).toBeLessThan(500);
+    // One request wins the row lock and saves; the other, once it acquires the lock, sees a batch
+    // that has already moved on and is refused rather than saving a second time.
+    const winners = [a, b].filter((r) => r.status() === 201);
+    expect(winners.length, "exactly one of two concurrent saves should succeed").toBe(1);
+    expect(
+      scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(createTitle)};`),
+      "a race between two saves created the same test case twice",
+    ).toBe("1");
+  });
+
+  test("ZYR-A-59 saving is refused once test case storage is disabled, even though the batch was staged while it was allowed", async () => {
+    const { taskId } = seedChatReviewTask();
+    const off = await asOwner.patch(url("/agents/zyra/settings"), { data: { capabilities: { testcaseStorage: false } }, failOnStatusCode: false });
+    expect(off.status()).toBeLessThan(300);
+    try {
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving with storage disabled — ${await res.text()}`).toBe(403);
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    } finally {
+      await asOwner.patch(url("/agents/zyra/settings"), { data: { capabilities: { testcaseStorage: true } }, failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-60 feedback is refused on a chat-staged batch — regeneration only applies to task-board generation", async () => {
+    const { taskId } = seedChatReviewTask();
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/feedback`), {
+      data: { feedback: "regenerate this" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `feedback on a chat-staged batch — ${await res.text()}`).toBe(400);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+  });
+
+  test("ZYR-A-61 discarding a draft from a chat-staged batch works the same as it does for a task-board one", async () => {
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title: "E2E chat discard A", description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+        { opType: "create", draft: { suiteId: null, title: "E2E chat discard B", description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" }, reason: "" },
+      ],
+    });
+    const res = await asOwner.delete(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { failOnStatusCode: false });
+    expect(res.status(), `discarding a chat-staged draft — ${await res.text()}`).toBe(200);
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored.map((d: any) => d.draft.title)).toEqual(["E2E chat discard B"]);
+  });
+
+  test("ZYR-A-62 two concurrent discards of different drafts from the same batch both take effect", async () => {
+    // Regression coverage for zyraDeleteDraft's read-modify-write, now locked with FOR UPDATE — an
+    // unlocked pair of concurrent deletes can each read the same array and one silently overwrite
+    // the other's removal.
+    const { taskId } = seedChatReviewTask({
+      entries: Array.from({ length: 4 }, (_, i) => ({
+        opType: "create",
+        draft: { suiteId: null, title: `E2E concurrent discard ${i}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2", type: "Functional", status: "Draft" },
+        reason: "",
+      })),
+    });
+    const [a, b] = await Promise.all([
+      asOwner.delete(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { failOnStatusCode: false }),
+      asOwner.delete(url(`/agents/zyra/tasks/${taskId}/drafts/1`), { failOnStatusCode: false }),
+    ]);
+    expect(a.status(), `first concurrent discard — ${await a.text()}`).toBeLessThan(500);
+    expect(b.status(), `second concurrent discard — ${await b.text()}`).toBeLessThan(500);
+    // Whichever commits first shifts the later indexes down by one, so which two titles survive is
+    // legitimately order-dependent — not asserted here. What FOR UPDATE actually guarantees is that
+    // an unlocked read-modify-write can't lose: both removals apply, landing on exactly 2 remaining,
+    // never 3 (one removal silently overwritten) or corrupted.
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored, "a race between two discards lost one of the removals").toHaveLength(2);
   });
 });

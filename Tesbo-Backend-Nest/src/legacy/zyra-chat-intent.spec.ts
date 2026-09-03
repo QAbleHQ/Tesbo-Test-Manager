@@ -50,8 +50,20 @@ type Internals = {
   ) => { id?: string; name: string } | null;
   reconcileZyraReply: (
     decision: { reply: string; actionType: string; operations: Array<{ type: string }> },
-    applied: { testcases: unknown[]; activity: unknown[] }
+    applied: {
+      testcases: unknown[];
+      activity: unknown[];
+      moveBreakdown?: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>;
+    }
   ) => string;
+  zyraMoveBreakdownSuffix: (
+    moveBreakdown: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }> | undefined
+  ) => string;
+  zyraMoveBreakdown: (
+    projectId: string,
+    moveSuites: Map<string, { suiteName: string; created: boolean }>,
+    moveTargetIds: Set<string>
+  ) => Promise<Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>>;
   stripZyraTestcaseTables: (reply: string, hasRows: boolean) => string;
   detectZyraChatIntent: (message: string) => string;
   zyraDegradedDecision: (
@@ -325,8 +337,10 @@ describe("Zyra chat AI routing", () => {
     it("strips only the authored table when a reply carries both kinds", () => {
       const both = [coveredAreasTable, "", "| Title | Priority | Status |", "|---|---|---|", "| New login case | P1 | Draft |"].join("\n");
       const out = internals(svc).stripZyraTestcaseTables(both, true);
-      expect(out, "the coverage table is the answer and must survive").toContain("| Area | Test Cases |");
-      expect(out, "the authored rows belong in the structured array").not.toContain("New login case");
+      // The coverage table is the answer and must survive; the authored rows belong in the
+      // structured array, not the prose reply.
+      expect(out).toContain("| Area | Test Cases |");
+      expect(out).not.toContain("New login case");
     });
   });
 
@@ -451,6 +465,153 @@ describe("Zyra chat AI routing", () => {
         { testcases: [], activity: [] }
       );
       expect(reply).toBe(claim);
+    });
+
+    // The reported bug: Zyra's prose claimed "10 Email Login" + "3 Mobile Login" (13) against 11
+    // real testcases. The model's own count is never trusted for this — a ground-truth footer is
+    // appended below whatever the prose says, built from applied.moveBreakdown (see zyraMoveBreakdown).
+    it("appends the real per-suite breakdown below a reply that miscounted", () => {
+      const wrongClaim = "Email Login suite will receive the 10 email login test cases, and Mobile Login suite will receive the mobile login test cases.";
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: wrongClaim, actionType: "mixed", operations: [{ type: "move_to_suite" }, { type: "move_to_suite" }] },
+        {
+          testcases: Array.from({ length: 11 }, (_, i) => ({ id: `id-${i}` })),
+          activity: [],
+          moveBreakdown: [
+            { suiteId: "s-email", suiteName: "Email Login", created: true, count: 8 },
+            { suiteId: "s-mobile", suiteName: "Mobile Login", created: true, count: 3 }
+          ]
+        }
+      );
+      // The (wrong) model prose is preserved verbatim above the correction, same as every other
+      // reconciliation banner in this function — never silently rewritten.
+      expect(reply).toContain(wrongClaim);
+      expect(reply).toContain("📦 **Moved to suites (actual):** Email Login (created): 8 · Mobile Login (created): 3 — 11 test case(s) total.");
+    });
+
+    it("marks a targeted suite that matched nothing instead of omitting it", () => {
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: "Moved everything into QA Regression.", actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        {
+          testcases: [],
+          activity: [],
+          moveBreakdown: [{ suiteId: "s-1", suiteName: "QA Regression", created: false, count: 0 }]
+        }
+      );
+      // testcases is empty, so the "nothing was saved" banner fires too — the breakdown must still
+      // show underneath it rather than being dropped because the happy path never ran.
+      expect(reply).toContain("Nothing was saved");
+      expect(reply).toContain("QA Regression: 0 (none matched)");
+    });
+
+    it("does not append a breakdown when no move_to_suite operation ran", () => {
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: suiteClaim, actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        { testcases: [{ id: "11111111-1111-1111-1111-111111111111" }], activity: [] }
+      );
+      expect(reply).toBe(suiteClaim);
+      expect(reply).not.toContain("📦");
+    });
+  });
+
+  describe("zyraMoveBreakdownSuffix", () => {
+    it("returns nothing for an empty or missing breakdown", () => {
+      expect(internals(svc).zyraMoveBreakdownSuffix(undefined)).toBe("");
+      expect(internals(svc).zyraMoveBreakdownSuffix([])).toBe("");
+    });
+
+    it("sums counts across suites into the trailing total, not the operation count", () => {
+      const suffix = internals(svc).zyraMoveBreakdownSuffix([
+        { suiteId: "a", suiteName: "Email Login", created: false, count: 8 },
+        { suiteId: "b", suiteName: "Mobile Login", created: false, count: 3 }
+      ]);
+      expect(suffix).toContain("Email Login: 8");
+      expect(suffix).toContain("Mobile Login: 3");
+      expect(suffix).toContain("11 test case(s) total");
+    });
+
+    it("labels a suite created this turn", () => {
+      const suffix = internals(svc).zyraMoveBreakdownSuffix([
+        { suiteId: "a", suiteName: "Regression", created: true, count: 5 }
+      ]);
+      expect(suffix).toContain("Regression (created): 5");
+    });
+  });
+
+  describe("zyraMoveBreakdown (ground truth read-back)", () => {
+    function withDbQuery(impl: (sql: string, values: unknown[]) => Promise<{ rows: unknown[] }>): LegacyService {
+      const instance = makeLegacy();
+      (instance as unknown as { db: { query: jest.Mock } }).db.query = jest.fn(impl);
+      return instance;
+    }
+
+    it("returns [] and never queries when no move_to_suite operation targeted a suite", async () => {
+      const query = jest.fn();
+      const instance = withDbQuery(query);
+      const result = await internals(instance).zyraMoveBreakdown("project-1", new Map(), new Set());
+      expect(result).toEqual([]);
+      expect(query).not.toHaveBeenCalled();
+    });
+
+    it("reports 0 for a targeted suite that matched no testcases, without querying", async () => {
+      const query = jest.fn();
+      const instance = withDbQuery(query);
+      const moveSuites = new Map([["s-1", { suiteName: "QA Regression", created: false }]]);
+      const result = await internals(instance).zyraMoveBreakdown("project-1", moveSuites, new Set());
+      expect(result).toEqual([{ suiteId: "s-1", suiteName: "QA Regression", created: false, count: 0 }]);
+      expect(query).not.toHaveBeenCalled();
+    });
+
+    it("splits the real per-suite counts from the grouped read-back query", async () => {
+      const query = jest.fn((_sql: string, _values: unknown[]) =>
+        Promise.resolve({
+          rows: [
+            { suite_id: "s-email", count: 8 },
+            { suite_id: "s-mobile", count: 3 }
+          ]
+        })
+      );
+      const instance = withDbQuery(query);
+      const moveSuites = new Map([
+        ["s-email", { suiteName: "Email Login", created: true }],
+        ["s-mobile", { suiteName: "Mobile Login", created: true }]
+      ]);
+      const targetIds = new Set(["tc-1", "tc-2", "tc-3", "tc-4", "tc-5", "tc-6", "tc-7", "tc-8", "tc-9", "tc-10", "tc-11"]);
+      const result = await internals(instance).zyraMoveBreakdown("project-1", moveSuites, targetIds);
+      expect(result).toEqual([
+        { suiteId: "s-email", suiteName: "Email Login", created: true, count: 8 },
+        { suiteId: "s-mobile", suiteName: "Mobile Login", created: true, count: 3 }
+      ]);
+      // Exactly one read-back query for the whole turn, scoped to the project and the union of ids.
+      expect(query).toHaveBeenCalledTimes(1);
+      const [sql, values] = query.mock.calls[0];
+      expect(sql).toContain("GROUP BY suite_id");
+      expect(values[0]).toBe("project-1");
+      expect(values[1]).toHaveLength(11);
+    });
+
+    it("counts a testcase only once, under its final suite, when two ops in the same turn target it", async () => {
+      // Simulates the model putting the same id in two move operations: whichever UPDATE ran last
+      // wins in the database, so the grouped read-back — the only source this function trusts —
+      // returns it under exactly one suite_id. A naive per-operation counter would have double-counted it.
+      const query = jest.fn(() => Promise.resolve({ rows: [{ suite_id: "s-mobile", count: 1 }] }));
+      const instance = withDbQuery(query);
+      const moveSuites = new Map([
+        ["s-email", { suiteName: "Email Login", created: false }],
+        ["s-mobile", { suiteName: "Mobile Login", created: false }]
+      ]);
+      const result = await internals(instance).zyraMoveBreakdown("project-1", moveSuites, new Set(["tc-overlap"]));
+      expect(result).toEqual([
+        { suiteId: "s-email", suiteName: "Email Login", created: false, count: 0 },
+        { suiteId: "s-mobile", suiteName: "Mobile Login", created: false, count: 1 }
+      ]);
+    });
+
+    it("falls back to zero counts instead of throwing when the read-back query fails", async () => {
+      const instance = withDbQuery(() => Promise.reject(new Error("connection reset")));
+      const moveSuites = new Map([["s-1", { suiteName: "Email Login", created: false }]]);
+      const result = await internals(instance).zyraMoveBreakdown("project-1", moveSuites, new Set(["tc-1"]));
+      expect(result).toEqual([{ suiteId: "s-1", suiteName: "Email Login", created: false, count: 0 }]);
     });
   });
 });

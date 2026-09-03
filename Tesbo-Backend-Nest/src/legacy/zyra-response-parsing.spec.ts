@@ -112,11 +112,10 @@ describe("Zyra model-response parsing", () => {
         '{"reply":"## Coverage Analysis\\n\\nGenerated 15 test cases covering the full Projects, Test Suites & Test Cases module — happy path, negative';
       const parsed = internals(svc).parseModelJson(truncated);
       expect(parsed?.reply).toContain("Generated 15 test cases");
-      expect(parsed?.action, "salvage cannot recover the action").toBeUndefined();
-      expect(
-        (parsed as Record<string, unknown>)?.salvaged,
-        "a salvaged fragment must be distinguishable from a clean parse"
-      ).toBe(true);
+      // salvage cannot recover the action
+      expect(parsed?.action).toBeUndefined();
+      // a salvaged fragment must be distinguishable from a clean parse
+      expect((parsed as Record<string, unknown>)?.salvaged).toBe(true);
     });
 
     it("does not mark a cleanly parsed envelope as salvaged", () => {
@@ -299,7 +298,8 @@ describe("Zyra model-response parsing", () => {
           { reply, actionType: "answer", operations: [] },
           { testcases: [], activity: [] }
         );
-        expect(out, `must not double-warn on: ${reply}`).toBe(reply);
+        // must not double-warn on: ${reply}
+        expect(out).toBe(reply);
       }
     });
 
@@ -313,7 +313,8 @@ describe("Zyra model-response parsing", () => {
           { reply, actionType: "answer", operations: [] },
           { testcases: [], activity: [] }
         );
-        expect(out, `must not warn on: ${reply}`).toBe(reply);
+        // must not warn on: ${reply}
+        expect(out).toBe(reply);
       }
     });
 

@@ -22,6 +22,7 @@ import {
 } from "@/lib/api";
 import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, type Priority } from "@/components/ui";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -92,6 +93,8 @@ function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
+  const proposedCount = (counts["proposed-create"] || 0) + (counts["proposed-update"] || 0) + (counts["proposed-archive"] || 0);
+  if (proposedCount === rows.length) return `${rows.length} test case${rows.length === 1 ? "" : "s"} drafted for review`;
   const verb = counts.created ? "generated" : counts.updated ? "updated" : counts.archived ? "archived" : "suggested";
   return `${rows.length} test case${rows.length === 1 ? "" : "s"} ${verb}`;
 }
@@ -358,6 +361,10 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
   }
 
   const metaLabel = summarizeTestcaseActions(testcases);
+  // Proposed rows aren't in the repository yet — they get the review panel (select/edit/discard/
+  // save) instead of the plain read-only table, and don't count toward "View test cases" below.
+  const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
+  const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -383,10 +390,13 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
         dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
       />
 
-      <TestcaseTable rows={testcases} />
+      <TestcaseTable rows={appliedRows} />
+      {message.reviewRequestId && proposedRows.length > 0 && (
+        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      )}
 
       <div className="flex items-center gap-2">
-        {testcases.length > 0 && (
+        {appliedRows.length > 0 && (
           <Link
             href={`/projects/${projectId}/testcases`}
             className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]"

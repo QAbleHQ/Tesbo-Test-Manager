@@ -231,6 +231,13 @@ export default function PlansPage() {
     return sorted;
   }, [plans, searchQuery, statusFilter, sortBy]);
 
+  const hasActiveFilters = Boolean(searchQuery.trim() || statusFilter !== "all");
+
+  function clearFilters() {
+    setSearchQuery("");
+    setStatusFilter("all");
+  }
+
   const activeCount = plans.filter((p) => planStatus(p) === "active").length;
   const draftCount = plans.filter((p) => planStatus(p) === "draft").length;
   const passRate = overallPassRate(plans);
@@ -394,6 +401,15 @@ export default function PlansPage() {
               )}
             </button>
             <PlanSortMenu sortBy={sortBy} onSortChange={setSortBy} />
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--border)] px-3 text-[12px] font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+              >
+                Clear all
+              </button>
+            )}
             <div className="flex-1" />
             <div className="flex items-center gap-0.5 rounded-[6px] bg-[var(--surface-secondary)] p-[3px]">
               <button
@@ -447,7 +463,7 @@ export default function PlansPage() {
               <p className="text-[13px] text-[var(--muted-soft)]">Try adjusting your search or filters.</p>
               <button
                 type="button"
-                onClick={() => { setSearchQuery(""); setStatusFilter("all"); }}
+                onClick={clearFilters}
                 className="flex cursor-pointer items-center gap-1 text-[12px] font-medium text-[var(--accent-light)] hover:underline"
               >
                 <IconX size={12} stroke={2} />

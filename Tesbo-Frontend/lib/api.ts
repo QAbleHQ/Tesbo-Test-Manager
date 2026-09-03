@@ -899,8 +899,9 @@ export interface ZyraAgentState {
   /**
    * Test cases Zyra has created in this project, counted across chat mode AND task mode.
    *
-   * Authoritative, and not derivable from `tasks`: chat mode writes no generation row, so summing
-   * task.generatedCount reports 0 for a project whose cases were all made by talking to Zyra.
+   * Authoritative, and not derivable from `tasks`: a chat-staged batch that's still pending review
+   * (or was discarded without saving) has no rows in the live testcases table yet, so summing
+   * task.generatedCount over-counts drafts that were never actually saved.
    */
   testcasesCreated: number;
   tasks: ZyraTask[];
@@ -916,8 +917,17 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /**
+   * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
+   * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/
+   * moved/suggested) is a row already reflected in the repository.
+   */
   action?: string;
   reason?: string;
+  /** Position of this row within its review request's drafts — only set on a "proposed-*" row. */
+  draftIndex?: number;
+  /** The ai_generation_requests id this proposal is staged under — only set on a "proposed-*" row. */
+  reviewRequestId?: string;
 }
 
 export interface ZyraChatMessage {
@@ -933,6 +943,8 @@ export interface ZyraChatMessage {
   testcases: ZyraChatTestcaseRow[];
   activity: Array<{ actor?: string; title?: string; detail?: string; createdAt?: string }>;
   createdAt: string;
+  /** Set when this message proposed create/update/archive operations awaiting review/Save. */
+  reviewRequestId?: string | null;
 }
 
 export interface ZyraChatActivePlan {
@@ -1052,6 +1064,19 @@ export async function deleteZyraTaskDraft(projectId: string, taskId: string, dra
   });
 }
 
+/** Edit one pending draft's fields before Save — the review step's inline-edit action. */
+export async function editZyraTaskDraft(
+  projectId: string,
+  taskId: string,
+  draftIndex: number,
+  fields: Record<string, unknown>
+): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/drafts/${draftIndex}`, {
+    method: "PATCH",
+    body: fields,
+  });
+}
+
 export async function closeZyraTask(projectId: string, taskId: string): Promise<ZyraTask> {
   return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/close`, {
     method: "POST",
@@ -1062,7 +1087,13 @@ export async function saveZyraTask(
   projectId: string,
   taskId: string,
   data: { selectedDraftIndexes: number[]; suiteId?: string; suiteName?: string }
-): Promise<{ savedCount: number; suiteId: string | null; testcases: { id: string; externalId: string; title: string; createdAt: string }[] }> {
+): Promise<{
+  savedCount: number;
+  suiteId: string | null;
+  testcases: { id: string; externalId: string; title: string; createdAt: string }[];
+  /** Chat-staged batches only: drafts left un-saved by a partial selection, still pending review. */
+  remaining?: number;
+}> {
   return api(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/save`, {
     method: "POST",
     body: data,
@@ -1457,6 +1488,7 @@ export interface ImportTestCaseRow {
   status?: string;
   suite?: string;
   component?: string;
+  estimatedDuration?: string;
   // definitionId -> already-coerced value. The modal resolves select labels to option ids before
   // sending, since it is the side that loaded the option lists to build the mapping UI.
   customFieldValues?: Record<string, unknown>;

@@ -5,7 +5,7 @@ import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
-import { IntegrationSyncClient } from "./integration-sync.client";
+import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
 import { IntegrationSyncService } from "./integration-sync.service";
@@ -96,22 +96,34 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
   private async processNightlyOrchestrator(provider: SyncProvider): Promise<void> {
     const targets = await this.runs.listNightlySyncTargets(provider);
+    this.logger.log(`Nightly ${provider} sync starting for ${targets.length} target${targets.length === 1 ? "" : "s"}.`);
+    let started = 0;
+    let deduped = 0;
+    let failedToStart = 0;
     for (const target of targets) {
       try {
         const lastStart = await this.runs.getLastSuccessfulRunStart(target.projectId, provider);
         const since = lastStart ? new Date(lastStart.getTime() - NIGHTLY_SYNC_SINCE_BUFFER_MINUTES * 60_000).toISOString() : null;
-        await this.runs.startRun(target.organizationId, target.projectId, provider, null, target.remoteKey, {
+        const { alreadyRunning } = await this.runs.startRun(target.organizationId, target.projectId, provider, null, target.remoteKey, {
           triggerSource: "nightly",
           since
         });
+        if (alreadyRunning) deduped++;
+        else started++;
       } catch (err) {
         // One tenant's failure (revoked token, transient DB error) must never abort the rest of
         // the night's run for everyone else.
+        failedToStart++;
         this.logger.warn(
           `Nightly ${provider} sync failed to start for project ${target.projectId}: ${err instanceof Error ? err.message : err}`
         );
       }
     }
+    // The direct answer to "is the nightly cron healthy" without resorting to manual DB forensics.
+    // A nonzero `deduped` count on a night with no known double-fire is itself a signal that the
+    // BullMQ Job Scheduler misfired again (see idx_integration_sync_runs_nightly_cycle, V90) and is
+    // worth investigating on its own.
+    this.logger.log(`Nightly ${provider} sync complete: ${started} started, ${deduped} already ran this cycle, ${failedToStart} failed to start.`);
   }
 
   // ── Coordinator: page the provider, upsert tickets, fan out document jobs ──
@@ -182,7 +194,14 @@ export class IntegrationSyncProcessor extends WorkerHost {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Sync run ${runId} failed: ${message}`);
+      // IntegrationConnectionInvalidError's message is already the clean, user-facing text
+      // (integration-sync.client.ts) — logged distinctly here so an auth failure is grep-able
+      // separately from any other kind of run failure.
+      this.logger.warn(
+        err instanceof IntegrationConnectionInvalidError
+          ? `Sync run ${runId} could not use its ${provider} connection: ${message}`
+          : `Sync run ${runId} failed: ${message}`
+      );
       await this.runs.failRun(runId, message);
     }
   }

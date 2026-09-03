@@ -534,6 +534,18 @@ export default function BugsPage() {
     });
   }, [bugs, filterStatus, filterSeverity, filterPriority, filterAssignee, search]);
 
+  const hasActiveFilters = Boolean(
+    search.trim() || filterStatus || filterSeverity || filterPriority || filterAssignee
+  );
+
+  function clearFilters() {
+    setSearch("");
+    setFilterStatus("");
+    setFilterSeverity("");
+    setFilterPriority("");
+    setFilterAssignee("");
+  }
+
   /* Options for the "Assign to" filter: every project member, plus any bug's current assignee who
      has since left the project (or is an AI agent, never a member to begin with) — otherwise
      filtering to that person would offer no way to select them. */
@@ -820,6 +832,15 @@ export default function BugsPage() {
                   </option>
                 ))}
               </Select>
+              {hasActiveFilters && (
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--ink-200)] px-3 text-[12px] font-medium text-[var(--ink-600)] hover:bg-[var(--ink-100)]"
+                >
+                  Clear all
+                </button>
+              )}
               <div className="ml-auto">
                 <ViewToggle mode={viewMode} onChange={setViewMode} />
               </div>
