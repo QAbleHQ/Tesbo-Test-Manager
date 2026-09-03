@@ -20,7 +20,7 @@ import {
   type ZyraChatSession,
   type ZyraChatTestcaseRow,
 } from "@/lib/api";
-import { Button, CopyButton, PageLoader, StatusChip, Textarea } from "@/components/ui";
+import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, type Priority } from "@/components/ui";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { toTsv } from "@/lib/tsv";
@@ -70,14 +70,6 @@ function firstStepPreview(value: unknown): string {
   }
   if (typeof value !== "string") return "—";
   try { return firstStepPreview(JSON.parse(value)); } catch { return "—"; }
-}
-
-// ─── Tone maps — mirror RepositoryTestCaseTable's priority/status conventions ──
-function priorityTone(priority?: string) {
-  if (priority === "P0") return "error" as const;
-  if (priority === "P1") return "warning" as const;
-  if (priority === "P2") return "confidenceHigh" as const;
-  return "neutral" as const;
 }
 
 function statusTone(status?: string) {
@@ -156,9 +148,7 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
                 </td>
                 <td className="max-w-[280px] px-3 py-3 text-[12px] leading-snug text-[var(--foreground)]">{row.title}</td>
                 <td className="px-3 py-3">
-                  <StatusChip tone={priorityTone(row.priority)} className="!rounded-[5px] !px-[7px] !py-[2px] !font-mono !text-[11px] !font-semibold">
-                    {row.priority || "P2"}
-                  </StatusChip>
+                  <PriorityBadge priority={(row.priority || "P2") as Priority} />
                 </td>
                 <td className="px-3 py-3">
                   <StatusChip tone={statusTone(row.status)} className="!px-[9px] !py-[2px] !text-[11px] !font-medium">

@@ -814,11 +814,6 @@ function ProjectsPageContent() {
                               </div>
                             )}
                             <span className="text-xs font-medium" style={{ color: passRateTextColor(p.currentPassRate) }}>{p.currentPassRate}%</span>
-                            {p.runCounts && p.runCounts.failed > 0 && (
-                              <span className="whitespace-nowrap text-[11px]" style={{ color: "var(--status-fail-text)" }}>
-                                {p.runCounts.failed} failed
-                              </span>
-                            )}
                           </div>
                         ) : (
                           <span className="text-xs text-[var(--muted-soft)]">{p.statsLoaded ? "No runs yet" : "—"}</span>
