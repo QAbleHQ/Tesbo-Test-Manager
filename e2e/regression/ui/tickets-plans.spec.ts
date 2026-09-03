@@ -126,12 +126,14 @@ test.describe("test plan runs — reported tickets", () => {
 });
 
 /*
- * The plan detail screen: its progress header, its test-case count, the Plan items tab and the
- * inline edit form. Four more cards from the same screen.
+ * The plan detail screen: its progress header, its test-case count, the (now-removed) Plan items
+ * tab and internal sidebar, and the inline edit form. Four more cards from the same screen.
  *
  *   10213208002 / overall progress percentage not matching what the runs beneath it show
  *   10221932189 / the header's test-case count is wrong ("0 test cases" on a plan running twelve)
- *   10221983132 / Plan items shows a 0 count and "no planed items"
+ *   10221983132 / Plan items shows a 0 count and "no planed items" — moot since the Test Plans page
+ *                 restructuring removed the Plan items tab and its sidebar outright; REG-PLAN-05
+ *                 below now guards that removal instead.
  *   10221977100 / the Edit test plan form has no field labels
  *
  * WHY THESE MOVED HERE. ui/plans.spec.ts covers all four, but that file is pinned to
@@ -160,13 +162,14 @@ async function progressPanel(page: Page): Promise<{ percent: number; tiles: Reco
 }
 
 /**
- * One run's row in the plan's Test runs tab.
+ * One run's row in the plan's Test runs list.
  *
- * Matched on the Tailwind arbitrary-value class the card is built with: the rows carry no role or
- * test id, and every ancestor of the run's name would match a bare "div" filter.
+ * Matched on the shared `Card` component's class — the same card the standalone Runs module list
+ * uses — since the rows carry no role or test id and every ancestor of the run's name would match
+ * a bare "div" filter.
  */
 function runRow(page: Page, name: string): Locator {
-  return page.locator('div[class*="rounded-[10px]"]').filter({ hasText: name }).first();
+  return page.locator("div.tesbo-card").filter({ hasText: name }).first();
 }
 
 test.describe("test plan detail — progress, counts and editing", () => {
@@ -227,10 +230,10 @@ test.describe("test plan detail — progress, counts and editing", () => {
         await expect(runRow(page, runA.name)).toContainText("4 cases");
         await expect(runRow(page, runB.name)).toContainText("4 cases");
 
-        // The header must not be able to disagree with a row: each row's percentage is its own
-        // executed/total, and the header is the same arithmetic over both.
-        await expect(runRow(page, runA.name), "run A should be 3 of 4 settled").toContainText("75%");
-        await expect(runRow(page, runB.name), "run B should be 2 of 4 settled").toContainText("50%");
+        // The header must not be able to disagree with a row: each row's own executed/total split
+        // is part of the same arithmetic the header sums.
+        await expect(runRow(page, runA.name), "run A should be 3 of 4 settled").toContainText("3 / 4 cases");
+        await expect(runRow(page, runB.name), "run B should be 2 of 4 settled").toContainText("2 / 4 cases");
       } finally {
         await cleanupRun(api, projectId, runB);
         await cleanupRun(api, projectId, runA);
@@ -271,13 +274,16 @@ test.describe("test plan detail — progress, counts and editing", () => {
   );
 
   test(
-    ticket("REG-PLAN-05", "10221983132", "the empty Plan items tab explains where the plan's cases come from"),
+    ticket("REG-PLAN-05", "10221983132", "the plan detail page has no Plan items tab and no internal plans sidebar"),
     { tag: '@tesbo.testId("TES-TC-1299")' },
     async ({ page }) => {
       /*
-       * "Plan items shows 0 count and message 'no planed items'". The count was accurate — nothing
-       * was pinned — but sitting next to a header announcing the plan's cases it read as a
-       * contradiction. The copy names the other number now, so the two stop disagreeing.
+       * 10221983132 was "Plan items shows 0 count and message 'no planed items'" — accurate, but
+       * reading as a contradiction next to a header announcing the plan's cases. That UI is gone:
+       * the Test Plans page restructuring removed the Plan items tab and the plan-switcher sidebar
+       * entirely (Main Sidebar → Test Plans → [sidebar + Plan items + Test runs] is now just
+       * Test Plans → Test Runs), so this now guards both removals and that Test Runs still renders
+       * directly, with no tab navigation to reach it.
        */
       const api = await apiContext();
       const projectId = accountA().projectId;
@@ -287,11 +293,13 @@ test.describe("test plan detail — progress, counts and editing", () => {
         run = await seedRun(api, projectId, { statuses: ["Passed", "Failed"], planId: plan.id });
 
         await page.goto(`/projects/${projectId}/plans/${plan.id}`);
-        await page.getByRole("button", { name: /Plan items/ }).click();
 
-        const empty = page.getByText(/Nothing is pinned to this plan/);
-        await expect(empty).toBeVisible();
-        await expect(empty).toContainText(/\d+ test cases? come from the linked test runs/);
+        await expect(page.getByRole("button", { name: /Plan items/ })).toHaveCount(0);
+        await expect(page.getByRole("button", { name: /^Test runs$/ })).toHaveCount(0);
+        await expect(page.getByRole("link", { name: "All plans" })).toHaveCount(0);
+        await expect(page.getByRole("button", { name: "New test plan" })).toHaveCount(0);
+        await expect(page.getByRole("button", { name: "Create test run" }).first()).toBeVisible();
+        await expect(page.getByRole("button", { name: "Link existing run" })).toBeVisible();
       } finally {
         await cleanupRun(api, projectId, run);
         await cleanup(api, [`/api/plans/${plan.id}`]);
