@@ -13,15 +13,14 @@ import {
   IconCalendarEvent,
   IconClock,
   IconFileDescription,
-  IconLayoutGrid,
-  IconLayoutSidebarLeftCollapse,
-  IconLayoutSidebarLeftExpand,
-  IconList,
   IconClipboardList,
   IconCircleCheck,
   IconCircleX,
+  IconCircleMinus,
   IconAlertTriangle,
+  IconPlayerPlay,
   IconPlayerSkipForward,
+  IconArrowRight,
   IconServer,
   IconX,
 } from "@tabler/icons-react";
@@ -30,7 +29,6 @@ import {
   getPlan,
   updatePlan,
   deletePlan,
-  listPlanItems,
   listPlanRuns,
   getPlanProgress,
   listTestRuns,
@@ -40,40 +38,20 @@ import {
   getProject,
   listPlans,
   listProjectMembers,
-  removePlanItem,
-  type PlanItem,
   type PlanListItem,
   type PlanRunItem,
   type PlanProgress,
   type TestRunListItem,
   type TestEnvironmentSetting,
 } from "@/lib/api";
-import { Button, StatusChip, StatusBadge, PriorityBadge, Input, PageLoader, Select, Field, FieldLabel, type TestStatus, type Priority } from "@/components/ui";
+import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
+import { Button, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { planStatus, formatLastRun, OwnerAvatar, PlanStatusBadge } from "@/components/testplans/PlanCard";
-import { readStoredValue, writeStoredValue } from "@/lib/storage";
-
-const PANEL_STORAGE_KEY = "tesbo_plan_switcher_panel";
+import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
 
 /* ───── Helpers ───── */
-
-function toPriority(raw: string | null): Priority {
-  if (raw === "P0") return "critical";
-  if (raw === "P1") return "high";
-  if (raw === "P3") return "low";
-  return "medium";
-}
-
-function toTestStatus(raw: string | null): TestStatus {
-  const map: Record<string, TestStatus> = {
-    Passed: "pass",
-    Failed: "fail",
-    Blocked: "blocked",
-    Skipped: "skipped",
-  };
-  return map[raw ?? ""] ?? "not_run";
-}
 
 function runStatusToTone(status: string) {
   const map: Record<string, "success" | "info" | "warning" | "neutral"> = {
@@ -135,10 +113,6 @@ function StatTile({ label, value, icon, textVar, fillVar }: { label: string; val
   );
 }
 
-function StatusDot({ color }: { color: string }) {
-  return <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: color }} />;
-}
-
 /* ───── Main Page ───── */
 
 export default function PlanDetailPage() {
@@ -154,7 +128,6 @@ export default function PlanDetailPage() {
   }, [setTopBarFilled]);
 
   const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
-  const [items, setItems] = useState<PlanItem[]>([]);
   const [runs, setRuns] = useState<PlanRunItem[]>([]);
   /*
    * The header is DERIVED from the runs below it, not fetched separately.
@@ -175,8 +148,6 @@ export default function PlanDetailPage() {
   const [ownerNames, setOwnerNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
 
-  const [planPanelOpen, setPlanPanelOpen] = useState(true);
-
   // Create cycle from plan
   const [creatingCycle, setCreatingCycle] = useState(false);
   const [newCycleName, setNewCycleName] = useState("");
@@ -195,12 +166,6 @@ export default function PlanDetailPage() {
   const [editName, setEditName] = useState("");
   const [editDesc, setEditDesc] = useState("");
   const [editRelease, setEditRelease] = useState("");
-
-  // Removing a plan item
-  const [removingItemId, setRemovingItemId] = useState<string | null>(null);
-
-  // Tab state
-  const [activeTab, setActiveTab] = useState<"runs" | "items">("runs");
 
   function parseProjectSettings(raw: unknown): { testRunEnvironments?: Array<{ name?: string; url?: string }> } {
     if (typeof raw !== "string" || !raw.trim()) return {};
@@ -227,9 +192,8 @@ export default function PlanDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [p, i, r, pg, project, plansList, members] = await Promise.all([
+      const [p, r, pg, project, plansList, members] = await Promise.all([
         getPlan(planId),
-        listPlanItems(planId),
         listPlanRuns(planId),
         getPlanProgress(planId),
         getProject(projectId),
@@ -237,7 +201,6 @@ export default function PlanDetailPage() {
         listProjectMembers(projectId).catch(() => []),
       ]);
       setPlan(p);
-      setItems(i);
       setRuns(r);
       setProgress(pg);
       setProjectName(String(project.name || ""));
@@ -256,8 +219,6 @@ export default function PlanDetailPage() {
   }, [planId, projectId, router]);
 
   useEffect(() => {
-    const saved = readStoredValue(PANEL_STORAGE_KEY);
-    if (saved === "closed") setPlanPanelOpen(false);
     authMe().then((me) => {
       if (!me) {
         router.replace("/login");
@@ -266,14 +227,6 @@ export default function PlanDetailPage() {
       loadData().finally(() => setLoading(false));
     });
   }, [loadData, router]);
-
-  function togglePlanPanel() {
-    setPlanPanelOpen((prev) => {
-      const next = !prev;
-      writeStoredValue(PANEL_STORAGE_KEY, next ? "open" : "closed");
-      return next;
-    });
-  }
 
   async function handleCreateCycle(e: React.FormEvent) {
     e.preventDefault();
@@ -335,17 +288,6 @@ export default function PlanDetailPage() {
     router.push(`/projects/${projectId}/plans`);
   }
 
-  async function handleRemoveItem(itemId: string) {
-    if (removingItemId) return;
-    setRemovingItemId(itemId);
-    try {
-      await removePlanItem(planId, itemId);
-      await loadData();
-    } finally {
-      setRemovingItemId(null);
-    }
-  }
-
   const derivedProgress = useMemo<PlanProgress | null>(() => {
     if (!runs.length) return progress;
     const sum = (pick: (r: (typeof runs)[number]) => number) => runs.reduce((acc, r) => acc + (pick(r) || 0), 0);
@@ -355,7 +297,6 @@ export default function PlanDetailPage() {
     const blocked = sum((r) => r.blocked);
     const skipped = sum((r) => r.skipped);
     const untested = sum((r) => r.untested);
-    const executed = passed + failed + blocked + skipped;
     return {
       ...(progress ?? ({} as PlanProgress)),
       runCount: runs.length,
@@ -365,7 +306,8 @@ export default function PlanDetailPage() {
       blocked,
       skipped,
       untested,
-      completionPercent: totalCases > 0 ? Math.round((executed / totalCases) * 100) : 0,
+      passRate: computePassRate({ passed, failed, blocked }),
+      completionPercent: computeExecutionProgress({ passed, failed, blocked, skipped }, totalCases),
     };
   }, [runs, progress]);
 
@@ -447,7 +389,7 @@ export default function PlanDetailPage() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => { setActiveTab("runs"); setShowCreateCycle(true); }}
+                    onClick={() => setShowCreateCycle(true)}
                     className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[6px] border-0 bg-[var(--cta-primary)] px-3.5 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-[var(--cta-hover)]"
                   >
                     <IconPlus size={14} stroke={2} />
@@ -532,8 +474,7 @@ export default function PlanDetailPage() {
                     * test cases" directly above a TOTAL of 12.
                     *
                     * The chip now reports the same number as TOTAL, because that is what a reader
-                    * means by "how many test cases are in this plan". The pinned scope still has its
-                    * own count on the Plan items tab, where the word "items" says what it is.
+                    * means by "how many test cases are in this plan".
                     */}
                   <span className="font-mono text-[var(--foreground)]">
                     {/*
@@ -543,7 +484,7 @@ export default function PlanDetailPage() {
                       * same defect as 10221932189 pointing the other way. Caught by PLN-U-05, which
                       * exists precisely to catch this chip being widened by accident.
                       */}
-                    {derivedProgress?.totalCases || currentPlanSummary?.caseCount || items.length}
+                    {derivedProgress?.totalCases || currentPlanSummary?.caseCount || 0}
                   </span> test cases
                 </span>
                 {ownerName && <OwnerAvatar name={ownerName} seed={planOwnerId} />}
@@ -552,122 +493,28 @@ export default function PlanDetailPage() {
           )}
         </div>
 
-        {/* Body: plan switcher panel + detail content */}
-        <div className="flex min-h-0 flex-1 overflow-hidden rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]">
-          {/* ── Plans switcher panel ── */}
-          <aside className={`flex shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] transition-[width] duration-150 ${planPanelOpen ? "w-[220px]" : "w-[38px]"}`}>
-            <div className={`flex h-10 shrink-0 items-center border-b border-[var(--border)] px-3 ${planPanelOpen ? "justify-between" : "justify-center"}`}>
-              {planPanelOpen && (
-                <p className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-[var(--ink-600)]">
-                  <IconLayoutGrid size={14} stroke={1.75} className="text-[var(--accent-light)]" />
-                  Plans
-                  <span className="rounded-full bg-[var(--brand-soft)] px-1.5 py-px font-mono text-[10px] font-normal normal-case text-[var(--accent-light)]">
-                    {allPlans.length}
-                  </span>
-                </p>
-              )}
-              <div className="flex items-center gap-0.5">
-                {planPanelOpen && (
-                  <button
-                    type="button"
-                    title="New test plan"
-                    onClick={() => router.push(`/projects/${projectId}/plans?create=1`)}
-                    className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-[var(--muted)] transition-colors hover:bg-[var(--brand-soft)] hover:text-[var(--accent-light)]"
-                  >
-                    <IconPlus size={14} stroke={2.5} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  title={planPanelOpen ? "Collapse plans" : "Show plans"}
-                  onClick={togglePlanPanel}
-                  className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                >
-                  {planPanelOpen ? <IconLayoutSidebarLeftCollapse size={14} stroke={1.75} /> : <IconLayoutSidebarLeftExpand size={14} stroke={1.75} />}
-                </button>
-              </div>
-            </div>
-
-            {planPanelOpen && (
-              <div className="min-h-0 flex-1 overflow-y-auto p-2">
-                <button
-                  type="button"
-                  onClick={() => router.push(`/projects/${projectId}/plans`)}
-                  className="mb-1 flex h-8 w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-left text-[13px] text-[var(--ink-600)] transition-colors hover:bg-[var(--surface-secondary)]"
-                >
-                  <span className="flex items-center gap-1.5"><IconList size={14} stroke={1.75} className="text-[var(--muted)]" />All plans</span>
-                  <span className="font-mono text-[11px] text-[var(--muted)]">{allPlans.length}</span>
-                </button>
-
-                <div className="mx-1 my-1.5 h-px bg-[var(--border)]" />
-
-                {allPlans.map((p) => {
-                  const isActive = p.id === planId;
-                  const itemStatus = planStatus(p);
-                  return (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => router.push(`/projects/${projectId}/plans/${p.id}`)}
-                      className={`mb-0.5 flex h-8 w-full cursor-pointer items-center gap-2 rounded-[6px] px-2 text-left transition-colors ${isActive ? "bg-[var(--brand-soft)]" : "hover:bg-[var(--surface-secondary)]"}`}
-                    >
-                      <StatusDot color={itemStatus === "active" ? "var(--status-pass-dot)" : "var(--muted-soft)"} />
-                      <span className={`min-w-0 flex-1 truncate text-[12.5px] ${isActive ? "font-medium text-[var(--accent-light)]" : "text-[var(--ink-600)]"}`}>
-                        {p.name}
-                      </span>
-                      <span className={`shrink-0 font-mono text-[11px] ${isActive ? "text-[var(--accent-light)] opacity-70" : "text-[var(--muted)]"}`}>
-                        {p.runCount}
-                      </span>
-                    </button>
-                  );
-                })}
-
-                <button
-                  type="button"
-                  onClick={() => router.push(`/projects/${projectId}/plans?create=1`)}
-                  className="mt-2 flex h-8 w-full cursor-pointer items-center gap-1.5 rounded-[6px] border border-dashed border-[var(--border)] px-2 text-[12px] text-[var(--muted)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
-                >
-                  <IconPlus size={13} stroke={1.75} />
-                  New test plan
-                </button>
-              </div>
-            )}
-          </aside>
-
-          {/* ── Detail content ── */}
-          <div className="flex min-w-0 flex-1 flex-col bg-[var(--surface)]">
-            {/* Tabs */}
-            <div className="flex shrink-0 items-center gap-0 border-b border-[var(--border)] px-4">
-              <button
-                onClick={() => setActiveTab("runs")}
-                className={`flex h-10 cursor-pointer items-center gap-1.5 border-b-2 px-3 text-[13px] font-medium transition-colors ${
-                  activeTab === "runs" ? "border-[var(--brand-primary)] text-[var(--accent-light)]" : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
-                }`}
-              >
-                Test runs
-                <span className="rounded-full bg-[var(--surface-tertiary)] px-1.5 py-px font-mono text-[11px] text-[var(--muted)]">{visibleRuns.length}</span>
-              </button>
-              <button
-                onClick={() => setActiveTab("items")}
-                className={`flex h-10 cursor-pointer items-center gap-1.5 border-b-2 px-3 text-[13px] font-medium transition-colors ${
-                  activeTab === "items" ? "border-[var(--brand-primary)] text-[var(--accent-light)]" : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
-                }`}
-              >
-                Plan items
-                <span className="rounded-full bg-[var(--surface-tertiary)] px-1.5 py-px font-mono text-[11px] text-[var(--muted)]">{items.length}</span>
-              </button>
-            </div>
-
-            {/* Scrollable content */}
-            <div className="min-h-0 flex-1 overflow-y-auto p-6">
-              {/* Overall progress */}
+        {/* Test runs */}
+        <div className="flex min-h-0 flex-1 flex-col rounded-xl border border-[var(--border)] bg-[var(--surface)]">
+          <div className="min-h-0 flex-1 overflow-y-auto p-6">
+            {/* Overall progress */}
               {derivedProgress && total > 0 && (
                 <section className="mb-5 rounded-[10px] border border-[var(--border)] p-5">
                   <div className="mb-3 flex items-center justify-between">
-                    <span className="text-[13px] font-medium text-[var(--muted)]">Overall progress</span>
-                    <span className="font-mono text-[24px] font-bold tracking-tight" style={{ color: pctColor(derivedProgress.completionPercent) }}>
-                      {derivedProgress.completionPercent}%
-                    </span>
+                    <div>
+                      <span className="text-[13px] font-medium text-[var(--muted)]">Overall progress</span>
+                      <div className="font-mono text-[24px] font-bold tracking-tight" style={{ color: pctColor(derivedProgress.completionPercent) }}>
+                        {derivedProgress.completionPercent}%
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[13px] font-medium text-[var(--muted)]">Pass rate</span>
+                      <div
+                        className="font-mono text-[24px] font-bold tracking-tight"
+                        style={{ color: derivedProgress.passRate !== null ? pctColor(derivedProgress.passRate) : "var(--muted-soft)" }}
+                      >
+                        {derivedProgress.passRate !== null ? `${derivedProgress.passRate}%` : "—"}
+                      </div>
+                    </div>
                   </div>
                   <SegmentedBar passed={derivedProgress.passed} failed={derivedProgress.failed} blocked={derivedProgress.blocked} skipped={derivedProgress.skipped} untested={derivedProgress.untested} total={total} />
                   <div className="mt-4 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-6">
@@ -688,211 +535,181 @@ export default function PlanDetailPage() {
                 </section>
               )}
 
-              {/* Runs tab */}
-              {activeTab === "runs" && (
-                <section>
-                  <div className="mb-4 flex items-center gap-2">
-                    <Button onClick={() => setShowCreateCycle(!showCreateCycle)}>
-                      <IconPlus size={14} stroke={2} className="mr-1.5 inline" />
-                      Create test run
-                    </Button>
-                    <Button variant="secondary" onClick={handleOpenAssociate}>
-                      <IconLink size={14} stroke={1.75} className="mr-1.5 inline" />
-                      Link existing run
-                    </Button>
-                  </div>
+              <section>
+                <div className="mb-4 flex items-center gap-2">
+                  <Button onClick={() => setShowCreateCycle(!showCreateCycle)}>
+                    <IconPlus size={14} stroke={2} className="mr-1.5 inline" />
+                    Create test run
+                  </Button>
+                  <Button variant="secondary" onClick={handleOpenAssociate}>
+                    <IconLink size={14} stroke={1.75} className="mr-1.5 inline" />
+                    Link existing run
+                  </Button>
+                </div>
 
-                  {showCreateCycle && (
-                    <form onSubmit={handleCreateCycle} className="mb-4 space-y-3 rounded-[10px] border border-[var(--border)] p-4">
-                      <div>
-                        <label className="mb-1 block text-xs font-medium text-[var(--muted)]">Run Name</label>
-                        <Input value={newCycleName} onChange={(e) => setNewCycleName(e.target.value)} placeholder={planName || "Test Run"} autoFocus />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-xs font-medium text-[var(--muted)]">
-                          Environment <span className="text-[var(--error-foreground)]">*</span>
-                        </label>
-                        <Select value={selectedEnvironment} onChange={(e) => setSelectedEnvironment(e.target.value)} required>
-                          <option value="">Select environment</option>
-                          {environmentOptions.map((env) => (
-                            <option key={env.name} value={env.name}>{env.name}</option>
-                          ))}
-                        </Select>
-                        {selectedEnvironment && (
-                          <p className="mt-1 text-xs text-[var(--muted)]">
-                            URL: {environmentOptions.find((item) => item.name === selectedEnvironment)?.url ?? "Not available"}
-                          </p>
-                        )}
-                        {environmentOptions.length === 0 && (
-                          <p className="mt-1 text-xs text-[var(--status-blocked-text)]">No environments configured in project settings.</p>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Button type="submit" disabled={creatingCycle || !selectedEnvironment.trim() || environmentOptions.length === 0}>
-                          {creatingCycle ? "Creating..." : "Create Test Run"}
-                        </Button>
-                        <Button variant="secondary" type="button" onClick={() => setShowCreateCycle(false)}>Cancel</Button>
-                      </div>
-                    </form>
-                  )}
-
-                  <Modal open={showAssociate} onClose={() => setShowAssociate(false)} title="Link Existing Test Run">
-                    <div className="max-h-80 overflow-y-auto">
-                      {loadingRuns ? (
-                        <div className="flex items-center justify-center py-8">
-                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
-                        </div>
-                      ) : allRuns.length === 0 ? (
-                        <p className="py-8 text-center text-sm text-[var(--muted)]">No unlinked test runs available.</p>
-                      ) : (
-                        <ul className="space-y-2">
-                          {allRuns.map((run) => (
-                            <li key={run.id} className="flex items-center justify-between rounded-lg border border-[var(--border)] p-3 transition-colors hover:bg-[var(--surface-secondary)]">
-                              <div className="min-w-0 flex-1">
-                                <p className="truncate text-sm font-medium text-[var(--foreground)]">{run.name}</p>
-                                <div className="mt-0.5 flex items-center gap-2">
-                                  <StatusChip tone={runStatusToTone(run.status)}>{run.status}</StatusChip>
-                                  <span className="text-xs text-[var(--muted)]">{run.totalCases} cases</span>
-                                </div>
-                              </div>
-                              <Button size="sm" onClick={() => handleAssociate(run.id)} disabled={associating === run.id} className="ml-3 shrink-0">
-                                {associating === run.id ? "Linking..." : "Link"}
-                              </Button>
-                            </li>
-                          ))}
-                        </ul>
+                {showCreateCycle && (
+                  <form onSubmit={handleCreateCycle} className="mb-4 space-y-3 rounded-[10px] border border-[var(--border)] p-4">
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-[var(--muted)]">Run Name</label>
+                      <Input value={newCycleName} onChange={(e) => setNewCycleName(e.target.value)} placeholder={planName || "Test Run"} autoFocus />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-[var(--muted)]">
+                        Environment <span className="text-[var(--error-foreground)]">*</span>
+                      </label>
+                      <Select value={selectedEnvironment} onChange={(e) => setSelectedEnvironment(e.target.value)} required>
+                        <option value="">Select environment</option>
+                        {environmentOptions.map((env) => (
+                          <option key={env.name} value={env.name}>{env.name}</option>
+                        ))}
+                      </Select>
+                      {selectedEnvironment && (
+                        <p className="mt-1 text-xs text-[var(--muted)]">
+                          URL: {environmentOptions.find((item) => item.name === selectedEnvironment)?.url ?? "Not available"}
+                        </p>
+                      )}
+                      {environmentOptions.length === 0 && (
+                        <p className="mt-1 text-xs text-[var(--status-blocked-text)]">No environments configured in project settings.</p>
                       )}
                     </div>
-                  </Modal>
-
-                  {visibleRuns.length === 0 ? (
-                    <div className="rounded-[10px] border border-dashed border-[var(--border)] p-8 text-center">
-                      <p className="text-sm text-[var(--muted)]">No runs associated with this plan. Create a new run or link an existing one.</p>
+                    <div className="flex items-center gap-2">
+                      <Button type="submit" disabled={creatingCycle || !selectedEnvironment.trim() || environmentOptions.length === 0}>
+                        {creatingCycle ? "Creating..." : "Create Test Run"}
+                      </Button>
+                      <Button variant="secondary" type="button" onClick={() => setShowCreateCycle(false)}>Cancel</Button>
                     </div>
-                  ) : (
-                    <div className="flex flex-col gap-3">
-                      {visibleRuns.map((run) => {
-                        const runTotal = run.totalCases;
-                        // Executed is spelled out the same way the header's completionPercent is
-                        // (passed + failed + blocked + skipped), rather than total - untested, so a
-                        // run's percentage and the plan's are the same arithmetic on the same rows.
-                        const runExecuted = run.passed + run.failed + run.blocked + run.skipped;
-                        const runPercent = runTotal > 0 ? Math.round((runExecuted / runTotal) * 100) : 0;
-                        return (
-                          <div key={run.id} className="rounded-[10px] border border-[var(--border)] bg-[var(--background)] p-4 transition-colors hover:border-[var(--brand-primary)]">
-                            <div className="flex items-start justify-between gap-3">
-                              <Link href={`/projects/${projectId}/cycles/${run.id}`} className="group min-w-0 flex-1">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <h4 className="truncate text-[14px] font-semibold text-[var(--foreground)] transition-colors group-hover:text-[var(--accent-light)]">{run.name}</h4>
-                                  <StatusChip tone={runStatusToTone(run.status)}>{run.status}</StatusChip>
-                                </div>
-                                <div className="mt-1 flex flex-wrap items-center gap-3 text-[12px] text-[var(--muted)]">
-                                  {run.environment && (
-                                    <span className="flex items-center gap-1"><IconServer size={12} stroke={1.75} />Env: {run.environment}</span>
-                                  )}
-                                  {run.buildVersion && <span>Build: {run.buildVersion}</span>}
-                                  <span className="flex items-center gap-1"><IconCalendarEvent size={12} stroke={1.75} />{new Date(run.createdAt).toLocaleDateString()}</span>
-                                </div>
-                              </Link>
-                              <div className="ml-2 flex shrink-0 items-center gap-2">
-                                <span className="font-mono text-[16px] font-bold" style={{ color: runTotal > 0 ? pctColor(runPercent) : "var(--muted-soft)" }}>
-                                  {runPercent}%
-                                </span>
-                                <button
-                                  onClick={() => handleDissociate(run.id)}
-                                  title="Unlink from plan"
-                                  className="cursor-pointer rounded-lg p-1.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--status-fail-fill)] hover:text-[var(--error-foreground)]"
+                  </form>
+                )}
+
+                <Modal open={showAssociate} onClose={() => setShowAssociate(false)} title="Link Existing Test Run">
+                  <div className="max-h-80 overflow-y-auto">
+                    {loadingRuns ? (
+                      <div className="flex items-center justify-center py-8">
+                        <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--brand-primary)] border-t-transparent" />
+                      </div>
+                    ) : allRuns.length === 0 ? (
+                      <p className="py-8 text-center text-sm text-[var(--muted)]">No unlinked test runs available.</p>
+                    ) : (
+                      <ul className="space-y-2">
+                        {allRuns.map((run) => (
+                          <li key={run.id} className="flex items-center justify-between rounded-lg border border-[var(--border)] p-3 transition-colors hover:bg-[var(--surface-secondary)]">
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-medium text-[var(--foreground)]">{run.name}</p>
+                              <div className="mt-0.5 flex items-center gap-2">
+                                <StatusChip tone={statusTone(run.status)}>{run.status}</StatusChip>
+                                <span className="text-xs text-[var(--muted)]">{run.totalCases} cases</span>
+                              </div>
+                            </div>
+                            <Button size="sm" onClick={() => handleAssociate(run.id)} disabled={associating === run.id} className="ml-3 shrink-0">
+                              {associating === run.id ? "Linking..." : "Link"}
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </Modal>
+
+                {visibleRuns.length === 0 ? (
+                  <EmptyStateBlock
+                    title="No test runs yet"
+                    description="Create one or link an existing run to start tracking progress for this plan."
+                    icon={<IconPlayerPlay size={48} stroke={1.25} className="text-[var(--ink-300)]" />}
+                    action={
+                      <Button onClick={() => setShowCreateCycle(true)}>
+                        Create Test Run
+                      </Button>
+                    }
+                  />
+                ) : (
+                  <div className="grid gap-3">
+                    {visibleRuns.map((run) => {
+                      const runTotal = run.totalCases;
+                      const executed = run.passed + run.failed + run.blocked + run.skipped;
+                      const ownerName = run.ownerId ? ownerNames[run.ownerId] : null;
+                      return (
+                        <Card key={run.id} className="p-0 transition-colors hover:border-[var(--border-strong)]">
+                          <div className="flex items-center gap-3 p-4">
+                            <RunAvatar name={run.name} />
+
+                            <div className="min-w-0 flex-1">
+                              <div className="mb-0.5 flex flex-wrap items-center gap-2">
+                                <Link
+                                  href={`/projects/${projectId}/cycles/${run.id}`}
+                                  className="text-[14.5px] font-semibold text-[var(--foreground)] hover:text-[var(--accent-light)]"
                                 >
-                                  <IconX size={15} stroke={1.75} />
-                                </button>
+                                  {run.name}
+                                </Link>
+                                <StatusChip tone={statusTone(run.status)}>{run.status}</StatusChip>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-[var(--muted-soft)]">
+                                {run.environment && (
+                                  <span className="flex items-center gap-1">
+                                    <IconServer size={12} stroke={1.75} />
+                                    {run.environment}
+                                  </span>
+                                )}
+                                {run.buildVersion && <span>Build: {run.buildVersion}</span>}
+                                <span className="flex items-center gap-1">
+                                  <IconCalendarEvent size={12} stroke={1.75} />
+                                  {formatDate(run.createdAt)}
+                                </span>
                               </div>
                             </div>
 
-                            {runTotal > 0 && (
-                              <div className="mt-3">
-                                <SegmentedBar passed={run.passed} failed={run.failed} blocked={run.blocked} skipped={run.skipped} untested={run.untested} total={runTotal} />
-                                <div className="mt-1.5 flex flex-wrap items-center gap-3">
-                                  <span className="font-mono text-[11px] text-[var(--muted)]">{runTotal} cases</span>
-                                  {run.passed > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-pass-dot)" />{run.passed} passed</span>}
-                                  {run.failed > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-fail-dot)" />{run.failed} failed</span>}
-                                  {run.blocked > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-blocked-dot)" />{run.blocked} blocked</span>}
-                                  {run.skipped > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-skipped-dot)" />{run.skipped} skipped</span>}
-                                  {run.untested > 0 && <span className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><StatusDot color="var(--status-notrun-dot)" />{run.untested} untested</span>}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </section>
-              )}
+                            {ownerName && <OwnerAvatar name={ownerName} seed={run.ownerId} />}
 
-              {/* Items tab */}
-              {activeTab === "items" && (
-                <section>
-                  {items.length === 0 ? (
-                    <div className="rounded-[10px] border border-dashed border-[var(--border)] p-8 text-center">
-                      {/*
-                        * Basecamp 10221983132 ("Plan items shows 0 count and message 'no planed
-                        * items'"). The count was accurate — nothing was pinned — but it sat next to
-                        * a plan that was visibly running twelve cases, so it read as a bug. Naming
-                        * the other number is what removes the contradiction.
-                        */}
-                      <p className="text-sm text-[var(--muted)]">
-                        {total > 0
-                          ? `Nothing is pinned to this plan's scope yet. Its ${total} test case${total === 1 ? "" : "s"} come from the linked test runs — pin suites or cases here to say what the plan is meant to cover.`
-                          : "No items in this plan. Items are suites or test cases that define the scope of the plan."}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="border-b border-[var(--border)] bg-[var(--surface-secondary)]">
-                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">ID</th>
-                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Title</th>
-                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Priority</th>
-                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Last Result</th>
-                            <th className="w-10 px-4 py-2.5" />
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {items.map((item) => {
-                            const isSuite = !!item.suiteId;
-                            return (
-                              <tr key={item.id} className="border-b border-[var(--border-subtle)] transition-colors last:border-0 hover:bg-[var(--surface-secondary)]">
-                                <td className="px-4 py-2.5">
-                                  {isSuite ? (
-                                    <StatusChip tone="info">Suite</StatusChip>
-                                  ) : (
-                                    <span className="font-mono text-[12px] font-medium text-[var(--accent-light)]">{item.tcExternalId ?? "—"}</span>
-                                  )}
-                                </td>
-                                <td className="px-4 py-2.5 text-[var(--foreground)]">{isSuite ? (item.suiteName ?? "Unknown suite") : (item.tcTitle ?? "Untitled test case")}</td>
-                                <td className="px-4 py-2.5">{isSuite ? <span className="text-[var(--muted-soft)]">—</span> : <PriorityBadge priority={toPriority(item.tcPriority)} />}</td>
-                                <td className="px-4 py-2.5">{isSuite ? <span className="text-[var(--muted-soft)]">—</span> : <StatusBadge status={toTestStatus(item.lastStatus)} />}</td>
-                                <td className="px-4 py-2.5 text-center">
-                                  <button
-                                    onClick={() => handleRemoveItem(item.id)}
-                                    disabled={removingItemId === item.id}
-                                    title="Remove from plan"
-                                    className="cursor-pointer rounded p-1 text-[var(--muted-soft)] transition-colors hover:text-[var(--error-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
-                                  >
-                                    <IconX size={14} stroke={1.75} />
-                                  </button>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </section>
-              )}
-            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <Link
+                                href={`/projects/${projectId}/cycles/${run.id}`}
+                                title="View run"
+                                className="flex h-7 w-7 items-center justify-center rounded-[6px] text-[var(--muted-soft)] transition-colors hover:bg-[var(--ink-100)] hover:text-[var(--foreground)]"
+                              >
+                                <IconArrowRight size={15} stroke={1.75} />
+                              </Link>
+                              <button
+                                onClick={() => handleDissociate(run.id)}
+                                title="Unlink from plan"
+                                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-[6px] text-[var(--muted-soft)] transition-colors hover:bg-[var(--status-fail-fill)] hover:text-[var(--error-foreground)]"
+                              >
+                                <IconX size={15} stroke={1.75} />
+                              </button>
+                            </div>
+                          </div>
+                          {runTotal > 0 && (
+                            <div className="border-t border-[var(--border-subtle)] px-4 py-3">
+                              <RunProgressBar passed={run.passed} failed={run.failed} blocked={run.blocked} skipped={run.skipped} total={runTotal} />
+                              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex flex-wrap items-center gap-4">
+                                  <span className="flex items-center gap-1 text-[11.5px] font-medium text-[var(--status-pass-text)]">
+                                    <IconCircleCheck size={13} stroke={1.75} />
+                                    {run.passed} passed
+                                  </span>
+                                  <span className="flex items-center gap-1 text-[11.5px] font-medium text-[var(--status-fail-text)]">
+                                    <IconCircleX size={13} stroke={1.75} />
+                                    {run.failed} failed
+                                  </span>
+                                  <span className="flex items-center gap-1 text-[11.5px] font-medium text-[var(--status-blocked-text)]">
+                                    <IconCircleMinus size={13} stroke={1.75} />
+                                    {run.blocked} blocked
+                                  </span>
+                                  <span className="flex items-center gap-1 text-[11.5px] font-medium text-[var(--status-skipped-text)]">
+                                    <IconPlayerSkipForward size={13} stroke={1.75} />
+                                    {run.skipped} skipped
+                                  </span>
+                                </div>
+                                <span className="text-[11.5px] text-[var(--muted)]">
+                                  {executed} / {runTotal} cases
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </Card>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
           </div>
         </div>
       </div>

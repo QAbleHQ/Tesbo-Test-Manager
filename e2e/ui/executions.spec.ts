@@ -185,6 +185,83 @@ test.describe("auto bug-filing on Failed", () => {
   });
 });
 
+/*
+ * "[Test Runs] Unable to assign test cases for execution" — the editable "Assign to" control.
+ *
+ * Before this change, assignee was read-only everywhere in the UI, and even when set through the
+ * API it was silently wiped by the next status change or Save (see api/executions.spec.ts). These
+ * cover the same regression at the UI layer, through the controls a person actually uses.
+ */
+test.describe("assigning a test execution", () => {
+  test("assigning via the run drawer persists, and a status-only Save does not clear it", { tag: '@tesbo.testId("TES-TC-1915")' }, async ({ page }) => {
+    const title = `UI Assignee Drawer Case ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+
+      const assignSelect = page.getByRole("combobox", { name: "Assigned to" });
+      await expect(assignSelect).toBeVisible();
+      await assignSelect.selectOption(me.userId);
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterAssign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterAssign.assigneeId).toBe(me.userId);
+
+      // Re-open and Save again with only a status change — the drawer always resends the
+      // current selection, but this pins that a plain status edit elsewhere in the product
+      // (the inline dropdown) must not silently clear what was just assigned.
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("combobox", { name: "Assigned to" })).toHaveValue(me.userId);
+      await page.getByRole("button", { name: "Passed", exact: true }).first().click();
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterStatus] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterStatus.status).toBe("Passed");
+      expect(afterStatus.assigneeId, "a status change from the drawer must not clear the assignee").toBe(me.userId);
+
+      // Unassign via the drawer's "Unassigned" option.
+      await page.getByText(testcase.title).first().click();
+      await page.getByRole("combobox", { name: "Assigned to" }).selectOption("");
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+
+      const [afterUnassign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(afterUnassign.assigneeId).toBeNull();
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("the full-page execute view also offers Assigned to, and persists it", { tag: '@tesbo.testId("TES-TC-1916")' }, async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Assignee Full Page ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+      const assignSelect = page.getByRole("combobox", { name: "Assigned to" });
+      await expect(assignSelect).toBeVisible();
+      await assignSelect.selectOption(me.userId);
+      await page.getByRole("button", { name: "Save" }).first().click();
+      await page.waitForURL(`**/projects/${ctx.projectId}/cycles/${cycle.id}`);
+
+      const [after] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(after.assigneeId).toBe(me.userId);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
 test.describe("removing cases from a run", () => {
   /*
    * Basecamp 10199377404 — "[Test Run] Count does not match when deleted test cases from run". The
@@ -196,8 +273,12 @@ test.describe("removing cases from a run", () => {
    * filtered the local `executions` array (which drives the body) but `allRuns` (which drives the
    * panel badge) was only ever fetched by load() on mount, so the badge kept the pre-delete number.
    *
-   * Asserted against the badge AND the body together, because either number alone looked correct — it
-   * was only their disagreement that was wrong.
+   * The panel has since been removed from the run detail screen altogether: it duplicated navigation
+   * the screen already has (the "Test Runs" breadcrumb, the sidebar's Runs entry) while taking ~220px
+   * of width from the table the screen exists to show. So this test was updated rather than replaced —
+   * it now owns both ends of that change. The badge half became its opposite (the panel and its
+   * controls must be absent, and the table must occupy the width they held), and the half that still
+   * has a UI — the run body's own count following a removal, and the server agreeing — is unchanged.
    */
   async function setUpCycleWithCases(count: number) {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -220,7 +301,7 @@ test.describe("removing cases from a run", () => {
     return { cycle, testcaseIds };
   }
 
-  test("the run panel's count follows a removal, and never disagrees with the run's own Total", { tag: '@tesbo.testId("TES-TC-999")' }, async ({
+  test("the run detail shows no runs switcher panel, and its own count follows a removal", { tag: '@tesbo.testId("TES-TC-999")' }, async ({
     page,
   }) => {
     const { cycle, testcaseIds } = await setUpCycleWithCases(3);
@@ -228,12 +309,31 @@ test.describe("removing cases from a run", () => {
     try {
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
 
-      const badge = page.locator(`[data-testid="run-list-count"][data-run-id="${cycle.id}"]`);
       // The count beside the "Test Cases" heading — the run body's own number.
       const bodyCount = page.getByRole("heading", { name: "Test Cases" }).locator("+ span");
 
-      await expect(badge, "the run panel shows no count for this run").toHaveText("3");
       await expect(bodyCount).toHaveText("3");
+
+      // ── The runs switcher panel is gone ──
+      // Its per-run count badge (this testid only ever existed inside it), its "All runs" back-link
+      // and its collapse toggle are all absent.
+      await expect(page.locator('[data-testid="run-list-count"]')).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "All runs" })).toHaveCount(0);
+      await expect(page.getByTitle("Collapse runs")).toHaveCount(0);
+      await expect(page.getByTitle("Show runs")).toHaveCount(0);
+
+      // And the table has the width the panel held. Asserted as geometry rather than a class name
+      // because ~220px of horizontal space is precisely what was removed: the run's h1 marks the left
+      // edge of the content region, and with the panel present the table started past the panel's full
+      // width. Now only the card's own padding separates them.
+      const titleBox = await page.getByRole("heading", { level: 1 }).boundingBox();
+      const tableBox = await page.getByRole("table").boundingBox();
+      expect(titleBox, "the run title did not render").not.toBeNull();
+      expect(tableBox, "the test cases table did not render").not.toBeNull();
+      expect(
+        tableBox!.x - titleBox!.x,
+        "the test cases table still starts well right of the run header — a left panel is taking that width",
+      ).toBeLessThan(80);
 
       // Remove one case through the row's own control, the way the reporter did. The control only
       // appears on hover (opacity-0 until group-hover), so the row is hovered first.
@@ -242,13 +342,8 @@ test.describe("removing cases from a run", () => {
       await firstRow.hover();
       await firstRow.getByTitle("Remove from test run").click();
 
-      // The body drops to 2 — that half always worked.
+      // The body drops to 2.
       await expect(bodyCount).toHaveText("2", { timeout: 15_000 });
-      // And the panel badge follows it. This is the assertion that failed before the fix.
-      await expect(
-        badge,
-        "the run panel's count did not follow the removal — it disagrees with the run's own Total",
-      ).toHaveText("2");
 
       // Persisted, not just repainted: the server agrees the run now holds 2.
       const listed = await (await api.get(`/api/projects/${ctx.projectId}/cycles`)).json();
@@ -458,17 +553,242 @@ test.describe("execution evidence and automation provenance", () => {
       // Retries are a flakiness signal even on a result that eventually passed.
       await expect(page.getByText("2 retries")).toBeVisible();
 
-      // Evidence, grouped by kind: the screenshot renders inline, the trace is a named download.
+      // Evidence, grouped by kind: the screenshot renders inline, the trace gets its own viewer.
       await expect(page.getByText("Evidence")).toBeVisible();
       await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
       await expect(page.getByText("cart-trace.zip")).toBeVisible();
 
-      // The download link points at the route that did not exist before this card.
-      const traceLink = page.getByRole("link", { name: /cart-trace\.zip/ });
-      await expect(traceLink).toHaveAttribute(
+      /*
+       * A trace used to be a named download link, and this assertion pinned that presentation. It
+       * is now the viewer card below (a .zip in the Downloads folder needs `npx playwright
+       * show-trace` to be worth anything), so the expectation moved with the product — the archive
+       * itself is still one click away, which is what this checks.
+       */
+      const traceDownload = page.getByRole("link", { name: /Download \.zip/ });
+      await expect(traceDownload).toHaveAttribute(
         "href",
         new RegExp(`/api/cycles/${runId}/executions/[0-9a-f-]{36}/attachments/[0-9a-f-]{36}/download$`),
       );
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("opening a result fetches its evidence once, and stops", async ({ page }) => {
+    /*
+     * The regression for a drawer that never left "Loading evidence…".
+     *
+     * ExecutionEvidencePanel took its onCountChange prop as a dependency of the fetch callback, and
+     * this drawer passes an inline arrow that calls setExecutions(prev => prev.map(...)) — a new
+     * array every time. So reporting the count re-rendered the parent, which produced a new
+     * callback, a new `load`, and a re-fired effect: fetch, report, re-render, fetch, for as long as
+     * the drawer stayed open. Evidence did appear, for the few milliseconds between one fetch
+     * resolving and the next starting, which is why the assertions above pass either way and this
+     * one is about the request count instead.
+     *
+     * Counted rather than timed: "still loading after N seconds" would only ever be flaky, while a
+     * second request to the same endpoint is the defect itself, unambiguously.
+     */
+    const { runId, testcase } = await seedAutomatedRun("loop");
+    try {
+      const evidenceRequests: string[] = [];
+      page.on("request", (request) => {
+        // The list endpoint only — the download/trace-link calls the panel makes are legitimate.
+        if (/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/.test(request.url())) {
+          evidenceRequests.push(request.url());
+        }
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+
+      // The panel has to have actually loaded before a count of its requests means anything.
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      // Long enough for the loop to have made many more: each iteration was one round trip.
+      await page.waitForTimeout(3000);
+      expect(
+        evidenceRequests.length,
+        `the drawer refetched evidence ${evidenceRequests.length} times; it must settle after one`,
+      ).toBe(1);
+
+      // And it settled showing the evidence, not the spinner.
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+      await expect(page.getByText("Evidence")).toBeVisible();
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  /*
+   * "[Test Runs] Evidence section flickers while loading in Test Case Detail View."
+   *
+   * The loop above is fixed and pinned by the previous test, but `load()` still unconditionally set
+   * `loading` back to true on every call, including the refetch that follows every upload — and
+   * never cleared `files` first. So each refetch tore the already-rendered evidence back down to the
+   * "Loading evidence…" placeholder (with the header's stale count still showing above it) and then
+   * rebuilt it, every single time evidence was added. Fixed by only showing that placeholder before
+   * the panel's first fetch has completed; a later refetch now leaves whatever is already on screen
+   * in place until the new data actually arrives.
+   *
+   * Each of the three specs below holds the post-upload GET open with page.route so the assertions
+   * land while that refetch is actually in flight, rather than racing a real one.
+   */
+  test("uploading more evidence keeps what's already shown, instead of flashing back to the loading placeholder", async ({
+    page,
+  }) => {
+    const { runId, testcase } = await seedAutomatedRun("upload-no-flicker");
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "extra-note.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second file"),
+      });
+
+      // The refetch triggered by the upload is held open by the route above. While it's in flight,
+      // the evidence already on screen (and the upload's own progress state) must stay put.
+      await expect(page.getByText("Uploading…")).toBeVisible();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      await expect(page.getByText("extra-note.txt")).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+      expect(getCount, "expected exactly one refetch after the upload").toBe(2);
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("uploading the first piece of evidence for a result with none does not flash the loading placeholder", async ({
+    page,
+  }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Evidence First Upload ${Date.now()}`);
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "first-shot.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      });
+
+      // Empty-state edge case of the same defect: the "No evidence attached" message must stay put
+      // through the refetch too, rather than flashing to the loading placeholder in between.
+      await expect(page.getByText("Uploading…")).toBeVisible();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+
+      await expect(page.getByRole("img", { name: "first-shot.png" })).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByText(/No evidence attached/)).toHaveCount(0);
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("a failed refresh after upload keeps existing evidence visible and reports the error, without flickering", async ({
+    page,
+  }) => {
+    const { runId, testcase } = await seedAutomatedRun("upload-refresh-error");
+    try {
+      let getCount = 0;
+      await page.route(/\/executions\/[0-9a-f-]{36}\/attachments(\?|$)/, async (route) => {
+        if (route.request().method() === "GET") {
+          getCount++;
+          if (getCount > 1) {
+            await route.fulfill({
+              status: 500,
+              contentType: "application/json",
+              body: JSON.stringify({ error: "boom" }),
+            });
+            return;
+          }
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      // The upload itself (a plain POST) still succeeds; only the follow-up GET that refreshes the
+      // list fails, which is the case this error-handling path exists for.
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "extra-note.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second file"),
+      });
+
+      await expect(page.getByText("Couldn't load evidence for this result.")).toBeVisible({ timeout: 10_000 });
+      // A failed refresh must not discard evidence that was already showing.
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      await expect(page.getByText("Loading evidence…")).toHaveCount(0);
+    } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  test("a trace opens in the viewer, in place and in a new tab", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("trace");
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+
+      const card = page.getByTestId("trace-viewer");
+      await expect(card).toBeVisible();
+      await expect(card.getByText("Playwright Trace")).toBeVisible();
+      await expect(card.getByText("cart-trace.zip")).toBeVisible();
+
+      /*
+       * Both controls point at Playwright's hosted viewer, loaded with a signed link back to our
+       * own API — the viewer fetches the archive itself, cross-origin and without cookies, so a
+       * session-authorized download URL would be no use to it.
+       */
+      const newTab = card.getByTestId("trace-open-tab");
+      await expect(newTab).toBeVisible();
+      const href = await newTab.getAttribute("href");
+      expect(href).toContain("https://trace.playwright.dev/?trace=");
+      expect(decodeURIComponent(href ?? ""), "the viewer must be handed the public trace route").toMatch(
+        /\/api\/public\/trace\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+      );
+      await expect(newTab).toHaveAttribute("target", "_blank");
+
+      // In place: the iframe is only mounted once asked for, so the drawer stays cheap to open.
+      await expect(page.getByTestId("trace-iframe")).toHaveCount(0);
+      await card.getByTestId("trace-view").click();
+      const frame = page.getByTestId("trace-iframe");
+      await expect(frame).toBeVisible();
+      await expect(frame).toHaveAttribute("src", href ?? "");
+
+      await card.getByTestId("trace-close").click();
+      await expect(page.getByTestId("trace-iframe")).toHaveCount(0);
     } finally {
       await cleanUp(runId, testcase.id);
     }

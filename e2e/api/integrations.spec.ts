@@ -28,6 +28,16 @@ import {
  * the read, search, pagination and aggregate paths are exercised against real rows. What is left
  * uncovered is the response-shape handling of a live provider, which is stated in
  * docs/e2e-coverage-waves.md rather than silently skipped.
+ *
+ * The nightly sync cron (two BullMQ Job Schedulers firing at 00:00 IST — see
+ * integration-sync.module.ts) adds a per-ticket change log, read through
+ * GET .../knowledge-base/documents/:id/sync-events, which IS driven here end to end (authorization,
+ * 404s, empty vs. populated timelines) with knowledge_document_sync_events seeded directly for the
+ * same "no fake upstream" reason as the ticket tables above. What is NOT reachable from this suite:
+ * the orchestrator's own trigger is a cron tick, not an HTTP route, so the incremental "updated >="
+ * fetch, the content-compare write-skip, and the Linear plan-gating exclusion in
+ * IntegrationSyncService.listNightlySyncTargets are exercised by unit-level reasoning and code
+ * review rather than a driven end-to-end run.
  */
 
 test.describe("integrations — Jira and Linear", () => {
@@ -38,6 +48,9 @@ test.describe("integrations — Jira and Linear", () => {
   let asGuest: APIRequestContext;
   let anon: APIRequestContext;
 
+  /** The project's root folder id — needed to seed a mirror document directly (see below). */
+  let rootFolderId = "";
+
   test.beforeAll(async () => {
     tenant = await provisionRbacTenant("integrations");
     if (!tenant) return;
@@ -47,6 +60,10 @@ test.describe("integrations — Jira and Linear", () => {
     asGuest = await loginAs(tenant.guest);
     anon = await anonymousContext();
     purge(tenant);
+    backfillMissingRootFolder(tenant);
+    const tree = await asOwner.get(`/api/projects/${tenant.mainProjectId}/knowledge-base/folders/tree`);
+    expect(tree.status(), `resolving the KB root folder — ${await tree.text()}`).toBe(200);
+    rootFolderId = (await tree.json()).id;
   });
 
   test.afterAll(async () => {
@@ -76,6 +93,79 @@ test.describe("integrations — Jira and Linear", () => {
     exec(`DELETE FROM jira_project_mappings WHERE project_id IN (${projects});`);
     exec(`DELETE FROM linear_project_mappings WHERE project_id IN (${projects});`);
     exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)};`);
+    // Was missing entirely until the nightly-sync dedup fix (V90) added tests that seed rows here —
+    // without it, seeded runs from one test could leak into the next.
+    exec(`DELETE FROM integration_sync_runs WHERE project_id IN (${projects});`);
+    // knowledge_document_sync_events cascades off knowledge_documents (ON DELETE CASCADE), so
+    // deleting the seeded mirror documents is enough to clear both.
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+  }
+
+  /** Same fixture-repair as e2e/api/knowledge-base.spec.ts's helper of the same purpose — see its
+   *  comment for why: a pre-fix workspace can be bootstrapped with no knowledge_folders root, and
+   *  that cannot be repaired through the API. */
+  function backfillMissingRootFolder(t: RbacTenant): void {
+    const existing = scalar(
+      `SELECT COUNT(*) FROM knowledge_folders WHERE project_id = ${literal(t.mainProjectId)} AND is_root = true;`,
+    );
+    if (existing !== "0") return;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(t.organizationId)}, ${literal(t.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+  }
+
+  /**
+   * A mirrored Knowledge Base document exactly as integration-sync.processor.ts's processTicket
+   * would leave it — seeded directly because actually producing one means a real sync, which means
+   * a real outbound call to Jira/Linear (see the file-level note above).
+   */
+  function seedMirrorDocument(provider: "jira" | "linear", externalId: string, title: string, projectId?: string): string {
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId ?? tenant!.mainProjectId)}, ${literal(rootFolderId)}, ` +
+        `${literal(title)}, 'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', ` +
+        `'published', ${literal(provider)}, ${literal(externalId)}, 'mirror', true);`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(projectId ?? tenant!.mainProjectId)} ` +
+        `AND source_provider = ${literal(provider)} AND source_external_id = ${literal(externalId)} AND source_role = 'mirror';`,
+    );
+  }
+
+  /**
+   * A row of `integration_sync_runs`, as a completed (or failed) sync would have left it —
+   * seeded directly for the same "no real Jira/Linear call" reason as the fixtures above. Used to
+   * pin the nightly-sync dedup fix (V90) and the clean-reconnect-message fix on the read side
+   * (sync-status/sync-history), without needing to reproduce either defect through a real sync.
+   */
+  function seedSyncRun(
+    provider: "jira" | "linear",
+    fields: { status?: string; triggerSource?: "manual" | "nightly"; error?: string | null; remoteProjectKey?: string; projectId?: string } = {},
+  ): string {
+    const status = fields.status ?? "failed";
+    const projectId = fields.projectId ?? tenant!.mainProjectId;
+    exec(
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, error, remote_project_key, started_at, finished_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, ${literal(status)}, ` +
+        `${literal(status === "failed" ? "failed" : "done")}, ${literal(fields.triggerSource ?? "nightly")}, ` +
+        `${fields.error === undefined ? "NULL" : literal(fields.error)}, ${fields.remoteProjectKey ? literal(fields.remoteProjectKey) : "NULL"}, ` +
+        "now(), now());",
+    );
+    return scalar(
+      `SELECT id FROM integration_sync_runs WHERE project_id = ${literal(projectId)} AND provider = ${literal(provider)} ` +
+        "ORDER BY created_at DESC LIMIT 1;",
+    );
+  }
+
+  /** One row of a mirror document's sync timeline — what recordSyncEvent writes on a real change. */
+  function seedSyncEvent(documentId: string, eventType: "created" | "updated", changedSummary: string | null, provider: "jira" | "linear" = "jira"): void {
+    exec(
+      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary) VALUES (" +
+        `${literal(documentId)}, ${literal(provider)}, ${literal(eventType)}, ` +
+        `${changedSummary === null ? "NULL" : literal(changedSummary)});`,
+    );
   }
 
   /**
@@ -644,5 +734,178 @@ test.describe("integrations — Jira and Linear", () => {
       expect(res.status()).toBeGreaterThanOrEqual(400);
       expect(res.status()).toBeLessThan(500);
     }
+  });
+
+  // ─── Knowledge Base sync-events (the nightly-cron work's info-icon popover) ──────────────
+  //
+  // What's driven here: the read endpoint end to end, seeding knowledge_document_sync_events
+  // directly (the same reason every other seed* helper above exists — actually producing an event
+  // means a real sync, which means a real outbound call). What is NOT reachable from this suite,
+  // for the same reason the rest of this file states up top: the nightly orchestrator's own trigger
+  // (a BullMQ Job Scheduler tick, not an HTTP route), the incremental "updated >=" fetch, the
+  // content-compare skip, and the Linear plan-gating exclusion in listNightlySyncTargets — all of
+  // that logic either has no route to drive it from outside the process, or only resolves once a
+  // real provider answers. Recorded here rather than silently left uncovered.
+
+  test("INT-A-26 sync-events answers a caller with no session with a refusal, not the timeline", { tag: '@tesbo.testId("TES-TC-248")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-1", "Anon must not see this");
+    seedSyncEvent(doc, "created", null);
+
+    const res = await anon.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    await expectRefused(res, "sync-events (anonymous)");
+  });
+
+  test("INT-A-27 sync-events refuses a caller outside the project", { tag: '@tesbo.testId("TES-TC-249")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-2", "Not for the guest");
+    seedSyncEvent(doc, "created", null);
+
+    // The guest holds a valid session in this workspace but isn't a member of the project the
+    // document lives in — the harder case than an outright stranger.
+    const asGuestRes = await asGuest.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    await expectRefused(asGuestRes, "sync-events (non-member)");
+
+    // A member of the *second* project reaching for the main project's document by id.
+    const secondDoc = seedMirrorDocument("jira", "sync-evt-3", "Second project's ticket", tenant!.secondProjectId);
+    const crossProject = await asQa.get(url(`/knowledge-base/documents/${secondDoc}/sync-events`), { failOnStatusCode: false });
+    await expectRefused(crossProject, "sync-events (wrong project)");
+  });
+
+  test("INT-A-28 sync-events 404s for a document that doesn't exist or isn't in this project", { tag: '@tesbo.testId("TES-TC-250")' }, async () => {
+    const missing = await asOwner.get(url(`/knowledge-base/documents/${crypto.randomUUID()}/sync-events`), {
+      failOnStatusCode: false,
+    });
+    expect(missing.status(), `an unknown document id answered ${missing.status()}`).toBe(404);
+
+    // Malformed input must not reach the query as a bad UUID and 500.
+    const malformed = await asOwner.get(url("/knowledge-base/documents/not-a-uuid/sync-events"), {
+      failOnStatusCode: false,
+    });
+    expect(malformed.status(), `a malformed document id answered ${malformed.status()}: ${await malformed.text()}`).toBe(404);
+  });
+
+  test("INT-A-29 a mirror with no recorded history yet answers with an empty timeline, not an error", { tag: '@tesbo.testId("TES-TC-251")' }, async () => {
+    // Covers a mirror synced before this feature shipped: it exists, but recordSyncEvent never ran
+    // for it, so it has zero rows in knowledge_document_sync_events — the endpoint must not treat
+    // that as "not found".
+    const doc = seedMirrorDocument("jira", "sync-evt-4", "Never had an event logged");
+    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    expect((await res.json()).events).toEqual([]);
+  });
+
+  test("INT-A-30 a regular (non-synced) document also answers with an empty timeline", { tag: '@tesbo.testId("TES-TC-252")' }, async () => {
+    // The endpoint doesn't special-case on source_provider — a human-authored document is simply a
+    // document with no sync history, not a different code path.
+    const created = await asOwner.post(url("/knowledge-base/documents"), {
+      data: { title: "Plain human document", folderId: rootFolderId },
+      failOnStatusCode: false,
+    });
+    expect(created.status()).toBe(201);
+    const docId = (await created.json()).id;
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/sync-events`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    expect((await res.json()).events).toEqual([]);
+  });
+
+  test("INT-A-31 a mirror's timeline lists its events newest first, with type and summary", { tag: '@tesbo.testId("TES-TC-253")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-5", "E2E-70: Has a real timeline");
+    seedSyncEvent(doc, "created", null);
+    seedSyncEvent(doc, "updated", "Status: To Do -> In Progress updated.");
+    seedSyncEvent(doc, "updated", "Description updated.");
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.events).toHaveLength(3);
+    // Newest first: the last-seeded "Description updated." row leads.
+    expect(body.events[0].eventType).toBe("updated");
+    expect(body.events[0].changedSummary).toBe("Description updated.");
+    expect(body.events[2].eventType).toBe("created");
+    expect(body.events[2].changedSummary).toBeNull();
+    // Fewer than a page's worth (default limit 5) — nothing more to page to.
+    expect(body.hasMore).toBe(false);
+  });
+
+  test("INT-A-32 the timeline paginates 5 per page, newest first, stable across pages", { tag: '@tesbo.testId("TES-TC-256")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-6", "E2E-71: Long timeline");
+    // 7 events, oldest to newest, so the newest ("v7") is what page 1 must lead with.
+    for (let i = 1; i <= 7; i++) seedSyncEvent(doc, "updated", `v${i}`);
+
+    const firstPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=0`))).json();
+    expect(firstPage.events).toHaveLength(5);
+    expect(firstPage.hasMore, "5 shown out of 7 total — there must be a next page").toBe(true);
+    expect(firstPage.events.map((e: any) => e.changedSummary)).toEqual(["v7", "v6", "v5", "v4", "v3"]);
+
+    const secondPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=5`))).json();
+    expect(secondPage.events).toHaveLength(2);
+    expect(secondPage.hasMore, "exactly the remainder — no third page").toBe(false);
+    expect(secondPage.events.map((e: any) => e.changedSummary)).toEqual(["v2", "v1"]);
+
+    // Pages don't overlap or drop a row between them.
+    const allSummaries = [...firstPage.events, ...secondPage.events].map((e: any) => e.changedSummary);
+    expect(allSummaries).toEqual(["v7", "v6", "v5", "v4", "v3", "v2", "v1"]);
+
+    // Past the end is an empty page with nothing further, not an error.
+    const beyond = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=500`), { failOnStatusCode: false });
+    expect(beyond.status()).toBe(200);
+    const beyondBody = await beyond.json();
+    expect(beyondBody.events).toEqual([]);
+    expect(beyondBody.hasMore).toBe(false);
+  });
+
+  test("INT-A-33 malformed limit/offset fall back to defaults instead of a 500", { tag: '@tesbo.testId("TES-TC-257")' }, async () => {
+    const doc = seedMirrorDocument("jira", "sync-evt-7", "E2E-72: Bad pagination input");
+    seedSyncEvent(doc, "created", null);
+
+    for (const qs of ["limit=abc&offset=abc", "limit=-5", "offset=-1", "limit=2.7", "limit=0", "limit=100000"]) {
+      const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?${qs}`), { failOnStatusCode: false });
+      expect(res.status(), `${qs} answered ${res.status()}: ${await res.text()}`).toBe(200);
+      const body = await res.json();
+      expect(Array.isArray(body.events), `${qs} — events was ${JSON.stringify(body)}`).toBe(true);
+    }
+  });
+
+  // ─── Nightly sync dedup (V90) and the clean reconnect message ───────────────
+  //
+  // The orchestrator's own trigger is a cron tick, not an HTTP route — see the file header note —
+  // so neither defect from the 2026-09-02 incident (a duplicate nightly fire; a raw provider 401
+  // leaking through) is reproduced here. That's IntegrationSyncService.spec.ts's and
+  // IntegrationSyncClient.spec.ts's job. What belongs here is the real read path: given the rows
+  // those write-side fixes actually produce, does the real HTTP + auth + Postgres path deliver them
+  // correctly to the screen.
+
+  test("INT-A-34 sync-status and sync-history surface the clean reconnect message, never a raw provider error", { tag: '@tesbo.testId("TES-TC-258")' }, async () => {
+    seedSyncRun("jira", { status: "failed", error: "Jira needs to be reconnected to this workspace." });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status()).toBe(200);
+    const statusBody = await status.json();
+    expect(statusBody.run?.error).toBe("Jira needs to be reconnected to this workspace.");
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status()).toBe(200);
+    const historyBody = await history.json();
+    expect(historyBody.runs[0]?.error).toBe("Jira needs to be reconnected to this workspace.");
+
+    // Pins the literal shape of the reported bug: a raw provider body must never reach either route.
+    const rendered = JSON.stringify([statusBody, historyBody]);
+    expect(rendered).not.toContain('"code":401');
+    expect(rendered).not.toContain("Unauthorized");
+  });
+
+  test("INT-A-35 sync-status and sync-history stay well-formed with more than one same-day nightly run recorded", { tag: '@tesbo.testId("TES-TC-259")' }, async () => {
+    // A pre-fix workspace can already carry duplicate nightly rows from the incident, or a residual
+    // edge case can still slip one through — either way, the read side must not assume at most one.
+    seedSyncRun("jira", { status: "failed", error: "jira request failed (401): {\"code\":401,\"message\":\"Unauthorized\"}" });
+    seedSyncRun("jira", { status: "succeeded", error: null });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status()).toBe(200);
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status()).toBe(200);
+    const historyBody = await history.json();
+    expect(historyBody.runs.length).toBeGreaterThanOrEqual(2);
   });
 });

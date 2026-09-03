@@ -2,7 +2,7 @@ import type { ButtonHTMLAttributes } from "react";
 import { cx } from "@/components/ui/cx";
 
 type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "destructive" | "ai" | "confidence";
-type ButtonSize = "sm" | "md" | "lg";
+type ButtonSize = "sm" | "md" | "lg" | "icon";
 
 const variantClasses: Record<ButtonVariant, string> = {
   // Violet CTA — main action buttons
@@ -32,6 +32,11 @@ const sizeClasses: Record<ButtonSize, string> = {
   sm: "h-8 rounded-[6px] px-3 text-[13px] font-medium",
   md: "h-9 rounded-[6px] px-4 text-[13px] font-medium",
   lg: "h-10 rounded-[6px] px-5 text-[14px] font-medium",
+  // Square icon-only button. cx() is a plain className join (no tailwind-merge dedup), so this
+  // carries no padding utility of its own — callers that need icon buttons use this instead of
+  // fighting sizeClasses.sm's `px-3` with an ad-hoc `p-0` override, which is a cascade-order race
+  // that can leave the padding in place and squeeze/clip the icon inside a fixed h-8 w-8 box.
+  icon: "h-8 w-8 rounded-[6px]",
 };
 
 export type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {

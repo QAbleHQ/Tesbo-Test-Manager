@@ -11,6 +11,7 @@ import {
   IconVideo,
 } from "@tabler/icons-react";
 import { Button } from "@/components/ui";
+import TraceViewerPanel from "@/components/TraceViewerPanel";
 import {
   API_BASE,
   listExecutionEvidence,
@@ -89,9 +90,34 @@ interface Props {
 export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly, onCountChange }: Props) {
   const [files, setFiles] = useState<ExecutionEvidence[]>([]);
   const [loading, setLoading] = useState(true);
+  /*
+   * Whether the panel has completed at least one fetch (success or failure) for this
+   * cycleId/executionId. Gates the full-panel "Loading evidence…" placeholder to the very first
+   * load only — see the note above `load` for why every later call also flips `loading` back to
+   * true and would otherwise tear the already-rendered grid down and rebuild it.
+   */
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  /*
+   * The count callback is held in a ref, and deliberately kept out of `load`'s dependencies.
+   *
+   * It used to be a dependency, which made the panel unusable in the run drawer: that caller passes
+   * an inline arrow that calls setExecutions(prev => prev.map(...)), so every reported count
+   * re-rendered the parent, produced a new callback identity, produced a new `load`, re-fired the
+   * effect below, and fetched again — for ever. The panel never left "Loading evidence…" and the
+   * attachments endpoint took a request per render. The full-page execute screen passes no callback
+   * at all, which is the only reason evidence ever appeared there.
+   *
+   * A ref fixes it here rather than asking every caller to remember useCallback, since forgetting
+   * cost the feature entirely and failed loudly nowhere.
+   */
+  const onCountChangeRef = useRef(onCountChange);
+  useEffect(() => {
+    onCountChangeRef.current = onCountChange;
+  }, [onCountChange]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -99,15 +125,16 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
     try {
       const res = await listExecutionEvidence(cycleId, executionId);
       setFiles(res.list ?? []);
-      onCountChange?.(res.list?.length ?? 0);
+      onCountChangeRef.current?.(res.list?.length ?? 0);
     } catch {
       // A failed evidence fetch must not blank the panel it lives in — the status picker and the
       // test case body around it are still usable, so this reports and stops.
       setError("Couldn't load evidence for this result.");
     } finally {
       setLoading(false);
+      setHasLoaded(true);
     }
-  }, [cycleId, executionId, onCountChange]);
+  }, [cycleId, executionId]);
 
   useEffect(() => {
     void load();
@@ -188,7 +215,10 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
         </p>
       )}
 
-      {loading ? (
+      {loading && !hasLoaded ? (
+        // Only the very first fetch shows this placeholder. A later refetch — after an upload, or
+        // a retry following an error — must not tear down evidence that is already on screen just
+        // to show the same text again; see the note on `hasLoaded` above.
         <p className="text-[12.5px] text-[var(--muted)]">Loading evidence…</p>
       ) : files.length === 0 ? (
         <p className="text-[12.5px] text-[var(--muted)]">
@@ -204,8 +234,29 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                   <Icon size={13} />
                   {KIND_LABEL[kind]}
                 </p>
-                {/* Screenshots are worth seeing without a click; everything else is a named row. */}
-                {kind === "screenshot" ? (
+                {/*
+                  * Three shapes, by what the file is worth: screenshots show themselves, a trace
+                  * gets an inline viewer (a .zip download is useless without a terminal), and
+                  * everything else stays a named download row.
+                  */}
+                {kind === "trace" ? (
+                  <div className="space-y-2">
+                    {items.map((file) => (
+                      <div key={file.id} className="space-y-1">
+                        <TraceViewerPanel cycleId={cycleId} executionId={executionId} file={file} />
+                        {/* The raw archive stays one click away — `npx playwright show-trace` and
+                            attaching it to a bug report both still want the file itself. */}
+                        <a
+                          href={evidenceDownloadUrl(cycleId, executionId, file.id)}
+                          className="inline-flex items-center gap-1.5 pl-1 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                        >
+                          <IconDownload size={12} />
+                          Download .zip
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                ) : kind === "screenshot" ? (
                   <div className="flex flex-wrap gap-2">
                     {items.map((file) => (
                       <a

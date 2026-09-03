@@ -244,14 +244,7 @@ export default function SignupPage() {
               {submitting ? "Sending code..." : "Create account"}
             </Button>
             <p className="text-center text-[11px] leading-relaxed text-[var(--muted-soft)]">
-              By signing up you agree to our{" "}
-              <Link href="/terms-and-conditions" className="hover:underline">
-                Terms
-              </Link>{" "}
-              and{" "}
-              <Link href="/privacy-policy" className="hover:underline">
-                Privacy Policy
-              </Link>
+              By signing up you agree to our Terms and Privacy Policy
             </p>
           </form>
         )}

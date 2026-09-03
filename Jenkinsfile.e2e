@@ -216,10 +216,25 @@ pipeline {
 
             # --ipc=host is Playwright's own recommendation: Chromium's default 64MB /dev/shm inside a
             # container makes tabs crash under parallel load, which reads as random test flake.
+            #
+            # The six JENKINS_*/GIT_*/BUILD_*/JOB_NAME variables are forwarded for the Tesbo
+            # reporter, and this is the one CI trap that is not specific to this repo: `docker run`
+            # inherits NOTHING from the agent's environment, so a containerised run silently loses
+            # every provider variable. The SDK's detectRunSource() (dist/ci.js) needs JENKINS_URL and
+            # BUILD_NUMBER to recognise Jenkins at all, and reads the rest for the run's commit SHA,
+            # branch and build link. Without them the run is still recorded — but labelled "other"
+            # with no provenance, and with no externalId, which is the idempotency key that makes
+            # shards and re-runs converge on one run instead of opening several. Nothing errors; the
+            # data is just quietly worse. The same applies to GitHub Actions `container:` and
+            # GitLab `image:`.
+            #
+            # The reporter's own three values are NOT here: baseUrl, projectId and token come from
+            # the committed e2e/tesbo.config.json, which the -v mount already puts in the container.
             docker run --rm --ipc=host \\
               --env-file "$WORKSPACE/.e2e-db.env" \\
               -e API_BASE_URL -e WEB_BASE_URL \\
               -e E2E_SPECS -e E2E_WORKERS -e E2E_DB_TRANSPORT -e E2E_SKIP_BROWSER_INSTALL \\
+              -e JENKINS_URL -e BUILD_NUMBER -e BUILD_URL -e JOB_NAME -e GIT_COMMIT -e GIT_BRANCH \\
               -v "$WORKSPACE:/work" \\
               -w /work \\
               "$RUNNER_IMAGE" \\

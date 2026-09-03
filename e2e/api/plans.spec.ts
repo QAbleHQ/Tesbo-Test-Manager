@@ -315,6 +315,10 @@ test.describe("test plan progress roll-up", () => {
       expectBucketsSumToTotal(progress);
       expect(progress.executed).toBe(4);
       expect(progress.completionPercent).toBe(67);
+      // Pass Rate = Passed / (Passed + Failed + Blocked) = 1 / 3 = 33%. Skipped and the two
+      // untested/retest cases sit outside this ratio entirely — completionPercent (67%) counts
+      // Skipped as "done", passRate does not count it as a verdict either way.
+      expect(progress.passRate).toBe(33);
 
       const runs: {
         id: string;
@@ -400,6 +404,7 @@ test.describe("test plan progress roll-up", () => {
       expect(progress.untested).toBe(0);
       expectBucketsSumToTotal(progress);
       expect(progress.completionPercent).toBe(100);
+      expect(progress.passRate).toBe(100);
 
       const runs: { id: string; totalCases: number; untested: number }[] = await (
         await request.get(`/api/plans/${plan.id}/runs`)
@@ -445,6 +450,9 @@ test.describe("test plan progress roll-up", () => {
       expect(progress.executed).toBe(0);
       expectBucketsSumToTotal(progress);
       expect(progress.completionPercent).toBe(0);
+      // Nothing has settled — null (rendered as "—"), not 0%, so an empty plan is never shown as a
+      // failing one.
+      expect(progress.passRate).toBeNull();
     } finally {
       for (const run of runs) await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
       await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
@@ -510,6 +518,7 @@ test.describe("test plan progress roll-up", () => {
       expect(progress.failed).toBe(0);
       expectBucketsSumToTotal(progress);
       expect(progress.completionPercent).toBe(100);
+      expect(progress.passRate).toBe(100);
 
       const runRow = (await (await request.get(`/api/plans/${plan.id}/runs`)).json()).find(
         (r: { id: string }) => r.id === cycle.id,
@@ -557,6 +566,7 @@ test.describe("test plan progress roll-up", () => {
       expect(unlinked.runCount).toBe(0);
       expect(unlinked.totalCases).toBe(0);
       expect(unlinked.completionPercent).toBe(0);
+      expect(unlinked.passRate).toBeNull();
 
       await request.patch(`/api/cycles/${cycle.id}`, { data: { planId: plan.id } });
       const linked = await (await request.get(`/api/plans/${plan.id}/progress`)).json();
@@ -565,6 +575,8 @@ test.describe("test plan progress roll-up", () => {
       expect(linked.failed).toBe(1);
       expectBucketsSumToTotal(linked);
       expect(linked.completionPercent).toBe(100);
+      // A settled-but-failing case is a real 0%, distinct from the null "nothing settled" above.
+      expect(linked.passRate).toBe(0);
 
       await request.patch(`/api/cycles/${cycle.id}`, { data: { clearPlan: true } });
       const after = await (await request.get(`/api/plans/${plan.id}/progress`)).json();
@@ -572,6 +584,7 @@ test.describe("test plan progress roll-up", () => {
       expect(after.totalCases).toBe(0);
       expect(after.failed).toBe(0);
       expect(after.completionPercent).toBe(0);
+      expect(after.passRate).toBeNull();
       expect((await (await request.get(`/api/plans/${plan.id}/runs`)).json())).toHaveLength(0);
     } finally {
       await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });

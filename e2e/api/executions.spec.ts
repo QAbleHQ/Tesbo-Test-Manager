@@ -108,6 +108,99 @@ test.describe("test execution updates", () => {
     }
   });
 
+  /*
+   * "[Test Runs] Unable to assign test cases for execution" — the actual defect.
+   *
+   * assignee_id used to be written unconditionally as `body.assigneeId ?? null` on every PATCH, so a
+   * PATCH that only changed status or actualResult — every inline status change, and every quick-view
+   * Save — silently wiped whatever assignee bulk-assign (or a previous PATCH) had just set. This test
+   * FAILS against the unfixed code: the assignee is gone after the second, status-only PATCH.
+   */
+  test("a status-only PATCH does not clear a previously set assignee", { tag: '@tesbo.testId("TES-TC-1900")' }, async ({ request }) => {
+    const fixture = await makeExecutionFixture(request);
+    try {
+      const me = await (await request.get("/api/auth/me")).json();
+      await request.patch(`/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`, {
+        data: { assigneeId: me.userId },
+      });
+      const [assigned] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(assigned.assigneeId).toBe(me.userId);
+
+      // The exact shape of the reported bug: a save that only touches status/actualResult.
+      const statusOnly = await request.patch(
+        `/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`,
+        { data: { status: "Passed", actualResult: "Looks fine" }, failOnStatusCode: false },
+      );
+      expect(statusOnly.ok(), await statusOnly.text()).toBeTruthy();
+
+      const [afterStatusOnly] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(afterStatusOnly.assigneeId, "a status-only PATCH must not clear the assignee").toBe(me.userId);
+      expect(afterStatusOnly.status).toBe("Passed");
+    } finally {
+      await cleanupExecutionFixture(request, fixture);
+    }
+  });
+
+  test("assigneeId: null or \"\" explicitly clears the assignee; omitting the key leaves it alone", { tag: '@tesbo.testId("TES-TC-1901")' }, async ({
+    request,
+  }) => {
+    const fixture = await makeExecutionFixture(request);
+    try {
+      const me = await (await request.get("/api/auth/me")).json();
+      await request.patch(`/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`, {
+        data: { assigneeId: me.userId },
+      });
+
+      const cleared = await request.patch(
+        `/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`,
+        { data: { assigneeId: null }, failOnStatusCode: false },
+      );
+      expect(cleared.ok(), await cleared.text()).toBeTruthy();
+      let [row] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(row.assigneeId).toBeNull();
+
+      // Re-assign, then clear via an empty string — the same value an HTML <select>'s "Unassigned"
+      // option naturally submits.
+      await request.patch(`/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`, {
+        data: { assigneeId: me.userId },
+      });
+      await request.patch(`/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`, {
+        data: { assigneeId: "" },
+      });
+      [row] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(row.assigneeId, "an empty string must clear the assignee, same as null").toBeNull();
+
+      // And re-assigning twice in a row is idempotent, not an error.
+      await request.patch(`/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`, {
+        data: { assigneeId: me.userId },
+      });
+      const reassigned = await request.patch(
+        `/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`,
+        { data: { assigneeId: me.userId }, failOnStatusCode: false },
+      );
+      expect(reassigned.ok()).toBeTruthy();
+      [row] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(row.assigneeId).toBe(me.userId);
+    } finally {
+      await cleanupExecutionFixture(request, fixture);
+    }
+  });
+
+  test("a malformed assigneeId is refused and nothing is stored", { tag: '@tesbo.testId("TES-TC-1902")' }, async ({ request }) => {
+    const fixture = await makeExecutionFixture(request);
+    try {
+      const res = await request.patch(
+        `/api/cycles/${fixture.cycle.id}/executions/${fixture.execution.id}`,
+        { data: { assigneeId: "not-a-uuid" }, failOnStatusCode: false },
+      );
+      expect(res.status()).toBe(404);
+      const [row] = await (await request.get(`/api/cycles/${fixture.cycle.id}/executions`)).json();
+      expect(row.assigneeId).toBeNull();
+    } finally {
+      await cleanupExecutionFixture(request, fixture);
+    }
+  });
+
   test("supports every status in the EXEC_STATUSES set the UI offers", { tag: '@tesbo.testId("TES-TC-194")' }, async ({ request }) => {
     const fixture = await makeExecutionFixture(request);
     try {

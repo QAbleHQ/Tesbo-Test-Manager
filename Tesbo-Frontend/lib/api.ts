@@ -6,14 +6,49 @@ type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
 type ApiErrorBody = { error?: string; detail?: string; errors?: { field?: string; message?: string }[] };
 
+/**
+ * A response with no `error`/`errors` body is never something the endpoint chose to say to a
+ * user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
+ * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
+ * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
+ * the entire message — this is the friendly sentence for that case, keyed off the status class.
+ */
+function genericStatusMessage(status: number): string {
+  if (status === 401) return "Your session has expired. Please sign in again.";
+  if (status === 403) return "You don't have permission to do this.";
+  if (status === 404) return "That could not be found. It may have been deleted or moved.";
+  if (status === 409) return "This couldn't be saved because it conflicts with a recent change. Refresh and try again.";
+  if (status === 429) return "Too many requests. Please wait a moment and try again.";
+  if (status >= 500) return "Something went wrong on our end. Please try again.";
+  return "Something went wrong. Please try again.";
+}
+
 function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
-    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || String(status);
+    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  const msg = body.error || String(status);
+  const msg = body.error || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
+}
+
+function isNetworkFetchError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : "Network request failed";
+  return (
+    msg === "Failed to fetch" ||
+    msg === "Load failed" ||
+    msg.includes("NetworkError") ||
+    msg.includes("network")
+  );
+}
+
+// Only ever thrown by a `signal` an individual call opted into (e.g. AbortSignal.timeout(...) on
+// the integration Connect/Sync/Disconnect calls) — api() itself sets no default timeout, so this
+// never fires for a call that didn't ask for one.
+function isAbortError(e: unknown): boolean {
+  return e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
 }
 
 async function fetchWithNetworkErrorMessage(
@@ -23,18 +58,22 @@ async function fetchWithNetworkErrorMessage(
   try {
     return await fetch(input, init);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Network request failed";
-    const looksLikeCorsOrNetwork =
-      msg === "Failed to fetch" ||
-      msg === "Load failed" ||
-      msg.includes("NetworkError") ||
-      msg.includes("network");
-    if (looksLikeCorsOrNetwork) {
+    if (isAbortError(e)) throw new Error("The request took too long. Please check your connection and try again.");
+    if (!isNetworkFetchError(e)) throw e instanceof Error ? e : new Error(String(e));
+    // A browser keep-alive connection left idle past the server/proxy's keep-alive window fails
+    // on the next write before any bytes reach the server — the request was never delivered, so
+    // retrying once (a fresh connection) is safe even for a POST body. `init.body` here is always
+    // an already-serialized JSON string (see `api()` below), never a one-shot stream, so it can be
+    // resent. This is what a manual page refresh already did to "fix" the error; automate that one
+    // retry instead of surfacing it.
+    try {
+      return await fetch(input, init);
+    } catch (e2) {
+      const msg = e2 instanceof Error ? e2.message : "Network request failed";
       throw new Error(
         `${msg} — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL, HTTPS, and that the backend allows this page’s origin in CORS_ALLOWED_ORIGINS.`
       );
     }
-    throw e instanceof Error ? e : new Error(String(e));
   }
 }
 
@@ -621,6 +660,12 @@ export async function removeWorkspaceProjectAccess(data: { projectId: string; us
 // Projects
 export type ProjectType = "tesbox";
 
+/** `color`/`glyph` null means "not overridden" — the card falls back to the generated placeholder. */
+export interface ProjectIcon {
+  color: string | null;
+  glyph: string | null;
+}
+
 export interface ProjectSummary {
   id: string;
   key: string;
@@ -629,6 +674,7 @@ export interface ProjectSummary {
   projectType: ProjectType;
   role: string;
   createdAt: string;
+  icon: ProjectIcon | null;
 }
 
 export async function listProjects(): Promise<ProjectSummary[]> {
@@ -667,7 +713,8 @@ export interface ProjectOverview extends ProjectSummary {
   teamMembers: { userId: string; name: string }[];
   lastActivityAt: string | null;
   status: "setup_required" | "configured" | "active";
-  runCounts: { passed: number; failed: number; blocked: number; total: number } | null;
+  runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
   currentPassRate: number | null;
 }
 
@@ -683,7 +730,13 @@ export interface CreateProjectResponse {
   createdAt: string;
 }
 
-export async function createProject(data: { key?: string; name: string; description?: string; projectType?: ProjectType }): Promise<CreateProjectResponse> {
+export async function createProject(data: {
+  key?: string;
+  name: string;
+  description?: string;
+  projectType?: ProjectType;
+  icon?: { color?: string | null; glyph?: string | null } | null;
+}): Promise<CreateProjectResponse> {
   return api<CreateProjectResponse>("/api/projects", { method: "POST", body: data });
 }
 
@@ -691,7 +744,15 @@ export async function getProject(id: string): Promise<Record<string, unknown>> {
   return api<Record<string, unknown>>(`/api/projects/${id}`);
 }
 
-export async function updateProject(id: string, data: { name?: string; description?: string; settings?: string }): Promise<void> {
+export async function updateProject(
+  id: string,
+  data: {
+    name?: string;
+    description?: string;
+    settings?: string;
+    icon?: { color?: string | null; glyph?: string | null } | null;
+  }
+): Promise<void> {
   await api(`/api/projects/${id}`, { method: "PATCH", body: data });
 }
 
@@ -810,7 +871,7 @@ export interface ZyraTask {
   linearIssueKeys: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
-  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string }>;
+  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
   tokenUsage: { input: number; output: number; total: number };
   createdAt: string;
   updatedAt: string;
@@ -829,6 +890,7 @@ export interface ZyraAgentState {
     role: string;
     active: boolean;
     activationReason: string;
+    lastUsedAt: string | null;
   };
   settings: { testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities };
   aiKey: {
@@ -845,8 +907,9 @@ export interface ZyraAgentState {
   /**
    * Test cases Zyra has created in this project, counted across chat mode AND task mode.
    *
-   * Authoritative, and not derivable from `tasks`: chat mode writes no generation row, so summing
-   * task.generatedCount reports 0 for a project whose cases were all made by talking to Zyra.
+   * Authoritative, and not derivable from `tasks`: a chat-staged batch that's still pending review
+   * (or was discarded without saving) has no rows in the live testcases table yet, so summing
+   * task.generatedCount over-counts drafts that were never actually saved.
    */
   testcasesCreated: number;
   tasks: ZyraTask[];
@@ -862,8 +925,17 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /**
+   * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
+   * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/
+   * moved/suggested) is a row already reflected in the repository.
+   */
   action?: string;
   reason?: string;
+  /** Position of this row within its review request's drafts — only set on a "proposed-*" row. */
+  draftIndex?: number;
+  /** The ai_generation_requests id this proposal is staged under — only set on a "proposed-*" row. */
+  reviewRequestId?: string;
 }
 
 export interface ZyraChatMessage {
@@ -879,6 +951,8 @@ export interface ZyraChatMessage {
   testcases: ZyraChatTestcaseRow[];
   activity: Array<{ actor?: string; title?: string; detail?: string; createdAt?: string }>;
   createdAt: string;
+  /** Set when this message proposed create/update/archive operations awaiting review/Save. */
+  reviewRequestId?: string | null;
 }
 
 export interface ZyraChatActivePlan {
@@ -998,6 +1072,19 @@ export async function deleteZyraTaskDraft(projectId: string, taskId: string, dra
   });
 }
 
+/** Edit one pending draft's fields before Save — the review step's inline-edit action. */
+export async function editZyraTaskDraft(
+  projectId: string,
+  taskId: string,
+  draftIndex: number,
+  fields: Record<string, unknown>
+): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/drafts/${draftIndex}`, {
+    method: "PATCH",
+    body: fields,
+  });
+}
+
 export async function closeZyraTask(projectId: string, taskId: string): Promise<ZyraTask> {
   return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/close`, {
     method: "POST",
@@ -1008,7 +1095,13 @@ export async function saveZyraTask(
   projectId: string,
   taskId: string,
   data: { selectedDraftIndexes: number[]; suiteId?: string; suiteName?: string }
-): Promise<{ savedCount: number; suiteId: string | null; testcases: { id: string; externalId: string; title: string; createdAt: string }[] }> {
+): Promise<{
+  savedCount: number;
+  suiteId: string | null;
+  testcases: { id: string; externalId: string; title: string; createdAt: string }[];
+  /** Chat-staged batches only: drafts left un-saved by a partial selection, still pending review. */
+  remaining?: number;
+}> {
   return api(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/save`, {
     method: "POST",
     body: data,
@@ -1403,6 +1496,7 @@ export interface ImportTestCaseRow {
   status?: string;
   suite?: string;
   component?: string;
+  estimatedDuration?: string;
   // definitionId -> already-coerced value. The modal resolves select labels to option ids before
   // sending, since it is the side that loaded the option lists to build the mapping UI.
   customFieldValues?: Record<string, unknown>;
@@ -1800,6 +1894,9 @@ export interface PlanProgress {
   skipped: number;
   untested: number;
   executed: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
+  passRate: number | null;
+  /** (Passed + Failed + Blocked + Skipped) / totalCases. */
   completionPercent: number;
 }
 
@@ -2079,7 +2176,7 @@ export async function listCycleExecutions(cycleId: string): Promise<ExecutionIte
   return api(`/api/cycles/${cycleId}/executions`);
 }
 
-export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
+export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string | null; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
@@ -2218,6 +2315,9 @@ export interface BugItem {
   reportedBy: string | null;
   reporterName: string;
   reporterEmail: string;
+  assigneeId: string | null;
+  assigneeName: string | null;
+  assigneeType?: "user" | "agent" | null;
   integrationProvider: "JIRA" | "LINEAR" | null;
   integrationIssueKey: string | null;
   betterbugsUrl: string | null;
@@ -2227,10 +2327,14 @@ export interface BugItem {
   updatedAt: string;
 }
 
-export async function listBugs(projectId: string, params?: { status?: string; cycleId?: string }): Promise<BugItem[]> {
+export async function listBugs(
+  projectId: string,
+  params?: { status?: string; cycleId?: string; assigneeId?: string }
+): Promise<BugItem[]> {
   const sp = new URLSearchParams();
   if (params?.status) sp.set("status", params.status);
   if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
   const query = sp.toString();
   return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
 }
@@ -2245,6 +2349,8 @@ export async function createBug(projectId: string, data: {
   externalUrl?: string;
   severity?: BugSeverity;
   priority?: BugPriority | null;
+  // null/omitted both mean unassigned on create; there is no "clear" distinction to make yet.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -2261,6 +2367,8 @@ export async function updateBug(bugId: string, data: {
   severity?: BugSeverity;
   // null clears it back to untriaged; omitted leaves the stored value alone.
   priority?: BugPriority | null;
+  // null clears the assignee; omitted leaves the stored value alone.
+  assigneeId?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -2411,7 +2519,15 @@ export interface CyclePassRatePoint {
   name: string;
   createdAt: string;
   total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  /** Passed + Failed + Blocked + Skipped (Untested/Retest excluded). */
   executed: number;
+  /** (executed / total) * 100. */
+  executionProgress: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has settled. */
   passRate: number | null;
 }
 
@@ -2419,6 +2535,8 @@ export interface CyclePassRatePoint {
 export interface SuiteHealthRow {
   suiteName: string;
   executed: number;
+  skipped: number;
+  executionProgress: number;
   passedPct: number;
   failedPct: number;
   blockedPct: number;
@@ -2504,6 +2622,7 @@ export function getReportsExportUrl(
 export interface ProjectDashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
+  executionProgress: { value: number };
   openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
@@ -2522,12 +2641,6 @@ export async function getProjectDashboardSummary(projectId: string): Promise<Pro
 
 export type IntegrationProvider = "jira" | "linear";
 
-// A same-tab redirect to Jira/Linear and back can't carry query params through the OAuth
-// provider, so we stash which project to return to here before leaving, and the callback page
-// (app/integrations/callback) picks it back up to land the user straight back on that project's
-// mapping screen instead of the generic workspace integrations page.
-export const INTEGRATION_RETURN_PROJECT_KEY = "tesbo:integrationReturnProjectId";
-
 /**
  * Read-only view of how the deployment is configured for this provider. Credentials come from the
  * backend environment (`<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET`) and cannot be set from the UI, so
@@ -2540,8 +2653,15 @@ export interface IntegrationOAuthConfig {
   redirectUri: string;
 }
 
+// Timed so the Connect button can never stay stuck mid-click waiting on a hung backend — the
+// popup is already open by the time this is called, so a hang here would otherwise leave the
+// button disabled with no way out short of a page reload.
+const INTEGRATION_CALL_TIMEOUT_MS = 20_000;
+
 export async function getIntegrationAuthUrl(provider: IntegrationProvider): Promise<{ url: string }> {
-  return api<{ url: string }>(`/api/workspace/integrations/${provider}/auth-url`);
+  return api<{ url: string }>(`/api/workspace/integrations/${provider}/auth-url`, {
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function getIntegrationConfig(provider: IntegrationProvider): Promise<IntegrationOAuthConfig> {
@@ -2555,11 +2675,18 @@ export async function integrationCallback(
   code: string,
   state: string
 ): Promise<{ connectionId: string; siteUrl: string }> {
-  return api(`/api/workspace/integrations/${provider}/callback`, { method: "POST", body: { code, state } });
+  return api(`/api/workspace/integrations/${provider}/callback`, {
+    method: "POST",
+    body: { code, state },
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function disconnectIntegration(provider: IntegrationProvider): Promise<void> {
-  await api(`/api/workspace/integrations/${provider}/disconnect`, { method: "DELETE" });
+  await api(`/api/workspace/integrations/${provider}/disconnect`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export interface IntegrationConnectionStatus {
@@ -2675,7 +2802,10 @@ export function isSyncRunActive(run: SyncRun | null | undefined): boolean {
 }
 
 export async function syncJiraTickets(projectId: string): Promise<StartSyncResult> {
-  return api<StartSyncResult>(`/api/projects/${projectId}/jira/sync`, { method: "POST" });
+  return api<StartSyncResult>(`/api/projects/${projectId}/jira/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function getIntegrationSyncStatus(projectId: string, provider: IntegrationProvider): Promise<{ run: SyncRun | null }> {
@@ -2806,7 +2936,10 @@ export async function connectLinearTeams(
 }
 
 export async function syncLinearTickets(projectId: string): Promise<StartSyncResult> {
-  return api<StartSyncResult>(`/api/projects/${projectId}/linear/sync`, { method: "POST" });
+  return api<StartSyncResult>(`/api/projects/${projectId}/linear/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function addLinearComment(projectId: string, issueKey: string, comment: string): Promise<void> {
@@ -3068,6 +3201,27 @@ export function getKnowledgeDocument(
   documentId: string
 ): Promise<KnowledgeDocument & { breadcrumb: KnowledgeBreadcrumbEntry[] }> {
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
+}
+
+// The info-icon popover on a synced (mirror) row: this ticket's add/update timeline.
+export interface KnowledgeDocumentSyncEvent {
+  id: string;
+  eventType: "created" | "updated";
+  changedSummary: string | null;
+  createdAt: string;
+  triggeredByName: string | null;
+}
+
+export function getKnowledgeDocumentSyncEvents(
+  projectId: string,
+  documentId: string,
+  page: { limit?: number; offset?: number } = {}
+): Promise<{ events: KnowledgeDocumentSyncEvent[]; hasMore: boolean }> {
+  const sp = new URLSearchParams();
+  if (page.limit != null) sp.set("limit", String(page.limit));
+  if (page.offset != null) sp.set("offset", String(page.offset));
+  const qs = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events${qs ? `?${qs}` : ""}`);
 }
 
 export function updateKnowledgeDocument(
@@ -3432,6 +3586,40 @@ export async function listExecutionEvidence(
   return api<{ list: ExecutionEvidence[]; total: number }>(
     `/api/cycles/${cycleId}/executions/${executionId}/attachments`
   );
+}
+
+/*
+ * Playwright trace viewing.
+ *
+ * A trace .zip is not something a browser can open; the thing that renders it is Playwright's own
+ * web app at trace.playwright.dev, which runs wholly in the visitor's browser and fetches the
+ * archive itself — cross-origin, with no cookies. So the ordinary evidence download URL is no use
+ * to it (session-authorized, and it redirects to a private presigned URL). These mint a short-lived
+ * signed link instead and turn it into the viewer URL.
+ *
+ * The trace bytes go from our API to the person's own browser. trace.playwright.dev uploads
+ * nothing and stores nothing — it is a static page — but the link it is handed does grant access to
+ * that one archive until it expires, which is why the token is scoped to a single attachment and
+ * lives for an hour rather than indefinitely.
+ */
+export async function createExecutionTraceLink(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ token: string; expiresAt: string }> {
+  return api<{ token: string; expiresAt: string }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-link`
+  );
+}
+
+/** The URL the viewer fetches: our API, redeeming the signed token, with CORS for that one origin. */
+export function publicTraceUrl(token: string): string {
+  return `${API_BASE}/api/public/trace/${token}`;
+}
+
+/** Playwright's hosted viewer, pointed at a trace of ours. Used for both the iframe and the tab. */
+export function playwrightTraceViewerUrl(traceUrl: string): string {
+  return `https://trace.playwright.dev/?trace=${encodeURIComponent(traceUrl)}`;
 }
 
 export async function uploadExecutionEvidence(

@@ -98,6 +98,16 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
       S3_PRESIGNED_URL_TTL_SECONDS: ${S3_PRESIGNED_URL_TTL_SECONDS:-300}
+      # Langfuse tracing. Local/OSS only — stage and production do not run under compose and read
+      # these from their own environment. Every default is empty on purpose: with no keys the
+      # backend starts no exporter and makes no network call, and an empty LANGFUSE_BASE_URL makes
+      # it refuse to fall back to cloud.langfuse.com (see observability/langfuse.ts).
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
+      LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-development}
+      LANGFUSE_ALLOW_CLOUD: ${LANGFUSE_ALLOW_CLOUD:-}
     ports:
       - "${BACKEND_PORT:-1011}:7000"
     volumes:
@@ -120,6 +130,9 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:1011}
         NEXT_PUBLIC_BETTERBUGS_API_KEY: ${NEXT_PUBLIC_BETTERBUGS_API_KEY:-}
         NEXT_PUBLIC_BETTERBUGS_PROJECT_ID: ${NEXT_PUBLIC_BETTERBUGS_PROJECT_ID:-}
+        # Stage only — set DSN + ENVIRONMENT=stage on stage .env; leave empty on prod
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+        NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${NEXT_PUBLIC_SENTRY_ENVIRONMENT:-}
     restart: unless-stopped
     depends_on:
       backend:

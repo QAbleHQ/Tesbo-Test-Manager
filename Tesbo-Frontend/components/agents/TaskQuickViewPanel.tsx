@@ -5,8 +5,9 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
 import { closeZyraTask, type ZyraTask } from "@/lib/api";
-import { Button, CopyButton, StatusChip } from "@/components/ui";
+import { Button, CopyButton, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
+import { renderMarkdown } from "@/lib/markdown";
 
 export const JIRA_BADGE_CLASS =
   "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
@@ -36,23 +37,26 @@ export function latestFailureDetail(activities: ZyraTask["activities"]): string 
   return null;
 }
 
+// The activity log is one flat timeline that also backs the Activity tab, but only a reviewer's
+// actual submitted words belong under "Feedback" — everything else in it (picked up, read
+// sources, generated drafts, closed, saved...) is status/process narration. The backend marks
+// the one entry that is genuine feedback with `kind: "feedback"`; rows written before that field
+// existed carry no `kind`, so entries are also matched by their fixed title as a fallback.
+export function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
+  return activity.kind === "feedback" || activity.title === "Review feedback submitted";
+}
+
 const TASK_STATUS_LABELS: Record<string, string> = {
   todo: "Pending",
   in_progress: "In Progress",
   in_review: "In Review",
+  failed: "Failed",
   done: "Done",
 };
 
 export function taskStatusLabel(status: string): string {
   const normalized = normalizeTaskStatus(status);
   return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
-}
-
-function priorityTone(priority: string): "error" | "warning" | "confidenceHigh" | "neutral" {
-  if (priority === "P0") return "error";
-  if (priority === "P1") return "warning";
-  if (priority === "P2") return "confidenceHigh";
-  return "neutral";
 }
 
 function firstStepText(stepsJson: string): string | null {
@@ -124,7 +128,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const normalizedStatus = normalizeTaskStatus(task.taskStatus);
   const done = normalizedStatus === "done";
   const failed = normalizedStatus === "failed";
-  const failureDetail = failed ? latestFailureDetail(task.activities) : null;
+  // Defensive: activity_log is a jsonb array server-side and should always arrive as one, but a
+  // malformed or missing value here must render an empty list rather than throw.
+  const activities = Array.isArray(task.activities) ? task.activities : [];
+  const feedbackActivities = activities.filter(isFeedbackActivity);
+  const failureDetail = failed ? latestFailureDetail(activities) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
   const draftsTsv = toTsv(
     ["Title", "Priority", "Preconditions", "Steps", "Expected Result", "Tags"],
@@ -153,27 +161,20 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
   const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
     { key: "testcases", label: "Test cases", count: task.drafts.length },
-    { key: "feedback", label: "Feedback" },
+    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
     { key: "sources", label: "Sources", count: task.sources.length },
-    { key: "activity", label: "Activity", count: task.activities.length },
+    { key: "activity", label: "Activity", count: activities.length },
   ];
 
   return createPortal(
     <>
       <div role="presentation" className="fixed inset-0 z-40" onClick={onClose} />
       <div className="slide-in-right fixed right-0 top-0 z-50 flex h-screen w-full max-w-[520px] flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
-        {/* Header */}
-        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--border)] p-5">
-          <div className="min-w-0">
-            <div className="mb-1.5 flex items-center gap-2">
-              <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
-              <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
-            </div>
-            <h2 className="line-clamp-2 text-[15px] font-semibold leading-snug text-[var(--foreground)]">{task.userStory}</h2>
-            {failureDetail && (
-              <p className="mt-1.5 line-clamp-2 text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
-            )}
-            {task.context && <p className="mt-1.5 text-[13px] leading-relaxed text-[var(--muted)]">{task.context}</p>}
+        {/* Header — kept slim and always visible so the close control never scrolls out of reach */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
+            <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
           </div>
           <button
             type="button"
@@ -183,6 +184,18 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           >
             <IconX size={16} stroke={1.75} />
           </button>
+        </div>
+
+        {/* Title + description — a long user story or context (e.g. pulled in from a Knowledge
+            Base doc) must never push the stats/tabs/footer below out of view, so this block is
+            height-capped and scrolls internally instead of growing without bound. The scrollbar
+            is hidden (no-scrollbar) so a short description still looks like plain static text. */}
+        <div className="no-scrollbar max-h-[35vh] shrink-0 overflow-y-auto border-b border-[var(--border)] p-5">
+          <h2 className="break-words text-[15px] font-semibold leading-snug text-[var(--foreground)]">{task.userStory}</h2>
+          {failureDetail && (
+            <p className="mt-1.5 break-words text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
+          )}
+          {task.context && <p className="mt-1.5 break-words whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--muted)]">{task.context}</p>}
         </div>
 
         {/* Stats row */}
@@ -245,7 +258,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 return (
                   <div key={`${task.id}-draft-${index}`} className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
                     <div className="mb-1.5 flex items-center gap-2">
-                      <StatusChip tone={priorityTone(draft.priority)}>{draft.priority}</StatusChip>
+                      <PriorityBadge priority={draft.priority as Priority} />
                       {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
                     </div>
                     <div className="text-[13px] font-medium leading-snug text-[var(--foreground)]">{draft.title}</div>
@@ -259,7 +272,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
           {activeTab === "feedback" && (
             <div className="flex flex-col gap-3">
-              {task.activities.map((activity, index) => {
+              {feedbackActivities.map((activity, index) => {
                 const isAgent = activity.actor === "agent";
                 return (
                   <div
@@ -283,7 +296,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   </div>
                 );
               })}
-              {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+              {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
             </div>
           )}
 
@@ -293,7 +306,14 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
-                  <p className="mt-1 text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  {source.type === "knowledge_base" ? (
+                    <div
+                      className="zyra-prose zyra-prose-compact break-words mt-1 text-[12px] text-[var(--muted)]"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
+                    />
+                  ) : (
+                    <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  )}
                 </div>
               ))}
               {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">No source summary recorded.</p>}
@@ -302,11 +322,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
 
           {activeTab === "activity" && (
             <div className="flex flex-col gap-2.5">
-              {task.activities.map((activity, index) => (
+              {activities.map((activity, index) => (
                 <div key={`${task.id}-activity-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
-                      {activity.actor} · {activity.stage.replaceAll("_", " ")}
+                      {activity.actor} · {(activity.stage || "").replaceAll("_", " ")}
                     </span>
                     <span className="font-mono text-[11px] text-[var(--muted-soft)]">
                       {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
@@ -316,7 +336,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{activity.detail}</p>
                 </div>
               ))}
-              {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+              {activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
             </div>
           )}
         </div>
@@ -330,9 +350,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           >
             View full task
           </Link>
-          <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={done || working}>
-            {working ? "Closing…" : "Close task"}
-          </Button>
+          {!done && (
+            <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={working}>
+              {working ? "Closing…" : "Close task"}
+            </Button>
+          )}
         </div>
       </div>
     </>,

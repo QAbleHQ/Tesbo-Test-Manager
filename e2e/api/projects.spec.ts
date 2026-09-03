@@ -208,6 +208,199 @@ test.describe("project CRUD", () => {
 });
 
 /*
+ * A project card's badge: an optional color (restricted to the AVATAR_COLORS palette, so every
+ * choice keeps the WCAG AA contrast the generated placeholder already guarantees) plus an optional
+ * glyph (a letter or one emoji) that replaces the auto-derived initial. `null`/omitted on either
+ * field means "keep using the generated placeholder" — see legacy.service.ts's validateProjectIcon.
+ */
+test.describe("project icon", () => {
+  const PALETTE_COLOR = "#1F7A3D";
+
+  test("a valid color and glyph are persisted and surface on GET, list, and overview", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Icon ${suffix}`, key: `E2EICON${suffix}`, icon: { color: PALETTE_COLOR, glyph: "Z" } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+
+    try {
+      // GET /api/projects/:id (getProjectForUser) returns the raw settings blob, same as it does
+      // for testcaseIdPrefix — only the list/overview endpoints below flatten out a clean `icon`.
+      const fetched = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(fetched.settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+
+      const list = await (await request.get("/api/projects")).json();
+      expect(list.find((p: { id: string }) => p.id === created.id).icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+
+      const overview = await (await request.get("/api/projects/overview")).json();
+      expect(overview.find((p: { id: string }) => p.id === created.id).icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a project created without an icon reports null, not an empty override", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", { data: { name: `E2E No Icon ${suffix}`, key: `E2ENOICON${suffix}` } });
+    const created = await createRes.json();
+
+    try {
+      const fetched = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(fetched.settings.icon ?? null).toBeNull();
+      const list = await (await request.get("/api/projects")).json();
+      expect(list.find((p: { id: string }) => p.id === created.id).icon).toBeNull();
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a color outside the supported palette is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Bad Color ${suffix}`, key: `E2EBADCLR${suffix}`, icon: { color: "#123456" } },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+    expect((await res.json()).error).toMatch(/palette/i);
+  });
+
+  test("a palette color is matched case-insensitively", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Lowercase Color ${suffix}`, key: `E2ELOWCLR${suffix}`, icon: { color: PALETTE_COLOR.toLowerCase() } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      // Normalized to the canonical palette casing, not stored verbatim.
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.color).toBe(PALETTE_COLOR);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a glyph over 2 characters is rejected, and exactly 2 is accepted", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const tooLong = await request.post("/api/projects", {
+      data: { name: `E2E Long Glyph ${suffix}`, key: `E2ELONGGL${suffix}`, icon: { glyph: "ABC" } },
+      failOnStatusCode: false,
+    });
+    expect(tooLong.status()).toBe(400);
+
+    const atLimit = await request.post("/api/projects", {
+      data: { name: `E2E Max Glyph ${suffix}`, key: `E2EMAXGL${suffix}`, icon: { glyph: "AB" } },
+    });
+    expect(atLimit.ok()).toBeTruthy();
+    const created = await atLimit.json();
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.glyph).toBe("AB");
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a single emoji built from multiple code points counts as one glyph character", async ({ request }) => {
+    // U+2764 (heavy black heart) + U+FE0F (variation selector) — two UTF-16 code units, one
+    // grapheme. A length check instead of a grapheme count would reject this as "too long".
+    const emoji = "❤️";
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Emoji Glyph ${suffix}`, key: `E2EEMOJI${suffix}`, icon: { glyph: emoji } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.glyph).toBe(emoji);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a whitespace-only glyph is treated as no override, not an error", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Whitespace Glyph ${suffix}`, key: `E2EWSGL${suffix}`, icon: { color: PALETTE_COLOR, glyph: "   " } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      const icon = (await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon;
+      expect(icon.color).toBe(PALETTE_COLOR);
+      expect(icon.glyph).toBeNull();
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a glyph containing control characters is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Control Glyph ${suffix}`, key: `E2ECTLGL${suffix}`, icon: { glyph: `A${String.fromCharCode(7)}` } },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("a non-object icon payload is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Bad Icon Shape ${suffix}`, key: `E2EBADSHP${suffix}`, icon: "purple" },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("update adds an icon to a project that had none, and can later clear it back to automatic", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await request.post("/api/projects", { data: { name: `E2E Icon Update ${suffix}`, key: `E2EICONUP${suffix}` } })
+    ).json();
+
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon ?? null).toBeNull();
+
+      const addRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: { color: PALETTE_COLOR, glyph: "Q" } } });
+      expect(addRes.ok()).toBeTruthy();
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Q" });
+
+      const clearRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: null } });
+      expect(clearRes.ok()).toBeTruthy();
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon).toEqual({ color: null, glyph: null });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("updating just the icon does not require resending, or erase, the rest of settings", async ({ request }) => {
+    // The icon is merged into `settings` with a targeted jsonb_set rather than folded into the
+    // generic `settings` field's whole-object replace, specifically so a caller updating one icon
+    // doesn't have to read-modify-write the whole blob (and risk losing a concurrent change to
+    // testcaseIdPrefix/testRunEnvironments) just to change a color.
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await request.post("/api/projects", { data: { name: `E2E Icon Settings ${suffix}`, key: `E2EICONSET${suffix}` } })
+    ).json();
+
+    try {
+      const settingsRes = await request.patch(`/api/projects/${created.id}`, {
+        data: { settings: { testcaseIdPrefix: "ABC" } },
+      });
+      expect(settingsRes.ok()).toBeTruthy();
+
+      const iconRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: { color: PALETTE_COLOR } } });
+      expect(iconRes.ok()).toBeTruthy();
+
+      const afterIcon = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(afterIcon.settings.testcaseIdPrefix, "the icon update erased an unrelated settings key").toBe("ABC");
+      expect(afterIcon.settings.icon).toEqual({ color: PALETTE_COLOR, glyph: null });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
  * ── GET /api/projects/:projectId/dashboard ──
  *
  * Runs against the disposable screens tenant, not account A: every assertion here is arithmetic
@@ -238,6 +431,7 @@ test.describe("project dashboard summary", () => {
       expect(summary).toEqual({
         testCases: { total: 0, addedThisWeek: 0 },
         passRate: { value: null, deltaThisWeek: null },
+        executionProgress: { value: 0 },
         openBugs: { total: 0, bySeverity: { Critical: 0, High: 0, Medium: 0, Low: 0 } },
         coverage: { pct: null, totalRequirements: 0 },
         plans: 0,
@@ -310,6 +504,41 @@ test.describe("project dashboard summary", () => {
       await seedRun(api, project.id, { statuses: ["Untested", "Untested", "Untested"] });
 
       expect((await getDashboard(api, project.id)).passRate.value).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06b Skipped is excluded from the pass rate denominator but counted in execution progress", { tag: '@tesbo.testId("TES-TC-416-1")' }, async () => {
+    /*
+     * The reported defect's own numbers: 3 Passed, 2 Failed, 2 Blocked, 1 Skipped, 2 Untested.
+     * Test Run Details used to read 3/10 = 30% (dividing by every case) while the Test Plan page
+     * read 3/7 = 43% (dividing by the settled cases). Pass Rate = Passed / (Passed+Failed+Blocked)
+     * = 3/7 = 43% is correct; Execution Progress counts the Skipped case as "done" even though it
+     * carries no verdict, so it is 8/10 = 80%, a different number answering a different question.
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBe(43);
+      expect(summary.executionProgress.value).toBe(80);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06c a run that is entirely Skipped reports no pass rate but full execution progress", { tag: '@tesbo.testId("TES-TC-416-2")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBeNull();
+      expect(summary.executionProgress.value).toBe(100);
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -614,7 +843,7 @@ test.describe("projects overview", () => {
     teamMembers: { userId: string; name: string }[];
     lastActivityAt: string | null;
     status: "setup_required" | "configured" | "active";
-    runCounts: { passed: number; failed: number; blocked: number; total: number } | null;
+    runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
     currentPassRate: number | null;
   };
 
@@ -755,6 +984,50 @@ test.describe("projects overview", () => {
       const entry = await overviewFor(project.id);
       expect(entry.currentPassRate, "an unexecuted run displaced the last executed one").toBe(100);
       expect(entry.runCounts!.total).toBe(2);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-12 the pass rate excludes Skipped from the denominator, matching Test Run Details and Test Plan", { tag: '@tesbo.testId("TES-TC-1198")' }, async () => {
+    /*
+     * The exact numbers from the reported defect: a run with 3 Passed, 2 Failed, 2 Blocked, 1
+     * Skipped and 2 Untested read 30% (3 of 10 total cases) on Test Run Details and 43% (3 of the
+     * 7 settled cases) on the Test Plan page. Passed / (Passed + Failed + Blocked) = 3/7 = 43% is
+     * the one correct answer, and this project-list card is a third surface that has to agree —
+     * runCounts.skipped is exposed precisely so a caller can tell the 1 Skipped case apart from
+     * the 2 still-Untested ones instead of both being silently folded into "not counted".
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.total).toBe(10);
+      expect(entry.runCounts!.passed).toBe(3);
+      expect(entry.runCounts!.failed).toBe(2);
+      expect(entry.runCounts!.blocked).toBe(2);
+      expect(entry.runCounts!.skipped).toBe(1);
+      expect(entry.currentPassRate).toBe(43);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-13 a run that is entirely Skipped reports no pass rate rather than 0%", { tag: '@tesbo.testId("TES-TC-1199")' }, async () => {
+    // Skipped is neither a pass nor a fail — a run with nothing but Skipped cases has no settled
+    // verdict, so this must read "—" (null), the same as an all-Untested run, not 0%.
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.skipped).toBe(2);
+      expect(entry.currentPassRate).toBeNull();
     } finally {
       await deleteProjects(api, [project.id]);
     }

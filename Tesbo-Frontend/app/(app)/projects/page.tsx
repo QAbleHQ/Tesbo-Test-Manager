@@ -13,7 +13,7 @@ import {
   IconSearch,
 } from "@tabler/icons-react";
 import { authMe, listProjects, listProjectsOverview, createProject, getWorkspace } from "@/lib/api";
-import type { ProjectSummary, ProjectType } from "@/lib/api";
+import type { ProjectIcon, ProjectSummary, ProjectType } from "@/lib/api";
 import {
   Button,
   Card,
@@ -27,6 +27,7 @@ import {
   PageLoader,
   Textarea,
 } from "@/components/ui";
+import { ProjectIconPicker, type ProjectIconValue } from "@/components/ProjectIconPicker";
 import { ListWorkspaceLayout, PageHeader } from "@/components/workflows";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import {
@@ -34,12 +35,23 @@ import {
   PROJECT_KEY_MAX_LENGTH,
   PROJECT_NAME_MAX_LENGTH,
   validateProjectDescription,
+  validateProjectIconGlyph,
   validateProjectKey,
   validateProjectName,
 } from "@/lib/validation";
 import { avatarColor } from "@/lib/avatarColors";
 
-type RunCounts = { passed: number; failed: number; blocked: number; total: number };
+const EMPTY_ICON: ProjectIconValue = { color: null, glyph: null };
+
+/** The badge a project card actually paints: an explicit icon override, or the generated fallback. */
+function resolveProjectIcon(id: string, name: string, icon: ProjectIcon | null | undefined) {
+  return {
+    color: icon?.color || avatarColor(id),
+    glyph: icon?.glyph || (name.trim().charAt(0).toUpperCase() || "P"),
+  };
+}
+
+type RunCounts = { passed: number; failed: number; blocked: number; skipped: number; total: number };
 type ProjectStatus = "active" | "configured" | "setup_required";
 
 /*
@@ -356,11 +368,13 @@ function ProjectsPageContent() {
   const [createName, setCreateName] = useState("");
   const [createKey, setCreateKey] = useState("");
   const [createDescription, setCreateDescription] = useState("");
+  const [createIcon, setCreateIcon] = useState<ProjectIconValue>(EMPTY_ICON);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
   const [createNameError, setCreateNameError] = useState("");
   const [createKeyError, setCreateKeyError] = useState("");
   const [createDescriptionError, setCreateDescriptionError] = useState("");
+  const [createIconGlyphError, setCreateIconGlyphError] = useState("");
   const [workspaceRole, setWorkspaceRole] = useState<string>("");
   const canCreateProject = workspaceRole === "owner" || workspaceRole === "admin" || workspaceRole === "manager";
 
@@ -457,12 +471,14 @@ function ProjectsPageContent() {
     setCreateName("");
     setCreateKey("");
     setCreateDescription("");
+    setCreateIcon(EMPTY_ICON);
     setCreateError("");
     // Field-level validation errors have to go too, or reopening the modal shows a complaint about
     // input the user can no longer see.
     setCreateNameError("");
     setCreateKeyError("");
     setCreateDescriptionError("");
+    setCreateIconGlyphError("");
   }
 
   async function handleCreate(e: React.FormEvent) {
@@ -487,6 +503,11 @@ function ProjectsPageContent() {
       setCreateDescriptionError(descriptionError);
       return;
     }
+    const iconGlyphError = validateProjectIconGlyph(createIcon.glyph ?? "");
+    if (iconGlyphError) {
+      setCreateIconGlyphError(iconGlyphError);
+      return;
+    }
     setCreateLoading(true);
     try {
       const created = await createProject({
@@ -494,15 +515,18 @@ function ProjectsPageContent() {
         key: createKey.trim() || undefined,
         description: createDescription.trim() || undefined,
         projectType: "tesbox",
+        icon: { color: createIcon.color, glyph: createIcon.glyph?.trim() || null },
       });
       setCreateOpen(false);
       setCreateName("");
       setCreateKey("");
       setCreateDescription("");
+      setCreateIcon(EMPTY_ICON);
       setCreateError("");
       setCreateNameError("");
       setCreateKeyError("");
       setCreateDescriptionError("");
+      setCreateIconGlyphError("");
       router.push(`/projects/${created.id}/dashboard`);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create project");
@@ -601,6 +625,15 @@ function ProjectsPageContent() {
                 />
             {createNameError && <FieldError>{createNameError}</FieldError>}
           </Field>
+          <ProjectIconPicker
+            value={createIcon}
+            onChange={setCreateIcon}
+            fallbackColor="#7C5FCC"
+            fallbackGlyph={createName.trim().charAt(0).toUpperCase() || "P"}
+            glyphError={createIconGlyphError}
+            onGlyphErrorChange={setCreateIconGlyphError}
+            disabled={createLoading}
+          />
           <Field>
             <div className="flex items-baseline justify-between">
               <FieldLabel htmlFor="create-key">Key (optional)</FieldLabel>
@@ -669,7 +702,7 @@ function ProjectsPageContent() {
           {viewMode === "grid" ? (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {filteredProjects.map((p) => {
-                const color = projectColor(p.id);
+                const icon = resolveProjectIcon(p.id, p.name, p.icon);
                 return (
                   <Link key={p.id} href={`/projects/${p.id}/dashboard`} className="group block cursor-pointer">
                     {/* Hover border/shadow live in globals.css (a.group:hover > .tesbo-card) — see
@@ -679,9 +712,9 @@ function ProjectsPageContent() {
                         <div className="mb-2.5 flex items-start gap-3">
                           <div
                             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-sm font-semibold text-white"
-                            style={{ background: color }}
+                            style={{ background: icon.color }}
                           >
-                            {p.name.trim().charAt(0).toUpperCase() || "P"}
+                            {icon.glyph}
                           </div>
                           <div className="min-w-0 flex-1">
                             <h2 className="truncate text-[15px] font-medium leading-5 text-[var(--foreground)] group-hover:text-[var(--accent-light)]">
@@ -744,7 +777,7 @@ function ProjectsPageContent() {
                 <div className="text-right text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Updated</div>
               </div>
               {filteredProjects.map((p, idx) => {
-                const color = projectColor(p.id);
+                const icon = resolveProjectIcon(p.id, p.name, p.icon);
                 // `last:border-b-0` doesn't work here: each row's border-carrying div is wrapped in
                 // its own <Link>, so it's trivially the :last-child of that single-child parent on
                 // every row, not just the last project — CSS never sees "last in this list", only
@@ -757,8 +790,8 @@ function ProjectsPageContent() {
                       style={{ gridTemplateColumns: "1fr 120px 90px 100px 110px 160px 100px" }}
                     >
                       <div className="flex min-w-0 items-center gap-2.5">
-                        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-white" style={{ background: color }}>
-                          {p.name.trim().charAt(0).toUpperCase() || "P"}
+                        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-white" style={{ background: icon.color }}>
+                          {icon.glyph}
                         </div>
                         <div className="min-w-0">
                           <div className="truncate text-[13px] font-medium text-[var(--foreground)] group-hover:text-[var(--accent-light)]">{p.name}</div>
@@ -781,11 +814,6 @@ function ProjectsPageContent() {
                               </div>
                             )}
                             <span className="text-xs font-medium" style={{ color: passRateTextColor(p.currentPassRate) }}>{p.currentPassRate}%</span>
-                            {p.runCounts && p.runCounts.failed > 0 && (
-                              <span className="whitespace-nowrap text-[11px]" style={{ color: "var(--status-fail-text)" }}>
-                                {p.runCounts.failed} failed
-                              </span>
-                            )}
                           </div>
                         ) : (
                           <span className="text-xs text-[var(--muted-soft)]">{p.statsLoaded ? "No runs yet" : "—"}</span>

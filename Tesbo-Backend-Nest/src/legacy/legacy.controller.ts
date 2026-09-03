@@ -18,7 +18,7 @@ import {
 } from "@nestjs/common";
 import { FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
@@ -114,24 +114,38 @@ export class LegacyController {
     ].join("\n");
   }
 
-  private sendWorkbook(
+  // exceljs writes whatever it is handed, and a plain object or an array would land as a formula or
+  // rich-text cell rather than a value. Numbers, booleans and dates have to stay typed — a real 0
+  // must survive as the number 0 (see longRow) — so only those pass through untouched; null and
+  // undefined become an empty cell, and anything else is stringified.
+  private cellValue(value: unknown): ExcelJS.CellValue {
+    if (value == null) return null;
+    if (typeof value === "number" || typeof value === "boolean" || value instanceof Date) return value;
+    return String(value);
+  }
+
+  private async sendWorkbook(
     res: Response,
     fileName: string,
     sheetName: string,
     rows: Record<string, unknown>[],
     headers?: string[]
   ) {
-    const workbook = XLSX.utils.book_new();
-    // The header list is passed explicitly wherever the caller knows it: json_to_sheet otherwise
-    // derives the columns from the first row's keys, so exporting a project with no test cases
-    // produced a workbook with no header row at all — a blank sheet with nothing to fill in, while
-    // the CSV export of the same project still emitted its headers.
-    const worksheet = XLSX.utils.json_to_sheet(rows, headers ? { header: headers } : undefined);
-    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
-    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet(sheetName);
+    // The header list is passed explicitly wherever the caller knows it: deriving the columns from
+    // the first row's keys means exporting a project with no test cases produces a workbook with no
+    // header row at all — a blank sheet with nothing to fill in, while the CSV export of the same
+    // project still emits its headers.
+    const columns = headers ?? Object.keys(rows[0] ?? {});
+    worksheet.addRow(columns);
+    for (const row of rows) {
+      worksheet.addRow(columns.map((column) => this.cellValue(row[column])));
+    }
+    const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-    res.send(buffer);
+    res.send(Buffer.from(buffer));
   }
 
   @Post("/api/onboarding/workspace")
@@ -616,6 +630,47 @@ export class LegacyController {
     throw new Error("Attachment content unavailable");
   }
 
+  /**
+   * Mints a short-lived link the embedded Playwright trace viewer can read.
+   *
+   * The viewer is trace.playwright.dev running inside an iframe: it fetches the .zip itself, from
+   * the browser, cross-origin and without credentials, so it cannot use the download route above.
+   * This hands back a signed token instead; /api/public/trace/:token below is what redeems it.
+   */
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/trace-link")
+  createExecutionTraceLink(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.createExecutionTraceLink(cycleId, req.userId, executionId, attachmentId);
+  }
+
+  /**
+   * Serves one trace archive to a holder of a valid link. Unauthenticated by design — see
+   * createExecutionTraceLink in the service for why, and for what keeps the grant narrow.
+   *
+   * The bytes are streamed from storage rather than redirected to a presigned URL: the fetch comes
+   * from a third-party origin, so the response needs CORS headers we control, and a private bucket
+   * has none. Evidence is capped at MAX_EVIDENCE_FILE_SIZE (25 MB by default), so buffering one
+   * trace is bounded.
+   */
+  @Get("/api/public/trace/:token")
+  async publicTrace(@Res() res: Response, @Param("token") token: string) {
+    const trace = await this.legacy.getPublicTraceContent(token);
+    // The viewer is a fixed, known origin, so it is named rather than wildcarded. No credentials
+    // are involved either way — the token is the authorization.
+    res.setHeader("Access-Control-Allow-Origin", "https://trace.playwright.dev");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Content-Type", "application/zip");
+    // attachment, never inline: nothing served from this route may be rendered by a browser.
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(trace.fileName)}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(trace.buffer);
+  }
+
   @Post("/api/cycles/:cycleId/executions/bulk-assign")
   bulkAssign(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
     return this.legacy.bulkAssignExecutions(cycleId, req.userId, body);
@@ -764,7 +819,7 @@ export class LegacyController {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
     const rows = await this.legacy.exportTestCases(projectId, definitions);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
-    this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
+    await this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
   }
 
   @Get("/api/projects/:projectId/testcases/import/template")
@@ -784,6 +839,7 @@ export class LegacyController {
         title: "Example login test",
         description: "Verify a valid user can sign in.",
         preconditions: "User account exists.",
+        postconditions: "User lands on the dashboard with an active session.",
         // "action => expected result" per step, separated by " | " — the expected result after
         // "=>" is optional but importing it this way carries it into each step's Expected Result.
         steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
@@ -793,12 +849,15 @@ export class LegacyController {
         type: "Functional",
         status: "Draft",
         suite: "Authentication",
-        component: "Login"
+        component: "Login",
+        // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
+        // normalizeEstimatedDuration in legacy.service.ts.
+        estimatedDuration: "10m"
       }
     ];
     const headers = Object.keys(rows[0]);
     if (format === "xlsx") {
-      this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
+      await this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
       return;
     }
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -908,7 +967,7 @@ export class LegacyController {
       res.send(this.rowsToCsv(headers, rows));
       return;
     }
-    this.sendWorkbook(res, `${fileName}.xlsx`, REPORT_VIEW_SHEET_NAMES[typedView], rows, headers);
+    await this.sendWorkbook(res, `${fileName}.xlsx`, REPORT_VIEW_SHEET_NAMES[typedView], rows, headers);
   }
 
   private longRow(section: string, label: string, metric: string, value: unknown): Record<string, unknown> {
@@ -1151,6 +1210,17 @@ export class LegacyController {
     return this.legacy.zyraDeleteDraft(projectId, req.userId, taskId, Number(draftIndex));
   }
 
+  @Patch("/api/projects/:projectId/agents/zyra/tasks/:taskId/drafts/:draftIndex")
+  editZyraDraft(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("draftIndex") draftIndex: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.zyraEditDraft(projectId, req.userId, taskId, Number(draftIndex), body);
+  }
+
   @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/close")
   closeZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
     return this.legacy.zyraCloseTask(projectId, req.userId, taskId);
@@ -1316,6 +1386,16 @@ export class LegacyController {
   @Get("/api/projects/:projectId/knowledge-base/documents/:documentId")
   getKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
     return this.legacy.getKnowledgeDocument(projectId, req.userId, documentId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId/sync-events")
+  getKnowledgeDocumentSyncEvents(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Query() query: Record<string, any>
+  ) {
+    return this.legacy.getKnowledgeDocumentSyncEvents(projectId, req.userId, documentId, query);
   }
 
   @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/move")

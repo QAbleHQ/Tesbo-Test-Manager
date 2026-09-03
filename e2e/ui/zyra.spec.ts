@@ -89,10 +89,98 @@ test.describe("zyra / agents (UI)", () => {
     // off by one test stays off for the next one and for the next run against the same volume.
     // Dropping the key restores the built-in defaults (every capability on, the default range).
     exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id IN (${projects});`);
+    // Fixtures for the "Create Zyra task" modal tests below: an allocated (fake) AI key, so
+    // state.agent.active is true and the modal's Create task button is enabled; Knowledge Base
+    // documents used to exercise the Acceptance Criteria split; and a Jira connection + ticket
+    // used to prove the ticket picker stays gone even when Jira genuinely is connected.
+    exec(
+      `DELETE FROM knowledge_document_versions WHERE document_id IN (SELECT id FROM knowledge_documents WHERE project_id IN (${projects}));`,
+    );
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
+    exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(
+      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+    );
   }
 
   function stamp(label: string): string {
     return `E2E ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  }
+
+  // ─── Fixtures for the "Create Zyra task" modal (Jira picker removal, Acceptance Criteria) ──
+
+  /**
+   * The board's Create task button is disabled whenever state.agent.active is false (see ZYU-05),
+   * which is this tenant's default so no test here accidentally drives a real model. Allocating a
+   * fake key flips that flag without ever being submitted against a real provider — every modal
+   * test below only reads/writes form fields and never clicks the final "Create task" submit.
+   */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E key ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-not-a-real-key" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating an AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const t = tenant!;
+    const existing = scalar(
+      `SELECT id FROM knowledge_folders WHERE project_id = ${literal(t.mainProjectId)} AND is_root = true;`,
+    );
+    if (existing) return existing;
+    // Same backfill api/knowledge-base.spec.ts relies on: is_root rows are only ever written by
+    // project creation, so a fixture project missing one (KB-A-00's defect) gets one here instead.
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(t.organizationId)}, ${literal(t.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_folders WHERE project_id = ${literal(t.mainProjectId)} AND is_root = true;`,
+    );
+  }
+
+  /** Creates a Knowledge Base document via the real API, the same content the picker will read. */
+  async function createKnowledgeDoc(body: Record<string, unknown>): Promise<{ id: string; title: string }> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", ...body },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `creating knowledge doc ${JSON.stringify(body)} — ${await res.text()}`).toBe(201);
+    return res.json();
+  }
+
+  /** Seeds a real Jira connection + ticket, so "the picker is gone" is proven with Jira actually connected. */
+  function seedFakeJiraConnection(): void {
+    const t = tenant!;
+    exec(
+      `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+        `VALUES (${literal(t.organizationId)}, 'jira', 'e2e-zyra-ui', 'https://e2e-zyra-ui.invalid', 'e2e', '', now() + interval '365 days') ` +
+        `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+    );
+    const connectionId = scalar(
+      `SELECT id FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+    );
+    exec(
+      `INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status) ` +
+        `VALUES (${literal(t.mainProjectId)}, ${literal(connectionId)}, 'ZYE-1', 'ZYE-1', 'Seeded Jira ticket', 'Story', 'Open') ` +
+        `ON CONFLICT DO NOTHING;`,
+    );
+  }
+
+  /** Opens the board and the "Create Zyra task" modal, returning its locator. */
+  async function openCreateModal(browser: Browser): Promise<{ page: Page; dialog: Locator }> {
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("button", { name: "Create task" }).click();
+    return { page, dialog: modal(page, "Create Zyra task") };
   }
 
   interface SeedOptions {
@@ -101,6 +189,7 @@ test.describe("zyra / agents (UI)", () => {
     drafts?: Array<Record<string, unknown>>;
     projectId?: string;
     context?: string;
+    sources?: Array<{ type: string; title: string; detail: string }>;
   }
 
   /** Writes a completed Zyra task straight into the table, drafts and all. Returns its id. */
@@ -118,7 +207,9 @@ test.describe("zyra / agents (UI)", () => {
       { title: "Sign in with a wrong password", priority: "P2", preconditions: "", steps: [] },
     ];
     const activity = JSON.stringify([{ type: "picked_up", title: "Picked up task", detail: userStory }]);
-    const sources = JSON.stringify([{ type: "knowledge_document", title: "Auth notes", detail: "Seeded source" }]);
+    const sources = JSON.stringify(
+      options.sources ?? [{ type: "knowledge_document", title: "Auth notes", detail: "Seeded source" }],
+    );
 
     exec(
       `INSERT INTO ai_generation_requests
@@ -136,6 +227,80 @@ test.describe("zyra / agents (UI)", () => {
     return scalar(
       `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(projectId)} AND user_story = ${literal(userStory)};`,
     );
+  }
+
+  interface ChatEntry {
+    opType: "create" | "update" | "archive";
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null };
+    testcaseId?: string;
+    externalId?: string;
+    fields?: Record<string, unknown>;
+  }
+
+  /**
+   * A chat-staged review batch: a chat session, a chat_session_id-linked ai_generation_requests
+   * row (the wrapped {opType, draft|fields} shape — NOT seedTask()'s flat AiGeneratedDraft), and
+   * the assistant chat message that references it via review_request_id, the way a real reply
+   * would once applyZyraChatOperations stages it. Seeded directly for the same reason seedTask()
+   * is: reaching this state through the live chat route needs a model this suite never calls.
+   */
+  function seedChatReviewBatch(options: { status?: string; entries?: ChatEntry[] } = {}): {
+    taskId: string;
+    sessionId: string;
+  } {
+    const t = tenant!;
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const entries: ChatEntry[] = options.entries ?? [
+      {
+        opType: "create",
+        draft: {
+          suiteId: null,
+          title: "Sign in with a valid password",
+          description: "The dashboard opens",
+          preconditions: "The account exists",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the form", expectedResult: "The dashboard opens" }]),
+          priority: "P1",
+        },
+      },
+      { opType: "create", draft: { suiteId: null, title: "Sign in with a wrong password", description: "", preconditions: "", stepsJson: "[]", priority: "P2" } },
+    ];
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', 'Zyra chat proposal', ` +
+        `${entries.length}, ${entries.length}, ${literal(JSON.stringify(entries))}::jsonb, ${literal(ZYRA_AGENT_NAME)}, ` +
+        `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
+    );
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+
+    const rows = entries.map((entry, index) => ({
+      title: entry.draft?.title ?? String(entry.fields?.title ?? "Untitled"),
+      priority: entry.draft?.priority ?? String(entry.fields?.priority ?? "P2"),
+      status: "Draft",
+      type: "Functional",
+      preconditions: entry.draft?.preconditions ?? "",
+      expectedSummary: entry.draft?.description ?? "",
+      stepsJson: entry.draft?.stepsJson ?? "[]",
+      action: entry.opType === "create" ? "proposed-create" : entry.opType === "archive" ? "proposed-archive" : "proposed-update",
+      reason: "",
+      draftIndex: index,
+      reviewRequestId: taskId,
+    }));
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
+        `'I have drafted these test cases for your review.', 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ${literal(taskId)});`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+    return { taskId, sessionId };
   }
 
   function draftTitles(taskId: string): string[] {
@@ -170,6 +335,18 @@ test.describe("zyra / agents (UI)", () => {
       "UPDATE ai_generation_requests SET activity_log = activity_log || " +
         `${literal(
           JSON.stringify([{ actor: "agent", stage: "failed", title: "Generation failed", detail, createdAt: new Date().toISOString() }]),
+        )}::jsonb WHERE id = ${literal(taskId)};`,
+    );
+  }
+
+  /** Appends a "Review feedback submitted" entry the way zyraFeedback writes one, `kind` and all. */
+  function seedFeedbackActivity(taskId: string, detail: string): void {
+    exec(
+      "UPDATE ai_generation_requests SET activity_log = activity_log || " +
+        `${literal(
+          JSON.stringify([
+            { actor: "user", stage: "todo", kind: "feedback", title: "Review feedback submitted", detail, createdAt: new Date().toISOString() },
+          ]),
         )}::jsonb WHERE id = ${literal(taskId)};`,
     );
   }
@@ -209,6 +386,78 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("heading", { name: "Zyra", level: 1 })).toBeVisible();
   });
 
+  test("ZYU-40 the Agents card shows nothing until used, then an absolute last-used date, and the chat sidebar's own timestamps are untouched", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test. The Agents picker card used to read "Used Nd ago" and go stale whenever the
+     * activity was through chat rather than the task board (see api/zyra.spec.ts ZYR-A-43/44 for the
+     * backend half). The card now shows nothing at all in that footer slot until Zyra has actually
+     * been used — no "Not used yet" placeholder either — and once used reads "Last used on
+     * DD/MM/YYYY"; this pins both states and that it never regresses back to a relative "…ago"
+     * string.
+     *
+     * The Zyra chat screen's own "Conversations" sidebar renders each session's timestamp with its
+     * own long-standing `formatTime` (e.g. "Aug 24, 08:08 PM") and was explicitly asked NOT to change
+     * — pinned here too, on the same seeded session, so a future edit to the card's date logic can't
+     * silently leak into the sidebar.
+     */
+    // Same selector convention as ZYU-02: the whole card is one <button>, and its accessible name is
+    // the concatenation of everything visible inside it — heading, role text, description, chips,
+    // and the "Last used on …" footer this test cares about.
+    const agentCard = (page: Page) => page.getByRole("button", { name: /Zyra the Test Generator/ });
+    const lastUsedText = (page: Page) => agentCard(page).getByText(/^(Last used on|Not used|Used) /);
+
+    // Nothing used yet — the footer slot must render no last-used text of any kind.
+    const cleanPage = await open(browser, "/agents");
+    await expect(agentCard(cleanPage)).toBeVisible();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Auto-creates one empty session to type into — must NOT make the card show a last-used date,
+    // the same boundary ZYU-26/27 pin for the sidebar's own "0 sessions" / hasMessages reporting.
+    await open(browser, "/agents/zyra");
+    await cleanPage.reload();
+    await expect(lastUsedText(cleanPage)).toHaveCount(0);
+
+    // Give that session an actual message, the same way ZYU-26 does — direct insert, since no AI
+    // provider is configured for this tenant (file header) to drive a real send.
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(sessionId, "opening the chat did not auto-create a session").toBeTruthy();
+    exec(
+      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES ` +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Write me some test cases', 'sent');`,
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    await cleanPage.reload();
+    const usedLabel = agentCard(cleanPage).getByText(/^Last used on \d{2}\/\d{2}\/\d{4}$/);
+    await expect(usedLabel).toBeVisible();
+    await expect(agentCard(cleanPage).getByText(/ago$/)).toHaveCount(0);
+
+    // The date is DD/MM/YYYY and within a day of "now" either side of a UTC/local boundary — not
+    // asserted against an exact string, since the browser's and the DB's timezone need not match.
+    const labelText = (await usedLabel.textContent())!;
+    const [, dd, mm, yyyy] = labelText.match(/(\d{2})\/(\d{2})\/(\d{4})/)!;
+    const shown = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+    const today = new Date();
+    const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const dayDiff = Math.abs(shown.getTime() - todayMidnight.getTime()) / 86_400_000;
+    expect(dayDiff, `"${labelText}" is not close to today's date`).toBeLessThanOrEqual(1);
+
+    // The chat screen's own "Conversations" sidebar timestamp is untouched by this fix — still its
+    // pre-existing locale format, not DD/MM/YYYY.
+    const chatPage = await open(browser, "/agents/zyra");
+    const sidebarRow = chatPage.locator("aside button").first();
+    await expect(sidebarRow).toBeVisible();
+    const sidebarTimestamp = (await sidebarRow.locator("span").nth(1).textContent()) ?? "";
+    expect(sidebarTimestamp, "the chat sidebar's own timestamp regressed to DD/MM/YYYY").not.toMatch(
+      /^\d{2}\/\d{2}\/\d{4}$/,
+    );
+    expect(sidebarTimestamp.trim().length, "the sidebar row lost its timestamp entirely").toBeGreaterThan(0);
+  });
+
   // ─── The unconfigured-provider state, which is most workspaces ─────────────
 
   test("ZYU-03 the chat says the provider is not connected and points at where to fix it", { tag: '@tesbo.testId("TES-TC-1088")' }, async ({
@@ -245,6 +494,200 @@ test.describe("zyra / agents (UI)", () => {
     // The gate is on the control, not only in the API: a workspace with no key cannot start a task
     // it has no way to finish.
     await expect(page.getByRole("button", { name: "Create task" })).toBeDisabled();
+  });
+
+  // ─── The "Create Zyra task" modal: no Jira picker, a dedicated Acceptance Criteria field ───
+  //
+  // Regression coverage for a reported bug (a Jira ticket's Acceptance Criteria landed mixed into
+  // Context) and a follow-up ask (drop the Jira ticket picker from this modal entirely — Jira and
+  // Linear tickets already mirror into the Knowledge Base as documents via
+  // IntegrationSyncDocumentBuilder, so nothing is lost by only offering Knowledge Base here).
+  //
+  // page.tsx's splitAcceptanceCriteria/resolveDocumentText run entirely client-side against
+  // knowledgeItems already loaded by listKnowledgeDocuments — no AI call is involved, so these
+  // tests never need to submit the form, only read back the Story/Context/Acceptance Criteria
+  // textareas after picking a document from the "Knowledge Base docs and notes" select.
+
+  test("ZYU-50 the modal has no Jira ticket picker, and none appears even when Jira is genuinely connected", async ({ browser }) => {
+    await allocateFakeAiKey();
+    seedFakeJiraConnection();
+
+    const { page, dialog } = await openCreateModal(browser);
+    await expect(dialog).toBeVisible();
+
+    // The primary fields are still there...
+    await expect(dialog.getByPlaceholder("As a user, I want...")).toBeVisible();
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toBeVisible();
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toBeVisible();
+
+    // ...but no Jira selection surface of any kind, despite a real jira_tickets row existing for
+    // this project and a connected integration_connections row for this org.
+    await expect(dialog.getByText("Jira tickets", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText("Select ticket...", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText("ZYE-1", { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText(/^Linear/)).toHaveCount(0);
+  });
+
+  test("ZYU-51 selecting a Knowledge Base document maps its Acceptance Criteria section to a dedicated field, not Context", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Login KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentText:
+        "## Description\n\nUsers should be able to log in with email and password.\n\n" +
+        "Acceptance Criteria:\nShows an error on a wrong password\nRedirects to the dashboard on success",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const story = dialog.getByPlaceholder("As a user, I want...");
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(story).toHaveValue(new RegExp(title));
+    await expect(context).toHaveValue(/Users should be able to log in/);
+    await expect(context).not.toHaveValue(/wrong password/);
+    await expect(acceptanceCriteria).toHaveValue(/Shows an error on a wrong password/);
+    await expect(acceptanceCriteria).toHaveValue(/Redirects to the dashboard on success/);
+  });
+
+  test("ZYU-52 a Knowledge Base document with no Acceptance Criteria section leaves the field empty and puts everything in Context", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Plain KB doc");
+    await createKnowledgeDoc({ title, contentText: "Just a plain note with no special sections at all." });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toHaveValue(
+      /Just a plain note/,
+    );
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toHaveValue("");
+  });
+
+  test("ZYU-53 an Acceptance Criteria heading stops at the next heading, not swallowing later sections", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Headed KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentText:
+        "## Description\n\nDo the thing well.\n\n## Acceptance Criteria\n\nCase one applies\nCase two applies\n\n" +
+        "## Comments\n\nNothing noteworthy yet.",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(acceptanceCriteria).toHaveValue(/Case one applies/);
+    await expect(acceptanceCriteria).toHaveValue(/Case two applies/);
+    await expect(acceptanceCriteria).not.toHaveValue(/Nothing noteworthy yet/);
+    await expect(context).toHaveValue(/Do the thing well/);
+    await expect(context).toHaveValue(/Nothing noteworthy yet/);
+    await expect(context).not.toHaveValue(/Case one applies/);
+  });
+
+  test("ZYU-54 a document with content only in contentHtml (no contentText) still populates Context and Acceptance Criteria", async ({
+    browser,
+  }) => {
+    // Regression guard for a silent-failure edge case: contentText is the plain-text render kept
+    // in sync by the editor, but it can be unset (a document written straight through the API, or
+    // an older row) while contentHtml still holds the real content. Selecting such a document must
+    // not quietly leave Context empty.
+    await allocateFakeAiKey();
+    const title = stamp("HTML-only KB doc");
+    await createKnowledgeDoc({
+      title,
+      contentHtml: "<p>Do the thing well.</p><p>Acceptance Criteria:</p><ul><li>Case one</li><li>Case two</li></ul>",
+    });
+
+    const { dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(context).toHaveValue(/Do the thing well/);
+    await expect(context).not.toHaveValue(/Case one/);
+    await expect(acceptanceCriteria).toHaveValue(/Case one/);
+    await expect(acceptanceCriteria).toHaveValue(/Case two/);
+    // And no raw HTML leaked into either field.
+    await expect(context).not.toHaveValue(/<p>|<li>/);
+    await expect(acceptanceCriteria).not.toHaveValue(/<p>|<li>/);
+  });
+
+  test("ZYU-55 a document with no content at all does not crash the modal and still contributes its title to Story", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Empty KB doc");
+    await createKnowledgeDoc({ title });
+
+    const { page, dialog } = await openCreateModal(browser);
+    await dialog.getByRole("combobox").selectOption({ label: `${title} - general` });
+
+    await expect(dialog.getByPlaceholder("As a user, I want...")).toHaveValue(new RegExp(title));
+    await expect(dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...")).toHaveValue("");
+    await expect(dialog.getByPlaceholder("Given ..., when ..., then ...")).toHaveValue("");
+    // The modal, and the page under it, are still fully responsive.
+    await expect(dialog.getByRole("button", { name: "Create task" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Zyra", exact: false })).toBeVisible();
+  });
+
+  test("ZYU-56 removing a selected document's chip and reselecting it does not duplicate its content", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const title = stamp("Reselect KB doc");
+    await createKnowledgeDoc({ title, contentText: "Some unique reselection content." });
+
+    const { dialog } = await openCreateModal(browser);
+    const select = dialog.getByRole("combobox");
+    await select.selectOption({ label: `${title} - general` });
+
+    const chip = dialog.getByRole("button", { name: new RegExp(`^${title}`) });
+    await expect(chip).toBeVisible();
+    await chip.click(); // removes it from the selected-items chips, but not from the text fields
+
+    await select.selectOption({ label: `${title} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const value = await context.inputValue();
+    const occurrences = value.split("Some unique reselection content.").length - 1;
+    expect(occurrences, `content was duplicated in Context:\n${value}`).toBe(1);
+  });
+
+  test("ZYU-57 selecting two Knowledge Base documents combines both into Context, and only the one with a section into Acceptance Criteria", async ({
+    browser,
+  }) => {
+    await allocateFakeAiKey();
+    const titleA = stamp("Multi KB doc A");
+    const titleB = stamp("Multi KB doc B");
+    await createKnowledgeDoc({
+      title: titleA,
+      contentText: "Doc A body text.\n\nAcceptance Criteria:\nOnly doc A has this bullet",
+    });
+    await createKnowledgeDoc({ title: titleB, contentText: "Doc B body text with no special section." });
+
+    const { dialog } = await openCreateModal(browser);
+    const select = dialog.getByRole("combobox");
+    await select.selectOption({ label: `${titleA} - general` });
+    await select.selectOption({ label: `${titleB} - general` });
+
+    const context = dialog.getByPlaceholder("Business rules, edge cases, acceptance notes...");
+    const acceptanceCriteria = dialog.getByPlaceholder("Given ..., when ..., then ...");
+
+    await expect(context).toHaveValue(/Doc A body text/);
+    await expect(context).toHaveValue(/Doc B body text/);
+    await expect(context).not.toHaveValue(/Only doc A has this bullet/);
+    await expect(acceptanceCriteria).toHaveValue(/Only doc A has this bullet/);
   });
 
   // ─── Settings that are ours, not the model's ───────────────────────────────
@@ -382,6 +825,161 @@ test.describe("zyra / agents (UI)", () => {
     const panel = page.locator(".slide-in-right");
     await expect(panel.getByText(userStory)).toBeVisible();
     await expect(panel.locator("h2 + p")).toHaveCount(0);
+  });
+
+  // ─── The quick-view panel's description block (fix for "Task Details popup is not
+  // scrollable when the user story description is long") ─────────────────────
+  //
+  // Before the fix, task.context rendered unbounded and unscrollable inside the panel's shrink-0
+  // header, so a long description (a common shape once a Knowledge Base doc is pulled in — see
+  // page.tsx's context concatenation) pushed the stats row, tabs, generated drafts, and the
+  // footer's "View full task"/"Close task" controls below the panel's fixed h-screen height, with
+  // no way to scroll down to them. The description now lives in its own height-capped,
+  // internally-scrollable block (the `no-scrollbar` div) below a slim, always-visible top bar.
+
+  test("ZYU-58 a long description does not push the footer's 'View full task' link out of the panel", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Long context story");
+    const longContext = "Flight booking scope detail. ".repeat(400);
+    seedTask({ userStory, context: longContext });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const footerLink = panel.getByRole("link", { name: "View full task" });
+    await expect(footerLink).toBeVisible();
+    // The tabs are reachable too, not just the footer — the whole rest of the panel below the
+    // description must still render, not just its very last control.
+    await expect(panel.getByRole("button", { name: /^Test cases/ })).toBeVisible();
+
+    const panelBox = (await panel.boundingBox())!;
+    const footerBox = (await footerLink.boundingBox())!;
+    expect(
+      footerBox.y + footerBox.height,
+      "the footer link must stay within the panel's own bounds, not be clipped below it",
+    ).toBeLessThanOrEqual(panelBox.y + panelBox.height + 1);
+  });
+
+  test("ZYU-59 a long description scrolls internally within its own capped region, with no visible scrollbar", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Scrollable description story");
+    const longContext = "Booking flow detail line. ".repeat(300);
+    seedTask({ userStory, context: longContext });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    await expect(descriptionBlock).toBeVisible();
+
+    const overflow = await descriptionBlock.evaluate((el) => ({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(overflow.scrollHeight, "the block must actually overflow so there is something to scroll").toBeGreaterThan(
+      overflow.clientHeight,
+    );
+
+    // Scrolling this block moves its own scrollTop, independent of the rest of the panel.
+    await descriptionBlock.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    const scrolledTop = await descriptionBlock.evaluate((el) => el.scrollTop);
+    expect(scrolledTop, "the description block itself must be the thing that scrolls").toBeGreaterThan(0);
+
+    // No visible scrollbar track claiming layout width, despite being scrollable.
+    const scrollbarWidth = await descriptionBlock.evaluate((el) => (el as HTMLElement).offsetWidth - el.clientWidth);
+    expect(scrollbarWidth, "the scrollbar must be visually hidden").toBe(0);
+  });
+
+  test("ZYU-60 a short description does not scroll and shows no scrollbar", async ({ browser }) => {
+    const userStory = stamp("Short story");
+    seedTask({ userStory, context: "Just a short one-line context." });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    const overflow = await descriptionBlock.evaluate((el) => ({
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(
+      overflow.scrollHeight,
+      "a short description must not be clipped as though it needed to scroll",
+    ).toBeLessThanOrEqual(overflow.clientHeight);
+
+    await expect(panel.getByRole("link", { name: "View full task" })).toBeVisible();
+  });
+
+  test("ZYU-61 a long unbroken token in the description wraps instead of overflowing the panel horizontally", async ({
+    browser,
+  }) => {
+    const longToken = `https://example.com/${"a".repeat(200)}`;
+    const userStory = stamp("Long token in context story");
+    seedTask({ userStory, context: `See ${longToken} for details.` });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const descriptionBlock = panel.locator("div.no-scrollbar");
+    await expect(descriptionBlock.getByText(longToken, { exact: false })).toBeVisible();
+
+    const overflow = await descriptionBlock.evaluate((el) => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+    expect(
+      overflow.scrollWidth,
+      "a long token must wrap, not push the description block into horizontal overflow",
+    ).toBeLessThanOrEqual(overflow.clientWidth + 1);
+  });
+
+  test("ZYU-62 the description preserves line breaks between combined Knowledge Base sections", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Multiline context story");
+    const context = "Section one detail.\n\nSection two detail.\n\nSection three detail.";
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const contextParagraph = panel.locator("div.no-scrollbar p").last();
+    await expect(contextParagraph).toHaveCSS("white-space", "pre-wrap");
+    expect(await contextParagraph.textContent()).toBe(context);
+  });
+
+  test("ZYU-63 a failed task with a long failure detail still keeps 'Close task' reachable in the footer", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Long failure story");
+    const taskId = seedTask({ userStory, status: "failed" });
+    seedFailureActivity(taskId, "Provider timeout while generating drafts. ".repeat(200));
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const closeButton = panel.getByRole("button", { name: "Close task" });
+    await expect(closeButton).toBeVisible();
+
+    const panelBox = (await panel.boundingBox())!;
+    const closeBox = (await closeButton.boundingBox())!;
+    expect(
+      closeBox.y + closeBox.height,
+      "'Close task' must stay within the panel's own bounds even with a very long failure detail",
+    ).toBeLessThanOrEqual(panelBox.y + panelBox.height + 1);
   });
 
   test("ZYU-18 a failed task shows a distinct error state on the task window, not a silent 'Pending'", async ({
@@ -528,6 +1126,40 @@ test.describe("zyra / agents (UI)", () => {
 
     // The chip updates in place to the Title Case label, not the raw "done"/"accepted" token.
     await expect(page.getByText("Done", { exact: true })).toBeVisible();
+
+    // Regression: the button used to stay mounted-but-disabled once done, so a closed task
+    // still showed an actionable-looking "Close task" button. It must be gone, not greyed out.
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-26 a task that is already done never shows a Close task button, on either surface", async ({ browser }) => {
+    // Covers the initial-render path, not just the transition covered by ZYU-17: a task can
+    // load already-done (e.g. "accepted" from a Jira sync), and the button must never mount.
+    const userStory = stamp("Already done story");
+    const taskId = seedTask({ userStory, status: "done" });
+
+    const fullPage = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(fullPage.getByText("Done", { exact: true })).toBeVisible();
+    await expect(fullPage.getByRole("button", { name: "Close task" })).toHaveCount(0);
+
+    const boardPage = await open(browser, "/agents/tasks");
+    await boardPage.getByRole("tab", { name: "Kanban board" }).click();
+    const cardContainer = boardPage.locator("button", { has: boardPage.getByText(userStory) });
+    await cardContainer.click();
+    const panel = boardPage.locator(".slide-in-right");
+    await expect(panel.getByText(userStory)).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Close task" })).toHaveCount(0);
+  });
+
+  test("ZYU-27 a task synced back as 'accepted' is treated as done for the Close task button too", async ({ browser }) => {
+    // normalizeTaskStatus() maps the Jira-sync status "accepted" to "done" for the chip and the
+    // disabled state alike — confirm the button-hiding fix keys off that same normalization,
+    // not a literal `=== "done"` check that a raw "accepted" row would slip past.
+    const taskId = seedTask({ status: "accepted" });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(page.getByText("Done", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Close task" })).toHaveCount(0);
   });
 
   // ─── Authorization ─────────────────────────────────────────────────────────
@@ -672,5 +1304,471 @@ test.describe("zyra / agents (UI)", () => {
 
     await expect(page.getByText("failed", { exact: true })).toBeVisible({ timeout: 9000 });
     await expect(page.getByText("E2E simulated provider timeout while this page was open")).toBeVisible();
+  });
+
+  // ─── The quick-view panel's Feedback tab (fix for "Feedback and Activity sections
+  // display similar content") ─────────────────────────────────────────────────
+
+  test("ZYU-28 the quick-view panel's Feedback tab says so when a task has no feedback, even though Activity has entries", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test: the Feedback tab used to render the whole activity_log verbatim, so it was
+     * never actually empty — it just duplicated whatever Activity showed. seedTask()'s default
+     * activity_log entry is status/process narration ("Picked up task"), not reviewer feedback, so
+     * a correct Feedback tab must show its own empty state here while Activity still lists it.
+     */
+    const userStory = stamp("No feedback story");
+    seedTask({ userStory });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Feedback/ }).click();
+    await expect(panel.getByText("No feedback yet.")).toBeVisible();
+    await expect(panel.getByText("Picked up task"), "the empty state must not be the whole activity log in disguise").toHaveCount(0);
+
+    await panel.getByRole("button", { name: /^Activity/ }).click();
+    await expect(panel.getByText("Picked up task"), "Activity keeps the full history unfiltered").toBeVisible();
+  });
+
+  test("ZYU-29 the quick-view panel's Feedback tab shows only the reviewer's submitted feedback, not status activity", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Feedback story");
+    const taskId = seedTask({ userStory });
+    seedFeedbackActivity(taskId, "Cover the locked-account case too");
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    // The tab count is the filtered count, not the raw activity_log length (2 entries seeded).
+    await expect(panel.getByRole("button", { name: "Feedback (1)" })).toBeVisible();
+    await panel.getByRole("button", { name: /^Feedback/ }).click();
+    await expect(panel.getByText("Cover the locked-account case too")).toBeVisible();
+    await expect(panel.getByText("Picked up task"), "a status entry must not leak into Feedback").toHaveCount(0);
+
+    await expect(panel.getByRole("button", { name: "Activity (2)" })).toBeVisible();
+    await panel.getByRole("button", { name: /^Activity/ }).click();
+    await expect(panel.getByText("Cover the locked-account case too"), "Activity still carries the full history, feedback included").toBeVisible();
+    await expect(panel.getByText("Picked up task")).toBeVisible();
+  });
+
+  // ─── Sources tab: label and formatting ─────────────────────────────────────
+
+  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test for [Agents-Tasks] "User context" in the Task Details view: the source label
+     * had to read "User Story Context", not "User context", and the detail text — pulled from a
+     * multi-paragraph Jira description — had to keep its line breaks rather than rendering as one
+     * flattened paragraph. The real generation flow that builds this source can't be driven end to
+     * end here (see the file header — no AI provider is configured for this suite), so the source is
+     * seeded the way aiGenerate leaves it and this asserts the panel renders it correctly.
+     */
+    const userStory = stamp("Context story");
+    const context = "Line one of the story\nLine two of the story\nLine three";
+    seedTask({ userStory, sources: [{ type: "context", title: "User Story Context", detail: context }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    const title = panel.getByRole("heading", { name: "User Story Context", level: 3 });
+    await expect(title).toBeVisible();
+    await expect(panel.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
+
+    const sourceCard = panel.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail, "the detail paragraph must preserve line breaks visually, not collapse them").toHaveCSS("white-space", "pre-wrap");
+    expect(await detail.textContent()).toBe(context);
+  });
+
+  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+    browser,
+  }) => {
+    const context = "Line one of the story\nLine two of the story\nLine three";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: context }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    await expect(title).toBeVisible();
+    await expect(page.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
+
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail).toHaveCSS("white-space", "pre-wrap");
+    expect(await detail.textContent()).toBe(context);
+  });
+
+  test("ZYU-32 a source with no line breaks in its detail still renders correctly", async ({ browser }) => {
+    // Guard against a regression the other way: whitespace-pre-wrap must not visually alter
+    // single-line detail text (extra wrapping, stray whitespace) — only multi-line text is affected.
+    const single = "A single line of context with no breaks at all";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: single }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    await expect(detail).toBeVisible();
+    expect(await detail.textContent()).toBe(single);
+  });
+
+  // ─── Sources tab: Knowledge Base Markdown rendering (KAN-6 report) ─────────
+  //
+  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }` — only that type
+  // goes through renderMarkdown (lib/markdown.ts, shared with the Zyra chat page); every other
+  // source type keeps rendering as literal whitespace-pre-wrap text, which is what ZYU-30/31/32
+  // above depend on. Real generation can't be driven end to end in this suite (see file header —
+  // no AI provider is configured), so these seed a `knowledge_base` source directly, the same way
+  // the context/story sources above are seeded, and assert on what the panel/page render from it.
+
+  test("ZYU-34 the quick-view panel's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const userStory = stamp("KB markdown story");
+    const detail =
+      "# Search Forum Posts\n\nAs a user, I want to **carefully** review existing posts.\n\nAcceptance Criteria:\n- Search bar is available\n- Results are sortable";
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KAN-6: Search Forum Posts", detail }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.getByRole("heading", { name: "Search Forum Posts", level: 1 })).toBeVisible();
+    await expect(panel.locator("strong", { hasText: "carefully" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Search bar is available" })).toBeVisible();
+    await expect(panel.locator("li", { hasText: "Results are sortable" })).toBeVisible();
+
+    await expect(
+      panel.getByText("# Search Forum Posts", { exact: true }),
+      "the raw markdown symbol must not be shown as literal text",
+    ).toHaveCount(0);
+    await expect(panel.getByText("**carefully**", { exact: false })).toHaveCount(0);
+  });
+
+  test("ZYU-35 the task detail page's Sources tab renders Knowledge Base Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const detail = "## Description\n\nUse `filters` to narrow **results**.\n- item a\n- item b";
+    const taskId = seedTask({ sources: [{ type: "knowledge_base", title: "KB doc", detail }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Description", level: 2 })).toBeVisible();
+    await expect(page.locator("strong", { hasText: "results" })).toBeVisible();
+    await expect(page.locator(".inline-code", { hasText: "filters" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item a" })).toBeVisible();
+    await expect(page.locator("li", { hasText: "item b" })).toBeVisible();
+
+    await expect(page.getByText("## Description", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-36 a Knowledge Base source displays its complete content, not cut off at the old 320-character limit", async ({
+    browser,
+  }) => {
+    // Regression test for the reported truncation ("...so t"): source.detail used to be hard-cut
+    // at 320 characters with no word-boundary awareness. legacy.service.ts now applies a much
+    // larger, word-safe cap (truncateAtWordBoundary) upstream of this point, so content within
+    // that cap must render in full here — this proves the panel itself performs no additional
+    // client-side clipping of what it's given.
+    const tail = "the final sentence must remain fully visible and unclipped";
+    const filler = "Paragraph text describing the feature in detail. ".repeat(10); // > 320 chars
+    const userStory = stamp("KB long content story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `${filler}${tail}` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(tail, { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-37 Knowledge Base content with a long unbroken token wraps inside the panel instead of overflowing it", async ({
+    browser,
+  }) => {
+    // whitespace-pre-wrap alone does not break an unspaced token (a URL, an id) — only
+    // overflow-wrap does. Regression guard for the fixed max-w-[520px] quick-view panel.
+    const longToken = `https://example.com/${"a".repeat(120)}`;
+    const userStory = stamp("KB long token story");
+    seedTask({ userStory, sources: [{ type: "knowledge_base", title: "KB doc", detail: `See ${longToken} for details.` }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expect(panel.getByText(longToken, { exact: false })).toBeVisible();
+
+    const scrollArea = panel.locator(".overflow-y-auto");
+    const { scrollWidth, clientWidth } = await scrollArea.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    }));
+    expect(scrollWidth, "a long token must wrap, not push the content area into horizontal overflow").toBeLessThanOrEqual(
+      clientWidth + 1,
+    );
+  });
+
+  test("ZYU-38 Knowledge Base content containing HTML-like text is escaped, not rendered as markup", async ({ browser }) => {
+    const marker = `xss-marker-${Date.now()}`;
+    const userStory = stamp("KB injection story");
+    seedTask({
+      userStory,
+      sources: [{ type: "knowledge_base", title: "KB doc", detail: `<img src=x onerror="window.__zyraXss='${marker}'">` }],
+    });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+
+    await expect(panel.locator("img")).toHaveCount(0);
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraXss);
+    expect(injected, "the markdown renderer escapes HTML before parsing, so this must never execute").toBeUndefined();
+    await expect(panel.getByText("<img", { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-39 a non-Knowledge-Base source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
+    // Locks the type gate in TaskQuickViewPanel/the task detail page: only `knowledge_base`
+    // sources go through renderMarkdown. Every other type (context, story, jira, linear,
+    // existing_testcase) must keep rendering as literal pre-wrap text — ZYU-30/31/32 depend on
+    // that for `context`, and this pins it against the Markdown-looking text a real Jira
+    // description or user story can plausibly contain (e.g. a literal "- " bullet in prose).
+    const raw = "# Not a heading\n**not bold** and a - bullet look-alike";
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: raw }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+
+    await expect(page.getByRole("heading", { name: "Not a heading" })).toHaveCount(0);
+    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = page.locator("div.rounded-lg", { has: title });
+    const detail = sourceCard.locator("p");
+    expect(await detail.textContent()).toBe(raw);
+  });
+
+  // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─
+
+  test("ZYU-33 a transport-level failure on save is retried once instead of surfacing to the user", async ({ browser }) => {
+    /*
+     * Regression test for intermittent "Failed to fetch — browser blocked or could not reach the
+     * API" reports on Zyra staging. RCA: browsers refuse to silently retry a POST/PATCH written
+     * into a keep-alive connection the server already closed while idle (nginx's default
+     * keepalive_timeout, 75s, is shorter than the gaps a real chat session leaves between
+     * requests) — fetch() throws a transport TypeError instead, which used to reach the user
+     * verbatim. A page refresh "fixed" it only because it opened a fresh connection. lib/api.ts's
+     * fetchWithNetworkErrorMessage now retries exactly once on that error class before surfacing
+     * anything, since the failed write never reached the server in the first place.
+     *
+     * Settings save (PATCH .../agents/zyra/settings) stands in for the chat POST here because it
+     * needs no AI key (see file header) and already has an observable persisted side effect
+     * (ZYU-06/07). route.abort("failed") reproduces the exact browser-level failure — Chromium
+     * surfaces it to fetch() as `TypeError: Failed to fetch`, the same string production code
+     * matches on.
+     */
+    const page = await open(browser, "/agents/zyra/settings");
+    const settingsPath = `/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`;
+
+    let patchAttempts = 0;
+    // Matched by pathname predicate, not a glob: the frontend posts to the backend's own origin
+    // while the page is served from the frontend's, and a relative glob is resolved against
+    // baseURL — see NAV-B-07 in navigation.spec.ts for the same gotcha.
+    await page.route(
+      (url) => url.pathname === settingsPath,
+      async (route) => {
+        if (route.request().method() !== "PATCH") {
+          await route.continue();
+          return;
+        }
+        patchAttempts++;
+        if (patchAttempts === 1) {
+          await route.abort("failed");
+        } else {
+          await route.continue();
+        }
+      },
+    );
+
+    const knowledgeBase = page.getByRole("switch").nth(1);
+    await knowledgeBase.click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+
+    await expect(page.getByText("All changes saved.")).toBeVisible();
+    await expect(page.getByText(/Failed to fetch|browser blocked or could not reach the API/)).toHaveCount(0);
+    expect(patchAttempts, "the first attempt fails and the client retries exactly once").toBe(2);
+
+    await page.reload();
+    await expect(
+      page.getByRole("switch").nth(1),
+      "the retried request actually persisted the change, not just the UI's optimism",
+    ).not.toBeChecked();
+  });
+
+  test("ZYU-34 a failure that survives the retry still reaches the user", async ({ browser }) => {
+    // The other half of ZYU-33: a genuinely dead backend (both attempts fail) must not be silently
+    // swallowed — the user still needs to see it, just after one automatic retry rather than zero.
+    const page = await open(browser, "/agents/zyra/settings");
+    const settingsPath = `/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`;
+
+    let patchAttempts = 0;
+    await page.route(
+      (url) => url.pathname === settingsPath,
+      async (route) => {
+        if (route.request().method() !== "PATCH") {
+          await route.continue();
+          return;
+        }
+        patchAttempts++;
+        await route.abort("failed");
+      },
+    );
+
+    const knowledgeBase = page.getByRole("switch").nth(1);
+    await knowledgeBase.click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+
+    await expect(page.getByText(/browser blocked or could not reach the API/)).toBeVisible();
+    expect(patchAttempts, "still only one retry, not an unbounded loop").toBe(2);
+  });
+
+  // ─── Review step for Zyra-chat-generated test cases ────────────────────────
+  // Chat no longer writes create/update/archive operations straight to `testcases` — they're
+  // staged (applyZyraChatOperations) and shown in a review panel on the assistant's own message,
+  // the same select/edit/discard/save actions the task board already has. The live chat route
+  // can't drive staging itself (file header — no AI provider configured), so every scenario below
+  // seeds the staged batch and its referencing chat message directly, same rule seedTask() and
+  // seedChatReviewBatch() already establish.
+
+  test("ZYU-64 a chat message with a review batch renders every proposal, all selected by default", async ({ browser }) => {
+    seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Sign in with a valid password")).toBeVisible();
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect(page.getByText(/2 of 2 selected/)).toBeVisible();
+    await expect(page.getByRole("checkbox", { name: "Select proposed test case 1" })).toBeChecked();
+    await expect(page.getByRole("checkbox", { name: "Select proposed test case 2" })).toBeChecked();
+    await expect(page.getByRole("button", { name: /Save 2 to repository/ })).toBeEnabled();
+
+    // Unselecting one drops the save button's count and disables nothing else.
+    await page.getByRole("checkbox", { name: "Select proposed test case 1" }).uncheck();
+    await expect(page.getByText(/1 of 2 selected/)).toBeVisible();
+    await expect(page.getByRole("button", { name: /Save 1 to repository/ })).toBeEnabled();
+  });
+
+  test("ZYU-65 discarding a proposed row removes it from the panel and the stored batch", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Sign in with a valid password")).toBeVisible();
+    await page
+      .getByRole("listitem")
+      .filter({ hasText: "Sign in with a valid password" })
+      .getByRole("button", { name: "Discard" })
+      .click();
+
+    await expect(page.getByText("Sign in with a valid password")).toHaveCount(0);
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect
+      .poll(() => draftTitles(taskId), { message: "the discard must persist, not just disappear client-side" })
+      .toEqual(["Sign in with a wrong password"]);
+  });
+
+  test("ZYU-66 editing a proposed row updates what's displayed and what's stored", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
+    await row.getByRole("button", { name: "Edit" }).click();
+    const titleInput = row.getByRole("textbox").first();
+    await titleInput.fill("Sign in with a wrong password — edited");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(page.getByText("Sign in with a wrong password — edited")).toBeVisible();
+    await expect
+      .poll(() => draftTitles(taskId), { message: "the edit must persist, not just render client-side" })
+      .toContain("Sign in with a wrong password — edited");
+  });
+
+  test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {
+    const suiteName = stamp("Chat review suite");
+    const createdSuite = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(createdSuite.status()).toBe(201);
+    const realSuiteId = (await createdSuite.json()).id;
+
+    const draftTitle = stamp("Chat-saved case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: realSuiteId, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    await expect
+      .poll(
+        () =>
+          Number(
+            scalar(
+              `SELECT COUNT(*) FROM testcases t WHERE t.project_id = ${literal(tenant!.mainProjectId)} AND t.suite_id = ${literal(realSuiteId)} AND t.title = ${literal(draftTitle)};`,
+            ),
+          ),
+        { message: "the saved proposal must land in its own suite as a real test case" },
+      )
+      .toBe(1);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYU-68 a review batch already resolved elsewhere shows a read-only note instead of live controls", async ({ browser }) => {
+    seedChatReviewBatch({ status: "done" });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/This batch was already saved or closed/)).toBeVisible();
+    await expect(page.getByRole("checkbox", { name: /Select proposed test case/ })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /Save \d+ to repository/ })).toHaveCount(0);
+  });
+
+  test("ZYU-69 saving only part of a batch leaves the rest visible and actionable, not resolved", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    await page.getByRole("checkbox", { name: "Select proposed test case 2" }).uncheck();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    // The unselected draft is still on screen, still checked, still actionable — the batch did not
+    // resolve just because one of its two drafts was saved.
+    await expect(page.getByText("Sign in with a wrong password")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Discard" })).toBeVisible();
+    await expect
+      .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
+      .toBe("in_review");
   });
 });

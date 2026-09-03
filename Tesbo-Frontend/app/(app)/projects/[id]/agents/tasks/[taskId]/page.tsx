@@ -21,6 +21,7 @@ import {
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
+import { renderMarkdown } from "@/lib/markdown";
 
 type SaveMode = "existing" | "new";
 type DetailTab = "testcases" | "activities" | "sources";
@@ -51,6 +52,7 @@ const TASK_STATUS_LABELS: Record<string, string> = {
   todo: "Pending",
   in_progress: "In Progress",
   in_review: "In Review",
+  failed: "Failed",
   done: "Done",
 };
 
@@ -368,7 +370,9 @@ export default function ZyraTaskDetailPage() {
             )}
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={done || working}>Close task</Button>
+            {!done && (
+              <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>Close task</Button>
+            )}
             <Button variant="confidence" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>Save selected</Button>
           </div>
         </div>
@@ -528,7 +532,7 @@ export default function ZyraTaskDetailPage() {
           {task.activities.map((activity, index) => (
             <div key={`${activity.title}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {activity.stage.replaceAll("_", " ")}</span>
+                <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {(activity.stage || "").replaceAll("_", " ")}</span>
                 <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}</span>
               </div>
               <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{activity.title}</h3>
@@ -548,7 +552,14 @@ export default function ZyraTaskDetailPage() {
               <div key={`${source.type}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
                 <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                 <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{source.title}</h3>
-                <p className="mt-1 text-sm text-[var(--muted)]">{source.detail}</p>
+                {source.type === "knowledge_base" ? (
+                  <div
+                    className="zyra-prose zyra-prose-compact break-words mt-1 text-sm text-[var(--muted)]"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
+                  />
+                ) : (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-sm text-[var(--muted)]">{source.detail}</p>
+                )}
               </div>
             ))
           )}

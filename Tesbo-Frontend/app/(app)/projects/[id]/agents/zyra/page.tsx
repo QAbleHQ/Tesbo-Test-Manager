@@ -20,9 +20,11 @@ import {
   type ZyraChatSession,
   type ZyraChatTestcaseRow,
 } from "@/lib/api";
-import { Button, CopyButton, PageLoader, StatusChip, Textarea } from "@/components/ui";
+import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, type Priority } from "@/components/ui";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { toTsv } from "@/lib/tsv";
+import { renderMarkdown } from "@/lib/markdown";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
 function ZyraMark({ size = 24 }: { size?: number }) {
@@ -48,60 +50,6 @@ const QUICK_ACTIONS = [
   { label: "API test cases", prompt: "Generate API test cases for the main endpoints covering success, error, and boundary scenarios." },
 ];
 
-// ─── Markdown renderer ────────────────────────────────────────────────────────
-function mdInline(s: string): string {
-  return s
-    .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>");
-}
-
-function mdTable(lines: string[]): string {
-  const isSep = (l: string) => /^\|[\s\-:|]+\|$/.test(l.trim());
-  const cells = (l: string) => l.trim().replace(/(?:^\|)|(?:\|$)/g, "").split("|").map(c => c.trim());
-  const data = lines.filter(l => !isSep(l));
-  if (!data.length) return "";
-  const [hdr, ...rows] = data;
-  const thead = `<thead><tr>${cells(hdr).map(h => `<th>${mdInline(h)}</th>`).join("")}</tr></thead>`;
-  const tbody = `<tbody>${rows.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("")}</tbody>`;
-  return `<div class="zyra-md-table-wrap"><table class="zyra-md-table">${thead}${tbody}</table></div>`;
-}
-
-function renderMarkdown(text: string): string {
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const lines = esc(text).split("\n");
-  const out: string[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const t = lines[i].trim();
-    if (/^### /.test(t)) { out.push(`<h3>${mdInline(t.slice(4))}</h3>`); i++; continue; }
-    if (/^## /.test(t)) { out.push(`<h2>${mdInline(t.slice(3))}</h2>`); i++; continue; }
-    if (/^# /.test(t)) { out.push(`<h1>${mdInline(t.slice(2))}</h1>`); i++; continue; }
-    if (/^---+$/.test(t)) { out.push("<hr/>"); i++; continue; }
-    if (t.startsWith("|")) {
-      const tbl: string[] = [];
-      while (i < lines.length && lines[i].trim().startsWith("|")) { tbl.push(lines[i]); i++; }
-      out.push(mdTable(tbl));
-      continue;
-    }
-    if (/^[-*] /.test(t) || /^\d+\. /.test(t)) {
-      const items: string[] = [];
-      while (i < lines.length) {
-        const l = lines[i].trim();
-        if (/^[-*] /.test(l)) { items.push(`<li>${mdInline(l.slice(2))}</li>`); i++; }
-        else if (/^\d+\. /.test(l)) { items.push(`<li>${mdInline(l.replace(/^\d+\. /, ""))}</li>`); i++; }
-        else break;
-      }
-      out.push(`<ul>${items.join("")}</ul>`);
-      continue;
-    }
-    if (t === "") { out.push("<br/>"); i++; continue; }
-    out.push(`<p>${mdInline(t)}</p>`);
-    i++;
-  }
-  return out.join("");
-}
-
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function formatTime(value?: string) {
   if (!value) return "";
@@ -122,14 +70,6 @@ function firstStepPreview(value: unknown): string {
   }
   if (typeof value !== "string") return "—";
   try { return firstStepPreview(JSON.parse(value)); } catch { return "—"; }
-}
-
-// ─── Tone maps — mirror RepositoryTestCaseTable's priority/status conventions ──
-function priorityTone(priority?: string) {
-  if (priority === "P0") return "error" as const;
-  if (priority === "P1") return "warning" as const;
-  if (priority === "P2") return "confidenceHigh" as const;
-  return "neutral" as const;
 }
 
 function statusTone(status?: string) {
@@ -153,6 +93,8 @@ function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
+  const proposedCount = (counts["proposed-create"] || 0) + (counts["proposed-update"] || 0) + (counts["proposed-archive"] || 0);
+  if (proposedCount === rows.length) return `${rows.length} test case${rows.length === 1 ? "" : "s"} drafted for review`;
   const verb = counts.created ? "generated" : counts.updated ? "updated" : counts.archived ? "archived" : "suggested";
   return `${rows.length} test case${rows.length === 1 ? "" : "s"} ${verb}`;
 }
@@ -206,9 +148,7 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
                 </td>
                 <td className="max-w-[280px] px-3 py-3 text-[12px] leading-snug text-[var(--foreground)]">{row.title}</td>
                 <td className="px-3 py-3">
-                  <StatusChip tone={priorityTone(row.priority)} className="!rounded-[5px] !px-[7px] !py-[2px] !font-mono !text-[11px] !font-semibold">
-                    {row.priority || "P2"}
-                  </StatusChip>
+                  <PriorityBadge priority={(row.priority || "P2") as Priority} />
                 </td>
                 <td className="px-3 py-3">
                   <StatusChip tone={statusTone(row.status)} className="!px-[9px] !py-[2px] !text-[11px] !font-medium">
@@ -421,6 +361,10 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
   }
 
   const metaLabel = summarizeTestcaseActions(testcases);
+  // Proposed rows aren't in the repository yet — they get the review panel (select/edit/discard/
+  // save) instead of the plain read-only table, and don't count toward "View test cases" below.
+  const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
+  const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -446,10 +390,13 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
         dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
       />
 
-      <TestcaseTable rows={testcases} />
+      <TestcaseTable rows={appliedRows} />
+      {message.reviewRequestId && proposedRows.length > 0 && (
+        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      )}
 
       <div className="flex items-center gap-2">
-        {testcases.length > 0 && (
+        {appliedRows.length > 0 && (
           <Link
             href={`/projects/${projectId}/testcases`}
             className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]"

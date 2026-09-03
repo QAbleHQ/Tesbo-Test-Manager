@@ -3,15 +3,15 @@
   "version": "0.1.0",
   "license": "Apache-2.0",
   "scripts": {
-    "dev": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --webpack",
-    "dev:turbo": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next dev --turbopack",
+    "dev": "next dev --webpack",
+    "dev:turbo": "next dev --turbopack",
     "build": "next build",
-    "start": "cross-env NODE_OPTIONS=\"--import ./instrumentation.mjs\" next start",
+    "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
     "@betterbugs/web-sdk": "^0.0.44",
-    "@middleware.io/node-apm": "^2.4.2",
+    "@sentry/nextjs": "^10.73.0",
     "@tabler/icons-react": "^3.44.0",
     "@tiptap/extension-image": "^3.27.1",
     "@tiptap/extension-table": "^3.27.1",
@@ -19,7 +19,8 @@
     "@tiptap/extension-task-list": "^3.27.1",
     "@tiptap/react": "^3.27.1",
     "@tiptap/starter-kit": "^3.27.1",
-    "next": "16.1.6",
+    "exceljs": "^4.4.0",
+    "next": "16.3.3",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "xlsx": "^0.18.5"
@@ -29,9 +30,8 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "cross-env": "^10.1.0",
     "eslint": "^9",
-    "eslint-config-next": "16.1.6",
+    "eslint-config-next": "16.3.3",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

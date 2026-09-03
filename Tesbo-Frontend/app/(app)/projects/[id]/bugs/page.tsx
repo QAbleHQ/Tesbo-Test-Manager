@@ -16,6 +16,7 @@ import {
   deleteBugAttachment,
   getBugAttachmentDownloadUrl,
   listTestRuns,
+  listProjectMembers,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -32,8 +33,11 @@ import {
   Textarea,
   Select,
   StatusChip,
+  PriorityBadge,
+  SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
@@ -50,16 +54,47 @@ const BUG_SEVERITIES: BugSeverity[] = ["Critical", "High", "Medium", "Low"];
  */
 const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
 
-const PRIORITY_TONE: Record<BugPriority, "error" | "warning" | "info" | "neutral"> = {
-  P0: "error",
-  P1: "warning",
-  P2: "info",
-  P3: "neutral",
-};
-
 function BugPriorityBadge({ priority }: { priority: BugPriority | null }) {
   if (!priority) return <span className="text-xs text-[var(--muted-soft)]">—</span>;
-  return <StatusChip tone={PRIORITY_TONE[priority]}>{priority}</StatusChip>;
+  return <PriorityBadge priority={priority} />;
+}
+
+/* ───── Assignee avatar ─────
+ * Seeded on the assignee's id, not their name, matching the same convention used for executions
+ * (cycles/[cycleId]/page.tsx) so a person keeps the same colour everywhere they're shown assigned.
+ */
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
+}
+
+function MemberAvatar({ name, seed, size = 20 }: { name: string; seed?: string | null; size?: number }) {
+  return (
+    <span
+      className="inline-flex shrink-0 items-center justify-center rounded-full border-2 border-[var(--surface)] font-semibold text-white"
+      style={{ background: avatarColor(seed || name), width: size, height: size, fontSize: size * 0.42 }}
+      title={name}
+    >
+      {getInitials(name)}
+    </span>
+  );
+}
+
+function BugAssignee({ id, name }: { id: string | null; name: string | null }) {
+  if (!id) return <span className="text-xs text-[var(--muted-soft)]">Unassigned</span>;
+  // Assigned, but the join in bugSelect turned up no actor_profiles row (a deleted actor). Still a
+  // real assignment — distinct from Unassigned — just with nothing to render a name or colour from.
+  if (!name) return <span className="text-xs text-[var(--muted-soft)]">Unknown assignee</span>;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <MemberAvatar name={name} seed={id} size={20} />
+      <span className="text-xs text-[var(--muted)] truncate max-w-[120px]" title={name}>
+        {name}
+      </span>
+    </span>
+  );
 }
 const PAGE_SIZE = 15;
 
@@ -77,13 +112,6 @@ const STATUS_COLOR: Record<string, string> = {
   Closed: "var(--success)",
 };
 
-const SEVERITY_TONE: Record<BugSeverity, "error" | "warning" | "neutral" | "success"> = {
-  Critical: "error",
-  High: "warning",
-  Medium: "neutral",
-  Low: "success",
-};
-
 /* ───── Status badge ───── */
 function BugStatusBadge({ status }: { status: string }) {
   return (
@@ -93,7 +121,7 @@ function BugStatusBadge({ status }: { status: string }) {
 
 /* ───── Severity badge ───── */
 function BugSeverityBadge({ severity }: { severity: BugSeverity }) {
-  return <StatusChip tone={SEVERITY_TONE[severity]}>{severity}</StatusChip>;
+  return <SeverityBadge severity={severity} />;
 }
 
 /* ───── View toggle buttons ───── */
@@ -165,29 +193,37 @@ function KanbanCard({
         <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
           {bug.title}
         </h4>
+        {/*
+          * Same defect as the List view's row actions (Basecamp 10226234070 / 10218564160): a
+          * 14px glyph in a ~22px box is a hairline nobody can reliably click. Matches the List
+          * view's fix — ghost Button, 18px icon, 32px box, aria-labels, distinct destructive
+          * colour — plus focus-within so the actions are reachable by keyboard, not just hover.
+          */}
         <div
           role="presentation"
-          className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+          className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 shrink-0"
           onClick={(e) => e.stopPropagation()}
         >
-          <button
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={onEdit}
-            className="p-1 rounded text-[var(--muted)] hover:text-[var(--foreground)] hover:bg-[var(--surface-raised)]"
-            title="Edit"
+            className="text-[var(--muted)] hover:bg-[var(--surface-raised)] hover:text-[var(--accent-light)]"
+            title="Edit bug"
+            aria-label="Edit bug"
           >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-            </svg>
-          </button>
-          <button
+            <IconPencil size={18} stroke={1.75} />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={onDelete}
-            className="p-1 rounded text-[var(--muted)] hover:text-[var(--error-foreground)] hover:bg-[var(--error)]/10"
-            title="Delete"
+            className="text-[var(--status-fail-text)] hover:bg-[var(--error-soft)] hover:text-[var(--status-fail-text)]"
+            title="Delete bug"
+            aria-label="Delete bug"
           >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-            </svg>
-          </button>
+            <IconTrash size={18} stroke={1.75} />
+          </Button>
         </div>
       </div>
 
@@ -231,9 +267,12 @@ function KanbanCard({
         <span className="text-[10px] text-[var(--muted-soft)]">
           {bug.reporterName || bug.reporterEmail || "Unknown"}
         </span>
-        <span className="text-[10px] text-[var(--muted-soft)]">
-          {new Date(bug.createdAt).toLocaleDateString()}
-        </span>
+        <div className="flex items-center gap-1.5">
+          {bug.assigneeId && bug.assigneeName && <MemberAvatar name={bug.assigneeName} seed={bug.assigneeId} size={16} />}
+          <span className="text-[10px] text-[var(--muted-soft)]">
+            {new Date(bug.createdAt).toLocaleDateString()}
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -383,6 +422,9 @@ export default function BugsPage() {
    */
   const [filterSeverity, setFilterSeverity] = useState("");
   const [filterPriority, setFilterPriority] = useState("");
+  /* "" = everyone, "unassigned" = no assignee, otherwise a user id. A sentinel string rather than
+     null/"" for "unassigned" because "" already means "no filter" — the two have to stay distinct. */
+  const [filterAssignee, setFilterAssignee] = useState("");
   const [search, setSearch] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("kanban");
   const [page, setPage] = useState(1);
@@ -395,6 +437,7 @@ export default function BugsPage() {
      mandatory when there's actually something to pick, so reporting a bug is never blocked
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
+  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -409,6 +452,7 @@ export default function BugsPage() {
   const [createEvidenceMode, setCreateEvidenceMode] = useState<EvidenceMode>("FILES");
   const [createStagedFiles, setCreateStagedFiles] = useState<File[]>([]);
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
+  const [createAssigneeId, setCreateAssigneeId] = useState("");
   const [creating, setCreating] = useState(false);
 
   /* edit modal */
@@ -426,6 +470,7 @@ export default function BugsPage() {
   const [editAttachments, setEditAttachments] = useState<BugAttachment[]>([]);
   const [editBetterbugsUrl, setEditBetterbugsUrl] = useState("");
   const [editStatus, setEditStatus] = useState("");
+  const [editAssigneeId, setEditAssigneeId] = useState("");
   const [saving, setSaving] = useState(false);
   /*
    * Basecamp 10226296533: createBug/updateBug succeeded, uploadBugAttachments then threw, and the
@@ -463,6 +508,7 @@ export default function BugsPage() {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
+    listProjectMembers(projectId).then(setMembers).catch(() => {});
   }, [projectId]);
 
   /* filtered list */
@@ -472,6 +518,8 @@ export default function BugsPage() {
       if (filterStatus && b.status !== filterStatus) return false;
       if (filterSeverity && b.severity !== filterSeverity) return false;
       if (filterPriority && b.priority !== filterPriority) return false;
+      if (filterAssignee === "unassigned" && b.assigneeId) return false;
+      if (filterAssignee && filterAssignee !== "unassigned" && b.assigneeId !== filterAssignee) return false;
       if (
         term &&
         !b.title.toLowerCase().includes(term) &&
@@ -484,12 +532,36 @@ export default function BugsPage() {
         return false;
       return true;
     });
-  }, [bugs, filterStatus, filterSeverity, filterPriority, search]);
+  }, [bugs, filterStatus, filterSeverity, filterPriority, filterAssignee, search]);
+
+  const hasActiveFilters = Boolean(
+    search.trim() || filterStatus || filterSeverity || filterPriority || filterAssignee
+  );
+
+  function clearFilters() {
+    setSearch("");
+    setFilterStatus("");
+    setFilterSeverity("");
+    setFilterPriority("");
+    setFilterAssignee("");
+  }
+
+  /* Options for the "Assign to" filter: every project member, plus any bug's current assignee who
+     has since left the project (or is an AI agent, never a member to begin with) — otherwise
+     filtering to that person would offer no way to select them. */
+  const assigneeFilterOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const m of members) seen.set(m.userId, m.name || m.email);
+    for (const b of bugs) {
+      if (b.assigneeId && !seen.has(b.assigneeId)) seen.set(b.assigneeId, b.assigneeName || "Unknown assignee");
+    }
+    return Array.from(seen.entries());
+  }, [members, bugs]);
 
   /* reset page when filters change */
   useEffect(() => {
     setPage(1);
-  }, [filterStatus, filterSeverity, search, viewMode]);
+  }, [filterStatus, filterSeverity, filterAssignee, search, viewMode]);
 
   /* paginated list for list view */
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -506,10 +578,12 @@ export default function BugsPage() {
     }));
   }, [filtered]);
 
-  /* stats */
-  const openCount = bugs.filter(
-    (b) => b.status === "Open" || b.status === "Reopened"
-  ).length;
+  /*
+   * Header stats must match the board's own per-status columns below them — the board treats
+   * "Open" and "Reopened" as distinct columns, so the header's "open" count previously summing
+   * both (Open + Reopened) showed a number no column on the board actually displayed.
+   */
+  const openCount = bugs.filter((b) => b.status === "Open").length;
   const closedCount = bugs.filter((b) => b.status === "Closed").length;
 
   /* reset create modal state */
@@ -527,6 +601,7 @@ export default function BugsPage() {
     setCreateEvidenceMode("FILES");
     setCreateStagedFiles([]);
     setCreateBetterbugsUrl("");
+    setCreateAssigneeId("");
   }
 
   /* create */
@@ -541,6 +616,7 @@ export default function BugsPage() {
         description: createDesc.trim(),
         severity: createSeverity,
         priority: createPriority || null,
+        assigneeId: createAssigneeId || null,
         externalUrl: selfLogged ? createUrl.trim() : undefined,
         integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
         integrationIssueKey: null,
@@ -590,6 +666,7 @@ export default function BugsPage() {
     setEditAttachments(bug.attachments);
     setEditBetterbugsUrl(bug.betterbugsUrl || "");
     setEditStatus(bug.status);
+    setEditAssigneeId(bug.assigneeId || "");
   }
 
   /* remove an already-uploaded attachment from the bug being edited */
@@ -611,6 +688,7 @@ export default function BugsPage() {
         status: editStatus,
         severity: editSeverity,
         priority: editPriority || null,
+        assigneeId: editAssigneeId || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
         integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
         integrationIssueKey: null,
@@ -741,6 +819,28 @@ export default function BugsPage() {
                   </option>
                 ))}
               </Select>
+              <Select
+                value={filterAssignee}
+                onChange={(e) => setFilterAssignee(e.target.value)}
+                aria-label="Filter by assignee"
+              >
+                <option value="">All Assignees</option>
+                <option value="unassigned">Unassigned</option>
+                {assigneeFilterOptions.map(([id, name]) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </Select>
+              {hasActiveFilters && (
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--ink-200)] px-3 text-[12px] font-medium text-[var(--ink-600)] hover:bg-[var(--ink-100)]"
+                >
+                  Clear all
+                </button>
+              )}
               <div className="ml-auto">
                 <ViewToggle mode={viewMode} onChange={setViewMode} />
               </div>
@@ -796,6 +896,7 @@ export default function BugsPage() {
                           <th>Test Case</th>
                           <th>Test Run</th>
                           <th>Reporter</th>
+                          <th>Assignee</th>
                           <th>Reported</th>
                           <th className="w-8"></th>
                         </tr>
@@ -904,6 +1005,9 @@ export default function BugsPage() {
                                 {b.reporterName || b.reporterEmail || "—"}
                               </span>
                             </td>
+                            <td>
+                              <BugAssignee id={b.assigneeId} name={b.assigneeName} />
+                            </td>
                             <td className="text-xs text-[var(--muted-soft)] whitespace-nowrap">
                               {new Date(b.createdAt).toLocaleDateString()}
                             </td>
@@ -926,9 +1030,9 @@ export default function BugsPage() {
                                   */}
                                 <Button
                                   variant="ghost"
-                                  size="sm"
+                                  size="icon"
                                   onClick={() => openEdit(b)}
-                                  className="h-8 w-8 min-w-8 p-0 text-[var(--muted)] hover:bg-[var(--surface-raised)] hover:text-[var(--accent-light)]"
+                                  className="text-[var(--muted)] hover:bg-[var(--surface-raised)] hover:text-[var(--accent-light)]"
                                   title="Edit bug"
                                   aria-label="Edit bug"
                                 >
@@ -936,9 +1040,9 @@ export default function BugsPage() {
                                 </Button>
                                 <Button
                                   variant="ghost"
-                                  size="sm"
+                                  size="icon"
                                   onClick={() => setDeletingId(b.id)}
-                                  className="h-8 w-8 min-w-8 p-0 text-[var(--status-fail-text)] hover:bg-[var(--error-soft)] hover:text-[var(--status-fail-text)]"
+                                  className="text-[var(--status-fail-text)] hover:bg-[var(--error-soft)] hover:text-[var(--status-fail-text)]"
                                   title="Delete bug"
                                   aria-label="Delete bug"
                                 >
@@ -1094,6 +1198,12 @@ export default function BugsPage() {
               </div>
               <div>
                 <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+                  Assigned To
+                </p>
+                <BugAssignee id={viewBug.assigneeId} name={viewBug.assigneeName} />
+              </div>
+              <div>
+                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
                   Reported On
                 </p>
                 <span className="text-sm text-[var(--foreground)]">
@@ -1188,7 +1298,7 @@ export default function BugsPage() {
               placeholder="Steps to reproduce, expected vs actual behavior…"
             />
           </Field>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <Field>
               <FieldLabel>Severity</FieldLabel>
               <Select value={createSeverity} onChange={(e) => setCreateSeverity(e.target.value as BugSeverity)}>
@@ -1212,6 +1322,21 @@ export default function BugsPage() {
                 {BUG_PRIORITIES.map((p) => (
                   <option key={p} value={p}>
                     {p}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Assign to</FieldLabel>
+              <Select
+                value={createAssigneeId}
+                onChange={(e) => setCreateAssigneeId(e.target.value)}
+                aria-label="Assign to"
+              >
+                <option value="">Unassigned</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>
+                    {m.name || m.email}
                   </option>
                 ))}
               </Select>
@@ -1376,6 +1501,29 @@ export default function BugsPage() {
                   {p}
                 </option>
               ))}
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel>Assign to</FieldLabel>
+            <Select
+              value={editAssigneeId}
+              onChange={(e) => setEditAssigneeId(e.target.value)}
+              aria-label="Assign to"
+            >
+              <option value="">Unassigned</option>
+              {members.map((m) => (
+                <option key={m.userId} value={m.userId}>
+                  {m.name || m.email}
+                </option>
+              ))}
+              {/* Current assignee not among this project's members — an AI agent or a stale row.
+                  Kept visible as a disabled option so Save doesn't silently clear a real
+                  assignment nobody touched. */}
+              {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
+                <option value={editAssigneeId} disabled>
+                  {editBug?.assigneeName || "Unknown assignee"} (not a project member)
+                </option>
+              )}
             </Select>
           </Field>
           <div className="flex justify-end gap-2 pt-2">

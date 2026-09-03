@@ -2,13 +2,40 @@ import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { decryptSecret, encryptSecret } from "../common/crypto.util";
 import { jiraDescriptionToText } from "../common/integration-text.util";
-import { COMMENTS_PER_TICKET, JIRA_PAGE_SIZE, LINEAR_PAGE_SIZE, MAX_TICKETS_PER_RUN } from "./integration-sync.constants";
+import {
+  COMMENTS_PER_TICKET,
+  INTEGRATION_SYNC_FETCH_TIMEOUT_MS,
+  JIRA_PAGE_SIZE,
+  JIRA_TOKEN_REFRESH_RETRY_DELAY_MS,
+  LINEAR_PAGE_SIZE,
+  MAX_TICKETS_PER_RUN,
+  PROVIDER_FOLDER_NAMES
+} from "./integration-sync.constants";
 import { RemoteComment, RemoteTicket, SyncProvider } from "./integration-sync.types";
 
 type Row = Record<string, any>;
 
 function asArray(value: unknown): Row[] {
   return Array.isArray(value) ? (value as Row[]) : [];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Thrown when a Jira connection's token cannot be made valid — authorization was revoked/expired,
+ * or this deployment has no Jira OAuth app configured. Distinguishing this from the raw provider
+ * HTTP error is the point: without it, a stale/unrefreshable token flows straight into a real Jira
+ * API call, which 401s, and that raw body (e.g. `jira request failed (401): {"code":401,...}`)
+ * propagates verbatim into the run's `error` field and onto the screen (SyncStatusPanel.tsx renders
+ * `run.error` as-is).
+ */
+export class IntegrationConnectionInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IntegrationConnectionInvalidError";
+  }
 }
 
 /**
@@ -43,24 +70,35 @@ export class IntegrationSyncClient {
   private async refreshJiraToken(connection: Row): Promise<Row> {
     const clientId = (process.env.JIRA_CLIENT_ID || "").trim();
     const clientSecret = (process.env.JIRA_CLIENT_SECRET || "").trim();
-    // Without deployment credentials there's nothing to refresh with. Hand back the stale
-    // connection so the caller fails on the actual API 401 with a provider-shaped error,
-    // rather than throwing a confusing config error mid-sync.
-    if (!clientId || !clientSecret) return connection;
+    if (!clientId || !clientSecret) {
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} sync is not configured for this workspace.`);
+    }
 
-    const res = await fetch("https://auth.atlassian.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: decryptSecret(String(connection.refresh_token || ""))
-      })
-    });
-    if (!res.ok) {
-      this.logger.warn(`Jira token refresh failed (${res.status}) for connection ${connection.id}`);
-      return connection;
+    const attempt = () =>
+      fetch("https://auth.atlassian.com/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: decryptSecret(String(connection.refresh_token || ""))
+        }),
+        signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
+      }).catch(() => null);
+
+    // One retry, unconditional on the failure shape: a cold-start network blip right after a
+    // container restart and a genuinely revoked refresh token both land here, and the retry is
+    // cheap enough that it isn't worth distinguishing Atlassian's error taxonomy to skip it — a
+    // revoked token just fails the same way again a second later.
+    let res = await attempt();
+    if (!res?.ok) {
+      await sleep(JIRA_TOKEN_REFRESH_RETRY_DELAY_MS);
+      res = await attempt();
+    }
+    if (!res?.ok) {
+      this.logger.warn(`Jira token refresh failed (${res ? res.status : "network error"}) for connection ${connection.id} after retry`);
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} needs to be reconnected to this workspace.`);
     }
     const token = (await res.json()) as Row;
     const accessToken = encryptSecret(String(token.access_token || ""));
@@ -85,7 +123,7 @@ export class IntegrationSyncClient {
   }
 
   private async json<T>(url: string, init: RequestInit, provider: SyncProvider): Promise<T> {
-    const res = await fetch(url, init);
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`${provider} request failed (${res.status}): ${text.slice(0, 300)}`);
@@ -97,11 +135,23 @@ export class IntegrationSyncClient {
    * Pages through every issue in a Jira project, newest-updated first, invoking `onPage` per
    * page so the caller can upsert incrementally and report progress before the whole backlog
    * is in memory. Stops at MAX_TICKETS_PER_RUN.
+   *
+   * `sinceIso`, when given, narrows the JQL to `updated >= sinceIso` — the nightly scheduler's
+   * incremental fetch. Manual Sync never passes it, so its full-resync behavior is unchanged.
    */
-  async fetchJiraTickets(connection: Row, projectKey: string, onPage: (tickets: RemoteTicket[]) => Promise<void>): Promise<{ total: number; truncated: boolean }> {
+  async fetchJiraTickets(
+    connection: Row,
+    projectKey: string,
+    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    sinceIso?: string | null
+  ): Promise<{ total: number; truncated: boolean }> {
     const { baseUrl, headers } = this.jiraAuth(connection);
     const siteUrl = String(connection.site_url || "").replace(/\/$/, "");
-    const jql = `project = "${projectKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" ORDER BY updated DESC`;
+    const escapedKey = projectKey.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    // Jira JQL date literals don't take a full ISO instant, only "yyyy-MM-dd HH:mm" — truncate to
+    // the minute, which only widens the window (never narrows it past what sinceIso intended).
+    const sinceClause = sinceIso ? ` AND updated >= "${new Date(sinceIso).toISOString().slice(0, 16).replace("T", " ")}"` : "";
+    const jql = `project = "${escapedKey}"${sinceClause} ORDER BY updated DESC`;
     let nextPageToken: string | undefined;
     let total = 0;
 
@@ -180,7 +230,8 @@ export class IntegrationSyncClient {
         Authorization: `Bearer ${decryptSecret(String(connection.access_token || ""))}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ query, variables })
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -191,14 +242,39 @@ export class IntegrationSyncClient {
     return payload.data as T;
   }
 
-  async fetchLinearTickets(connection: Row, teamId: string, onPage: (tickets: RemoteTicket[]) => Promise<void>): Promise<{ total: number; truncated: boolean }> {
+  /**
+   * `sinceIso`, when given, adds a `filter: { updatedAt: { gte } }` clause — the nightly
+   * scheduler's incremental fetch. Manual Sync never passes it, so its full-resync behavior
+   * (page through every issue in the team) is unchanged.
+   */
+  async fetchLinearTickets(
+    connection: Row,
+    teamId: string,
+    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    sinceIso?: string | null
+  ): Promise<{ total: number; truncated: boolean }> {
     let cursor: string | null = null;
     let total = 0;
-
-    for (;;) {
-      const data = await this.linearGraphQL<Row>(
-        connection,
-        `query TeamIssues($teamId: String!, $first: Int!, $after: String) {
+    // Built as two distinct query strings (rather than one query with a nullable filter variable)
+    // so an unset sinceIso can never risk Linear interpreting `gte: null` as "match nothing" —
+    // manual Sync's full-resync query is byte-for-byte what it was before this change.
+    const query = sinceIso
+      ? `query TeamIssues($teamId: String!, $first: Int!, $after: String, $since: DateTimeOrDuration!) {
+           team(id: $teamId) {
+             issues(first: $first, after: $after, orderBy: updatedAt, filter: { updatedAt: { gte: $since } }) {
+               nodes {
+                 id identifier title description url createdAt updatedAt
+                 state { name }
+                 priorityLabel
+                 assignee { name }
+                 creator { name }
+                 labels { nodes { name } }
+               }
+               pageInfo { hasNextPage endCursor }
+             }
+           }
+         }`
+      : `query TeamIssues($teamId: String!, $first: Int!, $after: String) {
            team(id: $teamId) {
              issues(first: $first, after: $after, orderBy: updatedAt) {
                nodes {
@@ -212,8 +288,13 @@ export class IntegrationSyncClient {
                pageInfo { hasNextPage endCursor }
              }
            }
-         }`,
-        { teamId, first: LINEAR_PAGE_SIZE, after: cursor }
+         }`;
+
+    for (;;) {
+      const data = await this.linearGraphQL<Row>(
+        connection,
+        query,
+        sinceIso ? { teamId, first: LINEAR_PAGE_SIZE, after: cursor, since: sinceIso } : { teamId, first: LINEAR_PAGE_SIZE, after: cursor }
       );
 
       const issues = asArray(data?.team?.issues?.nodes);

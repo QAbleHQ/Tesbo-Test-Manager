@@ -11,6 +11,7 @@ import {
   listProjectMembers,
   type PlanListItem,
 } from "@/lib/api";
+import { computePassRate } from "@/lib/executionMetrics";
 import {
   Button,
   Input,
@@ -97,10 +98,11 @@ function PlanSortMenu({ sortBy, onSortChange }: { sortBy: SortBy; onSortChange: 
   );
 }
 
-function overallPassRate(plans: PlanListItem[]): number {
+function overallPassRate(plans: PlanListItem[]): number | null {
   const passed = plans.reduce((sum, p) => sum + p.passed, 0);
-  const executed = plans.reduce((sum, p) => sum + p.passed + p.failed + p.blocked, 0);
-  return executed ? Math.round((passed / executed) * 100) : 0;
+  const failed = plans.reduce((sum, p) => sum + p.failed, 0);
+  const blocked = plans.reduce((sum, p) => sum + p.blocked, 0);
+  return computePassRate({ passed, failed, blocked });
 }
 
 export default function PlansPage() {
@@ -229,6 +231,13 @@ export default function PlansPage() {
     return sorted;
   }, [plans, searchQuery, statusFilter, sortBy]);
 
+  const hasActiveFilters = Boolean(searchQuery.trim() || statusFilter !== "all");
+
+  function clearFilters() {
+    setSearchQuery("");
+    setStatusFilter("all");
+  }
+
   const activeCount = plans.filter((p) => planStatus(p) === "active").length;
   const draftCount = plans.filter((p) => planStatus(p) === "draft").length;
   const passRate = overallPassRate(plans);
@@ -347,7 +356,7 @@ export default function PlansPage() {
             <div className="flex items-center gap-2 rounded-[7px] border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5">
               <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: "var(--status-pass-dot)" }} />
               <div>
-                <div className="text-[13px] font-semibold leading-tight text-[var(--foreground)]">{passRate}%</div>
+                <div className="text-[13px] font-semibold leading-tight text-[var(--foreground)]">{passRate !== null ? `${passRate}%` : "—"}</div>
                 <div className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Overall pass rate</div>
               </div>
             </div>
@@ -392,6 +401,15 @@ export default function PlansPage() {
               )}
             </button>
             <PlanSortMenu sortBy={sortBy} onSortChange={setSortBy} />
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--border)] px-3 text-[12px] font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+              >
+                Clear all
+              </button>
+            )}
             <div className="flex-1" />
             <div className="flex items-center gap-0.5 rounded-[6px] bg-[var(--surface-secondary)] p-[3px]">
               <button
@@ -445,7 +463,7 @@ export default function PlansPage() {
               <p className="text-[13px] text-[var(--muted-soft)]">Try adjusting your search or filters.</p>
               <button
                 type="button"
-                onClick={() => { setSearchQuery(""); setStatusFilter("all"); }}
+                onClick={clearFilters}
                 className="flex cursor-pointer items-center gap-1 text-[12px] font-medium text-[var(--accent-light)] hover:underline"
               >
                 <IconX size={12} stroke={2} />

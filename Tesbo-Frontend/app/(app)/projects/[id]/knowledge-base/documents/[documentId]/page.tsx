@@ -34,6 +34,7 @@ import {
 import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
 import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
 import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
+import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
 
 type SaveStatus = "saved" | "saving" | "unsaved";
@@ -408,6 +409,11 @@ export default function KnowledgeDocumentPage() {
 
   async function openHistory() {
     setHistoryOpen(true);
+    // A mirror is never saved through the edit-and-save flow that produces version snapshots (it's
+    // read-only, rewritten wholesale by every sync) — the versions list would always be empty and
+    // "Restore" wouldn't mean anything against it, so skip the fetch and render the sync timeline
+    // (ChangeHistoryList) instead. See the modal below.
+    if (isSyncedMirror) return;
     const data = await listKnowledgeDocumentVersions(projectId, documentId).catch(() => ({ list: [], total: 0 }));
     setVersions(data.list);
   }
@@ -461,6 +467,32 @@ export default function KnowledgeDocumentPage() {
   // rejects updates. Comments are the writable channel — they're stored apart from the body.
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = doc.sourceProvider === "linear" ? "Linear" : "Jira";
+
+  let historyModalBody: React.ReactNode;
+  if (isSyncedMirror) {
+    // A mirror's "history" is what the sync pipeline changed, not a manually saved version — same
+    // data and component as the Knowledge Base list's info-icon popover, so the two surfaces never
+    // drift into showing different things for the same document.
+    historyModalBody = <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} />;
+  } else if (versions.length === 0) {
+    historyModalBody = <p className="text-[13px] text-[var(--muted)]">No earlier versions yet.</p>;
+  } else {
+    historyModalBody = (
+      <ul className="max-h-80 space-y-2 overflow-y-auto">
+        {versions.map((v) => (
+          <li key={v.id} className="flex items-center justify-between rounded-[8px] border border-[var(--border)] px-3 py-2">
+            <div>
+              <p className="text-[13px] font-medium">{v.title}</p>
+              <p className="text-[12px] text-[var(--muted)]">Version {v.versionNumber} — {new Date(v.createdAt).toLocaleString()}</p>
+            </div>
+            <Button size="sm" variant="secondary" onClick={() => handleRestoreVersion(v.id)}>
+              <IconArrowRight size={14} /> Restore
+            </Button>
+          </li>
+        ))}
+      </ul>
+    );
+  }
 
   const parentFolder = breadcrumb[breadcrumb.length - 1];
   const rootFolder = breadcrumb[0];
@@ -537,7 +569,11 @@ export default function KnowledgeDocumentPage() {
             </span>
           )}
           <div className="relative" ref={menuRef}>
-            <button onClick={() => setMenuOpen((v) => !v)} className="rounded-[6px] border border-[var(--border)] p-2 hover:bg-[var(--surface-secondary)]">
+            <button
+              onClick={() => setMenuOpen((v) => !v)}
+              aria-label="More actions"
+              className="rounded-[6px] border border-[var(--border)] p-2 hover:bg-[var(--surface-secondary)]"
+            >
               <IconDots size={16} />
             </button>
             {menuOpen && (
@@ -646,24 +682,8 @@ export default function KnowledgeDocumentPage() {
         />
       </div>
 
-      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="Version history">
-        {versions.length === 0 ? (
-          <p className="text-[13px] text-[var(--muted)]">No earlier versions yet.</p>
-        ) : (
-          <ul className="max-h-80 space-y-2 overflow-y-auto">
-            {versions.map((v) => (
-              <li key={v.id} className="flex items-center justify-between rounded-[8px] border border-[var(--border)] px-3 py-2">
-                <div>
-                  <p className="text-[13px] font-medium">{v.title}</p>
-                  <p className="text-[12px] text-[var(--muted)]">Version {v.versionNumber} — {new Date(v.createdAt).toLocaleString()}</p>
-                </div>
-                <Button size="sm" variant="secondary" onClick={() => handleRestoreVersion(v.id)}>
-                  <IconArrowRight size={14} /> Restore
-                </Button>
-              </li>
-            ))}
-          </ul>
-        )}
+      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title={isSyncedMirror ? "Change history" : "Version history"}>
+        {historyModalBody}
       </Modal>
     </div>
   );

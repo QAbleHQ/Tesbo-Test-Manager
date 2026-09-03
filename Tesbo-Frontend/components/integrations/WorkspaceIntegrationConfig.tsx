@@ -8,15 +8,14 @@ import {
   getWorkspace,
   getIntegrationConfig,
   getIntegrationStatus,
-  getIntegrationAuthUrl,
   disconnectIntegration,
-  INTEGRATION_RETURN_PROJECT_KEY,
   type IntegrationOAuthConfig,
   type IntegrationConnectionStatus,
   type IntegrationProvider,
 } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
 import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
 
 function isValidProjectId(value: string | null): value is string {
   return !!value && /^[a-zA-Z0-9-]+$/.test(value);
@@ -48,7 +47,6 @@ function WorkspaceIntegrationConfigInner({
   const [canManage, setCanManage] = useState(false);
   const [status, setStatus] = useState<IntegrationConnectionStatus | null>(null);
   const [config, setConfig] = useState<IntegrationOAuthConfig | null>(null);
-  const [connecting, setConnecting] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
@@ -79,19 +77,14 @@ function WorkspaceIntegrationConfigInner({
     });
   }, [loadData, router]);
 
-  async function handleConnect() {
-    setConnecting(true);
-    setMessage(null);
-    try {
-      if (returnProjectId) sessionStorage.setItem(INTEGRATION_RETURN_PROJECT_KEY, returnProjectId);
-      else sessionStorage.removeItem(INTEGRATION_RETURN_PROJECT_KEY);
-      const { url } = await getIntegrationAuthUrl(provider);
-      window.location.href = url;
-    } catch (err) {
-      setMessage({ type: "error", text: err instanceof Error ? err.message : `Failed to initiate ${label} authentication.` });
-      setConnecting(false);
-    }
-  }
+  const handleConnected = useCallback(() => {
+    setMessage({ type: "success", text: `${label} connected.` });
+    void loadData();
+    if (returnProjectId) router.replace(`/projects/${returnProjectId}/settings/integrations/${provider}`);
+  }, [label, loadData, returnProjectId, router, provider]);
+
+  const { connect, phase: connectPhase, error: connectError } = useIntegrationOAuthConnect(provider, handleConnected);
+  const connecting = connectPhase === "opening" || connectPhase === "waiting";
 
   async function handleDisconnect() {
     setDisconnecting(true);
@@ -211,15 +204,29 @@ function WorkspaceIntegrationConfigInner({
 
             {config?.configured ? (
               <>
-                <Button type="button" onClick={handleConnect} disabled={connecting}>
-                  {connecting ? `Redirecting to ${label}...` : `Connect ${label}`}
+                <Button type="button" onClick={connect} disabled={connecting}>
+                  {connectPhase === "opening"
+                    ? `Redirecting to ${label}...`
+                    : connectPhase === "waiting"
+                      ? "Waiting for you to finish in the new tab…"
+                      : `Connect ${label}`}
                 </Button>
-                <p className="text-xs text-[var(--muted)]">
-                  You&apos;ll be taken to {label} to approve access, then brought back here automatically.
+                <p
+                  className={`text-xs ${
+                    connectPhase === "blocked" || connectPhase === "timeout" || connectError
+                      ? "text-[var(--error-foreground)]"
+                      : "text-[var(--muted)]"
+                  }`}
+                >
+                  {connectPhase === "blocked"
+                    ? "Your browser blocked the popup — allow popups for this site and try again."
+                    : connectPhase === "timeout"
+                      ? "This took too long and the request may have expired. Try again."
+                      : connectError || `You'll be taken to ${label} in a new tab to approve access — this tab stays right here and picks it up automatically.`}
                 </p>
                 {returnProjectId && (
                   <p className="text-xs text-[var(--muted)]">
-                    You&apos;ll be brought straight back to finish mapping your project after connecting.
+                    You&apos;ll be brought straight to finish mapping your project after connecting.
                   </p>
                 )}
               </>

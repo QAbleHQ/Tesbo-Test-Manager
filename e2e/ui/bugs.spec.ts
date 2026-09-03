@@ -237,6 +237,35 @@ test.describe("bugs list — controls and filters", () => {
     expect(deleteColor, "delete should be distinguishable from edit by colour").not.toBe(editColor);
   });
 
+  test("BUG-U-27 the board card's edit and delete controls are labelled and legibly sized", async ({ page }) => {
+    // Same defect as BUG-U-06, on the other view: the card's actions were a 14px glyph in a ~22px
+    // box, hidden until hover, with no aria-label — reported again as "icon size is very small
+    // not visible properly" because Board, not List, is what a project lands on by default.
+    await page.getByRole("button", { name: "Board", exact: true }).click();
+    const card = page.locator('[role="button"]').filter({ hasText: "E2E Low sev bug" }).first();
+    await card.hover();
+
+    const edit = card.getByRole("button", { name: "Edit bug" });
+    const del = card.getByRole("button", { name: "Delete bug" });
+
+    await expect(edit).toBeVisible();
+    await expect(del).toBeVisible();
+
+    for (const control of [edit, del]) {
+      const box = await control.boundingBox();
+      expect(box, "an icon control with no box is not on screen").toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(28);
+      expect(box!.width).toBeGreaterThanOrEqual(28);
+      const svg = control.locator("svg").first();
+      const svgBox = await svg.boundingBox();
+      expect(svgBox!.height, "the glyph itself has to be big enough to read").toBeGreaterThanOrEqual(17);
+    }
+
+    const editColor = await edit.evaluate((el) => getComputedStyle(el).color);
+    const deleteColor = await del.evaluate((el) => getComputedStyle(el).color);
+    expect(deleteColor, "delete should be distinguishable from edit by colour").not.toBe(editColor);
+  });
+
   test("BUG-U-07 a long title is clamped and carries its full text as a tooltip", { tag: '@tesbo.testId("TES-TC-1317")' }, async ({ page }) => {
     const title = page.locator("td span[title]").filter({ hasText: "E2E long bug title" }).first();
     await expect(title).toBeVisible();
@@ -274,6 +303,53 @@ test.describe("bugs list — controls and filters", () => {
 
     await severity.selectOption("Low");
     await expect(page.getByText("E2E long bug title")).toHaveCount(0);
+  });
+
+  test("BUG-U-32 Clear all is hidden with no filters and resets every filter at once", async ({ page }) => {
+    const rows = page.locator("tbody tr");
+    const before = await rows.count();
+    expect(before, "the fixture seeds two bugs of different severities").toBeGreaterThanOrEqual(2);
+
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll, "no filters applied yet — there is nothing to clear").toBeHidden();
+
+    // Two independent filter dimensions at once: a dropdown and free text.
+    await page.getByLabel("Filter by severity").selectOption("Critical");
+    await expect(clearAll).toBeVisible();
+    await page.getByPlaceholder("Search bugs…").fill("E2E long bug title");
+    await expect(rows).toHaveCount(1);
+
+    await clearAll.click();
+    await expect(page.getByLabel("Filter by severity")).toHaveValue("");
+    await expect(page.getByPlaceholder("Search bugs…")).toHaveValue("");
+    await expect(rows).toHaveCount(before);
+    await expect(clearAll).toBeHidden();
+  });
+
+  test("BUG-U-33 Clear all resets filters identically on the board view", async ({ page }) => {
+    // Same `filtered` list feeds both views (BUG-U-09/BUG-U-14) — Clear all must not be a
+    // List-only control.
+    await page.getByRole("button", { name: "Board", exact: true }).click();
+    await page.getByLabel("Filter by severity").selectOption("Low");
+    await expect(page.getByText("E2E long bug title")).toHaveCount(0);
+
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll).toBeVisible();
+    await clearAll.click();
+    await expect(page.getByLabel("Filter by severity")).toHaveValue("");
+    await expect(page.getByText("E2E long bug title")).toBeVisible();
+  });
+
+  test("BUG-U-35 whitespace-only search still counts as an active filter", async ({ page }) => {
+    // A lone space is truthy but filters nothing visible — Clear all still has to appear and clear it,
+    // rather than the button's own "is anything active" check silently trimming it away.
+    await page.getByPlaceholder("Search bugs…").fill("   ");
+    const clearAll = page.getByRole("button", { name: "Clear all" });
+    await expect(clearAll).toBeVisible();
+
+    await clearAll.click();
+    await expect(page.getByPlaceholder("Search bugs…")).toHaveValue("");
+    await expect(clearAll).toBeHidden();
   });
 
   test("BUG-U-10 the edit modal scrolls to its own footer instead of the page behind it", { tag: '@tesbo.testId("TES-TC-1320")' }, async ({ page }) => {
@@ -408,6 +484,222 @@ test.describe("bug priority", () => {
     await priority.selectOption("P1");
     await expect(page.getByText(untriagedTitle)).toHaveCount(0);
     await expect(page.getByText(triagedTitle)).toBeVisible();
+  });
+});
+
+/*
+ * Bug "Assign to" — "[Test Runs] Unable to assign test cases for execution". Bugs had no assignee
+ * concept before this; the field lives on the report/edit forms next to Severity/Priority. The
+ * membership rule and clear-vs-omit semantics are covered in api/bugs.spec.ts; this is what the
+ * person filling in the form actually sees.
+ */
+test.describe("bug assignee", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  let selfUserId: string;
+  let selfLabel: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+    const me = await (await api.get("/api/auth/me")).json();
+    selfUserId = me.userId;
+    const members = await (await api.get(`/api/projects/${projectId}/members`)).json();
+    const self = members.find((m: { userId: string }) => m.userId === selfUserId);
+    selfLabel = self.name || self.email;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-24 the report form offers Assign to, defaulting to Unassigned, and it persists", { tag: '@tesbo.testId("TES-TC-1917")' }, async ({ page }) => {
+    const title = `E2E Assignee Report ${uniqueSuffix()}`;
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "Report Bug" }).first().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+    const assign = page.getByLabel("Assign to");
+    await expect(assign).toBeVisible();
+    await expect(assign).toHaveValue("");
+    await assign.selectOption({ label: selfLabel });
+
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await page.getByRole("button", { name: "Report Bug" }).last().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created.assigneeId).toBe(selfUserId);
+  });
+
+  test("BUG-U-25 the report form saves unassigned when no assignee is picked", { tag: '@tesbo.testId("TES-TC-1918")' }, async ({ page }) => {
+    const title = `E2E Assignee Report Unassigned ${uniqueSuffix()}`;
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "Report Bug" }).first().click();
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await page.getByRole("button", { name: "Report Bug" }).last().click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created.assigneeId).toBeNull();
+  });
+
+  test("BUG-U-26 the edit form changes the assignee and can clear it back to Unassigned", { tag: '@tesbo.testId("TES-TC-1919")' }, async ({ page }) => {
+    const title = `E2E Assignee Edit ${uniqueSuffix()}`;
+    const bug = await createBug(api, projectId, { title, severity: "Medium" });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    const assign = page.getByLabel("Assign to");
+    await expect(assign).toHaveValue("");
+    await assign.selectOption({ label: selfLabel });
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    let after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(after.assigneeId).toBe(selfUserId);
+
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByLabel("Assign to")).toHaveValue(selfUserId);
+    await page.getByLabel("Assign to").selectOption("");
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(after.assigneeId).toBeNull();
+  });
+
+  /*
+   * Assignment itself worked (BUG-U-24/25/26 above); nothing shown it back once set. That gap is
+   * what the "assign bug to project members should be available" report actually meant — the field
+   * existed, but you had to re-open Edit to see who a bug was assigned to.
+   */
+  test("BUG-U-27 the list shows who a bug is assigned to, and Unassigned when there isn't one", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Display Assigned ${suffix}`;
+    const unassignedTitle = `E2E Assignee Display Unassigned ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+
+    const assignedRow = page.locator("tbody tr").filter({ hasText: assignedTitle });
+    await expect(assignedRow.getByText(selfLabel, { exact: true })).toBeVisible();
+
+    const unassignedRow = page.locator("tbody tr").filter({ hasText: unassignedTitle });
+    await expect(unassignedRow.getByText("Unassigned", { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-28 the bug details modal shows the assignee", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const title = `E2E Assignee Modal ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title, severity: "Medium", assigneeId: selfUserId },
+    });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(page.getByText("Assigned To", { exact: true })).toBeVisible();
+    await expect(page.getByText(selfLabel, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-29 the kanban card shows the assignee's avatar", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const title = `E2E Assignee Kanban ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title, severity: "Medium", assigneeId: selfUserId },
+    });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    const card = page.locator('[role="button"]').filter({ hasText: title }).first();
+    await expect(card.getByTitle(selfLabel)).toBeVisible();
+  });
+
+  test("BUG-U-30 the assignee filter narrows to that person, Unassigned narrows to bugs with none, and both clear back", async ({
+    page,
+  }) => {
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Filter Assigned ${suffix}`;
+    const unassignedTitle = `E2E Assignee Filter Unassigned ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+
+    const filter = page.getByLabel("Filter by assignee");
+    await filter.selectOption({ label: selfLabel });
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(unassignedTitle, { exact: true })).toHaveCount(0);
+
+    await filter.selectOption("unassigned");
+    await expect(page.getByText(unassignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(assignedTitle, { exact: true })).toHaveCount(0);
+
+    await filter.selectOption("");
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
+    await expect(page.getByText(unassignedTitle, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-34 Clear all resets the Unassigned sentinel, not just a real assignee", async ({ page }) => {
+    // "unassigned" is a sentinel string distinct from "" (no filter) — Clear all has to reset it
+    // back to "", not leave it stuck on the sentinel.
+    const suffix = uniqueSuffix();
+    const unassignedTitle = `E2E Assignee Clear All ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const rows = page.locator("tbody tr");
+    const before = await rows.count();
+
+    await page.getByLabel("Filter by assignee").selectOption("unassigned");
+    await expect(rows.count()).resolves.toBeLessThan(before);
+
+    await page.getByRole("button", { name: "Clear all" }).click();
+    await expect(page.getByLabel("Filter by assignee")).toHaveValue("");
+    await expect(rows).toHaveCount(before);
+  });
+
+  test("BUG-U-31 the assignee filter is available on the board too", async ({ page }) => {
+    // Same `filtered` list feeds the board's columns as every other filter on this page
+    // (BUG-U-09/20) — an assignee filter that only existed in List would leave Board silently
+    // narrowed after a view switch, with no control there to see or clear it.
+    const suffix = uniqueSuffix();
+    const assignedTitle = `E2E Assignee Filter Board ${suffix}`;
+    const unassignedTitle = `E2E Assignee Filter Board Other ${suffix}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: assignedTitle, severity: "Medium", assigneeId: selfUserId },
+    });
+    await api.post(`/api/projects/${projectId}/bugs`, { data: { title: unassignedTitle, severity: "Medium" } });
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    const filter = page.getByLabel("Filter by assignee");
+    await expect(filter).toBeVisible();
+    await filter.selectOption({ label: selfLabel });
+    await expect(page.getByText(unassignedTitle, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(assignedTitle, { exact: true })).toBeVisible();
   });
 });
 
@@ -583,6 +875,105 @@ test.describe("bugs — status filter and search consistency across Board and Li
       await expect(page.getByText(otherTitle, { exact: true })).toHaveCount(0);
     } finally {
       await deleteBugs([wanted.id, other.id]);
+    }
+  });
+});
+
+/*
+ * The "X open · Y closed · Z total" line under the page title. `openCount` used to be
+ * `status === "Open" || status === "Reopened"`, so a project with 1 Open + 1 Reopened bug read
+ * "2 open" while the Kanban board directly below it — which gives Reopened its own column — showed
+ * only 1 card under "Open". Same page, two different definitions of "open" a few pixels apart. Fixed
+ * to count "Open" literally, matching the board's own column exactly.
+ */
+test.describe("bugs — header status counts", () => {
+  let api: APIRequestContext;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+  });
+
+  test.afterAll(async () => {
+    if (api) await api.dispose();
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The header subtitle, matched by its fixed " · " shape rather than exact numbers. */
+  function headerStats(page: Page): Locator {
+    return page.getByText(/^\d+ open · \d+ closed · \d+ total$/);
+  }
+
+  test("BUG-U-21 a Reopened bug is not folded into the open count", async ({ page }) => {
+    const project = await createProject(api);
+    const suffix = uniqueSuffix();
+    await createBug(api, project.id, { title: `E2E Header Open ${suffix}`, severity: "Medium" });
+    await createBug(api, project.id, {
+      title: `E2E Header Reopened ${suffix}`,
+      severity: "Medium",
+      status: "Reopened",
+    });
+    await createBug(api, project.id, {
+      title: `E2E Header InProgress ${suffix}`,
+      severity: "Medium",
+      status: "In Progress",
+    });
+    await createBug(api, project.id, {
+      title: `E2E Header Closed ${suffix}`,
+      severity: "Medium",
+      status: "Closed",
+    });
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+
+      // The regression itself: 1 Open + 1 Reopened must read "1 open", not "2 open".
+      await expect(headerStats(page)).toHaveText("1 open · 1 closed · 4 total");
+
+      const openColumn = page
+        .getByRole("heading", { name: "Open", exact: true })
+        .locator("xpath=ancestor::div[contains(@class,'min-w-')][1]");
+      const reopenedColumn = page
+        .getByRole("heading", { name: "Reopened", exact: true })
+        .locator("xpath=ancestor::div[contains(@class,'min-w-')][1]");
+      await expect(openColumn.getByText("1", { exact: true })).toBeVisible();
+      await expect(reopenedColumn.getByText("1", { exact: true })).toBeVisible();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("BUG-U-22 a project with no bugs shows all-zero counts", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+      await expect(headerStats(page)).toHaveText("0 open · 0 closed · 0 total");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("BUG-U-23 the header keeps counting the whole project while a status filter narrows the board", async ({ page }) => {
+    const project = await createProject(api);
+    const suffix = uniqueSuffix();
+    await createBug(api, project.id, { title: `E2E Header Filter Open ${suffix}`, severity: "Medium" });
+    const inProgress = await createBug(api, project.id, {
+      title: `E2E Header Filter InProgress ${suffix}`,
+      severity: "Medium",
+      status: "In Progress",
+    });
+    try {
+      await page.goto(`/projects/${project.id}/bugs`);
+      await expect(headerStats(page)).toHaveText("1 open · 0 closed · 2 total");
+
+      // Narrowing the board to one status must not shrink the header's project-wide totals.
+      await page.getByLabel("Filter by status").selectOption("Open");
+      await expect(page.getByText(inProgress.title, { exact: true })).toHaveCount(0);
+      await expect(headerStats(page)).toHaveText("1 open · 0 closed · 2 total");
+    } finally {
+      await deleteProjects(api, [project.id]);
     }
   });
 });
