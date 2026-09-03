@@ -64,3 +64,26 @@ export const JIRA_TOKEN_REFRESH_RETRY_DELAY_MS = 1000;
 // 'running' forever with no way for the UI's poll loop to ever see a terminal state. A timeout
 // turns that into an ordinary failure, which the existing attempts/retry handling already covers.
 export const INTEGRATION_SYNC_FETCH_TIMEOUT_MS = 30_000;
+
+// ── Stuck-run recovery ──
+//
+// The outbound fetch timeout above closes the dominant way a run used to hang forever (a silent
+// provider response), but it doesn't cover every way a `sync-run`/`sync-ticket` job can stop
+// making progress without ever reaching a terminal DB status — a hung DB/Redis call, or a worker
+// process killed without the container itself restarting. Both mechanisms below exist so a run can
+// ALWAYS reach 'failed' on its own, without depending on a restart to notice: startRun's own dedup
+// index (V90) means a clean failure is always safely retryable, by the next nightly cycle or by
+// clicking Sync again — exactly the same recovery a manual sync already has.
+
+// Watchdog cadence: how often the periodic sweep below runs.
+export const SYNC_WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
+
+// How long a run may sit in 'queued'/'running' with no write to it at all (no markRunning,
+// setStage, setTotals, or recordTicketResult — every real step touches updated_at) before the
+// watchdog fails it. Comfortably above any legitimate gap: a page fetch and a ticket's comment
+// fetch are each bounded by INTEGRATION_SYNC_FETCH_TIMEOUT_MS above, so a genuinely progressing
+// run — even a 2000-ticket one — touches updated_at far more often than this.
+export const SYNC_RUN_STALE_MINUTES = 20;
+
+export const INTEGRATION_SYNC_WATCHDOG_JOB = "sync-watchdog";
+export const INTEGRATION_SYNC_WATCHDOG_SCHEDULER_ID = "integration-sync-watchdog";

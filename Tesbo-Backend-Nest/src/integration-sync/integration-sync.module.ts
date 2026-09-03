@@ -14,8 +14,11 @@ import {
   INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB,
   INTEGRATION_SYNC_NIGHTLY_LINEAR_SCHEDULER_ID,
   INTEGRATION_SYNC_QUEUE,
+  INTEGRATION_SYNC_WATCHDOG_JOB,
+  INTEGRATION_SYNC_WATCHDOG_SCHEDULER_ID,
   NIGHTLY_SYNC_CRON,
-  NIGHTLY_SYNC_TZ
+  NIGHTLY_SYNC_TZ,
+  SYNC_WATCHDOG_INTERVAL_MS
 } from "./integration-sync.constants";
 
 /**
@@ -40,9 +43,10 @@ export class IntegrationSyncModule implements OnModuleInit {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    this.sync.resumeInterruptedRuns().catch((err) => {
-      this.logger.warn(`Failed to resume interrupted sync runs on startup: ${err instanceof Error ? err.message : err}`);
-    });
+    // Fails (never resumes) anything left 'queued'/'running' from before this boot — see
+    // IntegrationSyncService's own comment on why resuming was replaced. `.catch` already lives
+    // inside failInterruptedRuns, so a DB hiccup here can't block the rest of startup.
+    await this.sync.failInterruptedRuns();
 
     // Job Schedulers are Redis-backed and keyed by id, so re-registering the same schedule on
     // every boot (including across multiple app instances) just confirms it rather than creating
@@ -65,5 +69,18 @@ export class IntegrationSyncModule implements OnModuleInit {
       )
       .then(() => this.logger.log(`Nightly Linear sync scheduler registered (${NIGHTLY_SYNC_CRON} ${NIGHTLY_SYNC_TZ}).`))
       .catch((err) => this.logger.warn(`Failed to register nightly Linear sync scheduler: ${err instanceof Error ? err.message : err}`));
+
+    // The periodic half of stuck-run recovery — failInterruptedRuns above only runs at boot, so
+    // this is what catches a run that stalls without a restart (a hung DB/Redis call, a worker
+    // killed without the container itself restarting). `every` rather than a cron `pattern`: a
+    // fixed cadence is what a watchdog needs, not a wall-clock slot.
+    await this.queue
+      .upsertJobScheduler(
+        INTEGRATION_SYNC_WATCHDOG_SCHEDULER_ID,
+        { every: SYNC_WATCHDOG_INTERVAL_MS },
+        { name: INTEGRATION_SYNC_WATCHDOG_JOB, data: {} }
+      )
+      .then(() => this.logger.log(`Stuck-run watchdog registered (every ${SYNC_WATCHDOG_INTERVAL_MS / 60_000}m).`))
+      .catch((err) => this.logger.warn(`Failed to register stuck-run watchdog: ${err instanceof Error ? err.message : err}`));
   }
 }

@@ -7,7 +7,8 @@ import {
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
   INTEGRATION_SYNC_TICKET_JOB,
-  PROVIDER_FOLDER_NAMES
+  PROVIDER_FOLDER_NAMES,
+  SYNC_RUN_STALE_MINUTES
 } from "./integration-sync.constants";
 import { SyncProvider, SyncRunJobPayload, SyncRunStage, SyncTicketJobPayload, SyncTriggerSource } from "./integration-sync.types";
 
@@ -363,47 +364,68 @@ export class IntegrationSyncService {
     return raced.rows[0].id;
   }
 
-  // ── Boot recovery ──
+  // ── Boot recovery & stuck-run watchdog ──
+  //
+  // Earlier version of this tried to "resume" an interrupted run: reset its counters to 0 and
+  // re-add its coordinator job under the same BullMQ jobId, trusting that "if Redis still holds
+  // that job this is a no-op and the surviving job does the work." Two ways that trust broke, found
+  // via a real incident (a nightly run stuck 'running' for 13.5 hours): (1) it's a check-then-act
+  // race — nothing re-verified `status` was still 'queued'/'running' at UPDATE time, so a run that
+  // legitimately finished in the gap got its stage/counters blindly stomped back to a fake "just
+  // started" state; (2) resetting counters while relying on jobId dedupe is unsound — any ticket
+  // job that had already completed (and was still Redis-retained) would silently no-op on re-add
+  // rather than re-run, so its contribution to the now-zeroed tally was gone for good, and the
+  // completion check (processed+failed >= total) could then never be satisfied again.
+  //
+  // Replaced with something structurally simpler and race-free: a run interrupted by whatever
+  // stopped the previous process has nothing left in memory to resume, so it's just failed —
+  // atomically, in one UPDATE with no separate read step to race against. Recovery becomes
+  // identical to a manual Sync's own failure path: the run shows failed with a clear reason, the
+  // next nightly cycle or a fresh click starts clean, and startRun's own dedup index (V90) makes
+  // that always safe to retry.
+
+  private async failStuckRuns(maxAgeMinutes: number, message: string): Promise<number> {
+    const res = await this.db.query<{ id: string }>(
+      `UPDATE integration_sync_runs
+       SET status = 'failed', stage = 'failed', error = COALESCE(error, $2), finished_at = now(), updated_at = now()
+       WHERE status IN ('queued', 'running') AND updated_at < now() - make_interval(mins => $1)
+       RETURNING id`,
+      [maxAgeMinutes, message]
+    );
+    return res.rows.length;
+  }
 
   /**
-   * A backend restart mid-run leaves a run row 'running' with no worker behind it, which would
-   * spin the UI progress bar forever. Counters are reset and the coordinator re-enqueued: every
-   * write in the pipeline is an upsert gated on a content hash, so redoing a run is cheap and
-   * converges to the same state. Same idiom as RagModule's resumeInterruptedEmbeddings.
+   * Called once at boot. Any run still 'queued'/'running' from before this process started was
+   * interrupted by whatever stopped the previous one (crash, deploy, restart) — there is no
+   * in-memory work left to continue, so it's failed outright rather than resurrected.
+   * `maxAgeMinutes: 0` matches every such run regardless of how recently it was touched.
    */
-  async resumeInterruptedRuns(): Promise<void> {
-    const stuck = await this.db
-      .query<{ id: string; organization_id: string; project_id: string; provider: SyncProvider; triggered_by: string | null }>(
-        `SELECT id, organization_id, project_id, provider, triggered_by
-         FROM integration_sync_runs
-         WHERE status IN ('queued', 'running')`
-      )
-      .catch(() => ({ rows: [] as Array<{ id: string; organization_id: string; project_id: string; provider: SyncProvider; triggered_by: string | null }> }));
+  async failInterruptedRuns(): Promise<void> {
+    const count = await this
+      .failStuckRuns(0, "Sync was interrupted before it finished (the server restarted). Run Sync again to retry.")
+      .catch((err) => {
+        this.logger.warn(`Failed to clean up interrupted sync runs on startup: ${err instanceof Error ? err.message : err}`);
+        return 0;
+      });
+    if (count) this.logger.warn(`Failed ${count} sync run(s) left over from before this restart.`);
+  }
 
-    for (const run of stuck.rows) {
-      await this.db
-        .query(
-          `UPDATE integration_sync_runs
-           SET processed_tickets = 0, failed_tickets = 0, documents_created = 0, documents_updated = 0,
-               comments_synced = 0, decision_summaries = 0, total_tickets = 0, stage = 'queued', updated_at = now()
-           WHERE id = $1`,
-          [run.id]
-        )
-        .catch(() => undefined);
-
-      const payload: SyncRunJobPayload = {
-        runId: run.id,
-        organizationId: run.organization_id,
-        projectId: run.project_id,
-        provider: run.provider,
-        triggeredBy: run.triggered_by
-      };
-      // jobId is unchanged from the original add, so if Redis still holds that job this is a
-      // no-op and the surviving job does the work.
-      await this.queue
-        .add(INTEGRATION_SYNC_RUN_JOB, payload, { jobId: `run-${run.id}`, attempts: 1, removeOnComplete: { count: 200 }, removeOnFail: { count: 200 } })
-        .catch((err) => this.logger.warn(`Failed to resume sync run ${run.id}: ${err instanceof Error ? err.message : err}`));
-    }
+  /**
+   * Periodic safety net (SYNC_WATCHDOG_INTERVAL_MS) for a run that stalls without a restart — a
+   * hung DB/Redis call, a worker killed without the container itself restarting. Anchored on
+   * updated_at, which every real step (markRunning/setStage/setTotals/recordTicketResult) touches,
+   * so a genuinely active run — even a large one — is never at risk of a false positive here; only
+   * a run that has made zero progress for SYNC_RUN_STALE_MINUTES gets caught.
+   */
+  async failStaleRuns(): Promise<void> {
+    const count = await this
+      .failStuckRuns(SYNC_RUN_STALE_MINUTES, `Sync timed out after ${SYNC_RUN_STALE_MINUTES} minutes with no progress. Run Sync again to retry.`)
+      .catch((err) => {
+        this.logger.warn(`Stuck-run watchdog failed: ${err instanceof Error ? err.message : err}`);
+        return 0;
+      });
+    if (count) this.logger.warn(`Watchdog failed ${count} stale sync run(s).`);
   }
 
   // ── Nightly cron ──
