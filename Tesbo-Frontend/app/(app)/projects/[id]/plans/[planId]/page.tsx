@@ -53,6 +53,25 @@ import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/
 
 /* ───── Helpers ───── */
 
+function toTestStatus(raw: string | null): TestStatus {
+  const map: Record<string, TestStatus> = {
+    Passed: "pass",
+    Failed: "fail",
+    Blocked: "blocked",
+    Skipped: "skipped",
+  };
+  return map[raw ?? ""] ?? "not_run";
+}
+
+function runStatusToTone(status: string) {
+  const map: Record<string, "success" | "info" | "warning" | "neutral"> = {
+    Completed: "success",
+    "In Progress": "info",
+    Planning: "neutral",
+  };
+  return map[status] ?? "neutral";
+}
+
 function pctColor(pct: number): string {
   if (pct >= 90) return "var(--status-pass-text)";
   if (pct >= 70) return "var(--status-blocked-text)";
@@ -668,6 +687,70 @@ export default function PlanDetailPage() {
                             </div>
                           </div>
 
+              {/* Items tab */}
+              {activeTab === "items" && (
+                <section>
+                  {items.length === 0 ? (
+                    <div className="rounded-[10px] border border-dashed border-[var(--border)] p-8 text-center">
+                      {/*
+                        * Basecamp 10221983132 ("Plan items shows 0 count and message 'no planed
+                        * items'"). The count was accurate — nothing was pinned — but it sat next to
+                        * a plan that was visibly running twelve cases, so it read as a bug. Naming
+                        * the other number is what removes the contradiction.
+                        */}
+                      <p className="text-sm text-[var(--muted)]">
+                        {total > 0
+                          ? `Nothing is pinned to this plan's scope yet. Its ${total} test case${total === 1 ? "" : "s"} come from the linked test runs — pin suites or cases here to say what the plan is meant to cover.`
+                          : "No items in this plan. Items are suites or test cases that define the scope of the plan."}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="overflow-hidden rounded-[10px] border border-[var(--border)]">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-[var(--border)] bg-[var(--surface-secondary)]">
+                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">ID</th>
+                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Title</th>
+                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Priority</th>
+                            <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">Last Result</th>
+                            <th className="w-10 px-4 py-2.5" />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {items.map((item) => {
+                            const isSuite = !!item.suiteId;
+                            return (
+                              <tr key={item.id} className="border-b border-[var(--border-subtle)] transition-colors last:border-0 hover:bg-[var(--surface-secondary)]">
+                                <td className="px-4 py-2.5">
+                                  {isSuite ? (
+                                    <StatusChip tone="info">Suite</StatusChip>
+                                  ) : (
+                                    <span className="font-mono text-[12px] font-medium text-[var(--accent-light)]">{item.tcExternalId ?? "—"}</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2.5 text-[var(--foreground)]">{isSuite ? (item.suiteName ?? "Unknown suite") : (item.tcTitle ?? "Untitled test case")}</td>
+                                <td className="px-4 py-2.5">{isSuite || !item.tcPriority ? <span className="text-[var(--muted-soft)]">—</span> : <PriorityBadge priority={item.tcPriority as Priority} />}</td>
+                                <td className="px-4 py-2.5">{isSuite ? <span className="text-[var(--muted-soft)]">—</span> : <StatusBadge status={toTestStatus(item.lastStatus)} />}</td>
+                                <td className="px-4 py-2.5 text-center">
+                                  <button
+                                    onClick={() => handleRemoveItem(item.id)}
+                                    disabled={removingItemId === item.id}
+                                    title="Remove from plan"
+                                    className="cursor-pointer rounded p-1 text-[var(--muted-soft)] transition-colors hover:text-[var(--error-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <IconX size={14} stroke={1.75} />
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </section>
+              )}
+            </div>
                           {runTotal > 0 && (
                             <div className="border-t border-[var(--border-subtle)] px-4 py-3">
                               <RunProgressBar passed={run.passed} failed={run.failed} blocked={run.blocked} skipped={run.skipped} total={runTotal} />
