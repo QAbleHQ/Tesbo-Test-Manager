@@ -53,6 +53,15 @@ import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/
 
 /* ───── Helpers ───── */
 
+function runStatusToTone(status: string) {
+  const map: Record<string, "success" | "info" | "warning" | "neutral"> = {
+    Completed: "success",
+    "In Progress": "info",
+    Planning: "neutral",
+  };
+  return map[status] ?? "neutral";
+}
+
 function pctColor(pct: number): string {
   if (pct >= 90) return "var(--status-pass-text)";
   if (pct >= 70) return "var(--status-blocked-text)";
@@ -667,7 +676,6 @@ export default function PlanDetailPage() {
                               </button>
                             </div>
                           </div>
-
                           {runTotal > 0 && (
                             <div className="border-t border-[var(--border-subtle)] px-4 py-3">
                               <RunProgressBar passed={run.passed} failed={run.failed} blocked={run.blocked} skipped={run.skipped} total={runTotal} />
