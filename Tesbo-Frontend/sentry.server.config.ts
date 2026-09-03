@@ -7,6 +7,6 @@ if (config.enabled) {
   Sentry.init({
     dsn: config.dsn,
     environment: config.environment,
-    tracesSampleRate: 0.2,
+    tracesSampleRate: 1.0,
   });
 }
