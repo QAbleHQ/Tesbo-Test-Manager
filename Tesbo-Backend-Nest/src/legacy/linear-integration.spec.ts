@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from "@nestjs/common";
 import { LegacyService } from "./legacy.service";
 import { DatabaseService } from "../database/database.service";
 import { decryptSecret, encryptSecret } from "../common/crypto.util";
@@ -36,7 +36,11 @@ function makeDb(routes: Route[] = []) {
     }
     return Promise.resolve({ rows: [] });
   });
-  return { db: { query } as unknown as DatabaseService, query, calls };
+  // Real DatabaseService.transaction hands the callback a PoolClient wrapping BEGIN/COMMIT/ROLLBACK
+  // around it; the double only needs to run the callback against the same routed `query` so the
+  // routes above and the `calls` log behave identically inside and outside a transaction.
+  const transaction = jest.fn((fn: (client: { query: typeof query }) => Promise<unknown>) => fn({ query }));
+  return { db: { query, transaction } as unknown as DatabaseService, query, transaction, calls };
 }
 
 /** Route for LegacyService#workspace()'s primary "active organization" lookup. */
@@ -74,7 +78,7 @@ async function validState(svc: LegacyService, provider: "jira" | "linear"): Prom
   return new URL(url).searchParams.get("state")!;
 }
 
-function makeLegacy(db: DatabaseService): LegacyService {
+function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyncService> = {}): LegacyService {
   return new LegacyService(
     db,
     {} as unknown as EmailService,
@@ -83,7 +87,7 @@ function makeLegacy(db: DatabaseService): LegacyService {
     {} as unknown as StorageService,
     {} as unknown as RagIngestionService,
     {} as unknown as RagRetrievalService,
-    {} as unknown as IntegrationSyncService,
+    integrationSync as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     { assertIntegrationAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as PlanLimitsService,
     {} as unknown as CustomFieldsService
@@ -573,5 +577,89 @@ describe("LegacyService#connectLinearTeams — per-project team mapping", () => 
     expect(err).toBeInstanceOf(BadRequestException);
     expect(calls.some((c) => c.sql.includes("UPDATE linear_project_mappings SET enabled = false"))).toBe(false);
     expect(calls.some((c) => c.sql.includes("INSERT INTO linear_project_mappings"))).toBe(false);
+  });
+});
+
+// idx_linear_project_mappings_one_per_project (a partial unique index on project_id WHERE
+// enabled=true) rejects a second concurrent save-mapping request for the same project. Before this
+// was caught, that unique-violation propagated as a raw 500 instead of the same clean 409 the UI
+// already renders for any conflict (lib/api.ts's genericStatusMessage).
+describe("LegacyService#connectLinearTeams — concurrent save race", () => {
+  it("returns a clean 409 instead of a raw DB error when two requests race the same project's mapping", async () => {
+    const { db, calls } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", auth_method: "oauth" }] },
+      { match: "UPDATE linear_project_mappings SET enabled = false", rows: [] },
+      {
+        match: "INSERT INTO linear_project_mappings",
+        handler: () => {
+          throw Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" });
+        }
+      }
+    ]));
+    const svc = makeLegacy(db);
+    const err = await rejection(svc.connectLinearTeams(PROJECT_ID, CALLER_ID, { projects: [{ id: "team-1", key: "ENG", name: "Engineering" }] }));
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse().error).toMatch(/just changed by another action/i);
+    // The disable-then-insert pair runs inside one transaction — the UPDATE still ran even though
+    // the INSERT lost the race, so the loser's request didn't leave a half-applied write behind.
+    expect(calls.some((c) => c.sql.includes("UPDATE linear_project_mappings SET enabled = false"))).toBe(true);
+  });
+});
+
+// A sync run is org-scoped, not project-scoped, so it can be queued/running for any project mapped
+// to this connection when Disconnect is clicked. Settling it first (rather than letting the
+// DELETE's ON DELETE CASCADE race the sync processor's own concurrent writes to the same
+// integration_sync_runs/*_tickets rows) is what rules out the deadlock shape described in
+// IntegrationSyncService#failActiveRunsForConnection's own comment.
+describe("LegacyService#integrationDisconnect", () => {
+  it("fails any active sync run for the connection before deleting it", async () => {
+    const order: string[] = [];
+    const failActiveRunsForConnection = jest.fn(async () => {
+      order.push("guard");
+    });
+    const { db } = makeDb([
+      workspaceRoute("owner"),
+      {
+        match: "DELETE FROM integration_connections",
+        handler: () => {
+          order.push("delete");
+          return { rows: [] };
+        }
+      }
+    ]);
+    const svc = makeLegacy(db, { failActiveRunsForConnection });
+    const res = await svc.integrationDisconnect("user-1", "linear");
+    expect(res).toEqual({ disconnected: true });
+    expect(failActiveRunsForConnection).toHaveBeenCalledWith("org-1", "linear", expect.stringMatching(/disconnected/i));
+    expect(order).toEqual(["guard", "delete"]);
+  });
+});
+
+// jiraFetch/linearGraphQL used to forward the raw provider response body (up to 500 chars) into
+// what the user sees. That's fine for an uncommon status code, but a 401/403 — the token was
+// revoked/expired — is common enough (and the raw body unhelpful enough) to deserve its own clean
+// message, mirroring what the queued sync path already does via IntegrationConnectionInvalidError.
+describe("LegacyService#linearTeams — provider auth failure", () => {
+  it("throws a clean reconnect message on a 401, never the raw provider body", async () => {
+    const { db } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      {
+        match: "FROM integration_connections WHERE organization_id",
+        rows: [{ id: "conn-1", access_token: encryptSecret("at"), auth_method: "oauth" }]
+      }
+    ]));
+    jest.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({ errors: [{ message: "Authentication required, not authenticated" }] })
+    } as unknown as Response);
+
+    const svc = makeLegacy(db);
+    const err = await rejection(svc.linearTeams(PROJECT_ID, CALLER_ID));
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err.getResponse().error).toMatch(/needs to be reconnected/i);
+    expect(err.getResponse().detail).toBeUndefined();
+    expect(JSON.stringify(err.getResponse())).not.toMatch(/Authentication required, not authenticated/);
   });
 });

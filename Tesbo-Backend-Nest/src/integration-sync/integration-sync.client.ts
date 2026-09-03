@@ -4,6 +4,7 @@ import { decryptSecret, encryptSecret } from "../common/crypto.util";
 import { jiraDescriptionToText } from "../common/integration-text.util";
 import {
   COMMENTS_PER_TICKET,
+  INTEGRATION_SYNC_FETCH_TIMEOUT_MS,
   JIRA_PAGE_SIZE,
   JIRA_TOKEN_REFRESH_RETRY_DELAY_MS,
   LINEAR_PAGE_SIZE,
@@ -82,7 +83,8 @@ export class IntegrationSyncClient {
           client_id: clientId,
           client_secret: clientSecret,
           refresh_token: decryptSecret(String(connection.refresh_token || ""))
-        })
+        }),
+        signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
       }).catch(() => null);
 
     // One retry, unconditional on the failure shape: a cold-start network blip right after a
@@ -121,7 +123,7 @@ export class IntegrationSyncClient {
   }
 
   private async json<T>(url: string, init: RequestInit, provider: SyncProvider): Promise<T> {
-    const res = await fetch(url, init);
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`${provider} request failed (${res.status}): ${text.slice(0, 300)}`);
@@ -228,7 +230,8 @@ export class IntegrationSyncClient {
         Authorization: `Bearer ${decryptSecret(String(connection.access_token || ""))}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ query, variables })
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");

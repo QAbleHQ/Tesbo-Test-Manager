@@ -8336,6 +8336,9 @@ export class LegacyService implements OnModuleInit {
     const p = assertIntegrationProvider(provider);
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
+    // Settle any in-flight sync before the DELETE's cascade touches the same rows the sync
+    // processor may be concurrently writing (see failActiveRunsForConnection's own comment).
+    await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
     await this.db.query("DELETE FROM integration_connections WHERE organization_id = $1 AND provider = $2", [workspace.id, p]);
     return { disconnected: true };
   }
@@ -8450,20 +8453,32 @@ export class LegacyService implements OnModuleInit {
     // Disable rather than DELETE: the outgoing mapping's jira_tickets rows and mirrored Knowledge
     // Base documents reference it, and re-linking the same project later restores continuity
     // instead of re-mirroring from scratch. An empty request is an explicit unlink.
-    await this.db.query("UPDATE jira_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
     const [project] = projects;
-    if (!project) return { linked: 0 };
-
-    await this.db.query(
-      `INSERT INTO jira_project_mappings (jira_connection_id, project_id, jira_project_id, jira_project_key, jira_project_name)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (jira_connection_id, jira_project_id, project_id) DO UPDATE SET
-         jira_project_key = EXCLUDED.jira_project_key,
-         jira_project_name = EXCLUDED.jira_project_name,
-         enabled = true`,
-      [connection.id, projectId, project.id, project.key, project.name]
-    );
-    return { linked: 1 };
+    try {
+      await this.db.transaction(async (client) => {
+        await client.query("UPDATE jira_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
+        if (!project) return;
+        await client.query(
+          `INSERT INTO jira_project_mappings (jira_connection_id, project_id, jira_project_id, jira_project_key, jira_project_name)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (jira_connection_id, jira_project_id, project_id) DO UPDATE SET
+             jira_project_key = EXCLUDED.jira_project_key,
+             jira_project_name = EXCLUDED.jira_project_name,
+             enabled = true`,
+          [connection.id, projectId, project.id, project.key, project.name]
+        );
+      });
+    } catch (error) {
+      // idx_jira_project_mappings_one_per_project (partial unique on project_id WHERE enabled=true)
+      // rejects a second concurrent save-mapping request for this project — a double-click or two
+      // tabs racing this same endpoint. Translate the raw DB conflict into the same message the UI
+      // already renders for any 409 (lib/api.ts's genericStatusMessage) instead of a raw 500.
+      if ((error as { code?: string })?.code === "23505") {
+        throw new ConflictException({ error: "This project's Jira link was just changed by another action. Reload and try again." });
+      }
+      throw error;
+    }
+    return { linked: project ? 1 : 0 };
   }
 
   async syncJira(userId: string | null | undefined, projectId: string) {
@@ -8668,9 +8683,20 @@ export class LegacyService implements OnModuleInit {
     return `Bearer ${decryptSecret(String(connection.access_token || ""))}`;
   }
 
+  // A 401/403 here means the stored token was revoked/expired mid-session — the raw Atlassian/
+  // Linear error body is not useful to a user and shouldn't be shown to one; every other status is
+  // left with its existing (truncated) detail since those are less common and the detail still
+  // helps in support/debugging.
+  private cleanAuthErrorOrNull(provider: "Jira" | "Linear", status: number): BadRequestException | null {
+    if (status !== 401 && status !== 403) return null;
+    return new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
+  }
+
   private async jiraFetch<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
+      const authError = this.cleanAuthErrorOrNull("Jira", res.status);
+      if (authError) throw authError;
       const text = await res.text().catch(() => "");
       throw new BadRequestException({ error: `Jira request failed (${res.status}).`, detail: text.slice(0, 500) });
     }
@@ -8684,6 +8710,8 @@ export class LegacyService implements OnModuleInit {
       body: JSON.stringify({ query, variables })
     });
     if (!res.ok) {
+      const authError = this.cleanAuthErrorOrNull("Linear", res.status);
+      if (authError) throw authError;
       const text = await res.text().catch(() => "");
       throw new BadRequestException({ error: `Linear request failed (${res.status}).`, detail: text.slice(0, 500) });
     }
@@ -8754,20 +8782,32 @@ export class LegacyService implements OnModuleInit {
     // One Linear team per Tesbo project — same invariant as Jira above.
     if (teams.length > 1) throw new BadRequestException({ error: "Link one Linear team at a time to this project." });
 
-    await this.db.query("UPDATE linear_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
     const [team] = teams;
-    if (!team) return { linked: 0 };
-
-    await this.db.query(
-      `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (integration_connection_id, linear_team_id, project_id) DO UPDATE SET
-         linear_team_key = EXCLUDED.linear_team_key,
-         linear_team_name = EXCLUDED.linear_team_name,
-         enabled = true`,
-      [connection.id, projectId, team.id, team.key, team.name]
-    );
-    return { linked: 1 };
+    try {
+      await this.db.transaction(async (client) => {
+        await client.query("UPDATE linear_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
+        if (!team) return;
+        await client.query(
+          `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (integration_connection_id, linear_team_id, project_id) DO UPDATE SET
+             linear_team_key = EXCLUDED.linear_team_key,
+             linear_team_name = EXCLUDED.linear_team_name,
+             enabled = true`,
+          [connection.id, projectId, team.id, team.key, team.name]
+        );
+      });
+    } catch (error) {
+      // idx_linear_project_mappings_one_per_project (partial unique on project_id WHERE enabled=true)
+      // rejects a second concurrent save-mapping request for this project — a double-click or two
+      // tabs racing this same endpoint. Translate the raw DB conflict into the same message the UI
+      // already renders for any 409 (lib/api.ts's genericStatusMessage) instead of a raw 500.
+      if ((error as { code?: string })?.code === "23505") {
+        throw new ConflictException({ error: "This project's Linear link was just changed by another action. Reload and try again." });
+      }
+      throw error;
+    }
+    return { linked: team ? 1 : 0 };
   }
 
   async syncLinear(userId: string | null | undefined, projectId: string) {

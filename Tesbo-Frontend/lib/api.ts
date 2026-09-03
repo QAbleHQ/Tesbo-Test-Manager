@@ -44,6 +44,13 @@ function isNetworkFetchError(e: unknown): boolean {
   );
 }
 
+// Only ever thrown by a `signal` an individual call opted into (e.g. AbortSignal.timeout(...) on
+// the integration Connect/Sync/Disconnect calls) — api() itself sets no default timeout, so this
+// never fires for a call that didn't ask for one.
+function isAbortError(e: unknown): boolean {
+  return e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+}
+
 async function fetchWithNetworkErrorMessage(
   input: string,
   init: RequestInit
@@ -51,6 +58,7 @@ async function fetchWithNetworkErrorMessage(
   try {
     return await fetch(input, init);
   } catch (e) {
+    if (isAbortError(e)) throw new Error("The request took too long. Please check your connection and try again.");
     if (!isNetworkFetchError(e)) throw e instanceof Error ? e : new Error(String(e));
     // A browser keep-alive connection left idle past the server/proxy's keep-alive window fails
     // on the next write before any bytes reach the server — the request was never delivered, so
@@ -2645,8 +2653,15 @@ export interface IntegrationOAuthConfig {
   redirectUri: string;
 }
 
+// Timed so the Connect button can never stay stuck mid-click waiting on a hung backend — the
+// popup is already open by the time this is called, so a hang here would otherwise leave the
+// button disabled with no way out short of a page reload.
+const INTEGRATION_CALL_TIMEOUT_MS = 20_000;
+
 export async function getIntegrationAuthUrl(provider: IntegrationProvider): Promise<{ url: string }> {
-  return api<{ url: string }>(`/api/workspace/integrations/${provider}/auth-url`);
+  return api<{ url: string }>(`/api/workspace/integrations/${provider}/auth-url`, {
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function getIntegrationConfig(provider: IntegrationProvider): Promise<IntegrationOAuthConfig> {
@@ -2660,11 +2675,18 @@ export async function integrationCallback(
   code: string,
   state: string
 ): Promise<{ connectionId: string; siteUrl: string }> {
-  return api(`/api/workspace/integrations/${provider}/callback`, { method: "POST", body: { code, state } });
+  return api(`/api/workspace/integrations/${provider}/callback`, {
+    method: "POST",
+    body: { code, state },
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function disconnectIntegration(provider: IntegrationProvider): Promise<void> {
-  await api(`/api/workspace/integrations/${provider}/disconnect`, { method: "DELETE" });
+  await api(`/api/workspace/integrations/${provider}/disconnect`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export interface IntegrationConnectionStatus {
@@ -2780,7 +2802,10 @@ export function isSyncRunActive(run: SyncRun | null | undefined): boolean {
 }
 
 export async function syncJiraTickets(projectId: string): Promise<StartSyncResult> {
-  return api<StartSyncResult>(`/api/projects/${projectId}/jira/sync`, { method: "POST" });
+  return api<StartSyncResult>(`/api/projects/${projectId}/jira/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function getIntegrationSyncStatus(projectId: string, provider: IntegrationProvider): Promise<{ run: SyncRun | null }> {
@@ -2911,7 +2936,10 @@ export async function connectLinearTeams(
 }
 
 export async function syncLinearTickets(projectId: string): Promise<StartSyncResult> {
-  return api<StartSyncResult>(`/api/projects/${projectId}/linear/sync`, { method: "POST" });
+  return api<StartSyncResult>(`/api/projects/${projectId}/linear/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
 }
 
 export async function addLinearComment(projectId: string, issueKey: string, comment: string): Promise<void> {
