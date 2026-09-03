@@ -58,3 +58,9 @@ export const NIGHTLY_SYNC_SINCE_BUFFER_MINUTES = 10;
 // delay absorbs that without masking a genuinely revoked/expired authorization, which still fails
 // the same way after the retry.
 export const JIRA_TOKEN_REFRESH_RETRY_DELAY_MS = 1000;
+
+// Every outbound fetch to Jira/Linear in IntegrationSyncClient carries this timeout. Without it, a
+// provider response that never arrives (not an error, just silence) leaves the run stuck in
+// 'running' forever with no way for the UI's poll loop to ever see a terminal state. A timeout
+// turns that into an ordinary failure, which the existing attempts/retry handling already covers.
+export const INTEGRATION_SYNC_FETCH_TIMEOUT_MS = 30_000;

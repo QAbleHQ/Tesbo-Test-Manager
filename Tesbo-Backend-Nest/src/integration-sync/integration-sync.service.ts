@@ -189,6 +189,24 @@ export class IntegrationSyncService {
     );
   }
 
+  /**
+   * Called from LegacyService.integrationDisconnect before it deletes the integration_connections
+   * row. A connection is org-scoped and can be mapped into several Tesbo projects, so a run can be
+   * queued/running for any of them at disconnect time — without this, the DELETE's ON DELETE
+   * CASCADE onto integration_sync_runs (and jira_tickets/linear_tickets) races the sync
+   * processor's own concurrent writes to those same rows (recordTicketResult/finishRun), which can
+   * deadlock rather than merely fail. Settling every active run to a terminal state first removes
+   * that race entirely instead of trying to out-order the locks.
+   */
+  async failActiveRunsForConnection(organizationId: string, provider: SyncProvider, message: string): Promise<void> {
+    await this.db.query(
+      `UPDATE integration_sync_runs
+       SET status = 'failed', stage = 'failed', error = $3, finished_at = now(), updated_at = now()
+       WHERE organization_id = $1 AND provider = $2 AND status IN ('queued', 'running')`,
+      [organizationId, provider, message.slice(0, 2000)]
+    );
+  }
+
   async finishRun(runId: string, note: string | null): Promise<void> {
     await this.db.query(
       `UPDATE integration_sync_runs

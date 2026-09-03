@@ -61,7 +61,7 @@ const TICKET_TABLES: Record<SyncProvider, {
     createdCol: "linear_created_at",
     updatedCol: "linear_updated_at",
     urlCol: "linear_url",
-    conflict: "(integration_connection_id, linear_issue_id)",
+    conflict: "(integration_connection_id, linear_issue_id, project_id)",
     mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name
                  FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
   }

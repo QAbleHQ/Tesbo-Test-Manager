@@ -27,6 +27,27 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// sessionStorage is tab-scoped (survives remounts within a tab, never shared across tabs), so this
+// gives every browser tab its own stable suffix for the popup window name below — without it, two
+// tabs both connecting the same provider would fight over one shared window name and could
+// steal-navigate each other's in-progress popup.
+function tabScopedId(): string {
+  if (typeof window === "undefined") return "ssr";
+  const key = "tesbo:oauth-tab-id";
+  try {
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+      window.sessionStorage.setItem(key, id);
+    }
+    return id;
+  } catch {
+    // Private browsing / storage blocked — fall back to a per-load id. Loses the same-tab dedup
+    // across a full page reload, but never collides with another tab.
+    return `${Date.now()}-${Math.random()}`;
+  }
+}
+
 /**
  * The real source of truth throughout this flow: the DB write already happened via an
  * authenticated backend call from the popup tab, so every signal below (broadcast message,
@@ -122,8 +143,10 @@ export function useIntegrationOAuthConnect(provider: IntegrationProvider, onConn
     // Named (not "_blank") so a same-instance double-click below reuses/focuses this tab instead
     // of spawning a duplicate. Opened synchronously, before the auth-url fetch, so the browser's
     // popup-blocker heuristic — which only allows window.open within the synchronous user-gesture
-    // call stack — doesn't block it just because we awaited first.
-    const popup = window.open("", `tesbo-oauth-${provider}`);
+    // call stack — doesn't block it just because we awaited first. The tab-scoped suffix keeps two
+    // different browser tabs connecting the same provider from colliding on one shared window name
+    // (see tabScopedId above) — same-tab dedup below is unaffected since the id is stable per tab.
+    const popup = window.open("", `tesbo-oauth-${provider}-${tabScopedId()}`);
     if (!popup) {
       setPhase("blocked");
       return;
@@ -132,9 +155,8 @@ export function useIntegrationOAuthConnect(provider: IntegrationProvider, onConn
     if (popupRef.current === popup && navigatedRef.current && !popup.closed) {
       // Same hook instance, already navigated this exact window — bring it forward instead of
       // re-fetching a new auth-url and yanking an in-progress consent screen out from under it.
-      // (This dedup is per hook instance only: two different tabs racing the same provider can
-      // still steal-navigate each other's popup via the shared window name. Narrow and owner-
-      // gated enough that we accept it rather than building cross-tab locking for it.)
+      // (This dedup is per hook instance/tab; a different tab gets its own window name via
+      // tabScopedId() above, so it can no longer steal-navigate this one.)
       popup.focus();
       setPhase("waiting");
       return;
