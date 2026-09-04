@@ -21,7 +21,7 @@ import {
   EmptyStateBlock,
   PageLoader,
 } from "@/components/ui";
-import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { PlanCard, planStatus, type PlanStatus } from "@/components/testplans/PlanCard";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import {
@@ -120,6 +120,7 @@ export default function PlansPage() {
   const [newDesc, setNewDesc] = useState("");
   const [newRelease, setNewRelease] = useState("");
   const [canManagePlans, setCanManagePlans] = useState(false);
+  const [projectName, setProjectName] = useState("");
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -159,6 +160,7 @@ export default function PlansPage() {
           const myRole = typeof projectData.myRole === "string" ? projectData.myRole.toLowerCase() : "";
           setCanManagePlans(!myRole || ["owner", "admin", "manager"].includes(myRole));
           setOwnerNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
+          setProjectName(String(projectData.name || ""));
         })
         .catch(() => router.replace("/projects"))
         .finally(() => setLoading(false));
@@ -252,6 +254,15 @@ export default function PlansPage() {
         <PageHeader
           title="Test plans"
           subtitle="Organise test runs and track overall testing progress."
+          breadcrumb={
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test plans" },
+              ]}
+            />
+          }
           actions={
             canManagePlans ? (
               <Button variant="primary" onClick={() => setShowCreate(!showCreate)}>

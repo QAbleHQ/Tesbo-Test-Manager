@@ -7250,15 +7250,21 @@ export class LegacyService implements OnModuleInit {
         !latest.rows[0] ||
         Date.now() - new Date(latest.rows[0].created_at).getTime() > staleMinutes * 60 * 1000;
       if (isStale) {
-        const nextVersion = await this.db.query<{ max: number }>(
-          "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
-          [documentId]
-        );
-        await this.db.query(
-          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-          [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
-        );
+        // Serialised per document, and sharing its lock key with restoreKnowledgeDocumentVersion —
+        // MAX(version_number)+1 alone lets a concurrent edit and a concurrent restore compute the
+        // same next number, and the table has no unique constraint to reject the duplicate insert.
+        await this.db.transaction(async (client) => {
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+          const nextVersion = await client.query<{ max: number }>(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+            [documentId]
+          );
+          await client.query(
+            `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+            [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
+          );
+        });
       }
     }
 
@@ -8009,22 +8015,54 @@ export class LegacyService implements OnModuleInit {
     if (!version.rows[0]) throw new NotFoundException({ error: "Version not found" });
     const v = version.rows[0];
 
-    // Snapshot the current state before overwriting, so restoring a version is itself reversible.
-    const nextVersion = await this.db.query<{ max: number }>(
-      "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
-      [documentId]
-    );
-    await this.db.query(
-      `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-      [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
-    );
+    // Serialised per document, and sharing its lock key with the auto-snapshot step in
+    // updateKnowledgeDocument — a concurrent restore and a concurrent edit both read-then-write
+    // this same version_number sequence, and the table has no unique constraint to reject a
+    // collision. The whole snapshot-then-overwrite sequence also runs inside one transaction so a
+    // mid-sequence failure can never leave a snapshot inserted without the restore having applied,
+    // or vice versa.
+    const res = await this.db.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
 
-    const res = await this.db.query(
-      `UPDATE knowledge_documents SET title = $2, content_json = $3::jsonb, content_html = $4, content_text = $5, updated_by = $6, updated_at = now()
-       WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
-      [documentId, v.title, v.content_json ? JSON.stringify(v.content_json) : null, v.content_html, v.content_text, uid]
-    );
+      // Re-read the document fresh, inside the lock — `doc` above may already be stale by the time
+      // this transaction gets to run, e.g. a concurrent edit committed while we waited on the lock.
+      const current = await client.query(
+        `SELECT title, content_json, content_html, content_text FROM knowledge_documents
+         WHERE id = $1 AND project_id = $2 AND is_deleted = false FOR UPDATE`,
+        [documentId, projectId]
+      );
+      if (!current.rows[0]) throw new NotFoundException({ error: "Document not found" });
+      const cur = current.rows[0];
+
+      // Restoring a version whose content already matches the current document (restoring the
+      // same version twice in a row, or a stray extra click before the UI caught up) has nothing to
+      // snapshot — skip the insert so repeated restores don't pile up identical junk versions, but
+      // still apply the write below so the call remains a normal, idempotent success.
+      const isNoop =
+        cur.title === v.title &&
+        cur.content_html === v.content_html &&
+        cur.content_text === v.content_text &&
+        JSON.stringify(cur.content_json) === JSON.stringify(v.content_json);
+
+      if (!isNoop) {
+        // Snapshot the current state before overwriting, so restoring a version is itself reversible.
+        const nextVersion = await client.query<{ max: number }>(
+          "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+          [documentId]
+        );
+        await client.query(
+          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+          [documentId, nextVersion.rows[0].max, cur.title, cur.content_json ? JSON.stringify(cur.content_json) : null, cur.content_html, cur.content_text, uid]
+        );
+      }
+
+      return client.query(
+        `UPDATE knowledge_documents SET title = $2, content_json = $3::jsonb, content_html = $4, content_text = $5, updated_by = $6, updated_at = now()
+         WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
+        [documentId, v.title, v.content_json ? JSON.stringify(v.content_json) : null, v.content_html, v.content_text, uid]
+      );
+    });
     await this.logProjectActivity(projectId, uid, "restored_version", "knowledge_document", documentId, res.rows[0].title, { versionNumber: v.version_number });
     return toCamel(res.rows[0]);
   }

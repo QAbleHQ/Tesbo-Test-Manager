@@ -50,6 +50,7 @@ import {
 } from "@/lib/api";
 import { RepositoryTestCaseTable } from "@/components/testcases/RepositoryTestCaseTable";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import {
   Button,
   CopyButton,
@@ -982,21 +983,13 @@ export default function TestCasesPage() {
         {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <span className="font-medium text-[var(--accent-light)]">Test cases</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test cases" },
+              ]}
+            />,
             topBarStartEl,
           )}
         {topBarEndEl &&

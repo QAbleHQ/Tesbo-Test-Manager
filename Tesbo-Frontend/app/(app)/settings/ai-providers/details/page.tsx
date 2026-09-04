@@ -5,12 +5,13 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { authMe, getWorkspace, listWorkspaceAiKeys, type WorkspaceAiKey } from "@/lib/api";
 import { Card, PageLoader, StatusChip } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 
 export default function AiProviderDetailsPage() {
   const router = useRouter();
   const [keys, setKeys] = useState<WorkspaceAiKey[]>([]);
   const [role, setRole] = useState("member");
+  const [workspaceName, setWorkspaceName] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,6 +19,7 @@ export default function AiProviderDetailsPage() {
     try {
       const [workspace, aiData] = await Promise.all([getWorkspace(), listWorkspaceAiKeys()]);
       setRole((workspace.role || "member").toLowerCase());
+      setWorkspaceName(workspace.name || "");
       setKeys(aiData.keys || []);
       setError(null);
     } catch (err) {
@@ -34,9 +36,19 @@ export default function AiProviderDetailsPage() {
     });
   }, [loadData, router]);
 
+  const breadcrumb = (
+    <Breadcrumbs
+      items={[
+        { label: workspaceName || "Workspace", href: "/dashboard" },
+        { label: "Workspace settings", href: "/settings?tab=ai" },
+        { label: "AI provider details" },
+      ]}
+    />
+  );
+
   if (loading) {
     return (
-      <StandardPageLayout header={<PageHeader title="AI provider details" />}>
+      <StandardPageLayout header={<PageHeader title="AI provider details" breadcrumb={breadcrumb} />}>
         <PageLoader label="Loading providers…" />
       </StandardPageLayout>
     );
@@ -48,6 +60,7 @@ export default function AiProviderDetailsPage() {
         <PageHeader
           title="AI provider details"
           subtitle="Review workspace provider configuration, custom API endpoints, authentication headers, and model names."
+          breadcrumb={breadcrumb}
           actions={<Link href="/settings?tab=ai" className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Back to AI providers</Link>}
         />
       }

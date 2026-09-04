@@ -7,6 +7,7 @@ import React from "react";
 import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
 import {
   authMe,
+  getProject,
   getJiraStatus,
   getLinearStatus,
   createZyraTask,
@@ -20,7 +21,7 @@ import {
   type TicketSourceStats,
 } from "@/lib/api";
 import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 
 const PAGE_SIZE = 25;
@@ -215,6 +216,7 @@ export default function RequirementsPage() {
   const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>({});
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("");
 
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
@@ -333,6 +335,7 @@ export default function RequirementsPage() {
       setSource(initialSource);
       await loadTickets(initialSource, 0, "", {});
       await Promise.all([refreshLinkedKeys(), refreshSummary()]);
+      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       setLoading(false);
     })();
   }, [projectId, loadTickets, refreshLinkedKeys, refreshSummary, router]);
@@ -413,6 +416,15 @@ export default function RequirementsPage() {
         <PageHeader
           title="Requirements"
           subtitle={`Requirements to be developed, synced from ${connectedPhrase}, and turned into test coverage with Zyra. Full documents live in the Knowledge base's Requirements folder.`}
+          breadcrumb={
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Requirements" },
+              ]}
+            />
+          }
           actions={
             <Link
               href={`/projects/${projectId}/settings?tab=integrations`}

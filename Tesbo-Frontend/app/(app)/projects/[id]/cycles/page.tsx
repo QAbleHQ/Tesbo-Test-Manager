@@ -47,7 +47,7 @@ import {
   PageLoader,
   Textarea,
 } from "@/components/ui";
-import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { getInitials, statusTone, formatDuration, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
 
 const STATUS_FILTERS: { value: string; label: string; dot: string }[] = [
@@ -126,6 +126,7 @@ export default function TestRunsPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
   const [canManageRuns, setCanManageRuns] = useState(false);
+  const [projectName, setProjectName] = useState("");
 
   useEffect(() => {
     if (searchParams.get("create") === "1") {
@@ -173,6 +174,7 @@ export default function TestRunsPage() {
         setCanManageRuns(!myRole || ["owner", "admin", "manager"].includes(myRole));
         setOwnerNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
         setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name])));
+        setProjectName(String(project.name || ""));
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -308,6 +310,15 @@ export default function TestRunsPage() {
         <PageHeader
           title="Test Runs"
           subtitle="Create and manage test runs to track execution progress."
+          breadcrumb={
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test Runs" },
+              ]}
+            />
+          }
           actions={
             canManageRuns ? (
               <div className="flex items-center gap-2">

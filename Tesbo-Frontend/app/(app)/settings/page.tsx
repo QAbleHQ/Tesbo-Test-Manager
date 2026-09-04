@@ -5,6 +5,7 @@ import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { authMe, getWorkspace } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import { PageLoader } from "@/components/ui";
 import GeneralTab from "@/components/settings/GeneralTab";
 import MembersTab from "@/components/settings/MembersTab";
@@ -98,9 +99,12 @@ function WorkspaceSettingsContent() {
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              <span className="truncate font-medium text-[var(--accent-light)]">Workspace settings</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: workspaceName || "Workspace", href: "/dashboard" },
+                { label: "Workspace settings" },
+              ]}
+            />,
             topBarStartEl,
           )}
 

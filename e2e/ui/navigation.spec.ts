@@ -3,10 +3,13 @@ import { expect, test, type APIRequestContext, type Page } from "@playwright/tes
 import { dbControlAvailable } from "../utils/psql";
 import {
   createPlan,
+  createProject,
+  deleteProjects,
   removeWorkspaceMember,
   screensApi,
   screensSuiteSkipReason,
   screensTenant,
+  seedRun,
   seedWorkspaceMember,
 } from "../utils/screens-tenant";
 
@@ -672,5 +675,180 @@ test.describe("top bar — notifications", () => {
     await panel(page).getByRole("button", { name: "Try again" }).click();
 
     await expect(panel(page).getByText("No notifications")).toBeVisible();
+  });
+});
+
+/*
+ * Basecamp/BetterBugs: "Breadcrumbs are inconsistent across pages" — some pages had no breadcrumb,
+ * the ones that did used five different separators/colours/font-sizes, and several didn't reflect
+ * the actual routing hierarchy (a "Projects" root pointing nowhere near /projects, a project's own
+ * key shown instead of its name, "Project" used as a literal label instead of the project's name).
+ * Every page now renders the single shared <Breadcrumbs> component (components/workflows/Breadcrumbs.tsx),
+ * so these tests assert the trail text/links match the real route nesting rather than a hand-rolled
+ * per-page string, and that the one shared markup shape (nav[aria-label="Breadcrumb"], the current
+ * page as a non-link with aria-current="page") is what's actually on the page.
+ */
+test.describe("breadcrumbs", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  const projectPath = (suffix = "") => `/projects/${tenant!.projectId}${suffix}`;
+
+  function breadcrumb(page: Page) {
+    return page.locator('nav[aria-label="Breadcrumb"]');
+  }
+
+  /** Every crumb's visible text in order, ignoring the "/" separators between them. */
+  async function breadcrumbLabels(page: Page): Promise<string[]> {
+    return breadcrumb(page)
+      .locator("a, [aria-current]")
+      .evaluateAll((els) => els.map((el) => (el.textContent ?? "").trim()));
+  }
+
+  async function breadcrumbLinkHref(page: Page, label: string): Promise<string | null> {
+    return breadcrumb(page).getByRole("link", { name: label, exact: true }).getAttribute("href");
+  }
+
+  let projectName = "";
+  let workspaceName = "";
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    const api = await screensApi();
+    try {
+      projectName = (await (await api.get(`/api/projects/${tenant!.projectId}`)).json()).name;
+      workspaceName = (await (await api.get("/api/workspace")).json()).name;
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  // Every project-scoped section, with the trail it must now show. The last label is always the
+  // current page (non-link); everything before it must be a working link up the hierarchy.
+  const projectSections: { label: string; path: string; trail: () => string[] }[] = [
+    { label: "Project dashboard", path: "/dashboard", trail: () => ["Projects", projectName] },
+    { label: "Test cases", path: "/testcases", trail: () => ["Projects", projectName, "Test cases"] },
+    { label: "Bugs", path: "/bugs", trail: () => ["Projects", projectName, "Bugs"] },
+    { label: "Reports", path: "/reports", trail: () => ["Projects", projectName, "Reports"] },
+    { label: "Activity", path: "/activity", trail: () => ["Projects", projectName, "Activity"] },
+    { label: "Knowledge base", path: "/knowledge-base", trail: () => ["Projects", projectName, "Knowledge base"] },
+    { label: "Project settings", path: "/settings", trail: () => ["Projects", projectName, "Settings"] },
+    // BC-06/07 below: these had NO breadcrumb at all before this fix.
+    { label: "Test plans (list)", path: "/plans", trail: () => ["Projects", projectName, "Test plans"] },
+    { label: "Test Runs (list)", path: "/cycles", trail: () => ["Projects", projectName, "Test Runs"] },
+    { label: "Requirements", path: "/requirements", trail: () => ["Projects", projectName, "Requirements"] },
+    { label: "Agents", path: "/agents", trail: () => ["Projects", projectName, "Agents"] },
+  ];
+
+  for (const section of projectSections) {
+    test(`BC-01 ${section.label} shows the full Projects → project → section trail`, async ({ page }) => {
+      await page.goto(projectPath(section.path));
+      await expect(breadcrumb(page)).toBeVisible();
+      expect(await breadcrumbLabels(page)).toEqual(section.trail());
+
+      // The current page is not a link — only everything before it is.
+      const current = section.trail().at(-1)!;
+      await expect(breadcrumb(page).getByText(current, { exact: true })).toHaveAttribute("aria-current", "page");
+      await expect(breadcrumb(page).getByRole("link", { name: current, exact: true })).toHaveCount(0);
+    });
+  }
+
+  test("BC-02 the Projects crumb always points at the projects list, not the current project", async ({ page }) => {
+    await page.goto(projectPath("/testcases"));
+    expect(await breadcrumbLinkHref(page, "Projects")).toBe("/projects");
+  });
+
+  test("BC-03 the project-name crumb points at this project's dashboard, and round-trips there", async ({ page }) => {
+    await page.goto(projectPath("/bugs"));
+    await expect(breadcrumb(page)).toBeVisible();
+    expect(await breadcrumbLinkHref(page, projectName)).toBe(projectPath("/dashboard"));
+
+    await breadcrumb(page).getByRole("link", { name: projectName, exact: true }).click();
+    await page.waitForURL(/\/dashboard$/);
+  });
+
+  test("BC-04 a plan detail page extends the list's trail with the plan as the current page", async ({ page }) => {
+    const api = await screensApi();
+    let planId: string | undefined;
+    try {
+      const plan = await createPlan(api, tenant!.projectId);
+      planId = plan.id;
+
+      await page.goto(projectPath(`/plans/${plan.id}`));
+      await expect(breadcrumb(page)).toBeVisible();
+      expect(await breadcrumbLabels(page)).toEqual(["Projects", projectName, "Test plans", plan.name]);
+
+      // Unlike the list page, "Test plans" is now a link back to the list, not the current page.
+      expect(await breadcrumbLinkHref(page, "Test plans")).toBe(projectPath("/plans"));
+      await breadcrumb(page).getByRole("link", { name: "Test plans", exact: true }).click();
+      await page.waitForURL(/\/plans$/);
+    } finally {
+      if (planId) await api.delete(`/api/plans/${planId}`, { failOnStatusCode: false }).catch(() => {});
+      await api.dispose();
+    }
+  });
+
+  test("BC-05 a run detail page extends the list's trail with the run as the current page", async ({ page }) => {
+    const api = await screensApi();
+    let cycleId: string | undefined;
+    try {
+      const run = await seedRun(api, tenant!.projectId);
+      cycleId = run.cycleId;
+
+      await page.goto(projectPath(`/cycles/${run.cycleId}`));
+      await expect(breadcrumb(page)).toBeVisible();
+      expect(await breadcrumbLabels(page)).toEqual(["Projects", projectName, "Test Runs", run.name]);
+      expect(await breadcrumbLinkHref(page, "Test Runs")).toBe(projectPath("/cycles"));
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false }).catch(() => {});
+      await api.dispose();
+    }
+  });
+
+  test("BC-06 workspace-level pages show the workspace name instead of a project", async ({ page }) => {
+    await page.goto("/dashboard");
+    await expect(breadcrumb(page)).toBeVisible();
+    expect(await breadcrumbLabels(page)).toEqual([workspaceName, "Dashboard"]);
+
+    await page.goto("/activity");
+    await expect(breadcrumb(page)).toBeVisible();
+    expect(await breadcrumbLabels(page)).toEqual([workspaceName, "Activity"]);
+  });
+
+  test("BC-07 introducing a breadcrumb on a previously-bare page doesn't shift the page title or actions", async ({ page }) => {
+    // Test plans and Test Runs had no breadcrumb before this fix — the regression this guards
+    // against is the new line pushing the title/actions row down by more than one compact row,
+    // or the actions button moving out from beside the title.
+    await page.goto(projectPath("/plans"));
+    const heading = page.getByRole("heading", { name: "Test plans" });
+    await expect(heading).toBeVisible();
+    await expect(breadcrumb(page)).toBeVisible();
+    const [crumbBox, headingBox] = [await breadcrumb(page).boundingBox(), await heading.boundingBox()];
+    expect(crumbBox).not.toBeNull();
+    expect(headingBox).not.toBeNull();
+    // The breadcrumb sits directly above the title, immediately adjacent — not pushed far away by
+    // some unrelated layout shift.
+    expect(headingBox!.y - (crumbBox!.y + crumbBox!.height)).toBeLessThan(24);
+  });
+
+  test("BC-08 a very long project name truncates instead of breaking the breadcrumb's layout", async ({ page }) => {
+    const api = await screensApi();
+    let longProjectId: string | undefined;
+    try {
+      const longProject = await createProject(api, {
+        name: `E2E Very Long Project Name For Breadcrumb Truncation Testing Purposes Only ${Date.now()}`,
+      });
+      longProjectId = longProject.id;
+
+      await page.goto(`/projects/${longProjectId}/testcases`);
+      const crumb = breadcrumb(page);
+      await expect(crumb).toBeVisible();
+      // The crumb never grows taller than a single line, however long the name is.
+      const box = await crumb.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.height).toBeLessThan(28);
+    } finally {
+      await deleteProjects(api, [longProjectId]);
+      await api.dispose();
+    }
   });
 });
