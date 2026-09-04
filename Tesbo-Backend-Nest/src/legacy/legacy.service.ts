@@ -11274,7 +11274,7 @@ export class LegacyService implements OnModuleInit {
     }];
     const claimRes = await this.db.query(
       `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now()
-       WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING id`,
+       WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING *`,
       [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback]
     );
     if (claimRes.rowCount === 0) {
@@ -11297,11 +11297,77 @@ export class LegacyService implements OnModuleInit {
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
     const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
+    // Regeneration is a real provider call (the same one processZyraTask makes for the initial
+    // generation) and routinely takes tens of seconds. Fire it off the same way processZyraTask
+    // does — the claim UPDATE above already moved the task to 'todo' and is what the caller needs
+    // to see; the reviewer gets an immediate response instead of the request hanging until the
+    // model finishes, and the existing todo/in_progress poll (see the frontend task-detail page)
+    // picks up the regenerated drafts once processZyraFeedback below finishes.
+    void this.processZyraFeedback(projectId, taskId, {
+      userId: uid,
+      story,
+      context,
+      acceptanceCriteria,
+      feedback,
+      feedbackText,
+      referenceNote,
+      jiraIssueKeys,
+      linearIssueKeys,
+      additionalJiraIssueKeys,
+      additionalLinearIssueKeys,
+      requestedCount,
+      testcaseRange,
+      provider,
+      model,
+      allocation: allocation.rows[0],
+      previousSourceSummary: existing.rows[0].source_summary
+    }).catch(() => undefined);
+    return {
+      generationRequestId: taskId,
+      task: this.formatAiTask(claimRes.rows[0]),
+      provider,
+      drafts: [],
+      generatedCount: 0,
+      tokenUsage: { input: 0, output: 0, total: 0 }
+    };
+  }
+
+  // Background continuation of zyraFeedback, split out so the HTTP request can return as soon as
+  // the task is claimed instead of blocking on the provider call below (which routinely takes tens
+  // of seconds) — mirrors processZyraTask's fire-and-forget shape for the initial generation.
+  private async processZyraFeedback(
+    projectId: string,
+    taskId: string,
+    options: {
+      userId: string;
+      story: string;
+      context: string;
+      acceptanceCriteria: string;
+      feedback: string;
+      feedbackText: string;
+      referenceNote: string;
+      jiraIssueKeys: string[];
+      linearIssueKeys: string[];
+      additionalJiraIssueKeys: string[];
+      additionalLinearIssueKeys: string[];
+      requestedCount: number;
+      testcaseRange: string;
+      provider: string;
+      model: string;
+      allocation: Body;
+      previousSourceSummary: unknown;
+    }
+  ): Promise<void> {
+    const {
+      userId, story, context, acceptanceCriteria, feedback, feedbackText, referenceNote,
+      jiraIssueKeys, linearIssueKeys, additionalJiraIssueKeys, additionalLinearIssueKeys,
+      requestedCount, testcaseRange, provider, model, allocation, previousSourceSummary
+    } = options;
     try {
       // These four snapshots are independent reads (knowledge base, Jira, Linear, existing
       // testcases) — gathering them concurrently instead of one after another cuts this stage's
       // wall time down to the slowest of the four instead of their sum, without changing what any
-      // of them return. The request still awaits the full pipeline before responding, same as before.
+      // of them return.
       const [knowledge, jira, linear, existingTestcases] = await Promise.all([
         this.knowledgeSnapshot(projectId),
         this.jiraSnapshot(projectId, jiraIssueKeys),
@@ -11311,10 +11377,10 @@ export class LegacyService implements OnModuleInit {
       const aiResult = await this.generateZyraWithProvider({
         provider,
         model,
-        apiKey: allocation.rows[0].api_key,
-        baseUrl: allocation.rows[0].base_url,
-        authHeaderName: allocation.rows[0].auth_header_name,
-        authScheme: allocation.rows[0].auth_scheme,
+        apiKey: allocation.api_key,
+        baseUrl: allocation.base_url,
+        authHeaderName: allocation.auth_header_name,
+        authScheme: allocation.auth_scheme,
         projectId,
         input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
       });
@@ -11327,7 +11393,7 @@ export class LegacyService implements OnModuleInit {
         { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
         { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
       ];
-      const previousSources = normalizeJsonArray(existing.rows[0].source_summary);
+      const previousSources = normalizeJsonArray(previousSourceSummary);
       const nextSources = [
         ...previousSources,
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
@@ -11358,13 +11424,11 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(linearIssueKeys)
         ]
       );
-      let responseRow = res.rows[0];
+      const responseRow = res.rows[0];
       if (!responseRow) {
         // Something else (a close/save from another tab) changed the task's status while the
-        // provider call was in flight. The caller's own request still succeeded — they should
-        // still see the drafts they asked for — but don't resurrect the row into 'in_review' out
-        // from under whatever the concurrent action already set; just record that this happened
-        // and return the task's current, true state.
+        // provider call was in flight. Don't resurrect the row into 'in_review' out from under
+        // whatever the concurrent action already set; just record that this happened.
         const droppedAt = new Date().toISOString();
         const note = [{
           actor: "agent",
@@ -11373,41 +11437,27 @@ export class LegacyService implements OnModuleInit {
           detail: `Zyra regenerated ${aiResult.drafts.length} testcase draft(s) after this feedback, but the task had already been updated elsewhere in the meantime, so the regenerated drafts were not applied.`,
           createdAt: droppedAt
         }];
-        const fresh = await this.db.query(
-          "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2 RETURNING *",
+        await this.db.query(
+          "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2",
           [taskId, projectId, JSON.stringify(note)]
         );
-        responseRow = fresh.rows[0];
-      } else {
-        await this.rememberZyraTurn({
-          projectId,
-          userId: uid,
-          provider,
-          model,
-          key: allocation.rows[0],
-          userMessage: `${story}\nReviewer feedback: ${feedbackText}`,
-          outcome: [
-            `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
-            referenceNote ? `Reviewer references: ${referenceNote}` : "",
-            additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
-            additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
-          ].filter(Boolean).join(" ")
-        });
+        return;
       }
-      return {
-        generationRequestId: taskId,
-        task: this.formatAiTask(responseRow),
+      await this.rememberZyraTurn({
+        projectId,
+        userId,
         provider,
-        drafts: aiResult.drafts,
-        generatedCount: aiResult.drafts.length,
-        tokenUsage: aiResult.usage
-      };
+        model,
+        key: allocation,
+        userMessage: `${story}\nReviewer feedback: ${feedbackText}`,
+        outcome: [
+          `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
+          referenceNote ? `Reviewer references: ${referenceNote}` : "",
+          additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
+          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
+        ].filter(Boolean).join(" ")
+      });
     } catch (error) {
-      // Regeneration runs synchronously in the request/response cycle, unlike the initial
-      // processZyraTask fire-and-forget — but it moved task_status to 'todo' above *before*
-      // calling the provider, with no catch here at all. A provider failure threw straight to
-      // the controller as a raw 500 and left the task stuck showing "Pending" with no record of
-      // what happened, same failure mode as the initial-generation bug this mirrors.
       const summary = this.extractAiErrorMessage(error) || "Zyra failed to regenerate testcase drafts.";
       const payload = typeof (error as { getResponse?: () => unknown })?.getResponse === "function"
         ? (error as { getResponse: () => unknown }).getResponse()
@@ -11426,7 +11476,6 @@ export class LegacyService implements OnModuleInit {
       // markZyraTaskFailed only marks 'failed' if the row is still 'todo'/'in_progress' — if a
       // concurrent close/save already moved it on, that action wins and this only leaves a note.
       await this.markZyraTaskFailed(projectId, taskId, detail);
-      throw error;
     }
   }
 
