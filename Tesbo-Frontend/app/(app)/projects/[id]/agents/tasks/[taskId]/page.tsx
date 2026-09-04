@@ -19,13 +19,14 @@ import {
   type SuiteNode,
   type ZyraTask,
 } from "@/lib/api";
+import { IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
 type SaveMode = "existing" | "new";
-type DetailTab = "testcases" | "activities" | "sources";
+type DetailTab = "testcases" | "feedback" | "activities" | "sources";
 
 function normalizeStatus(status: string): string {
   if (status === "accepted") return "done";
@@ -47,6 +48,13 @@ function latestFailureDetail(activities: ZyraTask["activities"]): string | null 
     if (activities[i].stage === "failed") return activities[i].detail || "Zyra failed to generate testcase drafts.";
   }
   return null;
+}
+
+// Mirrors TaskQuickViewPanel's isFeedbackActivity: only the entry carrying a reviewer's actual
+// words counts as "Feedback", not the status/process narration that shares the same activity log.
+// Rows written before `kind` existed fall back to matching the fixed title zyraFeedback writes.
+function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
+  return activity.kind === "feedback" || activity.title === "Review feedback submitted";
 }
 
 const TASK_STATUS_LABELS: Record<string, string> = {
@@ -325,6 +333,9 @@ export default function ZyraTaskDetailPage() {
 
   const done = normalizeStatus(task.taskStatus) === "done";
   const taskStatusNow = normalizeStatus(task.taskStatus);
+  // Defensive: activity_log is jsonb server-side and not schema-enforced, so a malformed or
+  // missing value must render an empty history rather than throw.
+  const feedbackActivities = Array.isArray(task.activities) ? task.activities.filter(isFeedbackActivity) : [];
   // Mirrors the backend guard in zyraFeedback: feedback only makes sense once there's something
   // to review, or to retry after a failure. Disabling it here for todo/in_progress avoids a
   // pointless round trip that the server would reject with a 409 anyway.
@@ -344,6 +355,7 @@ export default function ZyraTaskDetailPage() {
   );
   const tabItems: Array<{ key: DetailTab; label: string; count?: number }> = [
     { key: "testcases", label: "Generated Testcases", count: task.drafts.length },
+    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
     { key: "activities", label: "Activities", count: task.activities.length },
     { key: "sources", label: "Sources", count: task.sources.length },
   ];
@@ -486,10 +498,38 @@ export default function ZyraTaskDetailPage() {
               </table>
             </div>
           </Card>
+        </div>
+      )}
+
+      {activeTab === "feedback" && (
+        <div className="space-y-4">
+          <Card className="p-4 space-y-3">
+            {feedbackActivities.map((activity, index) => {
+              const isAgent = activity.actor === "agent";
+              return (
+                <div
+                  key={`${activity.title}-${index}`}
+                  className={`rounded-lg border border-[var(--border)] p-3 ${isAgent ? "border-l-[3px] border-l-[var(--brand-primary)]" : ""}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      {isAgent ? <IconSparkles size={12} stroke={1.75} /> : <IconUser size={12} stroke={1.75} />}
+                      {isAgent ? "Zyra" : "You"}
+                    </span>
+                    <span className="text-[11px] text-[var(--muted-soft)]">
+                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
+                    </span>
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail || activity.title}</p>
+                </div>
+              );
+            })}
+            {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
+          </Card>
 
           <Card className="p-4 space-y-4">
             <div>
-              <h2 className="text-base font-semibold text-[var(--foreground)]">Feedback</h2>
+              <h2 className="text-base font-semibold text-[var(--foreground)]">Send feedback</h2>
               <p className="mt-1 text-sm text-[var(--muted)]">Send updates from the same review table so Zyra can regenerate this task with the latest context.</p>
             </div>
             <Field>
