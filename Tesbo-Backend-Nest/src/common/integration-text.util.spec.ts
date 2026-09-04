@@ -1,4 +1,4 @@
-import { jiraDescriptionToText } from "./integration-text.util";
+import { jiraDescriptionToText, truncateForColumn } from "./integration-text.util";
 
 /*
  * jiraDescriptionToText flattens Atlassian Document Format (ADF) — the recursive
@@ -102,5 +102,39 @@ describe("jiraDescriptionToText", () => {
   it("drops empty nodes without leaving blank artifacts", () => {
     const doc = { type: "doc", content: [{ type: "paragraph", content: [] }, { type: "paragraph", content: [{ type: "text", text: "Only line." }] }] };
     expect(jiraDescriptionToText(doc)).toBe("Only line.");
+  });
+});
+
+/*
+ * Regression coverage for the "value too long for type character varying(1024)" prod incident: a
+ * Jira/Linear issue title (linear_tickets.summary / jira_tickets.summary) longer than the column
+ * allowed threw a raw Postgres error that aborted the whole sync run — see
+ * integration-sync.processor.ts's upsertTicket and integration-sync-document.builder.ts's title.
+ */
+describe("truncateForColumn", () => {
+  it("returns the value unchanged when it already fits", () => {
+    expect(truncateForColumn("short", 10)).toBe("short");
+  });
+
+  it("returns the value unchanged exactly at the limit", () => {
+    expect(truncateForColumn("1234567890", 10)).toBe("1234567890");
+  });
+
+  it("truncates and marks the cut with an ellipsis when the value is over the limit", () => {
+    const result = truncateForColumn("12345678901", 10);
+    expect(result).toBe("123456789…");
+    expect(result).toHaveLength(10);
+  });
+
+  it("never produces a result longer than maxLength, for a wide range of inputs", () => {
+    for (const len of [0, 1, 2, 5, 1024, 5000]) {
+      const value = "x".repeat(len);
+      expect(truncateForColumn(value, 512).length).toBeLessThanOrEqual(512);
+    }
+  });
+
+  it("degrades gracefully when maxLength is smaller than the ellipsis itself", () => {
+    expect(() => truncateForColumn("anything", 0)).not.toThrow();
+    expect(truncateForColumn("anything", 0).length).toBeLessThanOrEqual(1);
   });
 });

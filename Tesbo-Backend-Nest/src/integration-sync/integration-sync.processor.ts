@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { truncateForColumn } from "../common/integration-text.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
@@ -157,10 +158,22 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
       await this.runs.setStage(runId, "fetching_tickets");
       const queued: SyncTicketJobPayload[] = [];
+      let skipped = 0;
       const onPage = async (tickets: RemoteTicket[]) => {
         for (const ticket of tickets) {
-          const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket);
-          queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
+          try {
+            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket);
+            queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
+          } catch (err) {
+            // One ticket's data (an oversized field, or anything else unexpected) must never abort
+            // the rest of the page or the run — an incremental run cursors off the last
+            // *successful* run's start, so an uncaught failure here would keep hitting this same
+            // ticket on every future attempt, permanently blocking the whole project's sync.
+            skipped++;
+            this.logger.warn(
+              `Skipping ${provider} ticket ${ticket.issueKey} in run ${runId} — could not upsert: ${err instanceof Error ? err.message : err}`
+            );
+          }
         }
         // Published per page so the UI's "found N tickets" climbs while a large backlog is still
         // being pulled, instead of sitting at zero for a minute.
@@ -175,24 +188,39 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
       if (!queued.length) {
         // An incremental (nightly) run finding nothing means "nothing changed since last time",
-        // not "this project is empty" — a full run reports the latter as before.
-        await this.runs.finishRun(
-          runId,
-          since ? `No changes in ${remote.remote_key} since the last sync.` : `No tickets found in ${remote.remote_key}.`
-        );
+        // not "this project is empty" — a full run reports the latter as before. A run where
+        // every ticket was skipped (all had bad data) is neither — say so instead of implying an
+        // empty/unchanged project.
+        let emptyNote: string;
+        if (skipped) {
+          emptyNote = `All ${skipped} updated ticket${skipped === 1 ? "" : "s"} in ${remote.remote_key} had invalid data and were skipped — see server logs.`;
+        } else if (since) {
+          emptyNote = `No changes in ${remote.remote_key} since the last sync.`;
+        } else {
+          emptyNote = `No tickets found in ${remote.remote_key}.`;
+        }
+        await this.runs.finishRun(runId, emptyNote);
         return;
       }
 
       await this.runs.setStage(runId, "building_documents");
       await this.runs.enqueueTicketJobs(queued);
 
+      // Both conditions are independent and rare enough that combining them into one message,
+      // rather than writing one then leaving the other to COALESCE itself away, keeps neither one
+      // silently lost. Recorded now (not at finish) so it's visible while the run is still
+      // building documents — finishRun's own COALESCE keeps whatever is written here.
+      const notes: string[] = [];
       if (truncated) {
-        // Recorded now rather than at finish, so the cap is visible in the UI while the run is
-        // still building documents. finishRun's COALESCE keeps it.
-        await this.db.query("UPDATE integration_sync_runs SET error = $2, updated_at = now() WHERE id = $1", [
-          runId,
+        notes.push(
           `Stopped at the ${MAX_TICKETS_PER_RUN}-ticket limit for one sync. The most recently updated ${MAX_TICKETS_PER_RUN} tickets were synced; run Sync again to continue.`
-        ]);
+        );
+      }
+      if (skipped) {
+        notes.push(`${skipped} ticket${skipped === 1 ? "" : "s"} had invalid data and were skipped — see server logs.`);
+      }
+      if (notes.length) {
+        await this.db.query("UPDATE integration_sync_runs SET error = $2, updated_at = now() WHERE id = $1", [runId, notes.join(" ")]);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -236,17 +264,20 @@ export class IntegrationSyncProcessor extends WorkerHost {
         connectionId,
         ticket.issueId,
         ticket.issueKey,
+        // summary/description are TEXT (V93) — the provider's raw title is unbounded here. Every
+        // other column below is still a fixed-width varchar, so each gets a defensive cap: none of
+        // these have overflowed yet, but they were exactly as unguarded as summary was before V93.
         ticket.summary,
         ticket.description,
-        ticket.issueType,
-        ticket.status,
-        ticket.priority,
-        ticket.assignee,
-        ticket.reporter,
+        truncateForColumn(ticket.issueType, 128),
+        truncateForColumn(ticket.status, 128),
+        truncateForColumn(ticket.priority, 64),
+        truncateForColumn(ticket.assignee, 256),
+        truncateForColumn(ticket.reporter, 256),
         ticket.labels,
         ticket.createdAt,
         ticket.updatedAt,
-        ticket.url
+        truncateForColumn(ticket.url, 1024)
       ]
     );
     return res.rows[0].id;
