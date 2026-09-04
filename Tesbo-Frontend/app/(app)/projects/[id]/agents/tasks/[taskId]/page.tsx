@@ -9,6 +9,7 @@ import {
   createSuite,
   deleteZyraTaskDraft,
   getJiraStatus,
+  getProject,
   getZyraTask,
   listJiraTickets,
   listSuites,
@@ -19,7 +20,7 @@ import {
   type ZyraTask,
 } from "@/lib/api";
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -114,6 +115,7 @@ export default function ZyraTaskDetailPage() {
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("");
   const pollInFlightRef = useRef(false);
 
   const loadData = useCallback(async () => {
@@ -145,7 +147,8 @@ export default function ZyraTaskDetailPage() {
       if (!me) router.replace("/login");
       else void loadData();
     });
-  }, [loadData, router]);
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
+  }, [loadData, router, projectId]);
 
   // Lighter than loadData (skips suites/Jira) — just re-reads this task so Zyra finishing (or
   // failing) generation server-side shows up here without a manual reload.
@@ -300,9 +303,21 @@ export default function ZyraTaskDetailPage() {
     }
   }
 
+  const taskBreadcrumb = (
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Agents", href: `/projects/${projectId}/agents` },
+        { label: "Tasks", href: `/projects/${projectId}/agents/tasks` },
+        { label: "Zyra task" },
+      ]}
+    />
+  );
+
   if (loading || !task) {
     return (
-      <StandardPageLayout header={<PageHeader title="Zyra task" />}>
+      <StandardPageLayout header={<PageHeader title="Zyra task" breadcrumb={taskBreadcrumb} />}>
         <PageLoader label="Loading task…" />
       </StandardPageLayout>
     );
@@ -339,6 +354,7 @@ export default function ZyraTaskDetailPage() {
         <PageHeader
           title="Zyra task"
           subtitle="Review the task, save or remove generated testcases, provide feedback, and track every Zyra status update."
+          breadcrumb={taskBreadcrumb}
           actions={<Link href={`/projects/${projectId}/agents/tasks`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Back to board</Link>}
         />
       }

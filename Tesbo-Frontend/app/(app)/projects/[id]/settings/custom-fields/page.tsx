@@ -1,19 +1,19 @@
 "use client";
 
-import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { IconChevronRight, IconStack2 } from "@tabler/icons-react";
+import { IconStack2 } from "@tabler/icons-react";
 import {
   authMe,
   getBillingInfo,
+  getProject,
   listCustomFieldDefinitions,
   listProjectMembers,
   type BillingInfo,
   type CustomFieldDefinition,
 } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import CustomFieldDefinitionList from "@/components/customFields/CustomFieldDefinitionList";
 import CustomFieldDefinitionFormModal from "@/components/customFields/CustomFieldDefinitionFormModal";
 import PricingModal from "@/components/PricingModal";
@@ -41,6 +41,7 @@ export default function CustomFieldsSettingsPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<CustomFieldDefinition | null>(null);
   const [pricingOpen, setPricingOpen] = useState(false);
+  const [projectName, setProjectName] = useState("");
 
   const loadDefinitions = useCallback(async () => {
     try {
@@ -63,6 +64,7 @@ export default function CustomFieldsSettingsPage() {
       setCurrentUserId(me.userId);
       listProjectMembers(projectId).then(setProjectMembers).catch(() => {});
       getBillingInfo().then(setBillingInfo).catch(() => {});
+      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       loadDefinitions().catch(() => {});
     });
   }, [loadDefinitions, projectId, router]);
@@ -83,9 +85,14 @@ export default function CustomFieldsSettingsPage() {
       }
       subtitle="Capture additional test case metadata specific to this project."
       breadcrumb={
-        <Link href={`/projects/${projectId}/settings?tab=customFields`} className="inline-flex items-center gap-1 hover:text-[var(--foreground)]">
-          Settings <IconChevronRight size={13} /> Custom Fields
-        </Link>
+        <Breadcrumbs
+          items={[
+            { label: "Projects", href: "/projects" },
+            { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+            { label: "Settings", href: `/projects/${projectId}/settings?tab=customFields` },
+            { label: "Custom Fields" },
+          ]}
+        />
       }
     />
   );

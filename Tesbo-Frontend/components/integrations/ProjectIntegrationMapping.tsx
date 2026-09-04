@@ -6,12 +6,13 @@ import { useCallback, useEffect, useState } from "react";
 import {
   authMe,
   getWorkspace,
+  getProject,
   getIntegrationConfig,
   isSyncRunActive,
   type IntegrationProvider,
 } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
 
@@ -66,6 +67,7 @@ export function ProjectIntegrationMapping({
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [itemsLoading, setItemsLoading] = useState(false);
+  const [projectName, setProjectName] = useState("");
   const { run, starting, error: syncError, start: startSync } = useSyncRun(projectId, provider, !!status?.connected);
 
   const loadData = useCallback(async () => {
@@ -75,9 +77,10 @@ export function ProjectIntegrationMapping({
         router.replace("/login");
         return;
       }
-      const [workspace, statusRes] = await Promise.all([getWorkspace(), fetchStatus(projectId)]);
+      const [workspace, statusRes, project] = await Promise.all([getWorkspace(), fetchStatus(projectId), getProject(projectId).catch(() => null)]);
       setCanManage((workspace.role || "member").toLowerCase() === "owner");
       setStatus(statusRes);
+      setProjectName(project ? String(project.name || "") : "");
 
       if (statusRes.connected) {
         setItemsLoading(true);
@@ -141,9 +144,14 @@ export function ProjectIntegrationMapping({
   }
 
   const breadcrumb = (
-    <Link href={`/projects/${projectId}/settings?tab=integrations`} className="text-[var(--accent-light)] hover:underline">
-      &larr; Back to Project Settings
-    </Link>
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Settings", href: `/projects/${projectId}/settings?tab=integrations` },
+        { label },
+      ]}
+    />
   );
 
   if (loading) {

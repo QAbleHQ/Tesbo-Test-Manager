@@ -13,9 +13,9 @@ import {
   IconPlug,
   IconSparkles,
 } from "@tabler/icons-react";
-import { authMe, getZyraAgent, updateZyraSettings, testZyraAiConnection, type ZyraAgentState, type ZyraCapabilities } from "@/lib/api";
+import { authMe, getProject, getZyraAgent, updateZyraSettings, testZyraAiConnection, type ZyraAgentState, type ZyraCapabilities } from "@/lib/api";
 import { Button, Card, PageLoader, StatusChip } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 
 type ConnectionResult = { ok: boolean; provider: string; model: string; error?: string; latencyMs: number } | null;
 
@@ -87,6 +87,7 @@ export default function ZyraSettingsPage() {
   const [connectionResult, setConnectionResult] = useState<ConnectionResult>(null);
   const [error, setError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("");
 
   const loadData = useCallback(async () => {
     try {
@@ -108,7 +109,8 @@ export default function ZyraSettingsPage() {
       if (!me) router.replace("/login");
       else void loadData();
     });
-  }, [loadData, router]);
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
+  }, [loadData, router, projectId]);
 
   function updateCapability(key: keyof ZyraCapabilities, value: boolean) {
     setCapabilities((prev) => ({ ...prev, [key]: value }));
@@ -156,6 +158,16 @@ export default function ZyraSettingsPage() {
     <PageHeader
       title={<><ZyraMark size={28} />Zyra settings</>}
       subtitle="Configure Zyra defaults and verify AI key connectivity for this project."
+      breadcrumb={
+        <Breadcrumbs
+          items={[
+            { label: "Projects", href: "/projects" },
+            { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+            { label: "Agents", href: `/projects/${projectId}/agents` },
+            { label: "Zyra settings" },
+          ]}
+        />
+      }
       actions={
         <Link
           href={`/projects/${projectId}/agents/zyra`}

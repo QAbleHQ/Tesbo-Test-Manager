@@ -6,7 +6,7 @@ import ImageExtension from "@tiptap/extension-image";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   IconBold,
   IconItalic,
@@ -77,11 +77,16 @@ export default function RichTextEditor({
   contentHtml,
   editable = true,
   onUpdate,
+  resetKey,
 }: {
   contentJson?: JSONContent | null;
   contentHtml?: string | null;
   editable?: boolean;
   onUpdate?: (payload: { json: JSONContent; html: string; text: string }) => void;
+  // TipTap only reads `contentJson`/`contentHtml` once, when the editor is constructed below — a
+  // later prop change (e.g. the caller restoring an older version) does nothing on its own. Bump
+  // this to force the mounted editor to actually replace its document with the new content.
+  resetKey?: string | number;
 }) {
   const editor = useEditor({
     immediatelyRender: false,
@@ -110,6 +115,20 @@ export default function RichTextEditor({
   useEffect(() => {
     editor?.setEditable(editable);
   }, [editable, editor]);
+
+  // Only fires on a real `resetKey` change (the caller bumping it after e.g. a version restore),
+  // never on mount and never on an ordinary re-render — replacing content on every render would
+  // reset the caret/scroll position out from under a user who is mid-edit.
+  const lastResetKey = useRef(resetKey);
+  useEffect(() => {
+    if (!editor || resetKey === undefined || resetKey === lastResetKey.current) return;
+    lastResetKey.current = resetKey;
+    editor.commands.setContent(contentJson || contentHtml || "<p></p>");
+    // contentJson/contentHtml intentionally excluded: this effect keys off `resetKey` alone, so it
+    // still fires the FIRST time resetKey changes even if content happens to look referentially
+    // stable to React at that instant.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetKey, editor]);
 
   if (!editor) return null;
 

@@ -5,7 +5,6 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
 import {
-  IconChevronRight,
   IconPlus,
   IconPencil,
   IconTrash,
@@ -48,6 +47,7 @@ import { computePassRate, computeExecutionProgress } from "@/lib/executionMetric
 import { Button, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import { planStatus, formatLastRun, OwnerAvatar, PlanStatusBadge } from "@/components/testplans/PlanCard";
 import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
 
@@ -341,29 +341,14 @@ export default function PlanDetailPage() {
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="cursor-pointer truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <button
-                type="button"
-                onClick={() => router.push(`/projects/${projectId}/plans`)}
-                className="shrink-0 cursor-pointer text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-              >
-                Test plans
-              </button>
-              <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-              <span className="truncate font-medium text-[var(--accent-light)]">{planName}</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test plans", href: `/projects/${projectId}/plans` },
+                { label: planName },
+              ]}
+            />,
             topBarStartEl,
           )}
         {topBarEndEl &&

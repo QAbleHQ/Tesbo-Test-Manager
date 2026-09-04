@@ -1304,4 +1304,154 @@ test.describe("knowledge base (UI)", () => {
     await expect(versionDialog).toBeVisible();
     await expect(versionDialog.getByText("No earlier versions yet.")).toBeVisible();
   });
+
+  // ─── Restore confirmation (BetterBugs: "Restore old version feature is not working") ──────
+  //
+  // The reported bug traced to the editor never re-rendering after a restore: the API call
+  // genuinely succeeded, but TipTap only reads its initial content once, so the visible body never
+  // changed and users kept re-clicking a "broken" Restore, piling up junk versions. These pin the
+  // fix (the body itself, not just the title, must change) alongside the new confirm/cancel step.
+
+  /** Seeds a version row directly, rather than waiting out the 15-minute snapshot-coalescing
+   *  window (KB-A-25 in the API suite) that a real second edit would otherwise hit. */
+  function seedDocumentVersion(documentId: string, title: string, contentText: string): void {
+    exec(
+      "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_html, content_text, created_by) VALUES (" +
+        `${literal(documentId)}, 1, ${literal(title)}, ${literal(`<p>${contentText}</p>`)}, ${literal(contentText)}, NULL);`,
+    );
+  }
+
+  test("KBU-39 restoring a version asks for confirmation first — Cancel makes no request, Confirm restores and updates the visible body", { tag: '@tesbo.testId("TES-TC-1920")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("Restorable");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content", contentHtml: "<p>v2 content</p>" },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await expect(page.locator(".ProseMirror").first()).toContainText("v2 content");
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Version history");
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Restore" }).click();
+
+    // Confirming is a separate step — opening it must not itself have called the restore endpoint.
+    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+    await page.waitForTimeout(500);
+    expect(
+      scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      "opening the confirmation must not restore anything on its own",
+    ).toBe("v2 content");
+
+    // Cancel backs out with no side effect, and the version list is reachable again.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog.getByRole("button", { name: "Restore" })).toBeVisible();
+    expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`)).toBe("v2 content");
+
+    // Confirming actually restores — and the editor itself, not just the database, shows it. This
+    // is the regression check for the reported bug: before the fix, content_text flipped in the
+    // database but the on-screen body never did.
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+    await dialog.getByRole("button", { name: "Restore" }).click();
+
+    await expect(page.locator(".ProseMirror").first()).toContainText("v1 content");
+    await expect(dialog).toBeHidden();
+    expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`)).toBe("v1 content");
+
+    // Restoring is itself reversible: the pre-restore ("v2") state was snapshotted before the
+    // overwrite, so the history now has two entries, not a repeat of the same one.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const reopened = modal(page, "Version history");
+    await expect(reopened.getByText(/Version 2/)).toBeVisible();
+  });
+
+  test("KBU-40 two rapid clicks on Confirm restore exactly once, and the dialog is left in a normal, usable state afterward", { tag: '@tesbo.testId("TES-TC-1921")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("DoubleClickRestore");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content" },
+    });
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Version history");
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    const confirmButton = dialog.getByRole("button", { name: "Restore" });
+    await expect(confirmButton).toBeVisible();
+
+    // Two native click events dispatched back-to-back in the same browser task, ahead of any React
+    // re-render — the guard this proves is a synchronous ref, specifically because disabling the
+    // button via React state alone cannot close a window this tight.
+    await confirmButton.evaluate((el) => {
+      (el as HTMLButtonElement).click();
+      (el as HTMLButtonElement).click();
+    });
+
+    await expect(page.locator(".ProseMirror").first()).toContainText("v1 content");
+    expect(
+      scalar(`SELECT COUNT(*) FROM knowledge_document_versions WHERE document_id = ${literal(documentId)};`),
+      "exactly one restore applied, so exactly one new snapshot — not two",
+    ).toBe("2");
+
+    // Not stuck: history opens again with its Restore buttons enabled, not disabled from before.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const reopened = modal(page, "Version history");
+    await expect(reopened.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
+  });
+
+  test("KBU-41 a restore that fails server-side shows the error inline, and both buttons stay usable — not stuck loading", { tag: '@tesbo.testId("TES-TC-1922")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("FailedRestore");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content" },
+    });
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Version history");
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+
+    // Someone else deletes the document between the confirmation opening and being confirmed —
+    // the same 404 the API already returns for a restore against a soft-deleted document.
+    exec(`UPDATE knowledge_documents SET is_deleted = true WHERE id = ${literal(documentId)};`);
+
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText("Document not found")).toBeVisible();
+
+    // Not stuck: Cancel is still clickable, and backs out to the (still-listed, now stale) version
+    // list rather than staying wedged on the errored confirmation.
+    await expect(dialog.getByRole("button", { name: "Cancel" })).toBeEnabled();
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    exec(`UPDATE knowledge_documents SET is_deleted = false WHERE id = ${literal(documentId)};`);
+    await expect(dialog.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
+  });
 });
