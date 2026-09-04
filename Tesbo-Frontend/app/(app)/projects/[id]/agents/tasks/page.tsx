@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconSparkles } from "@tabler/icons-react";
+import { IconEye, IconPencil, IconSparkles } from "@tabler/icons-react";
 import {
   authMe,
   createZyraTask,
@@ -17,6 +17,7 @@ import {
 import { Button, Field, FieldLabel, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
+import { renderMarkdown } from "@/lib/markdown";
 
 const columns = [
   { key: "todo", label: "To Do", dot: "var(--muted-soft)" },
@@ -94,6 +95,10 @@ export default function ZyraTasksPage() {
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>([]);
   const [story, setStory] = useState("");
   const [context, setContext] = useState("");
+  // Context is prone to holding a large Jira/Linear-synced Markdown dump (see
+  // handleSelectKnowledgeItem below), so it defaults to a rendered preview instead of raw
+  // source; this toggles that field into its raw, editable textarea and back.
+  const [contextEditing, setContextEditing] = useState(false);
   const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [selectedKnowledgeItemIds, setSelectedKnowledgeItemIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -189,6 +194,7 @@ export default function ZyraTasksPage() {
       });
       setStory("");
       setContext("");
+      setContextEditing(false);
       setAcceptanceCriteria("");
       setSelectedKnowledgeItemIds([]);
       setCreateOpen(false);
@@ -428,8 +434,27 @@ export default function ZyraTasksPage() {
               <Textarea value={story} onChange={(event) => setStory(event.target.value)} rows={5} placeholder="As a user, I want..." />
             </Field>
             <Field>
-              <FieldLabel>Context</FieldLabel>
-              <Textarea value={context} onChange={(event) => setContext(event.target.value)} rows={5} placeholder="Business rules, edge cases, acceptance notes..." />
+              <div className="flex items-center justify-between">
+                <FieldLabel>Context</FieldLabel>
+                {context.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => setContextEditing((prev) => !prev)}
+                    className="flex items-center gap-1 text-xs text-[var(--muted)] hover:text-[var(--foreground)]"
+                  >
+                    {contextEditing ? <IconEye size={14} stroke={1.75} /> : <IconPencil size={14} stroke={1.75} />}
+                    {contextEditing ? "Preview" : "Edit"}
+                  </button>
+                )}
+              </div>
+              {contextEditing || !context.trim() ? (
+                <Textarea value={context} onChange={(event) => setContext(event.target.value)} rows={5} placeholder="Business rules, edge cases, acceptance notes..." />
+              ) : (
+                <div
+                  className="zyra-prose zyra-prose-compact break-words max-h-40 overflow-y-auto rounded-md border border-[var(--border)] bg-[var(--surface-secondary)] p-2 text-[12px] text-[var(--muted)]"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(context) }}
+                />
+              )}
             </Field>
           </div>
           <Field>
