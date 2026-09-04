@@ -2924,6 +2924,11 @@ export interface LinearTeam {
   name: string;
   style: string;
   connected: boolean;
+  // Present on every row now that the picker lists Linear Teams and Projects together (Teams are
+  // Linear's mandatory, every-issue-belongs-to-one container; Projects are an optional, often
+  // cross-team grouping) — optional only so this type stays a strict superset of the pre-feature
+  // shape.
+  entityType?: "team" | "project";
 }
 
 export interface LinearTicket {
@@ -2954,7 +2959,7 @@ export async function listLinearTeams(projectId: string): Promise<LinearTeam[]> 
 
 export async function connectLinearTeams(
   projectId: string,
-  projects: { id: string; key: string; name: string }[]
+  projects: { id: string; key: string; name: string; entityType?: "team" | "project" }[]
 ): Promise<void> {
   await api(`/api/projects/${projectId}/linear/teams`, { method: "POST", body: { projects } });
 }
