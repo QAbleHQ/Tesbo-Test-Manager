@@ -794,6 +794,69 @@ test.describe("knowledge base v2 — folders and documents", () => {
     }
   });
 
+  test("KB-A-60 two concurrent restore requests serialise instead of racing — no duplicate version_number, no 500", { tag: '@tesbo.testId("TES-TC-1923")' }, async () => {
+    const doc = await createDocument({ title: stamp("Concurrent"), contentText: "v1" });
+    await asOwner.patch(kbUrl(`/documents/${doc.id}`), { data: { contentText: "v2" }, failOnStatusCode: false });
+    const before = await (await asOwner.get(kbUrl(`/documents/${doc.id}/versions`))).json();
+    expect(before.total).toBe(1);
+    const versionId = before.list[0].id;
+
+    // Both requests target the same version. Whichever's transaction commits first snapshots the
+    // "v2" it found and overwrites to "v1"; the second then finds current content already equal to
+    // the version it's restoring (the no-op guard) and applies no second snapshot. Before the
+    // advisory lock, both could instead read the same MAX(version_number) and either collide on the
+    // new unique constraint (500) or silently insert two rows claiming the same number.
+    const [a, b] = await Promise.all([
+      asOwner.post(kbUrl(`/documents/${doc.id}/restore-version`), { data: { versionId }, failOnStatusCode: false }),
+      asOwner.post(kbUrl(`/documents/${doc.id}/restore-version`), { data: { versionId }, failOnStatusCode: false }),
+    ]);
+    for (const res of [a, b]) expect(res.status(), await res.text()).toBe(201);
+
+    const after = await (await asOwner.get(kbUrl(`/documents/${doc.id}/versions`))).json();
+    const numbers = after.list.map((v: { versionNumber: number }) => v.versionNumber);
+    expect(new Set(numbers).size, `version numbers must be unique: ${JSON.stringify(numbers)}`).toBe(numbers.length);
+    expect(after.total, "one real restore's snapshot, plus the no-op second restore taking none").toBe(2);
+
+    const final = await (await asOwner.get(kbUrl(`/documents/${doc.id}`))).json();
+    expect(final.contentText).toBe("v1");
+  });
+
+  test("KB-A-61 restoring a version whose content already matches the current document takes no new snapshot", { tag: '@tesbo.testId("TES-TC-1924")' }, async () => {
+    const doc = await createDocument({ title: stamp("NoopRestore"), contentText: "same" });
+    await asOwner.patch(kbUrl(`/documents/${doc.id}`), { data: { contentText: "changed" }, failOnStatusCode: false });
+    // Back to "same" within the 15-minute coalescing window (KB-A-25) — still just the one snapshot,
+    // holding "same", which is what the current document already reads again.
+    await asOwner.patch(kbUrl(`/documents/${doc.id}`), { data: { contentText: "same" }, failOnStatusCode: false });
+    const versions = await (await asOwner.get(kbUrl(`/documents/${doc.id}/versions`))).json();
+    expect(versions.total).toBe(1);
+    const versionId = versions.list[0].id;
+
+    const restored = await asOwner.post(kbUrl(`/documents/${doc.id}/restore-version`), {
+      data: { versionId },
+      failOnStatusCode: false,
+    });
+    expect(restored.status(), await restored.text()).toBe(201);
+
+    const after = await (await asOwner.get(kbUrl(`/documents/${doc.id}/versions`))).json();
+    expect(after.total, "an identical restore must not pile up a junk version").toBe(1);
+  });
+
+  test("KB-A-62 restore-version refuses a document that has been soft-deleted", { tag: '@tesbo.testId("TES-TC-1925")' }, async () => {
+    const doc = await createDocument({ title: stamp("DeletedBeforeRestore"), contentText: "v1" });
+    await asOwner.patch(kbUrl(`/documents/${doc.id}`), { data: { contentText: "v2" }, failOnStatusCode: false });
+    const versions = await (await asOwner.get(kbUrl(`/documents/${doc.id}/versions`))).json();
+    const versionId = versions.list[0].id;
+
+    expect((await asOwner.delete(kbUrl(`/documents/${doc.id}`), { failOnStatusCode: false })).status()).toBe(200);
+
+    const res = await asOwner.post(kbUrl(`/documents/${doc.id}/restore-version`), {
+      data: { versionId },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(404);
+    expect(JSON.stringify(await res.json())).toContain("Document not found");
+  });
+
   // ─── AI memory approval ───────────────────────────────────────────────────
 
   test("KB-A-28 an ai_memory document is approved, and re-editing it drops back to draft for review", { tag: '@tesbo.testId("TES-TC-360")' }, async () => {

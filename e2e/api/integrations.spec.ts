@@ -229,6 +229,16 @@ test.describe("integrations — Jira and Linear", () => {
     );
   }
 
+  /** A Linear mapping row for the main project — `entityType` covers both the pre-existing Team
+   *  mapping and the newer Project mapping (V95's entity_type column), which share this one table. */
+  function seedLinearMapping(connectionId: string, key = "E2E", entityType: "team" | "project" = "team"): void {
+    exec(
+      "INSERT INTO linear_project_mappings (project_id, integration_connection_id, linear_team_id, linear_team_key, " +
+        `linear_team_name, entity_type, enabled) VALUES (${literal(tenant!.mainProjectId)}, ${literal(connectionId)}, ` +
+        `${literal(`linear-${key}`)}, ${literal(key)}, ${literal(`E2E ${key}`)}, ${literal(entityType)}, true);`,
+    );
+  }
+
   /** Refused, whatever shape the refusal takes. See api/knowledge-base.spec.ts for the 400 note. */
   async function expectRefused(res: APIResponse, what: string): Promise<void> {
     expect([400, 401, 403, 404], `${what} answered with ${res.status()}: ${await res.text()}`).toContain(res.status());
@@ -907,5 +917,69 @@ test.describe("integrations — Jira and Linear", () => {
     expect(history.status()).toBe(200);
     const historyBody = await history.json();
     expect(historyBody.runs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ─── Linear Project mapping (V95) ─────────────────────────────────────────
+  //
+  // Linear's Team is the mandatory, every-issue-belongs-to-one container (Jira's real analog);
+  // Linear's Project is a separate, optional, often cross-team grouping. Before this, only Team
+  // mapping existed. These drive the real HTTP + auth + Postgres write path — connectLinearTeams
+  // never calls Linear's live API itself (it only trusts client-submitted ids), so this is safely
+  // e2e-testable without a fake upstream, unlike the outbound listing calls documented at the top
+  // of this file.
+
+  test("INT-A-36 connecting Linear accepts a Project mapping (entityType) alongside the existing Team mapping", { tag: '@tesbo.testId("TES-TC-260")' }, async () => {
+    const connectionId = seedConnection("linear");
+
+    const res = await asOwner.post(url("/linear/teams"), {
+      data: { projects: [{ id: "linear-proj-1", key: "redesign-abc", name: "Redesign", entityType: "project" }] },
+      failOnStatusCode: false,
+    });
+    expect(res.ok(), `POST linear/teams (project) answered ${res.status()}: ${await res.text()}`).toBe(true);
+
+    const row = scalar(
+      `SELECT entity_type FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
+        `AND integration_connection_id = ${literal(connectionId)} AND enabled = true;`,
+    );
+    expect(row).toBe("project");
+  });
+
+  test("INT-A-37 switching an existing Linear mapping from Team to Project disables the old row, not both enabled", { tag: '@tesbo.testId("TES-TC-261")' }, async () => {
+    const connectionId = seedConnection("linear");
+    seedLinearMapping(connectionId, "OLDTEAM", "team");
+
+    const res = await asOwner.post(url("/linear/teams"), {
+      data: { projects: [{ id: "linear-proj-2", key: "launch-xyz", name: "Launch", entityType: "project" }] },
+      failOnStatusCode: false,
+    });
+    expect(res.ok(), `POST linear/teams (switch to project) answered ${res.status()}: ${await res.text()}`).toBe(true);
+
+    const enabledCount = scalar(
+      `SELECT COUNT(*) FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND enabled = true;`,
+    );
+    expect(enabledCount, "exactly one mapping must be enabled after switching modes — never both").toBe("1");
+
+    const enabledType = scalar(
+      `SELECT entity_type FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND enabled = true;`,
+    );
+    expect(enabledType).toBe("project");
+  });
+
+  test("INT-A-38 an unknown Linear entityType is refused before it reaches the mapping table", { tag: '@tesbo.testId("TES-TC-262")' }, async () => {
+    const connectionId = seedConnection("linear");
+    const before = scalar(
+      `SELECT COUNT(*) FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND integration_connection_id = ${literal(connectionId)};`,
+    );
+
+    const res = await asOwner.post(url("/linear/teams"), {
+      data: { projects: [{ id: "linear-x", key: "X", name: "X", entityType: "workspace" }] },
+      failOnStatusCode: false,
+    });
+    await expectRefused(res, "an unknown Linear entityType");
+
+    const after = scalar(
+      `SELECT COUNT(*) FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND integration_connection_id = ${literal(connectionId)};`,
+    );
+    expect(after, "a rejected payload must not have written anything").toBe(before);
   });
 });

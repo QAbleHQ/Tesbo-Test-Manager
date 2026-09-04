@@ -543,7 +543,9 @@ describe("LegacyService#connectLinearTeams — per-project team mapping", () => 
 
     const insertCalls = calls.filter((c) => c.sql.includes("INSERT INTO linear_project_mappings"));
     expect(insertCalls).toHaveLength(1);
-    expect(insertCalls[0].params).toEqual(["conn-1", PROJECT_ID, "team-1", "ENG", "Engineering"]);
+    // entityType omitted on the request -> defaults to "team", identical to every pre-feature
+    // caller's behavior.
+    expect(insertCalls[0].params).toEqual(["conn-1", PROJECT_ID, "team-1", "ENG", "Engineering", "team"]);
   });
 
   it("links zero teams (and still clears old mappings) when the request has no valid teams", async () => {
@@ -649,7 +651,9 @@ describe("LegacyService#linearTeams — provider auth failure", () => {
         rows: [{ id: "conn-1", access_token: encryptSecret("at"), auth_method: "oauth" }]
       }
     ]));
-    jest.spyOn(global, "fetch").mockResolvedValueOnce({
+    // linearTeams now fires two GraphQL calls in parallel (teams + projects) — both must be mocked
+    // or the second would fall through to a real network call.
+    jest.spyOn(global, "fetch").mockResolvedValue({
       ok: false,
       status: 401,
       text: async () => JSON.stringify({ errors: [{ message: "Authentication required, not authenticated" }] })
@@ -661,5 +665,167 @@ describe("LegacyService#linearTeams — provider auth failure", () => {
     expect(err.getResponse().error).toMatch(/needs to be reconnected/i);
     expect(err.getResponse().detail).toBeUndefined();
     expect(JSON.stringify(err.getResponse())).not.toMatch(/Authentication required, not authenticated/);
+  });
+});
+
+/*
+ * linearTeams was extended to list Linear Projects alongside Teams (Linear's own docs: every issue
+ * belongs to exactly one Team, mandatory; a Project is optional and can span multiple Teams — so a
+ * user's "my project" can genuinely mean either). These tests cover the merge, the connected-flag
+ * computation, and — the part that's easy to get wrong — that the two independent GraphQL calls
+ * degrade gracefully on their own but never paper over a connection-wide auth failure.
+ */
+function connectionRoutes(connectedTeamIds: string[] = []): Route[] {
+  return withProjectAccess([
+    { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+    { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", access_token: encryptSecret("at"), auth_method: "oauth" }] },
+    { match: "FROM linear_project_mappings WHERE project_id", rows: connectedTeamIds.map((id) => ({ linear_team_id: id })) }
+  ]);
+}
+
+/** Routes `global.fetch` to a Teams or Projects GraphQL response based on the outgoing query text,
+ *  since linearTeams fires both calls concurrently via Promise.allSettled. */
+function mockLinearFetch(handler: (isTeamsQuery: boolean) => { ok: boolean; status?: number; body?: unknown }) {
+  return jest.spyOn(global, "fetch").mockImplementation(async (_url, init) => {
+    const parsed = JSON.parse(String((init as RequestInit)?.body ?? "{}"));
+    const isTeamsQuery = String(parsed.query || "").includes("teams");
+    const result = handler(isTeamsQuery);
+    if (!result.ok) {
+      return { ok: false, status: result.status ?? 500, text: async () => "" } as unknown as Response;
+    }
+    return { ok: true, json: async () => ({ data: result.body }) } as unknown as Response;
+  });
+}
+
+describe("LegacyService#linearTeams — merged Team + Project picker", () => {
+  it("merges Teams and Projects into one list, tagged and marked connected correctly", async () => {
+    mockLinearFetch((isTeamsQuery) =>
+      isTeamsQuery
+        ? { ok: true, body: { teams: { nodes: [{ id: "team-1", key: "ENG", name: "Engineering" }] } } }
+        : { ok: true, body: { projects: { nodes: [{ id: "proj-1", name: "Redesign", slugId: "redesign-abc" }] } } }
+    );
+    const svc = makeLegacy(makeDb(connectionRoutes(["team-1"])).db);
+    const result = await svc.linearTeams(PROJECT_ID, CALLER_ID);
+    expect(result).toEqual([
+      { id: "team-1", key: "ENG", name: "Engineering", style: "", connected: true, entityType: "team" },
+      { id: "proj-1", key: "redesign-abc", name: "Redesign", style: "", connected: false, entityType: "project" }
+    ]);
+  });
+
+  it("uses Project.slugId as the display key, never the internal/nullable identifier field", async () => {
+    mockLinearFetch((isTeamsQuery) =>
+      isTeamsQuery
+        ? { ok: true, body: { teams: { nodes: [] } } }
+        : { ok: true, body: { projects: { nodes: [{ id: "proj-1", name: "No lead team", slugId: "no-lead-team-abc", identifier: null }] } } }
+    );
+    const svc = makeLegacy(makeDb(connectionRoutes()).db);
+    const result = await svc.linearTeams(PROJECT_ID, CALLER_ID);
+    expect(result).toEqual([{ id: "proj-1", key: "no-lead-team-abc", name: "No lead team", style: "", connected: false, entityType: "project" }]);
+  });
+
+  it("degrades to the Teams half when the Projects query fails for a non-auth reason", async () => {
+    mockLinearFetch((isTeamsQuery) =>
+      isTeamsQuery ? { ok: true, body: { teams: { nodes: [{ id: "team-1", key: "ENG", name: "Engineering" }] } } } : { ok: false, status: 500 }
+    );
+    const svc = makeLegacy(makeDb(connectionRoutes()).db);
+    const result = await svc.linearTeams(PROJECT_ID, CALLER_ID);
+    expect(result).toEqual([{ id: "team-1", key: "ENG", name: "Engineering", style: "", connected: false, entityType: "team" }]);
+  });
+
+  it("degrades to the Projects half when the Teams query fails for a non-auth reason", async () => {
+    mockLinearFetch((isTeamsQuery) =>
+      isTeamsQuery ? { ok: false, status: 500 } : { ok: true, body: { projects: { nodes: [{ id: "proj-1", name: "Redesign", slugId: "redesign-abc" }] } } }
+    );
+    const svc = makeLegacy(makeDb(connectionRoutes()).db);
+    const result = await svc.linearTeams(PROJECT_ID, CALLER_ID);
+    expect(result).toEqual([{ id: "proj-1", key: "redesign-abc", name: "Redesign", style: "", connected: false, entityType: "project" }]);
+  });
+
+  it("still throws the clean reconnect message when only the Projects half is auth-rejected", async () => {
+    // An expired/revoked token affects the whole connection — a partial list here would leave the
+    // user wondering where their data went instead of telling them to reconnect.
+    mockLinearFetch((isTeamsQuery) => (isTeamsQuery ? { ok: true, body: { teams: { nodes: [] } } } : { ok: false, status: 401 }));
+    const svc = makeLegacy(makeDb(connectionRoutes()).db);
+    const err = await rejection(svc.linearTeams(PROJECT_ID, CALLER_ID));
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err.getResponse().error).toMatch(/needs to be reconnected/i);
+  });
+
+  it("returns an empty list, not an error, when the workspace has zero Teams and zero Projects", async () => {
+    mockLinearFetch(() => ({ ok: true, body: { teams: { nodes: [] }, projects: { nodes: [] } } }));
+    const svc = makeLegacy(makeDb(connectionRoutes()).db);
+    expect(await svc.linearTeams(PROJECT_ID, CALLER_ID)).toEqual([]);
+  });
+});
+
+describe("LegacyService#connectLinearTeams — entityType (team vs project)", () => {
+  it("accepts entityType 'project' and writes it", async () => {
+    const { db, calls } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", auth_method: "oauth" }] },
+      { match: "UPDATE linear_project_mappings SET enabled = false", rows: [] },
+      { match: "INSERT INTO linear_project_mappings", rows: [] }
+    ]));
+    const svc = makeLegacy(db);
+    const res = await svc.connectLinearTeams(PROJECT_ID, CALLER_ID, {
+      projects: [{ id: "proj-1", key: "redesign-abc", name: "Redesign", entityType: "project" }]
+    });
+    expect(res).toEqual({ linked: 1 });
+    const insertCalls = calls.filter((c) => c.sql.includes("INSERT INTO linear_project_mappings"));
+    expect(insertCalls[0].params).toEqual(["conn-1", PROJECT_ID, "proj-1", "redesign-abc", "Redesign", "project"]);
+  });
+
+  it("rejects an unknown entityType with 400, before touching the database", async () => {
+    const { db, calls } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", auth_method: "oauth" }] }
+    ]));
+    const svc = makeLegacy(db);
+    const err = await rejection(
+      svc.connectLinearTeams(PROJECT_ID, CALLER_ID, { projects: [{ id: "x", key: "X", name: "X", entityType: "workspace" }] })
+    );
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(calls.some((c) => c.sql.includes("linear_project_mappings"))).toBe(false);
+  });
+
+  it("switching an existing mapping from Team to Project disables the old row and inserts the new one", async () => {
+    const { db, calls } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", auth_method: "oauth" }] },
+      { match: "UPDATE linear_project_mappings SET enabled = false", rows: [] },
+      { match: "INSERT INTO linear_project_mappings", rows: [] }
+    ]));
+    const svc = makeLegacy(db);
+    await svc.connectLinearTeams(PROJECT_ID, CALLER_ID, { projects: [{ id: "proj-9", key: "slug-9", name: "Launch", entityType: "project" }] });
+    expect(calls.some((c) => c.sql.includes("UPDATE linear_project_mappings SET enabled = false"))).toBe(true);
+    const insertCall = calls.find((c) => c.sql.includes("INSERT INTO linear_project_mappings"));
+    expect(insertCall!.params[5]).toBe("project");
+  });
+});
+
+// Same mechanism proven for the Team-only case above (idx_linear_project_mappings_one_per_project,
+// a partial unique index on project_id WHERE enabled=true) — this pins that adding entity_type to
+// the row doesn't change or bypass it: a Project-mapping save racing an existing mapping hits the
+// exact same index and gets the exact same clean 409, not a new/different failure mode.
+describe("LegacyService#connectLinearTeams — concurrent save race (team vs project)", () => {
+  it("returns a clean 409, not a raw DB error, when a Project-mapping save loses the race", async () => {
+    const { db, calls } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", auth_method: "oauth" }] },
+      { match: "UPDATE linear_project_mappings SET enabled = false", rows: [] },
+      {
+        match: "INSERT INTO linear_project_mappings",
+        handler: () => {
+          throw Object.assign(new Error("duplicate key value violates unique constraint"), { code: "23505" });
+        }
+      }
+    ]));
+    const svc = makeLegacy(db);
+    const err = await rejection(
+      svc.connectLinearTeams(PROJECT_ID, CALLER_ID, { projects: [{ id: "proj-1", key: "redesign-abc", name: "Redesign", entityType: "project" }] })
+    );
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse().error).toMatch(/just changed by another action/i);
+    expect(calls.some((c) => c.sql.includes("UPDATE linear_project_mappings SET enabled = false"))).toBe(true);
   });
 });

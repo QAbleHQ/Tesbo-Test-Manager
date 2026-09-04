@@ -283,8 +283,12 @@ function makeServiceForStuckRuns(rows: FakeStuckRun[]) {
   return { service, store };
 }
 
+// The "+ 25" guards against a real-clock race with the fake's own `Date.now()` call inside
+// failStuckRuns: with n=0, a row timestamped at the exact same millisecond as the query's cutoff
+// is not "< cutoff" and the assertion flakes. A tiny, fixed backdate removes the tie without
+// meaningfully changing what minutesAgo(5)/minutesAgo(25)/minutesAgo(60) assert.
 function minutesAgo(n: number): Date {
-  return new Date(Date.now() - n * 60_000);
+  return new Date(Date.now() - n * 60_000 - 25);
 }
 
 describe("IntegrationSyncService#failInterruptedRuns — boot recovery (no more resume-by-reset)", () => {

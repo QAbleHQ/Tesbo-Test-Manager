@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import {
@@ -14,7 +13,7 @@ import {
   type IntegrationProvider,
 } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
 
 function isValidProjectId(value: string | null): value is string {
@@ -49,6 +48,7 @@ function WorkspaceIntegrationConfigInner({
   const [config, setConfig] = useState<IntegrationOAuthConfig | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [workspaceName, setWorkspaceName] = useState("");
 
   const loadData = useCallback(async () => {
     try {
@@ -58,6 +58,7 @@ function WorkspaceIntegrationConfigInner({
         getIntegrationConfig(provider).catch(() => null),
       ]);
       setCanManage((workspace.role || "member").toLowerCase() === "owner");
+      setWorkspaceName(String(workspace.name || ""));
       setStatus(statusRes);
       setConfig(configRes);
     } catch {
@@ -111,9 +112,13 @@ function WorkspaceIntegrationConfigInner({
   }
 
   const breadcrumb = (
-    <Link href="/settings?tab=integrations" className="text-[var(--accent-light)] hover:underline">
-      &larr; Back to Integrations
-    </Link>
+    <Breadcrumbs
+      items={[
+        { label: workspaceName || "Workspace", href: "/dashboard" },
+        { label: "Workspace settings", href: "/settings?tab=integrations" },
+        { label },
+      ]}
+    />
   );
 
   return (

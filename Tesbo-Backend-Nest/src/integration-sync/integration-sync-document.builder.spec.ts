@@ -32,6 +32,18 @@ describe("IntegrationSyncDocumentBuilder#buildMirror", () => {
     expect(builder.buildMirror(ticket(), [], null).title).toBe("EAD-123: Checkout fails on Safari");
   });
 
+  // Regression: knowledge_documents.title is VARCHAR(512). A summary comfortably under
+  // linear_tickets/jira_tickets' own (much larger, TEXT since V93) limit can still overflow this
+  // smaller, more widely shared column once "<KEY>: " is prepended — this is the dormant half of
+  // the "value too long for type character varying" prod incident.
+  it("truncates the title to fit knowledge_documents.title (512 chars) rather than overflowing it", () => {
+    const longSummary = "A".repeat(600);
+    const { title } = builder.buildMirror(ticket({ summary: longSummary }), [], null);
+    expect(title).toHaveLength(512);
+    expect(title.startsWith("EAD-123: AAAA")).toBe(true);
+    expect(title.endsWith("…")).toBe(true);
+  });
+
   // RagChunkingService splits on markdown headings and records the heading breadcrumb per chunk,
   // so this exact set — and its order — is what lets Zyra cite "EAD-123 > Comments".
   it("emits Description, Decisions and Comments as h2 sections in that order", () => {

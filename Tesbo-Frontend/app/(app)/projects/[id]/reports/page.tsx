@@ -3,7 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconChevronDown, IconChevronRight, IconDownload } from "@tabler/icons-react";
+import { IconChevronDown, IconDownload } from "@tabler/icons-react";
 import {
   authMe,
   getProject,
@@ -30,6 +30,7 @@ import {
 import { computePassRate } from "@/lib/executionMetrics";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { PageLoader } from "@/components/ui";
+import { Breadcrumbs } from "@/components/workflows";
 import { ReportsNav, type ReportView } from "@/components/reports/ReportsNav";
 import { OverviewTab } from "@/components/reports/OverviewTab";
 import { ExecutionReportTab } from "@/components/reports/ExecutionReportTab";
@@ -229,17 +230,13 @@ export default function ReportsPage() {
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button type="button" onClick={() => router.push("/projects")} className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]">
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <span className="font-medium text-[var(--accent-light)]">Reports</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Reports" },
+              ]}
+            />,
             topBarStartEl
           )}
         {topBarEndEl &&

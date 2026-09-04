@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import { escapeHtml } from "../common/integration-text.util";
+import { escapeHtml, truncateForColumn } from "../common/integration-text.util";
 import { RemoteComment, RemoteTicket } from "./integration-sync.types";
 
 export interface BuiltDocument {
@@ -26,7 +26,9 @@ function formatDate(value: string | null): string {
 @Injectable()
 export class IntegrationSyncDocumentBuilder {
   buildMirror(ticket: RemoteTicket, comments: RemoteComment[], decisionSummary: string | null): BuiltDocument {
-    const title = `${ticket.issueKey}: ${ticket.summary}`.trim();
+    // knowledge_documents.title is VARCHAR(512) — a summary comfortably under the ticket table's
+    // own (much larger) limit can still overflow this smaller, more widely shared column.
+    const title = truncateForColumn(`${ticket.issueKey}: ${ticket.summary}`.trim(), 512);
     const sections: string[] = [`# ${title}`];
 
     const meta: string[] = [];

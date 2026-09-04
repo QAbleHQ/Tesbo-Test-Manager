@@ -245,22 +245,28 @@ export class IntegrationSyncClient {
   /**
    * `sinceIso`, when given, adds a `filter: { updatedAt: { gte } }` clause — the nightly
    * scheduler's incremental fetch. Manual Sync never passes it, so its full-resync behavior
-   * (page through every issue in the team) is unchanged.
+   * (page through every issue in the team/project) is unchanged.
+   *
+   * `entityType` picks the GraphQL root field — `team(id: ...)` or `project(id: ...)` — aliased to
+   * `entity` in both cases so every line below (pagination, truncation, the RemoteTicket mapping)
+   * reads `data.entity` regardless of which kind of Linear entity this mapping actually is.
    */
   async fetchLinearTickets(
     connection: Row,
-    teamId: string,
+    entityId: string,
     onPage: (tickets: RemoteTicket[]) => Promise<void>,
-    sinceIso?: string | null
+    sinceIso?: string | null,
+    entityType: "team" | "project" = "team"
   ): Promise<{ total: number; truncated: boolean }> {
     let cursor: string | null = null;
     let total = 0;
+    const rootField = entityType === "project" ? "project" : "team";
     // Built as two distinct query strings (rather than one query with a nullable filter variable)
     // so an unset sinceIso can never risk Linear interpreting `gte: null` as "match nothing" —
     // manual Sync's full-resync query is byte-for-byte what it was before this change.
     const query = sinceIso
-      ? `query TeamIssues($teamId: String!, $first: Int!, $after: String, $since: DateTimeOrDuration!) {
-           team(id: $teamId) {
+      ? `query EntityIssues($id: String!, $first: Int!, $after: String, $since: DateTimeOrDuration!) {
+           entity: ${rootField}(id: $id) {
              issues(first: $first, after: $after, orderBy: updatedAt, filter: { updatedAt: { gte: $since } }) {
                nodes {
                  id identifier title description url createdAt updatedAt
@@ -274,8 +280,8 @@ export class IntegrationSyncClient {
              }
            }
          }`
-      : `query TeamIssues($teamId: String!, $first: Int!, $after: String) {
-           team(id: $teamId) {
+      : `query EntityIssues($id: String!, $first: Int!, $after: String) {
+           entity: ${rootField}(id: $id) {
              issues(first: $first, after: $after, orderBy: updatedAt) {
                nodes {
                  id identifier title description url createdAt updatedAt
@@ -294,10 +300,13 @@ export class IntegrationSyncClient {
       const data = await this.linearGraphQL<Row>(
         connection,
         query,
-        sinceIso ? { teamId, first: LINEAR_PAGE_SIZE, after: cursor, since: sinceIso } : { teamId, first: LINEAR_PAGE_SIZE, after: cursor }
+        sinceIso ? { id: entityId, first: LINEAR_PAGE_SIZE, after: cursor, since: sinceIso } : { id: entityId, first: LINEAR_PAGE_SIZE, after: cursor }
       );
 
-      const issues = asArray(data?.team?.issues?.nodes);
+      // Optional-chained throughout: a since-archived/deleted/inaccessible entity (team or
+      // project) resolves `data.entity` to null rather than erroring, and this yields zero
+      // tickets instead of crashing — identical to how a deleted Team already behaved.
+      const issues = asArray(data?.entity?.issues?.nodes);
       if (!issues.length) return { total, truncated: false };
 
       const remaining = MAX_TICKETS_PER_RUN - total;
@@ -322,7 +331,7 @@ export class IntegrationSyncClient {
       total += page.length;
       if (truncated) return { total, truncated: true };
 
-      const pageInfo = (data?.team?.issues?.pageInfo || {}) as Row;
+      const pageInfo = (data?.entity?.issues?.pageInfo || {}) as Row;
       if (!pageInfo.hasNextPage || !pageInfo.endCursor) return { total, truncated: false };
       cursor = String(pageInfo.endCursor);
     }

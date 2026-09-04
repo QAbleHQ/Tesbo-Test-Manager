@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   authMe,
+  getProject,
   listTestRuns,
   listTestRunSchedules,
   createTestRunSchedule,
@@ -14,7 +15,7 @@ import {
   type TestRunSchedule,
 } from "@/lib/api";
 import { Button, Input, Card, Field, FieldLabel, Select } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 
 function currentTimezone(): string {
   try {
@@ -46,6 +47,7 @@ export default function ScheduleRunsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("");
 
   const [name, setName] = useState("");
   const [cycleId, setCycleId] = useState("");
@@ -86,8 +88,9 @@ export default function ScheduleRunsPage() {
         return;
       }
       load();
+      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
     });
-  }, [router, load]);
+  }, [router, load, projectId]);
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -139,6 +142,16 @@ export default function ScheduleRunsPage() {
         <PageHeader
           title="Schedule Test Run"
           subtitle="Create one-time or recurring reminders for planned test runs."
+          breadcrumb={
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test Runs", href: `/projects/${projectId}/cycles` },
+                { label: "Schedule" },
+              ]}
+            />
+          }
           actions={
             <Link
               href={`/projects/${projectId}/cycles`}

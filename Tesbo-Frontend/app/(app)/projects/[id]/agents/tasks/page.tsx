@@ -7,6 +7,7 @@ import { IconSparkles } from "@tabler/icons-react";
 import {
   authMe,
   createZyraTask,
+  getProject,
   getZyraAgent,
   listKnowledgeDocuments,
   type KnowledgeDocument,
@@ -14,7 +15,7 @@ import {
   type ZyraTask,
 } from "@/lib/api";
 import { Button, Field, FieldLabel, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
 
 const columns = [
@@ -102,6 +103,7 @@ export default function ZyraTasksPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [quickViewTask, setQuickViewTask] = useState<ZyraTask | null>(null);
+  const [projectName, setProjectName] = useState("");
   // Guards the poll loop below against piling up requests if one tick is still in flight
   // (a slow response, or the tab waking from sleep) when the next interval fires.
   const pollInFlightRef = useRef(false);
@@ -130,7 +132,8 @@ export default function ZyraTasksPage() {
       if (!me) router.replace("/login");
       else void loadData();
     });
-  }, [loadData, router]);
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
+  }, [loadData, router, projectId]);
 
   // Refreshes just the task list (cheaper than loadData, which also re-pulls knowledge-base
   // data). Zyra picks up and finishes tasks asynchronously server-side, so without this the board
@@ -230,9 +233,20 @@ export default function ZyraTasksPage() {
     }
   }
 
+  const tasksBreadcrumb = (
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Agents", href: `/projects/${projectId}/agents` },
+        { label: "Tasks" },
+      ]}
+    />
+  );
+
   if (loading || !state) {
     return (
-      <StandardPageLayout header={<PageHeader title="Agent tasks" />}>
+      <StandardPageLayout header={<PageHeader title="Agent tasks" breadcrumb={tasksBreadcrumb} />}>
         <PageLoader label="Loading tasks…" />
       </StandardPageLayout>
     );
@@ -244,6 +258,7 @@ export default function ZyraTasksPage() {
     <StandardPageLayout
       header={
         <PageHeader
+          breadcrumb={tasksBreadcrumb}
           title={
             <>
               <span

@@ -2,7 +2,6 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
-import Link from "next/link";
 import { IconPencil, IconTrash } from "@tabler/icons-react";
 import {
   authMe,
@@ -17,6 +16,7 @@ import {
   getBugAttachmentDownloadUrl,
   listTestRuns,
   listProjectMembers,
+  getProject,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -36,7 +36,7 @@ import {
   PriorityBadge,
   SeverityBadge,
 } from "@/components/ui";
-import { PageHeader, ListWorkspaceLayout } from "@/components/workflows";
+import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
@@ -438,6 +438,7 @@ export default function BugsPage() {
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
   const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
+  const [projectName, setProjectName] = useState("");
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -509,6 +510,7 @@ export default function BugsPage() {
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
     listProjectMembers(projectId).then(setMembers).catch(() => {});
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
   }, [projectId]);
 
   /* filtered list */
@@ -736,18 +738,13 @@ export default function BugsPage() {
               title="Bugs"
               subtitle={`${openCount} open · ${closedCount} closed · ${bugs.length} total`}
               breadcrumb={
-                <>
-                  <Link
-                    href={`/projects/${projectId}`}
-                    className="text-[var(--muted)] hover:text-[var(--foreground)]"
-                  >
-                    Project
-                  </Link>
-                  {" / "}
-                  <span className="font-medium text-[var(--foreground)]">
-                    Bugs
-                  </span>
-                </>
+                <Breadcrumbs
+                  items={[
+                    { label: "Projects", href: "/projects" },
+                    { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                    { label: "Bugs" },
+                  ]}
+                />
               }
               actions={
                 <Button variant="primary" onClick={() => setShowCreate(true)}>

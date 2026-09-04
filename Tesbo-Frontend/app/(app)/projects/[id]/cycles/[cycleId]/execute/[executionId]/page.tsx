@@ -13,6 +13,7 @@ import {
 import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
+import { Breadcrumbs } from "@/components/workflows";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
@@ -117,17 +118,13 @@ export default function ExecutionDetailPage() {
   return (
     <div className="min-h-screen bg-[var(--background)]">
       <header className="border-b border-[var(--border)] bg-[var(--surface)] px-6 py-3">
-        <div className="flex items-center gap-2 text-sm">
-          <Link href={`/projects/${projectId}/cycles`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
-            Test Runs
-          </Link>
-          <span className="text-[var(--muted-soft)]">/</span>
-          <Link href={`/projects/${projectId}/cycles/${cycleId}`} className="text-[var(--muted)] hover:text-[var(--foreground)]">
-            Run Detail
-          </Link>
-          <span className="text-[var(--muted-soft)]">/</span>
-          <span className="text-[var(--foreground)] font-medium">Execute</span>
-        </div>
+        <Breadcrumbs
+          items={[
+            { label: "Test Runs", href: `/projects/${projectId}/cycles` },
+            { label: "Run Detail", href: `/projects/${projectId}/cycles/${cycleId}` },
+            { label: "Execute" },
+          ]}
+        />
       </header>
 
       <main className="max-w-2xl mx-auto px-6 py-8">

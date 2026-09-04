@@ -21,9 +21,9 @@ import {
   IconWand,
   IconX,
 } from "@tabler/icons-react";
-import { authMe, getZyraAgent, type ZyraAgentState, type ZyraCapabilities, type ZyraTask } from "@/lib/api";
+import { authMe, getProject, getZyraAgent, type ZyraAgentState, type ZyraCapabilities, type ZyraTask } from "@/lib/api";
 import { Modal, PageLoader, StatusChip } from "@/components/ui";
-import { ListWorkspaceLayout, PageHeader } from "@/components/workflows";
+import { ListWorkspaceLayout, PageHeader, Breadcrumbs } from "@/components/workflows";
 
 type ChipIcon = ComponentType<{ size?: number; stroke?: number; className?: string }>;
 
@@ -105,6 +105,7 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [projectName, setProjectName] = useState("");
 
   const loadData = useCallback(async () => {
     try {
@@ -116,6 +117,10 @@ export default function AgentsPage() {
     } finally {
       setLoading(false);
     }
+  }, [projectId]);
+
+  useEffect(() => {
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
   }, [projectId]);
 
   useEffect(() => {
@@ -133,9 +138,19 @@ export default function AgentsPage() {
       .map((key) => CAPABILITY_META[key]);
   }, [state]);
 
+  const agentsBreadcrumb = (
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Agents" },
+      ]}
+    />
+  );
+
   if (loading) {
     return (
-      <ListWorkspaceLayout header={<PageHeader title="Agents" />}>
+      <ListWorkspaceLayout header={<PageHeader title="Agents" breadcrumb={agentsBreadcrumb} />}>
         <PageLoader label="Loading agents…" />
       </ListWorkspaceLayout>
     );
@@ -143,7 +158,7 @@ export default function AgentsPage() {
 
   if (!state || !stats) {
     return (
-      <ListWorkspaceLayout header={<PageHeader title="Agents" />}>
+      <ListWorkspaceLayout header={<PageHeader title="Agents" breadcrumb={agentsBreadcrumb} />}>
         <p className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
           {error ?? "Failed to load agents."}
         </p>
@@ -159,6 +174,7 @@ export default function AgentsPage() {
         <PageHeader
           title="Agents"
           subtitle="Select an AI agent to work with. Each agent has its own workspace, memory, and settings — open one to get started."
+          breadcrumb={agentsBreadcrumb}
         />
       }
     >

@@ -3287,9 +3287,12 @@ export class LegacyService implements OnModuleInit {
       throw new BadRequestException({ error: `An import is limited to ${MAX_ROWS} rows per request.` });
     }
 
-    // The suite the user had open when they hit Import, used as the parent for rows that leave the
-    // suite column blank. It arrives as client input like everything else, so it is confirmed to be a
-    // suite in THIS project before any row is parented to it.
+    // The suite the user had open when they hit Import. Rows that leave the suite column blank are
+    // parented directly to it; rows that name a suite of their own get that suite created/resolved
+    // as a CHILD of this one instead of at the project root, so importing from inside a suite always
+    // lands the file's structure under it rather than scattering new root-level suites. It arrives as
+    // client input like everything else, so it is confirmed to be a suite in THIS project before any
+    // row is parented to it.
     let defaultSuiteId: string | null = null;
     if (body?.defaultSuiteId) {
       const candidate = String(body.defaultSuiteId);
@@ -3519,28 +3522,59 @@ export class LegacyService implements OnModuleInit {
    * a time as it walked the rows. The whole chunk's names are known up front, so the missing ones go
    * in one insert per level — the top-level suites first, since the components need their parents to
    * exist before they can point at them.
+   *
+   * "Top-level" here means "child of the suite the user had open" (ctx.defaultSuiteId), not
+   * necessarily the project root: a row's own Suite column nests under wherever Import was launched
+   * from, exactly like a Component column nests under its row's resolved suite. When no suite was
+   * open (ctx.defaultSuiteId is null — the "All test cases" / project-root view), that parent is null
+   * and suite-named rows land at the root, same as before this nested behaviour existed.
+   *
+   * ctx.suiteIdByKey starts as a snapshot taken once at the top of importTestCases, before any lock
+   * is held — a second import into the same project, running concurrently and naming the same new
+   * suite, would see the same gap and (without the rescans below) both insert it, leaving two
+   * same-named siblings. By the time this method runs, the caller already holds
+   * pg_advisory_xact_lock(hashtext(`testcase-external-id:<projectId>`)) for the rest of this
+   * transaction, so any concurrent import for this project is either done and committed or still
+   * queued behind that same lock — never interleaved with what follows. Re-querying just the
+   * candidate parent(s) here, rather than trusting the stale snapshot, is what actually closes the
+   * race: a sibling a concurrent import just committed is now visible and reused instead of
+   * recreated. (This does not cover a plain "New Suite" click racing an import — that path takes no
+   * such lock, and already tolerates duplicate sibling names today; unchanged here.)
    */
   private async resolveImportSuites(client: PoolClient, ctx: ImportContext, prepared: PreparedImportRow[]): Promise<void> {
     const missingTop = new Map<string, string>();
     for (const row of prepared) {
       if (!row.suiteName) continue;
-      const key = importSuiteKey(row.suiteName, null);
+      const key = importSuiteKey(row.suiteName, ctx.defaultSuiteId);
       if (!ctx.suiteIdByKey.has(key)) missingTop.set(key, row.suiteName);
+    }
+    if (missingTop.size) {
+      const rescan = await client.query<{ id: string; name: string }>(
+        ctx.defaultSuiteId
+          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2"
+          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL",
+        ctx.defaultSuiteId ? [ctx.projectId, ctx.defaultSuiteId] : [ctx.projectId]
+      );
+      for (const row of rescan.rows) {
+        const key = importSuiteKey(row.name, ctx.defaultSuiteId);
+        ctx.suiteIdByKey.set(key, row.id);
+        missingTop.delete(key);
+      }
     }
     if (missingTop.size) {
       const created = await client.query<{ id: string; name: string }>(
         `INSERT INTO suites (project_id, parent_id, name, position)
-         SELECT $1, NULL, v.name, 0 FROM jsonb_to_recordset($2::jsonb) AS v(name text)
+         SELECT $1, $3::uuid, v.name, 0 FROM jsonb_to_recordset($2::jsonb) AS v(name text)
          RETURNING id, name`,
-        [ctx.projectId, JSON.stringify(Array.from(missingTop.values(), (name) => ({ name })))]
+        [ctx.projectId, JSON.stringify(Array.from(missingTop.values(), (name) => ({ name }))), ctx.defaultSuiteId]
       );
-      for (const row of created.rows) ctx.suiteIdByKey.set(importSuiteKey(row.name, null), row.id);
+      for (const row of created.rows) ctx.suiteIdByKey.set(importSuiteKey(row.name, ctx.defaultSuiteId), row.id);
     }
 
     const missingChild = new Map<string, { parent_id: string; name: string }>();
     for (const row of prepared) {
       row.parentSuiteId = row.suiteName
-        ? ctx.suiteIdByKey.get(importSuiteKey(row.suiteName, null)) ?? null
+        ? ctx.suiteIdByKey.get(importSuiteKey(row.suiteName, ctx.defaultSuiteId)) ?? ctx.defaultSuiteId
         : ctx.defaultSuiteId;
       if (!row.componentName || !row.parentSuiteId) continue;
       // A row that names a component but no suite nests under whatever the user had open, and that
@@ -3548,6 +3582,18 @@ export class LegacyService implements OnModuleInit {
       if (!row.suiteName) ctx.expandSuiteIds.add(row.parentSuiteId);
       const key = importSuiteKey(row.componentName, row.parentSuiteId);
       if (!ctx.suiteIdByKey.has(key)) missingChild.set(key, { parent_id: row.parentSuiteId, name: row.componentName });
+    }
+    if (missingChild.size) {
+      const parentIds = Array.from(new Set(Array.from(missingChild.values(), (v) => v.parent_id)));
+      const rescan = await client.query<{ id: string; parent_id: string; name: string }>(
+        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[])",
+        [ctx.projectId, parentIds]
+      );
+      for (const row of rescan.rows) {
+        const key = importSuiteKey(row.name, row.parent_id);
+        ctx.suiteIdByKey.set(key, row.id);
+        missingChild.delete(key);
+      }
     }
     if (missingChild.size) {
       const created = await client.query<{ id: string; parent_id: string; name: string }>(
@@ -7250,15 +7296,21 @@ export class LegacyService implements OnModuleInit {
         !latest.rows[0] ||
         Date.now() - new Date(latest.rows[0].created_at).getTime() > staleMinutes * 60 * 1000;
       if (isStale) {
-        const nextVersion = await this.db.query<{ max: number }>(
-          "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
-          [documentId]
-        );
-        await this.db.query(
-          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-          [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
-        );
+        // Serialised per document, and sharing its lock key with restoreKnowledgeDocumentVersion —
+        // MAX(version_number)+1 alone lets a concurrent edit and a concurrent restore compute the
+        // same next number, and the table has no unique constraint to reject the duplicate insert.
+        await this.db.transaction(async (client) => {
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+          const nextVersion = await client.query<{ max: number }>(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+            [documentId]
+          );
+          await client.query(
+            `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+            [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
+          );
+        });
       }
     }
 
@@ -8009,22 +8061,54 @@ export class LegacyService implements OnModuleInit {
     if (!version.rows[0]) throw new NotFoundException({ error: "Version not found" });
     const v = version.rows[0];
 
-    // Snapshot the current state before overwriting, so restoring a version is itself reversible.
-    const nextVersion = await this.db.query<{ max: number }>(
-      "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
-      [documentId]
-    );
-    await this.db.query(
-      `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-      [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
-    );
+    // Serialised per document, and sharing its lock key with the auto-snapshot step in
+    // updateKnowledgeDocument — a concurrent restore and a concurrent edit both read-then-write
+    // this same version_number sequence, and the table has no unique constraint to reject a
+    // collision. The whole snapshot-then-overwrite sequence also runs inside one transaction so a
+    // mid-sequence failure can never leave a snapshot inserted without the restore having applied,
+    // or vice versa.
+    const res = await this.db.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
 
-    const res = await this.db.query(
-      `UPDATE knowledge_documents SET title = $2, content_json = $3::jsonb, content_html = $4, content_text = $5, updated_by = $6, updated_at = now()
-       WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
-      [documentId, v.title, v.content_json ? JSON.stringify(v.content_json) : null, v.content_html, v.content_text, uid]
-    );
+      // Re-read the document fresh, inside the lock — `doc` above may already be stale by the time
+      // this transaction gets to run, e.g. a concurrent edit committed while we waited on the lock.
+      const current = await client.query(
+        `SELECT title, content_json, content_html, content_text FROM knowledge_documents
+         WHERE id = $1 AND project_id = $2 AND is_deleted = false FOR UPDATE`,
+        [documentId, projectId]
+      );
+      if (!current.rows[0]) throw new NotFoundException({ error: "Document not found" });
+      const cur = current.rows[0];
+
+      // Restoring a version whose content already matches the current document (restoring the
+      // same version twice in a row, or a stray extra click before the UI caught up) has nothing to
+      // snapshot — skip the insert so repeated restores don't pile up identical junk versions, but
+      // still apply the write below so the call remains a normal, idempotent success.
+      const isNoop =
+        cur.title === v.title &&
+        cur.content_html === v.content_html &&
+        cur.content_text === v.content_text &&
+        JSON.stringify(cur.content_json) === JSON.stringify(v.content_json);
+
+      if (!isNoop) {
+        // Snapshot the current state before overwriting, so restoring a version is itself reversible.
+        const nextVersion = await client.query<{ max: number }>(
+          "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+          [documentId]
+        );
+        await client.query(
+          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+          [documentId, nextVersion.rows[0].max, cur.title, cur.content_json ? JSON.stringify(cur.content_json) : null, cur.content_html, cur.content_text, uid]
+        );
+      }
+
+      return client.query(
+        `UPDATE knowledge_documents SET title = $2, content_json = $3::jsonb, content_html = $4, content_text = $5, updated_by = $6, updated_at = now()
+         WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
+        [documentId, v.title, v.content_json ? JSON.stringify(v.content_json) : null, v.content_html, v.content_text, uid]
+      );
+    });
     await this.logProjectActivity(projectId, uid, "restored_version", "knowledge_document", documentId, res.rows[0].title, { versionNumber: v.version_number });
     return toCamel(res.rows[0]);
   }
@@ -8716,6 +8800,12 @@ export class LegacyService implements OnModuleInit {
     return new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
   }
 
+  /** True for exactly the error cleanAuthErrorOrNull produces — used to tell "this connection's
+   *  token is dead" apart from any other failure when settling more than one call in parallel. */
+  private isReconnectError(err: unknown): boolean {
+    return err instanceof BadRequestException && /needs to be reconnected/i.test(String((err.getResponse() as Body)?.error || ""));
+  }
+
   private async jiraFetch<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
@@ -8771,24 +8861,70 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  /**
+   * Teams AND Projects, merged into one pickable list — Linear's own docs distinguish them (every
+   * issue belongs to exactly one Team, mandatory; a Project is optional and can span multiple
+   * Teams), and a user's "my project" can genuinely mean either depending on how their workspace is
+   * organized, so both are offered rather than forcing one.
+   *
+   * The two GraphQL calls run via allSettled, not all/Promise.all: a transient failure fetching
+   * Projects (rate limit, a future scope restriction) must not blank out Teams too — the picker
+   * degrades to whichever half actually came back rather than failing the whole request over one
+   * of two independent reads.
+   */
   async linearTeams(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", true);
     if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
-    const data = await this.linearGraphQL<Body>(this.linearAuthHeader(connection), "query { teams { nodes { id key name } } }");
-    const connected = await this.db.query(
+    const authHeader = this.linearAuthHeader(connection);
+
+    const [teamsResult, projectsResult] = await Promise.allSettled([
+      this.linearGraphQL<Body>(authHeader, "query { teams { nodes { id key name } } }"),
+      this.linearGraphQL<Body>(authHeader, "query { projects { nodes { id name slugId } } }")
+    ]);
+
+    // An expired/revoked token affects the whole connection, not just one of these two queries —
+    // surface it immediately rather than quietly degrading to a partial list that would leave the
+    // user wondering where their teams/projects went instead of telling them to reconnect.
+    for (const result of [teamsResult, projectsResult]) {
+      if (result.status === "rejected" && this.isReconnectError(result.reason)) throw result.reason;
+    }
+
+    const connected = await this.db.query<{ linear_team_id: string }>(
       "SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true",
       [projectId]
     );
     const connectedIds = new Set(connected.rows.map((row) => String(row.linear_team_id)));
-    return normalizeJsonArray(data?.teams?.nodes).map((team) => ({
-      id: String(team.id || ""),
-      key: String(team.key || ""),
-      name: String(team.name || team.key || "Linear team"),
-      style: "",
-      connected: connectedIds.has(String(team.id || ""))
-    })).filter((team) => team.id && team.key);
+
+    const entities: Array<{ id: string; key: string; name: string; style: string; connected: boolean; entityType: "team" | "project" }> = [];
+
+    if (teamsResult.status === "fulfilled") {
+      for (const team of normalizeJsonArray(teamsResult.value?.teams?.nodes)) {
+        const id = String(team.id || "");
+        const key = String(team.key || "");
+        if (!id || !key) continue;
+        entities.push({ id, key, name: String(team.name || key || "Linear team"), style: "", connected: connectedIds.has(id), entityType: "team" });
+      }
+    } else {
+      this.logger.warn(`Linear teams list failed for project ${projectId}: ${teamsResult.reason instanceof Error ? teamsResult.reason.message : teamsResult.reason}`);
+    }
+
+    if (projectsResult.status === "fulfilled") {
+      for (const project of normalizeJsonArray(projectsResult.value?.projects?.nodes)) {
+        const id = String(project.id || "");
+        // slugId, not the internal/nullable `identifier` field — Linear Projects have no short key
+        // the way Teams do, but slugId is real, non-null, and stable, which is all a "key" needs to
+        // be here (it's purely a display token downstream, never a uniqueness/format constraint).
+        const key = String(project.slugId || "");
+        if (!id || !key) continue;
+        entities.push({ id, key, name: String(project.name || key || "Linear project"), style: "", connected: connectedIds.has(id), entityType: "project" });
+      }
+    } else {
+      this.logger.warn(`Linear projects list failed for project ${projectId}: ${projectsResult.reason instanceof Error ? projectsResult.reason.message : projectsResult.reason}`);
+    }
+
+    return entities;
   }
 
   async connectLinearTeams(projectId: string, userId: string | null | undefined, body: Body) {
@@ -8796,15 +8932,25 @@ export class LegacyService implements OnModuleInit {
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", false);
     if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
-    const teams = normalizeJsonArray(body.projects)
+    const rawItems = normalizeJsonArray(body.projects);
+    // Reject a tampered/unknown entityType outright rather than silently coercing it — an omitted
+    // value defaults to "team", which is what every pre-existing frontend build already sends and
+    // keeps a rolling deploy (new backend, old frontend) working unchanged.
+    for (const item of rawItems) {
+      if (item.entityType !== undefined && item.entityType !== "team" && item.entityType !== "project") {
+        throw new BadRequestException({ error: `Unknown Linear entity type: ${item.entityType}` });
+      }
+    }
+    const teams = rawItems
       .map((team) => ({
         id: String(team.id || "").trim(),
         key: String(team.key || "").trim(),
-        name: String(team.name || team.key || "").trim()
+        name: String(team.name || team.key || "").trim(),
+        entityType: team.entityType === "project" ? "project" : "team"
       }))
       .filter((team) => team.id && team.key);
-    // One Linear team per Tesbo project — same invariant as Jira above.
-    if (teams.length > 1) throw new BadRequestException({ error: "Link one Linear team at a time to this project." });
+    // One Linear team/project per Tesbo project — same invariant as Jira above.
+    if (teams.length > 1) throw new BadRequestException({ error: "Link one Linear team or project at a time to this project." });
 
     const [team] = teams;
     try {
@@ -8812,13 +8958,14 @@ export class LegacyService implements OnModuleInit {
         await client.query("UPDATE linear_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
         if (!team) return;
         await client.query(
-          `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name, entity_type)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (integration_connection_id, linear_team_id, project_id) DO UPDATE SET
              linear_team_key = EXCLUDED.linear_team_key,
              linear_team_name = EXCLUDED.linear_team_name,
+             entity_type = EXCLUDED.entity_type,
              enabled = true`,
-          [connection.id, projectId, team.id, team.key, team.name]
+          [connection.id, projectId, team.id, team.key, team.name, team.entityType]
         );
       });
     } catch (error) {

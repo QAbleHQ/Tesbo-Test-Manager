@@ -2,7 +2,6 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
-import Link from "next/link";
 import { IconActivity, IconSearch } from "@tabler/icons-react";
 import {
   authMe,
@@ -14,7 +13,7 @@ import {
   type ActivityLogItem,
 } from "@/lib/api";
 import { Button, EmptyStateBlock, Select } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import {
   ActivityRow,
   ActivitySummaryPanel,
@@ -115,17 +114,13 @@ export default function ActivityPage() {
   const projectName = project ? ((project.name as string) ?? "") : "";
 
   const breadcrumb = (
-    <>
-      <Link href="/projects" className="hover:text-[var(--foreground)]">
-        Projects
-      </Link>
-      <span>/</span>
-      <Link href={`/projects/${projectId}/dashboard`} className="hover:text-[var(--foreground)]">
-        {projectName}
-      </Link>
-      <span>/</span>
-      <span>Activity</span>
-    </>
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Activity" },
+      ]}
+    />
   );
 
   return (

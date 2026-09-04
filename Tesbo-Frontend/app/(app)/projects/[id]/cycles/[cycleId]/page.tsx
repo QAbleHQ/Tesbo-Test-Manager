@@ -69,6 +69,7 @@ import TrackingDestinationField, { type TrackingDestination } from "@/components
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -976,29 +977,14 @@ export default function TestRunDetailPage() {
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <button
-                type="button"
-                onClick={() => router.push(`/projects/${projectId}/cycles`)}
-                className="shrink-0 text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-              >
-                Test Runs
-              </button>
-              <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-              <span className="truncate font-medium text-[var(--accent-light)]">{run.name}</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test Runs", href: `/projects/${projectId}/cycles` },
+                { label: run.name },
+              ]}
+            />,
             topBarStartEl,
           )}
         {topBarEndEl &&

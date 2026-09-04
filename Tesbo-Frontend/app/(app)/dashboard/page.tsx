@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { authMe, getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
 import { Card, PageLoader } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 
 /*
  * Basecamp 10221720616 ("[Dashboard] Execution progress bar colours are not visible").
@@ -108,11 +108,12 @@ export default function DashboardPage() {
           title="Dashboard"
           subtitle="Workspace-level analytics across all projects"
           breadcrumb={(
-            <div className="flex items-center gap-2">
-              <span className="text-[var(--foreground)]">{workspaceName}</span>
-              <span>/</span>
-              <span className="text-[var(--foreground)]">Dashboard</span>
-            </div>
+            <Breadcrumbs
+              items={[
+                { label: workspaceName || "Workspace", href: "/dashboard" },
+                { label: "Dashboard" },
+              ]}
+            />
           )}
         />
       )}

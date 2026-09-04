@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconChevronRight, IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
+import { IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
 import {
   authMe,
   continueZyraChatMessage,
@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, type Priority } from "@/components/ui";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
@@ -719,21 +720,13 @@ export default function ZyraChatPage() {
         {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <span className="font-medium text-[var(--accent-light)]">Zyra</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Zyra" },
+              ]}
+            />,
             topBarStartEl,
           )}
         {topBarEndEl &&

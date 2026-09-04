@@ -1,12 +1,12 @@
 "use client";
 
-import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { IconChevronRight, IconKey } from "@tabler/icons-react";
+import { IconKey } from "@tabler/icons-react";
 import {
   API_BASE,
   authMe,
+  getProject,
   listProjectMembers,
   listApiKeys,
   createApiKey,
@@ -16,7 +16,7 @@ import {
   type ApiTokenWithSecret,
 } from "@/lib/api";
 import { Button, Card, Modal, Input, Field, FieldLabel, StatusChip, CopyButton } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type ConnectTab = "claudeCode" | "claudeDesktop" | "other";
@@ -62,6 +62,7 @@ export default function ApiTokensPage() {
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
   const [connectTab, setConnectTab] = useState<ConnectTab>("claudeCode");
+  const [projectName, setProjectName] = useState("");
 
   const loadTokens = useCallback(async () => {
     try {
@@ -83,6 +84,7 @@ export default function ApiTokensPage() {
       }
       setCurrentUserId(me.userId);
       listProjectMembers(projectId).then(setProjectMembers).catch(() => {});
+      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       loadTokens().catch(() => {});
     });
   }, [loadTokens, projectId, router]);
@@ -205,12 +207,14 @@ export default defineConfig({
       }
       subtitle="Create tokens, connect AI agents like Claude Code or Claude Desktop, and report automated test results into this project."
       breadcrumb={
-        <Link
-          href={`/projects/${projectId}/settings?tab=apiTokens`}
-          className="inline-flex items-center gap-1 hover:text-[var(--foreground)]"
-        >
-          Settings <IconChevronRight size={13} /> API &amp; MCP
-        </Link>
+        <Breadcrumbs
+          items={[
+            { label: "Projects", href: "/projects" },
+            { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+            { label: "Settings", href: `/projects/${projectId}/settings?tab=apiTokens` },
+            { label: "API & MCP" },
+          ]}
+        />
       }
     />
   );

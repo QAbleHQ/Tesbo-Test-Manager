@@ -1358,6 +1358,81 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.getByText("Picked up task")).toBeVisible();
   });
 
+  // ─── The full task view's Feedback tab (fix for "Feedback tab is missing from Full
+  // Task view / feedback section shown at the bottom of Generated Testcases") ────────
+
+  test("ZYU-70 the full task view has its own Feedback tab, and the send-feedback form is no longer bolted onto Generated Testcases", async ({
+    browser,
+  }) => {
+    /*
+     * Regression test: the send-feedback form used to render unconditionally at the bottom of the
+     * "testcases" tab content, and there was no way to see past feedback at all in the full view —
+     * only in the quick-view popup. The full view must now offer "Feedback" as its own tab, exactly
+     * like the popup does, with the form (and, new here, the feedback history) living only there.
+     */
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    // Default tab is Generated Testcases — the form must not leak into it any more.
+    await expect(page.getByRole("heading", { name: "Zyra task", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toHaveCount(0);
+    await expect(page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.")).toHaveCount(0);
+
+    // The tab exists, is distinct from "Generated Testcases", and carries its own count badge.
+    const feedbackTab = page.getByRole("button", { name: "Feedback (0)" });
+    await expect(feedbackTab).toBeVisible();
+    await feedbackTab.click();
+
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();
+    await expect(page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.")).toBeVisible();
+    // No feedback has been submitted yet — the history must say so, not render empty and silent.
+    await expect(page.getByText("No feedback yet.")).toBeVisible();
+
+    // Leaving the tab unmounts its content — the form is not merely hidden behind the testcases tab.
+    await page.getByRole("button", { name: "Generated Testcases (2)" }).click();
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toHaveCount(0);
+  });
+
+  test("ZYU-71 the full task view's Feedback tab shows only the reviewer's submitted feedback, not status activity, and the count matches the popup's", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Full view feedback story");
+    const taskId = seedTask({ userStory });
+    seedFeedbackActivity(taskId, "Cover the locked-account case too");
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    // The tab count is the filtered count (isFeedbackActivity), not the raw activity_log length
+    // (2 entries seeded: the default "Picked up task" plus the seeded feedback entry).
+    await expect(page.getByRole("button", { name: "Feedback (1)" })).toBeVisible();
+    await page.getByRole("button", { name: "Feedback (1)" }).click();
+    await expect(page.getByText("Cover the locked-account case too")).toBeVisible();
+    await expect(page.getByText("Picked up task"), "a status entry must not leak into Feedback").toHaveCount(0);
+
+    // Activities keeps the full, unfiltered history — same contract as the quick-view popup (ZYU-29).
+    await expect(page.getByRole("button", { name: "Activities (2)" })).toBeVisible();
+    await page.getByRole("button", { name: "Activities (2)" }).click();
+    await expect(page.getByText("Cover the locked-account case too"), "Activities still carries the full history, feedback included").toBeVisible();
+    await expect(page.getByText("Picked up task")).toBeVisible();
+  });
+
+  test("ZYU-72 the full task view's Feedback tab still gates sending on task status once relocated", async ({ browser }) => {
+    // Proves the move didn't drop the existing status guard (see api/zyra.spec.ts ZYR-A-34): a task
+    // that hasn't finished generating, and one that's already closed, both refuse a real submission
+    // and say why, rather than silently accepting a click that the server would answer with a 409.
+    const pendingTask = seedTask({ userStory: stamp("Pending feedback story"), status: "todo" });
+    const pendingPage = await open(browser, `/agents/tasks/${pendingTask}`);
+    await pendingPage.getByRole("button", { name: "Feedback (0)" }).click();
+    await expect(pendingPage.getByText("Feedback opens up once Zyra finishes generating drafts for this task.")).toBeVisible();
+    await expect(pendingPage.getByRole("button", { name: "Send feedback" })).toBeDisabled();
+
+    const doneTask = seedTask({ userStory: stamp("Done feedback story"), status: "done" });
+    const donePage = await open(browser, `/agents/tasks/${doneTask}`);
+    await donePage.getByRole("button", { name: "Feedback (0)" }).click();
+    await expect(donePage.getByText("Feedback isn't available once a task is closed.")).toBeVisible();
+    await expect(donePage.getByRole("button", { name: "Send feedback" })).toBeDisabled();
+  });
+
   // ─── Sources tab: label and formatting ─────────────────────────────────────
 
   test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({

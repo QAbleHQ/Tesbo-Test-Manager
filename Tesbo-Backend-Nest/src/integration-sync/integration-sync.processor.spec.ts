@@ -9,7 +9,7 @@ import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.buil
 import { INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, INTEGRATION_SYNC_RUN_JOB } from "./integration-sync.constants";
 import { IntegrationSyncProcessor } from "./integration-sync.processor";
 import { IntegrationSyncService } from "./integration-sync.service";
-import { SyncRunJobPayload } from "./integration-sync.types";
+import { RemoteTicket, SyncProvider, SyncRunJobPayload } from "./integration-sync.types";
 
 /** Drives IntegrationSyncProcessor through its public `process(job)` entrypoint, matching how
  *  BullMQ actually dispatches — exercising the real, unmocked wiring between the orchestrator's
@@ -22,6 +22,7 @@ function job(name: string, data: unknown): Job {
 function makeProcessor(overrides: {
   runs?: Partial<IntegrationSyncService>;
   client?: Partial<IntegrationSyncClient>;
+  db?: { query: jest.Mock };
 } = {}) {
   const runs = {
     listNightlySyncTargets: jest.fn().mockResolvedValue([]),
@@ -29,6 +30,11 @@ function makeProcessor(overrides: {
     startRun: jest.fn(),
     markRunning: jest.fn().mockResolvedValue(undefined),
     failRun: jest.fn().mockResolvedValue(undefined),
+    ensureProviderFolder: jest.fn().mockResolvedValue("folder-1"),
+    setStage: jest.fn().mockResolvedValue(undefined),
+    setTotals: jest.fn().mockResolvedValue(undefined),
+    enqueueTicketJobs: jest.fn().mockResolvedValue(undefined),
+    finishRun: jest.fn().mockResolvedValue(undefined),
     ...overrides.runs
   } as unknown as IntegrationSyncService;
 
@@ -37,8 +43,10 @@ function makeProcessor(overrides: {
     ...overrides.client
   } as unknown as IntegrationSyncClient;
 
+  const db = (overrides.db ?? { query: jest.fn().mockResolvedValue({ rows: [] }) }) as unknown as DatabaseService;
+
   const processor = new IntegrationSyncProcessor(
-    {} as unknown as DatabaseService,
+    db,
     runs,
     client,
     {} as unknown as IntegrationSyncDocumentBuilder,
@@ -46,7 +54,7 @@ function makeProcessor(overrides: {
     {} as unknown as RagIngestionService,
     {} as unknown as PlanLimitsService
   );
-  return { processor, runs, client };
+  return { processor, runs, client, db };
 }
 
 describe("IntegrationSyncProcessor — nightly orchestrator observability", () => {
@@ -103,3 +111,135 @@ describe("IntegrationSyncProcessor#process — sync-run auth failure surfaces th
     expect(message).not.toContain("401");
   });
 });
+
+/**
+ * Regression coverage for the prod incident: "value too long for type character varying(1024)"
+ * on a Linear (and, identically, a Jira) ticket whose title overflowed a bounded column, thrown
+ * from inside onPage's loop with no try/catch of its own — which aborted the ENTIRE run rather
+ * than just the one bad ticket. Because incremental syncs cursor off the last *successful* run,
+ * that failure was permanent for the affected project. This proves the fix — a bad ticket's
+ * upsertTicket failure is now caught per-ticket, everything else on the page still syncs, and the
+ * run finishes (not fails) with a note about what was skipped — for both providers, since they
+ * share this exact code path.
+ */
+function remoteTicket(overrides: Partial<RemoteTicket> = {}): RemoteTicket {
+  return {
+    issueId: "id-1",
+    issueKey: "GOOD-1",
+    summary: "A perfectly normal title",
+    description: "",
+    issueType: "Bug",
+    status: "Open",
+    priority: "Medium",
+    assignee: "",
+    reporter: "",
+    labels: "",
+    createdAt: null,
+    updatedAt: null,
+    url: "https://example.invalid/GOOD-1",
+    ...overrides
+  };
+}
+
+describe.each<SyncProvider>(["jira", "linear"])(
+  "IntegrationSyncProcessor#process — a single bad ticket does not abort the %s run",
+  (provider) => {
+    it("skips only the failing ticket, still syncs the rest, and finishes (not fails) the run", async () => {
+      const goodTicket = remoteTicket({ issueId: "id-good", issueKey: "GOOD-1" });
+      const badTicket = remoteTicket({ issueId: "id-bad", issueKey: "BAD-1", summary: "A".repeat(2000) });
+
+      const dbQuery = jest.fn((sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM jira_project_mappings") || sql.includes("FROM linear_project_mappings")) {
+          return Promise.resolve({ rows: [{ remote_id: "team-1", remote_key: "ENG", remote_name: "Engineering" }] });
+        }
+        if (sql.includes("INSERT INTO jira_tickets") || sql.includes("INSERT INTO linear_tickets")) {
+          const issueKey = params[3];
+          if (issueKey === "BAD-1") return Promise.reject(new Error('value too long for type character varying(1024)'));
+          return Promise.resolve({ rows: [{ id: `ticket-${issueKey}` }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
+
+      const { processor, runs, client, db } = makeProcessor({
+        db: { query: dbQuery },
+        client: {
+          loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+          fetchJiraTickets: jest.fn(async (_conn, _key, onPage) => {
+            await onPage([goodTicket, badTicket]);
+            return { total: 2, truncated: false };
+          }),
+          fetchLinearTickets: jest.fn(async (_conn, _id, onPage) => {
+            await onPage([goodTicket, badTicket]);
+            return { total: 2, truncated: false };
+          })
+        }
+      });
+
+      const payload: SyncRunJobPayload = {
+        runId: "run-1",
+        organizationId: "org-1",
+        projectId: "proj-1",
+        provider,
+        triggeredBy: "user-1"
+      };
+
+      await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+
+      // The run must NEVER abort because of one bad ticket.
+      expect(runs.failRun).not.toHaveBeenCalled();
+
+      // Only the good ticket is queued for document-building.
+      expect(runs.enqueueTicketJobs).toHaveBeenCalledTimes(1);
+      const queued = (runs.enqueueTicketJobs as jest.Mock).mock.calls[0][0];
+      expect(queued).toHaveLength(1);
+      expect(queued[0].issueKey).toBe("GOOD-1");
+
+      // The skip is surfaced on the run, not silently dropped.
+      const errorUpdateCall = (db.query as unknown as jest.Mock).mock.calls.find(
+        ([sql]) => typeof sql === "string" && sql.includes("UPDATE integration_sync_runs SET error")
+      );
+      expect(errorUpdateCall).toBeDefined();
+      expect(String(errorUpdateCall?.[1]?.[1])).toMatch(/1 ticket.*invalid data/i);
+    });
+
+    it("finishes (not fails) a run where every ticket on the page was bad", async () => {
+      const badTicket = remoteTicket({ issueId: "id-bad", issueKey: "BAD-1", summary: "A".repeat(2000) });
+
+      const dbQuery = jest.fn((sql: string) => {
+        if (sql.includes("FROM jira_project_mappings") || sql.includes("FROM linear_project_mappings")) {
+          return Promise.resolve({ rows: [{ remote_id: "team-1", remote_key: "ENG", remote_name: "Engineering" }] });
+        }
+        if (sql.includes("INSERT INTO jira_tickets") || sql.includes("INSERT INTO linear_tickets")) {
+          return Promise.reject(new Error('value too long for type character varying(1024)'));
+        }
+        return Promise.resolve({ rows: [] });
+      });
+
+      const { processor, runs } = makeProcessor({
+        db: { query: dbQuery },
+        client: {
+          loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+          fetchJiraTickets: jest.fn(async (_conn, _key, onPage) => {
+            await onPage([badTicket]);
+            return { total: 1, truncated: false };
+          }),
+          fetchLinearTickets: jest.fn(async (_conn, _id, onPage) => {
+            await onPage([badTicket]);
+            return { total: 1, truncated: false };
+          })
+        }
+      });
+
+      const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider, triggeredBy: "user-1" };
+
+      jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+      (Logger.prototype.warn as jest.Mock).mockRestore();
+
+      expect(runs.failRun).not.toHaveBeenCalled();
+      expect(runs.enqueueTicketJobs).not.toHaveBeenCalled();
+      // Distinguishable from "nothing changed"/"empty project" — every ticket found was skipped.
+      expect(runs.finishRun).toHaveBeenCalledWith("run-1", expect.stringMatching(/all 1.*invalid data/i));
+    });
+  }
+);
