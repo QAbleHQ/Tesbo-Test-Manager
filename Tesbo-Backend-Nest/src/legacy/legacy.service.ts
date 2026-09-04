@@ -8754,6 +8754,12 @@ export class LegacyService implements OnModuleInit {
     return new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
   }
 
+  /** True for exactly the error cleanAuthErrorOrNull produces — used to tell "this connection's
+   *  token is dead" apart from any other failure when settling more than one call in parallel. */
+  private isReconnectError(err: unknown): boolean {
+    return err instanceof BadRequestException && /needs to be reconnected/i.test(String((err.getResponse() as Body)?.error || ""));
+  }
+
   private async jiraFetch<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
@@ -8809,24 +8815,70 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  /**
+   * Teams AND Projects, merged into one pickable list — Linear's own docs distinguish them (every
+   * issue belongs to exactly one Team, mandatory; a Project is optional and can span multiple
+   * Teams), and a user's "my project" can genuinely mean either depending on how their workspace is
+   * organized, so both are offered rather than forcing one.
+   *
+   * The two GraphQL calls run via allSettled, not all/Promise.all: a transient failure fetching
+   * Projects (rate limit, a future scope restriction) must not blank out Teams too — the picker
+   * degrades to whichever half actually came back rather than failing the whole request over one
+   * of two independent reads.
+   */
   async linearTeams(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", true);
     if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
-    const data = await this.linearGraphQL<Body>(this.linearAuthHeader(connection), "query { teams { nodes { id key name } } }");
-    const connected = await this.db.query(
+    const authHeader = this.linearAuthHeader(connection);
+
+    const [teamsResult, projectsResult] = await Promise.allSettled([
+      this.linearGraphQL<Body>(authHeader, "query { teams { nodes { id key name } } }"),
+      this.linearGraphQL<Body>(authHeader, "query { projects { nodes { id name slugId } } }")
+    ]);
+
+    // An expired/revoked token affects the whole connection, not just one of these two queries —
+    // surface it immediately rather than quietly degrading to a partial list that would leave the
+    // user wondering where their teams/projects went instead of telling them to reconnect.
+    for (const result of [teamsResult, projectsResult]) {
+      if (result.status === "rejected" && this.isReconnectError(result.reason)) throw result.reason;
+    }
+
+    const connected = await this.db.query<{ linear_team_id: string }>(
       "SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true",
       [projectId]
     );
     const connectedIds = new Set(connected.rows.map((row) => String(row.linear_team_id)));
-    return normalizeJsonArray(data?.teams?.nodes).map((team) => ({
-      id: String(team.id || ""),
-      key: String(team.key || ""),
-      name: String(team.name || team.key || "Linear team"),
-      style: "",
-      connected: connectedIds.has(String(team.id || ""))
-    })).filter((team) => team.id && team.key);
+
+    const entities: Array<{ id: string; key: string; name: string; style: string; connected: boolean; entityType: "team" | "project" }> = [];
+
+    if (teamsResult.status === "fulfilled") {
+      for (const team of normalizeJsonArray(teamsResult.value?.teams?.nodes)) {
+        const id = String(team.id || "");
+        const key = String(team.key || "");
+        if (!id || !key) continue;
+        entities.push({ id, key, name: String(team.name || key || "Linear team"), style: "", connected: connectedIds.has(id), entityType: "team" });
+      }
+    } else {
+      this.logger.warn(`Linear teams list failed for project ${projectId}: ${teamsResult.reason instanceof Error ? teamsResult.reason.message : teamsResult.reason}`);
+    }
+
+    if (projectsResult.status === "fulfilled") {
+      for (const project of normalizeJsonArray(projectsResult.value?.projects?.nodes)) {
+        const id = String(project.id || "");
+        // slugId, not the internal/nullable `identifier` field — Linear Projects have no short key
+        // the way Teams do, but slugId is real, non-null, and stable, which is all a "key" needs to
+        // be here (it's purely a display token downstream, never a uniqueness/format constraint).
+        const key = String(project.slugId || "");
+        if (!id || !key) continue;
+        entities.push({ id, key, name: String(project.name || key || "Linear project"), style: "", connected: connectedIds.has(id), entityType: "project" });
+      }
+    } else {
+      this.logger.warn(`Linear projects list failed for project ${projectId}: ${projectsResult.reason instanceof Error ? projectsResult.reason.message : projectsResult.reason}`);
+    }
+
+    return entities;
   }
 
   async connectLinearTeams(projectId: string, userId: string | null | undefined, body: Body) {
@@ -8834,15 +8886,25 @@ export class LegacyService implements OnModuleInit {
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", false);
     if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
-    const teams = normalizeJsonArray(body.projects)
+    const rawItems = normalizeJsonArray(body.projects);
+    // Reject a tampered/unknown entityType outright rather than silently coercing it — an omitted
+    // value defaults to "team", which is what every pre-existing frontend build already sends and
+    // keeps a rolling deploy (new backend, old frontend) working unchanged.
+    for (const item of rawItems) {
+      if (item.entityType !== undefined && item.entityType !== "team" && item.entityType !== "project") {
+        throw new BadRequestException({ error: `Unknown Linear entity type: ${item.entityType}` });
+      }
+    }
+    const teams = rawItems
       .map((team) => ({
         id: String(team.id || "").trim(),
         key: String(team.key || "").trim(),
-        name: String(team.name || team.key || "").trim()
+        name: String(team.name || team.key || "").trim(),
+        entityType: team.entityType === "project" ? "project" : "team"
       }))
       .filter((team) => team.id && team.key);
-    // One Linear team per Tesbo project — same invariant as Jira above.
-    if (teams.length > 1) throw new BadRequestException({ error: "Link one Linear team at a time to this project." });
+    // One Linear team/project per Tesbo project — same invariant as Jira above.
+    if (teams.length > 1) throw new BadRequestException({ error: "Link one Linear team or project at a time to this project." });
 
     const [team] = teams;
     try {
@@ -8850,13 +8912,14 @@ export class LegacyService implements OnModuleInit {
         await client.query("UPDATE linear_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
         if (!team) return;
         await client.query(
-          `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO linear_project_mappings (integration_connection_id, project_id, linear_team_id, linear_team_key, linear_team_name, entity_type)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (integration_connection_id, linear_team_id, project_id) DO UPDATE SET
              linear_team_key = EXCLUDED.linear_team_key,
              linear_team_name = EXCLUDED.linear_team_name,
+             entity_type = EXCLUDED.entity_type,
              enabled = true`,
-          [connection.id, projectId, team.id, team.key, team.name]
+          [connection.id, projectId, team.id, team.key, team.name, team.entityType]
         );
       });
     } catch (error) {

@@ -21,6 +21,10 @@ interface RemoteItem {
   key: string;
   name: string;
   connected: boolean;
+  // Set only when a provider's picker mixes more than one kind of remote entity (Linear's Teams
+  // and Projects, listed together) — absent for Jira, which has exactly one kind, so its rows
+  // render with no badge at all.
+  entityType?: "team" | "project";
 }
 
 interface ConnectionStatus {
@@ -45,7 +49,7 @@ export function ProjectIntegrationMapping({
   workspaceConfigHref: string;
   fetchStatus: (projectId: string) => Promise<ConnectionStatus>;
   fetchRemoteList: (projectId: string) => Promise<RemoteItem[]>;
-  saveMapping: (projectId: string, items: { id: string; key: string; name: string }[]) => Promise<void>;
+  saveMapping: (projectId: string, items: { id: string; key: string; name: string; entityType?: "team" | "project" }[]) => Promise<void>;
   /**
    * Settings that only make sense for this provider — Jira's AI-generation toggles, say. Rendered
    * below the mapping and sync cards, so each integration owns its settings on its own page instead
@@ -122,7 +126,7 @@ export function ProjectIntegrationMapping({
     setMessage(null);
     try {
       const item = remoteItems.find((candidate) => candidate.id === selectedId);
-      await saveMapping(projectId, item ? [{ id: item.id, key: item.key, name: item.name }] : []);
+      await saveMapping(projectId, item ? [{ id: item.id, key: item.key, name: item.name, entityType: item.entityType }] : []);
       setMessage({
         type: "success",
         text: item ? `${item.name} linked to this project.` : `${remoteUnitLabel} unlinked from this project.`,
@@ -278,6 +282,11 @@ export function ProjectIntegrationMapping({
                 />
                 <div className="min-w-0 flex-1">
                   <span className="text-sm font-medium text-[var(--foreground)]">{item.name}</span>
+                  {item.entityType && (
+                    <span className="ml-2 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--muted)]">
+                      {item.entityType}
+                    </span>
+                  )}
                   <span className="ml-2 text-xs text-[var(--muted)] font-mono">{item.key}</span>
                 </div>
               </label>

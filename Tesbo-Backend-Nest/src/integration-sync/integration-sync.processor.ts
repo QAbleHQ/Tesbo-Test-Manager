@@ -64,7 +64,10 @@ const TICKET_TABLES: Record<SyncProvider, {
     updatedCol: "linear_updated_at",
     urlCol: "linear_url",
     conflict: "(integration_connection_id, linear_issue_id, project_id)",
-    mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name
+    // entity_type (V95) disambiguates whether remote_id/remote_key/remote_name hold a Linear Team
+    // or a Linear Project — jira's mappingSql has no equivalent column since Jira only ever maps
+    // by Project.
+    mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name, entity_type
                  FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
   }
 };
@@ -144,7 +147,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
         return;
       }
 
-      const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string }>(config.mappingSql, [projectId]);
+      const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string; entity_type?: string }>(config.mappingSql, [projectId]);
       const remote = mapping.rows[0];
       if (!remote) {
         await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} project is mapped to this project yet.`);
@@ -182,7 +185,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
       const { truncated } = provider === "jira"
         ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
-        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since);
+        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
 
       await this.runs.setTotals(runId, queued.length);
 
