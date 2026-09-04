@@ -142,6 +142,50 @@ describe("Zyra chat AI routing", () => {
     it("reports an empty session rather than an empty string", () => {
       expect(internals(svc).zyraTranscript([])).toBe("No prior chat.");
     });
+
+    // Basecamp-reported: gap analysis identifies coverage gaps and asks "Would you like me to
+    // generate test cases for any of these gaps?"; the user replies "yes"; nothing happens. That turn
+    // routes `answer` (correctly — it changed nothing), so it never got the PROPOSAL annotation below,
+    // which only ever fires for create/archive/update. This is the same antecedent, for the one action
+    // type that didn't have it.
+    it("flags an answer turn that ends in an offer to act, so a following 'yes' has an antecedent", () => {
+      const transcript = internals(svc).zyraTranscript([
+        {
+          role: "assistant",
+          action_type: "answer",
+          content: "I found 3 coverage gaps around password reset. Would you like me to generate test cases for any of these gaps?",
+          testcases: []
+        }
+      ]);
+      expect(transcript).toContain("this turn ended with an offer to act");
+    });
+
+    it("does not flag an ordinary clarifying question as an offer to act", () => {
+      const transcript = internals(svc).zyraTranscript([
+        { role: "assistant", action_type: "answer", content: "Which module should this cover — checkout or login?", testcases: [] }
+      ]);
+      expect(transcript).not.toContain("offer to act");
+    });
+
+    it("does not flag an answer turn that already reports what it found, with no offer", () => {
+      const transcript = internals(svc).zyraTranscript([
+        { role: "assistant", action_type: "answer", content: "This project has 12 existing test cases covering login.", testcases: [] }
+      ]);
+      expect(transcript).not.toContain("offer to act");
+    });
+
+    it("prefers the PROPOSAL annotation over the offer annotation for a routed create/archive/update turn", () => {
+      const transcript = internals(svc).zyraTranscript([
+        {
+          role: "assistant",
+          action_type: "archive",
+          content: "I found TC-5 Login Test. Should I archive it? Reply yes to confirm.",
+          testcases: []
+        }
+      ]);
+      expect(transcript).toContain("PROPOSAL still awaiting the user's go-ahead");
+      expect(transcript).not.toContain("offer to act");
+    });
   });
 
   describe("intentFromZyraModelAction", () => {

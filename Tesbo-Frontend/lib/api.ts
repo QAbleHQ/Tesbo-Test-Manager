@@ -938,6 +938,13 @@ export interface ZyraChatTestcaseRow {
   reviewRequestId?: string;
 }
 
+/**
+ * Known `ZyraChatMessage.status` values relevant to the Continue affordance. The backend can still
+ * send other values (e.g. "sent", "completed") — `status` stays `string` below so an unrecognized one
+ * degrades to "no Continue button" rather than a type error.
+ */
+export const ZYRA_MESSAGE_TIMED_OUT = "timed_out";
+
 export interface ZyraChatMessage {
   id: string;
   sessionId: string;
@@ -1018,6 +1025,23 @@ export async function sendZyraChatMessage(
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
     body: { message },
+  });
+}
+
+/**
+ * Resumes a turn whose provider call timed out (message.status === ZYRA_MESSAGE_TIMED_OUT) — picks
+ * the SAME turn back up server-side (skipping the routing call if it had already resolved a
+ * suite/count before generation stalled) rather than re-sending the user's message from scratch.
+ * `message` in the response is null when the checkpoint was already claimed by a concurrent call
+ * (a double-click, another tab) — that is not an error, the caller should just re-render `session`.
+ */
+export async function continueZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  messageId: string
+): Promise<{ message: ZyraChatMessage | null; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`, {
+    method: "POST",
   });
 }
 

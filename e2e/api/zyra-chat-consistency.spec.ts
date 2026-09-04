@@ -286,6 +286,143 @@ test.describe("zyra chat ↔ repository consistency", () => {
     expect(liveCaseCount(), "saving the proposal must create the real test case").toBe(1);
   });
 
+  // ─── Continue after a provider timeout (no AI provider configured — see the file header) ──
+  //
+  // legacy.service.ts now puts a bounded timeout on every outbound AI-provider call
+  // (ZYRA_ROUTER_TIMEOUT_MS / ZYRA_GENERATE_TIMEOUT_MS). Before that, a stalled provider left the
+  // request open indefinitely — no reply, no error — exactly what "Zyra doesn't respond" reported.
+  // A timed-out turn is now persisted `status: 'timed_out'` with a `resume_checkpoint`, and
+  // POST .../messages/:messageId/continue (continueZyraChatMessage) picks it back up.
+  //
+  // A REAL stalled provider can't be exercised here (no AI provider is configured for this suite —
+  // see the file header); what's testable without one, and pinned below, is everything downstream of
+  // the provider call: the checkpoint's claim/race semantics, the idempotent double-click behaviour,
+  // and the new-message-supersedes-a-dangling-checkpoint rule. With no key allocated,
+  // buildZyraChatDecision's no-key branch (zyraDegradedDecision) still runs for real inside
+  // continueZyraChatMessage — so the resume path itself, not just its DB bookkeeping, is exercised.
+
+  function seedTimedOutTurn(sessionId: string, checkpoint: Record<string, unknown>): string {
+    const id = scalar(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, resume_checkpoint) VALUES (" +
+        `${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        `${literal("Timed out waiting on the AI provider.")}, 'timed_out', '[]'::jsonb, '[]'::jsonb, ` +
+        `${literal(JSON.stringify(checkpoint))}::jsonb) RETURNING id;`,
+    );
+    return id;
+  }
+
+  function messageStatus(messageId: string): string {
+    return scalar(`SELECT status FROM zyra_chat_messages WHERE id = ${literal(messageId)};`);
+  }
+
+  function assistantMessageCount(sessionId: string): number {
+    return Number(
+      scalar(`SELECT COUNT(*) FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} AND role = 'assistant';`),
+    );
+  }
+
+  test("ZCC-A-13 continuing a router-stage timeout with no AI provider produces a real (degraded) reply and marks the turn resumed", async () => {
+    const sessionId = await newSession("E2E ZCC continue router stage");
+    const timedOutId = seedTimedOutTurn(sessionId, {
+      stage: "router",
+      userMessageId: "00000000-0000-0000-0000-000000000000",
+      message: "Would you like me to generate test cases for these gaps? yes",
+    });
+    const before = assistantMessageCount(sessionId);
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false });
+    expect(res.status(), `continuing a timed-out turn — ${await res.text()}`).toBeLessThan(300);
+    const body = await res.json();
+
+    expect(body.message, "continue must post a real new assistant turn, not echo the timed-out one").toBeTruthy();
+    expect(body.message.id).not.toBe(timedOutId);
+    expect(assistantMessageCount(sessionId), "the timed-out turn's own row must not be deleted or reused").toBe(before + 1);
+    expect(messageStatus(timedOutId), "a resumed checkpoint must not still read as timed_out — it would keep offering Continue").toBe("resumed");
+  });
+
+  test("ZCC-A-14 continuing twice at once only ever produces one follow-up turn", async () => {
+    // The double-click / two-tabs case: the atomic `UPDATE ... WHERE status = 'timed_out'` in
+    // continueZyraChatMessage must let exactly one of two concurrent calls claim the checkpoint.
+    const sessionId = await newSession("E2E ZCC continue race");
+    const timedOutId = seedTimedOutTurn(sessionId, {
+      stage: "router",
+      userMessageId: "00000000-0000-0000-0000-000000000000",
+      message: "yes, go ahead",
+    });
+    const before = assistantMessageCount(sessionId);
+
+    const [first, second] = await Promise.all([
+      asOwner.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false }),
+      asOwner.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false }),
+    ]);
+    expect(first.status(), await first.text()).toBeLessThan(300);
+    expect(second.status(), await second.text()).toBeLessThan(300);
+
+    const [firstBody, secondBody] = await Promise.all([first.json(), second.json()]);
+    const posted = [firstBody, secondBody].filter((b) => b.message !== null);
+    expect(posted.length, "exactly one of two concurrent continues may post a follow-up turn — the loser must see message: null, not a duplicate").toBe(1);
+    expect(assistantMessageCount(sessionId), "a double-click must never generate the same test cases twice").toBe(before + 1);
+  });
+
+  test("ZCC-A-15 continuing an already-resumed turn is a no-op, not an error", async () => {
+    const sessionId = await newSession("E2E ZCC continue already resumed");
+    const timedOutId = seedTimedOutTurn(sessionId, { stage: "router", userMessageId: "00000000-0000-0000-0000-000000000000", message: "yes" });
+    exec(`UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = ${literal(timedOutId)};`);
+    const before = assistantMessageCount(sessionId);
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false });
+    expect(res.status(), `re-clicking Continue on an already-resumed turn — ${await res.text()}`).toBeLessThan(300);
+    const body = await res.json();
+    expect(body.message, "an already-resumed turn has nothing left to claim").toBeNull();
+    expect(assistantMessageCount(sessionId)).toBe(before);
+  });
+
+  test("ZCC-A-16 sending a new message expires a dangling timed-out checkpoint from an earlier turn", async () => {
+    const sessionId = await newSession("E2E ZCC continue superseded");
+    const timedOutId = seedTimedOutTurn(sessionId, { stage: "router", userMessageId: "00000000-0000-0000-0000-000000000000", message: "yes" });
+    expect(messageStatus(timedOutId)).toBe("timed_out");
+
+    const sent = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `E2E ZCC moved on ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(sent.status(), `sending a new message — ${await sent.text()}`).toBeLessThan(300);
+
+    expect(
+      messageStatus(timedOutId),
+      "a new message means the conversation moved past the stalled turn — Continue must not still be able to resolve to it",
+    ).toBe("expired");
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    expect((await res.json()).message, "an expired checkpoint must not be resumable").toBeNull();
+  });
+
+  test("ZCC-A-17 continuing a turn that was never timed out (or already saved cases) is a no-op", async () => {
+    const sessionId = await newSession("E2E ZCC continue non-timeout");
+    const first = await seedCase(`E2E ZCC Continue Case ${Date.now()}`);
+    seedAssistantTurn(sessionId, "I created 1 test case.", [first]);
+    const messageId = scalar(`SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} AND role = 'assistant' LIMIT 1;`);
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    expect((await res.json()).message, "a turn that completed normally has nothing to resume").toBeNull();
+  });
+
+  test("ZCC-A-18 continue is refused to a caller with no access to the project", async () => {
+    const sessionId = await newSession("E2E ZCC continue guarded");
+    const timedOutId = seedTimedOutTurn(sessionId, { stage: "router", userMessageId: "00000000-0000-0000-0000-000000000000", message: "yes" });
+    const asGuest = await loginAs(tenant!.guest);
+    try {
+      const res = await asGuest.post(url(`/chat/sessions/${sessionId}/messages/${timedOutId}/continue`), { failOnStatusCode: false });
+      expect([401, 403, 404], `a non-member resumed a turn they cannot see: ${await res.text()}`).toContain(res.status());
+    } finally {
+      await asGuest.dispose();
+    }
+    // Refused before any claim was attempted — the checkpoint must still be exactly as it was.
+    expect(messageStatus(timedOutId)).toBe("timed_out");
+  });
+
   test("ZCC-A-05 the session read is refused to a caller with no access to the project", { tag: '@tesbo.testId("TES-TC-983")' }, async () => {
     const sessionId = await newSession("E2E ZCC guarded");
     const asGuest = await loginAs(tenant!.guest);

@@ -7,6 +7,7 @@ import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useS
 import { IconChevronRight, IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
 import {
   authMe,
+  continueZyraChatMessage,
   createZyraChatSession,
   getProject,
   getZyraAgent,
@@ -15,6 +16,7 @@ import {
   sendZyraChatMessage,
   stopZyraChatPlan,
   resumeZyraChatPlan,
+  ZYRA_MESSAGE_TIMED_OUT,
   type ZyraAgentState,
   type ZyraChatMessage,
   type ZyraChatSession,
@@ -335,9 +337,20 @@ function resolveContent(message: ZyraChatMessage): { text: string; testcases: Zy
 }
 
 // ─── MessageBubble ────────────────────────────────────────────────────────────
-function MessageBubble({ message, projectId }: { message: ZyraChatMessage; projectId: string }) {
+function MessageBubble({
+  message,
+  projectId,
+  onContinue,
+}: {
+  message: ZyraChatMessage;
+  projectId: string;
+  // Only ever invoked from the Continue button below, which only renders for a timed-out turn — the
+  // happy path (a message that answered normally) never touches this prop at all.
+  onContinue: (messageId: string) => Promise<void>;
+}) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const { text, testcases, reasoning } = isUser ? { text: message.content, testcases: [], reasoning: null } : resolveContent(message);
 
   function handleCopy() {
@@ -345,6 +358,16 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
+  }
+
+  async function handleContinueClick() {
+    if (resuming) return;
+    setResuming(true);
+    try {
+      await onContinue(message.id);
+    } finally {
+      setResuming(false);
+    }
   }
 
   if (isUser) {
@@ -413,6 +436,12 @@ function MessageBubble({ message, projectId }: { message: ZyraChatMessage; proje
           <IconCopy size={13} stroke={1.9} />
           {copied ? "Copied" : "Copy"}
         </button>
+        {/* Only ever shown for a turn the provider never answered in time — never on a normal reply. */}
+        {message.status === ZYRA_MESSAGE_TIMED_OUT && (
+          <Button type="button" size="sm" variant="ai" onClick={handleContinueClick} disabled={resuming}>
+            {resuming ? "Resuming…" : "Continue"}
+          </Button>
+        )}
         <time className="ml-auto font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt)}</time>
       </div>
     </article>
@@ -619,6 +648,22 @@ export default function ZyraChatPage() {
     } finally {
       setSending(false);
       setTimeout(() => textareaRef.current?.focus(), 50);
+    }
+  }
+
+  // Resumes a turn the provider never answered in time (message.status === ZYRA_MESSAGE_TIMED_OUT).
+  // Deliberately does not touch `sending`/ThinkingBubble — those drive the normal send/response cycle,
+  // and this is a distinct, per-message action (MessageBubble tracks its own "Resuming…" state) so a
+  // Continue click can never look like or interfere with an ordinary in-flight send.
+  async function handleContinue(messageId: string) {
+    if (!activeSession) return;
+    setError(null);
+    try {
+      const result = await continueZyraChatMessage(projectId, activeSession.id, messageId);
+      setActiveSession(result.session);
+      void refreshSessions();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not resume that turn — try again.");
     }
   }
 
@@ -838,7 +883,7 @@ export default function ZyraChatPage() {
                   </div>
                 )}
 
-                {messages.map((msg) => <MessageBubble key={msg.id} message={msg} projectId={projectId} />)}
+                {messages.map((msg) => <MessageBubble key={msg.id} message={msg} projectId={projectId} onContinue={handleContinue} />)}
                 {sending && <ThinkingBubble />}
                 {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
                 <div ref={endRef} />
