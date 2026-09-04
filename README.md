@@ -435,3 +435,4 @@ Match CORS / URLs to these ports in `.env`.
 - [ ] Created or opened a project → added cases → created a **Cycle** → marked **Passed/Failed**  
 
 If you follow this checklist top to bottom, setup should complete without guesswork.
+#hi
