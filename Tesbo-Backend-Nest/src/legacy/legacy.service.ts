@@ -3287,9 +3287,12 @@ export class LegacyService implements OnModuleInit {
       throw new BadRequestException({ error: `An import is limited to ${MAX_ROWS} rows per request.` });
     }
 
-    // The suite the user had open when they hit Import, used as the parent for rows that leave the
-    // suite column blank. It arrives as client input like everything else, so it is confirmed to be a
-    // suite in THIS project before any row is parented to it.
+    // The suite the user had open when they hit Import. Rows that leave the suite column blank are
+    // parented directly to it; rows that name a suite of their own get that suite created/resolved
+    // as a CHILD of this one instead of at the project root, so importing from inside a suite always
+    // lands the file's structure under it rather than scattering new root-level suites. It arrives as
+    // client input like everything else, so it is confirmed to be a suite in THIS project before any
+    // row is parented to it.
     let defaultSuiteId: string | null = null;
     if (body?.defaultSuiteId) {
       const candidate = String(body.defaultSuiteId);
@@ -3519,28 +3522,59 @@ export class LegacyService implements OnModuleInit {
    * a time as it walked the rows. The whole chunk's names are known up front, so the missing ones go
    * in one insert per level — the top-level suites first, since the components need their parents to
    * exist before they can point at them.
+   *
+   * "Top-level" here means "child of the suite the user had open" (ctx.defaultSuiteId), not
+   * necessarily the project root: a row's own Suite column nests under wherever Import was launched
+   * from, exactly like a Component column nests under its row's resolved suite. When no suite was
+   * open (ctx.defaultSuiteId is null — the "All test cases" / project-root view), that parent is null
+   * and suite-named rows land at the root, same as before this nested behaviour existed.
+   *
+   * ctx.suiteIdByKey starts as a snapshot taken once at the top of importTestCases, before any lock
+   * is held — a second import into the same project, running concurrently and naming the same new
+   * suite, would see the same gap and (without the rescans below) both insert it, leaving two
+   * same-named siblings. By the time this method runs, the caller already holds
+   * pg_advisory_xact_lock(hashtext(`testcase-external-id:<projectId>`)) for the rest of this
+   * transaction, so any concurrent import for this project is either done and committed or still
+   * queued behind that same lock — never interleaved with what follows. Re-querying just the
+   * candidate parent(s) here, rather than trusting the stale snapshot, is what actually closes the
+   * race: a sibling a concurrent import just committed is now visible and reused instead of
+   * recreated. (This does not cover a plain "New Suite" click racing an import — that path takes no
+   * such lock, and already tolerates duplicate sibling names today; unchanged here.)
    */
   private async resolveImportSuites(client: PoolClient, ctx: ImportContext, prepared: PreparedImportRow[]): Promise<void> {
     const missingTop = new Map<string, string>();
     for (const row of prepared) {
       if (!row.suiteName) continue;
-      const key = importSuiteKey(row.suiteName, null);
+      const key = importSuiteKey(row.suiteName, ctx.defaultSuiteId);
       if (!ctx.suiteIdByKey.has(key)) missingTop.set(key, row.suiteName);
+    }
+    if (missingTop.size) {
+      const rescan = await client.query<{ id: string; name: string }>(
+        ctx.defaultSuiteId
+          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2"
+          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL",
+        ctx.defaultSuiteId ? [ctx.projectId, ctx.defaultSuiteId] : [ctx.projectId]
+      );
+      for (const row of rescan.rows) {
+        const key = importSuiteKey(row.name, ctx.defaultSuiteId);
+        ctx.suiteIdByKey.set(key, row.id);
+        missingTop.delete(key);
+      }
     }
     if (missingTop.size) {
       const created = await client.query<{ id: string; name: string }>(
         `INSERT INTO suites (project_id, parent_id, name, position)
-         SELECT $1, NULL, v.name, 0 FROM jsonb_to_recordset($2::jsonb) AS v(name text)
+         SELECT $1, $3::uuid, v.name, 0 FROM jsonb_to_recordset($2::jsonb) AS v(name text)
          RETURNING id, name`,
-        [ctx.projectId, JSON.stringify(Array.from(missingTop.values(), (name) => ({ name })))]
+        [ctx.projectId, JSON.stringify(Array.from(missingTop.values(), (name) => ({ name }))), ctx.defaultSuiteId]
       );
-      for (const row of created.rows) ctx.suiteIdByKey.set(importSuiteKey(row.name, null), row.id);
+      for (const row of created.rows) ctx.suiteIdByKey.set(importSuiteKey(row.name, ctx.defaultSuiteId), row.id);
     }
 
     const missingChild = new Map<string, { parent_id: string; name: string }>();
     for (const row of prepared) {
       row.parentSuiteId = row.suiteName
-        ? ctx.suiteIdByKey.get(importSuiteKey(row.suiteName, null)) ?? null
+        ? ctx.suiteIdByKey.get(importSuiteKey(row.suiteName, ctx.defaultSuiteId)) ?? ctx.defaultSuiteId
         : ctx.defaultSuiteId;
       if (!row.componentName || !row.parentSuiteId) continue;
       // A row that names a component but no suite nests under whatever the user had open, and that
@@ -3548,6 +3582,18 @@ export class LegacyService implements OnModuleInit {
       if (!row.suiteName) ctx.expandSuiteIds.add(row.parentSuiteId);
       const key = importSuiteKey(row.componentName, row.parentSuiteId);
       if (!ctx.suiteIdByKey.has(key)) missingChild.set(key, { parent_id: row.parentSuiteId, name: row.componentName });
+    }
+    if (missingChild.size) {
+      const parentIds = Array.from(new Set(Array.from(missingChild.values(), (v) => v.parent_id)));
+      const rescan = await client.query<{ id: string; parent_id: string; name: string }>(
+        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[])",
+        [ctx.projectId, parentIds]
+      );
+      for (const row of rescan.rows) {
+        const key = importSuiteKey(row.name, row.parent_id);
+        ctx.suiteIdByKey.set(key, row.id);
+        missingChild.delete(key);
+      }
     }
     if (missingChild.size) {
       const created = await client.query<{ id: string; parent_id: string; name: string }>(

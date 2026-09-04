@@ -15,14 +15,17 @@ import {
 
 /*
  * Getting data out of Tesbo and back into it: the test case CSV/XLSX exports, the import template,
- * the (stubbed) server-side import routes, and the run export.
+ * the server-side import route, and the run export.
  *
- * Where the import actually happens matters for reading this file: POST testcases/import/preview and
- * POST testcases/import are stubs in legacy.controller.ts that return a fixed empty payload. The real
- * import is client-side — components/ImportTestCasesModal.tsx parses the workbook in the browser and
- * POSTs one createTestCase per row — so the row-level import behaviour is covered in
- * ui/testcase-import.spec.ts, and what's asserted here is only that the dead routes don't hand a
- * caller a fabricated success.
+ * Where the import actually happens matters for reading this file: POST testcases/import/preview
+ * was never built (the preview is the parsed workbook, held in the browser — see
+ * components/ImportTestCasesModal.tsx — and never needed a round trip), but POST testcases/import
+ * itself is a real, server-side bulk commit (LegacyService.importTestCases): the browser still
+ * parses the workbook and maps columns, then POSTs the whole row set once. That row set names each
+ * row's suite/component by NAME, and the endpoint resolves/creates those suites itself — including
+ * nesting them under whichever suite the browser had open (`defaultSuiteId`) rather than always at
+ * the project root — so the "suite placement on import" section below exercises that endpoint
+ * directly rather than through the UI.
  *
  * Runs against its own disposable workspace ("import-export"): the exports assert on the WHOLE
  * project's contents, so a shared project other specs are seeding into would make the row counts
@@ -474,11 +477,12 @@ test.describe("import / export", () => {
     expect(unknownRes.status(), "a project that doesn't exist has no template").toBe(404);
   });
 
-  /* ───────────────────────── the server-side import routes ───────────────────────── */
+  /* ───────────────────────── the server-side import route ───────────────────────── */
 
   test("the import routes refuse an anonymous caller", { tag: '@tesbo.testId("TES-TC-214")' }, async () => {
-    // Red: previewImport()/executeImport() take no @Req() and no @Body() — they return a fixed
-    // payload to anyone. Harmless today only because they do nothing at all.
+    // /import/preview was never built (see the file header) so it 404s regardless of auth; /import
+    // is the real bulk-commit route (requireUser inside LegacyService.importTestCases) and must
+    // reject an unauthenticated caller before it ever looks at the body.
     for (const path of [
       `/api/projects/${projectId}/testcases/import/preview`,
       `/api/projects/${projectId}/testcases/import`,
@@ -490,15 +494,12 @@ test.describe("import / export", () => {
     }
   });
 
-  test("the import routes do not report a success they didn't perform", { tag: '@tesbo.testId("TES-TC-215")' }, async () => {
-    // Red: both routes are stubs. preview returns {uploadId:"local-upload", totalRows:0} for any
-    // file, and import returns {imported:0} without reading its body — so a client that trusts
-    // either one silently imports nothing and is told everything went fine.
-    //
-    // The real import lives in the browser (ImportTestCasesModal calls createTestCase per row), so
-    // the fix is either to implement these server-side or to delete them along with the dead
-    // previewImport/executeImport helpers in Tesbo-Frontend/lib/api.ts. This asserts the property
-    // that holds under either fix: a 2xx here must mean rows were actually imported.
+  test("a legacy-shaped import body is rejected, not silently accepted as zero rows", { tag: '@tesbo.testId("TES-TC-215")' }, async () => {
+    // The endpoint's real contract is { rows: [...] } (see "imports rows..." below for the happy
+    // path). A caller still sending the older preview/columnMapping shape has no `rows` array, so
+    // `rows` normalizes to [] and importTestCases refuses it outright — it must never come back as
+    // a 2xx claiming an empty success, which is what a client polling `imported` would otherwise
+    // read as "nothing needed importing" instead of "the request was malformed."
     const before = await (await asOwner.get(`/api/projects/${projectId}/testcases`)).json();
     const countBefore = Array.isArray(before) ? before.length : before.total;
 
@@ -507,16 +508,291 @@ test.describe("import / export", () => {
       failOnStatusCode: false,
     });
 
-    if (res.status() < 300) {
-      const body = await res.json();
-      const after = await (await asOwner.get(`/api/projects/${projectId}/testcases`)).json();
-      const countAfter = Array.isArray(after) ? after.length : after.total;
-      expect(countAfter - countBefore, "the reported count must match what landed").toBe(body.imported);
-      expect(body.imported, "the stub reports 0 imported for every request").toBeGreaterThan(0);
-    } else {
-      expect([400, 404, 501]).toContain(res.status());
-    }
+    expect(res.status(), "a body with no rows array must be refused, not treated as zero rows").toBe(400);
+    const after = await (await asOwner.get(`/api/projects/${projectId}/testcases`)).json();
+    const countAfter = Array.isArray(after) ? after.length : after.total;
+    expect(countAfter, "a refused request must not create anything").toBe(countBefore);
   });
+
+  /* ───────────────────────── suite placement on import ─────────────────────────
+   *
+   * Basecamp-style report: importing while a suite/sub-suite is open should land the file's test
+   * cases in that suite; instead LegacyService.resolveImportSuites always resolved a row's own Suite
+   * column as a project-ROOT suite, only ever consulting the open suite (`defaultSuiteId`) as the
+   * fallback for rows that left the column blank. Fixed by resolving/creating a named suite as a
+   * CHILD of `defaultSuiteId` instead of the root — the same name+parent scoping the code already
+   * used for Component nesting. Every test below runs against its own project: several assert on the
+   * project's whole suite list, which a shared project would make ambiguous once more than one test
+   * has created same-named suites in it.
+   */
+
+  interface ImportSuiteRow {
+    id: string;
+    parentId: string | null;
+    name: string;
+    testCaseCount: number;
+  }
+
+  const createSuite = async (name: string, parentId: string | undefined, project: string): Promise<ImportSuiteRow> => {
+    const res = await asOwner.post(`/api/projects/${project}/suites`, { data: { name, parentId } });
+    if (!res.ok()) throw new Error(`Could not create suite ${name} (${res.status()}): ${await res.text()}`);
+    return res.json();
+  };
+
+  const suitesOf = async (project: string): Promise<ImportSuiteRow[]> =>
+    (await (await asOwner.get(`/api/projects/${project}/suites`)).json()) as ImportSuiteRow[];
+
+  const casesInSuite = async (suiteId: string, project: string) =>
+    (await (await asOwner.get(`/api/projects/${project}/testcases?suiteId=${suiteId}`)).json()) as {
+      rows: { id: string; title: string }[];
+      total: number;
+    };
+
+  const importRows = async (
+    project: string,
+    rows: Record<string, unknown>[],
+    defaultSuiteId?: string,
+    failOnStatusCode = true,
+  ) =>
+    asOwner.post(`/api/projects/${project}/testcases/import`, {
+      data: { rows, defaultSuiteId },
+      failOnStatusCode,
+    });
+
+  test(
+    "a row with a blank Suite column lands directly in the suite Import was launched from",
+    { tag: '@tesbo.testId("TES-TC-2000")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Blank ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const title = `E2E Import Blank Suite ${stamp}`;
+
+      const res = await importRows(project, [{ rowNumber: 1, title }], open.id);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const cases = await casesInSuite(open.id, project);
+      expect(cases.rows.map((r) => r.title)).toContain(title);
+    },
+  );
+
+  test(
+    "a row naming a new suite nests it under the suite Import was launched from, not the project root",
+    { tag: '@tesbo.testId("TES-TC-2001")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest New ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const namedSuite = `E2E Named ${stamp}`;
+
+      const res = await importRows(project, [{ rowNumber: 1, title: `E2E Import Named Suite ${stamp}`, suite: namedSuite }], open.id);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      const matches = suites.filter((s) => s.name === namedSuite);
+      expect(matches, "exactly one suite must be created for the name — not one at root and one nested").toHaveLength(1);
+      expect(
+        matches[0].parentId,
+        "the named suite must nest under the suite Import was launched from, not sit at the project root",
+      ).toBe(open.id);
+    },
+  );
+
+  test(
+    "a row naming a suite that already exists as a child of the open suite reuses it, not duplicates it",
+    { tag: '@tesbo.testId("TES-TC-2002")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Reuse ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const childName = `E2E Existing Child ${stamp}`;
+      const existingChild = await createSuite(childName, open.id, project);
+      const title = `E2E Import Reuse Child ${stamp}`;
+
+      const res = await importRows(project, [{ rowNumber: 1, title, suite: childName }], open.id);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      expect(suites.filter((s) => s.name === childName), "no second suite of the same name+parent").toHaveLength(1);
+      const cases = await casesInSuite(existingChild.id, project);
+      expect(cases.rows.map((r) => r.title)).toContain(title);
+    },
+  );
+
+  test(
+    "a row naming a suite that exists elsewhere in the project does not reuse it across parents",
+    { tag: '@tesbo.testId("TES-TC-2003")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Cross ${stamp}`);
+      const sharedName = `E2E Shared Name ${stamp}`;
+      const rootSuite = await createSuite(sharedName, undefined, project);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const title = `E2E Import Cross Parent ${stamp}`;
+
+      const res = await importRows(project, [{ rowNumber: 1, title, suite: sharedName }], open.id);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      const matches = suites.filter((s) => s.name === sharedName);
+      expect(matches, "the pre-existing root suite and a new nested one, not a single shared node").toHaveLength(2);
+      expect(matches.some((s) => s.id === rootSuite.id && s.parentId === null)).toBe(true);
+      expect(matches.some((s) => s.parentId === open.id)).toBe(true);
+
+      // The pre-existing root suite must not have gained the imported row.
+      const rootCases = await casesInSuite(rootSuite.id, project);
+      expect(rootCases.total).toBe(0);
+    },
+  );
+
+  test(
+    "Suite and Component columns together nest two levels under the open suite",
+    { tag: '@tesbo.testId("TES-TC-2004")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Component ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const suiteName = `E2E Two Level Suite ${stamp}`;
+      const componentName = `E2E Two Level Component ${stamp}`;
+      const title = `E2E Import Two Level ${stamp}`;
+
+      const res = await importRows(project, [{ rowNumber: 1, title, suite: suiteName, component: componentName }], open.id);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      const suiteNode = suites.find((s) => s.name === suiteName && s.parentId === open.id);
+      expect(suiteNode, "the Suite column nests under the open suite").toBeTruthy();
+      const componentNode = suites.find((s) => s.name === componentName && s.parentId === suiteNode!.id);
+      expect(componentNode, "the Component column nests one level further, under the resolved suite").toBeTruthy();
+
+      const cases = await casesInSuite(componentNode!.id, project);
+      expect(cases.rows.map((r) => r.title)).toContain(title);
+    },
+  );
+
+  test(
+    "with no suite open, a row naming a suite still lands it at the project root (unchanged)",
+    { tag: '@tesbo.testId("TES-TC-2005")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Root ${stamp}`);
+      const namedSuite = `E2E Root Named ${stamp}`;
+
+      // No defaultSuiteId at all — the "All test cases" / project-root view.
+      const res = await importRows(project, [{ rowNumber: 1, title: `E2E Import Root Suite ${stamp}`, suite: namedSuite }]);
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      const created = suites.find((s) => s.name === namedSuite);
+      expect(created, "the suite must still be created").toBeTruthy();
+      expect(created!.parentId, "with nothing open, a named suite still lands at the project root").toBeNull();
+    },
+  );
+
+  test(
+    "an invalid or cross-project defaultSuiteId is refused, not silently used or crossing projects",
+    { tag: '@tesbo.testId("TES-TC-2006")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Invalid ${stamp}`);
+      const otherProject = await newProject(`E2E Import Nest Foreign ${stamp}`);
+      const foreignSuite = await createSuite(`E2E Foreign Suite ${stamp}`, undefined, otherProject);
+
+      const bogusRes = await importRows(
+        project,
+        [{ rowNumber: 1, title: `E2E Import Bogus Default ${stamp}` }],
+        "00000000-0000-0000-0000-000000000000",
+        false,
+      );
+      expect(bogusRes.status(), "a defaultSuiteId that names no suite at all must be refused").toBe(400);
+
+      const foreignRes = await importRows(
+        project,
+        [{ rowNumber: 1, title: `E2E Import Foreign Default ${stamp}` }],
+        foreignSuite.id,
+        false,
+      );
+      expect(
+        foreignRes.status(),
+        "a defaultSuiteId belonging to a different project must be refused, not accepted cross-project",
+      ).toBe(400);
+
+      const foreignCases = await casesInSuite(foreignSuite.id, otherProject);
+      expect(foreignCases.total, "nothing must have landed in the other project's suite").toBe(0);
+    },
+  );
+
+  test(
+    "an import spanning multiple 1000-row chunks creates exactly one suite for a name repeated across chunks",
+    { tag: '@tesbo.testId("TES-TC-2007")' },
+    async () => {
+      test.setTimeout(120_000);
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Chunked ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const namedSuite = `E2E Chunked Suite ${stamp}`;
+      // CHUNK_SIZE in importTestCases is 1000, so this exercises the cache carried across chunk 1
+      // and chunk 2 rather than just the single-statement path every other test here takes.
+      const rowCount = 1500;
+      const rows = Array.from({ length: rowCount }, (_, i) => ({
+        rowNumber: i + 1,
+        title: `E2E Chunk Row ${stamp} ${i}`,
+        suite: namedSuite,
+      }));
+
+      const res = await importRows(project, rows, open.id);
+      expect(res.status()).toBe(200);
+      const body = await res.json();
+      expect(body.imported, "every row across both chunks must land").toBe(rowCount);
+      expect(body.errors).toEqual([]);
+
+      const suites = await suitesOf(project);
+      const matches = suites.filter((s) => s.name === namedSuite);
+      expect(matches, "one suite for the whole import, not one recreated per chunk").toHaveLength(1);
+      expect(matches[0].parentId).toBe(open.id);
+      expect(matches[0].testCaseCount).toBe(rowCount);
+    },
+  );
+
+  test(
+    "two concurrent imports naming the same new suite under the same open suite do not create duplicate suites",
+    { tag: '@tesbo.testId("TES-TC-2008")' },
+    async () => {
+      // Closes a race the request-lifetime suiteIdByKey snapshot otherwise leaves open: two imports
+      // for the same project, each starting from a snapshot that predates the other's commit, both
+      // deciding the same new suite name is missing. resolveImportSuites now re-checks the database
+      // for the specific candidate parent(s) after the per-project advisory lock is already held, so
+      // whichever request commits first is visible to the second before it decides to insert.
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Nest Concurrent ${stamp}`);
+      const open = await createSuite(`E2E Open ${stamp}`, undefined, project);
+      const namedSuite = `E2E Concurrent Suite ${stamp}`;
+
+      const [resA, resB] = await Promise.all([
+        importRows(project, [{ rowNumber: 1, title: `E2E Concurrent Row A ${stamp}`, suite: namedSuite }], open.id, false),
+        importRows(project, [{ rowNumber: 1, title: `E2E Concurrent Row B ${stamp}`, suite: namedSuite }], open.id, false),
+      ]);
+      expect(resA.status(), "both concurrent imports must succeed").toBe(200);
+      expect(resB.status(), "both concurrent imports must succeed").toBe(200);
+      expect((await resA.json()).imported).toBe(1);
+      expect((await resB.json()).imported).toBe(1);
+
+      const suites = await suitesOf(project);
+      const matches = suites.filter((s) => s.name === namedSuite);
+      expect(
+        matches,
+        "two concurrent imports naming the same new suite under the same parent must not race into two siblings",
+      ).toHaveLength(1);
+      expect(matches[0].parentId).toBe(open.id);
+      expect(matches[0].testCaseCount, "both rows must have landed in the single suite").toBe(2);
+    },
+  );
 
   /* ───────────────────────── run (cycle) CSV export ───────────────────────── */
 
@@ -699,13 +975,23 @@ test.describe("import / export", () => {
       });
       expect(workbookRes.status(), "…in both formats").toBe(200);
 
-      // What the import wizard actually does, row by row.
+      // The single-create route the wizard used before the bulk endpoint existed.
       const importRes = await asOwner.post(`/api/projects/${locked}/testcases`, {
         data: { title: `E2E Export Locked Import ${stamp}` },
         failOnStatusCode: false,
       });
       expect(importRes.status(), "importing into a locked project is refused").toBe(403);
       expect((await importRes.json()).error).toContain("read-only");
+
+      // ProjectWriteLockGuard is applied globally by path pattern, not per-route, so the real bulk
+      // import endpoint the wizard actually calls today must be refused the same way — checked
+      // explicitly rather than assumed, since it's the exact route the suite-nesting fix touches.
+      const bulkImportRes = await asOwner.post(`/api/projects/${locked}/testcases/import`, {
+        data: { rows: [{ title: `E2E Export Locked Bulk Import ${stamp}` }] },
+        failOnStatusCode: false,
+      });
+      expect(bulkImportRes.status(), "bulk-importing into a locked project is refused").toBe(403);
+      expect((await bulkImportRes.json()).error).toContain("read-only");
     } finally {
       setProPlan(tenant!.organizationId);
     }
