@@ -8396,6 +8396,7 @@ export class LegacyService implements OnModuleInit {
            connected_by = EXCLUDED.connected_by,
            auth_method = 'oauth',
            personal_token_identifier = NULL,
+           disconnected_at = NULL,
            updated_at = now()
          RETURNING id, external_id, site_url`,
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
@@ -8433,6 +8434,7 @@ export class LegacyService implements OnModuleInit {
          connected_by = EXCLUDED.connected_by,
          auth_method = 'oauth',
          personal_token_identifier = NULL,
+         disconnected_at = NULL,
          updated_at = now()
        RETURNING id, site_url`,
       [workspace.id, String(org.id || ""), `https://linear.app/${org.urlKey}`, encryptSecret(accessToken), encryptSecret(String(token.refresh_token || "")), expiresAt, userId || null]
@@ -8444,10 +8446,30 @@ export class LegacyService implements OnModuleInit {
     const p = assertIntegrationProvider(provider);
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
-    // Settle any in-flight sync before the DELETE's cascade touches the same rows the sync
-    // processor may be concurrently writing (see failActiveRunsForConnection's own comment).
+    // Settle any in-flight sync before touching the connection, so the sync processor isn't
+    // concurrently writing to a run this same disconnect is about to invalidate.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
-    await this.db.query("DELETE FROM integration_connections WHERE organization_id = $1 AND provider = $2", [workspace.id, p]);
+    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
+    // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
+    // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
+    // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
+    // live credentials (so it can't be used even if some path forgets to check disconnected_at),
+    // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
+    // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
+    await this.db.transaction(async (client) => {
+      await client.query(
+        "UPDATE integration_connections SET disconnected_at = now(), access_token = '', refresh_token = '', updated_at = now() WHERE organization_id = $1 AND provider = $2",
+        [workspace.id, p]
+      );
+      await client.query(
+        `UPDATE ${mappingsTable} SET enabled = false
+         WHERE enabled = true AND ${connectionColumn} = (
+           SELECT id FROM integration_connections WHERE organization_id = $1 AND provider = $2
+         )`,
+        [workspace.id, p]
+      );
+    });
     return { disconnected: true };
   }
 
@@ -8502,12 +8524,22 @@ export class LegacyService implements OnModuleInit {
    */
   private async jiraStatusForProject(projectId: string) {
     const connection = await this.getJiraConnection(projectId, false);
-    if (!connection) return { connected: false, connectedProjects: [] };
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
     const projects = await this.db.query(
       `SELECT id, jira_project_id, jira_project_key, jira_project_name, created_at
        FROM jira_project_mappings
        WHERE project_id = $1 AND enabled = true
        ORDER BY jira_project_key`,
+      [projectId]
+    );
+    // Every Jira project this Tesbo project has ever been linked to (never deleted, only disabled)
+    // — lets the UI offer a "previously linked" source picker instead of that history being
+    // reachable only by direct DB inspection.
+    const history = await this.db.query(
+      `SELECT id, jira_project_id, jira_project_key, jira_project_name, created_at
+       FROM jira_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
       [projectId]
     );
     return {
@@ -8518,7 +8550,8 @@ export class LegacyService implements OnModuleInit {
       tokenExpiresAt: connection.token_expires_at,
       connectedBy: connection.connected_by,
       createdAt: connection.created_at,
-      connectedProjects: projects.rows.map(toCamel)
+      connectedProjects: projects.rows.map(toCamel),
+      history: history.rows.map(toCamel)
     };
   }
 
@@ -8650,6 +8683,19 @@ export class LegacyService implements OnModuleInit {
     const search = String(query.search || "").trim();
     const filters = ["project_id = $1"];
     const values: any[] = [projectId];
+    // No remoteId: scope to whatever's *currently* mapped, so a project that has ever been
+    // switched to a different Jira project doesn't mix the two together (this was the bug).
+    // An explicit remoteId (from the mapping "history" list) opts into browsing one specific past
+    // mapping's tickets instead.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(
+        `mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`
+      );
+    }
     if (search) {
       values.push(`%${search}%`);
       filters.push(`(jira_issue_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
@@ -8749,7 +8795,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async getIntegrationConnection(organizationId: string, provider: IntegrationProvider, refresh: boolean): Promise<Body | null> {
-    const res = await this.db.query("SELECT * FROM integration_connections WHERE organization_id = $1 AND provider = $2", [organizationId, provider]);
+    // disconnected_at IS NULL: a soft-disconnected row (integrationDisconnect) still exists so its
+    // historical tickets/mappings stay intact, but must read as "not connected" everywhere.
+    const res = await this.db.query(
+      "SELECT * FROM integration_connections WHERE organization_id = $1 AND provider = $2 AND disconnected_at IS NULL",
+      [organizationId, provider]
+    );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
     if (!refresh || new Date(connection.token_expires_at).getTime() > Date.now() + 60_000) return connection;
@@ -8842,12 +8893,22 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", false);
-    if (!connection) return { connected: false, connectedProjects: [] };
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
     const teams = await this.db.query(
-      `SELECT id, linear_team_id, linear_team_key, linear_team_name, created_at
+      `SELECT id, linear_team_id, linear_team_key, linear_team_name, entity_type, created_at
        FROM linear_project_mappings
        WHERE project_id = $1 AND enabled = true
        ORDER BY linear_team_key`,
+      [projectId]
+    );
+    // Every Linear team/project this Tesbo project has ever been linked to (never deleted, only
+    // disabled) — lets the UI offer a "previously linked" source picker instead of that history
+    // being reachable only by direct DB inspection.
+    const history = await this.db.query(
+      `SELECT id, linear_team_id, linear_team_key, linear_team_name, entity_type, created_at
+       FROM linear_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
       [projectId]
     );
     return {
@@ -8857,7 +8918,8 @@ export class LegacyService implements OnModuleInit {
       tokenExpiresAt: connection.token_expires_at,
       connectedBy: connection.connected_by,
       createdAt: connection.created_at,
-      connectedProjects: teams.rows.map(toCamel)
+      connectedProjects: teams.rows.map(toCamel),
+      history: history.rows.map(toCamel)
     };
   }
 
@@ -8992,6 +9054,17 @@ export class LegacyService implements OnModuleInit {
     const search = String(query.search || "").trim();
     const filters = ["project_id = $1"];
     const values: any[] = [projectId];
+    // See jiraTickets' identical comment: default scope is the currently mapped team/project only;
+    // remoteId opts into a specific past mapping from the "history" list instead.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(
+        `mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`
+      );
+    }
     if (search) {
       values.push(`%${search}%`);
       filters.push(`(linear_issue_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
@@ -9033,13 +9106,17 @@ export class LegacyService implements OnModuleInit {
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
-      FROM jira_tickets WHERE project_id = $1
+      FROM jira_tickets
+      WHERE project_id = $1
+        AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
       UNION ALL
       SELECT id, 'linear' AS source, linear_issue_key AS key, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
-      FROM linear_tickets WHERE project_id = $1
+      FROM linear_tickets
+      WHERE project_id = $1
+        AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
     `;
     const filters: string[] = [];
     const values: any[] = [projectId];
@@ -9076,17 +9153,26 @@ export class LegacyService implements OnModuleInit {
   // lists are derived from what's actually in the project rather than a hardcoded set.
   async requirementsSummary(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const bySource = async (table: "jira_tickets" | "linear_tickets", keyColumn: "jira_issue_key" | "linear_issue_key") => {
+    const bySource = async (
+      table: "jira_tickets" | "linear_tickets",
+      keyColumn: "jira_issue_key" | "linear_issue_key",
+      mappingTable: "jira_project_mappings" | "linear_project_mappings",
+      remoteIdColumn: "jira_project_id" | "linear_team_id"
+    ) => {
+      // Same "scope to the currently mapped entity only" rule as jiraTickets/linearTickets/
+      // allTickets, so the stat strip and filter dropdowns never count tickets from a
+      // since-switched-away-from project/team alongside the current one.
+      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)`;
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
                   SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND t.deleted_at IS NULL
                 ))::int AS covered
-         FROM ${table} src WHERE project_id = $1`,
+         FROM ${table} src WHERE ${scope}`,
         [projectId]
       );
-      const types = await this.db.query(`SELECT DISTINCT issue_type FROM ${table} WHERE project_id = $1 AND issue_type <> '' ORDER BY issue_type`, [projectId]);
-      const statuses = await this.db.query(`SELECT DISTINCT status FROM ${table} WHERE project_id = $1 AND status <> '' ORDER BY status`, [projectId]);
+      const types = await this.db.query(`SELECT DISTINCT issue_type FROM ${table} WHERE ${scope} AND issue_type <> '' ORDER BY issue_type`, [projectId]);
+      const statuses = await this.db.query(`SELECT DISTINCT status FROM ${table} WHERE ${scope} AND status <> '' ORDER BY status`, [projectId]);
       const total = stats.rows[0]?.total ?? 0;
       const covered = stats.rows[0]?.covered ?? 0;
       return {
@@ -9098,8 +9184,8 @@ export class LegacyService implements OnModuleInit {
       };
     };
     const [jira, linear] = await Promise.all([
-      bySource("jira_tickets", "jira_issue_key"),
-      bySource("linear_tickets", "linear_issue_key")
+      bySource("jira_tickets", "jira_issue_key", "jira_project_mappings", "jira_project_id"),
+      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id")
     ]);
     const all = {
       total: jira.total + linear.total,
@@ -11274,7 +11360,7 @@ export class LegacyService implements OnModuleInit {
     }];
     const claimRes = await this.db.query(
       `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now()
-       WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING id`,
+       WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING *`,
       [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback]
     );
     if (claimRes.rowCount === 0) {
@@ -11297,11 +11383,77 @@ export class LegacyService implements OnModuleInit {
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
     const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
+    // Regeneration is a real provider call (the same one processZyraTask makes for the initial
+    // generation) and routinely takes tens of seconds. Fire it off the same way processZyraTask
+    // does — the claim UPDATE above already moved the task to 'todo' and is what the caller needs
+    // to see; the reviewer gets an immediate response instead of the request hanging until the
+    // model finishes, and the existing todo/in_progress poll (see the frontend task-detail page)
+    // picks up the regenerated drafts once processZyraFeedback below finishes.
+    void this.processZyraFeedback(projectId, taskId, {
+      userId: uid,
+      story,
+      context,
+      acceptanceCriteria,
+      feedback,
+      feedbackText,
+      referenceNote,
+      jiraIssueKeys,
+      linearIssueKeys,
+      additionalJiraIssueKeys,
+      additionalLinearIssueKeys,
+      requestedCount,
+      testcaseRange,
+      provider,
+      model,
+      allocation: allocation.rows[0],
+      previousSourceSummary: existing.rows[0].source_summary
+    }).catch(() => undefined);
+    return {
+      generationRequestId: taskId,
+      task: this.formatAiTask(claimRes.rows[0]),
+      provider,
+      drafts: [],
+      generatedCount: 0,
+      tokenUsage: { input: 0, output: 0, total: 0 }
+    };
+  }
+
+  // Background continuation of zyraFeedback, split out so the HTTP request can return as soon as
+  // the task is claimed instead of blocking on the provider call below (which routinely takes tens
+  // of seconds) — mirrors processZyraTask's fire-and-forget shape for the initial generation.
+  private async processZyraFeedback(
+    projectId: string,
+    taskId: string,
+    options: {
+      userId: string;
+      story: string;
+      context: string;
+      acceptanceCriteria: string;
+      feedback: string;
+      feedbackText: string;
+      referenceNote: string;
+      jiraIssueKeys: string[];
+      linearIssueKeys: string[];
+      additionalJiraIssueKeys: string[];
+      additionalLinearIssueKeys: string[];
+      requestedCount: number;
+      testcaseRange: string;
+      provider: string;
+      model: string;
+      allocation: Body;
+      previousSourceSummary: unknown;
+    }
+  ): Promise<void> {
+    const {
+      userId, story, context, acceptanceCriteria, feedback, feedbackText, referenceNote,
+      jiraIssueKeys, linearIssueKeys, additionalJiraIssueKeys, additionalLinearIssueKeys,
+      requestedCount, testcaseRange, provider, model, allocation, previousSourceSummary
+    } = options;
     try {
       // These four snapshots are independent reads (knowledge base, Jira, Linear, existing
       // testcases) — gathering them concurrently instead of one after another cuts this stage's
       // wall time down to the slowest of the four instead of their sum, without changing what any
-      // of them return. The request still awaits the full pipeline before responding, same as before.
+      // of them return.
       const [knowledge, jira, linear, existingTestcases] = await Promise.all([
         this.knowledgeSnapshot(projectId),
         this.jiraSnapshot(projectId, jiraIssueKeys),
@@ -11311,10 +11463,10 @@ export class LegacyService implements OnModuleInit {
       const aiResult = await this.generateZyraWithProvider({
         provider,
         model,
-        apiKey: allocation.rows[0].api_key,
-        baseUrl: allocation.rows[0].base_url,
-        authHeaderName: allocation.rows[0].auth_header_name,
-        authScheme: allocation.rows[0].auth_scheme,
+        apiKey: allocation.api_key,
+        baseUrl: allocation.base_url,
+        authHeaderName: allocation.auth_header_name,
+        authScheme: allocation.auth_scheme,
         projectId,
         input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
       });
@@ -11327,7 +11479,7 @@ export class LegacyService implements OnModuleInit {
         { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
         { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
       ];
-      const previousSources = normalizeJsonArray(existing.rows[0].source_summary);
+      const previousSources = normalizeJsonArray(previousSourceSummary);
       const nextSources = [
         ...previousSources,
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
@@ -11358,13 +11510,11 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(linearIssueKeys)
         ]
       );
-      let responseRow = res.rows[0];
+      const responseRow = res.rows[0];
       if (!responseRow) {
         // Something else (a close/save from another tab) changed the task's status while the
-        // provider call was in flight. The caller's own request still succeeded — they should
-        // still see the drafts they asked for — but don't resurrect the row into 'in_review' out
-        // from under whatever the concurrent action already set; just record that this happened
-        // and return the task's current, true state.
+        // provider call was in flight. Don't resurrect the row into 'in_review' out from under
+        // whatever the concurrent action already set; just record that this happened.
         const droppedAt = new Date().toISOString();
         const note = [{
           actor: "agent",
@@ -11373,41 +11523,27 @@ export class LegacyService implements OnModuleInit {
           detail: `Zyra regenerated ${aiResult.drafts.length} testcase draft(s) after this feedback, but the task had already been updated elsewhere in the meantime, so the regenerated drafts were not applied.`,
           createdAt: droppedAt
         }];
-        const fresh = await this.db.query(
-          "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2 RETURNING *",
+        await this.db.query(
+          "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2",
           [taskId, projectId, JSON.stringify(note)]
         );
-        responseRow = fresh.rows[0];
-      } else {
-        await this.rememberZyraTurn({
-          projectId,
-          userId: uid,
-          provider,
-          model,
-          key: allocation.rows[0],
-          userMessage: `${story}\nReviewer feedback: ${feedbackText}`,
-          outcome: [
-            `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
-            referenceNote ? `Reviewer references: ${referenceNote}` : "",
-            additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
-            additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
-          ].filter(Boolean).join(" ")
-        });
+        return;
       }
-      return {
-        generationRequestId: taskId,
-        task: this.formatAiTask(responseRow),
+      await this.rememberZyraTurn({
+        projectId,
+        userId,
         provider,
-        drafts: aiResult.drafts,
-        generatedCount: aiResult.drafts.length,
-        tokenUsage: aiResult.usage
-      };
+        model,
+        key: allocation,
+        userMessage: `${story}\nReviewer feedback: ${feedbackText}`,
+        outcome: [
+          `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
+          referenceNote ? `Reviewer references: ${referenceNote}` : "",
+          additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
+          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
+        ].filter(Boolean).join(" ")
+      });
     } catch (error) {
-      // Regeneration runs synchronously in the request/response cycle, unlike the initial
-      // processZyraTask fire-and-forget — but it moved task_status to 'todo' above *before*
-      // calling the provider, with no catch here at all. A provider failure threw straight to
-      // the controller as a raw 500 and left the task stuck showing "Pending" with no record of
-      // what happened, same failure mode as the initial-generation bug this mirrors.
       const summary = this.extractAiErrorMessage(error) || "Zyra failed to regenerate testcase drafts.";
       const payload = typeof (error as { getResponse?: () => unknown })?.getResponse === "function"
         ? (error as { getResponse: () => unknown }).getResponse()
@@ -11426,7 +11562,6 @@ export class LegacyService implements OnModuleInit {
       // markZyraTaskFailed only marks 'failed' if the row is still 'todo'/'in_progress' — if a
       // concurrent close/save already moved it on, that action wins and this only leaves a note.
       await this.markZyraTaskFailed(projectId, taskId, detail);
-      throw error;
     }
   }
 

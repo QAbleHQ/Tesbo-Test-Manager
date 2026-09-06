@@ -219,7 +219,7 @@ export default function ZyraTaskDetailPage() {
       setFeedback("");
       setReferenceNote("");
       setSelectedJiraKeys([]);
-      setMessage("Feedback sent. Zyra moved the task to Todo, applied the feedback, and returned it for review.");
+      setMessage("Feedback sent. Zyra moved the task to Todo and is regenerating the testcase drafts now — this can take a minute.");
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to send feedback.");

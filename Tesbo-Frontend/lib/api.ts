@@ -2738,6 +2738,9 @@ export interface JiraConnection {
   connectedBy?: string;
   createdAt?: string;
   connectedProjects?: JiraConnectedProject[];
+  // Every Jira project this Tesbo project has ever been linked to (disabled, never deleted) — lets
+  // the Requirements page offer a "previously linked" source alongside the current one.
+  history?: JiraConnectedProject[];
 }
 
 export interface JiraConnectedProject {
@@ -2859,6 +2862,10 @@ export interface TicketListParams {
   issueType?: string;
   status?: string;
   coverage?: "covered" | "uncovered";
+  // Omitted: tickets from whatever's currently mapped. Set to one of JiraConnection.history's /
+  // LinearConnection.history's remote ids to browse a specific past (no-longer-mapped) source
+  // instead — nothing here is ever deleted, so old sources stay reachable this way.
+  remoteId?: string;
 }
 
 function ticketListParamsToSearch(params?: TicketListParams): URLSearchParams {
@@ -2869,6 +2876,7 @@ function ticketListParamsToSearch(params?: TicketListParams): URLSearchParams {
   if (params?.issueType) sp.set("issueType", params.issueType);
   if (params?.status) sp.set("status", params.status);
   if (params?.coverage) sp.set("coverage", params.coverage);
+  if (params?.remoteId) sp.set("remoteId", params.remoteId);
   return sp;
 }
 
@@ -2908,6 +2916,9 @@ export interface LinearConnection {
   connectedBy?: string;
   createdAt?: string;
   connectedProjects?: LinearConnectedTeam[];
+  // Every Linear team/project this Tesbo project has ever been linked to (disabled, never deleted)
+  // — lets the Requirements page offer a "previously linked" source alongside the current one.
+  history?: LinearConnectedTeam[];
 }
 
 export interface LinearConnectedTeam {
@@ -2915,6 +2926,7 @@ export interface LinearConnectedTeam {
   linearTeamId: string;
   linearTeamKey: string;
   linearTeamName: string;
+  entityType?: "team" | "project";
   createdAt: string;
 }
 
