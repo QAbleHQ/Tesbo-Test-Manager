@@ -611,21 +611,34 @@ describe("LegacyService#connectLinearTeams — concurrent save race", () => {
 
 // A sync run is org-scoped, not project-scoped, so it can be queued/running for any project mapped
 // to this connection when Disconnect is clicked. Settling it first (rather than letting the
-// DELETE's ON DELETE CASCADE race the sync processor's own concurrent writes to the same
+// disconnect UPDATE race the sync processor's own concurrent writes to the same
 // integration_sync_runs/*_tickets rows) is what rules out the deadlock shape described in
 // IntegrationSyncService#failActiveRunsForConnection's own comment.
+//
+// Disconnect used to DELETE the integration_connections row, which CASCADEd onto every
+// jira_tickets/linear_tickets/*_project_mappings row for that connection — silently destroying
+// every synced ticket the moment a workspace disconnected. It's now a soft disconnect: the row is
+// marked disconnected_at + credentials cleared, and every mapping it fed is disabled, but nothing
+// is ever deleted.
 describe("LegacyService#integrationDisconnect", () => {
-  it("fails any active sync run for the connection before deleting it", async () => {
+  it("fails any active sync run before soft-disconnecting, and never issues a DELETE", async () => {
     const order: string[] = [];
     const failActiveRunsForConnection = jest.fn(async () => {
       order.push("guard");
     });
-    const { db } = makeDb([
+    const { db, calls } = makeDb([
       workspaceRoute("owner"),
       {
-        match: "DELETE FROM integration_connections",
+        match: "UPDATE integration_connections SET disconnected_at",
         handler: () => {
-          order.push("delete");
+          order.push("soft-disconnect");
+          return { rows: [] };
+        }
+      },
+      {
+        match: "UPDATE linear_project_mappings SET enabled = false",
+        handler: () => {
+          order.push("disable-mappings");
           return { rows: [] };
         }
       }
@@ -634,7 +647,41 @@ describe("LegacyService#integrationDisconnect", () => {
     const res = await svc.integrationDisconnect("user-1", "linear");
     expect(res).toEqual({ disconnected: true });
     expect(failActiveRunsForConnection).toHaveBeenCalledWith("org-1", "linear", expect.stringMatching(/disconnected/i));
-    expect(order).toEqual(["guard", "delete"]);
+    expect(order).toEqual(["guard", "soft-disconnect", "disable-mappings"]);
+    // No DELETE anywhere in this flow — every ticket/mapping row this connection ever produced
+    // must survive a disconnect intact.
+    expect(calls.some((c) => c.sql.trim().toUpperCase().startsWith("DELETE"))).toBe(false);
+  });
+
+  it("clears live credentials on the soft-disconnected row", async () => {
+    const { db, calls } = makeDb([workspaceRoute("owner")]);
+    const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
+    await svc.integrationDisconnect("user-1", "jira");
+    const updateCall = calls.find((c) => c.sql.includes("UPDATE integration_connections SET disconnected_at"));
+    expect(updateCall).toBeDefined();
+    // access_token/refresh_token are cleared so a soft-disconnected row can't be used to make a
+    // live API call even if some path forgets to check disconnected_at.
+    expect(updateCall!.sql).toMatch(/access_token\s*=\s*''/);
+    expect(updateCall!.sql).toMatch(/refresh_token\s*=\s*''/);
+    expect(updateCall!.params).toEqual(["org-1", "jira"]);
+  });
+});
+
+// getIntegrationConnection is the single chokepoint every jiraStatus/linearStatus/
+// startIntegrationSync/integrationStatus call through — excluding a soft-disconnected row there
+// (rather than at each call site) is what makes every one of them correctly report "not connected"
+// again after a disconnect, with no other call site needing a change.
+describe("LegacyService#jiraStatus — soft-disconnected connection reads as not connected", () => {
+  it("reports connected: false when the stored connection row has disconnected_at set", async () => {
+    const { db } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      // getIntegrationConnection's own query already filters on disconnected_at IS NULL, so a
+      // disconnected row simply never comes back here — the route below proves the query shape.
+      { match: "FROM integration_connections WHERE organization_id = $1 AND provider = $2 AND disconnected_at IS NULL", rows: [] }
+    ]));
+    const svc = makeLegacy(db);
+    const status = await svc.jiraStatus(PROJECT_ID, CALLER_ID);
+    expect(status).toEqual({ connected: false, connectedProjects: [], history: [] });
   });
 });
 
@@ -827,5 +874,94 @@ describe("LegacyService#connectLinearTeams — concurrent save race (team vs pro
     expect(err).toBeInstanceOf(ConflictException);
     expect(err.getResponse().error).toMatch(/just changed by another action/i);
     expect(calls.some((c) => c.sql.includes("UPDATE linear_project_mappings SET enabled = false"))).toBe(true);
+  });
+});
+
+/*
+ * Regression coverage for "tickets from all projects are displayed after sync instead of only the
+ * selected project": jiraTickets/linearTickets used to filter only by project_id, so every entity
+ * this Tesbo project had ever been mapped to (before a switch) stayed mixed into the same result
+ * forever. The default (no remoteId) call must now also scope to whichever mapping is *currently*
+ * enabled; passing remoteId explicitly opts into browsing one specific past mapping instead.
+ */
+describe("LegacyService#jiraTickets / #linearTickets — scoped to the currently mapped entity", () => {
+  it("jiraTickets defaults to a mapped_remote_id filter against the currently enabled mapping", async () => {
+    const { db, calls } = makeDb(withProjectAccess([{ match: "FROM jira_tickets", rows: [] }]));
+    const svc = makeLegacy(db);
+    await svc.jiraTickets(PROJECT_ID, CALLER_ID, {});
+    const countCall = calls.find((c) => c.sql.includes("SELECT COUNT(*)::int AS count FROM jira_tickets"));
+    expect(countCall!.sql).toMatch(
+      /mapped_remote_id = \(SELECT jira_project_id FROM jira_project_mappings WHERE project_id = \$1 AND enabled = true LIMIT 1\)/
+    );
+    // No new bound param — the subquery reuses $1 (projectId) rather than adding one. (`values` is
+    // reused and later `.push(limit, offset)`ed for the paginated SELECT, so only its first two
+    // slots reflect what this COUNT query itself was called with.)
+    expect(countCall!.params.slice(0, 2)).toEqual([PROJECT_ID, 25]);
+  });
+
+  it("jiraTickets filters by an explicit remoteId instead, to browse a past mapping's tickets", async () => {
+    const { db, calls } = makeDb(withProjectAccess([{ match: "FROM jira_tickets", rows: [] }]));
+    const svc = makeLegacy(db);
+    await svc.jiraTickets(PROJECT_ID, CALLER_ID, { remoteId: "old-project-9" });
+    const countCall = calls.find((c) => c.sql.includes("SELECT COUNT(*)::int AS count FROM jira_tickets"));
+    expect(countCall!.sql).toContain("mapped_remote_id = $2");
+    expect(countCall!.sql).not.toContain("SELECT jira_project_id FROM jira_project_mappings");
+    expect(countCall!.params.slice(0, 2)).toEqual([PROJECT_ID, "old-project-9"]);
+  });
+
+  it("linearTickets defaults to a mapped_remote_id filter against the currently enabled mapping", async () => {
+    const { db, calls } = makeDb(withProjectAccess([{ match: "FROM linear_tickets", rows: [] }]));
+    const svc = makeLegacy(db);
+    await svc.linearTickets(PROJECT_ID, CALLER_ID, {});
+    const countCall = calls.find((c) => c.sql.includes("SELECT COUNT(*)::int AS count FROM linear_tickets"));
+    expect(countCall!.sql).toMatch(
+      /mapped_remote_id = \(SELECT linear_team_id FROM linear_project_mappings WHERE project_id = \$1 AND enabled = true LIMIT 1\)/
+    );
+    expect(countCall!.params.slice(0, 2)).toEqual([PROJECT_ID, 25]);
+  });
+});
+
+// jiraStatusForProject/linearStatus now also return every disabled (no-longer-current) mapping as
+// `history`, so the UI can offer a "previously linked" source picker instead of that history being
+// reachable only via direct DB inspection — and so that switching mappings never reads as data loss.
+describe("LegacyService#jiraStatus / #linearStatus — mapping history", () => {
+  it("jiraStatus returns disabled mappings as history, alongside the current one", async () => {
+    const { db } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", cloud_id: "cloud-1" }] },
+      {
+        match: "FROM jira_project_mappings\n       WHERE project_id = $1 AND enabled = true",
+        rows: [{ id: "m-2", jira_project_id: "9", jira_project_key: "NEW", jira_project_name: "New Project" }]
+      },
+      {
+        match: "FROM jira_project_mappings\n       WHERE project_id = $1 AND enabled = false",
+        rows: [{ id: "m-1", jira_project_id: "1", jira_project_key: "OLD", jira_project_name: "Old Project" }]
+      }
+    ]));
+    const svc = makeLegacy(db);
+    const status = await svc.jiraStatus(PROJECT_ID, CALLER_ID);
+    expect(status.connected).toBe(true);
+    expect(status.connectedProjects).toEqual([expect.objectContaining({ jiraProjectKey: "NEW" })]);
+    expect(status.history).toEqual([expect.objectContaining({ jiraProjectKey: "OLD" })]);
+  });
+
+  it("linearStatus returns disabled mappings as history, alongside the current one", async () => {
+    const { db } = makeDb(withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1" }] },
+      {
+        match: "FROM linear_project_mappings\n       WHERE project_id = $1 AND enabled = true",
+        rows: [{ id: "m-2", linear_team_id: "team-2", linear_team_key: "NEW", linear_team_name: "New Team" }]
+      },
+      {
+        match: "FROM linear_project_mappings\n       WHERE project_id = $1 AND enabled = false",
+        rows: [{ id: "m-1", linear_team_id: "team-1", linear_team_key: "OLD", linear_team_name: "Old Team" }]
+      }
+    ]));
+    const svc = makeLegacy(db);
+    const status = await svc.linearStatus(PROJECT_ID, CALLER_ID);
+    expect(status.connected).toBe(true);
+    expect(status.connectedProjects).toEqual([expect.objectContaining({ linearTeamKey: "NEW" })]);
+    expect(status.history).toEqual([expect.objectContaining({ linearTeamKey: "OLD" })]);
   });
 });

@@ -165,7 +165,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
       const onPage = async (tickets: RemoteTicket[]) => {
         for (const ticket of tickets) {
           try {
-            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket);
+            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket, remote.remote_id);
             queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
           } catch (err) {
             // One ticket's data (an oversized field, or anything else unexpected) must never abort
@@ -239,14 +239,20 @@ export class IntegrationSyncProcessor extends WorkerHost {
     }
   }
 
-  private async upsertTicket(projectId: string, connectionId: string, provider: SyncProvider, ticket: RemoteTicket): Promise<string> {
+  private async upsertTicket(
+    projectId: string,
+    connectionId: string,
+    provider: SyncProvider,
+    ticket: RemoteTicket,
+    mappedRemoteId: string
+  ): Promise<string> {
     const c = TICKET_TABLES[provider];
     const res = await this.db.query<{ id: string }>(
       `INSERT INTO ${c.table} (
          project_id, ${c.connectionCol}, ${c.issueIdCol}, ${c.issueKeyCol}, summary, description,
-         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at
+         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at, mapped_remote_id
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16)
        ON CONFLICT ${c.conflict} DO UPDATE SET
          ${c.issueKeyCol} = EXCLUDED.${c.issueKeyCol},
          summary = EXCLUDED.summary,
@@ -260,7 +266,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
          ${c.createdCol} = EXCLUDED.${c.createdCol},
          ${c.updatedCol} = EXCLUDED.${c.updatedCol},
          ${c.urlCol} = EXCLUDED.${c.urlCol},
-         synced_at = now()
+         synced_at = now(),
+         mapped_remote_id = EXCLUDED.mapped_remote_id
        RETURNING id`,
       [
         projectId,
@@ -280,7 +287,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
         ticket.labels,
         ticket.createdAt,
         ticket.updatedAt,
-        truncateForColumn(ticket.url, 1024)
+        truncateForColumn(ticket.url, 1024),
+        mappedRemoteId
       ]
     );
     return res.rows[0].id;
