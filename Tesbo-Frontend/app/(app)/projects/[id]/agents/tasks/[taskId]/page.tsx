@@ -401,7 +401,6 @@ export default function ZyraTaskDetailPage() {
             {!done && (
               <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>Close task</Button>
             )}
-            <Button variant="confidence" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>Save selected</Button>
           </div>
         </div>
       </Card>
@@ -430,7 +429,9 @@ export default function ZyraTaskDetailPage() {
                 <Button variant="secondary" onClick={allDraftsSelected ? clearDraftSelection : selectAllDrafts} disabled={done || task.drafts.length === 0}>
                   {allDraftsSelected ? "Unselect all" : "Select all"}
                 </Button>
-                <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>Clear selection</Button>
+                {!allDraftsSelected && (
+                  <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>Clear selection</Button>
+                )}
                 {task.drafts.length > 0 && (
                   <span title={selectedDrafts.length > 0 ? "Copy the selected testcases as tab-separated values, ready to paste into Excel." : "Copy every generated testcase as tab-separated values, ready to paste into Excel."}>
                     <CopyButton
