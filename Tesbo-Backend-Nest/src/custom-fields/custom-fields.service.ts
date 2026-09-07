@@ -12,7 +12,9 @@ import {
   FieldOption,
   FieldStatus,
   FieldType,
-  QueryRunner
+  normalizeTestcaseHeader,
+  QueryRunner,
+  RESERVED_TESTCASE_HEADERS
 } from "./custom-fields.types";
 
 type Body = Record<string, any>;
@@ -46,6 +48,13 @@ function requireFieldName(name: string): void {
   if (!name) throw new BadRequestException({ error: "name is required" });
   if (name.length > NAME_MAX_LENGTH) {
     throw new BadRequestException({ error: `name must be ${NAME_MAX_LENGTH} characters or fewer` });
+  }
+  // A field named e.g. "Title" or "externalId" would land on the same normalized column header as
+  // a fixed test case field the moment it starts appearing in the CSV/XLSX export or the import
+  // template/commit — see RESERVED_TESTCASE_HEADERS. Rejecting it here is the actual fix; nothing
+  // downstream can rename a field the user is actively relying on being called that.
+  if (RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name))) {
+    throw new BadRequestException({ error: "This name is reserved for a built-in test case field" });
   }
 }
 

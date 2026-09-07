@@ -248,6 +248,31 @@ test.describe("custom field definitions", () => {
     expect(reused.id).not.toBe(first.id);
   });
 
+  test(
+    "a name reserved for a built-in test case column is rejected on create and on rename",
+    { tag: '@tesbo.testId("TES-TC-170")' },
+    async () => {
+      // Once this field started appearing as a real column in the export/import template
+      // (Tesbo-Backend-Nest/src/legacy/legacy.controller.ts's template()), a field named e.g.
+      // "Title" or "externalId" would land on the exact same normalized header as the built-in
+      // column — see RESERVED_TESTCASE_HEADERS. Blocked at the source rather than worked around
+      // downstream in every place that generates a file.
+      for (const reserved of ["Title", "EXTERNALID", "Estimated Duration"]) {
+        const res = await post(asOwner, { name: reserved, fieldType: "text" });
+        expect(res.status(), `creating a field named "${reserved}"`).toBe(400);
+        expect((await res.json()).error).toContain("reserved");
+      }
+
+      const definition = await textField();
+      const renamed = await asOwner.patch(definitionUrl(definition.id), {
+        data: { name: "Status" },
+        failOnStatusCode: false,
+      });
+      expect(renamed.status()).toBe(400);
+      expect((await renamed.json()).error).toContain("reserved");
+    },
+  );
+
   test("fieldType must be one of the seven supported types", { tag: '@tesbo.testId("TES-TC-132")' }, async () => {
     for (const fieldType of [undefined, "", "string", "TEXT", "dropdown", 7]) {
       const res = await post(asOwner, { name: fieldName("Bad type"), fieldType });

@@ -1476,12 +1476,17 @@ export async function getCustomFieldValues(projectId: string, testcaseId: string
   return api<CustomFieldValue[]>(`/api/projects/${projectId}/testcases/${testcaseId}/custom-field-values`);
 }
 
-export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
-  return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+export interface LinkedIssueTaskStatus {
+  taskId: string;
+  status: string;
 }
 
-export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
-  return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
+export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+}
+
+export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
 }
 
 // Test case import/export

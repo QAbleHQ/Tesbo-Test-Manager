@@ -1049,10 +1049,15 @@ test.describe("zyra / agents (UI)", () => {
     await page.getByRole("button", { name: "Select all" }).click();
     await expect(page.getByText("2 of 2 testcases selected")).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete selected" })).toBeEnabled();
+    // With everything selected, the toggle becomes the one "unselect all" control — the standalone
+    // "Clear selection" button (only meaningful for a partial selection) is hidden rather than
+    // duplicating it.
+    await expect(page.getByRole("button", { name: "Clear selection" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Clear selection" }).click();
+    await page.getByRole("button", { name: "Unselect all" }).click();
     await expect(page.getByText("0 of 2 testcases selected")).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete selected" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Clear selection" })).toBeDisabled();
   });
 
   test("ZYU-14 saving a draft into a new suite creates a real test case", { tag: '@tesbo.testId("TES-TC-1099")' }, async ({ browser }) => {

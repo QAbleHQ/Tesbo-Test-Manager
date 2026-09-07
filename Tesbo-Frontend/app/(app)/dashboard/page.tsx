@@ -43,6 +43,18 @@ const STATUS_COLORS: Record<string, { badge: string; text: string; fill: string;
     fill: "var(--status-notrun-dot)",
     label: "Untested",
   },
+  Skipped: {
+    badge: "bg-[var(--status-skipped-fill)]",
+    text: "text-[var(--status-skipped-text)]",
+    fill: "var(--status-skipped-dot)",
+    label: "Skipped",
+  },
+  Retest: {
+    badge: "bg-[var(--status-retest-fill)]",
+    text: "text-[var(--status-retest-text)]",
+    fill: "var(--status-retest-dot)",
+    label: "Retest",
+  },
 };
 
 function statusStyle(status: string) {
