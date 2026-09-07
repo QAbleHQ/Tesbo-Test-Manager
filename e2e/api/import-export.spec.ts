@@ -49,11 +49,17 @@ const EXPORT_HEADERS = [
   "component",
 ];
 
-/** The import template's columns — LegacyController.template()'s example row. */
+/**
+ * The import template's base columns — LegacyController.template()'s example row — before any
+ * active custom field columns are appended. Corrected to match the endpoint's actual output: this
+ * previously omitted "postconditions" and "estimatedDuration", which the endpoint has always
+ * included, so TES-TC-210/211/212 were asserting a stale header list rather than the real one.
+ */
 const TEMPLATE_HEADERS = [
   "title",
   "description",
   "preconditions",
+  "postconditions",
   "steps",
   "testData",
   "priority",
@@ -62,6 +68,7 @@ const TEMPLATE_HEADERS = [
   "status",
   "suite",
   "component",
+  "estimatedDuration",
 ];
 
 const RUN_EXPORT_HEADERS = [
@@ -476,6 +483,151 @@ test.describe("import / export", () => {
     );
     expect(unknownRes.status(), "a project that doesn't exist has no template").toBe(404);
   });
+
+  /* ───────────────────────── import template × custom fields ─────────────────────────
+   *
+   * Basecamp-style report: mandatory custom fields never appeared as columns in the downloaded
+   * template, so a user filling it in and importing it back had no way to supply them — every row
+   * failed the importer's own required-field check (reported case: 0/128 imported, each row
+   * rejected with "<field name> is required"). Fixed in LegacyController.template() by reusing the
+   * same customFields.listActiveDefinitionsForColumns(...) call exportCsv/exportXlsx already made.
+   */
+
+  test(
+    "adds a column and a valid worked example for each active custom field, and none for archived/inactive ones",
+    { tag: '@tesbo.testId("TES-TC-223")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Template Custom Fields ${stamp}`);
+      const text = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: { name: `Owner Team ${stamp}`, fieldType: "text", required: true, config: { maxLength: 5 } },
+        })
+      ).json();
+      const boolean = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: { name: `Automatable ${stamp}`, fieldType: "boolean" },
+        })
+      ).json();
+      const select = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: {
+            name: `Release ${stamp}`,
+            fieldType: "single_select",
+            config: { options: [{ label: "R1" }, { label: "R2" }] },
+          },
+        })
+      ).json();
+      const inactive = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: { name: `Dormant ${stamp}`, fieldType: "text", active: false },
+        })
+      ).json();
+      const archived = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: { name: `Retired ${stamp}`, fieldType: "text" },
+        })
+      ).json();
+      await asOwner.patch(`/api/projects/${project}/custom-fields/definitions/${archived.id}/status`, {
+        data: { status: "archived" },
+      });
+
+      const { headers, records } = parseCsvRecords(
+        await (await asOwner.get(`/api/projects/${project}/testcases/import/template`)).text(),
+      );
+      expect(headers).toContain(text.name);
+      expect(headers).toContain(boolean.name);
+      expect(headers).toContain(select.name);
+      expect(headers, "an inactive definition is not a column").not.toContain(inactive.name);
+      expect(headers, "an archived definition is not a column").not.toContain(archived.name);
+
+      const row = records[0];
+      // The required text field's config caps it at 5 characters — the worked example must respect
+      // that, or filling the template in unmodified would itself fail validation.
+      expect(row[text.name].length).toBeLessThanOrEqual(5);
+      expect(row[text.name]).toBeTruthy();
+      expect(["Yes", "No"]).toContain(row[boolean.name]);
+      expect(["R1", "R2"]).toContain(row[select.name]);
+    },
+  );
+
+  test(
+    "a required custom field missing from the template makes every row fail; present, it imports cleanly",
+    { tag: '@tesbo.testId("TES-TC-224")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Template Required Field ${stamp}`);
+      const required = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: { name: `Compliance ${stamp}`, fieldType: "boolean", required: true },
+        })
+      ).json();
+
+      // Reproduces the reported defect directly: this is exactly what happened when the field had
+      // no column to map to at all, and it must still be true after the fix — the field only ever
+      // fails to validate when a value is genuinely missing, not because it can't be supplied.
+      const withoutValueRes = await asOwner.post(`/api/projects/${project}/testcases/import`, {
+        data: { rows: [{ rowNumber: 1, title: `E2E Missing Required ${stamp}` }] },
+      });
+      const withoutValue = await withoutValueRes.json();
+      expect(withoutValue.imported).toBe(0);
+      expect(withoutValue.errors[0].message).toContain(`${required.name} is required`);
+
+      // What downloading the (now-fixed) template and re-importing it unmodified actually sends:
+      // the template's own worked example value for this field.
+      const { records } = parseCsvRecords(
+        await (await asOwner.get(`/api/projects/${project}/testcases/import/template`)).text(),
+      );
+      const sample = records[0][required.name];
+      expect(sample, "the template must have a column to read a value from").toBeTruthy();
+
+      const withValueRes = await asOwner.post(`/api/projects/${project}/testcases/import`, {
+        data: {
+          rows: [
+            {
+              rowNumber: 1,
+              title: `E2E Present Required ${stamp}`,
+              customFieldValues: { [required.id]: sample.toLowerCase() === "yes" },
+            },
+          ],
+        },
+      });
+      const withValue = await withValueRes.json();
+      expect(withValue.errors).toEqual([]);
+      expect(withValue.imported).toBe(1);
+    },
+  );
+
+  test(
+    "a required select field with no active options still returns a template, with an empty sample cell",
+    { tag: '@tesbo.testId("TES-TC-225")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Template No Active Options ${stamp}`);
+      const select = await (
+        await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+          data: {
+            name: `Environment ${stamp}`,
+            fieldType: "single_select",
+            required: true,
+            config: { options: [{ label: "Staging" }] },
+          },
+        })
+      ).json();
+      const optionId = select.config.options[0].id;
+      await asOwner.patch(`/api/projects/${project}/custom-fields/definitions/${select.id}`, {
+        data: { config: { options: [{ id: optionId, label: "Staging", active: false }] } },
+      });
+
+      const res = await asOwner.get(`/api/projects/${project}/testcases/import/template`, {
+        failOnStatusCode: false,
+      });
+      expect(res.status(), "a field with no active option must not 500 the template").toBe(200);
+      const { headers, records } = parseCsvRecords(await res.text());
+      expect(headers).toContain(select.name);
+      expect(records[0][select.name]).toBe("");
+    },
+  );
 
   /* ───────────────────────── the server-side import route ───────────────────────── */
 

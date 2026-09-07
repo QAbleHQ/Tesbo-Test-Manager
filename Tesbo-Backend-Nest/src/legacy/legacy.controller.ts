@@ -22,6 +22,7 @@ import ExcelJS from "exceljs";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
 
 const TESTCASE_EXPORT_BASE_HEADERS = [
   "externalId",
@@ -105,6 +106,70 @@ export class LegacyController {
   private csvEscape(value: unknown): string {
     const text = String(value ?? "");
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  // Excel/Sheets treats a cell starting with =, +, -, @, tab or CR as a formula, regardless of
+  // format (CSV or XLSX). csvEscape/cellValue never guarded against that because every string they
+  // handled up to now was either static or already-validated app data. This fix is the first place
+  // a custom field's freeform NAME and its option LABELs get written into a generated file, so both
+  // now pass through here first. Prefixing with a single quote is the standard mitigation: it forces
+  // the cell to display as text in both Excel and Sheets without changing what the user typed.
+  private sanitizeFormulaCell(value: string): string {
+    return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  }
+
+  // A custom field's column, named for the file rather than the API: its display name, unless that
+  // name would collide with a fixed base column once normalized the same way the import modal's
+  // auto-mapper normalizes headers (lowercase, strip non-alphanumeric) — e.g. a field literally
+  // named "Title" or "externalId". Field creation now rejects new names like that (see
+  // CustomFieldsService), but this stays as a defensive fallback for any field named that way
+  // before the guard existed, so a generated file never has two columns that read as the same header.
+  private sampleColumnName(definition: CustomFieldDefinitionDto): string {
+    const name = this.sanitizeFormulaCell(definition.name);
+    return RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name)) ? `${name} (Custom Field)` : name;
+  }
+
+  // Builds a value that is valid for the definition's own config, so the template's worked example
+  // row can always be re-imported as-is instead of tripping the very validation it's meant to
+  // demonstrate (a maxLength, a min/max, a date-range restriction, or — for a select — simply having
+  // no active option to offer). Mirrors the parsing ImportTestCasesModal.tsx's
+  // coerceCustomFieldImportValue expects on the way back in.
+  private sampleCustomFieldValue(definition: CustomFieldDefinitionDto): string {
+    const config = definition.config || {};
+    switch (definition.fieldType) {
+      case "text":
+      case "long_text": {
+        const sample = "Sample value";
+        return this.sanitizeFormulaCell(
+          config.maxLength != null && config.maxLength < sample.length ? sample.slice(0, config.maxLength) : sample
+        );
+      }
+      case "boolean":
+        return config.displayFormat === "true_false" ? "True" : "Yes";
+      case "number": {
+        let sample = config.min ?? config.max ?? 1;
+        if (config.decimalsAllowed === false) sample = Math.round(sample);
+        return String(sample);
+      }
+      case "date":
+        // Today always satisfies any allowPastDates/allowFutureDates combination — see
+        // checkDateRange in custom-field-validation.ts, which only rejects date < today or date > today.
+        return new Date().toISOString().slice(0, 10);
+      case "single_select": {
+        const active = (config.options || []).find((o) => o.active);
+        return active ? this.sanitizeFormulaCell(active.label) : "";
+      }
+      case "multi_select": {
+        const activeOptions = (config.options || []).filter((o) => o.active);
+        const count = Math.min(Math.max(1, config.minSelected ?? 1), config.maxSelected ?? (activeOptions.length || 1));
+        return activeOptions
+          .slice(0, count)
+          .map((o) => this.sanitizeFormulaCell(o.label))
+          .join(", ");
+      }
+      default:
+        return "";
+    }
   }
 
   private rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
@@ -834,28 +899,36 @@ export class LegacyController {
     // /api/projects/:id — it was the one that answered with no session, and that served the same
     // 200 for a project id that doesn't exist.
     await this.legacy.requireProjectAccess(req.userId, projectId);
-    const rows = [
-      {
-        title: "Example login test",
-        description: "Verify a valid user can sign in.",
-        preconditions: "User account exists.",
-        postconditions: "User lands on the dashboard with an active session.",
-        // "action => expected result" per step, separated by " | " — the expected result after
-        // "=>" is optional but importing it this way carries it into each step's Expected Result.
-        steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
-        testData: "user@example.com",
-        priority: "P2",
-        severity: "Medium",
-        type: "Functional",
-        status: "Draft",
-        suite: "Authentication",
-        component: "Login",
-        // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
-        // normalizeEstimatedDuration in legacy.service.ts.
-        estimatedDuration: "10m"
-      }
-    ];
-    const headers = Object.keys(rows[0]);
+    // Every mandatory (and every other active) custom field must show up here: skipping one gives
+    // the user nothing to fill in for it, so the importer's own required-field check then rejects
+    // every row — see LegacyController.template()'s history for the incident this fixes.
+    const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
+    const row: Record<string, string> = {
+      title: "Example login test",
+      description: "Verify a valid user can sign in.",
+      preconditions: "User account exists.",
+      postconditions: "User lands on the dashboard with an active session.",
+      // "action => expected result" per step, separated by " | " — the expected result after
+      // "=>" is optional but importing it this way carries it into each step's Expected Result.
+      steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
+      testData: "user@example.com",
+      priority: "P2",
+      severity: "Medium",
+      type: "Functional",
+      status: "Draft",
+      suite: "Authentication",
+      component: "Login",
+      // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
+      // normalizeEstimatedDuration in legacy.service.ts.
+      estimatedDuration: "10m"
+    };
+    const headers = Object.keys(row);
+    for (const definition of definitions) {
+      const column = this.sampleColumnName(definition);
+      row[column] = this.sampleCustomFieldValue(definition);
+      headers.push(column);
+    }
+    const rows = [row];
     if (format === "xlsx") {
       await this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
       return;
