@@ -445,4 +445,52 @@ test.describe("the tail — api keys, activity, notifications, branding, admin",
       }
     }
   });
+
+  test(
+    "TAI-A-21 a ticket assigned to Zyra is reported before any testcase is saved, with its live task status",
+    { tag: '@tesbo.testId("TES-TC-2014")' },
+    async () => {
+      // Regression: the Requirements page decided "assigned to Zyra" purely from whether a
+      // testcase referenced the ticket, so a task sitting in todo/in_progress/in_review looked
+      // identical to a ticket nobody had touched. Seeding the ai_generation_requests row directly
+      // (rather than going through a real AI provider) isolates the assertion to the read path —
+      // linkedJiraKeys/linkedLinearKeys must surface the task's own status, not require it to
+      // finish and produce a testcase first.
+      const jiraKey = `E2E-JIRA-${Date.now()}`;
+      const linearKey = `E2E-LIN-${Date.now()}`;
+      const jiraTaskId = scalar(
+        `INSERT INTO ai_generation_requests
+           (project_id, requested_by, provider, user_story, agent_name, task_status, jira_issue_keys)
+         VALUES (${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai',
+                 'E2E in-progress Jira assignment', 'Zyra the Test Generator', 'in_progress',
+                 ${literal(JSON.stringify([jiraKey]))}::jsonb)
+         RETURNING id;`
+      );
+      const linearTaskId = scalar(
+        `INSERT INTO ai_generation_requests
+           (project_id, requested_by, provider, user_story, agent_name, task_status, linear_issue_keys)
+         VALUES (${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai',
+                 'E2E in-review Linear assignment', 'Zyra the Test Generator', 'in_review',
+                 ${literal(JSON.stringify([linearKey]))}::jsonb)
+         RETURNING id;`
+      );
+      try {
+        const jiraRes = await asOwner.get(url("/testcases/linked-jira-keys"));
+        expect(jiraRes.ok(), `linked-jira-keys — ${await jiraRes.text()}`).toBeTruthy();
+        const jiraBody = await jiraRes.json();
+        expect(jiraBody.tasks?.[jiraKey]?.status, "the in-progress task must be reported before any testcase exists").toBe("in_progress");
+        expect(jiraBody.tasks?.[jiraKey]?.taskId).toBe(jiraTaskId);
+        expect(jiraBody.keys, "no testcase was saved yet, so the coverage-linked key list must not include it").not.toContain(jiraKey);
+
+        const linearRes = await asOwner.get(url("/testcases/linked-linear-keys"));
+        expect(linearRes.ok(), `linked-linear-keys — ${await linearRes.text()}`).toBeTruthy();
+        const linearBody = await linearRes.json();
+        expect(linearBody.tasks?.[linearKey]?.status).toBe("in_review");
+        expect(linearBody.tasks?.[linearKey]?.taskId).toBe(linearTaskId);
+        expect(linearBody.keys).not.toContain(linearKey);
+      } finally {
+        exec(`DELETE FROM ai_generation_requests WHERE id IN (${literal(jiraTaskId)}, ${literal(linearTaskId)});`);
+      }
+    },
+  );
 });
