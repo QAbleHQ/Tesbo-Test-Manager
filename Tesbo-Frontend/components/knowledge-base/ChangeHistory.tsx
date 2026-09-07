@@ -2,18 +2,22 @@
 
 import { useEffect, useState } from "react";
 import { IconCalendar, IconClock } from "@tabler/icons-react";
-import { getKnowledgeDocumentSyncEvents, type KnowledgeDocumentSyncEvent } from "@/lib/api";
+import { getKnowledgeDocumentHistory, type KnowledgeDocumentHistoryEntry } from "@/lib/api";
+import { ChangeDiffModal } from "./ChangeDiffModal";
 
 /**
- * The Jira/Linear sync timeline for one mirrored Knowledge Base document — shared between the
- * knowledge-base list's info-icon popover (ChangeHistoryTrigger, knowledge-base/page.tsx) and the
- * document detail page's "View history" modal (documents/[documentId]/page.tsx), which shows this
- * instead of the ordinary version list for a mirror: a mirror is never saved through the normal
- * edit flow that produces knowledge_document_versions rows (it's read-only, rewritten wholesale by
- * every sync), so that list is always empty for one and "Restore" makes no sense against it either.
+ * The Change History timeline for one Knowledge Base document — shared between the knowledge-base
+ * list's info-icon popover (ChangeHistoryTrigger, knowledge-base/page.tsx) and the document detail
+ * page's "History" modal (documents/[documentId]/page.tsx). Renders the same shape for a synced
+ * Jira/Linear mirror (the sync pipeline's own log) and a manually-created document (synthesized
+ * from its version snapshots) — see getKnowledgeDocumentHistory in lib/api.ts.
  */
 
 export const CHANGE_HISTORY_PAGE_SIZE = 5;
+
+// A single field's before/after is only worth its own "View diff" button once it stops being a
+// one-glance sentence — short single-field edits keep today's plain, button-less row.
+const LARGE_CHANGE_THRESHOLD = 160;
 
 // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — a fixed format, deliberately not locale-dependent.
 function formatEventDate(value: string): string {
@@ -33,31 +37,46 @@ function formatEventTime(value: string): string {
   return `${String(hours12).padStart(2, "0")}:${mm}:${ss} ${period}`;
 }
 
+function isLargeChange(entry: KnowledgeDocumentHistoryEntry): boolean {
+  if (!entry.changedFields.length) return false;
+  if (entry.changedFields.length > 1) return true;
+  return entry.changedFields.some((f) => f.oldLength + f.newLength > LARGE_CHANGE_THRESHOLD);
+}
+
 export function ChangeHistoryList({
   projectId,
   documentId,
   showHeading = true,
+  onRestoreVersion,
+  restoringVersionId = null,
 }: {
   projectId: string;
   documentId: string;
   /** The popover has no surrounding chrome of its own and needs its own heading; a Modal usage
    *  already renders "Change history" in its title bar, so that caller passes false. */
   showHeading?: boolean;
+  /** Only a manual document's version-diff entries carry a versionId to restore — the button never
+   *  renders on any other row, so it's safe to always pass this (as the detail page's History
+   *  modal does) rather than needing to know in advance whether this document is a mirror. */
+  onRestoreVersion?: (entry: KnowledgeDocumentHistoryEntry) => void;
+  /** Disables every row's Restore button while one restore is in flight. */
+  restoringVersionId?: string | null;
 }) {
   const [page, setPage] = useState(0);
-  const [state, setState] = useState<{ loading: boolean; events: KnowledgeDocumentSyncEvent[]; hasMore: boolean; error: boolean }>({
+  const [state, setState] = useState<{ loading: boolean; events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean; error: boolean }>({
     loading: true,
     events: [],
     hasMore: false,
     error: false,
   });
+  const [diffEntry, setDiffEntry] = useState<KnowledgeDocumentHistoryEntry | null>(null);
 
   // Deliberately doesn't reset to `loading: true` before the fetch resolves: the previous page's
   // rows stay on screen until the new page arrives (typically near-instant, a single indexed
   // query), which reads as an instant page flip rather than a loading flash on every click.
   useEffect(() => {
     let cancelled = false;
-    getKnowledgeDocumentSyncEvents(projectId, documentId, { limit: CHANGE_HISTORY_PAGE_SIZE, offset: page * CHANGE_HISTORY_PAGE_SIZE })
+    getKnowledgeDocumentHistory(projectId, documentId, { limit: CHANGE_HISTORY_PAGE_SIZE, offset: page * CHANGE_HISTORY_PAGE_SIZE })
       .then((res) => {
         if (!cancelled) setState({ loading: false, events: res.events, hasMore: res.hasMore, error: false });
       })
@@ -86,28 +105,55 @@ export function ChangeHistoryList({
         </div>
       ) : (
         <ul className="max-h-80 space-y-2 overflow-y-auto">
-          {state.events.map((event) => (
-            <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-1.5">
-              <div className="text-[12px] font-medium text-[var(--foreground)]">
-                {event.eventType === "created" ? "Added" : "Updated"}
-                {/* Nightly-triggered runs carry no user (triggeredBy is NULL by design — see
-                    integration-sync.service.ts's startRun) — labelled explicitly rather than left
-                    blank, so "by whom" always has an answer. */}
-                <span className="font-normal text-[var(--muted)]"> · by {event.triggeredByName ?? "Nightly sync"}</span>
-              </div>
-              <div className="mt-1 flex items-center gap-3 text-[11px] text-[var(--muted)]">
-                <span className="flex items-center gap-1">
-                  <IconCalendar size={12} stroke={1.75} />
-                  {formatEventDate(event.createdAt)}
-                </span>
-                <span className="flex items-center gap-1">
-                  <IconClock size={12} stroke={1.75} />
-                  {formatEventTime(event.createdAt)}
-                </span>
-              </div>
-              {event.changedSummary && <div className="mt-1 text-[11px] text-[var(--muted)]">{event.changedSummary}</div>}
-            </li>
-          ))}
+          {state.events.map((event) => {
+            const large = isLargeChange(event);
+            return (
+              <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 truncate text-[12px] font-medium text-[var(--foreground)]" title={`by ${event.actorName}`}>
+                    {event.eventType === "created" ? "Added" : "Updated"}
+                    <span className="font-normal text-[var(--muted)]"> · by {event.actorName}</span>
+                  </div>
+                  {onRestoreVersion && event.versionId && (
+                    <button
+                      type="button"
+                      disabled={restoringVersionId !== null}
+                      onClick={() => onRestoreVersion(event)}
+                      className="shrink-0 text-[11px] font-medium text-[var(--accent-light)] hover:underline disabled:opacity-40 disabled:hover:no-underline"
+                    >
+                      {restoringVersionId === event.versionId ? "Restoring…" : "Restore"}
+                    </button>
+                  )}
+                </div>
+                <div className="mt-1 flex items-center gap-3 text-[11px] text-[var(--muted)]">
+                  <span className="flex items-center gap-1">
+                    <IconCalendar size={12} stroke={1.75} />
+                    {formatEventDate(event.createdAt)}
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <IconClock size={12} stroke={1.75} />
+                    {formatEventTime(event.createdAt)}
+                  </span>
+                </div>
+                {event.changedSummary && (
+                  <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                    <span className="min-w-0 flex-1 truncate" title={event.changedSummary}>
+                      {event.changedSummary}
+                    </span>
+                    {large && (
+                      <button
+                        type="button"
+                        onClick={() => setDiffEntry(event)}
+                        className="shrink-0 font-medium text-[var(--accent-light)] hover:underline"
+                      >
+                        View diff
+                      </button>
+                    )}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       {showPager && (
@@ -130,6 +176,14 @@ export function ChangeHistoryList({
             Next
           </button>
         </div>
+      )}
+      {diffEntry && (
+        <ChangeDiffModal
+          open
+          onClose={() => setDiffEntry(null)}
+          title={`${diffEntry.eventType === "created" ? "Added" : "Updated"} by ${diffEntry.actorName} · ${formatEventDate(diffEntry.createdAt)} ${formatEventTime(diffEntry.createdAt)}`}
+          fields={diffEntry.changedFields}
+        />
       )}
     </div>
   );

@@ -1627,9 +1627,10 @@ function KnowledgeBasePageInner() {
                           <td className="px-4 py-2.5 text-[var(--muted)]">
                             <div className="flex items-center gap-1">
                               <span>{formatDate((item as { updatedAt: string }).updatedAt)}</span>
-                              {/* Only a synced mirror has a change timeline to show — a
-                                  human-authored doc gets no icon rather than an empty popover. */}
-                              {syncedFrom && <ChangeHistoryTrigger projectId={projectId} documentId={item.id} />}
+                              {/* Every document — synced or manually created — has a change
+                                  timeline now; a brand-new doc's popover just reads "No change
+                                  history recorded yet." rather than omitting the icon entirely. */}
+                              {item.type === "document" && <ChangeHistoryTrigger projectId={projectId} documentId={item.id} />}
                             </div>
                           </td>
                           {/*

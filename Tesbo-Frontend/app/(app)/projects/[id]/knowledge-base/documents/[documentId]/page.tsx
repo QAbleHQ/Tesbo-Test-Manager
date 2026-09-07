@@ -24,12 +24,11 @@ import {
   updateKnowledgeDocument,
   duplicateKnowledgeDocument,
   deleteKnowledgeDocument,
-  listKnowledgeDocumentVersions,
   restoreKnowledgeDocumentVersion,
   approveAiMemory,
   rejectAiMemory,
   type KnowledgeDocument,
-  type KnowledgeDocumentVersion,
+  type KnowledgeDocumentHistoryEntry,
   type KnowledgeBreadcrumbEntry,
 } from "@/lib/api";
 import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
@@ -187,9 +186,8 @@ export default function KnowledgeDocumentPage() {
   const [error, setError] = useState<string | null>(null);
   const [canApprove, setCanApprove] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [versions, setVersions] = useState<KnowledgeDocumentVersion[]>([]);
   // The version a "Restore" click is asking to confirm — null means no confirmation is showing.
-  const [confirmTarget, setConfirmTarget] = useState<KnowledgeDocumentVersion | null>(null);
+  const [confirmTarget, setConfirmTarget] = useState<KnowledgeDocumentHistoryEntry | null>(null);
   const [restorePhase, setRestorePhase] = useState<"idle" | "restoring" | "error">("idle");
   const [restoreError, setRestoreError] = useState<string | null>(null);
   // Bumped only when the editor's content must be force-replaced (a restore) — not on every
@@ -429,24 +427,21 @@ export default function KnowledgeDocumentPage() {
     }
   }
 
-  async function openHistory() {
+  function openHistory() {
     setHistoryOpen(true);
     setConfirmTarget(null);
     setRestorePhase("idle");
     setRestoreError(null);
-    // A mirror is never saved through the edit-and-save flow that produces version snapshots (it's
-    // read-only, rewritten wholesale by every sync) — the versions list would always be empty and
-    // "Restore" wouldn't mean anything against it, so skip the fetch and render the sync timeline
-    // (ChangeHistoryList) instead. See the modal below.
-    if (isSyncedMirror) return;
-    const data = await listKnowledgeDocumentVersions(projectId, documentId).catch(() => ({ list: [], total: 0 }));
-    setVersions(data.list);
+    // ChangeHistoryList fetches its own timeline (mirror sync log or manual version diffs) —
+    // nothing to preload here.
   }
 
-  // Restore is a two-step action: this only opens the confirmation, it never calls the API.
-  function requestRestoreVersion(version: KnowledgeDocumentVersion) {
-    if (restorePhase === "restoring") return; // one confirmation/restore in flight at a time
-    setConfirmTarget(version);
+  // Restore is a two-step action: this only opens the confirmation, it never calls the API. Only a
+  // manual document's version-diff entries ever carry a versionId (see ChangeHistoryList), so this
+  // is only ever reachable for those.
+  function requestRestoreVersion(entry: KnowledgeDocumentHistoryEntry) {
+    if (restorePhase === "restoring" || !entry.versionId) return; // one confirmation/restore in flight at a time
+    setConfirmTarget(entry);
     setRestorePhase("idle");
     setRestoreError(null);
   }
@@ -473,7 +468,7 @@ export default function KnowledgeDocumentPage() {
     setRestorePhase("restoring");
     setRestoreError(null);
     try {
-      const updated = await restoreKnowledgeDocumentVersion(projectId, documentId, confirmTarget.id);
+      const updated = await restoreKnowledgeDocumentVersion(projectId, documentId, confirmTarget.versionId!);
       if (!isMountedRef.current) return;
       // A pending autosave still carries the pre-restore editor content in `latestContent` — left
       // alone, it fires a few hundred ms later and silently overwrites the restore we just applied.
@@ -492,9 +487,6 @@ export default function KnowledgeDocumentPage() {
       // Forces the TipTap instance to actually re-render the restored body — see RichTextEditor,
       // which otherwise only consumes `contentJson`/`contentHtml` once, at mount.
       setContentResetKey((k) => k + 1);
-      const refreshed = await listKnowledgeDocumentVersions(projectId, documentId).catch(() => null);
-      if (!isMountedRef.current) return;
-      if (refreshed) setVersions(refreshed.list);
       setConfirmTarget(null);
       setRestorePhase("idle");
       setHistoryOpen(false);
@@ -542,19 +534,17 @@ export default function KnowledgeDocumentPage() {
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = doc.sourceProvider === "linear" ? "Linear" : "Jira";
 
+  // Change History is the same data and component everywhere — the Knowledge Base list's
+  // info-icon popover and this modal never drift into showing different things for the same
+  // document, whether it's a synced mirror or a manually-created one. Only the confirmation step
+  // below is specific to this modal.
   let historyModalBody: React.ReactNode;
-  if (isSyncedMirror) {
-    // A mirror's "history" is what the sync pipeline changed, not a manually saved version — same
-    // data and component as the Knowledge Base list's info-icon popover, so the two surfaces never
-    // drift into showing different things for the same document.
-    historyModalBody = <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} />;
-  } else if (confirmTarget) {
+  if (confirmTarget) {
     historyModalBody = (
       <div className="space-y-4">
         <p className="text-[13px] text-[var(--foreground)]">
-          Restore to <span className="font-medium">Version {confirmTarget.versionNumber}</span> —{" "}
-          {new Date(confirmTarget.createdAt).toLocaleString()}? The current content will be saved as a new
-          version first, so this can be undone.
+          Restore to the version from <span className="font-medium">{new Date(confirmTarget.createdAt).toLocaleString()}</span>?
+          The current content will be saved as a new version first, so this can be undone.
         </p>
         {restorePhase === "error" && restoreError && (
           <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-[13px] text-[var(--error-foreground)]">
@@ -571,28 +561,11 @@ export default function KnowledgeDocumentPage() {
         </div>
       </div>
     );
-  } else if (versions.length === 0) {
-    historyModalBody = <p className="text-[13px] text-[var(--muted)]">No earlier versions yet.</p>;
   } else {
+    // The confirmation step above is a separate modal body, not an in-list "Restoring…" state —
+    // by the time a restore is actually in flight this branch isn't rendered at all.
     historyModalBody = (
-      <ul className="max-h-80 space-y-2 overflow-y-auto">
-        {versions.map((v) => (
-          <li key={v.id} className="flex items-center justify-between rounded-[8px] border border-[var(--border)] px-3 py-2">
-            <div>
-              <p className="text-[13px] font-medium">{v.title}</p>
-              <p className="text-[12px] text-[var(--muted)]">Version {v.versionNumber} — {new Date(v.createdAt).toLocaleString()}</p>
-            </div>
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => requestRestoreVersion(v)}
-              disabled={restorePhase === "restoring"}
-            >
-              <IconArrowRight size={14} /> Restore
-            </Button>
-          </li>
-        ))}
-      </ul>
+      <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} onRestoreVersion={requestRestoreVersion} />
     );
   }
 
@@ -773,7 +746,7 @@ export default function KnowledgeDocumentPage() {
         />
       </div>
 
-      <Modal open={historyOpen} onClose={closeHistoryModal} title={isSyncedMirror ? "Change history" : "Version history"}>
+      <Modal open={historyOpen} onClose={closeHistoryModal} title="Change history">
         {historyModalBody}
       </Modal>
     </div>

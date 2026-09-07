@@ -685,6 +685,72 @@ describe("LegacyService#jiraStatus — soft-disconnected connection reads as not
   });
 });
 
+/*
+ * Regression coverage for the reported nightly-cron defect: getIntegrationConnection used to skip
+ * refreshing Linear entirely ("Linear tokens are long-lived, no refresh flow needed") — an
+ * assumption Linear's own OAuth policy has since broken (it now issues ~24h access tokens with a
+ * rotating refresh token). linearTeams (refresh: true) is the public entrypoint that exercises this
+ * private method's refresh branch.
+ */
+describe("LegacyService#getIntegrationConnection — Linear token refresh (via linearTeams)", () => {
+  function expiredLinearConnectionRoutes(): Route[] {
+    return withProjectAccess([
+      { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+      {
+        match: "FROM integration_connections WHERE organization_id",
+        rows: [{ id: "conn-1", access_token: encryptSecret("old-access"), refresh_token: encryptSecret("old-refresh"), token_expires_at: new Date(Date.now() - 60_000).toISOString(), auth_method: "oauth" }]
+      },
+      // The SELECT ... FOR UPDATE re-check inside the refresh transaction — same row, by id.
+      {
+        match: "FROM integration_connections WHERE id",
+        rows: [{ id: "conn-1", access_token: encryptSecret("old-access"), refresh_token: encryptSecret("old-refresh"), token_expires_at: new Date(Date.now() - 60_000).toISOString(), auth_method: "oauth" }]
+      },
+      { match: "FROM linear_project_mappings WHERE project_id", rows: [] }
+    ]);
+  }
+
+  beforeEach(() => {
+    process.env.LINEAR_CLIENT_ID = "client-id";
+    process.env.LINEAR_CLIENT_SECRET = "client-secret";
+  });
+
+  it("refreshes an expired Linear token before listing Teams/Projects, and uses the new token for both calls", async () => {
+    const { db, calls } = makeDb(expiredLinearConnectionRoutes());
+    const authHeaders: string[] = [];
+    // Captures the Authorization header sent to the GraphQL calls specifically, so the assertion
+    // below can prove they used the freshly refreshed token, not the stale one.
+    jest.spyOn(global, "fetch").mockImplementation(async (url, init) => {
+      if (String(url) === "https://api.linear.app/oauth/token") {
+        return { ok: true, json: async () => ({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 }) } as unknown as Response;
+      }
+      authHeaders.push(String(((init as RequestInit | undefined)?.headers as Record<string, string> | undefined)?.Authorization || ""));
+      return { ok: true, json: async () => ({ data: { teams: { nodes: [] }, projects: { nodes: [] } } }) } as unknown as Response;
+    });
+
+    const svc = makeLegacy(db);
+    const result = await svc.linearTeams(PROJECT_ID, CALLER_ID);
+
+    expect(result).toEqual([]);
+    expect(authHeaders.length).toBeGreaterThan(0);
+    expect(authHeaders.every((h) => h === "Bearer new-access")).toBe(true);
+    expect(calls.some((c) => c.sql.includes("UPDATE integration_connections SET access_token"))).toBe(true);
+  });
+
+  it("throws a clean reconnect message, not a crash, when the refresh token itself is dead", async () => {
+    const { db } = makeDb(expiredLinearConnectionRoutes());
+    jest.spyOn(global, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({ error: "invalid_grant" })
+    } as unknown as Response);
+
+    const svc = makeLegacy(db);
+    const err = await rejection(svc.linearTeams(PROJECT_ID, CALLER_ID));
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err.getResponse().error).toMatch(/reconnect/i);
+  });
+});
+
 // jiraFetch/linearGraphQL used to forward the raw provider response body (up to 500 chars) into
 // what the user sees. That's fine for an uncommon status code, but a 401/403 — the token was
 // revoked/expired — is common enough (and the raw body unhelpful enough) to deserve its own clean
