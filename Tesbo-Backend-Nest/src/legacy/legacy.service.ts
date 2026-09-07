@@ -14096,14 +14096,35 @@ export class LegacyService implements OnModuleInit {
   }
 
   private safeSteps(value: unknown) {
-    if (Array.isArray(value)) return value;
-    if (typeof value !== "string") return [];
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
+    let steps: unknown[];
+    if (Array.isArray(value)) {
+      steps = value;
+    } else if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value);
+        steps = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    } else {
       return [];
     }
+    // Zyra (chat create/update and task-board generation) is never given a strict schema for a
+    // step object, so the per-field key it emits can drift — e.g. "expected" instead of
+    // "expectedResult". The CSV export already tolerates this (see exportTestcases' `step.action
+    // || step.step || step.description` / `step.expectedResult || step.expected`); the testcase
+    // editor does not, so a step written under a synonym key showed up correctly in an export but
+    // silently blank in the app. Normalizing here, at the one place every write path funnels
+    // through, means the editor never needs its own fallback.
+    return steps.map((step) => {
+      if (typeof step !== "object" || step === null) return step;
+      const raw = step as Record<string, unknown>;
+      return {
+        ...raw,
+        action: raw.action || raw.step || raw.description || "",
+        expectedResult: raw.expectedResult || raw.expected || ""
+      };
+    });
   }
 
   private compactTitle(value: string): string {
