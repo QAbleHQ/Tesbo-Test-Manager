@@ -118,6 +118,10 @@
   --status-notrun-text: #0D5070;
   --status-notrun-dot: #1D7FA8;
   --status-notrun-fill: #E6F5FB;
+  /* Retest */
+  --status-retest-text: #0F6E6E;
+  --status-retest-dot: #14B8A6;
+  --status-retest-fill: #E6FFFA;
 
   /* ── Semantic utility colors ─────────────────────────────────────── */
   --success: #2D9A52;
@@ -258,6 +262,9 @@
   --status-notrun-text: #38BDF8;
   --status-notrun-dot: #1D7FA8;
   --status-notrun-fill: #102030;
+  --status-retest-text: #5EEAD4;
+  --status-retest-dot: #14B8A6;
+  --status-retest-fill: rgba(20, 184, 166, 0.18);
 
   --success: #2D9A52;
   --success-foreground: #34D399;

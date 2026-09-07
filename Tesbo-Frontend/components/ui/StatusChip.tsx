@@ -21,7 +21,8 @@ type StatusTone =
   | "inReview"
   | "draft"
   | "running"
-  | "notRun";
+  | "notRun"
+  | "retest";
 
 const toneMap: Record<StatusTone, { chip: string; dot: string }> = {
   neutral: {
@@ -96,6 +97,10 @@ const toneMap: Record<StatusTone, { chip: string; dot: string }> = {
   notRun: {
     chip: "bg-[var(--status-notrun-fill)] text-[var(--status-notrun-text)]",
     dot: "bg-[var(--status-notrun-dot)]",
+  },
+  retest: {
+    chip: "bg-[var(--status-retest-fill)] text-[var(--status-retest-text)]",
+    dot: "bg-[var(--status-retest-dot)]",
   },
 };
 

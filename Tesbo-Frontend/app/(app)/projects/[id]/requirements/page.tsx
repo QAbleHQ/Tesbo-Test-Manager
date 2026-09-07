@@ -17,12 +17,14 @@ import {
   listLinkedJiraKeys,
   listLinkedLinearKeys,
   getRequirementsSummary,
+  type LinkedIssueTaskStatus,
   type RequirementsSummary,
   type TicketSourceStats,
 } from "@/lib/api";
 import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
+import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
 
 const PAGE_SIZE = 25;
 
@@ -220,8 +222,10 @@ export default function RequirementsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [linkedJiraKeys, setLinkedJiraKeys] = useState<Set<string>>(new Set());
   const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>({});
+  const [jiraTaskStatuses, setJiraTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>({});
   const [linkedLinearKeys, setLinkedLinearKeys] = useState<Set<string>>(new Set());
   const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>({});
+  const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>({});
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("");
@@ -257,6 +261,16 @@ export default function RequirementsPage() {
 
   function isLinked(req: Requirement): boolean {
     return req.source === "jira" ? linkedJiraKeys.has(req.key) : linkedLinearKeys.has(req.key);
+  }
+
+  // The latest Zyra task assigned to this ticket, however far along it is — independent of whether
+  // it has saved any testcase yet. Once the task reaches "done" it stops being reported here (an
+  // ai_generation_requests row still exists, but "done" is the case isLinked/tcCountFor already
+  // covers via the saved testcase itself), so the two states never fight over the same row.
+  function activeTaskFor(req: Requirement): LinkedIssueTaskStatus | undefined {
+    const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
+    if (!task || normalizeTaskStatus(task.status) === "done") return undefined;
+    return task;
   }
 
   const loadTickets = useCallback(
@@ -319,13 +333,15 @@ export default function RequirementsPage() {
 
   const refreshLinkedKeys = useCallback(async () => {
     const [jiraKeysRes, linearKeysRes] = await Promise.all([
-      listLinkedJiraKeys(projectId).catch(() => ({ keys: [], counts: {} })),
-      listLinkedLinearKeys(projectId).catch(() => ({ keys: [], counts: {} })),
+      listLinkedJiraKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
+      listLinkedLinearKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
     ]);
     setLinkedJiraKeys(new Set(jiraKeysRes.keys));
     setJiraKeyCounts(jiraKeysRes.counts ?? {});
+    setJiraTaskStatuses(jiraKeysRes.tasks ?? {});
     setLinkedLinearKeys(new Set(linearKeysRes.keys));
     setLinearKeyCounts(linearKeysRes.counts ?? {});
+    setLinearTaskStatuses(linearKeysRes.tasks ?? {});
   }, [projectId]);
 
   const refreshSummary = useCallback(async () => {
@@ -736,6 +752,7 @@ export default function RequirementsPage() {
                 {tickets.map((ticket) => {
                   const linked = isLinked(ticket);
                   const tcCount = tcCountFor(ticket);
+                  const activeTask = activeTaskFor(ticket);
                   return (
                     <React.Fragment key={ticket.id}>
                       <tr
@@ -793,27 +810,38 @@ export default function RequirementsPage() {
                                 {tcCount} saved
                               </span>
                             )}
-                            {linked ? (
+                            {linked && (
+                              <Link
+                                href={`/projects/${projectId}/testcases?${ticket.source === "jira" ? "jiraIssueKey" : "linearIssueKey"}=${encodeURIComponent(ticket.key)}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View testcases
+                              </Link>
+                            )}
+                            {activeTask ? (
                               <>
+                                <StatusChip tone={taskStatusTone(activeTask.status)}>{taskStatusLabel(activeTask.status)}</StatusChip>
                                 <Link
-                                  href={`/projects/${projectId}/testcases?${ticket.source === "jira" ? "jiraIssueKey" : "linearIssueKey"}=${encodeURIComponent(ticket.key)}`}
+                                  href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
                                   onClick={(e) => e.stopPropagation()}
                                   className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
                                 >
-                                  View testcases
+                                  View task
                                 </Link>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    void handleGenerateFromTicket(ticket, "regenerate");
-                                  }}
-                                  disabled={generatingKey === ticket.key}
-                                  className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
-                                >
-                                  {generatingKey === ticket.key ? "Assigning..." : "Regenerate with Zyra"}
-                                </button>
                               </>
+                            ) : linked ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleGenerateFromTicket(ticket, "regenerate");
+                                }}
+                                disabled={generatingKey === ticket.key}
+                                className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
+                              >
+                                {generatingKey === ticket.key ? "Assigning..." : "Regenerate with Zyra"}
+                              </button>
                             ) : (
                               <button
                                 type="button"

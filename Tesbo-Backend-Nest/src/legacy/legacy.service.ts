@@ -3987,24 +3987,54 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, "testcase_bulk_deleted", "testcase", null, null, { testcaseIds: ids });
   }
 
+  /**
+   * The most recent Zyra task touching each issue key, regardless of whether it has produced any
+   * saved testcase yet. `linkedJiraKeys`/`linkedLinearKeys` only sees a ticket once a testcase
+   * references it — which under-reports "assigned to Zyra" for the whole todo/in_progress/in_review
+   * window before drafts are saved. `chat_session_id IS NULL` scopes this to task-board assignments
+   * (the Requirements page's "Assign to Zyra"), not incidental Jira keys mentioned in Zyra chat.
+   */
+  private async zyraTaskStatusesByIssueKey(
+    projectId: string,
+    column: "jira_issue_keys" | "linear_issue_keys"
+  ): Promise<Record<string, { taskId: string; status: string }>> {
+    const res = await this.db.query(
+      `SELECT DISTINCT ON (key) key, id, task_status
+         FROM (
+           SELECT id, task_status, updated_at, jsonb_array_elements_text(${column}) AS key
+           FROM ai_generation_requests
+           WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND chat_session_id IS NULL
+         ) t
+         ORDER BY key, updated_at DESC`,
+      [projectId, ZYRA_AGENT_NAMES]
+    );
+    return Object.fromEntries(res.rows.map((r) => [r.key, { taskId: r.id, status: r.task_status }]));
+  }
+
   async linkedJiraKeys(projectId: string, userId?: string | null) {
     await this.requireProjectAccess(userId, projectId);
-    const res = await this.db.query(
-      "SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY jira_issue_key",
-      [projectId]
-    );
+    const [res, tasks] = await Promise.all([
+      this.db.query(
+        "SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY jira_issue_key",
+        [projectId]
+      ),
+      this.zyraTaskStatusesByIssueKey(projectId, "jira_issue_keys")
+    ]);
     const keys = res.rows.map((r) => r.jira_issue_key);
-    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.jira_issue_key, r.count])) };
+    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.jira_issue_key, r.count])), tasks };
   }
 
   async linkedLinearKeys(projectId: string, userId?: string | null) {
     await this.requireProjectAccess(userId, projectId);
-    const res = await this.db.query(
-      "SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY linear_issue_key",
-      [projectId]
-    );
+    const [res, tasks] = await Promise.all([
+      this.db.query(
+        "SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY linear_issue_key",
+        [projectId]
+      ),
+      this.zyraTaskStatusesByIssueKey(projectId, "linear_issue_keys")
+    ]);
     const keys = res.rows.map((r) => r.linear_issue_key);
-    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.linear_issue_key, r.count])) };
+    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.linear_issue_key, r.count])), tasks };
   }
 
   /**

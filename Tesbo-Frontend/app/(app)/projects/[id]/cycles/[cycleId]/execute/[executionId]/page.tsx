@@ -10,21 +10,23 @@ import {
   listProjectMembers,
   type ExecutionItem,
 } from "@/lib/api";
+import { IconBug } from "@tabler/icons-react";
 import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
+import { useLogBugDialog } from "@/components/LogBugDialog";
 import { Breadcrumbs } from "@/components/workflows";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
 function statusToTone(status: string) {
-  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "info" | "neutral"> = {
+  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "retest" | "notRun"> = {
     Passed: "success",
     Failed: "error",
     Skipped: "skipped",
     Blocked: "blocked",
-    Retest: "info",
-    Untested: "neutral",
+    Retest: "retest",
+    Untested: "notRun",
   };
   return map[status] ?? "neutral";
 }
@@ -67,6 +69,7 @@ export default function ExecutionDetailPage() {
   const [assigneeId, setAssigneeId] = useState("");
   const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [saving, setSaving] = useState(false);
+  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({ projectId, cycleId });
 
   useEffect(() => {
     authMe().then((me) => {
@@ -291,6 +294,10 @@ export default function ExecutionDetailPage() {
             <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save"}
             </Button>
+            <Button type="button" variant="secondary" onClick={() => openBugDialogFor(execution)}>
+              <IconBug size={14} />
+              Log bug
+            </Button>
             <Link
               href={`/projects/${projectId}/cycles/${cycleId}`}
               className="rounded-lg border border-[var(--border)] py-2 px-5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
@@ -300,6 +307,7 @@ export default function ExecutionDetailPage() {
           </div>
         </form>
       </main>
+      {bugDialog}
     </div>
   );
 }

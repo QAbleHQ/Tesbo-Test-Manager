@@ -696,7 +696,7 @@ function CreateDocumentModal({
     <Modal open={open} onClose={onClose} title="Create document" className="max-w-2xl">
       <div className="space-y-4">
         <Field>
-          <FieldLabel>Document title</FieldLabel>
+          <FieldLabel>Document title <span className="text-[var(--error-foreground)]">*</span></FieldLabel>
           <Input
             value={title}
             onChange={(e) => {
@@ -732,7 +732,7 @@ function CreateDocumentModal({
         </Field>
         {isBlankTemplate && (
           <Field>
-            <FieldLabel>Content</FieldLabel>
+            <FieldLabel>Content <span className="text-[var(--error-foreground)]">*</span></FieldLabel>
             <Textarea
               value={blankContent}
               onChange={(e) => setBlankContent(e.target.value)}

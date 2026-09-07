@@ -4,11 +4,11 @@ import { Card } from "@/components/ui";
 
 export function statusTone(
   s: string | null,
-): "neutral" | "brand" | "ai" | "success" | "warning" | "error" | "info" | "blocked" | "skipped" {
+): "neutral" | "brand" | "ai" | "success" | "warning" | "error" | "info" | "blocked" | "skipped" | "retest" | "notRun" {
   if (!s) return "neutral";
-  const map: Record<string, "success" | "error" | "warning" | "info" | "neutral" | "blocked" | "skipped"> = {
-    Passed: "success", Failed: "error", Skipped: "skipped", Blocked: "blocked", Retest: "info",
-    Untested: "neutral", Open: "error", Closed: "success", "In Progress": "info", Planning: "warning",
+  const map: Record<string, "success" | "error" | "warning" | "info" | "neutral" | "blocked" | "skipped" | "retest" | "notRun"> = {
+    Passed: "success", Failed: "error", Skipped: "skipped", Blocked: "blocked", Retest: "retest",
+    Untested: "notRun", Open: "error", Closed: "success", "In Progress": "info", Planning: "warning",
     Completed: "success", Draft: "neutral", Approved: "success", "In Review": "info", Deprecated: "neutral",
   };
   return map[s] ?? "neutral";
