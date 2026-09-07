@@ -226,3 +226,61 @@ test.describe("suite name validation and error display (UI)", () => {
     });
   }
 });
+
+/*
+ * Test Case Detail — bugs filed against this case.
+ *
+ * Before this: the panel had no bugs section at all, so there was no way to see a bug's key/URL
+ * from the test case side — only the Test Run flow's unrelated "Defect Key"/"Defect URL" free-text
+ * fields existed anywhere near this screen. This asserts the real fix: the panel's own "Bugs" tab
+ * shows the actual bug data (integrationIssueKey/externalUrl) under "Bug Key"/"Bug URL", and never
+ * borrows the Test Run flow's "Defect" wording.
+ */
+test.describe("test case detail — linked bugs", () => {
+  test("the Bugs tab shows the linked bug's real Bug Key and Bug URL, never Defect terminology", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const title = `E2E TC Detail Bugs ${Date.now()}`;
+    let testcaseId = "";
+    let bugId = "";
+    try {
+      const tc = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title } })
+      ).json();
+      testcaseId = tc.id;
+      const bug = await (
+        await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: `E2E Linked Bug ${Date.now()}`,
+            integrationProvider: "JIRA",
+            integrationIssueKey: "PROJ-9911",
+            externalUrl: "https://example.atlassian.net/browse/PROJ-9911",
+            links: [{ testcaseId }],
+          },
+        })
+      ).json();
+      bugId = bug.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await panel.getByRole("button", { name: /^Bugs/ }).click();
+
+      // exact: true — "PROJ-9911" is otherwise a substring match of the Bug URL link's own text
+      // (".../browse/PROJ-9911"), so a fuzzy match resolves to both links at once.
+      const bugKeyLink = panel.getByRole("link", { name: "PROJ-9911", exact: true });
+      await expect(bugKeyLink).toBeVisible();
+      await expect(bugKeyLink).toHaveAttribute("href", "https://example.atlassian.net/browse/PROJ-9911");
+      await expect(panel.getByRole("link", { name: "https://example.atlassian.net/browse/PROJ-9911" })).toBeVisible();
+
+      await expect(panel.getByText("Bug Key", { exact: true })).toBeVisible();
+      await expect(panel.getByText("Bug URL", { exact: true })).toBeVisible();
+      await expect(panel.getByText("Defect Key")).toHaveCount(0);
+      await expect(panel.getByText("Defect URL")).toHaveCount(0);
+    } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false });
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
