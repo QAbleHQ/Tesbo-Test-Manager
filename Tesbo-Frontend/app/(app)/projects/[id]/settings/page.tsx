@@ -4,7 +4,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
-import { IconChevronRight, IconKey, IconSettings, IconStack2, IconTrash } from "@tabler/icons-react";
+import { IconKey, IconSettings, IconStack2, IconTrash } from "@tabler/icons-react";
 import {
   authMe,
   getProject,
@@ -25,6 +25,7 @@ import {
   type TestEnvironmentSetting,
 } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import {
   Button,
   Input,
@@ -481,21 +482,13 @@ export default function ProjectSettingsPage() {
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="cursor-pointer truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <span className="truncate font-medium text-[var(--accent-light)]">Settings</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Settings" },
+              ]}
+            />,
             topBarStartEl,
           )}
 

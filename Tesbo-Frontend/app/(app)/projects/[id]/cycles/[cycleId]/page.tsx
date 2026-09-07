@@ -69,12 +69,14 @@ import TrackingDestinationField, { type TrackingDestination } from "@/components
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
 /* ───── Constants ───── */
 const EXEC_STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"] as const;
 const RUN_TABS = ["All", "Passed", "Failed", "Blocked", "Skipped", "Pending"] as const;
+const CANONICAL_PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 /*
  * Basecamp 10226268634 ("The Log Bug UI should be consistent across both Test Run → Log Bug and Bug
  * Page → Log Bug"). This modal collected only a title, a description and evidence, so every bug
@@ -417,6 +419,12 @@ export default function TestRunDetailPage() {
   const [activeTab, setActiveTab] = useState<RunTab>("All");
   const [tableSearch, setTableSearch] = useState("");
   const [page, setPage] = useState(1);
+  /* Priority/Type/Assignee filters for the run's own results table. Named distinctly from the
+     "Add Test Cases" picker's filterPriority/filterType (below) so the two filter sets never
+     collide — they filter different arrays (executions here vs. allCases in the picker). */
+  const [runFilterPriority, setRunFilterPriority] = useState("");
+  const [runFilterType, setRunFilterType] = useState("");
+  const [runFilterAssignee, setRunFilterAssignee] = useState("");
 
   /* test case picker state */
   const [showPicker, setShowPicker] = useState(false);
@@ -521,7 +529,7 @@ export default function TestRunDetailPage() {
   /* reset to first page whenever the filter/search changes */
   useEffect(() => {
     setPage(1);
-  }, [activeTab, tableSearch]);
+  }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
 
 
   /* ───── Load test cases for picker ───── */
@@ -933,10 +941,51 @@ export default function TestRunDetailPage() {
     return counts;
   }, [executions]);
 
+  // Type has no fixed enum in the DB (VARCHAR, free text) and the picker modal's canonical list
+  // (Functional/Regression/…/Usability/Other) doesn't match the Test Cases page's own list —
+  // rather than pick one, the filter options are the distinct values actually present on this
+  // run's test cases, so a legacy/imported Type string is always filterable, never hidden.
+  const runTypeOptions = useMemo(
+    () => Array.from(new Set(executions.map((e) => e.type).filter((t): t is string => !!t))).sort(),
+    [executions]
+  );
+
+  // Priority has a canonical P0–P3 list used app-wide, but the DB column is unconstrained free
+  // text, so a legacy/imported row could carry something outside it — append any such value
+  // rather than let it disappear from the filter silently.
+  const runPriorityOptions = useMemo(() => {
+    const extra = Array.from(
+      new Set(
+        executions
+          .map((e) => e.priority)
+          .filter((p): p is string => !!p && !(CANONICAL_PRIORITIES as readonly string[]).includes(p))
+      )
+    ).sort();
+    return [...CANONICAL_PRIORITIES, ...extra];
+  }, [executions]);
+
+  const activeRunFilterCount =
+    (runFilterPriority ? 1 : 0) + (runFilterType ? 1 : 0) + (runFilterAssignee ? 1 : 0);
+
+  function clearRunFilters() {
+    setRunFilterPriority("");
+    setRunFilterType("");
+    setRunFilterAssignee("");
+  }
+
   const filteredExecutions = useMemo(() => {
     let list = executions;
     if (activeTab !== "All") {
       list = list.filter((e) => (activeTab === "Pending" ? e.status === "Untested" || e.status === "Retest" : e.status === activeTab));
+    }
+    if (runFilterPriority) {
+      list = list.filter((e) => e.priority === runFilterPriority);
+    }
+    if (runFilterType) {
+      list = list.filter((e) => e.type === runFilterType);
+    }
+    if (runFilterAssignee) {
+      list = list.filter((e) => (runFilterAssignee === "__unassigned__" ? !e.assigneeId : e.assigneeId === runFilterAssignee));
     }
     const term = tableSearch.trim().toLowerCase();
     if (term) {
@@ -947,7 +996,7 @@ export default function TestRunDetailPage() {
       );
     }
     return list;
-  }, [executions, activeTab, tableSearch]);
+  }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
 
   const pageCount = Math.max(1, Math.ceil(filteredExecutions.length / PAGE_SIZE));
   const pagedExecutions = useMemo(
@@ -976,29 +1025,14 @@ export default function TestRunDetailPage() {
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <button
-                type="button"
-                onClick={() => router.push(`/projects/${projectId}/cycles`)}
-                className="shrink-0 text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-              >
-                Test Runs
-              </button>
-              <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-              <span className="truncate font-medium text-[var(--accent-light)]">{run.name}</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Test Runs", href: `/projects/${projectId}/cycles` },
+                { label: run.name },
+              ]}
+            />,
             topBarStartEl,
           )}
         {topBarEndEl &&
@@ -1159,6 +1193,57 @@ export default function TestRunDetailPage() {
                   </button>
                 );
               })}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Select
+                aria-label="Filter by priority"
+                data-testid="run-filter-priority"
+                value={runFilterPriority}
+                onChange={(e) => setRunFilterPriority(e.target.value)}
+                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+              >
+                <option value="">All priorities</option>
+                {runPriorityOptions.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </Select>
+              <Select
+                aria-label="Filter by type"
+                data-testid="run-filter-type"
+                value={runFilterType}
+                onChange={(e) => setRunFilterType(e.target.value)}
+                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+              >
+                <option value="">All types</option>
+                {runTypeOptions.map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </Select>
+              <Select
+                aria-label="Filter by assignee"
+                data-testid="run-filter-assignee"
+                value={runFilterAssignee}
+                onChange={(e) => setRunFilterAssignee(e.target.value)}
+                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+              >
+                <option value="">All assignees</option>
+                <option value="__unassigned__">Unassigned</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>{m.name || m.email}</option>
+                ))}
+              </Select>
+              {activeRunFilterCount > 0 && (
+                <button
+                  type="button"
+                  data-testid="run-filter-clear"
+                  onClick={clearRunFilters}
+                  className="flex h-[30px] items-center gap-1 rounded-[6px] px-2 text-[12px] text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconX size={12} stroke={2} />
+                  Clear filters ({activeRunFilterCount})
+                </button>
+              )}
             </div>
 
             <div className="relative ml-auto">
@@ -1344,6 +1429,7 @@ export default function TestRunDetailPage() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    aria-label="Previous page"
                     disabled={page <= 1}
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
                     className="flex h-7 w-7 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)] disabled:opacity-40"
@@ -1355,6 +1441,7 @@ export default function TestRunDetailPage() {
                   </span>
                   <button
                     type="button"
+                    aria-label="Next page"
                     disabled={page >= pageCount}
                     onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
                     className="flex h-7 w-7 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)] disabled:opacity-40"

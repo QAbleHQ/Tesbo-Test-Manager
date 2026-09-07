@@ -3,6 +3,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { Queue } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { ChangedField } from "../common/text-diff.util";
 import {
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
@@ -488,12 +489,13 @@ export class IntegrationSyncService {
     eventType: "created" | "updated",
     provider: SyncProvider,
     changedSummary: string | null,
+    changedFields: ChangedField[],
     triggeredBy: string | null
   ): Promise<void> {
     await this.db.query(
-      `INSERT INTO knowledge_document_sync_events (document_id, run_id, provider, event_type, changed_summary, triggered_by)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [documentId, runId, provider, eventType, changedSummary, triggeredBy]
+      `INSERT INTO knowledge_document_sync_events (document_id, run_id, provider, event_type, changed_summary, changed_fields, triggered_by)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+      [documentId, runId, provider, eventType, changedSummary, changedFields.length ? JSON.stringify(changedFields) : null, triggeredBy]
     );
   }
 
@@ -507,12 +509,19 @@ export class IntegrationSyncService {
     limit = 5,
     offset = 0
   ): Promise<{
-    events: Array<{ id: string; eventType: string; changedSummary: string | null; createdAt: string; triggeredByName: string | null }>;
+    events: Array<{
+      id: string;
+      eventType: string;
+      changedSummary: string | null;
+      changedFields: ChangedField[];
+      createdAt: string;
+      triggeredByName: string | null;
+    }>;
     hasMore: boolean;
   }> {
     const boundedLimit = Math.max(1, Math.min(50, limit));
     const res = await this.db.query<Row>(
-      `SELECT e.id, e.event_type, e.changed_summary, e.created_at,
+      `SELECT e.id, e.event_type, e.changed_summary, e.changed_fields, e.created_at,
               COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS triggered_by_name
        FROM knowledge_document_sync_events e
        LEFT JOIN users u ON u.id = e.triggered_by
@@ -527,6 +536,9 @@ export class IntegrationSyncService {
         id: String(row.id),
         eventType: String(row.event_type),
         changedSummary: row.changed_summary ? String(row.changed_summary) : null,
+        // Historical rows predate this column and stay NULL — the frontend falls back to the
+        // plain-sentence rendering (no badge/diff button) when this is empty.
+        changedFields: Array.isArray(row.changed_fields) ? (row.changed_fields as ChangedField[]) : [],
         createdAt: new Date(row.created_at).toISOString(),
         triggeredByName: row.triggered_by_name ? String(row.triggered_by_name) : null
       })),

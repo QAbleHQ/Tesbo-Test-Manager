@@ -2738,6 +2738,9 @@ export interface JiraConnection {
   connectedBy?: string;
   createdAt?: string;
   connectedProjects?: JiraConnectedProject[];
+  // Every Jira project this Tesbo project has ever been linked to (disabled, never deleted) — lets
+  // the Requirements page offer a "previously linked" source alongside the current one.
+  history?: JiraConnectedProject[];
 }
 
 export interface JiraConnectedProject {
@@ -2859,6 +2862,10 @@ export interface TicketListParams {
   issueType?: string;
   status?: string;
   coverage?: "covered" | "uncovered";
+  // Omitted: tickets from whatever's currently mapped. Set to one of JiraConnection.history's /
+  // LinearConnection.history's remote ids to browse a specific past (no-longer-mapped) source
+  // instead — nothing here is ever deleted, so old sources stay reachable this way.
+  remoteId?: string;
 }
 
 function ticketListParamsToSearch(params?: TicketListParams): URLSearchParams {
@@ -2869,6 +2876,7 @@ function ticketListParamsToSearch(params?: TicketListParams): URLSearchParams {
   if (params?.issueType) sp.set("issueType", params.issueType);
   if (params?.status) sp.set("status", params.status);
   if (params?.coverage) sp.set("coverage", params.coverage);
+  if (params?.remoteId) sp.set("remoteId", params.remoteId);
   return sp;
 }
 
@@ -2908,6 +2916,9 @@ export interface LinearConnection {
   connectedBy?: string;
   createdAt?: string;
   connectedProjects?: LinearConnectedTeam[];
+  // Every Linear team/project this Tesbo project has ever been linked to (disabled, never deleted)
+  // — lets the Requirements page offer a "previously linked" source alongside the current one.
+  history?: LinearConnectedTeam[];
 }
 
 export interface LinearConnectedTeam {
@@ -2915,6 +2926,7 @@ export interface LinearConnectedTeam {
   linearTeamId: string;
   linearTeamKey: string;
   linearTeamName: string;
+  entityType?: "team" | "project";
   createdAt: string;
 }
 
@@ -2924,6 +2936,11 @@ export interface LinearTeam {
   name: string;
   style: string;
   connected: boolean;
+  // Present on every row now that the picker lists Linear Teams and Projects together (Teams are
+  // Linear's mandatory, every-issue-belongs-to-one container; Projects are an optional, often
+  // cross-team grouping) — optional only so this type stays a strict superset of the pre-feature
+  // shape.
+  entityType?: "team" | "project";
 }
 
 export interface LinearTicket {
@@ -2954,7 +2971,7 @@ export async function listLinearTeams(projectId: string): Promise<LinearTeam[]> 
 
 export async function connectLinearTeams(
   projectId: string,
-  projects: { id: string; key: string; name: string }[]
+  projects: { id: string; key: string; name: string; entityType?: "team" | "project" }[]
 ): Promise<void> {
   await api(`/api/projects/${projectId}/linear/teams`, { method: "POST", body: { projects } });
 }
@@ -3227,25 +3244,39 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
-// The info-icon popover on a synced (mirror) row: this ticket's add/update timeline.
-export interface KnowledgeDocumentSyncEvent {
+// The Change History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
+// are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
+export interface KnowledgeChangedField {
+  label: string;
+  oldExcerpt: string;
+  newExcerpt: string;
+  oldLength: number;
+  newLength: number;
+  truncated: boolean;
+}
+
+export interface KnowledgeDocumentHistoryEntry {
   id: string;
   eventType: "created" | "updated";
   changedSummary: string | null;
+  changedFields: KnowledgeChangedField[];
   createdAt: string;
-  triggeredByName: string | null;
+  actorName: string;
+  /** Set only for a manual document's version-diff entry — lets the row offer "Restore". */
+  versionId: string | null;
 }
 
-export function getKnowledgeDocumentSyncEvents(
+export function getKnowledgeDocumentHistory(
   projectId: string,
   documentId: string,
   page: { limit?: number; offset?: number } = {}
-): Promise<{ events: KnowledgeDocumentSyncEvent[]; hasMore: boolean }> {
+): Promise<{ events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean }> {
   const sp = new URLSearchParams();
   if (page.limit != null) sp.set("limit", String(page.limit));
   if (page.offset != null) sp.set("offset", String(page.offset));
   const qs = sp.toString();
-  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events${qs ? `?${qs}` : ""}`);
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/history${qs ? `?${qs}` : ""}`);
 }
 
 export function updateKnowledgeDocument(

@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { truncateForColumn } from "../common/integration-text.util";
+import { summarizeTextChange } from "../common/text-diff.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
@@ -64,7 +65,10 @@ const TICKET_TABLES: Record<SyncProvider, {
     updatedCol: "linear_updated_at",
     urlCol: "linear_url",
     conflict: "(integration_connection_id, linear_issue_id, project_id)",
-    mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name
+    // entity_type (V95) disambiguates whether remote_id/remote_key/remote_name hold a Linear Team
+    // or a Linear Project — jira's mappingSql has no equivalent column since Jira only ever maps
+    // by Project.
+    mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name, entity_type
                  FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
   }
 };
@@ -144,7 +148,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
         return;
       }
 
-      const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string }>(config.mappingSql, [projectId]);
+      const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string; entity_type?: string }>(config.mappingSql, [projectId]);
       const remote = mapping.rows[0];
       if (!remote) {
         await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} project is mapped to this project yet.`);
@@ -162,7 +166,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
       const onPage = async (tickets: RemoteTicket[]) => {
         for (const ticket of tickets) {
           try {
-            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket);
+            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket, remote.remote_id);
             queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
           } catch (err) {
             // One ticket's data (an oversized field, or anything else unexpected) must never abort
@@ -182,7 +186,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
       const { truncated } = provider === "jira"
         ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
-        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since);
+        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
 
       await this.runs.setTotals(runId, queued.length);
 
@@ -236,14 +240,20 @@ export class IntegrationSyncProcessor extends WorkerHost {
     }
   }
 
-  private async upsertTicket(projectId: string, connectionId: string, provider: SyncProvider, ticket: RemoteTicket): Promise<string> {
+  private async upsertTicket(
+    projectId: string,
+    connectionId: string,
+    provider: SyncProvider,
+    ticket: RemoteTicket,
+    mappedRemoteId: string
+  ): Promise<string> {
     const c = TICKET_TABLES[provider];
     const res = await this.db.query<{ id: string }>(
       `INSERT INTO ${c.table} (
          project_id, ${c.connectionCol}, ${c.issueIdCol}, ${c.issueKeyCol}, summary, description,
-         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at
+         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at, mapped_remote_id
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16)
        ON CONFLICT ${c.conflict} DO UPDATE SET
          ${c.issueKeyCol} = EXCLUDED.${c.issueKeyCol},
          summary = EXCLUDED.summary,
@@ -257,7 +267,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
          ${c.createdCol} = EXCLUDED.${c.createdCol},
          ${c.updatedCol} = EXCLUDED.${c.updatedCol},
          ${c.urlCol} = EXCLUDED.${c.urlCol},
-         synced_at = now()
+         synced_at = now(),
+         mapped_remote_id = EXCLUDED.mapped_remote_id
        RETURNING id`,
       [
         projectId,
@@ -277,7 +288,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
         ticket.labels,
         ticket.createdAt,
         ticket.updatedAt,
-        truncateForColumn(ticket.url, 1024)
+        truncateForColumn(ticket.url, 1024),
+        mappedRemoteId
       ]
     );
     return res.rows[0].id;
@@ -426,15 +438,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
       void this.ragIngestion
         .enqueueEmbedding({ organizationId, projectId, sourceType: "document", sourceId: mirrorDoc.id, reason: "updated" })
         .catch(() => undefined);
+      const { summary, fields } = summarizeTextChange(previousDoc?.content_text ?? null, mirror.markdown, "Added from sync.", "Updated from sync.");
       await this.runs
-        .recordSyncEvent(
-          mirrorDoc.id,
-          runId,
-          mirrorDoc.inserted ? "created" : "updated",
-          provider,
-          this.summarizeChanges(previousDoc?.content_text ?? null, mirror.markdown),
-          triggeredBy
-        )
+        .recordSyncEvent(mirrorDoc.id, runId, mirrorDoc.inserted ? "created" : "updated", provider, summary, fields, triggeredBy)
         .catch((err) => this.logger.warn(`Failed to record sync event for ${ticket.issueKey}: ${err instanceof Error ? err.message : err}`));
     }
 
@@ -452,31 +458,6 @@ export class IntegrationSyncProcessor extends WorkerHost {
     if (!raw) return [];
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
     return Array.isArray(parsed) ? (parsed as RemoteComment[]) : [];
-  }
-
-  /**
-   * Short, human-readable "what changed" line for the Knowledge Base info-icon popover — deliberately
-   * a summary of which sections moved, not a full diff, per the "keep it minimal and small" ask.
-   * `oldContent` is null for a brand-new document.
-   */
-  private summarizeChanges(oldContent: string | null, newContent: string): string {
-    if (oldContent === null) return "Added from sync.";
-    const oldSections = new Map(oldContent.split("\n\n").map((section) => [this.sectionLabel(section), section]));
-    const changedLabels: string[] = [];
-    for (const section of newContent.split("\n\n")) {
-      const label = this.sectionLabel(section);
-      if (oldSections.get(label) !== section) changedLabels.push(label);
-    }
-    return changedLabels.length ? `${changedLabels.join(", ")} updated.` : "Updated from sync.";
-  }
-
-  private sectionLabel(section: string): string {
-    const firstLine = (section.split("\n")[0] || "").trim();
-    const heading = firstLine.match(/^#{1,6}\s+(.*)$/);
-    if (heading) return heading[1].trim();
-    // The title line ("# KEY: summary") and the meta block (Status/Type/Priority/...) have no
-    // "## " heading of their own — label them explicitly so the summary reads naturally.
-    return firstLine.startsWith("# ") ? "Title" : "Details";
   }
 
   @OnWorkerEvent("failed")

@@ -7,7 +7,6 @@ import {
   IconFolder,
   IconFileText,
   IconFile,
-  IconChevronRight,
   IconDots,
   IconPlus,
   IconSearch,
@@ -52,6 +51,7 @@ import {
 import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { Breadcrumbs } from "@/components/workflows";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
 import { FolderTreeNodeRow, flattenFolders, findAncestorIds, type FolderAction } from "@/components/knowledge-base/FolderTree";
@@ -1276,21 +1276,13 @@ function KnowledgeBasePageInner() {
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(
-            <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-[12px]">
-              {projectName && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => router.push("/projects")}
-                    className="truncate text-[var(--muted-soft)] transition-colors hover:text-[var(--accent-light)]"
-                  >
-                    {projectName}
-                  </button>
-                  <IconChevronRight size={12} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                </>
-              )}
-              <span className="font-medium text-[var(--accent-light)]">Knowledge base</span>
-            </nav>,
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Knowledge base" },
+              ]}
+            />,
             topBarStartEl
           )}
         {topBarEndEl &&
@@ -1635,9 +1627,10 @@ function KnowledgeBasePageInner() {
                           <td className="px-4 py-2.5 text-[var(--muted)]">
                             <div className="flex items-center gap-1">
                               <span>{formatDate((item as { updatedAt: string }).updatedAt)}</span>
-                              {/* Only a synced mirror has a change timeline to show — a
-                                  human-authored doc gets no icon rather than an empty popover. */}
-                              {syncedFrom && <ChangeHistoryTrigger projectId={projectId} documentId={item.id} />}
+                              {/* Every document — synced or manually created — has a change
+                                  timeline now; a brand-new doc's popover just reads "No change
+                                  history recorded yet." rather than omitting the icon entirely. */}
+                              {item.type === "document" && <ChangeHistoryTrigger projectId={projectId} documentId={item.id} />}
                             </div>
                           </td>
                           {/*

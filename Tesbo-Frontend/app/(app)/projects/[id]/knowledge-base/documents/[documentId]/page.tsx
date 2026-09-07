@@ -18,17 +18,17 @@ import {
 } from "@tabler/icons-react";
 import {
   authMe,
+  getProject,
   listProjectMembers,
   getKnowledgeDocument,
   updateKnowledgeDocument,
   duplicateKnowledgeDocument,
   deleteKnowledgeDocument,
-  listKnowledgeDocumentVersions,
   restoreKnowledgeDocumentVersion,
   approveAiMemory,
   rejectAiMemory,
   type KnowledgeDocument,
-  type KnowledgeDocumentVersion,
+  type KnowledgeDocumentHistoryEntry,
   type KnowledgeBreadcrumbEntry,
 } from "@/lib/api";
 import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
@@ -36,6 +36,7 @@ import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
 import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
+import { Breadcrumbs, type BreadcrumbItem } from "@/components/workflows";
 
 type SaveStatus = "saved" | "saving" | "unsaved";
 
@@ -179,12 +180,19 @@ export default function KnowledgeDocumentPage() {
   const [loading, setLoading] = useState(true);
   const [doc, setDoc] = useState<KnowledgeDocument | null>(null);
   const [breadcrumb, setBreadcrumb] = useState<KnowledgeBreadcrumbEntry[]>([]);
+  const [projectName, setProjectName] = useState("");
   const [title, setTitle] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [error, setError] = useState<string | null>(null);
   const [canApprove, setCanApprove] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [versions, setVersions] = useState<KnowledgeDocumentVersion[]>([]);
+  // The version a "Restore" click is asking to confirm — null means no confirmation is showing.
+  const [confirmTarget, setConfirmTarget] = useState<KnowledgeDocumentHistoryEntry | null>(null);
+  const [restorePhase, setRestorePhase] = useState<"idle" | "restoring" | "error">("idle");
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  // Bumped only when the editor's content must be force-replaced (a restore) — not on every
+  // ordinary save, which would otherwise reset the caret/scroll position on every autosave tick.
+  const [contentResetKey, setContentResetKey] = useState(0);
   const [linkCopied, setLinkCopied] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -201,6 +209,17 @@ export default function KnowledgeDocumentPage() {
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestContent = useRef<{ contentJson: JSONContent; contentHtml: string; contentText: string } | null>(null);
+  // Synchronous double-submit guard for restore: state alone can't stop a second click that fires
+  // before React re-renders the disabled button, so this is checked and set before any await.
+  const restoreInFlightRef = useRef(false);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -223,6 +242,7 @@ export default function KnowledgeDocumentPage() {
         const members = await listProjectMembers(projectId).catch(() => []);
         const role = normalizeRole(members.find((m) => m.userId === me.userId)?.role ?? "qa_engineer");
         setCanApprove(role === "owner" || role === "manager");
+        getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load document.");
       } finally {
@@ -407,30 +427,76 @@ export default function KnowledgeDocumentPage() {
     }
   }
 
-  async function openHistory() {
+  function openHistory() {
     setHistoryOpen(true);
-    // A mirror is never saved through the edit-and-save flow that produces version snapshots (it's
-    // read-only, rewritten wholesale by every sync) — the versions list would always be empty and
-    // "Restore" wouldn't mean anything against it, so skip the fetch and render the sync timeline
-    // (ChangeHistoryList) instead. See the modal below.
-    if (isSyncedMirror) return;
-    const data = await listKnowledgeDocumentVersions(projectId, documentId).catch(() => ({ list: [], total: 0 }));
-    setVersions(data.list);
+    setConfirmTarget(null);
+    setRestorePhase("idle");
+    setRestoreError(null);
+    // ChangeHistoryList fetches its own timeline (mirror sync log or manual version diffs) —
+    // nothing to preload here.
   }
 
-  async function handleRestoreVersion(versionId: string) {
+  // Restore is a two-step action: this only opens the confirmation, it never calls the API. Only a
+  // manual document's version-diff entries ever carry a versionId (see ChangeHistoryList), so this
+  // is only ever reachable for those.
+  function requestRestoreVersion(entry: KnowledgeDocumentHistoryEntry) {
+    if (restorePhase === "restoring" || !entry.versionId) return; // one confirmation/restore in flight at a time
+    setConfirmTarget(entry);
+    setRestorePhase("idle");
+    setRestoreError(null);
+  }
+
+  function cancelRestoreVersion() {
+    if (restorePhase === "restoring") return; // nothing to abandon safely mid-request
+    setConfirmTarget(null);
+    setRestoreError(null);
+  }
+
+  // Guards the history Modal's own close (Escape / backdrop click) the same way: closing while a
+  // restore is in flight would leave the confirm dialog gone but the request still resolving into
+  // state nothing is listening to render correctly.
+  function closeHistoryModal() {
+    if (restorePhase === "restoring") return;
+    setHistoryOpen(false);
+    setConfirmTarget(null);
+    setRestoreError(null);
+  }
+
+  async function confirmRestoreVersion() {
+    if (!confirmTarget || restoreInFlightRef.current) return;
+    restoreInFlightRef.current = true;
+    setRestorePhase("restoring");
+    setRestoreError(null);
     try {
-      const updated = await updateAfterRestore(versionId);
+      const updated = await restoreKnowledgeDocumentVersion(projectId, documentId, confirmTarget.versionId!);
+      if (!isMountedRef.current) return;
+      // A pending autosave still carries the pre-restore editor content in `latestContent` — left
+      // alone, it fires a few hundred ms later and silently overwrites the restore we just applied.
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      latestContent.current = {
+        contentJson: (updated.contentJson ?? null) as JSONContent,
+        contentHtml: updated.contentHtml ?? "",
+        contentText: updated.contentText ?? "",
+      };
       setDoc(updated);
       setTitle(updated.title);
+      setSaveStatus("saved");
+      // Forces the TipTap instance to actually re-render the restored body — see RichTextEditor,
+      // which otherwise only consumes `contentJson`/`contentHtml` once, at mount.
+      setContentResetKey((k) => k + 1);
+      setConfirmTarget(null);
+      setRestorePhase("idle");
       setHistoryOpen(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to restore version.");
+      if (!isMountedRef.current) return;
+      setRestorePhase("error");
+      setRestoreError(err instanceof Error ? err.message : "Failed to restore version.");
+    } finally {
+      restoreInFlightRef.current = false;
     }
-  }
-
-  async function updateAfterRestore(versionId: string) {
-    return restoreKnowledgeDocumentVersion(projectId, documentId, versionId);
   }
 
   async function handleApprove() {
@@ -468,58 +534,55 @@ export default function KnowledgeDocumentPage() {
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = doc.sourceProvider === "linear" ? "Linear" : "Jira";
 
+  // Change History is the same data and component everywhere — the Knowledge Base list's
+  // info-icon popover and this modal never drift into showing different things for the same
+  // document, whether it's a synced mirror or a manually-created one. Only the confirmation step
+  // below is specific to this modal.
   let historyModalBody: React.ReactNode;
-  if (isSyncedMirror) {
-    // A mirror's "history" is what the sync pipeline changed, not a manually saved version — same
-    // data and component as the Knowledge Base list's info-icon popover, so the two surfaces never
-    // drift into showing different things for the same document.
-    historyModalBody = <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} />;
-  } else if (versions.length === 0) {
-    historyModalBody = <p className="text-[13px] text-[var(--muted)]">No earlier versions yet.</p>;
-  } else {
+  if (confirmTarget) {
     historyModalBody = (
-      <ul className="max-h-80 space-y-2 overflow-y-auto">
-        {versions.map((v) => (
-          <li key={v.id} className="flex items-center justify-between rounded-[8px] border border-[var(--border)] px-3 py-2">
-            <div>
-              <p className="text-[13px] font-medium">{v.title}</p>
-              <p className="text-[12px] text-[var(--muted)]">Version {v.versionNumber} — {new Date(v.createdAt).toLocaleString()}</p>
-            </div>
-            <Button size="sm" variant="secondary" onClick={() => handleRestoreVersion(v.id)}>
-              <IconArrowRight size={14} /> Restore
-            </Button>
-          </li>
-        ))}
-      </ul>
+      <div className="space-y-4">
+        <p className="text-[13px] text-[var(--foreground)]">
+          Restore to the version from <span className="font-medium">{new Date(confirmTarget.createdAt).toLocaleString()}</span>?
+          The current content will be saved as a new version first, so this can be undone.
+        </p>
+        {restorePhase === "error" && restoreError && (
+          <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-[13px] text-[var(--error-foreground)]">
+            <span>{restoreError}</span>
+          </div>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button size="sm" variant="secondary" onClick={cancelRestoreVersion} disabled={restorePhase === "restoring"}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="danger" onClick={confirmRestoreVersion} disabled={restorePhase === "restoring"}>
+            {restorePhase === "restoring" ? "Restoring…" : "Restore"}
+          </Button>
+        </div>
+      </div>
+    );
+  } else {
+    // The confirmation step above is a separate modal body, not an in-list "Restoring…" state —
+    // by the time a restore is actually in flight this branch isn't rendered at all.
+    historyModalBody = (
+      <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} onRestoreVersion={requestRestoreVersion} />
     );
   }
 
   const parentFolder = breadcrumb[breadcrumb.length - 1];
   const rootFolder = breadcrumb[0];
+  const breadcrumbItems: BreadcrumbItem[] = [
+    { label: "Projects", href: "/projects" },
+    { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+    { label: "Knowledge base", href: `/projects/${projectId}/knowledge-base` },
+    ...breadcrumb.map((b) => ({ label: b.name, href: `/projects/${projectId}/knowledge-base?folder=${b.id}` })),
+    { label: title || "Untitled" },
+  ];
 
   return (
     <div className="mx-auto max-w-4xl">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-1.5 text-[13px] text-[var(--muted)]">
-          <Link href={`/projects/${projectId}`} className="hover:text-[var(--foreground)]">Projects</Link>
-          <span>/</span>
-          <Link
-            href={`/projects/${projectId}/knowledge-base${rootFolder ? `?folder=${rootFolder.id}` : ""}`}
-            className="hover:text-[var(--foreground)]"
-          >
-            Knowledge base
-          </Link>
-          {breadcrumb.slice(1).map((b) => (
-            <span key={b.id} className="flex items-center gap-1.5">
-              <span>/</span>
-              <Link href={`/projects/${projectId}/knowledge-base?folder=${b.id}`} className="hover:text-[var(--foreground)]">
-                {b.name}
-              </Link>
-            </span>
-          ))}
-          <span>/</span>
-          <span className="text-[var(--foreground)]">{title || "Untitled"}</span>
-        </div>
+        <Breadcrumbs items={breadcrumbItems} />
         {parentFolder && (
           <Link
             href={`/projects/${projectId}/knowledge-base?folder=${parentFolder.id}`}
@@ -667,6 +730,7 @@ export default function KnowledgeDocumentPage() {
           contentHtml={doc.contentHtml}
           editable={!isSyncedMirror}
           onUpdate={handleEditorUpdate}
+          resetKey={contentResetKey}
         />
       </div>
 
@@ -682,7 +746,7 @@ export default function KnowledgeDocumentPage() {
         />
       </div>
 
-      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title={isSyncedMirror ? "Change history" : "Version history"}>
+      <Modal open={historyOpen} onClose={closeHistoryModal} title="Change history">
         {historyModalBody}
       </Modal>
     </div>

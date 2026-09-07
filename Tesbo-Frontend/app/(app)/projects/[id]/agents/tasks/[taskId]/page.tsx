@@ -9,6 +9,7 @@ import {
   createSuite,
   deleteZyraTaskDraft,
   getJiraStatus,
+  getProject,
   getZyraTask,
   listJiraTickets,
   listSuites,
@@ -18,13 +19,14 @@ import {
   type SuiteNode,
   type ZyraTask,
 } from "@/lib/api";
+import { IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
 type SaveMode = "existing" | "new";
-type DetailTab = "testcases" | "activities" | "sources";
+type DetailTab = "testcases" | "feedback" | "activities" | "sources";
 
 function normalizeStatus(status: string): string {
   if (status === "accepted") return "done";
@@ -46,6 +48,13 @@ function latestFailureDetail(activities: ZyraTask["activities"]): string | null 
     if (activities[i].stage === "failed") return activities[i].detail || "Zyra failed to generate testcase drafts.";
   }
   return null;
+}
+
+// Mirrors TaskQuickViewPanel's isFeedbackActivity: only the entry carrying a reviewer's actual
+// words counts as "Feedback", not the status/process narration that shares the same activity log.
+// Rows written before `kind` existed fall back to matching the fixed title zyraFeedback writes.
+function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
+  return activity.kind === "feedback" || activity.title === "Review feedback submitted";
 }
 
 const TASK_STATUS_LABELS: Record<string, string> = {
@@ -114,6 +123,7 @@ export default function ZyraTaskDetailPage() {
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("");
   const pollInFlightRef = useRef(false);
 
   const loadData = useCallback(async () => {
@@ -145,7 +155,8 @@ export default function ZyraTaskDetailPage() {
       if (!me) router.replace("/login");
       else void loadData();
     });
-  }, [loadData, router]);
+    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
+  }, [loadData, router, projectId]);
 
   // Lighter than loadData (skips suites/Jira) — just re-reads this task so Zyra finishing (or
   // failing) generation server-side shows up here without a manual reload.
@@ -208,7 +219,7 @@ export default function ZyraTaskDetailPage() {
       setFeedback("");
       setReferenceNote("");
       setSelectedJiraKeys([]);
-      setMessage("Feedback sent. Zyra moved the task to Todo, applied the feedback, and returned it for review.");
+      setMessage("Feedback sent. Zyra moved the task to Todo and is regenerating the testcase drafts now — this can take a minute.");
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to send feedback.");
@@ -300,9 +311,21 @@ export default function ZyraTaskDetailPage() {
     }
   }
 
+  const taskBreadcrumb = (
+    <Breadcrumbs
+      items={[
+        { label: "Projects", href: "/projects" },
+        { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+        { label: "Agents", href: `/projects/${projectId}/agents` },
+        { label: "Tasks", href: `/projects/${projectId}/agents/tasks` },
+        { label: "Zyra task" },
+      ]}
+    />
+  );
+
   if (loading || !task) {
     return (
-      <StandardPageLayout header={<PageHeader title="Zyra task" />}>
+      <StandardPageLayout header={<PageHeader title="Zyra task" breadcrumb={taskBreadcrumb} />}>
         <PageLoader label="Loading task…" />
       </StandardPageLayout>
     );
@@ -310,6 +333,9 @@ export default function ZyraTaskDetailPage() {
 
   const done = normalizeStatus(task.taskStatus) === "done";
   const taskStatusNow = normalizeStatus(task.taskStatus);
+  // Defensive: activity_log is jsonb server-side and not schema-enforced, so a malformed or
+  // missing value must render an empty history rather than throw.
+  const feedbackActivities = Array.isArray(task.activities) ? task.activities.filter(isFeedbackActivity) : [];
   // Mirrors the backend guard in zyraFeedback: feedback only makes sense once there's something
   // to review, or to retry after a failure. Disabling it here for todo/in_progress avoids a
   // pointless round trip that the server would reject with a 409 anyway.
@@ -329,6 +355,7 @@ export default function ZyraTaskDetailPage() {
   );
   const tabItems: Array<{ key: DetailTab; label: string; count?: number }> = [
     { key: "testcases", label: "Generated Testcases", count: task.drafts.length },
+    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
     { key: "activities", label: "Activities", count: task.activities.length },
     { key: "sources", label: "Sources", count: task.sources.length },
   ];
@@ -339,6 +366,7 @@ export default function ZyraTaskDetailPage() {
         <PageHeader
           title="Zyra task"
           subtitle="Review the task, save or remove generated testcases, provide feedback, and track every Zyra status update."
+          breadcrumb={taskBreadcrumb}
           actions={<Link href={`/projects/${projectId}/agents/tasks`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Back to board</Link>}
         />
       }
@@ -470,10 +498,38 @@ export default function ZyraTaskDetailPage() {
               </table>
             </div>
           </Card>
+        </div>
+      )}
+
+      {activeTab === "feedback" && (
+        <div className="space-y-4">
+          <Card className="p-4 space-y-3">
+            {feedbackActivities.map((activity, index) => {
+              const isAgent = activity.actor === "agent";
+              return (
+                <div
+                  key={`${activity.title}-${index}`}
+                  className={`rounded-lg border border-[var(--border)] p-3 ${isAgent ? "border-l-[3px] border-l-[var(--brand-primary)]" : ""}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      {isAgent ? <IconSparkles size={12} stroke={1.75} /> : <IconUser size={12} stroke={1.75} />}
+                      {isAgent ? "Zyra" : "You"}
+                    </span>
+                    <span className="text-[11px] text-[var(--muted-soft)]">
+                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
+                    </span>
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail || activity.title}</p>
+                </div>
+              );
+            })}
+            {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
+          </Card>
 
           <Card className="p-4 space-y-4">
             <div>
-              <h2 className="text-base font-semibold text-[var(--foreground)]">Feedback</h2>
+              <h2 className="text-base font-semibold text-[var(--foreground)]">Send feedback</h2>
               <p className="mt-1 text-sm text-[var(--muted)]">Send updates from the same review table so Zyra can regenerate this task with the latest context.</p>
             </div>
             <Field>

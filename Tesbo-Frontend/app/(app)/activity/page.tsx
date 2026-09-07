@@ -15,7 +15,7 @@ import {
   type ProjectSummary,
 } from "@/lib/api";
 import { Button, EmptyStateBlock, PageLoader, Select } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import {
   ActivityRow,
   ActivitySummaryPanel,
@@ -138,11 +138,12 @@ export default function WorkspaceActivityPage() {
   const groups = useMemo(() => groupByDate(activities), [activities]);
 
   const breadcrumb = (
-    <div className="flex items-center gap-2">
-      <span className="text-[var(--foreground)]">{workspaceName}</span>
-      <span>/</span>
-      <span className="text-[var(--foreground)]">Activity</span>
-    </div>
+    <Breadcrumbs
+      items={[
+        { label: workspaceName || "Workspace", href: "/dashboard" },
+        { label: "Activity" },
+      ]}
+    />
   );
 
   if (checkingAccess) {

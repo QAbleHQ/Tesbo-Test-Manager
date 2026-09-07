@@ -27,7 +27,7 @@ import {
   type ActivityLogItem,
 } from "@/lib/api";
 import { Card, PageLoader, StatusChip, type StatusChipProps } from "@/components/ui";
-import { PageHeader, StandardPageLayout } from "@/components/workflows";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { OwnerAvatar } from "@/components/testplans/PlanCard";
 
 /* ───── shared small helpers ───── */
@@ -210,7 +210,6 @@ export default function ProjectDashboardPage() {
   }
 
   const name = (project.name as string) ?? "";
-  const key = (project.key as string) ?? "";
   const description = (project.description as string) ?? "";
 
   const bySeverity = summary.openBugs.bySeverity;
@@ -235,13 +234,12 @@ export default function ProjectDashboardPage() {
           title={name}
           subtitle={description || undefined}
           breadcrumb={
-            <div className="flex items-center gap-1.5 text-[13px]">
-              <Link href="/projects" className="text-[var(--ink-400)] hover:text-[var(--ink-800)] transition-colors">
-                Projects
-              </Link>
-              <span className="text-[var(--ink-300)]">/</span>
-              <span className="font-mono text-[var(--ink-300)]">{key}</span>
-            </div>
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: name || "Project" },
+              ]}
+            />
           }
           actions={
             <>

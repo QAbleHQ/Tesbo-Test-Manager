@@ -54,9 +54,11 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onImported: (result: ImportResult) => void;
-  // The suite the user was browsing when they opened Import, if any — used as the fallback
-  // parent when a row leaves "Suite Name" blank (matching how "Add test case" already defaults
-  // to the currently open suite instead of always landing rows at the root).
+  // The suite the user was browsing when they opened Import, if any. Rows that leave "Suite Name"
+  // blank land directly in it (matching how "Add test case" already defaults to the currently open
+  // suite instead of always landing rows at the root); rows that do name a suite/component get that
+  // structure created as children of it instead of at the project root, so importing from inside a
+  // suite nests the file's contents under it rather than scattering new suites at the top level.
   defaultSuiteId?: string;
 }
 
