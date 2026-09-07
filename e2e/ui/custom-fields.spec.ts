@@ -264,14 +264,17 @@ test.describe("custom fields (UI)", () => {
     await row.getByRole("button", { name: "Archive" }).click();
 
     await expect(row).toContainText("Archived");
-    // An archived field offers none of the edit affordances, because the API refuses all of them.
+    // An archived field offers none of the edit affordances, because the API refuses all of them —
+    // except Delete, which now works uniformly from any status (see TES-TC-3009: this used to be a
+    // dead end for an archived field that also held recorded values).
     await expect(row.getByRole("button", { name: "Edit" })).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Deactivate" })).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Archive" })).toHaveCount(0);
+    await expect(row.getByRole("button", { name: "Delete" })).toHaveCount(1);
     await expect.poll(async () => (await listFields())[0].status).toBe("archived");
   });
 
-  test("an unused field can be deleted, and a field in use is not offered for deletion", { tag: '@tesbo.testId("TES-TC-660")' }, async ({ browser }) => {
+  test("deleting a field now works whether or not it holds values, offering Undo instead of blocking", { tag: '@tesbo.testId("TES-TC-660")' }, async ({ browser }) => {
     const unused = await defineField({ fieldType: "text" });
     const used = await defineField({ fieldType: "text" });
     await seedTestCase({ customFieldValues: { [used.id]: "recorded" } });
@@ -279,17 +282,80 @@ test.describe("custom fields (UI)", () => {
     const page = await pageAs(browser, "owner");
     await page.goto(settingsUrl());
 
+    // Both are offered Delete now — a field in use is no longer excluded from it.
     const usedRow = definitionRow(page, used.name);
     await expect(usedRow).toContainText("Yes");
-    await expect(usedRow.getByRole("button", { name: "Delete" })).toHaveCount(0);
+    await expect(usedRow.getByRole("button", { name: "Delete" })).toHaveCount(1);
 
     await definitionRow(page, unused.name).getByRole("button", { name: "Delete" }).click();
     const confirm = modal(page, "Delete custom field");
     await expect(confirm).toContainText(unused.name);
-    await confirm.getByRole("button", { name: "Delete permanently" }).click();
+    await confirm.getByRole("button", { name: "Delete", exact: true }).click();
 
-    await expect(definitionRow(page, unused.name)).toHaveCount(0);
+    // The row stays, but as a struck-through "Deleted" placeholder offering only Undo.
+    const deletedRow = definitionRow(page, unused.name);
+    await expect(deletedRow).toContainText("Deleted");
+    await expect(deletedRow.getByRole("button", { name: "Undo" })).toBeVisible();
+    await expect(deletedRow.getByRole("button", { name: "Edit" })).toHaveCount(0);
     await expect.poll(async () => (await listFields()).map((d) => d.id)).toEqual([used.id]);
+  });
+
+  test("deleting a field in use preserves its recorded value, and Undo restores the row", { tag: '@tesbo.testId("TES-TC-3007")' }, async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+    const testcase = await seedTestCase({ customFieldValues: { [field.id]: "keep me" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+
+    await definitionRow(page, field.name).getByRole("button", { name: "Delete" }).click();
+    await modal(page, "Delete custom field").getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(definitionRow(page, field.name)).toContainText("Deleted");
+
+    // Gone from the settings list, but the value already on the test case is untouched.
+    expect(await listFields()).toHaveLength(0);
+    expect(storedValue(field.id, testcase.id)).toBe('"keep me"');
+
+    await definitionRow(page, field.name).getByRole("button", { name: "Undo" }).click();
+    await expect.poll(async () => (await listFields()).map((d) => d.id)).toEqual([field.id]);
+    const restoredRow = definitionRow(page, field.name);
+    await expect(restoredRow).toContainText("Active");
+    await expect(restoredRow.getByRole("button", { name: "Delete" })).toBeVisible();
+  });
+
+  test("the Undo offer does not survive a page reload", { tag: '@tesbo.testId("TES-TC-3008")' }, async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+
+    await definitionRow(page, field.name).getByRole("button", { name: "Delete" }).click();
+    await modal(page, "Delete custom field").getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(definitionRow(page, field.name)).toContainText("Deleted");
+
+    // Reloading is the user's signal they're done with this session — the row (and its Undo
+    // affordance) is local-only state and does not come back, even though the field remains
+    // soft-deleted (and technically restorable) in the database.
+    await page.reload();
+    await expect(definitionRow(page, field.name)).toHaveCount(0);
+    await expect(page.getByText("No custom fields yet.")).toBeVisible();
+  });
+
+  test("an archived field that also holds values can be deleted directly — no more dead end", { tag: '@tesbo.testId("TES-TC-3009")' }, async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+    await seedTestCase({ customFieldValues: { [field.id]: "still archived" } });
+    await api.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "archived" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    const row = definitionRow(page, field.name);
+    await expect(row).toContainText("Archived");
+    await expect(row).toContainText("Yes");
+
+    await row.getByRole("button", { name: "Delete" }).click();
+    await modal(page, "Delete custom field").getByRole("button", { name: "Delete", exact: true }).click();
+
+    await expect(definitionRow(page, field.name)).toContainText("Deleted");
+    expect(await listFields()).toHaveLength(0);
   });
 
   test("a QA engineer is told the screen isn't theirs to use", { tag: '@tesbo.testId("TES-TC-661")' }, async ({ browser }) => {

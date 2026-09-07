@@ -40,6 +40,7 @@ import {
   listCustomFieldDefinitions,
   getCustomFieldValues,
   buildCustomFieldFiltersQueryParam,
+  listBugs,
   UNASSIGNED_SUITE_ID,
   type TestCaseListItem,
   type SuiteNode,
@@ -47,6 +48,7 @@ import {
   type CustomFieldDefinition,
   type CustomFieldValue,
   type CustomFieldFilterCondition,
+  type BugItem,
 } from "@/lib/api";
 import { RepositoryTestCaseTable } from "@/components/testcases/RepositoryTestCaseTable";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -61,6 +63,7 @@ import {
   EmptyStateBlock,
   PageLoader,
   StatusChip,
+  SeverityBadge,
   Field,
   FieldLabel,
   FieldError,
@@ -92,7 +95,7 @@ const TESTCASE_AUTOMATION_TYPES = ["Automated", "Not Automated", "Can't Automate
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
-type PanelTab = "overview" | "steps" | "customFields";
+type PanelTab = "overview" | "steps" | "customFields" | "bugs";
 type BulkAction = "" | "delete" | "update" | "archive" | "move";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
@@ -205,6 +208,9 @@ export default function TestCasesPage() {
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("TC");
   const [panelJiraIssueKey, setPanelJiraIssueKey] = useState("");
   const [panelJiraUrl, setPanelJiraUrl] = useState("");
+
+  // Bugs filed against this test case (edit mode only — a case being created has none yet).
+  const [panelBugs, setPanelBugs] = useState<BugItem[]>([]);
 
   // Custom fields (Pro plan feature): `customFieldDefinitions` is the project's active
   // definitions (used for the create form and as the base for edit-mode merging).
@@ -545,6 +551,7 @@ export default function TestCasesPage() {
     setTestcaseIdPrefix(defaultTestcaseIdPrefix);
     setPanelJiraIssueKey("");
     setPanelJiraUrl("");
+    setPanelBugs([]);
     const defaults: Record<string, unknown> = {};
     for (const def of customFieldDefinitions) {
       const fallback = getConfiguredDefaultValue(def);
@@ -579,13 +586,15 @@ export default function TestCasesPage() {
     setPanelTab("overview");
     setCustomFieldErrors({});
     try {
-      const [data, customFields] = await Promise.all([
+      const [data, customFields, bugs] = await Promise.all([
         getTestCase(projectId, testcaseId),
         getCustomFieldValues(projectId, testcaseId).catch(() => []),
+        listBugs(projectId, { testcaseId }).catch(() => []),
       ]);
       fillFormFromTestCase(data);
       setPanelCustomFields(customFields);
       setCustomFieldValues(Object.fromEntries(customFields.map((f) => [f.id, f.value])));
+      setPanelBugs(bugs);
     } catch {
       setPanelError("Failed to load test case details.");
     } finally {
@@ -1765,7 +1774,7 @@ export default function TestCasesPage() {
             {/* Tabs (only for edit mode) */}
             {panelMode === "edit" && (
               <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
-                {(["overview", "steps", "customFields"] as PanelTab[]).map((tab) => (
+                {(["overview", "steps", "customFields", "bugs"] as PanelTab[]).map((tab) => (
                   <button
                     key={tab}
                     type="button"
@@ -1780,7 +1789,9 @@ export default function TestCasesPage() {
                       ? "Overview"
                       : tab === "steps"
                       ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}`
-                      : `Custom Fields${panelCustomFields.length > 0 ? ` (${panelCustomFields.length})` : ""}`}
+                      : tab === "customFields"
+                      ? `Custom Fields${panelCustomFields.length > 0 ? ` (${panelCustomFields.length})` : ""}`
+                      : `Bugs${panelBugs.length > 0 ? ` (${panelBugs.length})` : ""}`}
                   </button>
                 ))}
               </div>
@@ -2043,6 +2054,61 @@ export default function TestCasesPage() {
                             errors={customFieldErrors}
                             onChange={(id, value) => setCustomFieldValues((prev) => ({ ...prev, [id]: value }))}
                           />
+                        </div>
+                      )}
+                      {panelTab === "bugs" && (
+                        <div className="px-6 py-5">
+                          {panelBugs.length === 0 ? (
+                            <EmptyStateBlock title="No bugs linked" description="Bugs filed against this test case will appear here." />
+                          ) : (
+                            <div className="space-y-3">
+                              {panelBugs.map((bug) => (
+                                <div key={bug.id} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4">
+                                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                    <p className="text-sm font-semibold text-[var(--foreground)]">{bug.title}</p>
+                                    <div className="flex items-center gap-2">
+                                      <StatusChip tone="neutral">{bug.status}</StatusChip>
+                                      <SeverityBadge severity={bug.severity} />
+                                    </div>
+                                  </div>
+                                  {(bug.integrationIssueKey || bug.externalUrl) && (
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                      {bug.integrationIssueKey && (
+                                        <div>
+                                          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug Key</label>
+                                          {bug.externalUrl ? (
+                                            <a
+                                              href={bug.externalUrl}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="break-all text-sm text-[var(--accent-light)] hover:underline"
+                                            >
+                                              {bug.integrationIssueKey}
+                                            </a>
+                                          ) : (
+                                            <p className="text-sm text-[var(--foreground)]">{bug.integrationIssueKey}</p>
+                                          )}
+                                        </div>
+                                      )}
+                                      {bug.externalUrl && (
+                                        <div>
+                                          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug URL</label>
+                                          <a
+                                            href={bug.externalUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="break-all text-sm text-[var(--accent-light)] hover:underline"
+                                          >
+                                            {bug.externalUrl}
+                                          </a>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                     </>

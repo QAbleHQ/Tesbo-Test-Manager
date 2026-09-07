@@ -279,7 +279,9 @@ test.describe("test case import wizard", () => {
 
       await page.getByRole("button", { name: "Import 2 rows" }).click();
       await expect(page.getByText("Import complete.")).toBeVisible({ timeout: 30_000 });
-      await expect(page.getByText("1 test case imported successfully")).toBeVisible();
+      // 1 of 2 rows landed, so this is the partial-import state, not the all-clear one — the banner
+      // must not say "successfully" while a row was rejected. See ImportTestCasesModal.tsx.
+      await expect(page.getByText("1 of 2 test cases imported")).toBeVisible();
 
       // The error row number must point at the line the user can find in their file — line 3 — not
       // at an index into the rows the parser kept.
@@ -338,8 +340,9 @@ test.describe("test case import wizard", () => {
       await uploadCsv(page, csv);
       await runImport(page, 3);
 
-      await expect(page.getByText("1 test case imported successfully")).toBeVisible();
-      await expect(page.getByText("Out of 3 total rows in the file.")).toBeVisible();
+      // 1 of 3 rows landed and 2 were duplicates, so this is the partial-import state.
+      await expect(page.getByText("1 of 3 test cases imported")).toBeVisible();
+      await expect(page.getByText("2 rows had errors and were skipped. See the details below.")).toBeVisible();
       await expect(
         page.getByText("Skipped duplicate title: already exists in this project"),
       ).toBeVisible();
@@ -349,6 +352,42 @@ test.describe("test case import wizard", () => {
 
       const titles = (await listCases(projectId)).map((c) => c.title).sort();
       expect(titles, "exactly one copy of each title exists").toEqual([existing, fresh].sort());
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  // Regression test for: when every row in the file was rejected, the result step still rendered the
+  // green "successfully" banner with a checkmark, reporting "0 test cases imported successfully" — see
+  // ImportTestCasesModal.tsx. The banner must switch to the failure treatment instead, and must never
+  // say "successfully" when nothing was imported.
+  test("shows a failure banner, not a success banner, when every row is rejected", async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "All Rejected");
+      const { page, projectId } = fixture;
+      const existing = `E2E All Rejected ${Date.now()}`;
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title: existing } });
+
+      // The one row in the file collides with the case already in the project, so 0 of 1 rows import.
+      await openWizard(page, projectId);
+      await uploadCsv(page, toCsv(["Title"], [[existing]]));
+      await runImport(page, 1);
+
+      await expect(page.getByText("No test cases were imported")).toBeVisible();
+      await expect(
+        page.getByText("All 1 row in the file had errors. Fix the issues below and try again."),
+      ).toBeVisible();
+      await expect(page.getByText("0 test cases imported successfully")).toBeHidden();
+      await expect(page.getByText("Skipped duplicate title: already exists in this project")).toBeVisible();
+
+      // The shortcut back to mapping works, since a wall of identical errors is often a mapping
+      // problem rather than genuinely bad data.
+      await page.getByRole("button", { name: "Edit column mapping" }).click();
+      await expect(page.getByText("Map your file columns to test case fields.")).toBeVisible();
+
+      // Only the pre-existing case is present — the rejected row did not create a duplicate.
+      expect((await listCases(projectId)).map((c) => c.title)).toEqual([existing]);
     } finally {
       await disposeProject(fixture);
     }

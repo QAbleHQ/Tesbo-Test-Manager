@@ -4916,6 +4916,14 @@ export class LegacyService implements OnModuleInit {
       values.push(query.cycleId);
       filters.push(`b.cycle_id = $${values.length}`);
     }
+    // Sourced from bug_links, not the denormalized b.testcase_id column — updateBug's link edits
+    // only ever touch bug_links (see replaceBugLinks), so b.testcase_id can go stale once a bug's
+    // links are edited after creation. bug_links is what the Bugs page itself already trusts to
+    // show a bug's linked test case(s), so filtering the other direction has to agree with it.
+    if (query.testcaseId) {
+      values.push(query.testcaseId);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length})`);
+    }
     // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
     // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
     if (query.assigneeId === "unassigned") {

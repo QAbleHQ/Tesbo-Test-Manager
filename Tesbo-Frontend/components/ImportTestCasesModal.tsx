@@ -33,6 +33,35 @@ const SUPPORTED_FILE_EXTENSIONS = [".csv", ".xlsx", ".xls"];
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
 const MAX_FILE_SIZE_LABEL = "20MB";
 
+// Which of the four outcomes the result step is in, and the visual treatment for each. Kept as a
+// static lookup rather than inline conditionals so the banner, the icon and the copy can never
+// drift out of sync with each other the way the old single hardcoded "success" template did.
+type ImportResultStatus = "success" | "partial" | "failure" | "empty";
+
+const RESULT_STATUS_STYLES: Record<ImportResultStatus, { iconPath: string; containerClass: string; textClass: string }> = {
+  success: {
+    iconPath: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z",
+    containerClass: "border-[var(--success-border)] bg-[var(--success-soft)]",
+    textClass: "text-[var(--success-foreground)]",
+  },
+  partial: {
+    iconPath:
+      "M10.29 3.86L1.82 18a1.5 1.5 0 001.3 2.25h17.76a1.5 1.5 0 001.3-2.25L13.71 3.86a1.5 1.5 0 00-2.42 0zM12 9v4m0 3.5h.01",
+    containerClass: "border-[var(--warning-border)] bg-[var(--warning-soft)]",
+    textClass: "text-[var(--warning-foreground)]",
+  },
+  failure: {
+    iconPath: "M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
+    containerClass: "border-[var(--error-border)] bg-[var(--error-soft)]",
+    textClass: "text-[var(--error-foreground)]",
+  },
+  empty: {
+    iconPath: "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
+    containerClass: "border-[var(--border)] bg-[var(--surface-secondary)]",
+    textClass: "text-[var(--muted)]",
+  },
+};
+
 const IMPORTABLE_FIELDS: { key: string; label: string; required?: boolean }[] = [
   { key: "title", label: "Title", required: true },
   { key: "description", label: "Description" },
@@ -78,6 +107,9 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
   const [importError, setImportError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
+  // Collapsed by default only when there is a meaningful rollup to collapse into (see
+  // hasRepeatedErrors below) — otherwise the full row-by-row table is always what's shown.
+  const [showAllErrorRows, setShowAllErrorRows] = useState(false);
 
   const reset = useCallback(() => {
     setStep("upload");
@@ -93,6 +125,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setImportError(null);
     setDragActive(false);
     setCustomFieldMapping({});
+    setShowAllErrorRows(false);
   }, []);
 
   useEffect(() => {
@@ -418,6 +451,30 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     }
   };
 
+  // Rebuilds the skipped rows in the file's own column layout, plus one appended column for why
+  // each was rejected, so a user can fix the dozen bad rows offline instead of hunting for them
+  // by row number back in the original file.
+  const downloadErrorReport = () => {
+    if (!result || result.errors.length === 0) return;
+    const activeSheet = preview?.sheets.find((sheet) => sheet.name === selectedSheetName) ?? preview?.sheets[0];
+    const fileHeaders = activeSheet?.headers ?? [];
+    const escapeCsvCell = (value: string) => `"${value.replace(/"/g, '""')}"`;
+    const headerLine = [...fileHeaders, "Import Error"].map(escapeCsvCell).join(",");
+    const dataLines = result.errors.map((err) => {
+      const rowIndex = activeSheet ? err.row - activeSheet.headerRowIndex - 2 : -1;
+      const originalRow = activeSheet && rowIndex >= 0 ? activeSheet.rows[rowIndex] ?? [] : [];
+      const cells = fileHeaders.map((_, idx) => escapeCsvCell(originalRow[idx] ?? ""));
+      return [...cells, escapeCsvCell(err.message)].join(",");
+    });
+    const blob = new Blob([[headerLine, ...dataLines].join("\r\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "import-errors.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const updateMapping = (fieldKey: string, colIdx: number | null) => {
     setMapping((prev) => {
       const next = { ...prev };
@@ -453,6 +510,34 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
 
   const isStepComplete = (candidate: ImportStep) =>
     (step === "mapping" && candidate === "upload") || (step === "result" && candidate !== "result");
+
+  // errors.length is the source of truth for whether anything went wrong, not the row count math —
+  // if the two ever disagree, trust the errors, since that's what the table below is actually showing.
+  const resultStatus: ImportResultStatus = !result
+    ? "success"
+    : result.total === 0
+      ? "empty"
+      : result.errors.length === 0
+        ? "success"
+        : result.imported === 0
+          ? "failure"
+          : "partial";
+
+  // Same message repeated across many rows (a single missing required field, most often) collapses
+  // into one summary line with a count, rather than printing that sentence dozens of times.
+  const errorGroups = result
+    ? Array.from(
+        result.errors.reduce((map, err) => {
+          const rows = map.get(err.message) ?? [];
+          rows.push(err.row);
+          map.set(err.message, rows);
+          return map;
+        }, new Map<string, number[]>()),
+      )
+        .map(([message, rows]) => ({ message, rows }))
+        .sort((a, b) => b.rows.length - a.rows.length)
+    : [];
+  const hasRepeatedErrors = !!result && errorGroups.length > 0 && errorGroups.length < result.errors.length;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay-backdrop)] backdrop-blur-sm">
@@ -712,43 +797,106 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           {/* ---- STEP 3: RESULT ---- */}
           {step === "result" && result && (
             <div className="space-y-4">
-              <div className="flex items-center gap-3 rounded-xl border border-[var(--success-border)] bg-[var(--success-soft)] p-4">
-                <svg className="h-8 w-8 shrink-0 text-[var(--success-foreground)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              <div
+                className={`flex items-start gap-3 rounded-xl border p-4 ${RESULT_STATUS_STYLES[resultStatus].containerClass}`}
+                role={resultStatus === "failure" ? "alert" : "status"}
+              >
+                <svg
+                  className={`h-7 w-7 shrink-0 ${RESULT_STATUS_STYLES[resultStatus].textClass}`}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d={RESULT_STATUS_STYLES[resultStatus].iconPath} />
                 </svg>
-                <div>
-                  <p className="font-semibold text-[var(--success-foreground)]">
-                    {result.imported} test case{result.imported !== 1 ? "s" : ""} imported successfully
+                <div className="min-w-0 flex-1">
+                  <p className={`break-words font-semibold ${RESULT_STATUS_STYLES[resultStatus].textClass}`}>
+                    {resultStatus === "empty" && "No rows to import"}
+                    {resultStatus === "failure" && "No test cases were imported"}
+                    {resultStatus === "success" && `${result.imported} test case${result.imported !== 1 ? "s" : ""} imported successfully`}
+                    {resultStatus === "partial" && `${result.imported} of ${result.total} test case${result.total !== 1 ? "s" : ""} imported`}
                   </p>
-                  <p className="text-sm text-[var(--success-foreground)]">
-                    Out of {result.total} total rows in the file.
+                  <p className={`mt-0.5 break-words text-sm ${RESULT_STATUS_STYLES[resultStatus].textClass}`}>
+                    {resultStatus === "empty" && "The file did not contain any test case rows."}
+                    {resultStatus === "failure" &&
+                      `All ${result.total} row${result.total !== 1 ? "s" : ""} in the file had errors. Fix the issues below and try again.`}
+                    {resultStatus === "success" && `Out of ${result.total} total row${result.total !== 1 ? "s" : ""} in the file.`}
+                    {resultStatus === "partial" &&
+                      `${result.errors.length} row${result.errors.length !== 1 ? "s" : ""} had errors and were skipped. See the details below.`}
                   </p>
+                  {resultStatus === "partial" && (
+                    <div className="mt-2.5 flex h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-[var(--surface-secondary)]">
+                      <div className="h-full bg-[var(--success-foreground)]" style={{ width: `${(result.imported / result.total) * 100}%` }} />
+                      <div className="h-full bg-[var(--error-foreground)]" style={{ width: `${(result.errors.length / result.total) * 100}%` }} />
+                    </div>
+                  )}
                 </div>
               </div>
 
               {result.errors.length > 0 && (
-                <div>
-                  <p className="mb-2 text-sm font-medium text-[var(--error-foreground)]">
-                    {result.errors.length} row{result.errors.length !== 1 ? "s" : ""} skipped or had errors:
-                  </p>
-                  <div className="max-h-48 overflow-y-auto rounded-lg border border-[var(--error-border)]">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr className="bg-[var(--error-soft)]">
-                          <th className="px-3 py-1.5 text-left font-medium text-[var(--error-foreground)]">Row</th>
-                          <th className="px-3 py-1.5 text-left font-medium text-[var(--error-foreground)]">Error</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {result.errors.map((err, i) => (
-                          <tr key={i} className="border-t border-[var(--error-border)]">
-                            <td className="px-3 py-1.5 text-[var(--error-foreground)]">{err.row}</td>
-                            <td className="px-3 py-1.5 text-[var(--error-foreground)]">{err.message}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                <div className="min-w-0">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium text-[var(--foreground)]">
+                      {result.errors.length} row{result.errors.length !== 1 ? "s" : ""} skipped
+                    </p>
+                    <button
+                      type="button"
+                      onClick={downloadErrorReport}
+                      className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1 text-xs font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+                    >
+                      Download error report
+                    </button>
                   </div>
+
+                  {hasRepeatedErrors && !showAllErrorRows ? (
+                    <div className="space-y-1.5 rounded-lg border border-[var(--border)] p-3">
+                      {errorGroups.map((group) => (
+                        <div key={group.message} className="flex items-start gap-2 text-xs">
+                          <span className="mt-0.5 shrink-0 rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 font-medium text-[var(--muted)]">
+                            {group.rows.length}
+                          </span>
+                          <span className="min-w-0 flex-1 break-words text-[var(--foreground)]">{group.message}</span>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => setShowAllErrorRows(true)}
+                        className="pt-1 text-xs font-medium text-[var(--confidence-high-foreground)] hover:underline"
+                      >
+                        Show all {result.errors.length} rows
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="max-h-48 overflow-y-auto rounded-lg border border-[var(--border)]">
+                      <table className="w-full table-fixed text-xs">
+                        <thead>
+                          <tr className="bg-[var(--surface-secondary)]">
+                            <th className="w-16 px-3 py-1.5 text-left font-medium text-[var(--muted)]">Row</th>
+                            <th className="px-3 py-1.5 text-left font-medium text-[var(--muted)]">Error</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {result.errors.map((err, i) => (
+                            <tr key={`${err.row}-${i}`} className="border-t border-[var(--border-subtle)]">
+                              <td className="px-3 py-1.5 text-[var(--foreground)]">{err.row}</td>
+                              <td className="break-words px-3 py-1.5 text-[var(--foreground)]">{err.message}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {hasRepeatedErrors && (
+                        <div className="border-t border-[var(--border-subtle)] px-3 py-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setShowAllErrorRows(false)}
+                            className="text-xs font-medium text-[var(--confidence-high-foreground)] hover:underline"
+                          >
+                            Collapse to summary
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -788,9 +936,20 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
             </>
           )}
           {step === "result" && (
-            <button type="button" onClick={onClose} className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--brand-hover)]">
-              Done
-            </button>
+            <>
+              {resultStatus === "failure" && (
+                <button
+                  type="button"
+                  onClick={() => setStep("mapping")}
+                  className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  Edit column mapping
+                </button>
+              )}
+              <button type="button" onClick={onClose} className="rounded-lg border border-transparent bg-[var(--brand-primary)] px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-[var(--brand-hover)]">
+                Done
+              </button>
+            </>
           )}
         </div>
       </div>
