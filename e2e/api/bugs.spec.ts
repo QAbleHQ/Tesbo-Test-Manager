@@ -121,6 +121,77 @@ test.describe("bug CRUD", () => {
     }
   });
 
+  test(
+    "listBugs filters by testcaseId, following bug_links rather than the denormalized column",
+    { tag: '@tesbo.testId("TES-TC-2015")' },
+    async ({ request }) => {
+      // Regression: the Test Case Detail page had no way to show the bugs filed against a case
+      // because listBugs had no testcaseId filter at all. This also exercises the reason it has to
+      // read bug_links rather than bugs.testcase_id: that column is set once at creation and is
+      // never touched again when links are edited later (see legacy.service.ts updateBug), so a
+      // bug re-linked away from its original test case would otherwise still answer for it.
+      const testcaseA = await (
+        await request.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title: `E2E Bug Filter Case A ${Date.now()}` },
+        })
+      ).json();
+      const testcaseB = await (
+        await request.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title: `E2E Bug Filter Case B ${Date.now()}` },
+        })
+      ).json();
+
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: `E2E Bug Filter Target ${Date.now()}`,
+            integrationProvider: "JIRA",
+            integrationIssueKey: "PROJ-4242",
+            externalUrl: "https://example.atlassian.net/browse/PROJ-4242",
+            links: [{ testcaseId: testcaseA.id }],
+          },
+        })
+      ).json();
+
+      try {
+        const listForA = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcaseA.id } })
+        ).json();
+        expect(listForA.some((b: { id: string }) => b.id === created.id), "the bug is linked to A").toBeTruthy();
+        // The actual data the Test Case Detail page's Bug Key / Bug URL fields read.
+        const found = listForA.find((b: { id: string }) => b.id === created.id);
+        expect(found.integrationIssueKey).toBe("PROJ-4242");
+        expect(found.externalUrl).toBe("https://example.atlassian.net/browse/PROJ-4242");
+
+        const listForB = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcaseB.id } })
+        ).json();
+        expect(listForB.some((b: { id: string }) => b.id === created.id), "not yet linked to B").toBeFalsy();
+
+        // Re-link away from A to B — only bug_links changes; bugs.testcase_id (set at creation)
+        // is left exactly as it was.
+        await request.patch(`/api/bugs/${created.id}`, { data: { links: [{ testcaseId: testcaseB.id }] } });
+
+        const listForANow = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcaseA.id } })
+        ).json();
+        expect(
+          listForANow.some((b: { id: string }) => b.id === created.id),
+          "the stale bugs.testcase_id column must not resurrect the old link",
+        ).toBeFalsy();
+
+        const listForBNow = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcaseB.id } })
+        ).json();
+        expect(listForBNow.some((b: { id: string }) => b.id === created.id), "now linked to B").toBeTruthy();
+      } finally {
+        await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+      }
+    },
+  );
+
   test("sending an empty string to clear a field leaves the old value in place", { tag: '@tesbo.testId("TES-TC-101")' }, async ({ request }) => {
     // KNOWN GAP (documented, not test.fail() — a data-integrity bug, not a security one):
     // updateBug (legacy.service.ts:1958) sends every field as `body.field || null`, so an
