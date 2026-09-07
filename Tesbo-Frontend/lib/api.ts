@@ -3244,25 +3244,39 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
-// The info-icon popover on a synced (mirror) row: this ticket's add/update timeline.
-export interface KnowledgeDocumentSyncEvent {
+// The Change History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
+// are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
+export interface KnowledgeChangedField {
+  label: string;
+  oldExcerpt: string;
+  newExcerpt: string;
+  oldLength: number;
+  newLength: number;
+  truncated: boolean;
+}
+
+export interface KnowledgeDocumentHistoryEntry {
   id: string;
   eventType: "created" | "updated";
   changedSummary: string | null;
+  changedFields: KnowledgeChangedField[];
   createdAt: string;
-  triggeredByName: string | null;
+  actorName: string;
+  /** Set only for a manual document's version-diff entry — lets the row offer "Restore". */
+  versionId: string | null;
 }
 
-export function getKnowledgeDocumentSyncEvents(
+export function getKnowledgeDocumentHistory(
   projectId: string,
   documentId: string,
   page: { limit?: number; offset?: number } = {}
-): Promise<{ events: KnowledgeDocumentSyncEvent[]; hasMore: boolean }> {
+): Promise<{ events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean }> {
   const sp = new URLSearchParams();
   if (page.limit != null) sp.set("limit", String(page.limit));
   if (page.offset != null) sp.set("offset", String(page.offset));
   const qs = sp.toString();
-  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/sync-events${qs ? `?${qs}` : ""}`);
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/history${qs ? `?${qs}` : ""}`);
 }
 
 export function updateKnowledgeDocument(

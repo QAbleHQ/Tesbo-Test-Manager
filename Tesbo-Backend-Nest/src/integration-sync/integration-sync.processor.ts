@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { truncateForColumn } from "../common/integration-text.util";
+import { summarizeTextChange } from "../common/text-diff.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
@@ -437,15 +438,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
       void this.ragIngestion
         .enqueueEmbedding({ organizationId, projectId, sourceType: "document", sourceId: mirrorDoc.id, reason: "updated" })
         .catch(() => undefined);
+      const { summary, fields } = summarizeTextChange(previousDoc?.content_text ?? null, mirror.markdown, "Added from sync.", "Updated from sync.");
       await this.runs
-        .recordSyncEvent(
-          mirrorDoc.id,
-          runId,
-          mirrorDoc.inserted ? "created" : "updated",
-          provider,
-          this.summarizeChanges(previousDoc?.content_text ?? null, mirror.markdown),
-          triggeredBy
-        )
+        .recordSyncEvent(mirrorDoc.id, runId, mirrorDoc.inserted ? "created" : "updated", provider, summary, fields, triggeredBy)
         .catch((err) => this.logger.warn(`Failed to record sync event for ${ticket.issueKey}: ${err instanceof Error ? err.message : err}`));
     }
 
@@ -463,31 +458,6 @@ export class IntegrationSyncProcessor extends WorkerHost {
     if (!raw) return [];
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
     return Array.isArray(parsed) ? (parsed as RemoteComment[]) : [];
-  }
-
-  /**
-   * Short, human-readable "what changed" line for the Knowledge Base info-icon popover — deliberately
-   * a summary of which sections moved, not a full diff, per the "keep it minimal and small" ask.
-   * `oldContent` is null for a brand-new document.
-   */
-  private summarizeChanges(oldContent: string | null, newContent: string): string {
-    if (oldContent === null) return "Added from sync.";
-    const oldSections = new Map(oldContent.split("\n\n").map((section) => [this.sectionLabel(section), section]));
-    const changedLabels: string[] = [];
-    for (const section of newContent.split("\n\n")) {
-      const label = this.sectionLabel(section);
-      if (oldSections.get(label) !== section) changedLabels.push(label);
-    }
-    return changedLabels.length ? `${changedLabels.join(", ")} updated.` : "Updated from sync.";
-  }
-
-  private sectionLabel(section: string): string {
-    const firstLine = (section.split("\n")[0] || "").trim();
-    const heading = firstLine.match(/^#{1,6}\s+(.*)$/);
-    if (heading) return heading[1].trim();
-    // The title line ("# KEY: summary") and the meta block (Status/Type/Priority/...) have no
-    // "## " heading of their own — label them explicitly so the summary reads naturally.
-    return firstLine.startsWith("# ") ? "Title" : "Details";
   }
 
   @OnWorkerEvent("failed")

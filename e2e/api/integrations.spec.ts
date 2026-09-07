@@ -31,7 +31,7 @@ import {
  *
  * The nightly sync cron (two BullMQ Job Schedulers firing at 00:00 IST — see
  * integration-sync.module.ts) adds a per-ticket change log, read through
- * GET .../knowledge-base/documents/:id/sync-events, which IS driven here end to end (authorization,
+ * GET .../knowledge-base/documents/:id/history, which IS driven here end to end (authorization,
  * 404s, empty vs. populated timelines) with knowledge_document_sync_events seeded directly for the
  * same "no fake upstream" reason as the ticket tables above. What is NOT reachable from this suite:
  * the orchestrator's own trigger is a cron tick, not an HTTP route, so the incremental "updated >="
@@ -787,48 +787,51 @@ test.describe("integrations — Jira and Linear", () => {
     }
   });
 
-  // ─── Knowledge Base sync-events (the nightly-cron work's info-icon popover) ──────────────
+  // ─── Knowledge Base Change History (GET .../documents/:id/history) ──────────────────────
   //
-  // What's driven here: the read endpoint end to end, seeding knowledge_document_sync_events
-  // directly (the same reason every other seed* helper above exists — actually producing an event
-  // means a real sync, which means a real outbound call). What is NOT reachable from this suite,
-  // for the same reason the rest of this file states up top: the nightly orchestrator's own trigger
-  // (a BullMQ Job Scheduler tick, not an HTTP route), the incremental "updated >=" fetch, the
-  // content-compare skip, and the Linear plan-gating exclusion in listNightlySyncTargets — all of
-  // that logic either has no route to drive it from outside the process, or only resolves once a
-  // real provider answers. Recorded here rather than silently left uncovered.
+  // Serves BOTH a synced mirror's sync-pipeline log AND a manually-created document's own
+  // synthesized (version-diff) timeline behind one endpoint and one response shape — the read side
+  // never special-cases on source_provider (INT-A-30b). What's driven here: the read endpoint end
+  // to end, seeding knowledge_document_sync_events / knowledge_document_versions directly (the same
+  // reason every other seed* helper above exists — actually producing a sync event means a real
+  // sync, which means a real outbound call). What is NOT reachable from this suite, for the same
+  // reason the rest of this file states up top: the nightly orchestrator's own trigger (a BullMQ Job
+  // Scheduler tick, not an HTTP route), the incremental "updated >=" fetch, the content-compare
+  // skip, and the Linear plan-gating exclusion in listNightlySyncTargets — all of that logic either
+  // has no route to drive it from outside the process, or only resolves once a real provider
+  // answers. Recorded here rather than silently left uncovered.
 
-  test("INT-A-26 sync-events answers a caller with no session with a refusal, not the timeline", { tag: '@tesbo.testId("TES-TC-248")' }, async () => {
+  test("INT-A-26 history answers a caller with no session with a refusal, not the timeline", { tag: '@tesbo.testId("TES-TC-248")' }, async () => {
     const doc = seedMirrorDocument("jira", "sync-evt-1", "Anon must not see this");
     seedSyncEvent(doc, "created", null);
 
-    const res = await anon.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
-    await expectRefused(res, "sync-events (anonymous)");
+    const res = await anon.get(url(`/knowledge-base/documents/${doc}/history`), { failOnStatusCode: false });
+    await expectRefused(res, "history (anonymous)");
   });
 
-  test("INT-A-27 sync-events refuses a caller outside the project", { tag: '@tesbo.testId("TES-TC-249")' }, async () => {
+  test("INT-A-27 history refuses a caller outside the project", { tag: '@tesbo.testId("TES-TC-249")' }, async () => {
     const doc = seedMirrorDocument("jira", "sync-evt-2", "Not for the guest");
     seedSyncEvent(doc, "created", null);
 
     // The guest holds a valid session in this workspace but isn't a member of the project the
     // document lives in — the harder case than an outright stranger.
-    const asGuestRes = await asGuest.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
-    await expectRefused(asGuestRes, "sync-events (non-member)");
+    const asGuestRes = await asGuest.get(url(`/knowledge-base/documents/${doc}/history`), { failOnStatusCode: false });
+    await expectRefused(asGuestRes, "history (non-member)");
 
     // A member of the *second* project reaching for the main project's document by id.
     const secondDoc = seedMirrorDocument("jira", "sync-evt-3", "Second project's ticket", tenant!.secondProjectId);
-    const crossProject = await asQa.get(url(`/knowledge-base/documents/${secondDoc}/sync-events`), { failOnStatusCode: false });
-    await expectRefused(crossProject, "sync-events (wrong project)");
+    const crossProject = await asQa.get(url(`/knowledge-base/documents/${secondDoc}/history`), { failOnStatusCode: false });
+    await expectRefused(crossProject, "history (wrong project)");
   });
 
-  test("INT-A-28 sync-events 404s for a document that doesn't exist or isn't in this project", { tag: '@tesbo.testId("TES-TC-250")' }, async () => {
-    const missing = await asOwner.get(url(`/knowledge-base/documents/${crypto.randomUUID()}/sync-events`), {
+  test("INT-A-28 history 404s for a document that doesn't exist or isn't in this project", { tag: '@tesbo.testId("TES-TC-250")' }, async () => {
+    const missing = await asOwner.get(url(`/knowledge-base/documents/${crypto.randomUUID()}/history`), {
       failOnStatusCode: false,
     });
     expect(missing.status(), `an unknown document id answered ${missing.status()}`).toBe(404);
 
     // Malformed input must not reach the query as a bad UUID and 500.
-    const malformed = await asOwner.get(url("/knowledge-base/documents/not-a-uuid/sync-events"), {
+    const malformed = await asOwner.get(url("/knowledge-base/documents/not-a-uuid/history"), {
       failOnStatusCode: false,
     });
     expect(malformed.status(), `a malformed document id answered ${malformed.status()}: ${await malformed.text()}`).toBe(404);
@@ -839,14 +842,15 @@ test.describe("integrations — Jira and Linear", () => {
     // for it, so it has zero rows in knowledge_document_sync_events — the endpoint must not treat
     // that as "not found".
     const doc = seedMirrorDocument("jira", "sync-evt-4", "Never had an event logged");
-    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/history`), { failOnStatusCode: false });
     expect(res.status()).toBe(200);
     expect((await res.json()).events).toEqual([]);
   });
 
-  test("INT-A-30 a regular (non-synced) document also answers with an empty timeline", { tag: '@tesbo.testId("TES-TC-252")' }, async () => {
-    // The endpoint doesn't special-case on source_provider — a human-authored document is simply a
-    // document with no sync history, not a different code path.
+  test("INT-A-30 a regular (non-synced) document answers with its own Added entry, not the mirror's empty-timeline case", { tag: '@tesbo.testId("TES-TC-252")' }, async () => {
+    // Unlike a legacy mirror (INT-A-29), a document freshly created through this endpoint always has
+    // at least one entry — its own creation — because unlike a pre-feature mirror, there is no
+    // "created before this shipped" gap for a document being created right now.
     const created = await asOwner.post(url("/knowledge-base/documents"), {
       data: { title: "Plain human document", folderId: rootFolderId },
       failOnStatusCode: false,
@@ -854,9 +858,72 @@ test.describe("integrations — Jira and Linear", () => {
     expect(created.status()).toBe(201);
     const docId = (await created.json()).id;
 
-    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/sync-events`), { failOnStatusCode: false });
+    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false });
     expect(res.status()).toBe(200);
-    expect((await res.json()).events).toEqual([]);
+    const body = await res.json();
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0].eventType).toBe("created");
+    expect(body.events[0].changedSummary).toBe("Added.");
+    // A real resolved name, never a raw user id.
+    expect(body.events[0].actorName).toContain("Owner");
+    // Nothing has ever been edited yet, so there is no version to restore.
+    expect(body.events[0].versionId).toBeNull();
+    expect(body.hasMore).toBe(false);
+  });
+
+  test("INT-A-30b editing a manual document reports a real field-level diff, attributes it to the editor, and carries a restorable versionId", { tag: '@tesbo.testId("TES-TC-2053")' }, async () => {
+    const created = await asOwner.post(url("/knowledge-base/documents"), {
+      data: { title: "Diffable document", folderId: rootFolderId, documentType: "general", contentText: "Original body." },
+      failOnStatusCode: false,
+    });
+    const docId = (await created.json()).id;
+
+    // Seeded directly rather than waiting out the 15-minute snapshot-coalescing window a real
+    // second edit would otherwise hit (same reason ui/knowledge-base.spec.ts's seedDocumentVersion
+    // exists) — this snapshots the state right before an edit, exactly like a real throttled save.
+    exec(
+      "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_html, content_text, created_by) VALUES (" +
+        `${literal(docId)}, 1, 'Diffable document', '<p>Original body.</p>', 'Original body.', ${literal(tenant!.owner.userId)});`,
+    );
+    await asOwner.patch(url(`/knowledge-base/documents/${docId}`), { data: { contentText: "Edited body, now different." } });
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false });
+    const body = await res.json();
+    expect(body.events).toHaveLength(2);
+    const updated = body.events[0];
+    expect(updated.eventType).toBe("updated");
+    expect(updated.changedSummary).toContain("Details");
+    expect(updated.actorName).toContain("Owner");
+    expect(updated.versionId).not.toBeNull();
+    expect(Array.isArray(updated.changedFields)).toBe(true);
+    expect(updated.changedFields[0].oldExcerpt).toContain("Original body.");
+    expect(updated.changedFields[0].newExcerpt).toContain("Edited body, now different.");
+  });
+
+  test("INT-A-30c an AI memory's approve/reject is folded into its own history as a distinct entry", { tag: '@tesbo.testId("TES-TC-2054")' }, async () => {
+    const created = await asOwner.post(url("/knowledge-base/documents"), {
+      data: { title: "Memory doc", folderId: rootFolderId, documentType: "ai_memory", contentText: "Remembered fact." },
+      failOnStatusCode: false,
+    });
+    const docId = (await created.json()).id;
+
+    const approve = await asOwner.patch(url(`/knowledge-base/documents/${docId}/approve-ai-memory`), { failOnStatusCode: false });
+    expect(approve.status(), `approve answered ${approve.status()}: ${await approve.text()}`).toBe(200);
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false });
+    const body = await res.json();
+    expect(body.events.some((e: any) => e.changedSummary === "Marked as Approved.")).toBe(true);
+  });
+
+  test("INT-A-30d a Linear mirror's timeline round-trips through the same endpoint, provider-agnostic end to end", { tag: '@tesbo.testId("TES-TC-2055")' }, async () => {
+    const doc = seedMirrorDocument("linear", "sync-evt-linear-1", "E2E-70b: Linear ticket");
+    seedSyncEvent(doc, "updated", "Priority updated.", "linear");
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/history`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0].changedSummary).toBe("Priority updated.");
   });
 
   test("INT-A-31 a mirror's timeline lists its events newest first, with type and summary", { tag: '@tesbo.testId("TES-TC-253")' }, async () => {
@@ -865,7 +932,7 @@ test.describe("integrations — Jira and Linear", () => {
     seedSyncEvent(doc, "updated", "Status: To Do -> In Progress updated.");
     seedSyncEvent(doc, "updated", "Description updated.");
 
-    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events`), { failOnStatusCode: false });
+    const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/history`), { failOnStatusCode: false });
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(body.events).toHaveLength(3);
@@ -883,12 +950,12 @@ test.describe("integrations — Jira and Linear", () => {
     // 7 events, oldest to newest, so the newest ("v7") is what page 1 must lead with.
     for (let i = 1; i <= 7; i++) seedSyncEvent(doc, "updated", `v${i}`);
 
-    const firstPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=0`))).json();
+    const firstPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/history?limit=5&offset=0`))).json();
     expect(firstPage.events).toHaveLength(5);
     expect(firstPage.hasMore, "5 shown out of 7 total — there must be a next page").toBe(true);
     expect(firstPage.events.map((e: any) => e.changedSummary)).toEqual(["v7", "v6", "v5", "v4", "v3"]);
 
-    const secondPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=5`))).json();
+    const secondPage = await (await asOwner.get(url(`/knowledge-base/documents/${doc}/history?limit=5&offset=5`))).json();
     expect(secondPage.events).toHaveLength(2);
     expect(secondPage.hasMore, "exactly the remainder — no third page").toBe(false);
     expect(secondPage.events.map((e: any) => e.changedSummary)).toEqual(["v2", "v1"]);
@@ -898,7 +965,7 @@ test.describe("integrations — Jira and Linear", () => {
     expect(allSummaries).toEqual(["v7", "v6", "v5", "v4", "v3", "v2", "v1"]);
 
     // Past the end is an empty page with nothing further, not an error.
-    const beyond = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?limit=5&offset=500`), { failOnStatusCode: false });
+    const beyond = await asOwner.get(url(`/knowledge-base/documents/${doc}/history?limit=5&offset=500`), { failOnStatusCode: false });
     expect(beyond.status()).toBe(200);
     const beyondBody = await beyond.json();
     expect(beyondBody.events).toEqual([]);
@@ -910,7 +977,7 @@ test.describe("integrations — Jira and Linear", () => {
     seedSyncEvent(doc, "created", null);
 
     for (const qs of ["limit=abc&offset=abc", "limit=-5", "offset=-1", "limit=2.7", "limit=0", "limit=100000"]) {
-      const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/sync-events?${qs}`), { failOnStatusCode: false });
+      const res = await asOwner.get(url(`/knowledge-base/documents/${doc}/history?${qs}`), { failOnStatusCode: false });
       expect(res.status(), `${qs} answered ${res.status()}: ${await res.text()}`).toBe(200);
       const body = await res.json();
       expect(Array.isArray(body.events), `${qs} — events was ${JSON.stringify(body)}`).toBe(true);

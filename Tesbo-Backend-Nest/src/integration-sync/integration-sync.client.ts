@@ -14,6 +14,9 @@ import {
 import { RemoteComment, RemoteTicket, SyncProvider } from "./integration-sync.types";
 
 type Row = Record<string, any>;
+/** Loose structural type for either DatabaseService itself or a transaction's PoolClient — both
+ *  expose a `query(text, values)` returning `{ rows }`, which is all persistRefreshedToken needs. */
+type Queryable = { query: (text: string, values?: unknown[]) => Promise<{ rows: Row[] }> };
 
 function asArray(value: unknown): Row[] {
   return Array.isArray(value) ? (value as Row[]) : [];
@@ -59,58 +62,129 @@ export class IntegrationSyncClient {
     ]);
     const connection = res.rows[0] as Row | undefined;
     if (!connection) return null;
+    // Fast, lock-free path: the overwhelming majority of calls land here, so this stays exactly as
+    // cheap (and contention-free) as it always was. Only a token that's actually due for refresh
+    // pays for the transaction below.
+    if (this.isTokenStillValid(connection) || !connection.refresh_token) return connection;
 
-    const stillValid = new Date(connection.token_expires_at).getTime() > Date.now() + 60_000;
-    // Linear tokens are long-lived and have no refresh flow (see LegacyService.getIntegrationConnection).
-    if (stillValid || provider === "linear" || !connection.refresh_token) return connection;
-
-    return this.refreshJiraToken(connection);
+    // A connection is organization-scoped and can be mapped into several Tesbo projects, so at
+    // nightly-cron time (INTEGRATION_SYNC_CONCURRENCY concurrent jobs) more than one job can find
+    // the SAME connection's token expired at the same moment. Both Linear's and Atlassian's OAuth
+    // apps rotate the refresh token on use, so two independent, concurrent refresh calls would
+    // have the loser fail on an already-invalidated refresh token — a spurious "needs reconnecting"
+    // for a connection that's actually fine. SELECT ... FOR UPDATE serializes them: whichever job
+    // gets here first does the one real refresh; the rest block on the row lock, then re-check the
+    // now-current row and simply reuse what the first job already wrote, with zero wasted (and
+    // zero potentially-breaking) refresh calls. The lock is held across the outbound refresh call
+    // (bounded by INTEGRATION_SYNC_FETCH_TIMEOUT_MS, plus one retry's delay) — an acceptable,
+    // bounded cost given how rarely two jobs actually collide on the same connection's refresh
+    // moment, and nothing else touches this row at meaningful frequency.
+    return this.db.transaction(async (client) => {
+      const locked = await client.query("SELECT * FROM integration_connections WHERE id = $1 FOR UPDATE", [connection.id]);
+      const current = locked.rows[0] as Row | undefined;
+      if (!current) return null;
+      if (this.isTokenStillValid(current) || !current.refresh_token) return current;
+      return provider === "jira" ? this.refreshJiraToken(current, client) : this.refreshLinearToken(current, client);
+    });
   }
 
-  private async refreshJiraToken(connection: Row): Promise<Row> {
-    const clientId = (process.env.JIRA_CLIENT_ID || "").trim();
-    const clientSecret = (process.env.JIRA_CLIENT_SECRET || "").trim();
-    if (!clientId || !clientSecret) {
-      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} sync is not configured for this workspace.`);
-    }
+  private isTokenStillValid(connection: Row): boolean {
+    return new Date(connection.token_expires_at).getTime() > Date.now() + 60_000;
+  }
 
+  /**
+   * Shared shape for both providers' `grant_type=refresh_token` exchange: one retry (a cold-start
+   * network blip right after a container restart and a genuinely revoked refresh token both land
+   * here, and the retry is cheap enough that it isn't worth distinguishing the provider's error
+   * taxonomy to skip it — a revoked token just fails the same way again a second later), a clean
+   * `IntegrationConnectionInvalidError` on final failure, and "reuse the stored refresh token if
+   * the provider didn't rotate it" on success.
+   */
+  private async exchangeRefreshToken(
+    tokenUrl: string,
+    body: () => BodyInit,
+    headers: Record<string, string>,
+    connection: Row,
+    providerLabel: string
+  ): Promise<Row> {
     const attempt = () =>
-      fetch("https://auth.atlassian.com/oauth/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          grant_type: "refresh_token",
-          client_id: clientId,
-          client_secret: clientSecret,
-          refresh_token: decryptSecret(String(connection.refresh_token || ""))
-        }),
-        signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
-      }).catch(() => null);
+      fetch(tokenUrl, { method: "POST", headers, body: body(), signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS) }).catch(() => null);
 
-    // One retry, unconditional on the failure shape: a cold-start network blip right after a
-    // container restart and a genuinely revoked refresh token both land here, and the retry is
-    // cheap enough that it isn't worth distinguishing Atlassian's error taxonomy to skip it — a
-    // revoked token just fails the same way again a second later.
     let res = await attempt();
     if (!res?.ok) {
       await sleep(JIRA_TOKEN_REFRESH_RETRY_DELAY_MS);
       res = await attempt();
     }
     if (!res?.ok) {
-      this.logger.warn(`Jira token refresh failed (${res ? res.status : "network error"}) for connection ${connection.id} after retry`);
-      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} needs to be reconnected to this workspace.`);
+      this.logger.warn(`${providerLabel} token refresh failed (${res ? res.status : "network error"}) for connection ${connection.id} after retry`);
+      throw new IntegrationConnectionInvalidError(`${providerLabel} needs to be reconnected to this workspace.`);
     }
     const token = (await res.json()) as Row;
     const accessToken = encryptSecret(String(token.access_token || ""));
     const refreshToken = encryptSecret(String(token.refresh_token || decryptSecret(String(connection.refresh_token || ""))));
     const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
-    await this.db.query("UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1", [
+    return { accessToken, refreshToken, expiresAt };
+  }
+
+  private async persistRefreshedToken(client: Queryable, connection: Row, refreshed: Row): Promise<Row> {
+    await client.query("UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1", [
       connection.id,
-      accessToken,
-      refreshToken,
-      expiresAt
+      refreshed.accessToken,
+      refreshed.refreshToken,
+      refreshed.expiresAt
     ]);
-    return { ...connection, access_token: accessToken, refresh_token: refreshToken, token_expires_at: expiresAt };
+    return { ...connection, access_token: refreshed.accessToken, refresh_token: refreshed.refreshToken, token_expires_at: refreshed.expiresAt };
+  }
+
+  private async refreshJiraToken(connection: Row, client: Queryable): Promise<Row> {
+    const clientId = (process.env.JIRA_CLIENT_ID || "").trim();
+    const clientSecret = (process.env.JIRA_CLIENT_SECRET || "").trim();
+    if (!clientId || !clientSecret) {
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.jira} sync is not configured for this workspace.`);
+    }
+    const refreshed = await this.exchangeRefreshToken(
+      "https://auth.atlassian.com/oauth/token",
+      () =>
+        JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: decryptSecret(String(connection.refresh_token || ""))
+        }),
+      { "Content-Type": "application/json" },
+      connection,
+      PROVIDER_FOLDER_NAMES.jira
+    );
+    return this.persistRefreshedToken(client, connection, refreshed);
+  }
+
+  /**
+   * Linear's OAuth token endpoint accepts `grant_type=refresh_token` the same way Jira's does —
+   * this is the same endpoint (and same form-urlencoded shape) the initial authorization-code
+   * exchange already uses (LegacyService.integrationCallback). Added because Linear's own OAuth
+   * policy now issues short-lived (~24h) access tokens with a rotating refresh token, contradicting
+   * this file's former assumption that Linear tokens never needed refreshing.
+   */
+  private async refreshLinearToken(connection: Row, client: Queryable): Promise<Row> {
+    const clientId = (process.env.LINEAR_CLIENT_ID || "").trim();
+    const clientSecret = (process.env.LINEAR_CLIENT_SECRET || "").trim();
+    if (!clientId || !clientSecret) {
+      throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.linear} sync is not configured for this workspace.`);
+    }
+    const refreshed = await this.exchangeRefreshToken(
+      "https://api.linear.app/oauth/token",
+      () =>
+        new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: decryptSecret(String(connection.refresh_token || ""))
+        }).toString(),
+      { "Content-Type": "application/x-www-form-urlencoded" },
+      connection,
+      PROVIDER_FOLDER_NAMES.linear
+    );
+    return this.persistRefreshedToken(client, connection, refreshed);
   }
 
   // ── Jira ──
@@ -122,9 +196,23 @@ export class IntegrationSyncClient {
     };
   }
 
+  /**
+   * A 401/403 here means the access token that reached the real provider call is dead — most often
+   * because a refresh just above silently produced a token that doesn't actually work, or the
+   * refresh token itself is revoked. Without this check, the raw provider body (e.g.
+   * `jira request failed (401): {"code":401,...}`) leaks verbatim into the run's `error` field and
+   * onto the Requirements page — the exact defect IntegrationConnectionInvalidError exists to avoid,
+   * applied here as defense in depth alongside the proactive refresh in loadConnection.
+   */
+  private authErrorOrNull(status: number, providerLabel: string): IntegrationConnectionInvalidError | null {
+    return status === 401 || status === 403 ? new IntegrationConnectionInvalidError(`${providerLabel} needs to be reconnected to this workspace.`) : null;
+  }
+
   private async json<T>(url: string, init: RequestInit, provider: SyncProvider): Promise<T> {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
+      const authError = this.authErrorOrNull(res.status, PROVIDER_FOLDER_NAMES[provider]);
+      if (authError) throw authError;
       const text = await res.text().catch(() => "");
       throw new Error(`${provider} request failed (${res.status}): ${text.slice(0, 300)}`);
     }
@@ -234,11 +322,25 @@ export class IntegrationSyncClient {
       signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
     });
     if (!res.ok) {
+      const authError = this.authErrorOrNull(res.status, PROVIDER_FOLDER_NAMES.linear);
+      if (authError) throw authError;
       const text = await res.text().catch(() => "");
       throw new Error(`linear request failed (${res.status}): ${text.slice(0, 300)}`);
     }
     const payload = (await res.json()) as Row;
-    if (payload.errors) throw new Error(`linear request failed: ${JSON.stringify(payload.errors).slice(0, 300)}`);
+    if (payload.errors) {
+      // Linear can also report an auth failure as an HTTP 200 with a GraphQL-level error carrying
+      // extensions.code "AUTHENTICATION_ERROR" (or an embedded statusCode of 401/403) — the exact
+      // shape behind the reported "Authentication required, not authenticated" run failure. Caught
+      // here too, not just on !res.ok, so it gets the same clean message instead of raw JSON.
+      const errors = asArray(payload.errors);
+      const authFailure = errors.some((e) => {
+        const ext = (e as Row)?.extensions as Row | undefined;
+        return ext?.code === "AUTHENTICATION_ERROR" || ext?.statusCode === 401 || ext?.statusCode === 403;
+      });
+      if (authFailure) throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.linear} needs to be reconnected to this workspace.`);
+      throw new Error(`linear request failed: ${JSON.stringify(payload.errors).slice(0, 300)}`);
+    }
     return payload.data as T;
   }
 

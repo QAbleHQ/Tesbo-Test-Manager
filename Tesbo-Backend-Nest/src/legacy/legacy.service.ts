@@ -16,6 +16,7 @@ import { endZyraTurn, recordExistingCoverage, recordGeneration, recordJiraContex
 import { StorageService } from "../storage/storage.service";
 import { encryptSecret, decryptSecret } from "../common/crypto.util";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
+import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
 import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
@@ -7226,16 +7227,128 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(doc), syncedByName, breadcrumb };
   }
 
-  // Powers the Knowledge Base info-icon popover: this document's add/update timeline, 5 events per
-  // page (newest first) so a ticket synced nightly for a year doesn't dump hundreds of rows into a
-  // small popup. Only meaningful for a synced mirror, but reuses the same project-access +
-  // existence check as every other KB document route rather than special-casing on source_provider.
-  async getKnowledgeDocumentSyncEvents(projectId: string, userId: string | null | undefined, documentId: string, query: Body = {}) {
+  // Powers the Knowledge Base Change History popover/modal: this document's full add/update
+  // timeline, 5 entries per page (newest first) so a document with a long history doesn't dump
+  // hundreds of rows into a small popup. A synced mirror's timeline is the sync pipeline's
+  // append-only log; a manual document has no such log, so its timeline is synthesized from its
+  // version snapshots (buildManualDocumentHistory) — both shapes end up identical to the caller.
+  async getKnowledgeDocumentHistory(projectId: string, userId: string | null | undefined, documentId: string, query: Body = {}) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    await this.kbDocument(projectId, documentId);
+    const doc = await this.kbDocument(projectId, documentId);
     const limit = pageNumber(query.limit, 5, 1, 20);
     const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
-    return this.integrationSync.listSyncEventsForDocument(documentId, limit, offset);
+
+    if (doc.source_role === "mirror") {
+      const page = await this.integrationSync.listSyncEventsForDocument(documentId, limit, offset);
+      return {
+        events: page.events.map((e) => ({
+          id: e.id,
+          eventType: e.eventType,
+          changedSummary: e.changedSummary,
+          changedFields: e.changedFields,
+          createdAt: e.createdAt,
+          // Nightly-triggered runs carry no user (triggeredBy is NULL by design — see
+          // integration-sync.service.ts's startRun) — labelled explicitly, never left blank.
+          actorName: e.triggeredByName ?? "Nightly sync",
+          versionId: null as string | null
+        })),
+        hasMore: page.hasMore
+      };
+    }
+    return this.buildManualDocumentHistory(doc, documentId, limit, offset);
+  }
+
+  private async buildManualDocumentHistory(doc: Body, documentId: string, limit: number, offset: number) {
+    type HistoryEntry = {
+      id: string;
+      eventType: "created" | "updated";
+      changedSummary: string;
+      changedFields: ChangedField[];
+      createdAt: string;
+      actorName: string;
+      versionId: string | null;
+    };
+
+    const [versionsRes, createdByName] = await Promise.all([
+      this.db.query<{
+        id: string;
+        version_number: number;
+        title: string;
+        content_text: string | null;
+        created_by_name: string | null;
+        created_at: string;
+      }>(
+        `SELECT v.id, v.version_number, v.title, v.content_text,
+                COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS created_by_name, v.created_at
+         FROM knowledge_document_versions v
+         LEFT JOIN users u ON u.id = v.created_by
+         WHERE v.document_id = $1
+         ORDER BY v.version_number ASC`,
+        [documentId]
+      ),
+      this.kbSyncedByName(doc.created_by)
+    ]);
+    const versions = versionsRes.rows;
+
+    const entries: HistoryEntry[] = [
+      {
+        id: `${documentId}-added`,
+        eventType: "created",
+        changedSummary: "Added.",
+        changedFields: [],
+        createdAt: new Date(doc.created_at).toISOString(),
+        actorName: createdByName || "Deleted user",
+        versionId: null
+      }
+    ];
+
+    // Each version row snapshots the document's state right before the edit that superseded it,
+    // tagged with that edit's author (see updateKnowledgeDocument) — so the diff FROM one version
+    // TO the next (or, for the last version, TO the current live content) is exactly that editor's
+    // change, timestamped and attributed to that same row. An edit that lands inside the 15-minute
+    // snapshot-throttling window (KB_VERSION_SNAPSHOT_MINUTES) never gets its own row and is folded
+    // into whichever transition it happened inside, rather than being silently dropped.
+    const states = [
+      ...versions.map((v) => ({ title: v.title, contentText: v.content_text })),
+      { title: String(doc.title), contentText: (doc.content_text as string | null) ?? null }
+    ];
+    for (let i = 0; i < versions.length; i++) {
+      const diff = summarizeDocumentChange(states[i], states[i + 1]);
+      if (!diff.fields.length) continue;
+      entries.push({
+        id: versions[i].id,
+        eventType: "updated",
+        changedSummary: diff.summary,
+        changedFields: diff.fields,
+        createdAt: new Date(versions[i].created_at).toISOString(),
+        actorName: versions[i].created_by_name || "Deleted user",
+        versionId: versions[i].id
+      });
+    }
+
+    // Approve/reject already lands in the project activity feed (logProjectActivity), but that feed
+    // mixes every kind of activity across the whole project — folding it in here too means this
+    // document's own history never omits the one status change that isn't a content edit.
+    if (doc.document_type === "ai_memory" && doc.reviewed_at) {
+      const reviewedByName = await this.kbSyncedByName(doc.reviewed_by);
+      entries.push({
+        id: `${documentId}-review`,
+        eventType: "updated",
+        changedSummary: doc.status === "approved" ? "Marked as Approved." : "Marked as Rejected.",
+        changedFields: [],
+        createdAt: new Date(doc.reviewed_at).toISOString(),
+        actorName: reviewedByName || "Deleted user",
+        versionId: null
+      });
+    }
+
+    entries.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    const boundedLimit = Math.max(1, Math.min(50, limit));
+    const boundedOffset = Math.max(0, offset);
+    return {
+      events: entries.slice(boundedOffset, boundedOffset + boundedLimit),
+      hasMore: boundedOffset + boundedLimit < entries.length
+    };
   }
 
   // Display name for the person whose Sync click last rewrote a mirrored document.
@@ -8803,30 +8916,85 @@ export class LegacyService implements OnModuleInit {
     );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
-    if (!refresh || new Date(connection.token_expires_at).getTime() > Date.now() + 60_000) return connection;
-    if (provider === "linear" || !connection.refresh_token) return connection; // Linear OAuth tokens are long-lived; no refresh flow needed today.
+    // Fast, lock-free path: this is what the overwhelming majority of calls hit, so it stays exactly
+    // as cheap as it always was. Only a token actually due for refresh pays for the transaction below.
+    if (!refresh || this.isIntegrationTokenStillValid(connection) || !connection.refresh_token) return connection;
 
-    const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
-    const token = await this.jiraFetch<Body>("https://auth.atlassian.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: decryptSecret(String(connection.refresh_token || ""))
-      })
+    // A connection is organization-scoped and can be mapped into several Tesbo projects, so two
+    // interactive requests (or an interactive request racing the nightly sync worker's own
+    // loadConnection — see integration-sync.client.ts, which applies the identical guard) can see
+    // the same expired token at once. Both Linear's and Atlassian's OAuth apps rotate the refresh
+    // token on use, so two independent, concurrent refresh calls would have the loser fail on an
+    // already-invalidated refresh token. SELECT ... FOR UPDATE serializes them: whichever request
+    // gets here first does the one real refresh; the rest block on the row lock, then re-check the
+    // now-current row and reuse what the first already wrote.
+    return this.db.transaction(async (client) => {
+      const locked = await client.query(
+        "SELECT * FROM integration_connections WHERE id = $1 AND disconnected_at IS NULL FOR UPDATE",
+        [connection.id]
+      );
+      const current = locked.rows[0] as Body | undefined;
+      // Disconnected by a concurrent integrationDisconnect while this request was queued on the
+      // lock — must not resurrect a connection the user just told us to drop.
+      if (!current) return null;
+      if (this.isIntegrationTokenStillValid(current) || !current.refresh_token) return current;
+
+      const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
+      const providerLabel: "Jira" | "Linear" = provider === "jira" ? "Jira" : "Linear";
+      const refreshToken = decryptSecret(String(current.refresh_token || ""));
+      const token =
+        provider === "jira"
+          ? await this.providerTokenFetch<Body>(
+              "https://auth.atlassian.com/oauth/token",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken })
+              },
+              providerLabel
+            )
+          : await this.providerTokenFetch<Body>(
+              // Linear's OAuth token endpoint accepts grant_type=refresh_token the same way Jira's
+              // does — the same endpoint (and form-urlencoded shape) integrationCallback already
+              // uses for the initial authorization-code exchange. Added because Linear's own OAuth
+              // policy now issues short-lived (~24h) access tokens with a rotating refresh token,
+              // contradicting this method's former assumption that Linear tokens never expire.
+              "https://api.linear.app/oauth/token",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString()
+              },
+              providerLabel
+            );
+      const accessToken = String(token.access_token || "");
+      const rotatedRefreshToken = String(token.refresh_token || refreshToken);
+      const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
+      const encryptedAccessToken = encryptSecret(accessToken);
+      const encryptedRefreshToken = encryptSecret(rotatedRefreshToken);
+      await client.query(
+        "UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1",
+        [current.id, encryptedAccessToken, encryptedRefreshToken, expiresAt]
+      );
+      return { ...current, access_token: encryptedAccessToken, refresh_token: encryptedRefreshToken, token_expires_at: expiresAt };
     });
-    const accessToken = String(token.access_token || "");
-    const refreshToken = String(token.refresh_token || decryptSecret(String(connection.refresh_token || "")));
-    const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
-    const encryptedAccessToken = encryptSecret(accessToken);
-    const encryptedRefreshToken = encryptSecret(refreshToken);
-    await this.db.query(
-      "UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1",
-      [connection.id, encryptedAccessToken, encryptedRefreshToken, expiresAt]
-    );
-    return { ...connection, access_token: encryptedAccessToken, refresh_token: encryptedRefreshToken, token_expires_at: expiresAt };
+  }
+
+  private isIntegrationTokenStillValid(connection: Body): boolean {
+    return new Date(connection.token_expires_at).getTime() > Date.now() + 60_000;
+  }
+
+  /** Shared fetch+status-check for a provider's OAuth token endpoint — generalizes jiraFetch's
+   *  auth-error handling so Linear's token refresh gets the same clean-error treatment. */
+  private async providerTokenFetch<T = unknown>(url: string, init: RequestInit, providerLabel: "Jira" | "Linear"): Promise<T> {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const authError = this.cleanAuthErrorOrNull(providerLabel, res.status);
+      if (authError) throw authError;
+      const text = await res.text().catch(() => "");
+      throw new BadRequestException({ error: `${providerLabel} request failed (${res.status}).`, detail: text.slice(0, 500) });
+    }
+    return (await res.json()) as T;
   }
 
   // Every connection is OAuth, so Jira is always reached through the api.atlassian.com/ex/jira
@@ -8858,14 +9026,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async jiraFetch<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
-    const res = await fetch(url, init);
-    if (!res.ok) {
-      const authError = this.cleanAuthErrorOrNull("Jira", res.status);
-      if (authError) throw authError;
-      const text = await res.text().catch(() => "");
-      throw new BadRequestException({ error: `Jira request failed (${res.status}).`, detail: text.slice(0, 500) });
-    }
-    return (await res.json()) as T;
+    return this.providerTokenFetch<T>(url, init, "Jira");
   }
 
   private async linearGraphQL<T = unknown>(authHeader: string, query: string, variables?: Body): Promise<T> {

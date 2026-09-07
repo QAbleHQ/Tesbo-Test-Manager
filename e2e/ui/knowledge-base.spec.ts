@@ -206,12 +206,18 @@ test.describe("knowledge base (UI)", () => {
    * distinct values so "Added on" and "Last updated" can be told apart in the rendered table instead
    * of both coincidentally reading "Today".
    */
-  function seedMirrorDocument(title: string, externalId: string, createdDaysAgo: number, updatedDaysAgo: number): string {
+  function seedMirrorDocument(
+    title: string,
+    externalId: string,
+    createdDaysAgo: number,
+    updatedDaysAgo: number,
+    provider: "jira" | "linear" = "jira",
+  ): string {
     exec(
       "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
         "document_type, status, source_provider, source_external_id, source_role, is_read_only, created_at, updated_at) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(title)}, ` +
-        "'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', 'published', 'jira', " +
+        `'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', 'published', ${literal(provider)}, ` +
         `${literal(externalId)}, 'mirror', true, now() - interval '${createdDaysAgo} days', now() - interval '${updatedDaysAgo} days');`,
     );
     return scalar(
@@ -219,14 +225,20 @@ test.describe("knowledge base (UI)", () => {
     );
   }
 
-  function seedSyncEvent(documentId: string, eventType: "created" | "updated", changedSummary: string | null): void {
+  function seedSyncEvent(
+    documentId: string,
+    eventType: "created" | "updated",
+    changedSummary: string | null,
+    provider: "jira" | "linear" = "jira",
+  ): void {
     exec(
       "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary) VALUES (" +
-        `${literal(documentId)}, 'jira', ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)});`,
+        `${literal(documentId)}, ${literal(provider)}, ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)});`,
     );
   }
 
-  /** The row's info-icon trigger (Change history) — present only on a synced (mirror) row. */
+  /** The row's info-icon trigger (Change history) — every document row has one now, synced or not
+   *  (see KBU-35); a folder/file row never does. */
   function changeHistoryTrigger(page: Page, name: string): Locator {
     return row(page, name).getByRole("button", { name: "Change history" });
   }
@@ -1118,7 +1130,7 @@ test.describe("knowledge base (UI)", () => {
 
   // ─── Nightly sync cron follow-through: "Added on", "Last updated", and the change-history popover ──
 
-  test("KBU-35 a synced row shows distinct Added on / Last updated dates, its icon sits in Last updated, and a plain row has no icon", { tag: '@tesbo.testId("TES-TC-254")' }, async ({ browser }) => {
+  test("KBU-35 a synced row shows distinct Added on / Last updated dates, its icon sits in Last updated, and a manually-created row gets the same icon", { tag: '@tesbo.testId("TES-TC-254")' }, async ({ browser }) => {
     const mirrorTitle = stamp("E2E-80: Synced ticket");
     seedMirrorDocument(mirrorTitle, "kbu-added-on-1", 5, 0);
 
@@ -1146,10 +1158,24 @@ test.describe("knowledge base (UI)", () => {
     await expect(lastUpdatedCell.getByRole("button", { name: "Change history" })).toBeVisible();
     await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Change history" })).toHaveCount(0);
 
-    // A synced row gets the info icon; a plain, human-authored row does not — there is no change
-    // timeline to show for it.
+    // A manually-created, human-authored row gets the very same icon now — its own timeline is
+    // synthesized from version snapshots instead of a sync log, but the entry point is identical.
     await expect(changeHistoryTrigger(page, mirrorTitle)).toBeVisible();
-    await expect(changeHistoryTrigger(page, plainTitle)).toHaveCount(0);
+    await expect(changeHistoryTrigger(page, plainTitle)).toBeVisible();
+  });
+
+  test("KBU-35b a Linear-synced row gets the same Change history icon, popover, and provider label as a Jira one", { tag: '@tesbo.testId("TES-TC-2050")' }, async ({ browser }) => {
+    const title = stamp("E2E-80b: Linear ticket");
+    const documentId = seedMirrorDocument(title, "kbu-linear-1", 5, 0, "linear");
+    seedSyncEvent(documentId, "updated", "Priority updated.", "linear");
+
+    const page = await openKb(browser);
+    await expect(changeHistoryTrigger(page, title)).toBeVisible();
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel.getByText("Priority updated.")).toBeVisible();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await expect(page.getByText("Synced from Linear")).toBeVisible();
   });
 
   test("KBU-36 the change-history popover opens on hover as well as click, and lists the timeline newest first", { tag: '@tesbo.testId("TES-TC-255")' }, async ({ browser }) => {
@@ -1253,7 +1279,7 @@ test.describe("knowledge base (UI)", () => {
     await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
   });
 
-  test("KBU-38 a synced document's View history shows the change timeline with date/time/who, not a version list — a plain document is unaffected", { tag: '@tesbo.testId("TES-TC-260")' }, async ({ browser }) => {
+  test("KBU-38 a synced document's View history shows the change timeline with date/time/who, and a manual document gets the same timeline instead of a bare version list", { tag: '@tesbo.testId("TES-TC-260")' }, async ({ browser }) => {
     const mirrorTitle = stamp("E2E-84: View history mirror");
     const documentId = seedMirrorDocument(mirrorTitle, "kbu-view-history-1", 2, 0);
     seedSyncEvent(documentId, "updated", "Description updated.");
@@ -1292,17 +1318,19 @@ test.describe("knowledge base (UI)", () => {
     // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
     await page.keyboard.press("Escape");
 
-    // A regular, human-authored document is entirely unaffected: still "Version history", still
-    // the plain empty state, since it has never been saved yet either.
+    // A regular, human-authored document gets the identical "Change history" modal and the same
+    // empty-state copy — it's never had an edit yet either, so there is nothing but "Added".
     const created = await api.post(kbUrl("/documents"), { data: { title: stamp("Plain doc"), folderId: rootFolderId } });
     expect(created.status()).toBe(201);
     const plainDocumentId = (await created.json()).id;
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${plainDocumentId}`);
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const versionDialog = modal(page, "Version history");
-    await expect(versionDialog).toBeVisible();
-    await expect(versionDialog.getByText("No earlier versions yet.")).toBeVisible();
+    const plainDialog = modal(page, "Change history");
+    await expect(plainDialog).toBeVisible();
+    await expect(plainDialog.getByText("Added", { exact: false })).toBeVisible();
+    // Never had an edit, so there is nothing to restore — no version-diff entry exists yet.
+    await expect(plainDialog.getByRole("button", { name: "Restore" })).toHaveCount(0);
   });
 
   // ─── Restore confirmation (BetterBugs: "Restore old version feature is not working") ──────
@@ -1340,12 +1368,12 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Version history");
+    const dialog = modal(page, "Change history");
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Restore" }).click();
 
     // Confirming is a separate step — opening it must not itself have called the restore endpoint.
-    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
     await page.waitForTimeout(500);
     expect(
       scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`),
@@ -1361,7 +1389,7 @@ test.describe("knowledge base (UI)", () => {
     // is the regression check for the reported bug: before the fix, content_text flipped in the
     // database but the on-screen body never did.
     await dialog.getByRole("button", { name: "Restore" }).click();
-    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
     await dialog.getByRole("button", { name: "Restore" }).click();
 
     await expect(page.locator(".ProseMirror").first()).toContainText("v1 content");
@@ -1369,11 +1397,12 @@ test.describe("knowledge base (UI)", () => {
     expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`)).toBe("v1 content");
 
     // Restoring is itself reversible: the pre-restore ("v2") state was snapshotted before the
-    // overwrite, so the history now has two entries, not a repeat of the same one.
+    // overwrite, so the timeline now shows two distinct restorable entries, not a repeat of the
+    // same one — proof the reversibility actually happened, not just that a version count went up.
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const reopened = modal(page, "Version history");
-    await expect(reopened.getByText(/Version 2/)).toBeVisible();
+    const reopened = modal(page, "Change history");
+    await expect(reopened.getByRole("button", { name: "Restore" })).toHaveCount(2);
   });
 
   test("KBU-40 two rapid clicks on Confirm restore exactly once, and the dialog is left in a normal, usable state afterward", { tag: '@tesbo.testId("TES-TC-1921")' }, async ({
@@ -1393,7 +1422,7 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Version history");
+    const dialog = modal(page, "Change history");
     await dialog.getByRole("button", { name: "Restore" }).click();
     const confirmButton = dialog.getByRole("button", { name: "Restore" });
     await expect(confirmButton).toBeVisible();
@@ -1415,7 +1444,7 @@ test.describe("knowledge base (UI)", () => {
     // Not stuck: history opens again with its Restore buttons enabled, not disabled from before.
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const reopened = modal(page, "Version history");
+    const reopened = modal(page, "Change history");
     await expect(reopened.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
   });
 
@@ -1436,9 +1465,9 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Version history");
+    const dialog = modal(page, "Change history");
     await dialog.getByRole("button", { name: "Restore" }).click();
-    await expect(dialog.getByText(/Restore to Version 1/)).toBeVisible();
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
 
     // Someone else deletes the document between the confirmation opening and being confirmed —
     // the same 404 the API already returns for a restore against a soft-deleted document.
@@ -1447,11 +1476,61 @@ test.describe("knowledge base (UI)", () => {
     await dialog.getByRole("button", { name: "Restore" }).click();
     await expect(dialog.getByText("Document not found")).toBeVisible();
 
-    // Not stuck: Cancel is still clickable, and backs out to the (still-listed, now stale) version
-    // list rather than staying wedged on the errored confirmation.
+    // Not stuck: Cancel is still clickable, and backs out to the timeline rather than staying
+    // wedged on the errored confirmation. Undeleting before Cancel (not after): Cancel remounts the
+    // timeline, which refetches immediately — done here so that refetch lands against a document
+    // that exists again, rather than racing the very undelete this line performs.
     await expect(dialog.getByRole("button", { name: "Cancel" })).toBeEnabled();
-    await dialog.getByRole("button", { name: "Cancel" }).click();
     exec(`UPDATE knowledge_documents SET is_deleted = false WHERE id = ${literal(documentId)};`);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
     await expect(dialog.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
+  });
+
+  test("KBU-42 a large content change shows a compact badge with an on-demand 'View diff' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("LargeDiff");
+    const longText = "New paragraph about the change. ".repeat(10); // well over the 160-char threshold
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: longText, contentHtml: `<p>${longText}</p>` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "short old text");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Change history");
+    await expect(dialog).toBeVisible();
+
+    // The row itself stays a one-line badge — the full old/new text only appears once asked for.
+    await expect(dialog.getByText("short old text")).toHaveCount(0);
+    const diffButton = dialog.getByRole("button", { name: "View diff" });
+    await expect(diffButton).toBeVisible();
+    await diffButton.click();
+
+    const diffModal = modal(page, "View diff");
+    await expect(diffModal).toBeVisible();
+    await expect(diffModal.getByText("short old text", { exact: false })).toBeVisible();
+    await expect(diffModal.getByText("New paragraph about the change.", { exact: false }).first()).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    // A small, single-field change stays exactly as compact as it always has been: no badge.
+    const smallTitle = stamp("SmallDiff");
+    const smallCreated = await api.post(kbUrl("/documents"), {
+      data: { title: smallTitle, folderId: rootFolderId, documentType: "general", contentText: "new short text" },
+    });
+    const smallDocumentId = (await smallCreated.json()).id;
+    seedDocumentVersion(smallDocumentId, smallTitle, "old short text");
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${smallDocumentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const smallDialog = modal(page, "Change history");
+    await expect(smallDialog.getByText("Details updated.", { exact: false })).toBeVisible();
+    await expect(smallDialog.getByRole("button", { name: "View diff" })).toHaveCount(0);
   });
 });
