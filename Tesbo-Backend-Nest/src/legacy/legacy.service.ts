@@ -9932,6 +9932,7 @@ export class LegacyService implements OnModuleInit {
       "- list: show existing testcase or coverage rows when the user asks to show/list/compare coverage.",
       "- jira_pending_testcases: count Jira tickets, linked testcase coverage, and pending tickets for testcase writing.",
       "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases. If the user names an existing suite for these new testcases (or a prior turn already established one, e.g. confirming 'yes' to save into the suite you just discussed), set operation.suiteId (preferred, from 'Existing suites' below) or operation.suiteName directly on the create operation so the testcase lands in that suite immediately — do not require a separate move_to_suite step for testcases you are creating in this same turn.",
+      "operation.draft for a create op should be {title, preconditions, stepsJson (a JSON string of {stepNumber, action, expectedResult} objects), testData (concrete input values/sample data the case needs, empty string if none), expectedSummary, priority, tags, jiraIssueKey (set this to the ticket's key, e.g. 'HBP-14', ONLY when this testcase covers a specific Jira ticket that was named in this conversation or clearly matches one from the Jira context below — leave it unset otherwise)}.",
       "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
       "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
@@ -11810,6 +11811,7 @@ export class LegacyService implements OnModuleInit {
           description: draft.description || draft.expectedSummary || "",
           preconditions: draft.preconditions || "",
           stepsJson: this.safeSteps(draft.stepsJson),
+          testData: draft.testData || "",
           priority: draft.priority || "P2",
           type: draft.type || "Functional",
           status: draft.status || "Draft",
@@ -12384,9 +12386,10 @@ export class LegacyService implements OnModuleInit {
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
       "Prioritize edge cases, boundary values, negative paths, permissions, data integrity, state transitions, and traceability.",
-      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"]}]}",
+      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"testData\":\"\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"]}]}",
       "Do not include markdown fences, explanations, comments, or text before or after the JSON object.",
-      "stepsJson must be a JSON string containing an array of step objects with step, action, and expected fields."
+      "stepsJson must be a JSON string containing an array of step objects with stepNumber, action, and expectedResult fields.",
+      "testData is the concrete input values, sample records, or setup-specific data the test needs (e.g. specific usernames, amounts, file formats) — leave it an empty string only when the case genuinely needs no specific data beyond what the steps already state."
     ].join("\n");
   }
 
@@ -12454,6 +12457,7 @@ export class LegacyService implements OnModuleInit {
         title: String(draft.title || `Generated testcase ${index + 1}`).slice(0, 240),
         preconditions: String(draft.preconditions || "Required test data and user permissions are available."),
         stepsJson: typeof draft.stepsJson === "string" ? draft.stepsJson : JSON.stringify(draft.steps || []),
+        testData: String(draft.testData || ""),
         expectedSummary: String(draft.expectedSummary || draft.expected || "The workflow behaves as expected."),
         priority: String(draft.priority || (index < 2 ? "P1" : "P2")),
         tags
