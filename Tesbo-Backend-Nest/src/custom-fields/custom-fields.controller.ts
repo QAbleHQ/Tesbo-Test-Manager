@@ -74,6 +74,11 @@ export class CustomFieldsController {
     return this.customFields.deleteDefinition(req.userId, projectId, definitionId);
   }
 
+  @Post("/api/projects/:projectId/custom-fields/definitions/:definitionId/restore")
+  restoreDefinition(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("definitionId") definitionId: string) {
+    return this.customFields.restoreDefinition(req.userId, projectId, definitionId);
+  }
+
   @Get("/api/projects/:projectId/testcases/:testcaseId/custom-field-values")
   getValues(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("testcaseId") testcaseId: string) {
     return this.customFields.getValuesForTestCase(req.userId, projectId, testcaseId);

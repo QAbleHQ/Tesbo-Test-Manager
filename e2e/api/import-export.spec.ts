@@ -294,7 +294,7 @@ test.describe("import / export", () => {
     expect(res.headers()["content-disposition"]).toBe('attachment; filename="testcases.csv"');
   });
 
-  test("adds a cf_<key> column for each active custom field, and drops archived ones", { tag: '@tesbo.testId("TES-TC-203")' }, async () => {
+  test("adds a cf_<key> column for each active custom field, and drops archived or deleted ones", { tag: '@tesbo.testId("TES-TC-203")' }, async () => {
     const stamp = Date.now();
     const project = await newProject(`E2E Export Custom Fields ${stamp}`);
     const text = await (
@@ -320,6 +320,12 @@ test.describe("import / export", () => {
       `/api/projects/${project}/custom-fields/definitions/${retired.id}/status`,
       { data: { status: "archived" } },
     );
+    const removed = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `Removed ${stamp}`, fieldType: "text" },
+      })
+    ).json();
+    await asOwner.delete(`/api/projects/${project}/custom-fields/definitions/${removed.id}`);
 
     const r2 = select.config.options.find((o: { label: string }) => o.label === "R2");
     const seeded = await seedCase(
@@ -335,6 +341,7 @@ test.describe("import / export", () => {
     expect(headers).toContain(`cf_${text.key}`);
     expect(headers).toContain(`cf_${select.key}`);
     expect(headers, "an archived definition is not a column").not.toContain(`cf_${retired.key}`);
+    expect(headers, "a soft-deleted definition is not a column either").not.toContain(`cf_${removed.key}`);
 
     const row = records.find((r) => r.title === seeded.title)!;
     expect(row[`cf_${text.key}`]).toBe("Platform");

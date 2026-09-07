@@ -1453,6 +1453,10 @@ export async function deleteCustomFieldDefinition(projectId: string, definitionI
   await api(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}`, { method: "DELETE" });
 }
 
+export async function restoreCustomFieldDefinition(projectId: string, definitionId: string): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/restore`, { method: "POST" });
+}
+
 export async function addCustomFieldOption(projectId: string, definitionId: string, label: string): Promise<CustomFieldDefinition> {
   return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/options`, {
     method: "POST",
