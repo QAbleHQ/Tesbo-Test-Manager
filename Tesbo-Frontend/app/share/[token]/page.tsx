@@ -75,12 +75,12 @@ function DonutChart({
 /* ───── Status badge ───── */
 function StatusBadge({ status }: { status: string }) {
   const cls: Record<string, string> = {
-    Passed: "bg-green-100 text-green-800",
-    Failed: "bg-red-100 text-red-800",
-    Skipped: "bg-yellow-100 text-yellow-800",
-    Blocked: "bg-orange-100 text-orange-800",
-    Retest: "bg-purple-100 text-purple-800",
-    Untested: "bg-[var(--surface-secondary)] text-[var(--muted)]",
+    Passed: "bg-[var(--status-pass-fill)] text-[var(--status-pass-text)]",
+    Failed: "bg-[var(--status-fail-fill)] text-[var(--status-fail-text)]",
+    Skipped: "bg-[var(--status-skipped-fill)] text-[var(--status-skipped-text)]",
+    Blocked: "bg-[var(--status-blocked-fill)] text-[var(--status-blocked-text)]",
+    Retest: "bg-[var(--status-retest-fill)] text-[var(--status-retest-text)]",
+    Untested: "bg-[var(--status-notrun-fill)] text-[var(--status-notrun-text)]",
   };
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${cls[status] || cls.Untested}`}>
