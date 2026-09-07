@@ -243,3 +243,98 @@ describe.each<SyncProvider>(["jira", "linear"])(
     });
   }
 );
+
+/**
+ * Regression coverage for "tickets from all projects are displayed after sync instead of only the
+ * selected project": jira_tickets/linear_tickets used to carry no record of which remote
+ * project/team a ticket actually came from, so once a Tesbo project's mapping was ever switched,
+ * every past entity's tickets stayed mixed into the same project_id-scoped view forever. Tagging
+ * each ticket with the mapping's remote_id at sync time (read back out by legacy.service.ts's
+ * "current mapping only" filter) is what makes that filter possible.
+ */
+describe.each<SyncProvider>(["jira", "linear"])(
+  "IntegrationSyncProcessor#process — tags every synced %s ticket with its source mapping",
+  (provider) => {
+    it("writes mapped_remote_id from the mapping lookup's remote_id", async () => {
+      const ticket = remoteTicket({ issueId: "id-1", issueKey: "ENG-1" });
+      const insertCalls: unknown[][] = [];
+
+      const dbQuery = jest.fn((sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM jira_project_mappings") || sql.includes("FROM linear_project_mappings")) {
+          return Promise.resolve({ rows: [{ remote_id: "remote-team-42", remote_key: "ENG", remote_name: "Engineering" }] });
+        }
+        if (sql.includes("INSERT INTO jira_tickets") || sql.includes("INSERT INTO linear_tickets")) {
+          insertCalls.push(params);
+          return Promise.resolve({ rows: [{ id: "ticket-1" }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
+
+      const { processor } = makeProcessor({
+        db: { query: dbQuery },
+        client: {
+          loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+          fetchJiraTickets: jest.fn(async (_conn, _key, onPage) => {
+            await onPage([ticket]);
+            return { total: 1, truncated: false };
+          }),
+          fetchLinearTickets: jest.fn(async (_conn, _id, onPage) => {
+            await onPage([ticket]);
+            return { total: 1, truncated: false };
+          })
+        }
+      });
+
+      const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider, triggeredBy: "user-1" };
+      await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+
+      expect(insertCalls).toHaveLength(1);
+      // mapped_remote_id is the last bound column (see upsertTicket's INSERT column list).
+      expect(insertCalls[0][insertCalls[0].length - 1]).toBe("remote-team-42");
+    });
+
+    it("re-tags a ticket with the new mapping's remote_id after a mapping switch, leaving the old mapping's tag alone", async () => {
+      // Two syncs for the same Tesbo project/issue, under two different mappings — simulates a
+      // project/team switch. Only the second sync's row should end up tagged with the new entity.
+      const ticket = remoteTicket({ issueId: "id-1", issueKey: "ENG-1" });
+      let currentRemoteId = "remote-team-A";
+      const insertCalls: unknown[][] = [];
+
+      const dbQuery = jest.fn((sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM jira_project_mappings") || sql.includes("FROM linear_project_mappings")) {
+          return Promise.resolve({ rows: [{ remote_id: currentRemoteId, remote_key: "ENG", remote_name: "Engineering" }] });
+        }
+        if (sql.includes("INSERT INTO jira_tickets") || sql.includes("INSERT INTO linear_tickets")) {
+          insertCalls.push(params);
+          return Promise.resolve({ rows: [{ id: "ticket-1" }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
+
+      const { processor } = makeProcessor({
+        db: { query: dbQuery },
+        client: {
+          loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+          fetchJiraTickets: jest.fn(async (_conn, _key, onPage) => {
+            await onPage([ticket]);
+            return { total: 1, truncated: false };
+          }),
+          fetchLinearTickets: jest.fn(async (_conn, _id, onPage) => {
+            await onPage([ticket]);
+            return { total: 1, truncated: false };
+          })
+        }
+      });
+
+      const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider, triggeredBy: "user-1" };
+      await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+
+      currentRemoteId = "remote-team-B";
+      await processor.process(job(INTEGRATION_SYNC_RUN_JOB, { ...payload, runId: "run-2" }));
+
+      expect(insertCalls).toHaveLength(2);
+      expect(insertCalls[0][insertCalls[0].length - 1]).toBe("remote-team-A");
+      expect(insertCalls[1][insertCalls[1].length - 1]).toBe("remote-team-B");
+    });
+  }
+);

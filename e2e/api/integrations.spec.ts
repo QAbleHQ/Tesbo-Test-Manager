@@ -189,35 +189,76 @@ test.describe("integrations — Jira and Linear", () => {
     );
   }
 
+  /**
+   * A ticket only exists in the running product because some sync run wrote it under a mapping —
+   * mapped_remote_id (V96) records which one, and the default read path (jiraTickets/linearTickets/
+   * allTickets/tickets-summary) now scopes to whichever mapping is *currently* enabled for the
+   * project (this is the fix for "tickets from all projects are displayed instead of only the
+   * selected project"). So every ticket fixture needs a matching enabled mapping to be visible by
+   * default: reuse one if the test already seeded it (seedJiraMapping/seedLinearMapping), else
+   * auto-create one — transparent to every call site that doesn't care about mapping specifics.
+   * Pass `mappedRemoteId` explicitly to seed a ticket that deliberately does NOT match the current
+   * mapping (a stale/historical row) for the scoping tests below.
+   */
+  function currentOrAutoJiraMapping(connectionId: string, projectId: string): string {
+    const existing = scalar(
+      `SELECT jira_project_id FROM jira_project_mappings WHERE project_id = ${literal(projectId)} AND enabled = true LIMIT 1;`,
+    );
+    if (existing) return existing;
+    const autoId = `jira-auto-${projectId}`;
+    exec(
+      "INSERT INTO jira_project_mappings (project_id, jira_connection_id, jira_project_id, jira_project_key, jira_project_name, enabled) " +
+        `VALUES (${literal(projectId)}, ${literal(connectionId)}, ${literal(autoId)}, 'AUTO', 'E2E auto mapping', true);`,
+    );
+    return autoId;
+  }
+
+  function currentOrAutoLinearMapping(connectionId: string, projectId: string): string {
+    const existing = scalar(
+      `SELECT linear_team_id FROM linear_project_mappings WHERE project_id = ${literal(projectId)} AND enabled = true LIMIT 1;`,
+    );
+    if (existing) return existing;
+    const autoId = `linear-auto-${projectId}`;
+    exec(
+      "INSERT INTO linear_project_mappings (project_id, integration_connection_id, linear_team_id, linear_team_key, linear_team_name, entity_type, enabled) " +
+        `VALUES (${literal(projectId)}, ${literal(connectionId)}, ${literal(autoId)}, 'AUTO', 'E2E auto mapping', 'team', true);`,
+    );
+    return autoId;
+  }
+
   /** A mirrored Jira ticket, as a completed sync would have left it. */
   function seedJiraTicket(
     connectionId: string,
-    fields: { key: string; summary: string; status?: string; priority?: string; assignee?: string },
+    fields: { key: string; summary: string; status?: string; priority?: string; assignee?: string; mappedRemoteId?: string },
     projectId?: string,
   ): void {
+    const pid = projectId ?? tenant!.mainProjectId;
+    const mappedRemoteId = fields.mappedRemoteId ?? currentOrAutoJiraMapping(connectionId, pid);
     exec(
       "INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, " +
-        "description, issue_type, status, priority, assignee, jira_url, jira_created_at, jira_updated_at) VALUES (" +
-        `${literal(projectId ?? tenant!.mainProjectId)}, ${literal(connectionId)}, ` +
+        "description, issue_type, status, priority, assignee, jira_url, jira_created_at, jira_updated_at, mapped_remote_id) VALUES (" +
+        `${literal(pid)}, ${literal(connectionId)}, ` +
         `${literal(`id-${fields.key}`)}, ${literal(fields.key)}, ${literal(fields.summary)}, ` +
         `'seeded by the e2e suite', 'Story', ${literal(fields.status ?? "To Do")}, ` +
         `${literal(fields.priority ?? "Medium")}, ${literal(fields.assignee ?? "e2e@example.com")}, ` +
-        `${literal(`https://e2e.invalid/browse/${fields.key}`)}, now(), now());`,
+        `${literal(`https://e2e.invalid/browse/${fields.key}`)}, now(), now(), ${literal(mappedRemoteId)});`,
     );
   }
 
   function seedLinearTicket(
     connectionId: string,
-    fields: { key: string; summary: string; status?: string },
+    fields: { key: string; summary: string; status?: string; mappedRemoteId?: string },
     projectId?: string,
   ): void {
+    const pid = projectId ?? tenant!.mainProjectId;
+    const mappedRemoteId = fields.mappedRemoteId ?? currentOrAutoLinearMapping(connectionId, pid);
     exec(
       "INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, " +
-        "summary, description, issue_type, status, priority, assignee, linear_url, linear_created_at, linear_updated_at) VALUES (" +
-        `${literal(projectId ?? tenant!.mainProjectId)}, ${literal(connectionId)}, ` +
+        "summary, description, issue_type, status, priority, assignee, linear_url, linear_created_at, linear_updated_at, mapped_remote_id) VALUES (" +
+        `${literal(pid)}, ${literal(connectionId)}, ` +
         `${literal(`id-${fields.key}`)}, ${literal(fields.key)}, ${literal(fields.summary)}, ` +
         `'seeded by the e2e suite', 'Bug', ${literal(fields.status ?? "Todo")}, 'Medium', 'e2e@example.com', ` +
-        `${literal(`https://e2e.invalid/issue/${fields.key}`)}, now(), now());`,
+        `${literal(`https://e2e.invalid/issue/${fields.key}`)}, now(), now(), ${literal(mappedRemoteId)});`,
     );
   }
 
@@ -981,5 +1022,119 @@ test.describe("integrations — Jira and Linear", () => {
       `SELECT COUNT(*) FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND integration_connection_id = ${literal(connectionId)};`,
     );
     expect(after, "a rejected payload must not have written anything").toBe(before);
+  });
+
+  // ─── Regression: "tickets from all projects are displayed after sync instead of only the
+  //     selected project" — jiraTickets/linearTickets/tickets used to filter only by project_id,
+  //     so every entity a Tesbo project had ever been mapped to (before a switch) stayed mixed into
+  //     the same result forever. mapped_remote_id (V96) plus the "currently enabled mapping only"
+  //     read filter fixes this; these tests reproduce the exact reported scenario end to end. ───
+
+  test("INT-A-39 switching the mapped Jira project hides the old project's tickets from the default view, but ?remoteId still reaches them", { tag: '@tesbo.testId("TES-TC-263")' }, async () => {
+    const connectionId = seedConnection("jira");
+    seedJiraMapping(connectionId, "OLDPROJ");
+    seedJiraTicket(connectionId, { key: "OLDPROJ-1", summary: "Belongs to the old project" });
+
+    // Switch the mapping to a different Jira project — mirrors POST jira/projects.
+    const switchRes = await asOwner.post(url("/jira/projects"), {
+      data: { projects: [{ id: "jira-NEWPROJ", key: "NEWPROJ", name: "New Project" }] },
+      failOnStatusCode: false,
+    });
+    expect(switchRes.ok(), `switching the Jira mapping answered ${switchRes.status()}: ${await switchRes.text()}`).toBe(true);
+    seedJiraTicket(connectionId, { key: "NEWPROJ-1", summary: "Belongs to the new project" });
+
+    // Default view: only the newly mapped project's ticket, never the old one.
+    const defaultView = await (await asOwner.get(url("/jira/tickets"))).json();
+    const defaultKeys = defaultView.list.map((t: { jiraIssueKey: string }) => t.jiraIssueKey);
+    expect(defaultKeys, `default Jira tickets view was ${JSON.stringify(defaultKeys)}`).toEqual(["NEWPROJ-1"]);
+
+    // The old project's ticket was never deleted — it's still reachable by asking for it explicitly.
+    const oldProjectRemoteId = scalar(
+      `SELECT jira_project_id FROM jira_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_project_key = 'OLDPROJ';`,
+    );
+    const historical = await (await asOwner.get(url(`/jira/tickets?remoteId=${encodeURIComponent(oldProjectRemoteId)}`))).json();
+    const historicalKeys = historical.list.map((t: { jiraIssueKey: string }) => t.jiraIssueKey);
+    expect(historicalKeys).toEqual(["OLDPROJ-1"]);
+
+    // "All Sources" and the summary counts must agree with the default (current-mapping-only) view.
+    const all = await (await asOwner.get(url("/tickets"))).json();
+    expect(all.list.map((t: { key: string }) => t.key)).toEqual(["NEWPROJ-1"]);
+    const summary = await (await asOwner.get(url("/tickets/summary"))).json();
+    expect(summary.jira.total).toBe(1);
+  });
+
+  test("INT-A-40 switching the mapped Linear team hides the old team's tickets from the default view, but ?remoteId still reaches them", { tag: '@tesbo.testId("TES-TC-264")' }, async () => {
+    const connectionId = seedConnection("linear");
+    seedLinearMapping(connectionId, "OLDTEAM", "team");
+    seedLinearTicket(connectionId, { key: "OLDTEAM-1", summary: "Belongs to the old team" });
+
+    const switchRes = await asOwner.post(url("/linear/teams"), {
+      data: { projects: [{ id: "linear-NEWTEAM", key: "NEWTEAM", name: "New Team" }] },
+      failOnStatusCode: false,
+    });
+    expect(switchRes.ok(), `switching the Linear mapping answered ${switchRes.status()}: ${await switchRes.text()}`).toBe(true);
+    seedLinearTicket(connectionId, { key: "NEWTEAM-1", summary: "Belongs to the new team" });
+
+    const defaultView = await (await asOwner.get(url("/linear/tickets"))).json();
+    expect(defaultView.list.map((t: { linearIssueKey: string }) => t.linearIssueKey)).toEqual(["NEWTEAM-1"]);
+
+    const oldTeamRemoteId = scalar(
+      `SELECT linear_team_id FROM linear_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND linear_team_key = 'OLDTEAM';`,
+    );
+    const historical = await (await asOwner.get(url(`/linear/tickets?remoteId=${encodeURIComponent(oldTeamRemoteId)}`))).json();
+    expect(historical.list.map((t: { linearIssueKey: string }) => t.linearIssueKey)).toEqual(["OLDTEAM-1"]);
+  });
+
+  test("INT-A-41 unmapping a Jira project keeps its tickets in the database but hides them from the default view", { tag: '@tesbo.testId("TES-TC-265")' }, async () => {
+    const connectionId = seedConnection("jira");
+    seedJiraMapping(connectionId, "GONE");
+    seedJiraTicket(connectionId, { key: "GONE-1", summary: "Was mapped, then unmapped" });
+
+    const unlinkRes = await asOwner.post(url("/jira/projects"), { data: { projects: [] }, failOnStatusCode: false });
+    expect(unlinkRes.ok(), `unlinking the Jira mapping answered ${unlinkRes.status()}: ${await unlinkRes.text()}`).toBe(true);
+
+    const defaultView = await (await asOwner.get(url("/jira/tickets"))).json();
+    expect(defaultView.list, "an unmapped project must show no tickets by default").toEqual([]);
+
+    // Never deleted — still physically present in the ticket cache.
+    const stillThere = scalar(
+      `SELECT COUNT(*) FROM jira_tickets WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_issue_key = 'GONE-1';`,
+    );
+    expect(stillThere).toBe("1");
+  });
+
+  // ─── Regression: disconnecting Jira/Linear used to hard-delete every ticket and mapping for that
+  //     connection (ON DELETE CASCADE off integration_connections). Disconnect is now a soft state
+  //     flip — nothing synced is ever destroyed by disconnecting. ───
+
+  test("INT-A-42 disconnecting Jira preserves every ticket and mapping row, and reports not-connected afterward", { tag: '@tesbo.testId("TES-TC-266")' }, async () => {
+    const connectionId = seedConnection("jira");
+    seedJiraMapping(connectionId, "SURV");
+    seedJiraTicket(connectionId, { key: "SURV-1", summary: "Must survive a disconnect" });
+
+    const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+    expect(disconnectRes.ok(), `disconnect answered ${disconnectRes.status()}: ${await disconnectRes.text()}`).toBe(true);
+
+    // Reads as not-connected everywhere...
+    const status = await (await asOwner.get("/api/workspace/integrations/jira/status", { failOnStatusCode: false })).json();
+    expect(status.connected).toBe(false);
+    const projectStatus = await (await asOwner.get(url("/jira/status"), { failOnStatusCode: false })).json();
+    expect(projectStatus.connected).toBe(false);
+
+    // ...but nothing was deleted: the connection row, its mapping, and its ticket all survive.
+    expect(scalar(`SELECT COUNT(*) FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("1");
+    expect(
+      scalar(`SELECT disconnected_at IS NOT NULL FROM integration_connections WHERE id = ${literal(connectionId)};`),
+    ).toBe("t");
+    expect(
+      scalar(`SELECT COUNT(*) FROM jira_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_project_key = 'SURV';`),
+    ).toBe("1");
+    expect(
+      scalar(`SELECT COUNT(*) FROM jira_tickets WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_issue_key = 'SURV-1';`),
+    ).toBe("1");
+    // The mapping is disabled, not deleted, matching what a real per-project unmap does.
+    expect(
+      scalar(`SELECT enabled FROM jira_project_mappings WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_project_key = 'SURV';`),
+    ).toBe("f");
   });
 });

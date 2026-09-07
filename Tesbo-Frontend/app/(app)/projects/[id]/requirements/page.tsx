@@ -29,6 +29,14 @@ const PAGE_SIZE = 25;
 type Source = "all" | "jira" | "linear";
 type TicketSource = "jira" | "linear";
 
+/** Normalized shape for a past (no-longer-current) Jira project / Linear team-or-project this
+ * project has been mapped to — never deleted, just no longer the active mapping. */
+interface HistoricalSource {
+  remoteId: string;
+  remoteKey: string;
+  remoteName: string;
+}
+
 interface Requirement {
   id: string;
   source: TicketSource;
@@ -217,6 +225,10 @@ export default function RequirementsPage() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("");
+  // Past mappings for whichever single-provider tab is active — tickets from these are never
+  // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
+  const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>([]);
+  const [historicalRemoteId, setHistoricalRemoteId] = useState<string | null>(null);
 
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
@@ -252,7 +264,8 @@ export default function RequirementsPage() {
       activeSource: Source,
       pageNum: number,
       query: string,
-      filters: { issueType?: string; status?: string; coverage?: "" | "covered" | "uncovered" }
+      filters: { issueType?: string; status?: string; coverage?: "" | "covered" | "uncovered" },
+      remoteId?: string
     ) => {
       const listParams = {
         limit: PAGE_SIZE,
@@ -261,6 +274,9 @@ export default function RequirementsPage() {
         issueType: filters.issueType || undefined,
         status: filters.status || undefined,
         coverage: filters.coverage || undefined,
+        // Omitted -> whatever's currently mapped (the default, bug-fixed view). Set only when the
+        // user picked a past source from the history dropdown below.
+        remoteId: remoteId || undefined,
       };
       try {
         if (activeSource === "all") {
@@ -317,6 +333,20 @@ export default function RequirementsPage() {
     setSummary(data);
   }, [projectId]);
 
+  const refreshHistory = useCallback(async (activeSource: TicketSource) => {
+    if (activeSource === "jira") {
+      const status = await getJiraStatus(projectId).catch(() => null);
+      setSourceHistory(
+        (status?.history ?? []).map((h) => ({ remoteId: h.jiraProjectId, remoteKey: h.jiraProjectKey, remoteName: h.jiraProjectName }))
+      );
+    } else {
+      const status = await getLinearStatus(projectId).catch(() => null);
+      setSourceHistory(
+        (status?.history ?? []).map((h) => ({ remoteId: h.linearTeamId, remoteKey: h.linearTeamKey, remoteName: h.linearTeamName }))
+      );
+    }
+  }, [projectId]);
+
   useEffect(() => {
     (async () => {
       const me = await authMe();
@@ -334,27 +364,29 @@ export default function RequirementsPage() {
       const initialSource: Source = connected.length === 1 ? connected[0] : "all";
       setSource(initialSource);
       await loadTickets(initialSource, 0, "", {});
+      if (initialSource !== "all") void refreshHistory(initialSource);
       await Promise.all([refreshLinkedKeys(), refreshSummary()]);
       getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       setLoading(false);
     })();
-  }, [projectId, loadTickets, refreshLinkedKeys, refreshSummary, router]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, router]);
 
   useEffect(() => {
-    if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter });
-  }, [source, page, search, typeFilter, statusFilter, coverageFilter, loadTickets, loading]);
+    if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
+  }, [source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, loading]);
 
   // Pull the freshly synced tickets in on the active -> settled edge only. Reloading on every
   // poll tick would refetch the whole list every two seconds for the length of the run.
   const syncWasActiveRef = useRef(false);
   useEffect(() => {
     if (syncWasActiveRef.current && !anySyncActive) {
-      void loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter });
+      void loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
       void refreshSummary();
       void refreshLinkedKeys();
+      if (source !== "all") void refreshHistory(source);
     }
     syncWasActiveRef.current = anySyncActive;
-  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, loadTickets, refreshSummary, refreshLinkedKeys]);
+  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshHistory]);
 
   function handleSourceChange(next: Source) {
     setSource(next);
@@ -365,6 +397,9 @@ export default function RequirementsPage() {
     setStatusFilter("");
     setCoverageFilter("");
     setExpandedId(null);
+    setHistoricalRemoteId(null);
+    setSourceHistory([]);
+    if (next !== "all") void refreshHistory(next);
   }
 
   // Fires the runs and returns; the ticket list is refreshed by the effect below when the last
@@ -520,6 +555,21 @@ export default function RequirementsPage() {
               >
                 Manage
               </Link>
+            )}
+            {source !== "all" && sourceHistory.length > 0 && (
+              <select
+                value={historicalRemoteId ?? ""}
+                onChange={(e) => { setPage(0); setHistoricalRemoteId(e.target.value || null); }}
+                title="Tickets are never deleted when a mapping changes — switch here to browse a previously linked source."
+                className="h-9 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--foreground)] outline-none"
+              >
+                <option value="">Current source</option>
+                {sourceHistory.map((h) => (
+                  <option key={h.remoteId} value={h.remoteId}>
+                    Previously: {h.remoteKey} — {h.remoteName}
+                  </option>
+                ))}
+              </select>
             )}
             <Link
               href={`/projects/${projectId}/knowledge-base`}

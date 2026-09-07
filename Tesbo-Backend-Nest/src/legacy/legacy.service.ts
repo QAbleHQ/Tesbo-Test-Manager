@@ -8396,6 +8396,7 @@ export class LegacyService implements OnModuleInit {
            connected_by = EXCLUDED.connected_by,
            auth_method = 'oauth',
            personal_token_identifier = NULL,
+           disconnected_at = NULL,
            updated_at = now()
          RETURNING id, external_id, site_url`,
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
@@ -8433,6 +8434,7 @@ export class LegacyService implements OnModuleInit {
          connected_by = EXCLUDED.connected_by,
          auth_method = 'oauth',
          personal_token_identifier = NULL,
+         disconnected_at = NULL,
          updated_at = now()
        RETURNING id, site_url`,
       [workspace.id, String(org.id || ""), `https://linear.app/${org.urlKey}`, encryptSecret(accessToken), encryptSecret(String(token.refresh_token || "")), expiresAt, userId || null]
@@ -8444,10 +8446,30 @@ export class LegacyService implements OnModuleInit {
     const p = assertIntegrationProvider(provider);
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
-    // Settle any in-flight sync before the DELETE's cascade touches the same rows the sync
-    // processor may be concurrently writing (see failActiveRunsForConnection's own comment).
+    // Settle any in-flight sync before touching the connection, so the sync processor isn't
+    // concurrently writing to a run this same disconnect is about to invalidate.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
-    await this.db.query("DELETE FROM integration_connections WHERE organization_id = $1 AND provider = $2", [workspace.id, p]);
+    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
+    // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
+    // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
+    // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
+    // live credentials (so it can't be used even if some path forgets to check disconnected_at),
+    // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
+    // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
+    await this.db.transaction(async (client) => {
+      await client.query(
+        "UPDATE integration_connections SET disconnected_at = now(), access_token = '', refresh_token = '', updated_at = now() WHERE organization_id = $1 AND provider = $2",
+        [workspace.id, p]
+      );
+      await client.query(
+        `UPDATE ${mappingsTable} SET enabled = false
+         WHERE enabled = true AND ${connectionColumn} = (
+           SELECT id FROM integration_connections WHERE organization_id = $1 AND provider = $2
+         )`,
+        [workspace.id, p]
+      );
+    });
     return { disconnected: true };
   }
 
@@ -8502,12 +8524,22 @@ export class LegacyService implements OnModuleInit {
    */
   private async jiraStatusForProject(projectId: string) {
     const connection = await this.getJiraConnection(projectId, false);
-    if (!connection) return { connected: false, connectedProjects: [] };
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
     const projects = await this.db.query(
       `SELECT id, jira_project_id, jira_project_key, jira_project_name, created_at
        FROM jira_project_mappings
        WHERE project_id = $1 AND enabled = true
        ORDER BY jira_project_key`,
+      [projectId]
+    );
+    // Every Jira project this Tesbo project has ever been linked to (never deleted, only disabled)
+    // — lets the UI offer a "previously linked" source picker instead of that history being
+    // reachable only by direct DB inspection.
+    const history = await this.db.query(
+      `SELECT id, jira_project_id, jira_project_key, jira_project_name, created_at
+       FROM jira_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
       [projectId]
     );
     return {
@@ -8518,7 +8550,8 @@ export class LegacyService implements OnModuleInit {
       tokenExpiresAt: connection.token_expires_at,
       connectedBy: connection.connected_by,
       createdAt: connection.created_at,
-      connectedProjects: projects.rows.map(toCamel)
+      connectedProjects: projects.rows.map(toCamel),
+      history: history.rows.map(toCamel)
     };
   }
 
@@ -8650,6 +8683,19 @@ export class LegacyService implements OnModuleInit {
     const search = String(query.search || "").trim();
     const filters = ["project_id = $1"];
     const values: any[] = [projectId];
+    // No remoteId: scope to whatever's *currently* mapped, so a project that has ever been
+    // switched to a different Jira project doesn't mix the two together (this was the bug).
+    // An explicit remoteId (from the mapping "history" list) opts into browsing one specific past
+    // mapping's tickets instead.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(
+        `mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`
+      );
+    }
     if (search) {
       values.push(`%${search}%`);
       filters.push(`(jira_issue_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
@@ -8749,7 +8795,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async getIntegrationConnection(organizationId: string, provider: IntegrationProvider, refresh: boolean): Promise<Body | null> {
-    const res = await this.db.query("SELECT * FROM integration_connections WHERE organization_id = $1 AND provider = $2", [organizationId, provider]);
+    // disconnected_at IS NULL: a soft-disconnected row (integrationDisconnect) still exists so its
+    // historical tickets/mappings stay intact, but must read as "not connected" everywhere.
+    const res = await this.db.query(
+      "SELECT * FROM integration_connections WHERE organization_id = $1 AND provider = $2 AND disconnected_at IS NULL",
+      [organizationId, provider]
+    );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
     if (!refresh || new Date(connection.token_expires_at).getTime() > Date.now() + 60_000) return connection;
@@ -8842,12 +8893,22 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
     const connection = await this.getIntegrationConnection(organizationId, "linear", false);
-    if (!connection) return { connected: false, connectedProjects: [] };
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
     const teams = await this.db.query(
-      `SELECT id, linear_team_id, linear_team_key, linear_team_name, created_at
+      `SELECT id, linear_team_id, linear_team_key, linear_team_name, entity_type, created_at
        FROM linear_project_mappings
        WHERE project_id = $1 AND enabled = true
        ORDER BY linear_team_key`,
+      [projectId]
+    );
+    // Every Linear team/project this Tesbo project has ever been linked to (never deleted, only
+    // disabled) — lets the UI offer a "previously linked" source picker instead of that history
+    // being reachable only by direct DB inspection.
+    const history = await this.db.query(
+      `SELECT id, linear_team_id, linear_team_key, linear_team_name, entity_type, created_at
+       FROM linear_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
       [projectId]
     );
     return {
@@ -8857,7 +8918,8 @@ export class LegacyService implements OnModuleInit {
       tokenExpiresAt: connection.token_expires_at,
       connectedBy: connection.connected_by,
       createdAt: connection.created_at,
-      connectedProjects: teams.rows.map(toCamel)
+      connectedProjects: teams.rows.map(toCamel),
+      history: history.rows.map(toCamel)
     };
   }
 
@@ -8992,6 +9054,17 @@ export class LegacyService implements OnModuleInit {
     const search = String(query.search || "").trim();
     const filters = ["project_id = $1"];
     const values: any[] = [projectId];
+    // See jiraTickets' identical comment: default scope is the currently mapped team/project only;
+    // remoteId opts into a specific past mapping from the "history" list instead.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(
+        `mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`
+      );
+    }
     if (search) {
       values.push(`%${search}%`);
       filters.push(`(linear_issue_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
@@ -9033,13 +9106,17 @@ export class LegacyService implements OnModuleInit {
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
-      FROM jira_tickets WHERE project_id = $1
+      FROM jira_tickets
+      WHERE project_id = $1
+        AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
       UNION ALL
       SELECT id, 'linear' AS source, linear_issue_key AS key, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
-      FROM linear_tickets WHERE project_id = $1
+      FROM linear_tickets
+      WHERE project_id = $1
+        AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
     `;
     const filters: string[] = [];
     const values: any[] = [projectId];
@@ -9076,17 +9153,26 @@ export class LegacyService implements OnModuleInit {
   // lists are derived from what's actually in the project rather than a hardcoded set.
   async requirementsSummary(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const bySource = async (table: "jira_tickets" | "linear_tickets", keyColumn: "jira_issue_key" | "linear_issue_key") => {
+    const bySource = async (
+      table: "jira_tickets" | "linear_tickets",
+      keyColumn: "jira_issue_key" | "linear_issue_key",
+      mappingTable: "jira_project_mappings" | "linear_project_mappings",
+      remoteIdColumn: "jira_project_id" | "linear_team_id"
+    ) => {
+      // Same "scope to the currently mapped entity only" rule as jiraTickets/linearTickets/
+      // allTickets, so the stat strip and filter dropdowns never count tickets from a
+      // since-switched-away-from project/team alongside the current one.
+      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)`;
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
                   SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND t.deleted_at IS NULL
                 ))::int AS covered
-         FROM ${table} src WHERE project_id = $1`,
+         FROM ${table} src WHERE ${scope}`,
         [projectId]
       );
-      const types = await this.db.query(`SELECT DISTINCT issue_type FROM ${table} WHERE project_id = $1 AND issue_type <> '' ORDER BY issue_type`, [projectId]);
-      const statuses = await this.db.query(`SELECT DISTINCT status FROM ${table} WHERE project_id = $1 AND status <> '' ORDER BY status`, [projectId]);
+      const types = await this.db.query(`SELECT DISTINCT issue_type FROM ${table} WHERE ${scope} AND issue_type <> '' ORDER BY issue_type`, [projectId]);
+      const statuses = await this.db.query(`SELECT DISTINCT status FROM ${table} WHERE ${scope} AND status <> '' ORDER BY status`, [projectId]);
       const total = stats.rows[0]?.total ?? 0;
       const covered = stats.rows[0]?.covered ?? 0;
       return {
@@ -9098,8 +9184,8 @@ export class LegacyService implements OnModuleInit {
       };
     };
     const [jira, linear] = await Promise.all([
-      bySource("jira_tickets", "jira_issue_key"),
-      bySource("linear_tickets", "linear_issue_key")
+      bySource("jira_tickets", "jira_issue_key", "jira_project_mappings", "jira_project_id"),
+      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id")
     ]);
     const all = {
       total: jira.total + linear.total,
