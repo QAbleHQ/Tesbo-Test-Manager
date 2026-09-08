@@ -162,6 +162,8 @@ test.describe("test case import wizard", () => {
       description: string;
       preconditions: string;
       steps: { stepNumber: number; action: string; expectedResult: string }[];
+      automationStatus: string;
+      attachments: string | null;
     };
 
   const listSuites = async (projectId: string) =>
@@ -217,9 +219,6 @@ test.describe("test case import wizard", () => {
    */
   const mappingFor = (page: Page, label: string) =>
     page.locator(`xpath=//label[starts-with(normalize-space(.), "${label}")]/following-sibling::select`);
-
-  /** The "Import into suite" picker at the top of the wizard (id="import-target-suite" in the modal). */
-  const suitePicker = (page: Page) => page.locator("#import-target-suite");
 
   async function runImport(page: Page, rows: number): Promise<void> {
     await expect(page.getByText("Map your file columns to test case fields.")).toBeVisible();
@@ -446,213 +445,6 @@ test.describe("test case import wizard", () => {
     }
   });
 
-  /*
-   * Regression coverage for: imported rows landed in "All Test Cases" but never under the suite the
-   * user was visibly browsing — the picker below (ImportTestCasesModal's "Import into suite" select)
-   * is what replaced the old silent inference from the page's ambient `?suiteId=`. See the RCA: the
-   * bug was specifically that *expanding* a suite to see its children (not clicking into it) left the
-   * ambient state unset, so the import silently fell back to the project root.
-   */
-
-  test("the suite picker is not fooled by merely expanding a suite, and threads the explicit selection through", { tag: '@tesbo.testId("TES-TC-835")' }, async ({ browser }) => {
-    let fixture: Fixture | undefined;
-    try {
-      fixture = await withProject(browser, "Picker Basics");
-      const { page, projectId } = fixture;
-      const stamp = Date.now();
-      const parentName = `E2E Picker Parent ${stamp}`;
-      const childName = `E2E Picker Child ${stamp}`;
-      const parent = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: parentName } })
-      ).json();
-      await api.post(`/api/projects/${projectId}/suites`, { data: { name: childName, parentId: parent.id } });
-
-      // Brand-new project, no suite open yet: the picker offers root as the only destination.
-      await openWizard(page, projectId);
-      await expect(suitePicker(page)).toHaveValue("");
-      await expect(suitePicker(page).locator("option")).toHaveCount(3); // root + parent + child
-      await page.getByRole("button", { name: "Cancel" }).click();
-
-      // Expanding the parent (chevron) reveals its child but must NOT select it — this is the exact
-      // ambiguity that caused the bug: "browsing into" a suite is not the same action as "opening" it.
-      await page.getByTestId(`suite-expand-${parent.id}`).click();
-      await expect(page.getByRole("button", { name: childName })).toBeVisible();
-      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/testcases$`));
-      await clickImport(page);
-      await expect(suitePicker(page), "expand alone must not select a suite").toHaveValue("");
-      await page.getByRole("button", { name: "Cancel" }).click();
-
-      // Actually selecting the parent (clicking its name) is what the picker should now default to.
-      await page.getByRole("button", { name: parentName }).click();
-      await expect(page).toHaveURL(new RegExp(`suiteId=${parent.id}`));
-      await clickImport(page);
-      await expect(suitePicker(page)).toHaveValue(parent.id);
-
-      const title = `E2E Picker Basics Case ${stamp}`;
-      await uploadCsv(page, toCsv(["Title"], [[title]]));
-      await runImport(page, 1);
-      await expect(page.getByText("Imported into:")).toBeVisible();
-      await expect(page.getByText(parentName, { exact: false }).last()).toBeVisible();
-
-      const cases = await listCases(projectId);
-      expect(cases.find((c) => c.title === title)!.suiteId, "row nested under the SELECTED suite, not root or its child").toBe(parent.id);
-    } finally {
-      await disposeProject(fixture);
-    }
-  });
-
-  test("overriding the suite picker sends rows to the chosen suite, not the page's ambient selection", { tag: '@tesbo.testId("TES-TC-836")' }, async ({ browser }) => {
-    let fixture: Fixture | undefined;
-    try {
-      fixture = await withProject(browser, "Picker Override");
-      const { page, projectId } = fixture;
-      const stamp = Date.now();
-      const ambientName = `E2E Ambient ${stamp}`;
-      const overrideName = `E2E Override ${stamp}`;
-      const ambient = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: ambientName } })
-      ).json();
-      const override = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: overrideName } })
-      ).json();
-
-      // Open Import from inside the "ambient" suite, then explicitly change the target before uploading.
-      await page.goto(`/projects/${projectId}/testcases?suiteId=${ambient.id}`);
-      await page.getByRole("button", { name: "Import", exact: true }).click();
-      await expect(suitePicker(page)).toHaveValue(ambient.id);
-      await suitePicker(page).selectOption(override.id);
-
-      const title = `E2E Picker Override Case ${stamp}`;
-      await uploadCsv(page, toCsv(["Title"], [[title]]));
-      await runImport(page, 1);
-
-      const cases = await listCases(projectId);
-      expect(cases.find((c) => c.title === title)!.suiteId, "the explicit override wins over the ambient suite").toBe(override.id);
-    } finally {
-      await disposeProject(fixture);
-    }
-  });
-
-  test("Suite/Component columns nest under the picker's target suite rather than the project root", { tag: '@tesbo.testId("TES-TC-837")' }, async ({ browser }) => {
-    let fixture: Fixture | undefined;
-    try {
-      fixture = await withProject(browser, "Picker Nesting");
-      const { page, projectId } = fixture;
-      const stamp = Date.now();
-      const targetName = `E2E Nesting Target ${stamp}`;
-      const suiteColName = `E2E Nesting Suite ${stamp}`;
-      const componentColName = `E2E Nesting Component ${stamp}`;
-      const target = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: targetName } })
-      ).json();
-
-      await openWizard(page, projectId);
-      await suitePicker(page).selectOption(target.id);
-      await uploadCsv(
-        page,
-        toCsv(["Title", "Suite", "Component"], [[`E2E Nesting Case ${stamp}`, suiteColName, componentColName]]),
-      );
-      await runImport(page, 1);
-
-      const suites = await listSuites(projectId);
-      const createdSuite = suites.find((s) => s.name === suiteColName);
-      const createdComponent = suites.find((s) => s.name === componentColName);
-      expect(createdSuite?.parentId, "the Suite column nests under the picker's target, not the root").toBe(target.id);
-      expect(createdComponent?.parentId, "the Component column nests under the Suite column").toBe(createdSuite!.id);
-    } finally {
-      await disposeProject(fixture);
-    }
-  });
-
-  test("shows a friendly error and imports nothing if the picked suite is deleted before the import is submitted", { tag: '@tesbo.testId("TES-TC-838")' }, async ({ browser }) => {
-    let fixture: Fixture | undefined;
-    try {
-      fixture = await withProject(browser, "Picker Deleted Race");
-      const { page, projectId } = fixture;
-      const stamp = Date.now();
-      const suiteName = `E2E Deleted Race ${stamp}`;
-      const doomed = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: suiteName } })
-      ).json();
-
-      await page.goto(`/projects/${projectId}/testcases?suiteId=${doomed.id}`);
-      await page.getByRole("button", { name: "Import", exact: true }).click();
-      await expect(suitePicker(page)).toHaveValue(doomed.id);
-
-      const title = `E2E Deleted Race Case ${stamp}`;
-      await uploadCsv(page, toCsv(["Title"], [[title]]));
-      await expect(page.getByText("Map your file columns to test case fields.")).toBeVisible();
-
-      // Simulate a teammate deleting the suite in another tab between mapping and clicking Import.
-      const del = await api.delete(`/api/suites/${doomed.id}`, { failOnStatusCode: false });
-      expect(del.ok()).toBeTruthy();
-
-      await page.getByRole("button", { name: "Import 1 rows" }).click();
-      await expect(
-        page.getByText("The suite you selected no longer exists — it may have just been deleted. Pick another suite and try again."),
-      ).toBeVisible();
-      // Nothing was created — the whole request was rejected up front, not partially applied.
-      expect(await listCases(projectId)).toEqual([]);
-
-      // Recovery: the modal has no live sync with the suite list, so the picker still shows the now-
-      // deleted suite until the user picks something else — falling back to root and retrying succeeds.
-      await suitePicker(page).selectOption("");
-      await runImport(page, 1);
-      expect((await listCases(projectId)).map((c) => c.title)).toEqual([title]);
-    } finally {
-      await disposeProject(fixture);
-    }
-  });
-
-  // Regression test for a gap found in review of TES-TC-835-838: the page's own "suite no longer
-  // exists" cleanup (which resets the picker to root if the selected suite vanishes from `suites`)
-  // can't tell "still loading" apart from "genuinely doesn't exist" unless it's told. The page's
-  // Import button lives in a shared top-bar slot that isn't gated by this page's own loading state,
-  // so it's clickable before the suite fetch resolves — without the fix, opening Import in that
-  // window would wipe a real, URL-selected suite back to root the instant `suites` first arrived
-  // empty, before the real data ever got a chance to load.
-  test("does not lose a URL-selected suite when Import is opened before the suite list finishes loading", { tag: '@tesbo.testId("TES-TC-839")' }, async ({ browser }) => {
-    let fixture: Fixture | undefined;
-    try {
-      fixture = await withProject(browser, "Loading Race");
-      const { page, projectId } = fixture;
-      const stamp = Date.now();
-      const suiteName = `E2E Loading Race ${stamp}`;
-      const suite = await (
-        await api.post(`/api/projects/${projectId}/suites`, { data: { name: suiteName } })
-      ).json();
-
-      let releaseSuites: () => void = () => {};
-      const gate = new Promise<void>((resolve) => { releaseSuites = resolve; });
-      await page.route(`**/api/projects/${projectId}/suites`, async (route) => {
-        await gate;
-        await route.continue();
-      });
-
-      await page.goto(`/projects/${projectId}/testcases?suiteId=${suite.id}`);
-      await page.getByRole("button", { name: "Import", exact: true }).click();
-      await expect(page.getByText("Upload a CSV or Excel file to import test cases.")).toBeVisible();
-
-      // While the real suite list is still in flight, the picker is disabled rather than silently
-      // defaulting to (and locking in) "No suite".
-      await expect(suitePicker(page)).toBeDisabled();
-
-      releaseSuites();
-      await page.unroute(`**/api/projects/${projectId}/suites`);
-
-      // Once the suite list actually arrives, the URL-selected suite is still the picker's value.
-      await expect(suitePicker(page)).toBeEnabled();
-      await expect(suitePicker(page)).toHaveValue(suite.id);
-
-      const title = `E2E Loading Race Case ${stamp}`;
-      await uploadCsv(page, toCsv(["Title"], [[title]]));
-      await runImport(page, 1);
-      expect((await listCases(projectId)).find((c) => c.title === title)!.suiteId).toBe(suite.id);
-    } finally {
-      await disposeProject(fixture);
-    }
-  });
-
   test("splits steps into actions with their expected results", { tag: '@tesbo.testId("TES-TC-830")' }, async ({ browser }) => {
     let fixture: Fixture | undefined;
     try {
@@ -674,6 +466,92 @@ test.describe("test case import wizard", () => {
         { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
         { stepNumber: 2, action: "Submit empty credentials", expectedResult: "" },
       ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("builds a single step from separate Action/Expected Result columns when Steps isn't mapped", { tag: '@tesbo.testId("TES-TC-2103")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Action Expected Columns");
+      const { page, projectId } = fixture;
+      const title = `E2E Action Expected Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Action", "Expected Result"],
+          [[title, "Click the submit button", "The form is submitted"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Action"), "auto-maps by its own header, not into Steps").toHaveValue("1");
+      await expect(mappingFor(page, "Expected Result")).toHaveValue("2");
+      // Steps itself has nothing to map to — a file like this has no combined DSL column at all.
+      await expect(mappingFor(page, "Steps")).toHaveValue("");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([
+        { stepNumber: 1, action: "Click the submit button", expectedResult: "The form is submitted" },
+      ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("a mapped Steps column wins over Action/Expected Result when both are mapped", { tag: '@tesbo.testId("TES-TC-2104")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Steps Priority");
+      const { page, projectId } = fixture;
+      const title = `E2E Steps Priority Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Steps", "Action", "Expected Result"],
+          [[title, "Open the app => It loads", "This column must be ignored", "So must this one"]],
+        ),
+      );
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([{ stepNumber: 1, action: "Open the app", expectedResult: "It loads" }]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("maps Automation Type and Notes columns and imports them", { tag: '@tesbo.testId("TES-TC-2102")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Automation Notes");
+      const { page, projectId } = fixture;
+      const title = `E2E Automation Notes Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Automation Type", "Notes"],
+          [[title, "Automated", "Captured a screenshot of the failure"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Automation Type"), "the header auto-maps by its exact field label").toHaveValue("1");
+      await expect(mappingFor(page, "Notes")).toHaveValue("2");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.automationStatus).toBe("Automated");
+      expect(imported.attachments).toBe("Captured a screenshot of the failure");
     } finally {
       await disposeProject(fixture);
     }

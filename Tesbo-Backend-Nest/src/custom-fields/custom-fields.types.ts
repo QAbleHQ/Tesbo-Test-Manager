@@ -23,7 +23,9 @@ export const RESERVED_TESTCASE_HEADERS = new Set(
     "status",
     "suite",
     "component",
-    "estimatedDuration"
+    "estimatedDuration",
+    "automationStatus",
+    "attachments"
   ].map((h) => h.toLowerCase().replace(/[^a-z0-9]+/g, ""))
 );
 
