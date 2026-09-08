@@ -9847,61 +9847,110 @@ export class LegacyService implements OnModuleInit {
     const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
 
-    // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
-    // only stable identifier for the turn: seeding off the message text instead would give two
-    // identical messages in one session the same deterministic trace id, collapsing both turns
-    // into one trace.
-    const userMessageRes = await this.db.query(
-      `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status)
-       VALUES ($1,$2,$3,'user',$4,'sent')
+    // Claim this session for the duration of one turn. Without this, two overlapping requests for
+    // the same session (a double-click on "yes", a client retry after a slow reply, two open tabs)
+    // each read the same active_plan/history state independently and each write their own assistant
+    // message — a real race, not a hypothetical one, and it directly compounds the "confirmed twice,
+    // staged twice" shape of this bug. The claim is a single atomic UPDATE...RETURNING (same idiom as
+    // continueZyraChatMessage's checkpoint claim below), not a held transaction/advisory lock — the
+    // rest of this turn makes a live LLM call that can legitimately take up to
+    // ZYRA_GENERATE_TIMEOUT_MS, and holding a DB lock or connection across that would serialize every
+    // concurrent turn on this LLM call's latency for no benefit. The 5-minute staleness window means
+    // a request that crashed before reaching the `finally` release below self-heals instead of
+    // locking the session out permanently — no manual unlock, no deadlock possible.
+    const claimRes = await this.db.query(
+      `UPDATE zyra_chat_sessions SET processing_since = now()
+       WHERE id = $1 AND (processing_since IS NULL OR processing_since < now() - interval '5 minutes')
        RETURNING id`,
-      [sessionId, projectId, uid, message]
+      [sessionId]
     );
-    const userMessageId = String(userMessageRes.rows[0]?.id ?? "");
-
-    // A paused plan (stopped by the user, or paused after a batch failure) can be picked
-    // back up with a plain "continue" — resolved before any other decision-making so it
-    // doesn't get treated as a normal analytical question.
-    const existingPlan = sessionRes.rows[0].active_plan as Body | undefined;
-    if (existingPlan?.status === "paused" && this.isZyraResumeIntent(message)) {
-      const resumed = await this.resumeZyraChatPlan(projectId, uid, sessionId);
-      const lastMessage = resumed.messages[resumed.messages.length - 1];
-      return { message: lastMessage, session: resumed };
+    if (!claimRes.rows[0]) {
+      throw new ConflictException({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." });
     }
-    // Any other new message supersedes an in-flight or paused plan — the background loop
-    // checks the plan id before each batch and stops once it no longer matches (see
-    // continueZyraChatPlan).
-    if (existingPlan) {
-      await this.db.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
-    }
-    // A genuinely new message means the user has moved on from whatever turn timed out earlier in
-    // this session — expire any dangling checkpoint so Continue can no longer resolve to context this
-    // message has superseded. Deliberately scoped to 'timed_out' only: a checkpoint a concurrent
-    // continueZyraChatMessage call has already claimed (status 'resuming') is left alone so that
-    // in-flight resume can still finish and post its own message — see continueZyraChatMessage.
-    await this.db.query("UPDATE zyra_chat_messages SET status = 'expired' WHERE session_id = $1 AND status = 'timed_out'", [sessionId]);
-
-    const decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId);
-    const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
-    const activity = [
-      { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
-      ...applied.activity
-    ];
-    const testcases = applied.testcases.length ? applied.testcases : decision.testcases;
-    if (decision.actionType === "create" && applied.testcases.length) {
-      const ids = applied.testcases.map((tc) => tc.id).filter(Boolean);
-      await this.db.query(
-        "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
-        [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
+    try {
+      // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
+      // only stable identifier for the turn: seeding off the message text instead would give two
+      // identical messages in one session the same deterministic trace id, collapsing both turns
+      // into one trace.
+      const userMessageRes = await this.db.query(
+        `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status)
+         VALUES ($1,$2,$3,'user',$4,'sent')
+         RETURNING id`,
+        [sessionId, projectId, uid, message]
       );
+      const userMessageId = String(userMessageRes.rows[0]?.id ?? "");
+
+      // A paused plan (stopped by the user, or paused after a batch failure) can be picked
+      // back up with a plain "continue" — resolved before any other decision-making so it
+      // doesn't get treated as a normal analytical question.
+      const existingPlan = sessionRes.rows[0].active_plan as Body | undefined;
+      if (existingPlan?.status === "paused" && this.isZyraResumeIntent(message)) {
+        const resumed = await this.resumeZyraChatPlan(projectId, uid, sessionId);
+        const lastMessage = resumed.messages[resumed.messages.length - 1];
+        return { message: lastMessage, session: resumed };
+      }
+      // Any other new message supersedes an in-flight or paused plan — the background loop
+      // checks the plan id before each batch and stops once it no longer matches (see
+      // continueZyraChatPlan).
+      if (existingPlan) {
+        await this.db.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
+      }
+      // A genuinely new message means the user has moved on from whatever turn timed out earlier in
+      // this session — expire any dangling checkpoint so Continue can no longer resolve to context this
+      // message has superseded. Deliberately scoped to 'timed_out' only: a checkpoint a concurrent
+      // continueZyraChatMessage call has already claimed (status 'resuming') is left alone so that
+      // in-flight resume can still finish and post its own message — see continueZyraChatMessage.
+      await this.db.query("UPDATE zyra_chat_messages SET status = 'expired' WHERE session_id = $1 AND status = 'timed_out'", [sessionId]);
+
+      let decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId);
+      // Confirmation retry: a turn that answered with zero operations despite the user's message
+      // being an unmistakable "yes" to a proposal/offer the immediately preceding turn made is the
+      // exact failure shape behind this bug (Basecamp 10231190735 and its recurrences) — the model
+      // had a clear confirmation to act on and didn't. This never overrides a model decision that
+      // already produced operations; it only re-asks, once, when the model plainly didn't.
+      if (decision.actionType === "answer" && !decision.operations.length && this.zyraIsConfirmation(message)) {
+        const lastAssistantRes = await this.db.query(
+          `SELECT content, action_type, testcases FROM zyra_chat_messages
+           WHERE session_id = $1 AND project_id = $2 AND role = 'assistant'
+           ORDER BY created_at DESC LIMIT 1`,
+          [sessionId, projectId]
+        );
+        const pending = lastAssistantRes.rows[0] ? this.zyraPendingConfirmation(lastAssistantRes.rows[0]) : null;
+        if (pending) {
+          const hint = pending.kind === "proposal"
+            ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
+            : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
+          const fired = retried.operations.length > 0;
+          const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
+          decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
+        }
+      }
+      const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
+      const activity = [
+        { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
+        ...applied.activity
+      ];
+      const testcases = applied.testcases.length ? applied.testcases : decision.testcases;
+      if (decision.actionType === "create" && applied.testcases.length) {
+        const ids = applied.testcases.map((tc) => tc.id).filter(Boolean);
+        await this.db.query(
+          "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
+          [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
+        );
+      }
+      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
+      const title = this.compactTitle(message);
+      await this.db.query(
+        "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
+        [sessionId, projectId, title]
+      );
+      return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+    } finally {
+      // Best-effort: if this fails to run at all (process crash), the 5-minute staleness window
+      // above is what actually prevents a permanent lockout, not this line.
+      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [sessionId]).catch(() => {});
     }
-    const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
-    const title = this.compactTitle(message);
-    await this.db.query(
-      "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
-      [sessionId, projectId, title]
-    );
-    return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
   }
 
   /*
@@ -10108,7 +10157,14 @@ export class LegacyService implements OnModuleInit {
     // before the drafting call timed out. Its presence skips the router call entirely — that is the
     // whole point of resuming rather than restarting: the routing decision the user already waited
     // for is not repeated.
-    resume?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } }
+    resume?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } },
+    // Set only by sendZyraChatMessage's confirmation retry: a single extra call made when a turn
+    // routed `answer` with zero operations despite the transcript showing a clear, just-confirmed
+    // PROPOSAL or OFFER from the immediately preceding assistant turn (see zyraPendingConfirmation).
+    // Injected as one more system-prompt line rather than a new code path, so the model — not a
+    // keyword matcher — still decides what to actually emit; this only tells it plainly that this
+    // specific turn already had its confirmation and should stop describing the action and do it.
+    confirmationHint?: string
   ): Promise<ZyraChatDecision> {
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
@@ -10151,8 +10207,13 @@ export class LegacyService implements OnModuleInit {
     // wrong thing on this message") maps to its trace by recomputing the id from the row — no
     // trace_id column and no backfill. Falls back to the session only for the callers that have
     // no message row of their own.
+    // The trace id is deterministic from messageId (see startZyraTurn), so the confirmation-retry
+    // call in sendZyraChatMessage — which re-invokes this method with the SAME userMessageId — needs
+    // a distinct suffix here, or its span would collide with the first call's span under the same
+    // fixed spanId rather than landing as its own observation.
+    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
     const trace = await startZyraTurn({
-      messageId: userMessageId || `${sessionId}:${Date.now()}`,
+      messageId: confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId,
       sessionId,
       projectId,
       userId,
@@ -10267,7 +10328,8 @@ export class LegacyService implements OnModuleInit {
       "",
       "Recent chat (each assistant turn is annotated with what it actually wrote to the repository —",
       "trust the annotation over the wording of the reply, which may describe testcases that were never saved):",
-      this.zyraTranscript(chronologicalHistory)
+      this.zyraTranscript(chronologicalHistory),
+      confirmationHint ? `\nCRITICAL — this turn already has its confirmation: ${confirmationHint} Do not choose 'answer' again for this message; emit the operation(s).` : ""
     ].join("\n");
 
     // Resuming a turn whose drafting call already timed out once the router had resolved it — skip
@@ -10662,7 +10724,20 @@ export class LegacyService implements OnModuleInit {
         activity.push({ actor: "agent", title: "Drafted testcase for review", detail: draftPayload.title || "Untitled test case", createdAt: new Date().toISOString() });
       } else if ((op.type === "update" || op.type === "archive") && (op.testcaseId || op.externalId)) {
         const found = await this.findProjectTestcase(projectId, op.testcaseId, op.externalId);
-        if (!found) continue;
+        if (!found) {
+          // Same failure shape move_to_suite already guards below: bailing with a bare `continue`
+          // leaves no activity entry and no signal that this op was dropped, while the model's reply
+          // can still describe it as done. reconcileZyraReply's partial-count branch already scans
+          // activity for "could not|skipped" (see zyraMoveBreakdownSuffix's sibling below), so this
+          // reason surfaces in the chat reply with no other change needed.
+          activity.push({
+            actor: "agent",
+            title: `Could not ${op.type} testcase`,
+            detail: `${op.testcaseId || op.externalId} does not exist in this project, so there was nothing to ${op.type}.`,
+            createdAt: new Date().toISOString()
+          });
+          continue;
+        }
         const fields = op.type === "archive" ? { status: "Archived" } : this.sanitizeZyraUpdateFields(op.fields || {});
         const row = await this.getTestCase(found.id);
         // Staged only — the real row is untouched until zyraSave applies `fields` to it.
@@ -13471,14 +13546,7 @@ export class LegacyService implements OnModuleInit {
   private zyraTranscript(history: Body[]): string {
     if (!history.length) return "No prior chat.";
     return history.map((row) => {
-      let content = String(row?.content || "");
-      const trimmed = content.trim();
-      if (trimmed.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          if (typeof parsed?.reply === "string" && parsed.reply) content = parsed.reply;
-        } catch { /* not JSON — use as-is */ }
-      }
+      const content = this.zyraRowContent(row);
       if (String(row?.role) !== "assistant") return `user: ${content}`;
       const rows = normalizeJsonArray(row?.testcases);
       const saved = rows.filter((item) => item && (item as Body).id);
@@ -13497,24 +13565,16 @@ export class LegacyService implements OnModuleInit {
        * Naming the action type the turn was routed as gives the confirmation an antecedent. It is a
        * fact we already store (zyra_chat_messages.action_type) rather than another rule in the
        * prompt, and it is the model — not a keyword matcher — that decides what "yes" refers to.
+       *
+       * pending (below) is the same PROPOSAL/OFFER classification zyraConfirmationHint uses to decide
+       * whether to retry a turn server-side — one predicate, two consumers, so the annotation shown
+       * to the model and the condition that triggers a retry can never silently drift apart.
        */
-      const actionType = String(row?.action_type || row?.actionType || "").trim();
-      const proposal =
-        !saved.length && (actionType === "create" || actionType === "archive" || actionType === "update")
-          ? ` [this turn was routed as '${actionType}' but wrote nothing — treat it as a PROPOSAL still awaiting the user's go-ahead; if their next message confirms it, carry it out now]`
-          : "";
-      /*
-       * The proposal annotation above only fires for a turn routed create/archive/update — but a gap
-       * analysis routes `answer` (correctly: it changed nothing) and can still end in an offer —
-       * "Would you like me to generate test cases for these gaps?" — that the very next "yes" is
-       * meant to confirm. That routing decision has no antecedent flag at all today, unlike the
-       * create/archive/update case, so it depends entirely on the model re-reading this turn's prose
-       * — which the prompt already asks it to do (see the "confirmation of an offer" rule), but with
-       * no structural nudge behind it the way the proposal annotation gives the other three action
-       * types. This gives it the same nudge, without a keyword router deciding what the confirmation
-       * means — that stays the model's call.
-       */
-      const offer = !saved.length && !proposal && LegacyService.ZYRA_OFFER_PATTERN.test(content)
+      const pending = this.zyraPendingConfirmation(row);
+      const proposal = pending?.kind === "proposal"
+        ? ` [this turn was routed as '${pending.actionType}' but wrote nothing — treat it as a PROPOSAL still awaiting the user's go-ahead; if their next message confirms it, carry it out now]`
+        : "";
+      const offer = pending?.kind === "offer"
         ? " [this turn ended with an offer to act — if the user's next message confirms it (yes, go ahead, please do, do it), work out what was offered and carry it out now]"
         : "";
       const note = saved.length
@@ -13524,11 +13584,56 @@ export class LegacyService implements OnModuleInit {
     }).join("\n");
   }
 
+  // Shared by zyraTranscript (row content shown to the model) and zyraPendingConfirmation (row
+  // content matched against ZYRA_OFFER_PATTERN) — a stored assistant row's `content` column is
+  // sometimes the raw model JSON rather than the extracted reply string, so both callers need the
+  // same unwrap.
+  private zyraRowContent(row: Body): string {
+    const content = String(row?.content || "");
+    const trimmed = content.trim();
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed?.reply === "string" && parsed.reply) return parsed.reply;
+      } catch { /* not JSON — use as-is */ }
+    }
+    return content;
+  }
+
+  // One predicate, two consumers (see the comment on the `pending` const in zyraTranscript above):
+  // the annotation shown to the model, and the confirmation-retry check in sendZyraChatMessage that
+  // decides whether a turn that answered with zero operations had something concrete to confirm.
+  // Returns null for a user row, a row that actually persisted something, or a row that neither
+  // proposed nor offered anything — i.e. there is nothing for a later "yes" to resolve against.
+  private zyraPendingConfirmation(row: Body): { kind: "proposal" | "offer"; actionType?: string; content: string } | null {
+    if (String(row?.role) !== "assistant") return null;
+    const rows = normalizeJsonArray(row?.testcases);
+    if (rows.some((item) => item && (item as Body).id)) return null;
+    const content = this.zyraRowContent(row);
+    const actionType = String(row?.action_type || row?.actionType || "").trim();
+    if (actionType === "create" || actionType === "archive" || actionType === "update") {
+      return { kind: "proposal", actionType, content };
+    }
+    if (LegacyService.ZYRA_OFFER_PATTERN.test(content)) return { kind: "offer", content };
+    return null;
+  }
+
   // Deliberately narrow: an offer phrase immediately followed by an action verb and a question mark
   // within a short window, not "any sentence with a question mark" (which would flag ordinary
   // clarifying questions like "which module should this cover?" as something to auto-confirm).
   private static readonly ZYRA_OFFER_PATTERN =
     /\b(would you like me to|do you want me to|want me to|should i|shall i)\b[^.!?\n]{0,120}\b(generat|creat|add|writ|draft|archiv|remov|delet|updat|chang|mov|assign|organi[sz]e)\w*\b[^.!?\n]{0,120}\?/i;
+
+  // Whole-message match on the TRIMMED user text (not a substring anywhere in a longer message) —
+  // "yes" confirms; "yes but not the archive one" does not, because it isn't only "yes". This gates
+  // the confirmation retry in sendZyraChatMessage, which re-calls the model, so it is held to the
+  // same false-positive discipline as ZYRA_OFFER_PATTERN above, just anchored rather than windowed.
+  private static readonly ZYRA_AFFIRMATIVE_PATTERN =
+    /^(yes please|yes|yeah|yep|yup|sure|ok|okay|confirmed?|correct|go ahead|do it|please do it|please do|do that|please proceed|proceed|sounds good|go for it)[\s.!]*$/i;
+
+  private zyraIsConfirmation(message: string): boolean {
+    return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim());
+  }
 
   // Resolve the router's suite against reality: an id only counts if the suite exists, a name is
   // matched case-insensitively to an existing suite, and a genuinely new name is passed through to
@@ -13900,6 +14005,33 @@ export class LegacyService implements OnModuleInit {
     return `\n\n📦 **Moved to suites (actual):** ${parts.join(" · ")} — ${total} test case(s) total.`;
   }
 
+  // Shared by every branch of reconcileZyraReply below: a reply whose own prose falsely claims
+  // past-tense completion ("created", "saved", "archived"...) needs the same correction regardless
+  // of which action type the turn routed to. The `answer` branch needed this first (an answer
+  // changes nothing by definition, so any completion claim in it is necessarily false) — but a
+  // create/update/archive turn's own decision.reply can make the identical false claim even when
+  // reviewHint below correctly discloses staging, and until now nothing checked that branch's own
+  // wording at all, only appended a footer after it.
+  private zyraFalseCompletionBanner(reply: string): string {
+    if (!LegacyService.ZYRA_COMPLETION_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
+    return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
+  }
+
+  // Narrower than ZYRA_COMPLETION_CLAIM above, and used only where proposedCount > 0 (see the
+  // create/update/archive branch of reconcileZyraReply): "drafted"/"staged"/"proposed"/"generated"
+  // are exactly the words the system prompt tells the model to use for something that really is
+  // staged ("CRITICAL: ... your WORDING must match reality: describe what you produce as
+  // DRAFTED/PROPOSED and staged for review"), so a reply using them while proposedCount > 0 is
+  // telling the truth — ZYRA_COMPLETION_CLAIM would misfire on every ordinary "I drafted 3 test
+  // cases" reply. Only a verb implying the row already exists in the repository is false here.
+  private static readonly ZYRA_PERSISTED_CLAIM =
+    /\b(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b/i;
+
+  private zyraPersistedClaimBanner(reply: string): string {
+    if (!LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
+    return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
+  }
+
   private reconcileZyraReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations): string {
     const moveSuffix = this.zyraMoveBreakdownSuffix(applied.moveBreakdown);
     /*
@@ -13916,20 +14048,8 @@ export class LegacyService implements OnModuleInit {
      * The correction goes FIRST, before the model's prose, so the two are read in the right order.
      */
     if (decision.actionType === "answer") {
-      if (
-        !applied.testcases.length &&
-        LegacyService.ZYRA_COMPLETION_CLAIM.test(decision.reply) &&
-        !LegacyService.ZYRA_ALREADY_DISCLOSED.test(decision.reply)
-      ) {
-        return [
-          "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.",
-          "",
-          "Ask me to go ahead and I'll make the change and show you the affected test cases.",
-          "",
-          decision.reply
-        ].join("\n") + moveSuffix;
-      }
-      return decision.reply + moveSuffix;
+      const banner = !applied.testcases.length ? this.zyraFalseCompletionBanner(decision.reply) : "";
+      return banner ? [banner, "", decision.reply].join("\n") + moveSuffix : decision.reply + moveSuffix;
     }
     // Creating an empty suite touches no testcases and is still a complete success.
     if (decision.operations.length && decision.operations.every((op) => op.type === "create_suite")) return decision.reply + moveSuffix;
@@ -13958,6 +14078,15 @@ export class LegacyService implements OnModuleInit {
       ? `\n\n📝 ${proposedCount} of them ${proposedCount === 1 ? "is" : "are"} staged for your review — open the review panel to select, edit, or discard, then Save to add ${proposedCount === 1 ? "it" : "them"} to the repository. Nothing has been written to the repository yet.`
       : "";
 
+    // Gated on proposedCount, not just the reply text: move_to_suite/create_suite write immediately
+    // (applied.testcases rows carry a real id, no "proposed-" action), so a reply claiming "saved"/
+    // "moved" there is true and must pass through untouched — only a turn with something actually
+    // still staged can make the reply's completion claim false. And zyraPersistedClaimBanner, not
+    // zyraFalseCompletionBanner, because a staged turn legitimately says "drafted"/"staged" — see
+    // that method's own comment for why the two banners can't share one regex.
+    const banner = proposedCount > 0 ? this.zyraPersistedClaimBanner(decision.reply) : "";
+    const bannerPrefix = banner ? banner + "\n\n" : "";
+
     if (appliedCount < requested) {
       // The reasons are already in the activity log this turn; naming them here keeps the chat itself
       // truthful instead of making the user open the activity panel to find out.
@@ -13965,7 +14094,7 @@ export class LegacyService implements OnModuleInit {
         .filter((entry) => /could not|skipped/i.test(String(entry.title || "")))
         .map((entry) => String(entry.detail || entry.title))
         .filter(Boolean);
-      return [
+      return bannerPrefix + [
         `⚠️ ${appliedCount} of ${requested} test case operation(s) were drafted for review.` +
           (reasons.length ? ` ${reasons.join(" ")}` : " The rest were not drafted."),
         "",
@@ -13973,7 +14102,7 @@ export class LegacyService implements OnModuleInit {
       ].join("\n") + moveSuffix;
     }
 
-    return decision.reply + reviewHint + moveSuffix;
+    return bannerPrefix + decision.reply + reviewHint + moveSuffix;
   }
 
   private aiUnavailableForZyraChat(existingCount: number, reason = "AI generation was not available for this chat request."): ZyraChatDecision {
