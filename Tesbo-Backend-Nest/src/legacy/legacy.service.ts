@@ -10829,14 +10829,8 @@ export class LegacyService implements OnModuleInit {
           ? await this.getProjectSuite(projectId, op.suiteId)
           : await this.resolveOrCreateSuiteByName(projectId, String(op.suiteName));
         if (!suite) continue;
-        // Recorded even when nothing matches below, so a suite the model claimed to move cases into
-        // still shows up in the breakdown as 0 rather than silently disappearing from it.
-        const existingMoveSuite = moveSuites.get(suite.id);
-        moveSuites.set(suite.id, {
-          suiteName: suite.name,
-          created: existingMoveSuite?.created || ("created" in suite && !!suite.created)
-        });
         let matchedAnything = false;
+        let patchedTotal = 0;
 
         // fromLastPlan can resolve to a batch that is still just staged drafts (the common case
         // right after a generation — "save them to <suite>"), to a batch that was already saved via
@@ -10854,7 +10848,6 @@ export class LegacyService implements OnModuleInit {
           // update here would actually do (resurrect an already-saved draft, duplicating it on the
           // next Save).
           const pendingBatches = await this.zyraPendingCreateBatches(projectId, sessionId);
-          let patchedTotal = 0;
           for (const batch of pendingBatches) {
             const patched = await this.patchZyraPendingBatchSuite(projectId, batch.reviewRequestId, suite.id);
             if (!patched) continue;
@@ -10895,6 +10888,22 @@ export class LegacyService implements OnModuleInit {
           }
           activity.push({ actor: "agent", title: `Moved ${movedIds.length} testcase(s) to suite`, detail: `${suite.name}${"created" in suite && suite.created ? " (created)" : ""}`, createdAt: new Date().toISOString() });
           await this.logProjectActivity(projectId, actorId, "zyra_moved_to_suite", "suite", suite.id, suite.name, { source: "zyra_chat", movedCount: movedIds.length, testcaseIds: movedIds, reason: op.reason || null });
+        }
+
+        // zyraMoveBreakdownSuffix's footer is DB-move ground truth ("Moved to suites (actual)") — it
+        // must never register a suite that was ONLY touched via the pending-draft patch above, or the
+        // footer reads "Suite: 0 (none matched)" directly alongside reviewHint's true "N staged for
+        // review, will be filed into Suite" for the very same turn, a self-contradiction of exactly
+        // the shape the 2026-09-02 moveBreakdown fix (see this doc's changelog) exists to prevent.
+        // Still registered at 0 when NOTHING matched either path, preserving the original "a suite
+        // the model claimed to move cases into must not silently disappear from the breakdown" intent
+        // for a genuine total failure.
+        if (targets.length || !matchedAnything) {
+          const existingMoveSuite = moveSuites.get(suite.id);
+          moveSuites.set(suite.id, {
+            suiteName: suite.name,
+            created: existingMoveSuite?.created || ("created" in suite && !!suite.created)
+          });
         }
 
         if (!matchedAnything) {

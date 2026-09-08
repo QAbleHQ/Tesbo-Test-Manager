@@ -744,6 +744,13 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
     expect(String(lastAssistant.content || ""), "the reply must not claim permanence for a still-unsaved draft").not.toContain("Nothing was saved");
     expect(String(lastAssistant.content || "")).toContain("staged for your review");
+    // A suite touched ONLY via the pending-draft patch must never appear in the DB-truth "Moved to
+    // suites (actual)" footer — moveTargetIds never got this suite's id (nothing was actually moved
+    // in the DB), so a naive "register every targeted suite" would read "Checkout: 0 (none matched)"
+    // directly next to the true "staged for your review" line above: a self-contradiction of exactly
+    // the shape the moveBreakdown footer exists to prevent, just reintroduced from a different angle.
+    expect(String(lastAssistant.content || ""), "a pending-only match must not also claim 'none matched' in the moveBreakdown footer").not.toContain("none matched");
+    expect(String(lastAssistant.content || "")).not.toContain("Moved to suites (actual)");
 
     // Prove the whole point of patching rather than ignoring: Save now actually lands the row in
     // the suite the follow-up message asked for, with no suiteId passed in the save call itself.
