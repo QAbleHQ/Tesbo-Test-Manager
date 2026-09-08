@@ -23,6 +23,8 @@ export type Currency = "usd" | "inr";
 export type BillingRequestContext = Pick<Request, "ip" | "headers">;
 
 export interface BillingInfo {
+  /** False when STRIPE_SECRET_KEY is unset — Stripe checkout/portal are unavailable. */
+  enabled: boolean;
   plan: "launch" | "pro";
   billingInterval: BillingInterval | null;
   status: string | null;
@@ -114,6 +116,14 @@ export class BillingService {
     }
   }
 
+  private requireStripeEnabled(): void {
+    if (!this.config.isStripeBillingEnabled) {
+      throw new ServiceUnavailableException({
+        error: "Stripe billing is not configured. Set STRIPE_SECRET_KEY (and price IDs) in .env to enable it."
+      });
+    }
+  }
+
   // Stripe SDK errors are plain Error subclasses, not NestJS HttpExceptions, so left
   // uncaught they all surface to the client as a generic "Internal server error" —
   // this turns them into a clear, appropriately-coded response instead.
@@ -134,6 +144,21 @@ export class BillingService {
   async getBillingInfo(userId: string | null | undefined): Promise<BillingInfo> {
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
+    // Stripe not configured: keep the settings page loadable, unlock Pro-gated UI, no Stripe calls.
+    if (!this.config.isStripeBillingEnabled) {
+      return {
+        enabled: false,
+        plan: "pro",
+        billingInterval: null,
+        status: null,
+        currentPeriodEnd: null,
+        cancelAtPeriodEnd: false,
+        paymentFailedAt: null,
+        graceEndsAt: null,
+        inGracePeriod: false,
+        limitsEnforced: false
+      };
+    }
     await this.reconcileDriftedPlan(workspace.id, uid);
     const res = await this.db.query(
       `SELECT plan, billing_interval, subscription_status, current_period_end, cancel_at_period_end,
@@ -146,6 +171,7 @@ export class BillingService {
     const graceEndsAt: string | null = row?.plan_grace_ends_at ?? null;
     const inGracePeriod = plan === "launch" && !!graceEndsAt && new Date(graceEndsAt).getTime() > Date.now();
     return {
+      enabled: true,
       plan,
       billingInterval: row?.billing_interval ?? null,
       status: row?.subscription_status ?? null,
@@ -266,6 +292,7 @@ export class BillingService {
     req: BillingRequestContext | undefined,
     requestedCurrency?: string
   ): Promise<BillingPricing> {
+    this.requireStripeEnabled();
     const lockedCurrency = await this.lockedCurrencyFor(userId);
     const eligibility = await this.resolveIndiaEligibility(userId, req, lockedCurrency);
     const currency = await this.resolveCurrency(req, requestedCurrency, lockedCurrency, eligibility.indiaEligible);
@@ -336,6 +363,7 @@ export class BillingService {
     req: BillingRequestContext | undefined,
     requestedCurrency?: string
   ): Promise<{ url: string }> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     this.requireOwner(workspace.role);
@@ -370,6 +398,7 @@ export class BillingService {
   }
 
   async createPortalSession(userId: string | null | undefined): Promise<{ url: string }> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     this.requireOwner(workspace.role);
@@ -391,6 +420,7 @@ export class BillingService {
   }
 
   async constructWebhookEvent(rawBody: Buffer | undefined, signature: string | undefined): Promise<Stripe.Event> {
+    this.requireStripeEnabled();
     if (!rawBody || !signature) throw new BadRequestException({ error: "Missing Stripe signature" });
     if (!this.config.stripeWebhookSecret) throw new BadRequestException({ error: "Stripe webhook secret is not configured" });
     try {
@@ -554,6 +584,7 @@ export class BillingService {
    * successfully would sit on the free plan until someone noticed.
    */
   async reconcileFromStripe(userId: string | null | undefined): Promise<BillingInfo> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     const res = await this.db.query<{ stripe_customer_id: string | null }>(
@@ -663,6 +694,7 @@ export class BillingService {
    * URLs it returns are what customers actually need for accounting.
    */
   async getInvoices(userId: string | null | undefined): Promise<BillingInvoice[]> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     const res = await this.db.query<{ stripe_customer_id: string | null }>(

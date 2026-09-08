@@ -202,6 +202,7 @@ export class PlanLimitsService {
   }
 
   async assertCanCreateProject(organizationId: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan, plan } = await this.getEntitlement(organizationId);
     const limit = PROJECT_LIMITS[effectivePlan];
     if (limit == null) return;
@@ -226,6 +227,7 @@ export class PlanLimitsService {
    * copy anything out, and resubscribing lifts the lock immediately.
    */
   async assertProjectWritable(organizationId: string, projectId: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     const limit = PROJECT_LIMITS[effectivePlan];
     if (limit == null) return;
@@ -263,6 +265,10 @@ export class PlanLimitsService {
     organizationId: string,
     incomingBytes: number
   ): Promise<{ allowed: boolean; reason: string | null; usedBytes: number; limitBytes: number }> {
+    if (!this.config.isStripeBillingEnabled) {
+      const used = await this.getStorageUsedBytes(organizationId);
+      return { allowed: true, reason: null, usedBytes: used, limitBytes: Number.MAX_SAFE_INTEGER };
+    }
     const { effectivePlan, plan } = await this.getEntitlement(organizationId);
     const limit = STORAGE_LIMITS_BYTES[effectivePlan];
     const used = await this.getStorageUsedBytes(organizationId);
@@ -348,6 +354,7 @@ export class PlanLimitsService {
   }
 
   async assertCustomFieldsEnabled(organizationId: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan !== "pro") {
       throw new ForbiddenException({
@@ -357,6 +364,7 @@ export class PlanLimitsService {
   }
 
   async assertIntegrationAllowed(organizationId: string, provider: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan === "pro" || LAUNCH_ALLOWED_INTEGRATIONS.has(provider)) return;
     throw new ForbiddenException({
@@ -375,11 +383,24 @@ export class PlanLimitsService {
   }
 
   async getUsageSummary(organizationId: string): Promise<PlanUsageSummary> {
-    const { plan, effectivePlan, inGracePeriod, graceEndsAt } = await this.getEntitlement(organizationId);
     const [projectCount, storageUsedBytes] = await Promise.all([
       this.getProjectCount(organizationId),
       this.getStorageUsedBytes(organizationId)
     ]);
+    // Without Stripe configured there is no paid upgrade path — do not enforce Launch ceilings.
+    if (!this.config.isStripeBillingEnabled) {
+      return {
+        plan: "pro",
+        projectCount,
+        projectLimit: null,
+        storageUsedBytes,
+        storageLimitBytes: Number.MAX_SAFE_INTEGER,
+        inGracePeriod: false,
+        graceEndsAt: null,
+        supportContactEmail: this.config.supportContactEmail
+      };
+    }
+    const { plan, effectivePlan, inGracePeriod, graceEndsAt } = await this.getEntitlement(organizationId);
     return {
       plan,
       projectCount,

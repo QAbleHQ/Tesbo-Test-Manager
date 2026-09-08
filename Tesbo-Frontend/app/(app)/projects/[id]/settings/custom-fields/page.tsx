@@ -73,7 +73,7 @@ export default function CustomFieldsSettingsPage() {
     ? normalizeRole(projectMembers.find((m) => m.userId === currentUserId)?.role ?? "qa_engineer")
     : "qa_engineer";
   const canManage = currentUserRole === "owner" || currentUserRole === "manager";
-  const isPro = billingInfo?.plan === "pro";
+  const isPro = billingInfo?.enabled === false || billingInfo?.plan === "pro";
 
   const header = (
     <PageHeader
