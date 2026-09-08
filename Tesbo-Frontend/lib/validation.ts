@@ -205,6 +205,12 @@ export const EVIDENCE_ALLOWED_EXTENSIONS = [
 
 export const EVIDENCE_MAX_FILE_SIZE = 25 * 1024 * 1024;
 
+// Mirrors the FilesInterceptor("files", 10, ...) maxCount on the bug- and execution-attachment
+// routes in legacy.controller.ts: Multer rejects a request carrying more files than this outright,
+// so a batch larger than the limit is split into multiple sequential requests (see
+// uploadBugAttachments in lib/api.ts) rather than sent as one request that the server refuses.
+export const EVIDENCE_MAX_FILES_PER_REQUEST = 10;
+
 // The picker's `accept` list. Advisory only — a viewer can always switch the dialog to "All files",
 // which is why validateEvidenceFile still runs on everything that comes back.
 export const EVIDENCE_ACCEPT_ATTRIBUTE = EVIDENCE_ALLOWED_EXTENSIONS.map((ext) => `.${ext}`).join(",");

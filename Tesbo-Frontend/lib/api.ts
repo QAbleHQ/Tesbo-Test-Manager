@@ -1,4 +1,5 @@
 import { readStoredValue } from "./storage";
+import { EVIDENCE_MAX_FILES_PER_REQUEST } from "./validation";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -1186,7 +1187,10 @@ export interface SuiteNode {
   name: string;
   position: number;
   createdAt: string;
+  /** Direct children of this suite only. For the tree badge / rollup math, use recursiveTestCaseCount instead. */
   testCaseCount: number;
+  /** This suite's own test cases plus every descendant suite's, at any depth. */
+  recursiveTestCaseCount: number;
 }
 
 export async function listSuites(projectId: string): Promise<SuiteNode[]> {
@@ -1231,6 +1235,8 @@ export async function listTestCases(
     limit?: number;
     offset?: number;
     suiteId?: string;
+    /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+    includeDescendants?: boolean;
     status?: string;
     priority?: string;
     type?: string;
@@ -1246,6 +1252,7 @@ export async function listTestCases(
   if (params?.limit != null) sp.set("limit", String(params.limit));
   if (params?.offset != null) sp.set("offset", String(params.offset));
   if (params?.suiteId) sp.set("suiteId", params.suiteId);
+  if (params?.includeDescendants) sp.set("includeDescendants", "true");
   if (params?.status) sp.set("status", params.status);
   if (params?.priority) sp.set("priority", params.priority);
   if (params?.type) sp.set("type", params.type);
@@ -2215,6 +2222,10 @@ export async function updateExecution(cycleId: string, executionId: string, data
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
+export async function bulkAssignExecutions(cycleId: string, data: { executionIds: string[]; assigneeId: string | null }): Promise<{ updated: number; assigneeId: string | null }> {
+  return api(`/api/cycles/${cycleId}/executions/bulk-assign`, { method: "POST", body: data });
+}
+
 export async function getExecutionAutomationReport(cycleId: string, executionId: string): Promise<ExecutionAutomationReport> {
   return api<ExecutionAutomationReport>(`/api/cycles/${cycleId}/executions/${executionId}/automation-report`);
 }
@@ -2425,19 +2436,39 @@ export async function removeBugLink(bugId: string, linkId: string): Promise<BugI
   return api(`/api/bugs/${bugId}/links/${linkId}`, { method: "DELETE" });
 }
 
-export async function uploadBugAttachments(projectId: string, bugId: string, files: File[]): Promise<{ list: BugAttachment[]; total: number }> {
-  const formData = new FormData();
-  for (const file of files) formData.append("files", file);
-  const res = await fetch(`${API_BASE}/api/projects/${projectId}/bugs/${bugId}/attachments`, {
-    method: "POST",
-    credentials: "include",
-    body: formData,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((err as { error?: string }).error || String(res.status));
+/**
+ * Uploads bug attachments in batches of EVIDENCE_MAX_FILES_PER_REQUEST — the server rejects a
+ * request carrying more files than that outright, so a batch larger than the limit is split into
+ * multiple sequential requests against the same bug rather than sent as one request that fails.
+ * `onBatchUploaded` fires after each batch persists, so a caller can drop those files from
+ * whatever "still needs uploading" state it retries from, instead of re-sending files that already
+ * made it to the bug if a later batch fails.
+ */
+export async function uploadBugAttachments(
+  projectId: string,
+  bugId: string,
+  files: File[],
+  onBatchUploaded?: (batch: File[]) => void
+): Promise<{ list: BugAttachment[]; total: number }> {
+  const list: BugAttachment[] = [];
+  for (let i = 0; i < files.length; i += EVIDENCE_MAX_FILES_PER_REQUEST) {
+    const batch = files.slice(i, i + EVIDENCE_MAX_FILES_PER_REQUEST);
+    const formData = new FormData();
+    for (const file of batch) formData.append("files", file);
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/bugs/${bugId}/attachments`, {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error((err as { error?: string }).error || String(res.status));
+    }
+    const batchResult = (await res.json()) as { list: BugAttachment[]; total: number };
+    list.push(...batchResult.list);
+    onBatchUploaded?.(batch);
   }
-  return res.json();
+  return { list, total: list.length };
 }
 
 export async function deleteBugAttachment(attachmentId: string): Promise<void> {
