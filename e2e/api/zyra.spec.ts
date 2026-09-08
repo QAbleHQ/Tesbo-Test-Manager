@@ -8,6 +8,7 @@ import {
   type RbacTenant,
 } from "../utils/rbac-tenant";
 import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
+import { parseSseEvents } from "../utils/sse";
 
 /*
  * Zyra — the AI agent surface: agent state, connection test, settings, chat sessions and messages,

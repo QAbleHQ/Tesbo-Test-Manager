@@ -59,7 +59,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "create_testcase",
       description:
-        "Create a test case in the token's project. Required: title. Optional: suiteId, description, preconditions, steps (array), testData, priority, severity, type, automationStatus, component, status. The write is attributed to the Tesbo MCP agent actor.",
+        "Create a test case in the token's project. Required: title. Optional: suiteId, description, preconditions, steps (array of {stepNumber, action, expectedResult} — expectedResult belongs on the step it applies to, not in the overall description), testData, priority, severity, type, automationStatus, component, status. The write is attributed to the Tesbo MCP agent actor.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -68,7 +68,17 @@ export function buildMcpTools(): McpTool[] {
           suiteId: { type: "string" },
           description: { type: "string" },
           preconditions: { type: "string" },
-          steps: { type: "array" },
+          steps: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                stepNumber: { type: "number" },
+                action: { type: "string" },
+                expectedResult: { type: "string" }
+              }
+            }
+          },
           testData: { type: "string" },
           priority: { type: "string" },
           severity: { type: "string" },
@@ -82,7 +92,13 @@ export function buildMcpTools(): McpTool[] {
       },
       handler: async (args, ctx) => {
         requireString(args, "title");
-        return ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, args);
+        // An MCP caller gets no schema enforcement (inputSchema is advisory only — see
+        // mcp.service.ts), so its `steps` can drift onto synonym keys the editor doesn't read
+        // (e.g. "expected" instead of "expectedResult") exactly the way Zyra's chat/task-board
+        // output can. Reuse the same tolerant mapping Zyra's write paths already run through
+        // rather than storing whatever shape the caller happened to send.
+        const body = Array.isArray(args.steps) ? { ...args, steps: ctx.legacy.safeSteps(args.steps) } : args;
+        return ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, body);
       }
     },
     {
