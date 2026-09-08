@@ -4,6 +4,7 @@ import {
   Controller,
   Delete,
   Get,
+  MessageEvent,
   NotFoundException,
   NotImplementedException,
   Param,
@@ -13,16 +14,19 @@ import {
   Query,
   Req,
   Res,
+  Sse,
   UploadedFiles,
   UseInterceptors
 } from "@nestjs/common";
 import { FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
 import ExcelJS from "exceljs";
+import { map, Observable, of } from "rxjs";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
+import { ZyraProgressService } from "./zyra-progress.service";
 
 const TESTCASE_EXPORT_BASE_HEADERS = [
   "externalId",
@@ -100,8 +104,17 @@ const REPORT_VIEW_SHEET_NAMES: Record<ReportExportView, string> = {
 export class LegacyController {
   constructor(
     private readonly legacy: LegacyService,
-    private readonly customFields: CustomFieldsService
+    private readonly customFields: CustomFieldsService,
+    private readonly zyraProgress: ZyraProgressService
   ) {}
+
+  // Kill switch for the whole SSE progress-narration side-channel (see zyra-progress.service.ts's
+  // file header) — flip ZYRA_PROGRESS_STREAMING_ENABLED=false to disable it without a revert, with
+  // the guarantee that a disabled feature never registers a turn, never opens a stream, and the
+  // POST route it rides alongside behaves exactly as it did before this feature existed.
+  private zyraProgressStreamingEnabled(): boolean {
+    return process.env.ZYRA_PROGRESS_STREAMING_ENABLED !== "false";
+  }
 
   private csvEscape(value: unknown): string {
     const text = String(value ?? "");
@@ -1228,13 +1241,63 @@ export class LegacyController {
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
-  sendZyraChatMessage(
+  async sendZyraChatMessage(
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Param("sessionId") sessionId: string,
     @Body() body: Record<string, any>
   ) {
-    return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+    // turnId is a caller-supplied, purely optional, opaque correlation id — it exists only to let
+    // an ALREADY-open GET .../turns/:turnId/events stream narrate this same request while it runs.
+    // It changes nothing about what this route does or returns: a caller that omits it (every
+    // existing caller, every API-token/MCP integration) gets exactly today's behavior, byte for
+    // byte, because `onStage` below is then simply undefined and sendZyraChatMessage never calls it.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    if (!turnId) {
+      return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const onStage = this.zyraProgress.stageEmitter(turnId, owner);
+    try {
+      const result = await this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body, onStage);
+      this.zyraProgress.complete(turnId, result);
+      return result;
+    } catch (err) {
+      // Deliberately generic — the real error detail still reaches the client via this same
+      // request's own (unmodified) HTTP error response; the progress channel only needs to tell an
+      // open SSE stream to stop waiting, never to explain why.
+      this.zyraProgress.completeWithError(turnId, "This turn did not complete.");
+      throw err;
+    }
+  }
+
+  // Read-only, best-effort progress narration for one turn of the route above — see
+  // zyra-progress.service.ts's file header for the full design and the guarantees this route
+  // cannot violate (it can only ever narrate the POST above, never affect it). Same
+  // project/session ownership check as every other Zyra route (zyraChatSession already does both
+  // requireProjectAccess and "this session belongs to this project" in one call) — a turnId is an
+  // unguessable v4 UUID, but that is not the same as authorized, so this still runs before ever
+  // touching the in-memory turn registry.
+  @Sse("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/turns/:turnId/events")
+  async zyraTurnEvents(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Param("turnId") turnId: string
+  ): Promise<Observable<MessageEvent>> {
+    await this.legacy.zyraChatSession(projectId, req.userId, sessionId);
+    if (!this.zyraProgressStreamingEnabled()) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const subject = this.zyraProgress.subscribe(turnId, owner);
+    if (!subject) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    return subject.pipe(map((event) => ({ data: event })));
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")

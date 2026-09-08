@@ -937,6 +937,19 @@ export interface ZyraChatTestcaseRow {
   draftIndex?: number;
   /** The ai_generation_requests id this proposal is staged under — only set on a "proposed-*" row. */
   reviewRequestId?: string;
+  /**
+   * Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * generated case — resolved and verified server-side (see sanitizeZyraSourceRefs in
+   * legacy.service.ts), never a raw, unverified model claim. Always present, [] when the case was
+   * not grounded in any specific source.
+   */
+  sourceRefs?: ZyraSourceRef[];
+}
+
+export interface ZyraSourceRef {
+  type: "knowledge_document" | "knowledge_file" | "jira_ticket" | "testcase" | "bug";
+  id: string;
+  title: string;
 }
 
 /**

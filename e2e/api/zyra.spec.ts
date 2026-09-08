@@ -7,6 +7,7 @@ import {
   rbacSuiteSkipReason,
   type RbacTenant,
 } from "../utils/rbac-tenant";
+import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
 
 /*
  * Zyra — the AI agent surface: agent state, connection test, settings, chat sessions and messages,
@@ -1765,5 +1766,240 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     // never 3 (one removal silently overwritten) or corrupted.
     const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
     expect(stored, "a race between two discards lost one of the removals").toHaveLength(2);
+  });
+});
+
+/*
+ * Per-test-case citations — which knowledge-base doc, Jira ticket, existing test case, or bug
+ * actually informed a generated test case. Drives a REAL "create" turn through the fake AI provider
+ * (utils/fake-ai-server.ts, same tool zyra-chat-consistency.spec.ts's "confirmation retry" block
+ * uses) so the assertions are against sanitizeZyraSourceRefs/zyraSourceRefIndex actually running,
+ * not a hand-built decision object.
+ *
+ * A fresh tenant per describe block (not the "zyra" one above) so the knowledge-base recency
+ * snapshot and the bug/Jira relevance match are deterministic — a project that starts genuinely
+ * empty guarantees this test's one seeded KB doc is "KB 1" and its one seeded bug is "BUG 1", with
+ * nothing left over from another test to shift the ordering.
+ */
+test.describe("zyra chat — citations (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-citations");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM bugs WHERE project_id = ${project};`);
+    exec(`DELETE FROM jira_tickets WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E citations fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  /** Seeds one KB doc, one Jira ticket, one existing test case, and one bug — all sharing a
+   *  distinctive term ("biometric") so zyraSearchTerms/relevance-matching finds every one of them
+   *  from a single chat message, and none of the stopword-filtered common QA vocabulary. */
+  async function seedCitableSources(): Promise<{ kbDocId: string; jiraKey: string; testcaseExternalId: string; bugId: string }> {
+    const kbRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title: "Biometric login policy", content: "Face ID and fingerprint sign-in must fall back to password after 3 failures." },
+      failOnStatusCode: false,
+    });
+    expect(kbRes.status(), `seeding the KB doc — ${await kbRes.text()}`).toBe(201);
+    const kbDocId = (await kbRes.json()).id;
+
+    exec(
+      `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+        `VALUES (${literal(tenant!.organizationId)}, 'jira', 'e2e-zyra-citations', 'https://e2e-zyra-citations.invalid', 'e2e', '', now() + interval '365 days') ` +
+        `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+    );
+    const connectionId = scalar(`SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    const jiraKey = `CIT-${Date.now() % 100000}`;
+    exec(
+      `INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status) ` +
+        `VALUES (${literal(tenant!.mainProjectId)}, ${literal(connectionId)}, ${literal(jiraKey)}, ${literal(jiraKey)}, 'Biometric login rollout', 'Story', 'Open');`,
+    );
+
+    const tcRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: "Biometric login happy path" },
+      failOnStatusCode: false,
+    });
+    expect(tcRes.status(), `seeding the existing test case — ${await tcRes.text()}`).toBe(201);
+    const testcaseExternalId = (await tcRes.json()).externalId;
+
+    const bugRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: "Biometric login crashes on iOS 18", description: "Face ID prompt closes the app instead of falling back to password." },
+      failOnStatusCode: false,
+    });
+    expect(bugRes.status(), `seeding the bug — ${await bugRes.text()}`).toBe(201);
+    const bugId = (await bugRes.json()).id;
+
+    return { kbDocId, jiraKey, testcaseExternalId, bugId };
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  async function lastAssistantTestcases(sessionId: string): Promise<Array<Record<string, unknown>>> {
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(session.status()).toBe(200);
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    return lastAssistant.testcases as Array<Record<string, unknown>>;
+  }
+
+  test("ZYR-A-63 a generated test case cites the exact KB doc, Jira ticket, test case, and bug it was shown, and drops a fabricated label", async () => {
+    await allocateFakeAiKey();
+    const { kbDocId, jiraKey, testcaseExternalId, bugId } = await seedCitableSources();
+    const sessionId = await newSession("E2E citations");
+
+    // Router: routes to create.
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case for biometric login.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    // Generation: cites all four real labels PLUS one the model invented — GENERATED-999 was never
+    // offered in this turn's prompt (see zyraSourceRefIndex), so it must not survive sanitization.
+    ai.queueReply({
+      drafts: [{
+        title: "Biometric login falls back to password after repeated failures",
+        preconditions: "A device with Face ID/fingerprint enrolled is on the login screen.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Fail biometric auth 3 times", expectedResult: "The app falls back to the password field" }]),
+        testData: "",
+        expectedSummary: "Password fallback appears after 3 failed biometric attempts.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: ["KB 1", jiraKey, testcaseExternalId, "BUG 1", "GENERATED-999"],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a test case for biometric login, using the knowledge base, Jira, existing test cases, and bugs." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+    expect(ai.requests.length, "router + generation").toBe(2);
+
+    const testcases = await lastAssistantTestcases(sessionId);
+    expect(testcases).toHaveLength(1);
+    const sourceRefs = testcases[0].sourceRefs as Array<{ type: string; id: string; title: string }>;
+
+    expect(sourceRefs, "the fabricated label must be dropped, never surfaced").toHaveLength(4);
+    expect(sourceRefs).toEqual(
+      expect.arrayContaining([
+        { type: "knowledge_document", id: kbDocId, title: "Biometric login policy" },
+        { type: "jira_ticket", id: jiraKey, title: "Biometric login rollout" },
+        { type: "testcase", id: testcaseExternalId, title: "Biometric login happy path" },
+        { type: "bug", id: bugId, title: "Biometric login crashes on iOS 18" },
+      ]),
+    );
+    expect(sourceRefs.some((ref) => ref.id === "GENERATED-999" || ref.id === "999")).toBe(false);
+
+    // The same citations must survive from the staged draft through to what's persisted for save —
+    // applyZyraChatOperations resolves them once and stores them on the proposal itself.
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`));
+    expect(stored[0].draft.sourceRefs).toHaveLength(4);
+  });
+
+  test("ZYR-A-64 a turn grounded only in a matching bug is not reported as ungrounded", async () => {
+    await allocateFakeAiKey();
+    const bugRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: "Checkout timeout on slow networks", description: "The checkout button spins forever on a throttled connection." },
+      failOnStatusCode: false,
+    });
+    expect(bugRes.status(), `seeding the bug — ${await bugRes.text()}`).toBe(201);
+    const bugId = (await bugRes.json()).id;
+    const sessionId = await newSession("E2E bug-only grounding");
+
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case for the checkout timeout.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout completes on a throttled connection",
+        preconditions: "The network is throttled to a slow connection.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Complete checkout on a throttled connection", expectedResult: "Checkout finishes without an indefinite spinner" }]),
+        testData: "",
+        expectedSummary: "Checkout does not hang indefinitely on a slow connection.",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: ["BUG 1"],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a test case covering the checkout timeout bug." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    const testcases = await lastAssistantTestcases(sessionId);
+    expect(testcases).toHaveLength(1);
+    const sourceRefs = testcases[0].sourceRefs as Array<{ type: string; id: string; title: string }>;
+    expect(sourceRefs).toEqual([{ type: "bug", id: bugId, title: "Checkout timeout on slow networks" }]);
+
+    // The ungrounded disclaimer only fires when NOTHING (KB, Jira, bug) matched — a bug-only match
+    // must read as grounded, not "written from general practice".
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    expect(String(lastAssistant.content || "")).not.toContain("I don't have anything about this in the project's knowledge base");
   });
 });

@@ -90,7 +90,11 @@ export type RbacTenantKind =
   // Bug assignee membership checks ("[Test Runs] Unable to assign test cases for execution"). Needs
   // a user who is in the workspace but not a project member (guest) to prove the assignee has to be
   // a member of the bug's own project, the same rule executions.assignee_id already enforces.
-  | "bugs-assignee";
+  | "bugs-assignee"
+  // Per-test-case citations (which KB doc/Jira ticket/testcase/bug informed a generated case).
+  // Its own, genuinely-empty tenant because the KB-recency and bug/Jira relevance ordering these
+  // tests assert on ("KB 1", "BUG 1") is only deterministic in a project nothing else has seeded.
+  | "zyra-citations";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

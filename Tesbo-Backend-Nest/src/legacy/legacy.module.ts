@@ -9,11 +9,12 @@ import { LegacyController } from "./legacy.controller";
 import { LegacyService } from "./legacy.service";
 import { SignupController } from "./signup.controller";
 import { SignupService } from "./signup.service";
+import { ZyraProgressService } from "./zyra-progress.service";
 
 @Module({
   imports: [AuthModule, StorageModule, RagModule, IntegrationSyncModule, PlanLimitsModule, forwardRef(() => CustomFieldsModule)],
   controllers: [LegacyController, SignupController],
-  providers: [LegacyService, SignupService],
+  providers: [LegacyService, SignupService, ZyraProgressService],
   exports: [LegacyService]
 })
 export class LegacyModule {}

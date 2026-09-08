@@ -142,15 +142,39 @@ const ZYRA_AGENT_NAMES = [ZYRA_AGENT_NAME, LEGACY_ZYRA_AGENT_NAME];
 /** Frontend treats this path as "no custom logo" and renders the theme-aware lockup. */
 const DEFAULT_BRAND_LOGO_URL = "/brand/tesbo-logo-horizontal.svg";
 
+// Optional, best-effort progress narration for one chat turn (see zyra-progress.service.ts). Every
+// function below that accepts one defaults it to undefined and calls it with `?.()` — a caller that
+// never passes one gets behavior byte-for-byte identical to before this existed. Never awaited,
+// never allowed to change control flow: it only ever describes what the turn is already doing.
+type ZyraOnStage = (stage: string, meta?: Record<string, unknown>) => void;
+
+// A resolved citation attached to a generated test case — which knowledge-base doc/file, Jira
+// ticket, existing test case, or bug actually informed it. Resolved once from the exact in-memory
+// context objects gathered for the turn (see generateZyraChatTestcasesWithAi), never re-queried
+// later, so a citation is a historical record of what informed generation even if the source is
+// later edited or deleted.
+type ZyraSourceRef = { type: "knowledge_document" | "knowledge_file" | "jira_ticket" | "testcase" | "bug"; id: string; title: string };
+
+// Optional per-item citation identity, carried alongside the plain {title, content} shape the
+// prompt already flattens knowledge into. RAG retrieval already populates this (see
+// RetrievedKnowledgeItem in rag.types.ts); the recency/folder-name fallback paths populate it too
+// (knowledgeSnapshot/knowledgeFolderSnapshot) so every knowledge item Zyra can read carries an
+// identity a generated testcase can cite back to.
+type ZyraKnowledgeCitation = { sourceType: "document" | "file"; sourceId: string };
+
 type ZyraGenerationInput = {
   story: string;
   context: string;
   acceptanceCriteria: string;
   feedback: string;
-  knowledge: Array<{ title: string; content: string }>;
+  knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
   jira: Array<{ key: string; summary: string; description: string }>;
   linear: Array<{ key: string; summary: string; description: string }>;
   existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string }>;
+  // Optional and defaulted to [] wherever built, so every existing caller of the functions this
+  // type feeds (zyraGenerationContext, generateZyraChatTestcasesWithAi, ...) keeps compiling and
+  // behaving unchanged if it never learns about bugs.
+  bugs?: Array<{ id: string; title: string; description: string; status: string; priority: string }>;
   requestedCount: number;
   testcaseRange?: string; // "minimum" | "1-10" | "10-30" | "all"
 };
@@ -3148,8 +3172,8 @@ export class LegacyService implements OnModuleInit {
        (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
         priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
         automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28)
+        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29::jsonb)
        RETURNING *`,
       [
         projectId,
@@ -3179,7 +3203,8 @@ export class LegacyService implements OnModuleInit {
         body.linearUrl || null,
         body.attachments || null,
         uid,
-        this.normalizeEstimatedDuration(body.estimatedDuration)
+        this.normalizeEstimatedDuration(body.estimatedDuration),
+        JSON.stringify(body.sourceRefs || [])
       ]
     );
     const row = res.rows[0];
@@ -3881,7 +3906,8 @@ export class LegacyService implements OnModuleInit {
        status=COALESCE($20,status), jira_issue_key=COALESCE($21,jira_issue_key), jira_url=COALESCE($22,jira_url),
        linear_issue_key=COALESCE($23,linear_issue_key), linear_url=COALESCE($24,linear_url),
        attachments=COALESCE($25,attachments), updated_by=$26,
-       estimated_duration=COALESCE($27,estimated_duration), updated_at=now()
+       estimated_duration=COALESCE($27,estimated_duration),
+       source_refs=COALESCE($28::jsonb,source_refs), updated_at=now()
        WHERE id=$1 AND deleted_at IS NULL
        RETURNING *`,
       [
@@ -3911,7 +3937,11 @@ export class LegacyService implements OnModuleInit {
         body.linearUrl ?? null,
         body.attachments ?? null,
         uid,
-        this.normalizeEstimatedDuration(body.estimatedDuration)
+        this.normalizeEstimatedDuration(body.estimatedDuration),
+        // Every plain UI/API edit omits this, so COALESCE keeps whatever citations already existed
+        // on the row — an update never silently clears them. Only a Zyra save that explicitly
+        // resolved new citations (zyraSaveAttempt) passes a real array here.
+        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null
       ]
     );
     const row = res.rows[0];
@@ -9838,7 +9868,7 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(res.rows[0]), messages: [] };
   }
 
-  async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body) {
+  async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body, onStage?: ZyraOnStage) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
@@ -9868,6 +9898,7 @@ export class LegacyService implements OnModuleInit {
       throw new ConflictException({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." });
     }
     try {
+      onStage?.("received");
       // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
       // only stable identifier for the turn: seeding off the message text instead would give two
       // identical messages in one session the same deterministic trace id, collapsing both turns
@@ -9902,7 +9933,7 @@ export class LegacyService implements OnModuleInit {
       // in-flight resume can still finish and post its own message — see continueZyraChatMessage.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'expired' WHERE session_id = $1 AND status = 'timed_out'", [sessionId]);
 
-      let decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId);
+      let decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, undefined, onStage);
       // Confirmation retry: a turn that answered with zero operations despite the user's message
       // being an unmistakable "yes" to a proposal/offer the immediately preceding turn made is the
       // exact failure shape behind this bug (Basecamp 10231190735 and its recurrences) — the model
@@ -9920,12 +9951,13 @@ export class LegacyService implements OnModuleInit {
           const hint = pending.kind === "proposal"
             ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
             : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
           const fired = retried.operations.length > 0;
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
           decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
         }
       }
+      onStage?.("staging");
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -9939,6 +9971,7 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
+      onStage?.("finalizing");
       const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
       const title = this.compactTitle(message);
       await this.db.query(
@@ -10164,11 +10197,15 @@ export class LegacyService implements OnModuleInit {
     // Injected as one more system-prompt line rather than a new code path, so the model — not a
     // keyword matcher — still decides what to actually emit; this only tells it plainly that this
     // specific turn already had its confirmation and should stop describing the action and do it.
-    confirmationHint?: string
+    confirmationHint?: string,
+    // Optional progress narration (see ZyraOnStage) — undefined for every caller that doesn't pass
+    // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
+    onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
+    onStage?.("context");
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
-    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes] = await Promise.all([
+    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs] = await Promise.all([
       this.db.query(
         `SELECT role, content, reasoning_summary, action_type, testcases
          FROM zyra_chat_messages
@@ -10195,7 +10232,10 @@ export class LegacyService implements OnModuleInit {
       // Relevance-matched, not just explicitly-named: a request that never types an issue key still
       // needs the tickets it is about (see relevantJiraSnapshot).
       this.relevantJiraSnapshot(projectId, message, mentionedJiraKeys),
-      this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] }))
+      this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] })),
+      // Tesbo's own bug tracker (separate from Jira) — relevance-matched, same principle as
+      // relevantJiraSnapshot: an unrelated bug in the citation list is worse than none.
+      this.bugsSnapshot(projectId, message)
     ]);
     const ragKnowledge = ragDiagnostics.items;
     const usedRecencyFallback = !ragKnowledge.length;
@@ -10257,6 +10297,9 @@ export class LegacyService implements OnModuleInit {
     const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
     const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "1-10");
     const knowledgeForChat = capabilities.knowledgeBase ? knowledge : [];
+    // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
+    // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
+    const bugsForChat = capabilities.knowledgeBase ? bugs : [];
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -10326,6 +10369,9 @@ export class LegacyService implements OnModuleInit {
       "Existing testcases:",
       existingTestcases.map((tc) => `${tc.externalId} | ${tc.title} | ${tc.priority} | ${tc.status}\n${tc.description}\nSteps: ${tc.stepsSummary}`).join("\n\n") || "No existing testcases.",
       "",
+      "Related bugs from this project's bug tracker:",
+      bugsForChat.map((b) => `${b.title} | ${b.status} | ${b.priority || "unset"}\n${b.description}`).join("\n\n") || "No related bugs found.",
+      "",
       "Recent chat (each assistant turn is annotated with what it actually wrote to the repository —",
       "trust the annotation over the wording of the reply, which may describe testcases that were never saved):",
       this.zyraTranscript(chronologicalHistory),
@@ -10357,10 +10403,13 @@ export class LegacyService implements OnModuleInit {
         routedSuite: resume.routedSuite,
         routedCount: resume.routedCount,
         mentionedJira,
-        capabilities
+        capabilities,
+        bugsForChat,
+        onStage
       });
     }
 
+    onStage?.("routing");
     try {
       const raw = providerWire(provider) === "anthropic"
         ? await this.zyraChatWithAnthropic(key, model, context, message)
@@ -10427,7 +10476,9 @@ export class LegacyService implements OnModuleInit {
           routedSuite: this.routedZyraSuite(raw, projectSnapshot.suites),
           routedCount: { requestedCount: raw.requestedCount, exhaustive: raw.exhaustive === true },
           mentionedJira,
-          capabilities
+          capabilities,
+          bugsForChat,
+          onStage
         });
       }
       return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
@@ -10469,7 +10520,7 @@ export class LegacyService implements OnModuleInit {
     key: Body;
     message: string;
     userMessageId?: string;
-    knowledgeForChat: Array<{ title: string; content: string }>;
+    knowledgeForChat: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
     existingTestcases: ZyraGenerationInput["existingTestcases"];
     mentionedJiraKeys: string[];
     projectTestcaseRange: string;
@@ -10479,19 +10530,23 @@ export class LegacyService implements OnModuleInit {
     routedCount: { requestedCount?: unknown; exhaustive?: boolean };
     mentionedJira: Array<{ key: string; summary: string; description: string }>;
     capabilities: ZyraCapabilities;
+    bugsForChat?: ZyraGenerationInput["bugs"];
+    onStage?: ZyraOnStage;
   }): Promise<ZyraChatDecision> {
     const {
       projectId, userId, sessionId, provider, model, key, message, userMessageId,
       knowledgeForChat, existingTestcases, mentionedJiraKeys, projectTestcaseRange, suites,
-      conversation, routedSuite, routedCount, mentionedJira, capabilities
+      conversation, routedSuite, routedCount, mentionedJira, capabilities, bugsForChat, onStage
     } = params;
+    onStage?.("generating");
     try {
       const decision = await this.generateZyraChatCreateDecision({
         projectId, userId, sessionId, provider, model, key, message,
         knowledge: knowledgeForChat, existingTestcases, jiraIssueKeys: mentionedJiraKeys,
         projectTestcaseRange, suites, conversation, routedSuite, routedCount,
         // Already resolved for this turn — reuse instead of a second lookup.
-        jira: mentionedJira
+        jira: mentionedJira,
+        bugs: bugsForChat
       });
       return this.applyStorageGateToGenerated(decision, capabilities);
     } catch (err) {
@@ -10531,7 +10586,8 @@ export class LegacyService implements OnModuleInit {
           projectTestcaseRange, suites, conversation,
           routedSuite,
           routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false },
-          jira: mentionedJira
+          jira: mentionedJira,
+          bugs: bugsForChat
         });
         const gated = this.applyStorageGateToGenerated(retried, capabilities);
         const { cause } = LegacyService.zyraFailureCause(detail);
@@ -10711,7 +10767,10 @@ export class LegacyService implements OnModuleInit {
           type: op.draft.type || "Functional",
           status: op.draft.status || "Draft",
           component: op.draft.component || null,
-          jiraIssueKey: op.draft.jiraIssueKey || null
+          jiraIssueKey: op.draft.jiraIssueKey || null,
+          // Already resolved+verified by generateZyraChatTestcasesWithAi before this op ever
+          // reached the router's operations array — never re-trusted from raw model output here.
+          sourceRefs: Array.isArray(op.draft.sourceRefs) ? op.draft.sourceRefs : []
         };
         // Staged only — no insert, no external-id allocation, nothing to collide on yet. The
         // draft is committed (and a real external id allocated) only by zyraSave, which is also
@@ -10918,10 +10977,14 @@ export class LegacyService implements OnModuleInit {
     conversation?: string;
     routedSuite?: { id?: string; name?: string } | null;
     jira?: Array<{ key: string; summary: string; description: string }>;
+    // Optional and defaulted below — a caller that hasn't been updated to gather bugs (e.g. an
+    // older code path) simply generates with none, exactly as before this field existed.
+    bugs?: ZyraGenerationInput["bugs"];
   }): Promise<ZyraChatDecision> {
     // Prefer the Jira context already gathered for this turn (explicit keys plus relevance-matched
     // tickets); fall back to an explicit-key lookup only when a caller supplied none.
     const jira = params.jira ?? await this.relevantJiraSnapshot(params.projectId, params.message, params.jiraIssueKeys);
+    const bugs = params.bugs ?? [];
     // The router resolved the suite from the whole conversation ("put them in Login", "same suite
     // as before"); substring-matching the raw message is only the fallback for when it named none.
     const matchedSuite = this.resolveRoutedZyraSuite(params.routedSuite, params.suites)
@@ -10952,6 +11015,7 @@ export class LegacyService implements OnModuleInit {
         jira,
         linear: [],
         existingTestcases: params.existingTestcases,
+        bugs,
         requestedCount: params.requestedCount,
         testcaseRange: params.testcaseRange
       }
@@ -10960,6 +11024,13 @@ export class LegacyService implements OnModuleInit {
     // an exhaustive plan (startZyraChatPlan), and every subsequent background batch
     // (continueZyraChatPlan's loop) — instrumenting it once covers all three.
     await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, aiResult.usage);
+    // Resolve each draft's model-reported sourceRefs against the exact labels offered in THIS
+    // turn's prompt (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — a label the model invents, or
+    // carries over from an earlier turn's transcript, is dropped rather than trusted.
+    const sourceRefIndex = this.zyraSourceRefIndex({ knowledge: params.knowledge, jira, existingTestcases: params.existingTestcases, bugs });
+    for (const draft of aiResult.drafts) {
+      draft.sourceRefs = LegacyService.sanitizeZyraSourceRefs(draft.sourceRefs, sourceRefIndex);
+    }
     await this.rememberZyraTurn({
       projectId: params.projectId,
       userId: params.userId,
@@ -10970,20 +11041,25 @@ export class LegacyService implements OnModuleInit {
       outcome: [
         `Generated ${aiResult.drafts.length} testcase draft(s).`,
         params.jiraIssueKeys.length ? `Jira keys: ${params.jiraIssueKeys.join(", ")}` : "",
-        `Sources considered: ${params.knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${params.existingTestcases.length} existing testcase(s).`
+        `Sources considered: ${params.knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${params.existingTestcases.length} existing testcase(s), ${bugs.length} bug(s).`
       ].filter(Boolean).join(" ")
     });
-    // Nothing in the knowledge base and no Jira ticket matched: these drafts are the model's general
-    // knowledge, not this team's requirements, and the reply has to lead with that.
-    const ungrounded = params.knowledge.length === 0 && jira.length === 0;
+    // Nothing in the knowledge base, no Jira ticket, and no bug matched: these drafts are the
+    // model's general knowledge, not this team's requirements, and the reply has to lead with that.
+    const ungrounded = params.knowledge.length === 0 && jira.length === 0 && bugs.length === 0;
     const stagedSuiteName = matchedSuite?.name ?? LegacyService.ZYRA_DRAFT_SUITE_NAME;
     const groundedReply = [
         `I drafted ${aiResult.drafts.length} test case(s) after reading`,
         [
           `${params.knowledge.length} knowledge-base item(s)${jiraFromKnowledge ? ` (${jiraFromKnowledge} mirrored from Jira)` : ""}`,
           `${jira.length} Jira ticket(s) read directly`,
-          `${params.existingTestcases.length} existing test case(s) to avoid duplicating coverage`
-        ].join(", "),
+          `${params.existingTestcases.length} existing test case(s) to avoid duplicating coverage`,
+          // Only mentioned when it actually applies, same as jiraFromKnowledge above — most turns
+          // match zero bugs, and the older reply wording (asserted verbatim in
+          // zyra-response-parsing.spec.ts, which builds its own fixed reply string rather than
+          // calling this function) never mentioned bugs at all.
+          bugs.length ? `${bugs.length} related bug(s)` : ""
+        ].filter(Boolean).join(", "),
         "."
     ].join(" ").replace(" .", ".") + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`;
     return {
@@ -11019,26 +11095,31 @@ export class LegacyService implements OnModuleInit {
     jiraIssueKeys: string[],
     capabilities: ZyraCapabilities
   ): Promise<{
-    knowledge: Array<{ title: string; content: string }>;
+    knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
     existingTestcases: ZyraGenerationInput["existingTestcases"];
     suites: Array<{ id: string; name: string; testCaseCount: number }>;
     jira: Array<{ key: string; summary: string; description: string }>;
+    bugs: ZyraGenerationInput["bugs"];
   }> {
-    const [knowledgeFallback, ragKnowledge, folderKnowledge, existingTestcases, suites, jira] = await Promise.all([
+    const [knowledgeFallback, ragKnowledge, folderKnowledge, existingTestcases, suites, jira, bugs] = await Promise.all([
       this.knowledgeSnapshot(projectId),
       this.ragRetrieval.retrieveKnowledgeContext(projectId, message),
       this.knowledgeFolderSnapshot(projectId, message, jiraIssueKeys),
       this.existingTestcaseSnapshot(projectId, message, ""),
       this.projectSuiteSummaries(projectId),
       // Relevance-matched, not just explicitly-named — see relevantJiraSnapshot.
-      this.relevantJiraSnapshot(projectId, message, jiraIssueKeys)
+      this.relevantJiraSnapshot(projectId, message, jiraIssueKeys),
+      // Same gate as knowledge below — bugs are treated as part of the same "project knowledge"
+      // capability toggle rather than a new one, consistent with how this project already reads.
+      this.bugsSnapshot(projectId, message)
     ]);
     const knowledge = [...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge : knowledgeFallback)];
     return {
       knowledge: capabilities.knowledgeBase ? knowledge : [],
       existingTestcases,
       suites,
-      jira
+      jira,
+      bugs: capabilities.knowledgeBase ? bugs : []
     };
   }
 
@@ -11080,13 +11161,14 @@ export class LegacyService implements OnModuleInit {
     model: string;
     key: Body;
     message: string;
-    knowledge: Array<{ title: string; content: string }>;
+    knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
     existingTestcases: ZyraGenerationInput["existingTestcases"];
     jiraIssueKeys: string[];
     suites: Array<{ id: string; name: string }>;
     conversation?: string;
     routedSuite?: { id?: string; name?: string } | null;
     jira?: Array<{ key: string; summary: string; description: string }>;
+    bugs?: ZyraGenerationInput["bugs"];
   }): Promise<ZyraChatDecision> {
     let scenarios: string[] = [];
     try {
@@ -11121,7 +11203,8 @@ export class LegacyService implements OnModuleInit {
         suites: params.suites,
         conversation: params.conversation,
         routedSuite: params.routedSuite,
-        jira: params.jira
+        jira: params.jira,
+        bugs: params.bugs
       });
     }
 
@@ -11141,7 +11224,8 @@ export class LegacyService implements OnModuleInit {
       suites: params.suites,
       conversation: params.conversation,
       routedSuite: params.routedSuite,
-      jira: params.jira
+      jira: params.jira,
+      bugs: params.bugs
     });
 
     if (!remaining.length) return decision;
@@ -11225,7 +11309,7 @@ export class LegacyService implements OnModuleInit {
         const jiraIssueKeys = normalizeJsonArray(plan.jiraIssueKeys).map(String);
         // Re-read the sources for every batch: existing coverage grows as earlier batches land, so
         // this is also what stops batch N from duplicating what batch N-1 just wrote.
-        const { knowledge, existingTestcases, suites, jira } = await this.zyraGenerationContext(
+        const { knowledge, existingTestcases, suites, jira, bugs } = await this.zyraGenerationContext(
           projectId,
           `${originalMessage}\n${batch.join("\n")}`,
           jiraIssueKeys,
@@ -11242,6 +11326,7 @@ export class LegacyService implements OnModuleInit {
           existingTestcases,
           jiraIssueKeys,
           jira,
+          bugs,
           requestedCount: batch.length,
           suites,
           // Carried in the plan so every batch files into the suite the user asked for, not just
@@ -12170,7 +12255,11 @@ export class LegacyService implements OnModuleInit {
           jiraIssueKey: draft.jiraIssueKey || jiraIssueKey,
           jiraUrl,
           linearIssueKey,
-          linearUrl
+          linearUrl,
+          // Carried from the staged draft (already resolved+verified at generation time) onto the
+          // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
+          // no sourceRefs ever attached) simply carries none, same as it always has.
+          sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
         };
         this.assertTestcaseFieldLengths(payload);
         if (existingLinked.rows[linkedIndex]?.id) {
@@ -12380,7 +12469,7 @@ export class LegacyService implements OnModuleInit {
     if (inserted.rows[0]?.id) this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", inserted.rows[0].id, "created");
   }
 
-  private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string }>> {
+  private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
     const selected = Array.from(new Set(selectedItemIds.filter(Boolean)));
     const values: any[] = [projectId];
     // Only approved AI-memory documents are trusted context; every other document type
@@ -12395,7 +12484,7 @@ export class LegacyService implements OnModuleInit {
     // skip firing the files query at all in that case, rather than firing and discarding it.
     const [res, filesRes] = await Promise.all([
       this.db.query(
-        `SELECT title, content_text FROM knowledge_documents
+        `SELECT id, title, content_text FROM knowledge_documents
          WHERE ${filter}
          ORDER BY CASE WHEN title = 'Zyra AI Memory' THEN 0 ELSE 1 END, updated_at DESC
          LIMIT 12`,
@@ -12404,7 +12493,7 @@ export class LegacyService implements OnModuleInit {
       selected.length
         ? Promise.resolve({ rows: [] as any[] })
         : this.db.query(
-            `SELECT original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files
+            `SELECT id, original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files
              WHERE project_id = $1 AND is_deleted = false
              ORDER BY updated_at DESC
              LIMIT 8`,
@@ -12413,13 +12502,15 @@ export class LegacyService implements OnModuleInit {
     ]);
     const documents = res.rows.map((row) => ({
       title: row.title || "Knowledge base item",
-      content: String(row.content_text || "").slice(0, 1500)
+      content: String(row.content_text || "").slice(0, 1500),
+      citation: { sourceType: "document" as const, sourceId: String(row.id) }
     }));
     if (selected.length) return documents;
 
     const files = filesRes.rows.map((row) => ({
       title: row.original_file_name || "Uploaded file",
-      content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status)
+      content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status),
+      citation: { sourceType: "file" as const, sourceId: String(row.id) }
     }));
     return [...documents, ...files];
   }
@@ -12454,7 +12545,7 @@ export class LegacyService implements OnModuleInit {
   // content) can resolve a request that names a knowledge-base folder directly, e.g. "get details
   // from knowledge base 'EAD-11215' folder" — so when the message quotes a name or mentions a
   // Jira-key-shaped token, look it up by folder name and surface its documents/files explicitly.
-  private async knowledgeFolderSnapshot(projectId: string, message: string, jiraKeys: string[]): Promise<Array<{ title: string; content: string }>> {
+  private async knowledgeFolderSnapshot(projectId: string, message: string, jiraKeys: string[]): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
     const candidates = Array.from(new Set([...this.extractQuotedPhrases(message), ...jiraKeys])).slice(0, 5);
     if (!candidates.length) return [];
     const foldersRes = await this.db.query(
@@ -12467,23 +12558,26 @@ export class LegacyService implements OnModuleInit {
     const folderNames = foldersRes.rows.map((row) => row.name).join(", ");
     const [docsRes, filesRes] = await Promise.all([
       this.db.query(
-        `SELECT title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 12`,
+        `SELECT id, title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 12`,
         [folderIds]
       ).catch(() => ({ rows: [] as Body[] })),
       this.db.query(
-        `SELECT original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 8`,
+        `SELECT id, original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 8`,
         [folderIds]
       ).catch(() => ({ rows: [] as Body[] }))
     ]);
     const documents = docsRes.rows.map((row) => ({
       title: row.title || "Knowledge base item",
-      content: String(row.content_text || "").slice(0, 1500)
+      content: String(row.content_text || "").slice(0, 1500),
+      citation: { sourceType: "document" as const, sourceId: String(row.id) }
     }));
     const files = filesRes.rows.map((row) => ({
       title: row.original_file_name || "Uploaded file",
-      content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status)
+      content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status),
+      citation: { sourceType: "file" as const, sourceId: String(row.id) }
     }));
     if (!documents.length && !files.length) {
+      // A synthetic, id-less marker row — nothing to cite, so it deliberately carries no `citation`.
       return [{ title: `Knowledge base folder: ${folderNames}`, content: "This folder was found by name but currently has no documents or files in it." }];
     }
     return [{ title: `Knowledge base folder: ${folderNames}`, content: "" }, ...documents, ...files];
@@ -12548,6 +12642,35 @@ export class LegacyService implements OnModuleInit {
     const words = String(text || "").toLowerCase().split(/[^a-z0-9]+/);
     const terms = words.filter((word) => word.length > 3 && !this.isZyraStopword(word));
     return Array.from(new Set(terms)).slice(0, limit);
+  }
+
+  // Relevance-matched bugs for generation context — Tesbo's own internal bug tracker (separate
+  // from Jira), not read by Zyra at all before this. Modeled directly on relevantJiraSnapshot
+  // below: same term-matching helper, same "relevance is required, not padded" principle — an
+  // unrelated bug in the citation list is worse than no bug.
+  private async bugsSnapshot(
+    projectId: string,
+    message: string,
+    limit = 8
+  ): Promise<Array<{ id: string; title: string; description: string; status: string; priority: string }>> {
+    const terms = this.zyraSearchTerms(message);
+    if (!terms.length) return [];
+    const res = await this.db.query(
+      `SELECT id, title, description, status, priority
+       FROM bugs
+       WHERE project_id = $1
+         AND (lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]))
+       ORDER BY CASE WHEN lower(title) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC
+       LIMIT $3`,
+      [projectId, terms.map((term) => `%${term}%`), limit]
+    ).catch(() => ({ rows: [] as Body[] }));
+    return res.rows.map((row) => ({
+      id: String(row.id || ""),
+      title: String(row.title || "Untitled bug").slice(0, 512),
+      description: String(row.description || "").slice(0, 2000),
+      status: String(row.status || "Open"),
+      priority: String(row.priority || "")
+    })).filter((item) => item.id);
   }
 
   // Jira context for generation. jiraSnapshot only ever returns tickets whose keys were typed into
@@ -12737,7 +12860,8 @@ export class LegacyService implements OnModuleInit {
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
       "Prioritize edge cases, boundary values, negative paths, permissions, data integrity, state transitions, and traceability.",
-      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"testData\":\"\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"]}]}",
+      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"testData\":\"\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"],\"sourceRefs\":[\"\"]}]}",
+      "Each source below (knowledge base, Jira/Linear tickets, existing testcases, related bugs) is given a label, e.g. 'KB 2', 'HBP-14', 'AIP-TC-73', 'BUG 3'. For every draft, set sourceRefs to the exact labels of the sources that draft actually draws on — copy the label text exactly as given, do not invent or paraphrase one. Leave sourceRefs an empty array when a draft is not grounded in any specific source (general QA practice only).",
       "Do not include markdown fences, explanations, comments, or text before or after the JSON object.",
       "stepsJson must be a JSON string containing an array of step objects with stepNumber, action, and expectedResult fields.",
       "testData is the concrete input values, sample records, or setup-specific data the test needs (e.g. specific usernames, amounts, file formats) — leave it an empty string only when the case genuinely needs no specific data beyond what the steps already state."
@@ -12757,17 +12881,73 @@ export class LegacyService implements OnModuleInit {
     const existingTestcases = input.existingTestcases.length
       ? input.existingTestcases.map((item) => `${item.externalId}: ${item.title}\nPriority: ${item.priority}; Status: ${item.status}\n${item.description}\nSteps: ${item.stepsSummary}`).join("\n\n")
       : "No existing testcases were available.";
+    const bugs = input.bugs?.length
+      ? input.bugs.map((item, index) => `BUG ${index + 1}: ${item.title}\nStatus: ${item.status}; Priority: ${item.priority || "unset"}\n${item.description}`).join("\n\n")
+      : "No related bugs were found.";
     return [
       "Static project sources for prompt caching:",
-      "Knowledge base:",
+      "Knowledge base (cite by its 'KB N' label):",
       knowledge,
-      "Jira tickets:",
+      "Jira tickets (cite by its ticket key):",
       jira,
       "Linear tickets:",
       linear,
-      "Existing testcases to review for context and duplicate avoidance:",
-      existingTestcases
+      "Existing testcases to review for context and duplicate avoidance (cite by its external id):",
+      existingTestcases,
+      "Related bugs from this project's bug tracker (cite by its 'BUG N' label):",
+      bugs
     ].join("\n\n");
+  }
+
+  // The exact set of labels a draft's sourceRefs may legally cite for one generation call — built
+  // from the same arrays zyraStaticSourcePrompt renders into the prompt, in the same order, so "KB
+  // 2" always means the same item the model was actually shown. Never trust the model's own claim
+  // beyond this set (see sanitizeZyraSourceRefs) — the same principle reconcileZyraReply already
+  // applies to completion claims, extended to citations: an unverifiable claim is worse than none.
+  private zyraSourceRefIndex(input: Pick<ZyraGenerationInput, "knowledge" | "jira" | "existingTestcases"> & Partial<Pick<ZyraGenerationInput, "bugs">>): Map<string, ZyraSourceRef> {
+    const index = new Map<string, ZyraSourceRef>();
+    input.knowledge.forEach((item, i) => {
+      if (!item.citation) return; // synthetic/marker rows (e.g. an empty folder banner) have nothing to cite
+      const label = `KB ${i + 1}`;
+      index.set(label, {
+        type: item.citation.sourceType === "file" ? "knowledge_file" : "knowledge_document",
+        id: item.citation.sourceId,
+        title: item.title
+      });
+    });
+    input.jira.forEach((item) => {
+      if (!item.key) return;
+      index.set(item.key, { type: "jira_ticket", id: item.key, title: item.summary });
+    });
+    input.existingTestcases.forEach((item) => {
+      if (!item.externalId) return;
+      index.set(item.externalId, { type: "testcase", id: item.externalId, title: item.title });
+    });
+    (input.bugs || []).forEach((item, i) => {
+      if (!item.id) return;
+      index.set(`BUG ${i + 1}`, { type: "bug", id: item.id, title: item.title });
+    });
+    return index;
+  }
+
+  // Filters a draft's model-reported sourceRefs down to labels that were genuinely offered in this
+  // turn's prompt, and resolves the survivors to their full {type, id, title}. A label the model
+  // invents (or copies from a different turn's transcript) is dropped silently — never surfaced —
+  // exactly like reconcileZyraReply drops an unverifiable completion claim rather than passing it
+  // through. Pure function: no I/O, no DB, safe to unit test directly against a fixed index.
+  private static sanitizeZyraSourceRefs(rawRefs: unknown, knownRefs: Map<string, ZyraSourceRef>): ZyraSourceRef[] {
+    if (!Array.isArray(rawRefs)) return [];
+    const resolved: ZyraSourceRef[] = [];
+    const seen = new Set<string>();
+    for (const raw of rawRefs.slice(0, 20)) {
+      const label = String(raw ?? "").trim();
+      if (!label || seen.has(label)) continue;
+      const match = knownRefs.get(label);
+      if (!match) continue;
+      seen.add(label);
+      resolved.push(match);
+    }
+    return resolved;
   }
 
   private testcaseRangeConfig(range: string): { requestedCount: number; instruction: string } {
@@ -12811,7 +12991,11 @@ export class LegacyService implements OnModuleInit {
         testData: String(draft.testData || ""),
         expectedSummary: String(draft.expectedSummary || draft.expected || "The workflow behaves as expected."),
         priority: String(draft.priority || (index < 2 ? "P1" : "P2")),
-        tags
+        tags,
+        // Raw, unvalidated labels straight from the model — sanitizeZyraSourceRefs (called by
+        // whichever generation path has the turn's known-label index in scope) is what turns this
+        // into a trustworthy citation list. Never rendered or persisted as-is.
+        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
       };
     });
   }
@@ -14225,7 +14409,7 @@ export class LegacyService implements OnModuleInit {
     model: string;
     key: Body;
     message: string;
-    knowledge: Array<{ title: string; content: string }>;
+    knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
     existingTestcases: ZyraGenerationInput["existingTestcases"];
     jiraIssueKeys: string[];
     projectTestcaseRange: string;
@@ -14234,6 +14418,7 @@ export class LegacyService implements OnModuleInit {
     routedSuite?: { id?: string; name?: string } | null;
     routedCount?: { requestedCount?: unknown; exhaustive?: boolean };
     jira?: Array<{ key: string; summary: string; description: string }>;
+    bugs?: ZyraGenerationInput["bugs"];
   }): Promise<ZyraChatDecision> {
     const plan = this.chatTestcasePlan(params.message, params.projectTestcaseRange, params.routedCount);
     if (plan.testcaseRange === "all") {
@@ -14251,7 +14436,8 @@ export class LegacyService implements OnModuleInit {
         suites: params.suites,
         conversation: params.conversation,
         routedSuite: params.routedSuite,
-        jira: params.jira
+        jira: params.jira,
+        bugs: params.bugs
       });
     }
     return this.generateZyraChatTestcasesWithAi({
@@ -14268,6 +14454,7 @@ export class LegacyService implements OnModuleInit {
       conversation: params.conversation,
       routedSuite: params.routedSuite,
       jira: params.jira,
+      bugs: params.bugs,
       ...plan
     });
   }
@@ -14557,7 +14744,11 @@ export class LegacyService implements OnModuleInit {
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
       action,
-      reason: reason || ""
+      reason: reason || "",
+      // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
+      // raw model output. Defaults to [] for every row this function did not build from a draft
+      // carrying citations (e.g. a plain move/update row), never undefined.
+      sourceRefs: Array.isArray(value.sourceRefs) ? value.sourceRefs : []
     };
   }
 
@@ -14571,7 +14762,8 @@ export class LegacyService implements OnModuleInit {
       type: row.type,
       preconditions: row.preconditions,
       description: row.description,
-      stepsJson: row.steps
+      stepsJson: row.steps,
+      sourceRefs: row.sourceRefs
     }, action, reason);
   }
 
