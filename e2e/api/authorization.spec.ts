@@ -119,6 +119,49 @@ test.describe("test cases", () => {
   });
 });
 
+test.describe("test cases — cross-tenant suiteId parameter", () => {
+  /*
+   * Not the KNOWN GAP shape the rest of this file documents (account B reaching for account A's
+   * resource by id): here account A calls its OWN authorized project, but supplies account B's
+   * suite id as a filter value, with includeDescendants=true — the new recursive-rollup query
+   * added for the parent-suite bug fix. This is what the CTE's own `project_id = $1` re-scoping
+   * (legacy.service.ts listTestCases) exists to defend: without it, a foreign suite id that happens
+   * to exist (just in another tenant's project) could anchor the recursive walk and pull rows that
+   * were never supposed to be reachable from project A's request at all.
+   */
+  test("a suiteId belonging to a different project's suite matches nothing, recursively or not", { tag: '@tesbo.testId("TES-TC-905")' }, async ({
+    request,
+  }) => {
+    const bSuite = await (
+      await asB.post(`/api/projects/${ctxB.projectId}/suites`, {
+        data: { name: `E2E Cross-Tenant Suite ${Date.now()}` },
+      })
+    ).json();
+    const bCase = await (
+      await asB.post(`/api/projects/${ctxB.projectId}/testcases`, {
+        data: { title: `E2E Cross-Tenant Case ${Date.now()}`, suiteId: bSuite.id },
+      })
+    ).json();
+
+    try {
+      for (const includeDescendants of [undefined, "true"]) {
+        const res = await request.get(`/api/projects/${ctxA.projectId}/testcases`, {
+          params: { suiteId: bSuite.id, ...(includeDescendants ? { includeDescendants } : {}), limit: 500 },
+          failOnStatusCode: false,
+        });
+        // A foreign suiteId isn't an auth failure to refuse — it's a filter value that happens to
+        // match nothing in the caller's own project. What must never happen is B's case leaking in.
+        expect(res.ok(), `answered ${res.status()} for a foreign suiteId`).toBeTruthy();
+        const ids = (await res.json()).map((tc: { id: string }) => tc.id);
+        expect(ids, "a different tenant's test case leaked through a foreign suiteId").not.toContain(bCase.id);
+      }
+    } finally {
+      await asB.delete(`/api/projects/${ctxB.projectId}/testcases/${bCase.id}`, { failOnStatusCode: false });
+      await asB.delete(`/api/suites/${bSuite.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
 test.describe("test plans", () => {
   test("a different account can read, update, and delete another project's test plan by ID", { tag: '@tesbo.testId("TES-TC-33")' }, async ({
     request,

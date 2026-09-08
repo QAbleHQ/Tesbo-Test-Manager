@@ -2601,12 +2601,47 @@ export class LegacyService implements OnModuleInit {
     return this.listSuites(projectId);
   }
 
+  /*
+   * `test_case_count` stays exactly what it always was — direct children of this suite only —
+   * so every existing consumer of it is untouched. `recursive_test_case_count` is additive: the
+   * same figure rolled up through the suite's whole subtree, computed via a `WITH RECURSIVE` walk
+   * of `suites.parent_id` (the same shape already used for Knowledge Base folders, see
+   * `listKnowledgeFolderItems`'s subtree size query).
+   *
+   * Suites have no write-time cycle guard the way KB folders do (`moveKnowledgeFolder` refuses a
+   * move that would create one) — `createSuite`/`updateSuite` accept any `parentId` unconditionally
+   * — so this walk carries its own `path` array and stops via `NOT s.id = ANY(path)`. That bounds it
+   * to at most one pass over the project's suites even if the data ever contained a cycle, rather
+   * than relying on upstream data hygiene this codebase doesn't currently enforce. `project_id = $1`
+   * is re-asserted at every step for the same reason: nothing today stops a `parentId` from pointing
+   * at another project's suite, so the recursion re-scopes itself rather than trusting the chain.
+   */
   async listSuites(projectId: string) {
     const res = await this.db.query(
-      `SELECT s.id, s.parent_id, s.name, s.position, s.created_at, COUNT(t.id)::int AS test_case_count
-       FROM suites s LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
+      `WITH RECURSIVE descendants AS (
+         SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1
+         UNION ALL
+         SELECT d.root_id, s.id, d.path || s.id
+         FROM suites s JOIN descendants d ON s.parent_id = d.node_id
+         WHERE s.project_id = $1 AND NOT s.id = ANY(d.path)
+       ),
+       recursive_counts AS (
+         SELECT d.root_id, COUNT(t.id)::int AS recursive_test_case_count
+         FROM descendants d
+         LEFT JOIN testcases t ON t.suite_id = d.node_id AND t.deleted_at IS NULL
+         GROUP BY d.root_id
+       )
+       SELECT s.id, s.parent_id, s.name, s.position, s.created_at,
+              COUNT(t.id)::int AS test_case_count,
+              COALESCE(
+                (SELECT rc.recursive_test_case_count FROM recursive_counts rc WHERE rc.root_id = s.id),
+                0
+              )::int AS recursive_test_case_count
+       FROM suites s
+       LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
        WHERE s.project_id = $1
-       GROUP BY s.id ORDER BY s.position, s.name`,
+       GROUP BY s.id
+       ORDER BY s.position, s.name`,
       [projectId]
     );
     return res.rows.map(toCamel);
@@ -2632,7 +2667,7 @@ export class LegacyService implements OnModuleInit {
       "INSERT INTO suites (project_id, parent_id, name, position) VALUES ($1, $2, $3, $4) RETURNING id, parent_id, name, position, created_at",
       [projectId, body.parentId || null, name, Number(body.position || 0)]
     );
-    return { ...toCamel(res.rows[0]), testCaseCount: 0 };
+    return { ...toCamel(res.rows[0]), testCaseCount: 0, recursiveTestCaseCount: 0 };
   }
 
   async updateSuite(userId: string | null | undefined, suiteId: string, body: Body) {
@@ -2707,6 +2742,38 @@ export class LegacyService implements OnModuleInit {
       throw new BadRequestException({ error: "suiteId must be a valid id" });
     }
     /*
+     * `includeDescendants=true` widens a concrete `suiteId` from "this exact suite" to "this suite
+     * or any suite nested under it" — parent suites otherwise show none of their children's cases
+     * (the repository screen's bug: a parent's badge summed direct children client-side, but the
+     * list itself only ever matched `suite_id = $n`).
+     *
+     * Opt-in and additive on purpose: every other caller of this method (the MCP tool, Zyra, any
+     * other e2e spec) keeps matching by exact id unless it asks for the new behavior. It has no
+     * effect combined with `suiteId=none` (unfiled has no descendants to speak of) or with no
+     * `suiteId` at all (the loop below never reaches the suite column) — both fall through to
+     * their existing behavior unchanged.
+     *
+     * The walk carries its own `path` array and re-asserts `project_id` at every step rather than
+     * trusting `suites.parent_id` to behave: nothing in createSuite/updateSuite currently checks
+     * that a `parentId` belongs to the same project or refuses one that would form a cycle, so this
+     * is the only place that guarantees the recursion can't cross a tenant boundary or spin forever
+     * on a cyclic chain — it's bounded to at most one pass over the project's suites either way.
+     */
+    const includeDescendants = String(query.includeDescendants ?? "").toLowerCase() === "true";
+    const wantsSubtree = includeDescendants && !!suiteFilter && !wantsUnfiled;
+    let suiteSubtreeCteSql = "";
+    if (wantsSubtree) {
+      values.push(suiteFilter);
+      suiteSubtreeCteSql = `WITH RECURSIVE suite_subtree AS (
+         SELECT id, ARRAY[id] AS path FROM suites WHERE id = $${values.length} AND project_id = $1
+         UNION ALL
+         SELECT s.id, sub.path || s.id
+         FROM suites s JOIN suite_subtree sub ON s.parent_id = sub.id
+         WHERE s.project_id = $1 AND NOT s.id = ANY(sub.path)
+       ) `;
+      filters.push("suite_id IN (SELECT id FROM suite_subtree)");
+    }
+    /*
      * Archived cases are out of the working list unless they are asked for.
      *
      * "Archived" is the status Zyra's archive operation sets when a user asks it to remove test cases,
@@ -2731,7 +2798,7 @@ export class LegacyService implements OnModuleInit {
       ["jiraIssueKey", "jira_issue_key"],
       ["linearIssueKey", "linear_issue_key"]
     ] as const) {
-      if (param === "suiteId" && wantsUnfiled) continue;
+      if (param === "suiteId" && (wantsUnfiled || wantsSubtree)) continue;
       if (query[param]) {
         values.push(query[param]);
         // "type" can enter the system with inconsistent casing (e.g. an imported testcase
@@ -2767,7 +2834,7 @@ export class LegacyService implements OnModuleInit {
     // so folding two trips into one roughly halves its latency. COUNT(*) OVER () is evaluated
     // after WHERE and before LIMIT, so it still reports every matching row.
     const res = await this.db.query(
-      `SELECT testcases.id, testcases.external_id, testcases.title, testcases.priority, testcases.type,
+      `${suiteSubtreeCteSql}SELECT testcases.id, testcases.external_id, testcases.title, testcases.priority, testcases.type,
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,

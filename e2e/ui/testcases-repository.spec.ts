@@ -110,8 +110,10 @@ test.describe("test case repository (UI)", () => {
     return `E2E ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
   }
 
-  async function seedSuite(name: string): Promise<string> {
-    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, { data: { name } });
+  async function seedSuite(name: string, parentId?: string): Promise<string> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: parentId ? { name, parentId } : { name },
+    });
     expect(res.ok(), `seeding suite ${name} — ${await res.text()}`).toBeTruthy();
     return (await res.json()).id;
   }
@@ -573,5 +575,69 @@ test.describe("test case repository (UI)", () => {
     expect(updated.priority).toBe("P2");
     // The one left alone is still untouched.
     expect(updated.automationStatus).toBe("Automated");
+  });
+
+  // ─── Parent suites roll up their sub-suites' test cases ────────────────────
+  /*
+   * Reported bug: "Parent suits not showing test cases even though sub suite has test cases".
+   * Repro: a parent suite ("test case Import test", badge 86) shows "No test cases found" when
+   * selected directly, while its child ("Activity", badge 86) shows all 86 when selected. Expected:
+   * selecting a suite shows every case filed anywhere in its subtree, not only a case whose suite_id
+   * literally equals the selected id.
+   *
+   * Fails against the old screen: listTestCases matched `suite_id = $n` exactly, and the sidebar
+   * badge was a client-side, one-level-only sum computed from the same direct-only counts — so a
+   * parent whose cases live entirely on its child showed 0 in both the table and (for a 3rd level,
+   * not reachable through this 2-level tree widget) potentially the badge too.
+   *
+   * No @tesbo.testId tag: new coverage, no matching case in the live Tesbo project yet.
+   */
+  test("TCR-14 selecting a parent suite shows its child suite's test cases", async ({ browser }) => {
+    const parentName = stamp("ParentSuite");
+    const childName = stamp("ChildSuite");
+    const parentId = await seedSuite(parentName);
+    const childId = await seedSuite(childName, parentId);
+    const titles = [stamp("RollupA"), stamp("RollupB")];
+    for (const title of titles) await seedCase(title, { suiteId: childId });
+
+    const page = await openRepository(browser);
+
+    // The parent's own sidebar badge already rolls up its child's cases — this is the number the
+    // report's screenshot showed as "86" while the list beneath it read "No test cases found".
+    const parentRow = page.getByRole("button", { name: new RegExp(parentName) });
+    await expect(parentRow, "the parent's sidebar badge must include its child's cases").toContainText("2");
+
+    // Selecting the PARENT — not the child — is the exact reported repro.
+    await parentRow.click();
+    for (const title of titles) {
+      await expect(row(page, title), "a child suite's case is missing from its parent's list").toBeVisible();
+    }
+    await expect(pagination(page)).toContainText("2 results");
+
+    // The child, selected directly, still shows exactly its own cases — the already-working path
+    // this fix must not disturb.
+    await page.getByTestId(`suite-expand-${parentId}`).click();
+    const childRow = page.getByRole("button", { name: new RegExp(childName) });
+    await childRow.click();
+    for (const title of titles) await expect(row(page, title)).toBeVisible();
+    await expect(pagination(page)).toContainText("2 results");
+  });
+
+  test("TCR-15 a suite with no cases of its own, only a child's, is the exact reported repro", async ({ browser }) => {
+    // Same shape as TCR-14 but named for the precise complaint: the parent has ZERO direct cases —
+    // every one of them lives on the child — which is what made "No test cases found" so misleading
+    // (the parent looked empty, not merely under-counted).
+    const parentName = stamp("EmptyParent");
+    const childName = stamp("OnlyChild");
+    const parentId = await seedSuite(parentName);
+    const childId = await seedSuite(childName, parentId);
+    const title = stamp("OnlyOnChild");
+    await seedCase(title, { suiteId: childId });
+
+    const page = await openRepository(browser);
+    await page.getByRole("button", { name: new RegExp(parentName) }).click();
+
+    await expect(row(page, title), "the parent showed no cases though its child has one").toBeVisible();
+    await expect(pagination(page)).toContainText("1 result");
   });
 });
