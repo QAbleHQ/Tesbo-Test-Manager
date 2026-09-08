@@ -2004,3 +2004,165 @@ test.describe("zyra chat — citations (fake provider)", () => {
     expect(String(lastAssistant.content || "")).not.toContain("I don't have anything about this in the project's knowledge base");
   });
 });
+
+/*
+ * Live SSE progress narration for one chat turn (GET .../turns/:turnId/events) — see
+ * zyra-progress.service.ts's file header for the design. The one property that matters most and is
+ * asserted first here: the POST route this rides alongside is byte-for-byte unaffected by whether a
+ * turnId is present. Everything else about the stream is best-effort on top of that guarantee.
+ */
+test.describe("zyra chat — progress streaming (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-progress");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E progress fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  function queueSimpleAnswerTurn(): void {
+    ai.queueReply({
+      reply: "This project currently has 0 test cases.",
+      reasoningSummary: "Answered directly, no operations.",
+      action: "answer", actionType: "answer", operations: [], testcases: [],
+    });
+  }
+
+  test("ZYR-A-65 the POST response is byte-for-byte the same shape with or without a turnId", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E progress parity");
+
+    queueSimpleAnswerTurn();
+    const withoutTurnId = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many test cases exist?" },
+      failOnStatusCode: false,
+    });
+    expect(withoutTurnId.status()).toBeLessThan(300);
+    const bodyWithout = await withoutTurnId.json();
+
+    queueSimpleAnswerTurn();
+    const withTurnId = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many test cases exist?", turnId: "11111111-1111-4111-8111-111111111111" },
+      failOnStatusCode: false,
+    });
+    expect(withTurnId.status()).toBeLessThan(300);
+    const bodyWith = await withTurnId.json();
+
+    // Same top-level and message-level shape either way — turnId is inert request-only data.
+    expect(Object.keys(bodyWith).sort()).toEqual(Object.keys(bodyWithout).sort());
+    expect(Object.keys(bodyWith.message).sort()).toEqual(Object.keys(bodyWithout.message).sort());
+    expect(bodyWith.message.content).toBe(bodyWithout.message.content);
+    expect(bodyWith.message.actionType).toBe(bodyWithout.message.actionType);
+    // turnId must never be echoed back into persisted/returned data — it is a transport-only
+    // correlation id, not part of the chat message.
+    expect(JSON.stringify(bodyWith)).not.toContain("11111111-1111-4111-8111-111111111111");
+  });
+
+  test("ZYR-A-66 a real turn's progress stream narrates real stages and ends with a complete event matching the POST response", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E progress narration");
+    const turnId = "22222222-2222-4222-8222-222222222222";
+
+    queueSimpleAnswerTurn();
+
+    // Fired together, same as the frontend will: the POST first (so it wins the race to create the
+    // turn's registry entry — see subscribe()'s doc comment in zyra-progress.service.ts), the SSE
+    // GET immediately after. Both awaited with Promise.all so neither blocks the other.
+    const postPromise = asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many test cases exist?", turnId },
+      failOnStatusCode: false,
+    });
+    const ssePromise = asOwner.get(url(`/chat/sessions/${sessionId}/turns/${turnId}/events`), { failOnStatusCode: false });
+    const [postRes, sseRes] = await Promise.all([postPromise, ssePromise]);
+
+    expect(postRes.status(), `sending the message — ${await postRes.text()}`).toBeLessThan(300);
+    expect(sseRes.status(), `opening the progress stream — ${await sseRes.text()}`).toBe(200);
+    expect(sseRes.headers()["content-type"]).toContain("text/event-stream");
+
+    const postBody = await postRes.json();
+    const events = parseSseEvents(await sseRes.text()) as Array<Record<string, unknown>>;
+
+    expect(events.length, "expected at least a couple of stage events plus a terminal event").toBeGreaterThan(1);
+    const stageNames = events.filter((e) => e.kind === "stage").map((e) => e.stage);
+    // 'received' is the very first thing sendZyraChatMessage does once it has the session claim —
+    // if the SSE GET won the race and attached before the POST created the entry, this would be []
+    // instead, which is the scenario ZYR-A-68 covers deliberately; this test's whole point is that
+    // firing the POST first (as documented) makes that not happen in practice.
+    expect(stageNames.length, `no stage events at all — full stream: ${JSON.stringify(events)}`).toBeGreaterThan(0);
+    expect(stageNames).toContain("received");
+
+    const terminal = events[events.length - 1];
+    expect(terminal.kind, `stream did not end in a terminal event — full stream: ${JSON.stringify(events)}`).toBe("complete");
+    expect((terminal.payload as Record<string, unknown>).message, "the stream's own complete payload must match the POST response").toEqual(postBody.message);
+  });
+
+  test("ZYR-A-67 the progress stream enforces the same project/session access it always would — a session in a project this user cannot reach is refused", async () => {
+    const otherTenant = await provisionRbacTenant("zyra-citations"); // any other tenant's project works for this check
+    test.skip(otherTenant === null, rbacSuiteSkipReason(otherTenant) ?? "");
+    const res = await asOwner.get(`/api/projects/${otherTenant!.mainProjectId}/agents/zyra/chat/sessions/00000000-0000-4000-8000-000000000000/turns/any-turn/events`, {
+      failOnStatusCode: false,
+    });
+    expect([401, 403, 404], `expected a refusal, got ${res.status()}: ${await res.text()}`).toContain(res.status());
+  });
+
+  test("ZYR-A-68 a turnId nobody ever registered gets one 'unknown' event, not a hang or an error", async () => {
+    const sessionId = await newSession("E2E progress unknown turn");
+    const res = await asOwner.get(url(`/chat/sessions/${sessionId}/turns/never-posted-${Date.now()}/events`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const events = parseSseEvents(await res.text());
+    expect(events).toEqual([{ kind: "unknown" }]);
+  });
+});
