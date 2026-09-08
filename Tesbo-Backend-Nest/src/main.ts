@@ -46,9 +46,13 @@ async function bootstrap() {
   // xlsx, and image attachments), so the binary download routes keep passing bytes through untouched.
   // Nothing here sets Content-Length by hand, which is what would otherwise break under compression.
   //
-  // Safe to sit in front of every route because this API has no SSE or long-poll streaming endpoint —
-  // Zyra's chat is polled by the client, not streamed. Reintroducing a streaming route means giving it
-  // `Cache-Control: no-transform` (which this filter honours) or it will buffer.
+  // Safe to sit in front of every route, including the one SSE endpoint this API now has (Zyra
+  // chat progress narration, GET .../turns/:turnId/events — see zyra-progress.service.ts): Nest's
+  // built-in SSE response writer (@nestjs/core/router/sse-stream.js) already sends
+  // `Cache-Control: ...no-transform`, which this filter's own no-transform check (line 296 of
+  // compression/index.js) honours by skipping compression for that response — no extra
+  // configuration needed here. The turn's actual answer (the POST response) is plain JSON and
+  // compresses normally like everything else.
   app.use(compression());
 
   app.use(

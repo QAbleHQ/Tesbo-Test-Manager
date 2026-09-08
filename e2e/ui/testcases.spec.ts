@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, request as pwRequest, test } from "@playwright/test";
+import { expect, request as pwRequest, test, type Locator } from "@playwright/test";
 import { env } from "../utils/env";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -25,6 +25,57 @@ test.describe("test case creation", () => {
     // scope to the panel itself to hit its dedicated close button.
     await panel.getByRole("button", { name: "Close panel" }).click();
     await expect(page.getByRole("button", { name: title })).toBeVisible();
+
+    // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const listRes = await api.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: title },
+      });
+      const list = await listRes.json();
+      const match = list.find((tc: { id: string; title: string }) => tc.title === title);
+      if (match) await api.delete(`/api/projects/${ctx.projectId}/testcases/${match.id}`);
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  // Regression coverage for: Postconditions, Component and Severity had real DB columns and were
+  // already wired through the single create/update routes and the import mapping, but the Create
+  // Test Case form itself never exposed inputs for them — so a user could only ever set them via
+  // the import wizard, never by hand. "View/Edit" is the same panel as Create here (openViewPanel
+  // sets panelMode to "edit" — see testcases/page.tsx), so re-opening the created case IS the
+  // View/Edit half of this flow.
+  test("Postconditions, Component and Severity can be set on create and are shown when the case is reopened", async ({ page }) => {
+    const title = `UI new fields test case ${Date.now()}`;
+    const postconditions = "User is redirected to the dashboard.";
+    const component = "Login";
+
+    /** The label isn't tied to its control via for/id, so this walks the DOM structure instead. */
+    const fieldControl = (label: string): Locator =>
+      page.locator(
+        `xpath=//label[normalize-space(text())="${label}"]/following-sibling::*[self::input or self::select or self::textarea]`,
+      );
+
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+    await page.getByRole("button", { name: "Add test case" }).first().click();
+
+    const panel = page.locator("aside");
+    await panel.getByPlaceholder("Describe what this test case validates").fill(title);
+    await fieldControl("Postconditions").fill(postconditions);
+    await fieldControl("Component").fill(component);
+    await fieldControl("Severity").selectOption("Medium");
+    await panel.getByRole("button", { name: "Create", exact: true }).click();
+
+    await expect(panel.getByText("Test case created successfully.")).toBeVisible();
+    await panel.getByRole("button", { name: "Close panel" }).click();
+
+    // Reopening the row loads the edit panel (View/Edit) — the three new fields must come back
+    // exactly as saved, proving the round trip through the API rather than just the form state.
+    await page.getByRole("button", { name: title }).click();
+    await expect(fieldControl("Postconditions")).toHaveValue(postconditions);
+    await expect(fieldControl("Component")).toHaveValue(component);
+    await expect(fieldControl("Severity")).toHaveValue("Medium");
 
     // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });

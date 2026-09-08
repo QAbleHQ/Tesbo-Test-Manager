@@ -162,6 +162,8 @@ test.describe("test case import wizard", () => {
       description: string;
       preconditions: string;
       steps: { stepNumber: number; action: string; expectedResult: string }[];
+      automationStatus: string;
+      attachments: string | null;
     };
 
   const listSuites = async (projectId: string) =>
@@ -173,10 +175,17 @@ test.describe("test case import wizard", () => {
 
   /* ─────────────────────────── wizard drivers ─────────────────────────── */
 
-  async function openWizard(page: Page, projectId: string): Promise<void> {
-    await page.goto(`/projects/${projectId}/testcases`);
+  /** Opens the wizard from wherever the page already is — does NOT navigate. Use this whenever the
+   *  current `?suiteId=` (set by clicking into a suite, not by a fresh goto) needs to be preserved;
+   *  openWizard() below re-navigates to the bare URL and would silently drop it. */
+  async function clickImport(page: Page): Promise<void> {
     await page.getByRole("button", { name: "Import", exact: true }).click();
     await expect(page.getByText("Upload a CSV or Excel file to import test cases.")).toBeVisible();
+  }
+
+  async function openWizard(page: Page, projectId: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/testcases`);
+    await clickImport(page);
   }
 
   async function chooseFile(page: Page, name: string, buffer: Buffer, mimeType: string): Promise<void> {
@@ -457,6 +466,92 @@ test.describe("test case import wizard", () => {
         { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
         { stepNumber: 2, action: "Submit empty credentials", expectedResult: "" },
       ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("builds a single step from separate Action/Expected Result columns when Steps isn't mapped", { tag: '@tesbo.testId("TES-TC-2103")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Action Expected Columns");
+      const { page, projectId } = fixture;
+      const title = `E2E Action Expected Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Action", "Expected Result"],
+          [[title, "Click the submit button", "The form is submitted"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Action"), "auto-maps by its own header, not into Steps").toHaveValue("1");
+      await expect(mappingFor(page, "Expected Result")).toHaveValue("2");
+      // Steps itself has nothing to map to — a file like this has no combined DSL column at all.
+      await expect(mappingFor(page, "Steps")).toHaveValue("");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([
+        { stepNumber: 1, action: "Click the submit button", expectedResult: "The form is submitted" },
+      ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("a mapped Steps column wins over Action/Expected Result when both are mapped", { tag: '@tesbo.testId("TES-TC-2104")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Steps Priority");
+      const { page, projectId } = fixture;
+      const title = `E2E Steps Priority Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Steps", "Action", "Expected Result"],
+          [[title, "Open the app => It loads", "This column must be ignored", "So must this one"]],
+        ),
+      );
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([{ stepNumber: 1, action: "Open the app", expectedResult: "It loads" }]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("maps Automation Type and Notes columns and imports them", { tag: '@tesbo.testId("TES-TC-2102")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Automation Notes");
+      const { page, projectId } = fixture;
+      const title = `E2E Automation Notes Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Automation Type", "Notes"],
+          [[title, "Automated", "Captured a screenshot of the failure"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Automation Type"), "the header auto-maps by its exact field label").toHaveValue("1");
+      await expect(mappingFor(page, "Notes")).toHaveValue("2");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.automationStatus).toBe("Automated");
+      expect(imported.attachments).toBe("Captured a screenshot of the failure");
     } finally {
       await disposeProject(fixture);
     }

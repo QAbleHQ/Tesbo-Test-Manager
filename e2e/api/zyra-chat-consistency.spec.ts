@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
 import { exec, literal, scalar } from "../utils/psql";
 import {
   loginAs,
@@ -434,5 +435,246 @@ test.describe("zyra chat ↔ repository consistency", () => {
     } finally {
       await asGuest.dispose();
     }
+  });
+});
+
+/*
+ * "Zyra says test cases were generated for identified coverage gaps, but nothing is created" —
+ * reported three times over (Basecamp 10231190735 and its recurrences). Every prior fix worked at
+ * the annotation/reply-guard layer and could only be verified against hand-built `applied` objects,
+ * never against a real turn — this suite's own header above says why: every path that decides
+ * whether to create runs behind a live provider call, and there was no fake one.
+ *
+ * This describe block is that fake provider (utils/fake-ai-server.ts) driving REAL turns through
+ * the REAL code: buildZyraChatDecision, the confirmation retry in sendZyraChatMessage,
+ * applyZyraChatOperations, and reconcileZyraReply. It asserts on the actual `ai_generation_requests`
+ * / `testcases` rows afterward, not on a hand-built `applied` object — the thing three prior fixes
+ * could not do.
+ */
+test.describe("zyra chat — confirmation retry (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-chat");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    // This describe block, unlike the one above, mints its own AI key per test (it needs one
+    // pointed at the fake server's baseUrl) — clean up so a re-run doesn't accumulate rows in this
+    // tenant's org, and so a stale key never gets picked over the one the next test allocates.
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  /** Points this tenant's project at the fake provider — same routes api/zyra.spec.ts uses. */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ZCC fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  async function sendMessage(sessionId: string, message: string): Promise<{ status: number; body: Record<string, unknown> }> {
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, failOnStatusCode: false });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  function liveCaseCount(): number {
+    return Number(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND deleted_at IS NULL;`));
+  }
+
+  function reviewRequestFor(sessionId: string): { taskStatus: string; generatedCount: number; payloadLength: number } | null {
+    const row = scalar(
+      `SELECT task_status || '|' || generated_count || '|' || jsonb_array_length(generated_payload) ` +
+        `FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    if (!row) return null;
+    const [taskStatus, generatedCount, payloadLength] = row.split("|");
+    return { taskStatus, generatedCount: Number(generatedCount), payloadLength: Number(payloadLength) };
+  }
+
+  const GAP_OFFER_REPLY =
+    "I reviewed the password-reset test cases and found 2 coverage gaps: no test for an expired reset " +
+    "token, and no test for a reset token being reused after it was already consumed. Would you like me " +
+    "to generate test cases for these gaps?";
+
+  const DRAFTS = [
+    {
+      title: "Expired reset token is rejected",
+      preconditions: "A password reset token exists and has expired.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the expired reset token with a new password", expectedResult: "The reset is rejected with an expired-token error" }]),
+      testData: "An expired reset token.",
+      expectedSummary: "Expired tokens cannot be used to reset a password.",
+      priority: "P2",
+      tags: ["zyra"],
+    },
+    {
+      title: "Reused reset token is rejected",
+      preconditions: "A password reset token has already been used once.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the already-used reset token again", expectedResult: "The reset is rejected because the token was already consumed" }]),
+      testData: "A reset token that was already redeemed once.",
+      expectedSummary: "A reset token cannot be reused after consumption.",
+      priority: "P2",
+      tags: ["zyra"],
+    },
+  ];
+
+  test("ZCC-B-01 confirming a gap-analysis offer stages test cases via the retry, without writing to testcases", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai retry");
+    const before = liveCaseCount();
+
+    // Turn 1: gap analysis, ending in an offer. Routes `answer` correctly (nothing to apply yet).
+    ai.queueReply({ reply: GAP_OFFER_REPLY, reasoningSummary: "Reviewed existing coverage and found 2 gaps.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn1 = await sendMessage(sessionId, "Review my password-reset test cases and identify coverage gaps.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    // Turn 2: "yes" — first response reproduces the exact reported bug (the model answers again
+    // without emitting any operation despite the confirmation), which is what the retry exists for.
+    ai.queueReply({ reply: "Sure — let me know and I can generate those for you.", reasoningSummary: "Acknowledged.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    // The retry's router response: routes to create now that the hint names the unresolved offer.
+    ai.queueReply({ reply: "", reasoningSummary: "Confirmed the offer; generating test cases for the identified gaps.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 2, exhaustive: false });
+    // The generation call zyraHandleChatCreate makes once routed to create.
+    ai.queueReply({ drafts: DRAFTS });
+    const turn2 = await sendMessage(sessionId, "yes");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    expect(ai.requests.length, "router (turn 1) + router (turn 2) + retry router + generation").toBe(4);
+
+    const review = reviewRequestFor(sessionId);
+    expect(review, "the confirmed generation should stage a review request").toBeTruthy();
+    expect(review!.taskStatus).toBe("in_review");
+    expect(review!.generatedCount).toBe(2);
+    expect(review!.payloadLength, "both drafts should be staged in one batch").toBe(2);
+
+    // The exact invariant three prior fixes needed and could never prove: staged, not created.
+    expect(liveCaseCount(), "confirming generation must stage, never write testcases directly").toBe(before);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(session.status()).toBe(200);
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+
+    expect(
+      String(lastAssistant.reasoningSummary || ""),
+      "the retry must leave an observable marker instead of silently succeeding or silently failing",
+    ).toContain("[confirmation-retry:fired]");
+    expect(String(lastAssistant.content || "")).toContain("staged for your review");
+    expect(String(lastAssistant.content || ""), "the reply must not claim permanence for a staged batch").not.toContain("Sorry! Nothing was saved");
+
+    const testcases = lastAssistant.testcases as Array<Record<string, unknown>>;
+    expect(testcases).toHaveLength(2);
+    for (const tc of testcases) {
+      expect(tc.id, "a staged row must not carry a real id").toBeFalsy();
+      expect(String(tc.action || "")).toBe("proposed-create");
+    }
+  });
+
+  test("ZCC-B-02 an unrelated 'yes' with no prior offer or proposal never triggers the retry", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai no antecedent");
+
+    // No offer, no proposal — just an ordinary answer with nothing pending.
+    ai.queueReply({ reply: "This project currently has 12 test cases covering login.", reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn1 = await sendMessage(sessionId, "How many test cases cover login?");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    // A bare "yes" with nothing to confirm. If the retry over-fired, it would consume a second
+    // queued reply here; queuing only one for this turn makes an over-fire fail loudly (the fake
+    // server falls back to its "no scripted response was queued" reply, which routes to `answer`
+    // with zero operations, so an over-fire would surface as an extra request rather than a subtle
+    // false pass).
+    ai.queueReply({ reply: "Sorry, I'm not sure what you'd like me to confirm.", reasoningSummary: "No pending offer or proposal in context.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn2 = await sendMessage(sessionId, "yes");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    expect(ai.requests.length, "no retry should fire with nothing pending to confirm").toBe(2);
+    expect(reviewRequestFor(sessionId)).toBeNull();
+  });
+
+  test("ZCC-B-03 an archive op targeting a testcase that no longer exists is named, not silently dropped", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai archive gap");
+
+    const kept = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: `E2E ZCC Archive Kept ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(kept.status()).toBe(201);
+    const keptExternalId = (await kept.json()).externalId as string;
+
+    // One op targets a real testcase, the other names an external id that was never created — the
+    // exact shape applyZyraChatOperations used to drop with no activity entry at all (see the
+    // comment at its `if (!found) continue;` — this test pins the fix, item 3 of this change).
+    ai.queueReply({
+      reply: "Archiving the confirmed test case and the one you mentioned.",
+      reasoningSummary: "Archiving 2 confirmed test cases.",
+      action: "archive",
+      actionType: "archive",
+      operations: [
+        { type: "archive", externalId: keptExternalId, reason: "confirmed" },
+        { type: "archive", externalId: "TC-DOES-NOT-EXIST", reason: "confirmed" },
+      ],
+      testcases: [],
+    });
+    const turn = await sendMessage(sessionId, "archive both of those, please");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const activity = (assistant.activity as Array<{ title?: string; detail?: string }>) ?? [];
+
+    expect(
+      activity.some((a) => /could not archive/i.test(String(a.title || "")) && /TC-DOES-NOT-EXIST/.test(String(a.detail || ""))),
+      `the dropped op must be named in activity — got: ${JSON.stringify(activity)}`,
+    ).toBe(true);
+    // The reply itself must surface the reason too (reconcileZyraReply's partial-count branch pulls
+    // it straight from activity), not just the activity log a user may never open.
+    expect(String(assistant.content || "")).toContain("1 of 2");
   });
 });

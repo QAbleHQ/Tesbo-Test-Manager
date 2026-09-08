@@ -273,6 +273,15 @@ export default function RequirementsPage() {
     return task;
   }
 
+  // Unlike activeTaskFor (which hides once a task is "done" so the Action column can hand off to
+  // "N saved"/"Regenerate"), this is the persistent, always-on label: every requirement is always
+  // somewhere in the Zyra pipeline, including before any task exists at all ("Not started").
+  function zyraStatusFor(req: Requirement): { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" } {
+    const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
+    if (!task) return { label: "Not started", tone: "neutral" };
+    return { label: taskStatusLabel(task.status), tone: taskStatusTone(task.status) };
+  }
+
   const loadTickets = useCallback(
     async (
       activeSource: Source,
@@ -610,7 +619,15 @@ export default function RequirementsPage() {
       {(syncError || jiraSync.error || linearSync.error) && (
         <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2.5 text-sm text-[var(--error-foreground)]">
           <span>{syncError || jiraSync.error || linearSync.error}</span>
-          <button type="button" onClick={() => setSyncError(null)} className="ml-3 text-[var(--error-foreground)] hover:opacity-80">
+          <button
+            type="button"
+            onClick={() => {
+              setSyncError(null);
+              jiraSync.clearError();
+              linearSync.clearError();
+            }}
+            className="ml-3 text-[var(--error-foreground)] hover:opacity-80"
+          >
             Dismiss
           </button>
         </div>
@@ -745,6 +762,7 @@ export default function RequirementsPage() {
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-20">Priority</th>
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-32">Assignee</th>
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-24">Coverage</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-28">Zyra Status</th>
                   <th className="text-right px-4 py-2.5 font-medium text-[var(--muted-soft)] w-64">Action</th>
                 </tr>
               </thead>
@@ -753,6 +771,7 @@ export default function RequirementsPage() {
                   const linked = isLinked(ticket);
                   const tcCount = tcCountFor(ticket);
                   const activeTask = activeTaskFor(ticket);
+                  const zyraStatus = zyraStatusFor(ticket);
                   return (
                     <React.Fragment key={ticket.id}>
                       <tr
@@ -800,6 +819,11 @@ export default function RequirementsPage() {
                             <span className="text-[11px] text-[var(--muted-soft)]">—</span>
                           )}
                         </td>
+                        <td className="px-4 py-2.5">
+                          <StatusChip tone={zyraStatus.tone} title="Zyra's test-generation status for this requirement">
+                            {zyraStatus.label}
+                          </StatusChip>
+                        </td>
                         <td className="px-4 py-2.5 text-right">
                           <div className="inline-flex items-center gap-2">
                             {linked && (
@@ -820,16 +844,13 @@ export default function RequirementsPage() {
                               </Link>
                             )}
                             {activeTask ? (
-                              <>
-                                <StatusChip tone={taskStatusTone(activeTask.status)}>{taskStatusLabel(activeTask.status)}</StatusChip>
-                                <Link
-                                  href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
-                                  onClick={(e) => e.stopPropagation()}
-                                  className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
-                                >
-                                  View task
-                                </Link>
-                              </>
+                              <Link
+                                href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View task
+                              </Link>
                             ) : linked ? (
                               <button
                                 type="button"
@@ -860,7 +881,7 @@ export default function RequirementsPage() {
                       </tr>
                       {expandedId === ticket.id && (
                         <tr key={`${ticket.id}-detail`} className="bg-[var(--surface-secondary)]/20">
-                          <td colSpan={8} className="px-4 py-4">
+                          <td colSpan={9} className="px-4 py-4">
                             <div className="space-y-3">
                               {ticket.description && (
                                 <div>

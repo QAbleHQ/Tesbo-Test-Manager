@@ -205,6 +205,12 @@ export const EVIDENCE_ALLOWED_EXTENSIONS = [
 
 export const EVIDENCE_MAX_FILE_SIZE = 25 * 1024 * 1024;
 
+// Mirrors the FilesInterceptor("files", 10, ...) maxCount on the bug- and execution-attachment
+// routes in legacy.controller.ts: Multer rejects a request carrying more files than this outright,
+// so a batch larger than the limit is split into multiple sequential requests (see
+// uploadBugAttachments in lib/api.ts) rather than sent as one request that the server refuses.
+export const EVIDENCE_MAX_FILES_PER_REQUEST = 10;
+
 // The picker's `accept` list. Advisory only — a viewer can always switch the dialog to "All files",
 // which is why validateEvidenceFile still runs on everything that comes back.
 export const EVIDENCE_ACCEPT_ATTRIBUTE = EVIDENCE_ALLOWED_EXTENSIONS.map((ext) => `.${ext}`).join(",");
@@ -275,5 +281,16 @@ export function validateEnvironmentUrl(value: string, existing: { url: string }[
   if (existing.some((item) => item.url.trim().toLowerCase() === trimmed.toLowerCase())) {
     return "This URL is already added to another environment";
   }
+  return "";
+}
+
+// Mirrors LegacyController.validateScheduleRunAt (Tesbo-Backend-Nest) — a datetime-local value has
+// no timezone offset of its own, so both sides parse it as the browser's/server's local wall-clock
+// time and compare it to "now" as an instant, which is timezone-safe either way.
+export function validateScheduleRunAt(value: string): string {
+  if (!value) return "Run At is required";
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return "Run At must be a valid date and time";
+  if (ms <= Date.now()) return "Run At must be in the future";
   return "";
 }

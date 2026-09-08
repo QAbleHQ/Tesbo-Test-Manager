@@ -236,6 +236,36 @@ test.describe("attachments", () => {
     expect(attachmentRows(tenant!)).toHaveLength(0);
   });
 
+  /*
+   * The client (BugEvidenceField / lib/api.ts's uploadBugAttachments) splits anything over the
+   * ten-file cap into sequential requests against the same bug rather than sending one request the
+   * cap above would refuse outright. This is the backend half of that fix: appending attachments
+   * across several requests must behave exactly like one request would — every file lands on the
+   * one bug, and issuing more than one attachment request must never touch the bugs table itself.
+   * (The frontend half — a failed batch must not cause a second bug to be created on retry — is a
+   * client state-machine concern with nothing to assert here; it's covered in
+   * e2e/ui/bugs.spec.ts's BUG-U-36/BUG-U-37.)
+   */
+  test("attachments split across multiple requests all land on the same bug, not a duplicate", async () => {
+    const suffix = Date.now();
+    const firstBatch = Array.from({ length: 10 }, (_, i) => textFile(`split-a-${suffix}-${i}.txt`));
+    const secondBatch = Array.from({ length: 3 }, (_, i) => textFile(`split-b-${suffix}-${i}.txt`));
+
+    const first = await upload(asQa, bugUploadUrl(), firstBatch);
+    expect(first.ok(), `first batch failed: ${first.status()} ${await first.text()}`).toBeTruthy();
+    const second = await upload(asQa, bugUploadUrl(), secondBatch);
+    expect(second.ok(), `second batch failed: ${second.status()} ${await second.text()}`).toBeTruthy();
+
+    const bug = await (await asOwner.get(`/api/bugs/${bugId}`)).json();
+    expect(bug.attachments).toHaveLength(13);
+    expect(bug.attachments.map((a: any) => a.fileName).sort()).toEqual(
+      [...firstBatch, ...secondBatch].map((f) => f.name).sort(),
+    );
+
+    const bugs = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/bugs`)).json();
+    expect(bugs.filter((b: any) => b.id === bugId)).toHaveLength(1);
+  });
+
   test("a request with no files is refused", { tag: '@tesbo.testId("TES-TC-56")' }, async () => {
     for (const api of [asQa, asOwner]) {
       const res = await api.post(executionUploadUrl(), {

@@ -92,6 +92,9 @@ const TESTCASE_TYPES = [
   "API", "UI", "Performance", "Security",
 ];
 const TESTCASE_AUTOMATION_TYPES = ["Automated", "Not Automated", "Can't Automate"];
+// Same vocabulary as bugs.severity (BUG_SEVERITIES in legacy.service.ts) for consistency, though the
+// testcases.severity column has no CHECK constraint enforcing it — free text is stored either way.
+const TESTCASE_SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
@@ -195,6 +198,7 @@ export default function TestCasesPage() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
+  const [postconditions, setPostconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
@@ -203,6 +207,8 @@ export default function TestCasesPage() {
   const [priority, setPriority] = useState("P2");
   const [status, setStatus] = useState("Draft");
   const [automationStatus, setAutomationStatus] = useState("Not Automated");
+  const [component, setComponent] = useState("");
+  const [severity, setSeverity] = useState("");
   const [suiteId, setSuiteId] = useState("");
   const [defaultTestcaseIdPrefix, setDefaultTestcaseIdPrefix] = useState("TC");
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("TC");
@@ -318,12 +324,37 @@ export default function TestCasesPage() {
   );
   const suiteNameMap = useMemo(() => {
     const byId = new Map(suites.map((s) => [s.id, s]));
-    return new Map(
-      suites.map((s) => {
-        const parent = s.parentId ? byId.get(s.parentId) : undefined;
-        return [s.id, parent ? `${parent.name} / ${s.name}` : s.name];
-      })
-    );
+    /*
+     * Walks the FULL ancestor chain, not just one level up.
+     *
+     * A one-level "Parent / Child" label was enough while a suite 3+ levels deep could never show
+     * up here at all (the parent-suite rollup bug meant a grandchild's case never appeared while
+     * browsing an ancestor). Now that fetch is recursive, such a row is reachable through this
+     * table/TSV export/suite picker for the first time — a one-level label would silently truncate
+     * to "Child / Grandchild", dropping "Root /" and reading as if it belonged one level higher than
+     * it actually does.
+     *
+     * Identical output for every suite at depth <= 2 (the only depths the tree widget itself can
+     * navigate to), so this changes nothing visible for the common case — it only completes the
+     * label for a depth the UI couldn't previously reach in the first place.
+     *
+     * `visited` guards against a cyclic parent_id chain: suites.parent_id has no write-time cycle
+     * guard (createSuite/updateSuite accept any parentId unconditionally — see legacy.service.ts),
+     * so this mirrors the same defensive stance the backend's recursive suite queries already take,
+     * just to stop a client-side loop rather than a SQL recursion.
+     */
+    function pathFor(id: string): string {
+      const segments: string[] = [];
+      const visited = new Set<string>();
+      let current = byId.get(id);
+      while (current && !visited.has(current.id)) {
+        segments.unshift(current.name);
+        visited.add(current.id);
+        current = current.parentId ? byId.get(current.parentId) : undefined;
+      }
+      return segments.join(" / ");
+    }
+    return new Map(suites.map((s) => [s.id, pathFor(s.id)]));
   }, [suites]);
   const selectedSuiteCases = suiteCases;
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
@@ -361,13 +392,18 @@ export default function TestCasesPage() {
   /*
    * The sum of the suite counts, which is NOT the size of the repository.
    *
-   * listSuites counts cases through `t.suite_id = s.id`, so a case with no suite (the create form's
-   * default, and what import produces when no suite column is mapped) is counted by no suite row at
-   * all. Only ever a fallback for before the summary lands — see repositoryTotalCount.
+   * Summed over rootSuites only, using each root's recursiveTestCaseCount (itself + every
+   * descendant, at any depth): a root's recursive count already includes its whole subtree, so
+   * summing every suite in the flat `suites` list — root and child alike — would double-count a
+   * case once under its own suite and again under every ancestor above it.
+   *
+   * Still misses unfiled cases (a case with no suite, the create form's default, and what import
+   * produces when no suite column is mapped, belongs to no suite row at all). Only ever a fallback
+   * for before the summary lands — see repositoryTotalCount.
    */
   const suiteCaseCountSum = useMemo(
-    () => suites.reduce((sum, suite) => sum + suite.testCaseCount, 0),
-    [suites]
+    () => rootSuites.reduce((sum, suite) => sum + suite.recursiveTestCaseCount, 0),
+    [rootSuites]
   );
   const activeFilterCount = [
     suiteSearch.trim() !== "",
@@ -464,6 +500,10 @@ export default function TestCasesPage() {
         limit: pageSize,
         offset: ((pageOverride ?? suiteCasesPage) - 1) * pageSize,
         suiteId: activeSuiteId ?? undefined,
+        // A suite in this tree stands for itself and everything nested under it (see the
+        // sidebar's recursiveTestCaseCount) — the list has to agree, or a parent suite with all
+        // its cases in sub-suites shows "No test cases found" while its own badge says otherwise.
+        includeDescendants: activeSuiteId ? true : undefined,
         status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
         priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
         type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
@@ -522,6 +562,7 @@ export default function TestCasesPage() {
     setTitle((data.title as string) ?? "");
     setDescription((data.description as string) ?? "");
     setPreconditions((data.preconditions as string) ?? "");
+    setPostconditions((data.postconditions as string) ?? "");
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
@@ -530,6 +571,8 @@ export default function TestCasesPage() {
     setPriority((data.priority as string) ?? "P2");
     setStatus((data.status as string) ?? "Draft");
     setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setComponent((data.component as string) ?? "");
+    setSeverity((data.severity as string) ?? "");
     setSuiteId((data.suiteId as string) ?? formSuiteId ?? "");
     setPanelJiraIssueKey((data.jiraIssueKey as string) ?? "");
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
@@ -539,6 +582,7 @@ export default function TestCasesPage() {
     setTitle("");
     setDescription("");
     setPreconditions("");
+    setPostconditions("");
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
     setEstimatedDuration("");
@@ -547,6 +591,8 @@ export default function TestCasesPage() {
     setPriority("P2");
     setStatus("Draft");
     setAutomationStatus("Not Automated");
+    setComponent("");
+    setSeverity("");
     setSuiteId(defaultSuiteId ?? formSuiteId ?? "");
     setTestcaseIdPrefix(defaultTestcaseIdPrefix);
     setPanelJiraIssueKey("");
@@ -666,6 +712,11 @@ export default function TestCasesPage() {
           limit: MAX_PAGE_SIZE,
           offset,
           suiteId: activeSuiteId ?? undefined,
+          // Must match loadSelectedSuiteCases' filter exactly — suiteCasesTotal (the "Select all N
+          // matching" label) is computed with this flag on, so leaving it off here under-selects: a
+          // parent suite whose cases live entirely on a child would page through zero rows and select
+          // nothing at all while the button claims all N were selected.
+          includeDescendants: activeSuiteId ? true : undefined,
           status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
           priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
           type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
@@ -925,6 +976,7 @@ export default function TestCasesPage() {
           title,
           description,
           preconditions,
+          postconditions,
           steps: JSON.stringify(steps),
           testData,
           estimatedDuration,
@@ -933,6 +985,8 @@ export default function TestCasesPage() {
           priority,
           status,
           automationStatus,
+          component,
+          severity,
           testcaseIdPrefix,
           customFieldValues,
         });
@@ -957,6 +1011,7 @@ export default function TestCasesPage() {
           title,
           description,
           preconditions,
+          postconditions,
           steps: JSON.stringify(steps),
           testData,
           estimatedDuration,
@@ -965,6 +1020,8 @@ export default function TestCasesPage() {
           priority,
           status,
           automationStatus,
+          component,
+          severity,
           customFieldValues,
         });
         setPanelSuccess("Test case updated successfully.");
@@ -1202,8 +1259,9 @@ export default function TestCasesPage() {
                       const children = childrenBySuiteId.get(suite.id) ?? [];
                       const hasChildren = children.length > 0;
                       const isExpanded = expandedSuiteIds.has(suite.id);
-                      const rollupCount =
-                        suite.testCaseCount + children.reduce((sum, c) => sum + c.testCaseCount, 0);
+                      // Server-computed: itself + every descendant, at any depth (not just this
+                      // suite's direct children) — see SuiteNode.recursiveTestCaseCount.
+                      const rollupCount = suite.recursiveTestCaseCount;
                       return (
                         <div key={suite.id} className="mb-0.5">
                           <div
@@ -1214,6 +1272,8 @@ export default function TestCasesPage() {
                             {hasChildren ? (
                               <button
                                 type="button"
+                                data-testid={`suite-expand-${suite.id}`}
+                                aria-label={isExpanded ? `Collapse ${suite.name}` : `Expand ${suite.name}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   toggleSuiteExpanded(suite.id);
@@ -1315,7 +1375,7 @@ export default function TestCasesPage() {
                                       {child.name}
                                     </button>
                                     <span className={`shrink-0 font-mono text-[10px] group-hover:hidden ${childActive ? "text-[var(--accent-light)] opacity-70" : "text-[var(--muted)]"}`}>
-                                      {child.testCaseCount}
+                                      {child.recursiveTestCaseCount}
                                     </span>
                                     <div className="hidden shrink-0 items-center gap-0.5 group-hover:flex">
                                       <button
@@ -1885,10 +1945,25 @@ export default function TestCasesPage() {
                           <FieldLabel>Estimated Duration</FieldLabel>
                           <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 90, 45 min, or 2h 30m" />
                         </Field>
+                        <Field>
+                          <FieldLabel>Component</FieldLabel>
+                          <Input type="text" value={component} onChange={(e) => setComponent(e.target.value)} placeholder="e.g. Login" />
+                        </Field>
+                        <Field>
+                          <FieldLabel>Severity</FieldLabel>
+                          <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
+                            <option value="">No severity</option>
+                            {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                          </Select>
+                        </Field>
                       </div>
                       <Field>
                         <FieldLabel>Preconditions</FieldLabel>
                         <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={2} />
+                      </Field>
+                      <Field>
+                        <FieldLabel>Postconditions</FieldLabel>
+                        <Textarea value={postconditions} onChange={(e) => setPostconditions(e.target.value)} rows={2} />
                       </Field>
                       <Field>
                         <FieldLabel>Test Data</FieldLabel>
@@ -1963,6 +2038,10 @@ export default function TestCasesPage() {
                             <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={3} />
                           </Field>
                           <Field>
+                            <FieldLabel>Postconditions</FieldLabel>
+                            <Textarea value={postconditions} onChange={(e) => setPostconditions(e.target.value)} rows={3} />
+                          </Field>
+                          <Field>
                             <FieldLabel>Test Data</FieldLabel>
                             <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
                           </Field>
@@ -2001,6 +2080,17 @@ export default function TestCasesPage() {
                             <Field>
                               <FieldLabel>Estimated Duration</FieldLabel>
                               <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 90, 45 min, or 2h 30m" />
+                            </Field>
+                            <Field>
+                              <FieldLabel>Component</FieldLabel>
+                              <Input type="text" value={component} onChange={(e) => setComponent(e.target.value)} placeholder="e.g. Login" />
+                            </Field>
+                            <Field>
+                              <FieldLabel>Severity</FieldLabel>
+                              <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
+                                <option value="">No severity</option>
+                                {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                              </Select>
                             </Field>
                           </div>
                           <Field>
@@ -2436,7 +2526,6 @@ export default function TestCasesPage() {
         projectId={projectId}
         open={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
-        defaultSuiteId={formSuiteId || undefined}
         onImported={(result) => {
           if (result.imported > 0) {
             void loadData();

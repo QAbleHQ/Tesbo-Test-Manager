@@ -54,6 +54,11 @@ const EXPORT_HEADERS = [
  * active custom field columns are appended. Corrected to match the endpoint's actual output: this
  * previously omitted "postconditions" and "estimatedDuration", which the endpoint has always
  * included, so TES-TC-210/211/212 were asserting a stale header list rather than the real one.
+ *
+ * "automationStatus" and "attachments" (labelled "Automation Type" and "Notes" in the Map Columns
+ * UI) were added so the template, the import mapping and the Create Test Case form expose the same
+ * field set — both already had DB columns and worked through the single-create/update routes, but
+ * were silently dropped by the bulk import path (see PreparedImportRow/insertImportChunk).
  */
 const TEMPLATE_HEADERS = [
   "title",
@@ -69,6 +74,8 @@ const TEMPLATE_HEADERS = [
   "suite",
   "component",
   "estimatedDuration",
+  "automationStatus",
+  "attachments",
 ];
 
 const RUN_EXPORT_HEADERS = [
@@ -442,6 +449,11 @@ test.describe("import / export", () => {
     expect(records[0].steps).toContain(" => ");
     expect(records[0].steps).toContain(" | ");
     expect(records[0].title).toBeTruthy();
+    // A worked value for every base column, so filling the template in unmodified round-trips —
+    // in particular Automation Type must be one of TESTCASE_AUTOMATION_TYPES, since the importer
+    // stores whatever string it's given with no server-side enum check.
+    expect(records[0].automationStatus).toBe("Not Automated");
+    expect(records[0].attachments).toBeTruthy();
   });
 
   test("format=xlsx returns the same template as a workbook", { tag: '@tesbo.testId("TES-TC-211")' }, async () => {
@@ -672,6 +684,71 @@ test.describe("import / export", () => {
     const countAfter = Array.isArray(after) ? after.length : after.total;
     expect(countAfter, "a refused request must not create anything").toBe(countBefore);
   });
+
+  test(
+    "imports Automation Type and Notes, which the bulk endpoint used to silently drop",
+    { tag: '@tesbo.testId("TES-TC-2100")' },
+    async () => {
+      // Both columns already had real DB support and worked through the single create/update
+      // routes (LegacyService.insertTestCaseWithClient/updateTestCaseWithClient) — PreparedImportRow
+      // and insertImportChunk just never carried them, so a file mapping "Automation Type" or "Notes"
+      // imported every other column correctly and quietly discarded these two.
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Automation Notes ${stamp}`);
+      const title = `E2E Import Automation Notes ${stamp}`;
+
+      const res = await asOwner.post(`/api/projects/${project}/testcases/import`, {
+        data: {
+          rows: [
+            {
+              rowNumber: 1,
+              title,
+              automationStatus: "Automated",
+              attachments: "Screenshot attached: login.png",
+            },
+          ],
+        },
+      });
+      expect(res.status()).toBe(200);
+      const body = await res.json();
+      expect(body.errors).toEqual([]);
+      expect(body.imported).toBe(1);
+
+      const list = await (
+        await asOwner.get(`/api/projects/${project}/testcases`, { params: { search: title } })
+      ).json();
+      const created = list.find((tc: { title: string }) => tc.title === title);
+      expect(created, "the row must have actually been created").toBeTruthy();
+
+      const full = await (await asOwner.get(`/api/projects/${project}/testcases/${created.id}`)).json();
+      expect(full.automationStatus).toBe("Automated");
+      expect(full.attachments).toBe("Screenshot attached: login.png");
+    },
+  );
+
+  test(
+    "an unmapped Automation Type/Notes row still imports, defaulting Automation Type and leaving Notes blank",
+    { tag: '@tesbo.testId("TES-TC-2101")' },
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Import Automation Notes Default ${stamp}`);
+      const title = `E2E Import Automation Notes Default ${stamp}`;
+
+      const res = await asOwner.post(`/api/projects/${project}/testcases/import`, {
+        data: { rows: [{ rowNumber: 1, title }] },
+      });
+      expect(res.status()).toBe(200);
+      expect((await res.json()).imported).toBe(1);
+
+      const list = await (
+        await asOwner.get(`/api/projects/${project}/testcases`, { params: { search: title } })
+      ).json();
+      const created = list.find((tc: { title: string }) => tc.title === title);
+      const full = await (await asOwner.get(`/api/projects/${project}/testcases/${created.id}`)).json();
+      expect(full.automationStatus).toBe("Not Automated");
+      expect(full.attachments ?? "").toBe("");
+    },
+  );
 
   /* ───────────────────────── suite placement on import ─────────────────────────
    *

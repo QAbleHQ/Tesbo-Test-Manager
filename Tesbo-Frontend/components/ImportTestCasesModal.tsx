@@ -62,20 +62,29 @@ const RESULT_STATUS_STYLES: Record<ImportResultStatus, { iconPath: string; conta
   },
 };
 
+// Same order the Create Test Case form uses (testcases/page.tsx), field for field, so Map Columns
+// reads as the same form rather than a differently-arranged relist of the same fields.
 const IMPORTABLE_FIELDS: { key: string; label: string; required?: boolean }[] = [
   { key: "title", label: "Title", required: true },
   { key: "description", label: "Description" },
+  { key: "suite", label: "Suite" },
+  { key: "type", label: "Type" },
+  { key: "priority", label: "Priority" },
+  { key: "status", label: "Status" },
+  { key: "automationStatus", label: "Automation Type" },
+  { key: "estimatedDuration", label: "Estimated Duration" },
+  { key: "component", label: "Component" },
+  { key: "severity", label: "Severity" },
   { key: "preconditions", label: "Preconditions" },
   { key: "postconditions", label: "Postconditions" },
-  { key: "steps", label: "Steps" },
   { key: "testData", label: "Test Data" },
-  { key: "priority", label: "Priority" },
-  { key: "severity", label: "Severity" },
-  { key: "type", label: "Type" },
-  { key: "status", label: "Status" },
-  { key: "suite", label: "Suite" },
-  { key: "component", label: "Component" },
-  { key: "estimatedDuration", label: "Estimated Duration" },
+  { key: "steps", label: "Steps" },
+  // Alternative to "Steps" for a file that carries exactly one step as two plain columns instead
+  // of the "action => expected result" DSL — used only when "Steps" itself isn't mapped (see
+  // handleImport). Not a per-step field: a file needing several steps still needs the Steps column.
+  { key: "action", label: "Action" },
+  { key: "expectedResult", label: "Expected Result" },
+  { key: "attachments", label: "Notes" },
 ];
 
 interface Props {
@@ -83,15 +92,9 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onImported: (result: ImportResult) => void;
-  // The suite the user was browsing when they opened Import, if any. Rows that leave "Suite Name"
-  // blank land directly in it (matching how "Add test case" already defaults to the currently open
-  // suite instead of always landing rows at the root); rows that do name a suite/component get that
-  // structure created as children of it instead of at the project root, so importing from inside a
-  // suite nests the file's contents under it rather than scattering new suites at the top level.
-  defaultSuiteId?: string;
 }
 
-export default function ImportTestCasesModal({ projectId, open, onClose, onImported, defaultSuiteId }: Props) {
+export default function ImportTestCasesModal({ projectId, open, onClose, onImported }: Props) {
   const [step, setStep] = useState<ImportStep>("upload");
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -148,15 +151,22 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       description: ["description", "desc", "details"],
       preconditions: ["preconditions", "precondition", "prerequisites", "prerequisite"],
       postconditions: ["postconditions", "postcondition"],
-      steps: ["steps", "teststeps", "action", "actions"],
+      // "action"/"actions" moved off Steps and onto the dedicated Action field below — a header
+      // literally named "Action" is far more likely to be one plain single-step column than the
+      // multi-step "action => expected result" DSL Steps expects.
+      steps: ["steps", "teststeps"],
+      action: ["action", "actions", "step", "teststep"],
+      expectedResult: ["expectedresult", "expected", "expectedoutcome"],
       testData: ["testdata", "data", "inputdata"],
       priority: ["priority", "prio"],
       severity: ["severity"],
       type: ["type", "testtype", "casetype"],
       status: ["status", "state"],
+      automationStatus: ["automationstatus", "automationtype", "automation", "automated"],
       suite: ["suite", "suitename", "folder", "foldername", "module", "modulename"],
       component: ["component", "componentname", "subfolder", "subfoldername", "feature", "area"],
       estimatedDuration: ["estimatedduration", "duration", "estimate"],
+      attachments: ["notes", "attachment", "attachments", "comments"],
     };
     for (const field of IMPORTABLE_FIELDS) {
       const normalized = normalizeHeader(field.key);
@@ -394,6 +404,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
         }
 
         const stepsText = valueFor("steps");
+        const actionText = valueFor("action");
         const steps = stepsText
           // Each step segment may embed its expected result as "action => expected result" —
           // the same convention Tesbo's own export uses (see exportTestCases on the backend) —
@@ -406,7 +417,12 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                 expectedResult: resultParts.join(" => ").trim(),
               };
             }).filter((step) => step.action)
-          : [];
+          // A file with one step per plain "Action"/"Expected Result" column rather than the DSL
+          // above — only consulted when Steps itself isn't mapped, so a file that maps both is not
+          // ambiguous about which one wins.
+          : actionText
+            ? [{ stepNumber: 1, action: actionText, expectedResult: valueFor("expectedResult") }]
+            : [];
 
         rows.push({
           rowNumber,
@@ -420,17 +436,21 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
           severity: valueFor("severity") || undefined,
           type: valueFor("type") || "Functional",
           status: valueFor("status") || "Draft",
+          automationStatus: valueFor("automationStatus") || undefined,
           suite: valueFor("suite"),
           component: valueFor("component") || undefined,
           estimatedDuration: valueFor("estimatedDuration") || undefined,
+          attachments: valueFor("attachments") || undefined,
           customFieldValues,
         });
       }
 
       // Skipped rather than sent when every row was rejected above — the endpoint refuses an empty
-      // batch, and there is nothing left for it to do anyway.
+      // batch, and there is nothing left for it to do anyway. No defaultSuiteId is ever sent: a row
+      // with no Suite column of its own lands at the project root, full stop — see importTestCases
+      // in legacy.service.ts.
       const server = rows.length
-        ? await importTestCases(projectId, { rows, defaultSuiteId })
+        ? await importTestCases(projectId, { rows })
         : { imported: 0, errors: [] as { row: number; message: string }[], expandSuiteIds: [] as string[] };
 
       const res: ImportResult = {

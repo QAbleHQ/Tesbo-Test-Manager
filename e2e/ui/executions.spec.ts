@@ -183,6 +183,71 @@ test.describe("auto bug-filing on Failed", () => {
       await cleanUp(cycle.id, testcase.id);
     }
   });
+
+  /*
+   * Root-cause regression for "duplicate bug records created when saving a bug with more than 10
+   * attachments": createBug() succeeded, the attachments request that followed it failed (originally
+   * because more than ten files hit the server's per-request cap in one shot; here forced directly so
+   * the test doesn't depend on file-count timing), and the dialog stayed open with no error shown at
+   * all (handleBugSubmit had no catch block) — inviting a retry that called createBug() again and
+   * produced a duplicate. LogBugDialog.tsx now shows the failure and remembers the bug id from the
+   * failed attempt, so File Bug clicked again resumes the upload instead of filing a second bug.
+   */
+  test("a retry after a failed attachment upload does not create a duplicate bug", async ({ page }) => {
+    const title = `UI Bug Dialog Duplicate Guard ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    let attempt = 0;
+    await page.route("**/bugs/*/attachments", (route) => {
+      attempt += 1;
+      // The first attachment request fails; the retry's requests go through for real.
+      if (attempt === 1) {
+        return route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Simulated upload failure" }),
+        });
+      }
+      return route.continue();
+    });
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("combobox").first().selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles(
+        Array.from({ length: 12 }, (_, i) => ({
+          name: `evidence-${i}.png`,
+          mimeType: "image/png",
+          buffer: Buffer.from(`file contents ${i}`),
+        })),
+      );
+
+      const submit = page.getByRole("button", { name: "File Bug" });
+      await submit.click();
+      await expect(page.getByTestId("log-bug-error")).toBeVisible();
+      // The dialog stays open with the same staged files — exactly what invited the original defect.
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await submit.click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const matches = bugs.filter((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(matches, "the retry must reuse the bug from the failed attempt, not create a second one").toHaveLength(1);
+
+        const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
+        expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(12);
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
 });
 
 /*
@@ -258,6 +323,107 @@ test.describe("assigning a test execution", () => {
     } finally {
       await api.dispose();
       await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
+test.describe("bulk assignment (run detail)", () => {
+  async function setUpCycleWithTwoCases(prefix: string) {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = Date.now();
+    const cycle = await (
+      await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bulk Assign Cycle ${stamp}` } })
+    ).json();
+    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
+    const testcaseA = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} A ${stamp}` } })
+    ).json();
+    const testcaseB = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} B ${stamp}` } })
+    ).json();
+    await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+    await api.dispose();
+    return { cycle, testcaseA, testcaseB };
+  }
+
+  /*
+   * Before this: the run detail's bulk-selection toolbar offered only "Remove from run" — no way to
+   * assign several selected test cases to one person at once, despite the backend's bulk-assign
+   * route (executions/bulk-assign, covered at the API level in execution-ops.spec.ts EXO-A-04)
+   * already existing and working. This is the UI half: select several rows, assign them together,
+   * and the table reflects the new assignee immediately without a reload.
+   */
+  test("selecting several test cases and assigning them to a member updates all of them at once", async ({ page }) => {
+    const { cycle, testcaseA, testcaseB } = await setUpCycleWithTwoCases("UI Bulk Assign Case");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("checkbox", { name: `Select ${testcaseA.title}` }).check();
+      await page.getByRole("checkbox", { name: `Select ${testcaseB.title}` }).check();
+      await expect(page.getByText("2 selected")).toBeVisible();
+
+      await page.getByRole("button", { name: "Assign to" }).click();
+      await page.getByRole("combobox", { name: "Assign selected test cases to" }).selectOption(me.userId);
+      await page.getByRole("button", { name: "Assign 2" }).click();
+
+      // Selection clears and the modal closes on success, with no page reload in between.
+      await expect(page.getByText("2 selected")).toBeHidden();
+      // Scoped to each case's own row, not a bare page-wide text search — the run's own owner badge
+      // in the header can carry the same display name (this account both created and is assigned
+      // the run), which would otherwise make a page-wide count a false positive.
+      const displayName = me.name || me.email;
+      await expect(page.getByRole("row").filter({ hasText: testcaseA.title })).toContainText(displayName);
+      await expect(page.getByRole("row").filter({ hasText: testcaseB.title })).toContainText(displayName);
+
+      const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(executions.every((e: { assigneeId: string }) => e.assigneeId === me.userId)).toBeTruthy();
+    } finally {
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("individual assignment still works after a bulk assignment on the same run", async ({ page }) => {
+    const { cycle, testcaseA, testcaseB } = await setUpCycleWithTwoCases("UI Mixed Assign Case");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("checkbox", { name: `Select ${testcaseA.title}` }).check();
+      await page.getByRole("checkbox", { name: `Select ${testcaseB.title}` }).check();
+      await page.getByRole("button", { name: "Assign to" }).click();
+      await page.getByRole("combobox", { name: "Assign selected test cases to" }).selectOption(me.userId);
+      await page.getByRole("button", { name: "Assign 2" }).click();
+      await expect(page.getByText("2 selected")).toBeHidden();
+
+      // Unassign just one of the two rows through the existing per-row drawer. Waiting on the
+      // save request itself (not on the drawer closing/the row text hiding, which is a separate,
+      // pre-existing flake unrelated to bulk assignment) keeps this test scoped to what it's
+      // actually verifying: that per-row assignment still works the same after a bulk assignment.
+      await page.getByText(testcaseA.title).first().click();
+      await expect(page.getByRole("combobox", { name: "Assigned to" })).toHaveValue(me.userId);
+      await page.getByRole("combobox", { name: "Assigned to" }).selectOption("");
+      const [patchRes] = await Promise.all([
+        page.waitForResponse((res) => /\/executions\/[0-9a-f-]{36}$/.test(res.url()) && res.request().method() === "PATCH"),
+        page.getByRole("button", { name: "Save" }).first().click(),
+      ]);
+      expect(patchRes.ok()).toBeTruthy();
+
+      const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      const execA = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseA.id);
+      const execB = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseB.id);
+      expect(execA.assigneeId, "the bulk-then-individual case is cleared").toBeNull();
+      expect(execB.assigneeId, "the untouched bulk-assigned case keeps its assignee").toBe(me.userId);
+    } finally {
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+      await api.dispose();
     }
   });
 });
