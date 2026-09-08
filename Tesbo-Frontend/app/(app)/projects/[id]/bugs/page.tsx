@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { IconPencil, IconTrash } from "@tabler/icons-react";
 import {
   authMe,
@@ -455,6 +455,15 @@ export default function BugsPage() {
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
   const [createAssigneeId, setCreateAssigneeId] = useState("");
   const [creating, setCreating] = useState(false);
+  /*
+   * Basecamp: >10 attachments made createBug() succeed, then the (single, unbatched)
+   * uploadBugAttachments() request get rejected by the server's per-request file cap — leaving the
+   * modal open with an error and the bug already created. Retrying resubmitted the whole form,
+   * calling createBug() again and producing a duplicate bug. This ref remembers the bug created by
+   * the in-flight (or most recently failed) submit so a retry only resumes the attachment upload
+   * instead of creating a second bug; resetCreate() clears it once the submit is done or abandoned.
+   */
+  const createdBugIdRef = useRef<string | null>(null);
 
   /* edit modal */
   const [editBug, setEditBug] = useState<BugItem | null>(null);
@@ -590,6 +599,7 @@ export default function BugsPage() {
 
   /* reset create modal state */
   function resetCreate() {
+    createdBugIdRef.current = null;
     setShowCreate(false);
     setCreateError(null);
     setCreateTitle("");
@@ -609,28 +619,42 @@ export default function BugsPage() {
   /* create */
   async function handleCreate() {
     if (!createTitle.trim() || (hasTestRuns && !createLinks.length)) return;
+    // Belt-and-suspenders alongside the button's `disabled={creating}`: guards a re-entrant call
+    // (e.g. a key-repeat Enter) that lands before the disabled state has re-rendered.
+    if (creating) return;
     const selfLogged = (jiraConnected || linearConnected) && createDestination === "SELF";
     setCreating(true);
     setCreateError(null);
     try {
-      const bug = await createBug(projectId, {
-        title: createTitle.trim(),
-        description: createDesc.trim(),
-        severity: createSeverity,
-        priority: createPriority || null,
-        assigneeId: createAssigneeId || null,
-        externalUrl: selfLogged ? createUrl.trim() : undefined,
-        integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
-        integrationIssueKey: null,
-        betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
-        links: createLinks.map((link) => ({
-          testcaseId: link.testcaseId,
-          cycleId: link.cycleId,
-          executionId: link.executionId,
-        })),
-      });
+      // A retry after a failed attachment upload must not create a second bug: reuse the bug
+      // created by the previous attempt (if any) instead of calling createBug() again.
+      let bugId = createdBugIdRef.current;
+      if (!bugId) {
+        const bug = await createBug(projectId, {
+          title: createTitle.trim(),
+          description: createDesc.trim(),
+          severity: createSeverity,
+          priority: createPriority || null,
+          assigneeId: createAssigneeId || null,
+          externalUrl: selfLogged ? createUrl.trim() : undefined,
+          integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
+          integrationIssueKey: null,
+          betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
+          links: createLinks.map((link) => ({
+            testcaseId: link.testcaseId,
+            cycleId: link.cycleId,
+            executionId: link.executionId,
+          })),
+        });
+        bugId = bug.id;
+        createdBugIdRef.current = bugId;
+      }
       if (createEvidenceMode === "FILES" && createStagedFiles.length) {
-        await uploadBugAttachments(projectId, bug.id, createStagedFiles);
+        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
+        // only resends the files that never made it, not ones already attached to the bug.
+        await uploadBugAttachments(projectId, bugId, createStagedFiles, (batch) => {
+          setCreateStagedFiles((prev) => prev.slice(batch.length));
+        });
       }
       resetCreate();
       load();
@@ -702,7 +726,11 @@ export default function BugsPage() {
         })),
       });
       if (editEvidenceMode === "FILES" && editStagedFiles.length) {
-        await uploadBugAttachments(projectId, editBug.id, editStagedFiles);
+        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
+        // only resends the files that never made it, not ones already attached to the bug.
+        await uploadBugAttachments(projectId, editBug.id, editStagedFiles, (batch) => {
+          setEditStagedFiles((prev) => prev.slice(batch.length));
+        });
       }
       setEditBug(null);
       load();

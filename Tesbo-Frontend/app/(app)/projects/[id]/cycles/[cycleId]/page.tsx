@@ -27,6 +27,7 @@ import {
   IconShare,
   IconTag,
   IconTrash,
+  IconUserPlus,
   IconX,
 } from "@tabler/icons-react";
 import {
@@ -35,6 +36,7 @@ import {
   updateTestRun,
   listCycleExecutions,
   updateExecution,
+  bulkAssignExecutions,
   addTestCasesToRun,
   removeTestCaseFromRun,
   removeTestCasesFromRun,
@@ -323,6 +325,10 @@ export default function TestRunDetailPage() {
   const [bulkRemoveOpen, setBulkRemoveOpen] = useState(false);
   const [bulkRemoving, setBulkRemoving] = useState(false);
   const [bulkRemoveError, setBulkRemoveError] = useState<string | null>(null);
+  const [bulkAssignOpen, setBulkAssignOpen] = useState(false);
+  const [bulkAssignAssigneeId, setBulkAssignAssigneeId] = useState("");
+  const [bulkAssigning, setBulkAssigning] = useState(false);
+  const [bulkAssignError, setBulkAssignError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [memberNames, setMemberNames] = useState<Record<string, string>>({});
   const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
@@ -631,6 +637,30 @@ export default function TestRunDetailPage() {
       setBulkRemoveError(err instanceof Error ? err.message : "Failed to remove the selected test cases.");
     } finally {
       setBulkRemoving(false);
+    }
+  }
+
+  /* ───── Assign selected test cases ─────
+     selectedRunCaseIds is keyed by testcaseId (same set the remove action uses); the bulk-assign
+     endpoint takes execution ids, so they're resolved through the already-loaded executions list. */
+  async function handleBulkAssign() {
+    const executionIds = executions
+      .filter((e) => selectedRunCaseIds.has(e.testcaseId))
+      .map((e) => e.id);
+    if (!executionIds.length || bulkAssigning) return;
+    setBulkAssigning(true);
+    try {
+      const assigneeId = bulkAssignAssigneeId || null;
+      await bulkAssignExecutions(cycleId, { executionIds, assigneeId });
+      const updated = new Set(executionIds);
+      setExecutions((prev) => prev.map((e) => (updated.has(e.id) ? { ...e, assigneeId } : e)));
+      setSelectedRunCaseIds(new Set());
+      setBulkAssignError(null);
+      setBulkAssignOpen(false);
+    } catch (err) {
+      setBulkAssignError(err instanceof Error ? err.message : "Failed to assign the selected test cases.");
+    } finally {
+      setBulkAssigning(false);
     }
   }
 
@@ -1073,6 +1103,19 @@ export default function TestRunDetailPage() {
               </button>
               <button
                 type="button"
+                data-testid="run-bulk-assign"
+                onClick={() => {
+                  setBulkAssignError(null);
+                  setBulkAssignAssigneeId("");
+                  setBulkAssignOpen(true);
+                }}
+                className="flex items-center gap-1 font-medium text-[var(--brand-primary)] hover:underline"
+              >
+                <IconUserPlus size={13} />
+                Assign to
+              </button>
+              <button
+                type="button"
                 onClick={() => setSelectedRunCaseIds(new Set())}
                 className="ml-auto flex items-center gap-1 text-[var(--muted)] hover:text-[var(--foreground)]"
               >
@@ -1275,6 +1318,40 @@ export default function TestRunDetailPage() {
           </Button>
           <Button variant="danger" onClick={handleRemoveSelectedCases} disabled={bulkRemoving}>
             {bulkRemoving ? "Removing…" : `Remove ${selectedRunCaseIds.size}`}
+          </Button>
+        </div>
+      </Modal>
+
+      <Modal
+        open={bulkAssignOpen}
+        onClose={() => setBulkAssignOpen(false)}
+        title="Assign test cases"
+        className="max-w-[460px]"
+      >
+        <p className="text-[13px] text-[var(--muted)]">
+          Assign <span className="font-semibold text-[var(--foreground)]">{selectedRunCaseIds.size}</span> test case
+          {selectedRunCaseIds.size === 1 ? "" : "s"} to:
+        </p>
+        <div className="mt-3">
+          <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Assigned to</label>
+          <Select value={bulkAssignAssigneeId} onChange={(e) => setBulkAssignAssigneeId(e.target.value)} aria-label="Assign selected test cases to">
+            <option value="">Unassigned</option>
+            {members.map((m) => (
+              <option key={m.userId} value={m.userId}>
+                {m.name || m.email}
+              </option>
+            ))}
+          </Select>
+        </div>
+        {bulkAssignError && (
+          <p className="mt-3 text-[12.5px] text-[var(--error-foreground)]">{bulkAssignError}</p>
+        )}
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setBulkAssignOpen(false)} disabled={bulkAssigning}>
+            Cancel
+          </Button>
+          <Button onClick={handleBulkAssign} disabled={bulkAssigning}>
+            {bulkAssigning ? "Assigning…" : `Assign ${selectedRunCaseIds.size}`}
           </Button>
         </div>
       </Modal>
