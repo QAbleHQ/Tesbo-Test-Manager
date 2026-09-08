@@ -770,6 +770,21 @@ export class LegacyController {
     return [];
   }
 
+  // Nothing is persisted yet (see the comment above), but a one-time schedule's runAt is still
+  // validated up front: a caller bypassing the UI's own datetime-local `min` and submit-time check
+  // must not be able to submit a past or malformed instant just because the route 501s regardless —
+  // the rule has to hold at the API, not only in the form that happens to enforce it today.
+  private validateScheduleRunAt(body: Record<string, any>): void {
+    if (body?.scheduleType !== "one_time") return;
+    const raw = body?.runAt;
+    if (typeof raw !== "string" || !raw || Number.isNaN(Date.parse(raw))) {
+      throw new BadRequestException({ error: "Run At must be a valid date and time" });
+    }
+    if (Date.parse(raw) <= Date.now()) {
+      throw new BadRequestException({ error: "Run At must be in the future" });
+    }
+  }
+
   @Post("/api/projects/:projectId/cycles/schedules")
   async createSchedule(
     @Req() req: AuthenticatedRequest,
@@ -777,6 +792,7 @@ export class LegacyController {
     @Body() body: Record<string, any>
   ) {
     await this.legacy.requireProjectAccess(req.userId, projectId);
+    this.validateScheduleRunAt(body);
     throw new NotImplementedException({ error: "Scheduled runs are not available yet" });
   }
 

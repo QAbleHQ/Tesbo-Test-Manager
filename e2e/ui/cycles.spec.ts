@@ -524,3 +524,77 @@ test.describe("Test Run filters — concurrent updates, pagination boundary, and
     }
   });
 });
+
+/*
+ * Schedule Run — "Run At" must reject a past date/time and accept a future one.
+ *
+ * Scheduled runs themselves are not implemented server-side (see execution-ops.spec.ts's
+ * EXO-A-07/08b) — the create route always answers 501 regardless of a valid body. This section is
+ * scoped to what IS real today: the "Run At" field's own validation, both client-side (the form
+ * must never even send a past instant) and server-side (LegacyController.validateScheduleRunAt,
+ * which runs before the 501 so it cannot be bypassed by a caller skipping the form).
+ */
+test.describe("Schedule Run — Run At validation", () => {
+  let cycleId: string;
+  let cycleName: string;
+
+  test.beforeAll(async () => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      cycleName = `E2E ScheduleRunAt ${Date.now()}`;
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: cycleName } })
+      ).json();
+      cycleId = cycle.id;
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test.afterAll(async () => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  /** The "Test Run" select isn't tied to its label via for/id, so this walks the DOM structure. */
+  const testRunSelect = (page: Page) =>
+    page.locator('xpath=//label[normalize-space(text())="Test Run"]/following-sibling::select');
+
+  test("a past Run At is blocked client-side with an inline error, before any request is sent", { tag: '@tesbo.testId("TES-TC-2203")' }, async ({ page }) => {
+    let scheduleRequestSent = false;
+    await page.route("**/api/projects/*/cycles/schedules", async (route) => {
+      if (route.request().method() === "POST") scheduleRequestSent = true;
+      await route.continue();
+    });
+
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Past Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    // A clearly past datetime-local value — not merely a different day, to also cover "today with
+    // an earlier time" would need the current clock; a full year in the past is unambiguous either way.
+    await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
+    await page.getByRole("button", { name: "Create Schedule" }).click();
+
+    await expect(page.getByText("Run At must be in the future")).toBeVisible();
+    expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
+  });
+
+  test("a future Run At passes client validation and reaches the server (which then 501s)", { tag: '@tesbo.testId("TES-TC-2204")' }, async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Future Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const futureValue = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+    await page.locator('input[type="datetime-local"]').fill(futureValue);
+    await page.getByRole("button", { name: "Create Schedule" }).click();
+
+    // Client-side validation passes; the still-unimplemented backend is what answers, honestly.
+    await expect(page.getByText("Scheduled runs are not available yet")).toBeVisible();
+    await expect(page.getByText("Run At must be in the future")).toBeHidden();
+  });
+});
