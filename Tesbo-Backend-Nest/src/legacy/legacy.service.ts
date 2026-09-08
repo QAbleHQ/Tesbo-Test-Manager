@@ -13733,7 +13733,7 @@ export class LegacyService implements OnModuleInit {
       const content = this.zyraRowContent(row);
       if (String(row?.role) !== "assistant") return `user: ${content}`;
       const rows = normalizeJsonArray(row?.testcases);
-      const saved = rows.filter((item) => item && (item as Body).id);
+      const saved = rows.filter((item) => this.zyraRowPersisted(item));
       const externalIds = saved.map((item) => String((item as Body).externalId || "")).filter(Boolean);
       /*
        * The annotation says what the turn PERSISTED. Basecamp 10231190735 and 10231274688 showed
@@ -13789,16 +13789,41 @@ export class LegacyService implements OnModuleInit {
   // decides whether a turn that answered with zero operations had something concrete to confirm.
   // Returns null for a user row, a row that actually persisted something, or a row that neither
   // proposed nor offered anything — i.e. there is nothing for a later "yes" to resolve against.
+  // Shared by zyraTranscript's "saved N testcase(s)" note and zyraPendingConfirmation below — both
+  // answer the same question ("did this turn actually write to the repository, or only preview
+  // something?") and must use the identical rule or the two annotations can contradict each other
+  // in the very same transcript line, which is exactly what happened before this was unified: a
+  // staged update turn read simultaneously as "[saved 2 testcase(s)...]" (from the old raw
+  // `item.id` check) AND "[...routed as 'update' but wrote nothing... PROPOSAL...]" (from the fixed
+  // check below), because the two call sites computed "persisted" two different ways.
+  //
+  // A staged update/archive PREVIEW carries the id of the EXISTING testcase it proposes to change
+  // (applyZyraChatOperations builds it from the real row + the pending fields, see `preview` there)
+  // — that id is the target's, not proof anything was written this turn. Only "moved"/"covered" rows
+  // (chatTestcaseRow/chatDraftRow action strings for genuinely persisted or genuinely pre-existing
+  // content) count as real; "proposed-*" and "suggested" never do, regardless of the id they carry.
+  // A raw model-authored `list` row has no `action` at all — that's a citation of real repository
+  // state, not a draft, so it still counts as real (`action` defaults to "" here, which is neither
+  // prefix, so this correctly returns true for it).
+  private zyraRowPersisted(item: unknown): boolean {
+    const value = (item || {}) as Body;
+    if (!value.id) return false;
+    const action = String(value.action || "");
+    return action !== "suggested" && !action.startsWith("proposed-");
+  }
+
   private zyraPendingConfirmation(row: Body): { kind: "proposal" | "offer"; actionType?: string; content: string } | null {
     if (String(row?.role) !== "assistant") return null;
     const rows = normalizeJsonArray(row?.testcases);
-    if (rows.some((item) => item && (item as Body).id)) return null;
+    if (rows.some((item) => this.zyraRowPersisted(item))) return null;
     const content = this.zyraRowContent(row);
     const actionType = String(row?.action_type || row?.actionType || "").trim();
     if (actionType === "create" || actionType === "archive" || actionType === "update") {
       return { kind: "proposal", actionType, content };
     }
-    if (LegacyService.ZYRA_OFFER_PATTERN.test(content)) return { kind: "offer", content };
+    if (LegacyService.ZYRA_OFFER_PATTERN.test(content) || LegacyService.ZYRA_STAGED_AWAITING_PATTERN.test(content)) {
+      return { kind: "offer", content };
+    }
     return null;
   }
 
@@ -13807,6 +13832,17 @@ export class LegacyService implements OnModuleInit {
   // clarifying questions like "which module should this cover?" as something to auto-confirm).
   private static readonly ZYRA_OFFER_PATTERN =
     /\b(would you like me to|do you want me to|want me to|should i|shall i)\b[^.!?\n]{0,120}\b(generat|creat|add|writ|draft|archiv|remov|delet|updat|chang|mov|assign|organi[sz]e)\w*\b[^.!?\n]{0,120}\?/i;
+
+  // A turn routed `answer` (an analysis/candidate-list step, not yet confident enough to emit an
+  // operation) can still leave the user with something concrete to confirm, without ever phrasing
+  // it as a "would you like me to...?" question — e.g. "9 updates are staged for your review —
+  // nothing is changed in the repository until you save them." ZYRA_OFFER_PATTERN never matched
+  // this shape (no trailing "?"), so a plain "go ahead" after it had no antecedent: the retry in
+  // sendZyraChatMessage never fired, the model repeated the same analysis, and (before the
+  // ZYRA_COMPLETION_CLAIM fix nearby) the false-completion banner kept re-firing on it too —
+  // together the exact "same error on the second chat" loop this pattern closes.
+  private static readonly ZYRA_STAGED_AWAITING_PATTERN =
+    /\b(staged|drafted|proposed)\b[^.!?\n]{0,60}\bfor\s+(your\s+)?review\b|\bnothing\s+(is|has\s+been)\s+(changed|written|saved)\b[^.!?\n]{0,100}\buntil\s+you\s+save\b|\bawaiting\s+(your\s+)?(go[\s-]?ahead|confirmation|approval)\b/i;
 
   // Whole-message match on the TRIMMED user text (not a substring anywhere in a longer message) —
   // "yes" confirms; "yes but not the archive one" does not, because it isn't only "yes". This gates
@@ -14164,15 +14200,27 @@ export class LegacyService implements OnModuleInit {
    * This is a check on OUTPUT, not on comprehension — the router's reading of the user is the model's
    * job and stays the model's job. This only decides whether a reply that already exists is allowed
    * to say a mutation happened.
+   *
+   * The leading negative lookbehind is what actually makes "past tense only" true: without it the
+   * verb list matches its own past-participle form regardless of what precedes it, so "Cases being
+   * updated: PRO-TC-239" (present-continuous, honestly describing a staged-not-yet-saved batch) and
+   * "will be archived" (future) tripped the identical match "Created 7 test cases" does. Excluding a
+   * continuous/future/modal auxiliary immediately before the verb leaves genuine simple-past
+   * ("Created…") and passive-perfect (the second alternation, "…have been saved…") matching exactly
+   * as before.
    */
   private static readonly ZYRA_COMPLETION_CLAIM =
-    /\b(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b/i;
+    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b/i;
 
   // A reply that already admits nothing happened — "Nothing was saved", "No test cases were
   // created", "could not create/save" — must not be wrapped a second time; the completion-claim
-  // guard below exists to add an honest correction, not to stack one on top of an honest refusal.
+  // guard above exists to add an honest correction, not to stack one on top of an honest refusal.
+  // Also covers the PRESENT-tense staging disclosure the system prompt tells the model to use for a
+  // genuinely staged batch ("nothing IS changed…", "…staged for review", "…until you save them") —
+  // the past-tense-only "nothing WAS saved" wording used to miss this, so an honest, correctly staged
+  // reply got double-wrapped with the same warning it was already giving the user.
   private static readonly ZYRA_ALREADY_DISCLOSED =
-    /\b(nothing was (saved|changed|created|written)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added)|could\s+not\s+(create|save|generate|archive|update|add)|generation\s+is\s+(turned\s+off|disabled|off))\b/i;
+    /\b(nothing (is|was|has\s+been) (saved|changed|created|written)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added)|could\s+not\s+(create|save|generate|archive|update|add)|generation\s+is\s+(turned\s+off|disabled|off)|staged\s+for\s+(your\s+)?review|awaiting\s+(your\s+)?(go[\s-]?ahead|confirmation|approval)|until\s+you\s+save|not\s+(yet\s+)?(saved|written|applied)\s+to\s+the\s+repository)\b/i;
 
   // Deterministic per-suite footer built from applied.moveBreakdown (ground truth read back from the
   // database in zyraMoveBreakdown), appended to every reconcileZyraReply return path. The model's own
@@ -14208,8 +14256,11 @@ export class LegacyService implements OnModuleInit {
   // DRAFTED/PROPOSED and staged for review"), so a reply using them while proposedCount > 0 is
   // telling the truth — ZYRA_COMPLETION_CLAIM would misfire on every ordinary "I drafted 3 test
   // cases" reply. Only a verb implying the row already exists in the repository is false here.
+  // Same tense-aware lookbehind as ZYRA_COMPLETION_CLAIM, and for the same reason: "9 cases being
+  // updated" or "TC-4 will be archived" is not a persistence claim just because the bare word
+  // "updated"/"archived" appears near a testcase token.
   private static readonly ZYRA_PERSISTED_CLAIM =
-    /\b(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b/i;
+    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b/i;
 
   private zyraPersistedClaimBanner(reply: string): string {
     if (!LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
