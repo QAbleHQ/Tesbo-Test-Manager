@@ -14451,7 +14451,10 @@ export class LegacyService implements OnModuleInit {
     return item;
   }
 
-  private safeSteps(value: unknown) {
+  // Not private: the MCP create_testcase tool (mcp.tools.ts) normalizes its own input through
+  // this same synonym-tolerant mapping before delegating to createTestCase, for the same reason
+  // Zyra needs it below — an LLM caller with no strict schema drifts on step key names.
+  safeSteps(value: unknown) {
     let steps: unknown[];
     if (Array.isArray(value)) {
       steps = value;

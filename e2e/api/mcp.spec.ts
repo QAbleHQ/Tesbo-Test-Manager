@@ -100,3 +100,76 @@ test.describe("MCP list_testcases and the repository total agree on Archived cas
     }
   });
 });
+
+/*
+ * MCP's create_testcase gives a calling LLM no schema for the shape of a step object, and unlike
+ * Zyra's chat/task-board paths — which run their AI-generated steps through LegacyService's
+ * safeSteps() synonym normalizer before persisting — the create path MCP and REST share
+ * (insertTestCaseWithClient) stored `steps` verbatim. A step written under a plausible-but-wrong
+ * key (`expected` instead of `expectedResult`, `step` instead of `action`) round-tripped through
+ * the API untouched but rendered as blank Action/Expected Result text areas in the editor, which
+ * only ever reads the literal `action`/`expectedResult` keys (testcases/page.tsx). Fixed by
+ * normalizing create_testcase's `steps` argument through the same safeSteps() mapping before the
+ * insert, mirroring Zyra.
+ */
+test.describe("MCP create_testcase normalizes step field synonyms", () => {
+  test("a step written under synonym keys still persists with the exact action/expectedResult keys the editor reads", async ({
+    request,
+  }) => {
+    const title = `E2E MCP Steps Synonyms ${Date.now()}`;
+    let tokenId: string | undefined;
+    let createdId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP Steps token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      const created = await callMcpTool(mcpApi, token, "create_testcase", {
+        title,
+        // Deliberately the synonym keys safeSteps() maps, not the canonical ones — the shape an
+        // MCP-calling LLM guessing from an undocumented `steps: array` schema would plausibly send.
+        steps: [
+          { stepNumber: 1, step: "Open the login page", expected: "Login form is visible" },
+          { stepNumber: 2, action: "Submit valid credentials", expectedResult: "User lands on the dashboard" },
+        ],
+      });
+      createdId = created.id;
+      expect(createdId).toBeTruthy();
+
+      function assertNormalized(steps: Array<{ stepNumber: number; action: string; expectedResult: string }>) {
+        expect(steps).toHaveLength(2);
+        const [first, second] = steps;
+        expect(first.action).toBe("Open the login page");
+        expect(first.expectedResult).toBe("Login form is visible");
+        // A well-formed step (already using the canonical keys) must pass through unchanged —
+        // normalization must not corrupt input that was already correct.
+        expect(second.action).toBe("Submit valid credentials");
+        expect(second.expectedResult).toBe("User lands on the dashboard");
+      }
+
+      // The tool's own response reflects the normalized shape...
+      assertNormalized(created.steps);
+
+      // ...and so does what's actually persisted, fetched back through the same REST endpoint the
+      // test case editor uses — proving this isn't just an artifact of the tool's return value.
+      const fetched = await request.get(`/api/projects/${ctx.projectId}/testcases/${createdId}`);
+      expect(fetched.ok()).toBeTruthy();
+      assertNormalized((await fetched.json()).steps);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      if (createdId) await deleteCase(request, createdId);
+      await mcpApi.dispose();
+    }
+  });
+});
