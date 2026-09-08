@@ -94,7 +94,10 @@ export type RbacTenantKind =
   // Per-test-case citations (which KB doc/Jira ticket/testcase/bug informed a generated case).
   // Its own, genuinely-empty tenant because the KB-recency and bug/Jira relevance ordering these
   // tests assert on ("KB 1", "BUG 1") is only deterministic in a project nothing else has seeded.
-  | "zyra-citations";
+  | "zyra-citations"
+  // SSE progress narration (GET .../turns/:turnId/events). Its own tenant so a concurrent turn
+  // from another spec never lands in this suite's session and confuses which stream is whose.
+  | "zyra-progress";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

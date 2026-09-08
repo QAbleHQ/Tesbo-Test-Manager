@@ -36,7 +36,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "list_testcases",
       description:
-        "List test cases in the token's project. Supports optional filters: suiteId, status, priority, type, automationStatus, jiraIssueKey, search, and pagination (limit up to 500, offset).",
+        "List test cases in the token's project. Supports optional filters: suiteId, status, priority, type, automationStatus, jiraIssueKey, search, and pagination (limit up to 500, offset). Archived test cases are excluded unless status is \"Archived\" or includeArchived is true — pass includeArchived to match the project's total test case count (e.g. the repository summary total), which includes Archived cases.",
       requiredScope: "read",
       inputSchema: {
         type: "object",
@@ -48,6 +48,7 @@ export function buildMcpTools(): McpTool[] {
           automationStatus: { type: "string" },
           jiraIssueKey: { type: "string" },
           search: { type: "string" },
+          includeArchived: { type: "boolean" },
           limit: { type: "number" },
           offset: { type: "number" }
         },
