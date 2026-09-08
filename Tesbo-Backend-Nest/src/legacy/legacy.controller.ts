@@ -920,7 +920,9 @@ export class LegacyController {
       component: "Login",
       // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
       // normalizeEstimatedDuration in legacy.service.ts.
-      estimatedDuration: "10m"
+      estimatedDuration: "10m",
+      automationStatus: "Not Automated",
+      attachments: "Screenshot attached: successful-login.png"
     };
     const headers = Object.keys(row);
     for (const definition of definitions) {

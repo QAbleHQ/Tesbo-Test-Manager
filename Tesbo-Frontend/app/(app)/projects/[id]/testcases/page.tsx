@@ -92,6 +92,9 @@ const TESTCASE_TYPES = [
   "API", "UI", "Performance", "Security",
 ];
 const TESTCASE_AUTOMATION_TYPES = ["Automated", "Not Automated", "Can't Automate"];
+// Same vocabulary as bugs.severity (BUG_SEVERITIES in legacy.service.ts) for consistency, though the
+// testcases.severity column has no CHECK constraint enforcing it — free text is stored either way.
+const TESTCASE_SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
@@ -195,6 +198,7 @@ export default function TestCasesPage() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
+  const [postconditions, setPostconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
   const [estimatedDuration, setEstimatedDuration] = useState("");
@@ -203,6 +207,8 @@ export default function TestCasesPage() {
   const [priority, setPriority] = useState("P2");
   const [status, setStatus] = useState("Draft");
   const [automationStatus, setAutomationStatus] = useState("Not Automated");
+  const [component, setComponent] = useState("");
+  const [severity, setSeverity] = useState("");
   const [suiteId, setSuiteId] = useState("");
   const [defaultTestcaseIdPrefix, setDefaultTestcaseIdPrefix] = useState("TC");
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("TC");
@@ -556,6 +562,7 @@ export default function TestCasesPage() {
     setTitle((data.title as string) ?? "");
     setDescription((data.description as string) ?? "");
     setPreconditions((data.preconditions as string) ?? "");
+    setPostconditions((data.postconditions as string) ?? "");
     setSteps(parseSteps(data.steps));
     setTestData((data.testData as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
@@ -564,6 +571,8 @@ export default function TestCasesPage() {
     setPriority((data.priority as string) ?? "P2");
     setStatus((data.status as string) ?? "Draft");
     setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setComponent((data.component as string) ?? "");
+    setSeverity((data.severity as string) ?? "");
     setSuiteId((data.suiteId as string) ?? formSuiteId ?? "");
     setPanelJiraIssueKey((data.jiraIssueKey as string) ?? "");
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
@@ -573,6 +582,7 @@ export default function TestCasesPage() {
     setTitle("");
     setDescription("");
     setPreconditions("");
+    setPostconditions("");
     setSteps([{ ...EMPTY_STEP }]);
     setTestData("");
     setEstimatedDuration("");
@@ -581,6 +591,8 @@ export default function TestCasesPage() {
     setPriority("P2");
     setStatus("Draft");
     setAutomationStatus("Not Automated");
+    setComponent("");
+    setSeverity("");
     setSuiteId(defaultSuiteId ?? formSuiteId ?? "");
     setTestcaseIdPrefix(defaultTestcaseIdPrefix);
     setPanelJiraIssueKey("");
@@ -964,6 +976,7 @@ export default function TestCasesPage() {
           title,
           description,
           preconditions,
+          postconditions,
           steps: JSON.stringify(steps),
           testData,
           estimatedDuration,
@@ -972,6 +985,8 @@ export default function TestCasesPage() {
           priority,
           status,
           automationStatus,
+          component,
+          severity,
           testcaseIdPrefix,
           customFieldValues,
         });
@@ -996,6 +1011,7 @@ export default function TestCasesPage() {
           title,
           description,
           preconditions,
+          postconditions,
           steps: JSON.stringify(steps),
           testData,
           estimatedDuration,
@@ -1004,6 +1020,8 @@ export default function TestCasesPage() {
           priority,
           status,
           automationStatus,
+          component,
+          severity,
           customFieldValues,
         });
         setPanelSuccess("Test case updated successfully.");
@@ -1927,10 +1945,25 @@ export default function TestCasesPage() {
                           <FieldLabel>Estimated Duration</FieldLabel>
                           <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 90, 45 min, or 2h 30m" />
                         </Field>
+                        <Field>
+                          <FieldLabel>Component</FieldLabel>
+                          <Input type="text" value={component} onChange={(e) => setComponent(e.target.value)} placeholder="e.g. Login" />
+                        </Field>
+                        <Field>
+                          <FieldLabel>Severity</FieldLabel>
+                          <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
+                            <option value="">No severity</option>
+                            {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                          </Select>
+                        </Field>
                       </div>
                       <Field>
                         <FieldLabel>Preconditions</FieldLabel>
                         <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={2} />
+                      </Field>
+                      <Field>
+                        <FieldLabel>Postconditions</FieldLabel>
+                        <Textarea value={postconditions} onChange={(e) => setPostconditions(e.target.value)} rows={2} />
                       </Field>
                       <Field>
                         <FieldLabel>Test Data</FieldLabel>
@@ -2005,6 +2038,10 @@ export default function TestCasesPage() {
                             <Textarea value={preconditions} onChange={(e) => setPreconditions(e.target.value)} rows={3} />
                           </Field>
                           <Field>
+                            <FieldLabel>Postconditions</FieldLabel>
+                            <Textarea value={postconditions} onChange={(e) => setPostconditions(e.target.value)} rows={3} />
+                          </Field>
+                          <Field>
                             <FieldLabel>Test Data</FieldLabel>
                             <Textarea value={testData} onChange={(e) => setTestData(e.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
                           </Field>
@@ -2043,6 +2080,17 @@ export default function TestCasesPage() {
                             <Field>
                               <FieldLabel>Estimated Duration</FieldLabel>
                               <Input type="text" value={estimatedDuration} onChange={(e) => setEstimatedDuration(e.target.value)} placeholder="e.g. 90, 45 min, or 2h 30m" />
+                            </Field>
+                            <Field>
+                              <FieldLabel>Component</FieldLabel>
+                              <Input type="text" value={component} onChange={(e) => setComponent(e.target.value)} placeholder="e.g. Login" />
+                            </Field>
+                            <Field>
+                              <FieldLabel>Severity</FieldLabel>
+                              <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
+                                <option value="">No severity</option>
+                                {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                              </Select>
                             </Field>
                           </div>
                           <Field>
@@ -2478,10 +2526,6 @@ export default function TestCasesPage() {
         projectId={projectId}
         open={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
-        defaultSuiteId={formSuiteId || undefined}
-        suites={suites}
-        suiteNameMap={suiteNameMap}
-        suitesLoaded={!loading}
         onImported={(result) => {
           if (result.imported > 0) {
             void loadData();

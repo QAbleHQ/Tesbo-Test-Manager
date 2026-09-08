@@ -96,6 +96,8 @@ interface PreparedImportRow {
   severity: string | null;
   type: string;
   status: string;
+  automationStatus: string;
+  attachments: string;
   /** Stored on the test case itself, and also the name of the subfolder it goes in. */
   component: string | null;
   estimatedDuration: string | null;
@@ -3503,6 +3505,7 @@ export class LegacyService implements OnModuleInit {
     const severity = String(raw?.severity ?? "").trim() || null;
     const type = String(raw?.type ?? "").trim() || "Functional";
     const status = String(raw?.status ?? "").trim() || "Draft";
+    const automationStatus = String(raw?.automationStatus ?? "").trim() || "Not Automated";
     const component = String(raw?.component ?? "").trim() || null;
     const suiteName = String(raw?.suite ?? "").trim();
 
@@ -3529,6 +3532,7 @@ export class LegacyService implements OnModuleInit {
       ["Severity", severity, 32],
       ["Type", type, 32],
       ["Status", status, 32],
+      ["Automation type", automationStatus, 32],
       ["Component", component, 255],
       ["Suite", suiteName, 255]
     ];
@@ -3571,6 +3575,8 @@ export class LegacyService implements OnModuleInit {
         severity,
         type,
         status,
+        automationStatus,
+        attachments: String(raw?.attachments ?? ""),
         component,
         estimatedDuration,
         suiteName,
@@ -3711,6 +3717,8 @@ export class LegacyService implements OnModuleInit {
       severity: row.severity,
       type: row.type,
       status: row.status,
+      automation_status: row.automationStatus,
+      attachments: row.attachments,
       component: row.component,
       estimated_duration: row.estimatedDuration
     }));
@@ -3718,14 +3726,16 @@ export class LegacyService implements OnModuleInit {
     const inserted = await client.query<Body>(
       `INSERT INTO testcases
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps,
-          test_data, priority, severity, type, status, component, estimated_duration, created_by, updated_by)
+          test_data, priority, severity, type, status, automation_status, attachments, component,
+          estimated_duration, created_by, updated_by)
        SELECT $1, v.suite_id, v.external_id, v.title, v.description, v.preconditions, v.postconditions,
-              v.steps, v.test_data, v.priority, v.severity, v.type, v.status, v.component,
-              v.estimated_duration, $2, $2
+              v.steps, v.test_data, v.priority, v.severity, v.type, v.status, v.automation_status,
+              v.attachments, v.component, v.estimated_duration, $2, $2
        FROM jsonb_to_recordset($3::jsonb) AS v(
          external_id text, suite_id uuid, title text, description text, preconditions text,
          postconditions text, steps jsonb, test_data text, priority text, severity text,
-         type text, status text, component text, estimated_duration text)
+         type text, status text, automation_status text, attachments text, component text,
+         estimated_duration text)
        RETURNING *`,
       [ctx.projectId, ctx.uid, JSON.stringify(payload)]
     );
