@@ -1187,7 +1187,10 @@ export interface SuiteNode {
   name: string;
   position: number;
   createdAt: string;
+  /** Direct children of this suite only. For the tree badge / rollup math, use recursiveTestCaseCount instead. */
   testCaseCount: number;
+  /** This suite's own test cases plus every descendant suite's, at any depth. */
+  recursiveTestCaseCount: number;
 }
 
 export async function listSuites(projectId: string): Promise<SuiteNode[]> {
@@ -1232,6 +1235,8 @@ export async function listTestCases(
     limit?: number;
     offset?: number;
     suiteId?: string;
+    /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+    includeDescendants?: boolean;
     status?: string;
     priority?: string;
     type?: string;
@@ -1247,6 +1252,7 @@ export async function listTestCases(
   if (params?.limit != null) sp.set("limit", String(params.limit));
   if (params?.offset != null) sp.set("offset", String(params.offset));
   if (params?.suiteId) sp.set("suiteId", params.suiteId);
+  if (params?.includeDescendants) sp.set("includeDescendants", "true");
   if (params?.status) sp.set("status", params.status);
   if (params?.priority) sp.set("priority", params.priority);
   if (params?.type) sp.set("type", params.type);

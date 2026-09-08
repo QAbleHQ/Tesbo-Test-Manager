@@ -361,13 +361,18 @@ export default function TestCasesPage() {
   /*
    * The sum of the suite counts, which is NOT the size of the repository.
    *
-   * listSuites counts cases through `t.suite_id = s.id`, so a case with no suite (the create form's
-   * default, and what import produces when no suite column is mapped) is counted by no suite row at
-   * all. Only ever a fallback for before the summary lands — see repositoryTotalCount.
+   * Summed over rootSuites only, using each root's recursiveTestCaseCount (itself + every
+   * descendant, at any depth): a root's recursive count already includes its whole subtree, so
+   * summing every suite in the flat `suites` list — root and child alike — would double-count a
+   * case once under its own suite and again under every ancestor above it.
+   *
+   * Still misses unfiled cases (a case with no suite, the create form's default, and what import
+   * produces when no suite column is mapped, belongs to no suite row at all). Only ever a fallback
+   * for before the summary lands — see repositoryTotalCount.
    */
   const suiteCaseCountSum = useMemo(
-    () => suites.reduce((sum, suite) => sum + suite.testCaseCount, 0),
-    [suites]
+    () => rootSuites.reduce((sum, suite) => sum + suite.recursiveTestCaseCount, 0),
+    [rootSuites]
   );
   const activeFilterCount = [
     suiteSearch.trim() !== "",
@@ -464,6 +469,10 @@ export default function TestCasesPage() {
         limit: pageSize,
         offset: ((pageOverride ?? suiteCasesPage) - 1) * pageSize,
         suiteId: activeSuiteId ?? undefined,
+        // A suite in this tree stands for itself and everything nested under it (see the
+        // sidebar's recursiveTestCaseCount) — the list has to agree, or a parent suite with all
+        // its cases in sub-suites shows "No test cases found" while its own badge says otherwise.
+        includeDescendants: activeSuiteId ? true : undefined,
         status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
         priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
         type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
@@ -1202,8 +1211,9 @@ export default function TestCasesPage() {
                       const children = childrenBySuiteId.get(suite.id) ?? [];
                       const hasChildren = children.length > 0;
                       const isExpanded = expandedSuiteIds.has(suite.id);
-                      const rollupCount =
-                        suite.testCaseCount + children.reduce((sum, c) => sum + c.testCaseCount, 0);
+                      // Server-computed: itself + every descendant, at any depth (not just this
+                      // suite's direct children) — see SuiteNode.recursiveTestCaseCount.
+                      const rollupCount = suite.recursiveTestCaseCount;
                       return (
                         <div key={suite.id} className="mb-0.5">
                           <div
@@ -1317,7 +1327,7 @@ export default function TestCasesPage() {
                                       {child.name}
                                     </button>
                                     <span className={`shrink-0 font-mono text-[10px] group-hover:hidden ${childActive ? "text-[var(--accent-light)] opacity-70" : "text-[var(--muted)]"}`}>
-                                      {child.testCaseCount}
+                                      {child.recursiveTestCaseCount}
                                     </span>
                                     <div className="hidden shrink-0 items-center gap-0.5 group-hover:flex">
                                       <button
