@@ -9964,13 +9964,13 @@ export class LegacyService implements OnModuleInit {
         ...applied.activity
       ];
       const testcases = applied.testcases.length ? applied.testcases : decision.testcases;
-      if (decision.actionType === "create" && applied.testcases.length) {
-        const ids = applied.testcases.map((tc) => tc.id).filter(Boolean);
-        await this.db.query(
-          "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
-          [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
-        );
-      }
+      // last_completed_plan tracking for a `create` turn now happens inside applyZyraChatOperations
+      // (recordZyraPendingReviewRequest, at proposal time) and zyraSaveAttempt (real ids, at actual
+      // save time) — a `create` is staged, not written, so `applied.testcases[].id` is always null
+      // here and a block like this used to unconditionally overwrite last_completed_plan with
+      // `{testcaseIds: [], totalCount: 0}` on every create turn, silently erasing the
+      // pendingReviewRequestIds recordZyraPendingReviewRequest had just set moments earlier in the
+      // SAME call. See the changelog entry this was fixed alongside.
       onStage?.("finalizing");
       const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity });
       const title = this.compactTitle(message);
@@ -10205,7 +10205,7 @@ export class LegacyService implements OnModuleInit {
     onStage?.("context");
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
-    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs] = await Promise.all([
+    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
       this.db.query(
         `SELECT role, content, reasoning_summary, action_type, testcases
          FROM zyra_chat_messages
@@ -10235,7 +10235,11 @@ export class LegacyService implements OnModuleInit {
       this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] })),
       // Tesbo's own bug tracker (separate from Jira) — relevance-matched, same principle as
       // relevantJiraSnapshot: an unrelated bug in the citation list is worse than none.
-      this.bugsSnapshot(projectId, message)
+      this.bugsSnapshot(projectId, message),
+      // Still-unsaved create batch(es) from earlier in this session — see zyraPendingCreateBatches.
+      // Told to the model alongside lastCompletedPlanCount below so "Most recently generated batch"
+      // covers both what was actually saved and what is only staged, instead of only ever the former.
+      this.zyraPendingCreateBatches(projectId, sessionId)
     ]);
     const ragKnowledge = ragDiagnostics.items;
     const usedRecencyFallback = !ragKnowledge.length;
@@ -10284,6 +10288,10 @@ export class LegacyService implements OnModuleInit {
       testcases: existingTestcases.map((tc) => ({ externalId: String((tc as Body).externalId || ""), title: String((tc as Body).title || "") }))
     });
     const lastCompletedPlanCount = normalizeJsonArray((lastCompletedPlanRes.rows[0]?.last_completed_plan as Body | undefined)?.testcaseIds).length;
+    const lastPendingDraftCount = pendingCreateBatches.reduce(
+      (sum, batch) => sum + batch.drafts.filter((entry) => (entry as Body)?.opType === "create").length,
+      0
+    );
     // Oldest-first: the transcript handed to the model must read in conversation order.
     const chronologicalHistory = [...history.rows].reverse();
     const key = allocation.key;
@@ -10319,7 +10327,7 @@ export class LegacyService implements OnModuleInit {
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
       "CRITICAL: 'create'/'update'/'archive' operations are STAGED for review, not applied immediately — nothing is inserted, changed, or removed in the repository until the user separately reviews and saves the staged batch. Still emit the operation as soon as you are confident the user wants it — do not add an extra 'would you like me to save these?' round-trip of your own in the chat, the review step already exists downstream and is not yours to gate. But your WORDING must match reality: describe what you produce as DRAFTED/PROPOSED and staged for review — never as 'created', 'saved', 'updated', or 'archived' (all past tense, all claims about work this turn did not do), however many testcases your reply text lists. If the user wants testcases, choose 'create' now; otherwise do not enumerate any as if they existed.",
       `What you create is staged as a draft pending the user's review — it does not exist in the repository yet. Once saved it lands with status Draft, in the suite the request named, or in "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" if it named none. So say where it WILL be filed once saved, never where it "is" — nothing you create this turn is openable or runnable until the user reviews and saves it.`,
-      `"Save them" / "save them to <suite>" AFTER you have already drafted testcases is a move, not a create: emit move_to_suite with fromLastPlan=true and the target suiteName. Re-creating them would duplicate every case. Use the transcript annotations to tell the two apart — if the previous turn saved rows, they exist and must be moved; if it saved nothing, they do not exist yet and 'save them' means create.`,
+      `"Save them" / "save them to <suite>" after you already emitted a create operation is a move, not a new create: emit move_to_suite with fromLastPlan=true and the target suiteName — fromLastPlan reaches BOTH a batch already saved to the repository AND a batch still only staged/drafted (re-pointing the unsaved ones at the new suite; they still need the user's own Save afterwards, so describe that as staged/drafted, never as saved or moved). Re-creating them would duplicate every case. The signal for "was anything drafted for this" is the transcript's PROPOSAL annotation on a create-routed turn, or the recent-batch counts below (saved + staged) — NOT whether that turn "saved" anything, since a staged create always shows saved nothing and still has real drafts to move. Only treat "save them" as a brand-new create when NEITHER signal shows anything: a plain answer turn that only described hypothetical cases in prose, with no tracked batch below.`,
       "A short confirmation of an offer you made in your previous turn ('yes', 'yes please', 'go ahead', 'do it', 'please start generating', 'save it', 'save them into <suite>') is a create request: choose 'create', and set suiteName/suiteId on the create operation when a suite is named.",
       "Only use move_to_suite for testcases that appear under 'Existing suites'/'Existing testcases' below, or in the most recently generated batch. If the user asks you to save or file testcases that so far only appeared as text in this chat, those testcases DO NOT EXIST yet — choose 'create' with the suite named on the create operation, never move_to_suite.",
       "CRITICAL: moving or assigning existing testcases into a suite is NEVER a create action. Do not generate, draft, or duplicate testcases for a move/assign/organize request — only emit move_to_suite operations that reference the existing testcases. Use create only when the user explicitly asks to author brand-new testcases.",
@@ -10351,8 +10359,11 @@ export class LegacyService implements OnModuleInit {
         : "",
       `The total test case count for this project is ${projectSnapshot.testcaseCount}, equal to the suite counts above plus Unassigned. ALWAYS include the Unassigned row in any suite-wise or per-suite breakdown you give — never report a breakdown whose rows sum to less than the total without accounting for the difference.`,
       "",
-      "Most recently generated batch (already saved to the repository; use move_to_suite with fromLastPlan=true to reference all of these together):",
-      lastCompletedPlanCount ? `${lastCompletedPlanCount} testcase(s) tracked from the last generation batch in this session.` : "No tracked batch yet in this session — nothing has been generated and saved here, so there is no batch to move or file.",
+      "Most recently generated batch — use move_to_suite with fromLastPlan=true to reference it, whether or not it has been saved yet:",
+      [
+        lastCompletedPlanCount ? `${lastCompletedPlanCount} testcase(s) already saved to the repository from earlier in this session.` : "",
+        lastPendingDraftCount ? `${lastPendingDraftCount} testcase(s) drafted and staged for review but NOT saved yet — fromLastPlan can still re-target their suite now; say staged/drafted about these, never saved or moved, until the user actually saves them.` : ""
+      ].filter(Boolean).join(" ") || "No tracked batch yet in this session — nothing has been generated here, so there is no batch to move or file.",
       "",
       "Project snapshot:",
       JSON.stringify(projectSnapshot),
@@ -10825,8 +10836,68 @@ export class LegacyService implements OnModuleInit {
           suiteName: suite.name,
           created: existingMoveSuite?.created || ("created" in suite && !!suite.created)
         });
+        let matchedAnything = false;
+
+        // fromLastPlan can resolve to a batch that is still just staged drafts (the common case
+        // right after a generation — "save them to <suite>"), to a batch that was already saved via
+        // zyraSave earlier, or to both at once (a multi-batch plan, part saved, part not). A staged
+        // draft has no row in `testcases` at all, so there is nothing there for a DB move to act on
+        // — the only thing "move it" can honestly mean for one is "point it at this suite for when
+        // you do save it", which is exactly what this patches, directly in the pending
+        // ai_generation_requests row(s), never auto-saving it.
+        if (op.fromLastPlan) {
+          // zyraPendingCreateBatches is an unlocked candidate list only — the actual read-modify-
+          // write happens per-batch in patchZyraPendingBatchSuite, under the same row lock
+          // zyraSaveAttempt takes, so a Save landing concurrently (a separate request, not covered
+          // by sendZyraChatMessage's per-session processing_since claim) can never be overwritten by
+          // a stale pre-save copy of generated_payload — see that method's comment for what a lost
+          // update here would actually do (resurrect an already-saved draft, duplicating it on the
+          // next Save).
+          const pendingBatches = await this.zyraPendingCreateBatches(projectId, sessionId);
+          let patchedTotal = 0;
+          for (const batch of pendingBatches) {
+            const patched = await this.patchZyraPendingBatchSuite(projectId, batch.reviewRequestId, suite.id);
+            if (!patched) continue;
+            patchedTotal += patched.patchedCount;
+            patched.updatedDrafts.forEach((entry, index) => {
+              const row = entry as Body;
+              if (row.opType !== "create") return;
+              testcases.push({
+                ...this.chatDraftRow(row.draft as Body, "proposed-create", String(row.reason || "")),
+                draftIndex: index,
+                reviewRequestId: batch.reviewRequestId
+              });
+            });
+          }
+          if (patchedTotal > 0) {
+            matchedAnything = true;
+            activity.push({
+              actor: "agent",
+              title: `Set suite for ${patchedTotal} pending draft(s)`,
+              detail: `${patchedTotal} unsaved draft(s) from your last generation will be filed into "${suite.name}" once you save them — still not written to the repository.`,
+              createdAt: new Date().toISOString()
+            });
+          }
+        }
+
         const targets = await this.resolveZyraMoveTargets(projectId, sessionId, op, suite.id, createdThisTurn);
-        if (!targets.length) {
+        if (targets.length) {
+          matchedAnything = true;
+          const movedIds = targets.map((target) => target.id);
+          for (const id of movedIds) moveTargetIds.add(id);
+          await this.db.query(
+            "UPDATE testcases SET suite_id = $2, updated_by = $4, updated_at = now() WHERE project_id = $1 AND id = ANY($3::uuid[]) AND deleted_at IS NULL",
+            [projectId, suite.id, movedIds, actorId]
+          );
+          for (const target of targets.slice(0, 25)) {
+            const row = await this.getTestCase(target.id);
+            testcases.push(this.chatTestcaseRow(row, "moved", op.reason || `Moved to suite ${suite.name}`));
+          }
+          activity.push({ actor: "agent", title: `Moved ${movedIds.length} testcase(s) to suite`, detail: `${suite.name}${"created" in suite && suite.created ? " (created)" : ""}`, createdAt: new Date().toISOString() });
+          await this.logProjectActivity(projectId, actorId, "zyra_moved_to_suite", "suite", suite.id, suite.name, { source: "zyra_chat", movedCount: movedIds.length, testcaseIds: movedIds, reason: op.reason || null });
+        }
+
+        if (!matchedAnything) {
           // resolveOrCreateSuiteByName above may have just created the suite, so bailing silently
           // here left a new empty suite behind with no activity entry and no signal that the move
           // matched nothing — while the model's reply still announced a successful save.
@@ -10836,20 +10907,7 @@ export class LegacyService implements OnModuleInit {
             detail: `Nothing was moved into "${suite.name}" — the requested testcases do not exist in this project yet.`,
             createdAt: new Date().toISOString()
           });
-          continue;
         }
-        const movedIds = targets.map((target) => target.id);
-        for (const id of movedIds) moveTargetIds.add(id);
-        await this.db.query(
-          "UPDATE testcases SET suite_id = $2, updated_by = $4, updated_at = now() WHERE project_id = $1 AND id = ANY($3::uuid[]) AND deleted_at IS NULL",
-          [projectId, suite.id, movedIds, actorId]
-        );
-        for (const target of targets.slice(0, 25)) {
-          const row = await this.getTestCase(target.id);
-          testcases.push(this.chatTestcaseRow(row, "moved", op.reason || `Moved to suite ${suite.name}`));
-        }
-        activity.push({ actor: "agent", title: `Moved ${movedIds.length} testcase(s) to suite`, detail: `${suite.name}${"created" in suite && suite.created ? " (created)" : ""}`, createdAt: new Date().toISOString() });
-        await this.logProjectActivity(projectId, actorId, "zyra_moved_to_suite", "suite", suite.id, suite.name, { source: "zyra_chat", movedCount: movedIds.length, testcaseIds: movedIds, reason: op.reason || null });
       }
     }
     let reviewRequestId: string | null = null;
@@ -10864,9 +10922,16 @@ export class LegacyService implements OnModuleInit {
       );
       reviewRequestId = String(inserted.rows[0].id);
       // draftIndex on each row addresses generated_payload by position — set once the request
-      // (and therefore its final id) exists, since it can't be known beforehand.
+      // (and therefore its final id) exists, since it can't be known beforehand. Guarded on an
+      // absent reviewRequestId (not just a numeric draftIndex) because `testcases` can also carry
+      // rows the fromLastPlan branch above already stamped with a DIFFERENT, earlier batch's
+      // reviewRequestId (a turn can both move an older pending batch and stage a new one) — those
+      // must not be overwritten with this turn's id.
       for (const tc of testcases) {
-        if (typeof tc.draftIndex === "number") tc.reviewRequestId = reviewRequestId;
+        if (typeof tc.draftIndex === "number" && !tc.reviewRequestId) tc.reviewRequestId = reviewRequestId;
+      }
+      if (proposals.some((p) => (p as Body).opType === "create")) {
+        await this.recordZyraPendingReviewRequest(sessionId, reviewRequestId);
       }
     }
     const moveBreakdown = await this.zyraMoveBreakdown(projectId, moveSuites, moveTargetIds);
@@ -10920,13 +10985,100 @@ export class LegacyService implements OnModuleInit {
     return res.rows[0] ? { id: String(res.rows[0].id), name: String(res.rows[0].name) } : null;
   }
 
+  // A staged `create` batch is never written to `testcases` until zyraSave, so right after
+  // generating one there is no real id anywhere for `fromLastPlan` to find — `zyra_chat_sessions
+  // .last_completed_plan.pendingReviewRequestIds` is how a still-unsaved batch is found instead:
+  // every `ai_generation_requests` row an in-session create batch staged, re-verified live against
+  // `task_status = 'in_review'` (never trusted stale — a save or a close naturally drops a row out
+  // here without this needing to actively untrack it). A multi-batch plan can post several such rows
+  // before the user reacts to any of them, so this returns every one still pending, not just the
+  // newest.
+  private async zyraPendingCreateBatches(projectId: string, sessionId: string): Promise<Array<{ reviewRequestId: string; drafts: Body[] }>> {
+    const planRes = await this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] }));
+    const ids = normalizeJsonArray((planRes.rows[0]?.last_completed_plan as Body | undefined)?.pendingReviewRequestIds).map(String).filter(Boolean);
+    if (!ids.length) return [];
+    const res = await this.db.query(
+      "SELECT id, generated_payload FROM ai_generation_requests WHERE id = ANY($1::uuid[]) AND project_id = $2 AND task_status = 'in_review'",
+      [ids, projectId]
+    ).catch(() => ({ rows: [] as Body[] }));
+    return res.rows
+      .map((row) => ({ reviewRequestId: String(row.id), drafts: normalizeJsonArray(row.generated_payload) }))
+      .filter((batch) => batch.drafts.some((entry) => (entry as Body)?.opType === "create"));
+  }
+
+  // Re-reads and locks ONE batch's row before patching its still-pending create drafts' suite —
+  // zyraPendingCreateBatches above is a cheap, UNLOCKED candidate list, not the source of truth for
+  // the write. The lock matters because zyraSaveAttempt (the review panel's Save button) is a
+  // separate HTTP request, not covered by sendZyraChatMessage's per-session processing_since claim,
+  // so it can run concurrently with a chat "save them to <suite>" turn. Without this lock, whichever
+  // of the two commits last would blind-overwrite generated_payload with whatever it read first —
+  // if that's this method's stale pre-save copy, an already-saved draft reappears as still pending,
+  // and the NEXT save creates a second, duplicate real testcase from it. zyraSaveAttempt already
+  // takes the same `ai_generation_requests` row lock first thing in its own transaction, so the two
+  // simply serialize against each other on this one row; this always re-checks task_status =
+  // 'in_review' under the lock rather than trusting the candidate list, so a batch saved or closed a
+  // moment ago is silently skipped (returns null) instead of resurrected.
+  private async patchZyraPendingBatchSuite(projectId: string, reviewRequestId: string, suiteId: string): Promise<{ updatedDrafts: Body[]; patchedCount: number } | null> {
+    return this.db.transaction(async (client) => {
+      const res = await client.query(
+        "SELECT generated_payload FROM ai_generation_requests WHERE id = $1 AND project_id = $2 AND task_status = 'in_review' FOR UPDATE",
+        [reviewRequestId, projectId]
+      );
+      if (!res.rows[0]) return null;
+      let patchedCount = 0;
+      const updatedDrafts = normalizeJsonArray(res.rows[0].generated_payload).map((entry) => {
+        const row = entry as Body;
+        if (row.opType !== "create") return row;
+        patchedCount += 1;
+        return { ...row, draft: { ...(row.draft as Body), suiteId } };
+      });
+      if (!patchedCount) return null;
+      await client.query(
+        "UPDATE ai_generation_requests SET generated_payload = $2::jsonb, updated_at = now() WHERE id = $1",
+        [reviewRequestId, JSON.stringify(updatedDrafts)]
+      );
+      return { updatedDrafts, patchedCount };
+    });
+  }
+
+  // Called once per turn from applyZyraChatOperations, only when this turn staged at least one
+  // `create` proposal — records that batch's request id as "the last thing generated in this
+  // session" so a later fromLastPlan (in this turn or a following one) can find it via
+  // zyraPendingCreateBatches. Merges rather than overwrites: `last_completed_plan` also carries
+  // testcaseIds/totalCount for already-SAVED batches (written by zyraSaveAttempt), and clobbering the
+  // whole blob here used to silently erase that on every single create turn — see the changelog entry
+  // this shipped with. Transactional with a row lock, same as zyraSaveAttempt's own write to this
+  // session row and patchZyraPendingBatchSuite's write to the request row above: a chat turn staging
+  // a NEW batch and a concurrent Save of an OLDER batch (a separate request, not covered by
+  // sendZyraChatMessage's per-session processing_since claim) both read-modify-write this same JSONB
+  // column, and an unlocked merge here could read a stale copy and silently drop the real id
+  // zyraSaveAttempt had just committed to testcaseIds.
+  private async recordZyraPendingReviewRequest(sessionId: string, reviewRequestId: string): Promise<void> {
+    await this.db.transaction(async (client) => {
+      const res = await client.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1 FOR UPDATE", [sessionId]);
+      const existing = (res.rows[0]?.last_completed_plan as Body | undefined) || {};
+      const ids = normalizeJsonArray(existing.pendingReviewRequestIds).map(String);
+      // Capped, not unbounded: a session that generates many small batches without ever saving or
+      // closing them should not grow this array forever — 25 mirrors ZYRA_CHAT_MAX_OPERATIONS as
+      // "more than any reasonable single session needs to track at once".
+      const merged = Array.from(new Set([...ids, reviewRequestId])).slice(-25);
+      await client.query(
+        "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
+        [sessionId, JSON.stringify({ ...existing, pendingReviewRequestIds: merged })]
+      );
+    });
+  }
+
   // Resolve which existing testcases a move_to_suite op should affect: every non-archived testcase
   // (allExisting), the ones named by external id / internal id, or — when the model set
   // fromLastPlan (see the move_to_suite prompt instructions) — every testcase tracked in
   // last_completed_plan, unioned with any ids created earlier in the SAME batch. That union
   // matters because last_completed_plan is only persisted after the whole batch finishes
-  // (see sendZyraChatMessage), so a single turn that both creates testcases and moves them
-  // (fromLastPlan:true) would otherwise see only the previous turn's batch, or none at all.
+  // (see zyraSaveAttempt, which is when a create's id first becomes real), so a single turn that
+  // both creates testcases and moves them (fromLastPlan:true) would otherwise see only a prior
+  // SAVED batch, or none at all — a still-unsaved batch from the same or an earlier turn is instead
+  // handled by zyraPendingCreateBatches above, which patches the pending draft directly rather than
+  // going through this real-row resolver at all.
   // last_completed_plan tracking exists because the model's own view of "which testcases did
   // we just generate" is limited to the last 12 chat messages, which a multi-batch plan can
   // easily outgrow; it's a durable, exact record instead of something the model has to
@@ -11334,9 +11486,12 @@ export class LegacyService implements OnModuleInit {
           routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null
         });
         const gated = this.applyStorageGateToGenerated(decision, capabilities);
+        // applyZyraChatOperations itself records this batch's ai_generation_requests row as pending
+        // (recordZyraPendingReviewRequest) so a later "save them to <suite>" can find it — a batch
+        // here is staged exactly like a single chat turn's create, so there is no separate id-based
+        // tracking to do once it returns.
         const applied = await this.applyZyraChatOperations(projectId, userId, sessionId, gated.operations);
         const testcases = applied.testcases.length ? applied.testcases : gated.testcases;
-        await this.recordZyraLastCompletedPlanIds(sessionId, testcases.map((tc) => tc.id).filter(Boolean));
 
         const newDoneCount = doneCount + batch.length;
         const remaining = remainingScenarios.slice(batch.length);
@@ -11380,17 +11535,6 @@ export class LegacyService implements OnModuleInit {
         return;
       }
     }
-  }
-
-  private async recordZyraLastCompletedPlanIds(sessionId: string, newIds: string[]): Promise<void> {
-    if (!newIds.length) return;
-    const res = await this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] }));
-    const existingIds = normalizeJsonArray((res.rows[0]?.last_completed_plan as Body | undefined)?.testcaseIds).map(String);
-    const mergedIds = Array.from(new Set([...existingIds, ...newIds]));
-    await this.db.query(
-      "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
-      [sessionId, JSON.stringify({ testcaseIds: mergedIds, totalCount: mergedIds.length })]
-    );
   }
 
   private async finalizeZyraToolDecisionWithAi(params: {
@@ -12287,6 +12431,32 @@ export class LegacyService implements OnModuleInit {
       // for a later Save/Edit/Discard — rather than orphaning them the moment ANY draft is saved.
       const savedIndexSet = new Set(selected.map((entry) => entry.__index));
       const remainingPayload = drafts.filter((_: Body, index: number) => !savedIndexSet.has(index));
+
+      // This is the FIRST point a chat-staged create's id is ever real — until now it only existed
+      // as a draft inside generated_payload, which is why applyZyraChatOperations/the batch-plan loop
+      // could never populate last_completed_plan.testcaseIds themselves (see the changelog entry this
+      // shipped with: that dead code overwrote the field with an always-empty array on every create
+      // turn). `created` (not `touched`) because only a genuinely NEW row's id is news to fromLastPlan
+      // — an update/archive entry's testcaseId was already real before this save. Also drops this
+      // batch's id out of pendingReviewRequestIds once nothing of it is left staged, so
+      // zyraPendingCreateBatches stops considering it (a fresh live re-check of task_status already
+      // makes this redundant for correctness — see that method's comment — this just keeps the
+      // pointer array from accumulating fully-saved batches forever).
+      if (existing.chat_session_id && (created.length || remainingPayload.length === 0)) {
+        const planRow = await client.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1 FOR UPDATE", [existing.chat_session_id]);
+        const existingPlan = (planRow.rows[0]?.last_completed_plan as Body | undefined) || {};
+        const existingIds = normalizeJsonArray(existingPlan.testcaseIds).map(String);
+        const mergedIds = created.length
+          ? Array.from(new Set([...existingIds, ...created.map((row) => String(row.id))]))
+          : existingIds;
+        let pendingIds = normalizeJsonArray(existingPlan.pendingReviewRequestIds).map(String);
+        if (remainingPayload.length === 0) pendingIds = pendingIds.filter((id) => id !== taskId);
+        await client.query(
+          "UPDATE zyra_chat_sessions SET last_completed_plan = $2::jsonb WHERE id = $1",
+          [existing.chat_session_id, JSON.stringify({ ...existingPlan, testcaseIds: mergedIds, totalCount: mergedIds.length, pendingReviewRequestIds: pendingIds })]
+        );
+      }
+
       if (existing.chat_session_id && remainingPayload.length > 0) {
         await client.query(
           `UPDATE ai_generation_requests

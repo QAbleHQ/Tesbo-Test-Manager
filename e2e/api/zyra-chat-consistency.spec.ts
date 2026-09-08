@@ -677,4 +677,144 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     // it straight from activity), not just the activity log a user may never open.
     expect(String(assistant.content || "")).toContain("1 of 2");
   });
+
+  /*
+   * fromLastPlan — Basecamp-adjacent, found by architecture audit rather than a report. A `create` op
+   * has been staged-not-written since the 2026-09-03 review-panel change, so `applied.testcases[].id`
+   * is always null for one; the code that recorded `zyra_chat_sessions.last_completed_plan` still
+   * tried to read a real id off that array, so the field stayed permanently empty and
+   * `move_to_suite ... fromLastPlan=true` — the system prompt's own documented way to handle "save
+   * them to <suite>" right after a generation — always resolved to zero targets. These two tests pin
+   * both halves of the fix: re-pointing a still-PENDING batch's suite (patches the draft directly,
+   * never auto-saves it), and moving an ALREADY-SAVED batch for real (using the id zyraSaveAttempt
+   * now records at the moment it first becomes real).
+   */
+  test("ZCC-B-04 'save them to <suite>' right after a generation re-points the still-pending draft, never auto-saving it", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai fromLastPlan pending");
+    const before = liveCaseCount();
+
+    // Turn 1: generate one test case, no suite named — lands as an unfiled, unsaved draft.
+    ai.queueReply({ reply: "", reasoningSummary: "Generating a checkout test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout completes with a valid card",
+        preconditions: "The cart has at least one item.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Complete checkout with a valid card", expectedResult: "The order confirmation page is shown" }]),
+        testData: "",
+        expectedSummary: "Checkout succeeds with a valid card.",
+        priority: "P2",
+        tags: ["zyra"],
+      }],
+    });
+    const turn1 = await sendMessage(sessionId, "Generate 1 test case for checkout.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+    expect(liveCaseCount(), "a staged create must not write to testcases").toBe(before);
+
+    const reviewRow = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    expect(reviewRow).toBeTruthy();
+
+    // Turn 2: "save them to the Checkout suite" — the batch from turn 1 is still only staged, so
+    // there is no real row anywhere for a DB move to act on. A move_to_suite op with fromLastPlan=true
+    // needs no generation call, only the router.
+    ai.queueReply({
+      reply: "Filing the checkout test case into the Checkout suite.",
+      reasoningSummary: "Confirmed the suite for the last generated batch.",
+      action: "suite",
+      actionType: "suite",
+      operations: [{ type: "move_to_suite", suiteName: "Checkout", fromLastPlan: true, reason: "user asked to file the last batch" }],
+      testcases: [],
+    });
+    const turn2 = await sendMessage(sessionId, "save them to the Checkout suite");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+    expect(ai.requests.length, "router (turn 1) + generation (turn 1) + router (turn 2, no generation for a move)").toBe(3);
+
+    // Still nothing written to testcases — re-pointing a pending draft's suite must never auto-save it.
+    expect(liveCaseCount(), "fromLastPlan against a pending batch must only patch the draft, never save it").toBe(before);
+
+    const suiteId = scalar(`SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = 'Checkout';`);
+    expect(suiteId, "move_to_suite auto-creates the named suite even for a pending-draft match").toBeTruthy();
+
+    const payload = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(reviewRow)};`));
+    expect(payload).toHaveLength(1);
+    expect(payload[0].draft.suiteId, "the pending draft itself must be repointed at the new suite").toBe(suiteId);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    expect(String(lastAssistant.content || ""), "the reply must not claim permanence for a still-unsaved draft").not.toContain("Nothing was saved");
+    expect(String(lastAssistant.content || "")).toContain("staged for your review");
+
+    // Prove the whole point of patching rather than ignoring: Save now actually lands the row in
+    // the suite the follow-up message asked for, with no suiteId passed in the save call itself.
+    const saveRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/ai/generation-history/${reviewRow}/save`, {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(saveRes.status(), `saving the repointed draft — ${await saveRes.text()}`).toBeLessThan(300);
+    const saveBody = await saveRes.json();
+    expect(saveBody.savedCount).toBe(1);
+    expect(liveCaseCount()).toBe(before + 1);
+    const savedSuiteId = scalar(`SELECT suite_id::text FROM testcases WHERE id = ${literal(String(saveBody.testcases[0].id))};`);
+    expect(savedSuiteId, "the saved row must land in the suite the pending draft was repointed to").toBe(suiteId);
+  });
+
+  test("ZCC-B-05 'move them to <suite>' after the batch was already saved does a real move, using the id recorded at save time", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai fromLastPlan saved");
+    const before = liveCaseCount();
+
+    ai.queueReply({ reply: "", reasoningSummary: "Generating a refund test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: "Refund is issued for a cancelled order",
+        preconditions: "An order was placed and paid for.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Cancel the order and process a refund", expectedResult: "The refund is issued to the original payment method" }]),
+        testData: "",
+        expectedSummary: "A cancelled order is refunded.",
+        priority: "P2",
+        tags: ["zyra"],
+      }],
+    });
+    const turn1 = await sendMessage(sessionId, "Generate 1 test case for order refunds.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    const reviewRow = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    const saveRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/ai/generation-history/${reviewRow}/save`, {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBeLessThan(300);
+    expect(liveCaseCount()).toBe(before + 1);
+    const savedId = String((await saveRes.json()).testcases[0].id);
+
+    // zyraSaveAttempt is where a create's id first becomes real — this is what the fix records into
+    // last_completed_plan, and what fromLastPlan needs to find on the next turn.
+    const plan = JSON.parse(scalar(`SELECT coalesce(last_completed_plan::text, '{}') FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`));
+    expect(plan.testcaseIds, "zyraSaveAttempt must record the real id once the draft is actually saved").toContain(savedId);
+    expect(plan.pendingReviewRequestIds || [], "a fully-saved batch must drop out of the pending pointer").not.toContain(reviewRow);
+
+    // Turn 2: now ask to move the (already saved) last batch — fromLastPlan must resolve against
+    // the real id recorded above; there is no pending draft left to patch.
+    ai.queueReply({
+      reply: "Moving the refund test case into the Payments suite.",
+      reasoningSummary: "Moving the last saved batch.",
+      action: "suite",
+      actionType: "suite",
+      operations: [{ type: "move_to_suite", suiteName: "Payments", fromLastPlan: true, reason: "user asked to file the last batch" }],
+      testcases: [],
+    });
+    const turn2 = await sendMessage(sessionId, "move that to the Payments suite");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    const suiteId = scalar(`SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = 'Payments';`);
+    const movedSuiteId = scalar(`SELECT suite_id::text FROM testcases WHERE id = ${literal(savedId)};`);
+    expect(movedSuiteId, "a real move against an already-saved batch must actually update the row").toBe(suiteId);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    expect(String(lastAssistant.content || "")).toContain("Moved to suites (actual)");
+    expect(String(lastAssistant.content || "")).toContain("Payments: 1");
+  });
 });
