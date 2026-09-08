@@ -610,7 +610,15 @@ export default function RequirementsPage() {
       {(syncError || jiraSync.error || linearSync.error) && (
         <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2.5 text-sm text-[var(--error-foreground)]">
           <span>{syncError || jiraSync.error || linearSync.error}</span>
-          <button type="button" onClick={() => setSyncError(null)} className="ml-3 text-[var(--error-foreground)] hover:opacity-80">
+          <button
+            type="button"
+            onClick={() => {
+              setSyncError(null);
+              jiraSync.clearError();
+              linearSync.clearError();
+            }}
+            className="ml-3 text-[var(--error-foreground)] hover:opacity-80"
+          >
             Dismiss
           </button>
         </div>

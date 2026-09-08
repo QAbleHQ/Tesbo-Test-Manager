@@ -76,7 +76,9 @@ export function useSyncRun(projectId: string, provider: IntegrationProvider, ena
     }
   }, [projectId, provider]);
 
-  return { run, starting, error, start, refresh, isActive: isSyncRunActive(run) };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { run, starting, error, start, refresh, clearError, isActive: isSyncRunActive(run) };
 }
 
 function relativeTime(iso: string | null): string {
