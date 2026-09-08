@@ -362,8 +362,8 @@ export class BillingService {
     interval: BillingInterval,
     req: BillingRequestContext | undefined,
     requestedCurrency?: string
-  ): Promise<{
-    this.requireStripeEnabled(); url: string }> {
+  ): Promise<{ url: string }> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     this.requireOwner(workspace.role);
@@ -397,8 +397,8 @@ export class BillingService {
     return { url: session.url };
   }
 
-  async createPortalSession(userId: string | null | undefined): Promise<{
-    this.requireStripeEnabled(); url: string }> {
+  async createPortalSession(userId: string | null | undefined): Promise<{ url: string }> {
+    this.requireStripeEnabled();
     const uid = this.requireUser(userId);
     const workspace = await this.legacy.workspace(uid);
     this.requireOwner(workspace.role);
