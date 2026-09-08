@@ -1214,6 +1214,8 @@ export default function TestCasesPage() {
                             {hasChildren ? (
                               <button
                                 type="button"
+                                data-testid={`suite-expand-${suite.id}`}
+                                aria-label={isExpanded ? `Collapse ${suite.name}` : `Expand ${suite.name}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   toggleSuiteExpanded(suite.id);
@@ -2437,6 +2439,9 @@ export default function TestCasesPage() {
         open={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
         defaultSuiteId={formSuiteId || undefined}
+        suites={suites}
+        suiteNameMap={suiteNameMap}
+        suitesLoaded={!loading}
         onImported={(result) => {
           if (result.imported > 0) {
             void loadData();

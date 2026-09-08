@@ -8,6 +8,7 @@ import {
   type ImportResult,
   type ImportTestCaseRow,
   type CustomFieldDefinition,
+  type SuiteNode,
 } from "@/lib/api";
 import { validateCustomFieldValue } from "@/components/customFields/customFieldTypes";
 
@@ -83,15 +84,27 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onImported: (result: ImportResult) => void;
-  // The suite the user was browsing when they opened Import, if any. Rows that leave "Suite Name"
-  // blank land directly in it (matching how "Add test case" already defaults to the currently open
-  // suite instead of always landing rows at the root); rows that do name a suite/component get that
-  // structure created as children of it instead of at the project root, so importing from inside a
-  // suite nests the file's contents under it rather than scattering new suites at the top level.
+  // The suite the user was browsing when they opened Import, if any. This is only the *initial*
+  // value of the in-modal suite picker below — it used to be sent to the server as-is, which is
+  // what let an import silently land at the project root whenever the page's own notion of "open
+  // suite" was unset (e.g. the user had only expanded a suite to see its children, rather than
+  // clicking into it). The picker makes the target explicit and confirmable instead of ambient.
   defaultSuiteId?: string;
+  // All suites in the project, for the picker, plus the same full-path label map the rest of this
+  // page already uses (e.g. "Parent / Child") so the picker reads identically to the suite tree
+  // and the "Add test case" form's own suite select.
+  suites: SuiteNode[];
+  suiteNameMap: Map<string, string>;
+  // False only while the page's very first suite fetch is still in flight. The page's own Import
+  // button lives in a shared top-bar slot that isn't gated by that fetch, so it can be clicked
+  // before `suites` has ever been populated — without this flag, an empty `suites` array in that
+  // split second would be indistinguishable from "this project truly has no suites", and the
+  // stale-suite cleanup effect below would wrongly clear a real, URL-selected defaultSuiteId back
+  // to root before it ever got a chance to load.
+  suitesLoaded: boolean;
 }
 
-export default function ImportTestCasesModal({ projectId, open, onClose, onImported, defaultSuiteId }: Props) {
+export default function ImportTestCasesModal({ projectId, open, onClose, onImported, defaultSuiteId, suites, suiteNameMap, suitesLoaded }: Props) {
   const [step, setStep] = useState<ImportStep>("upload");
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -100,6 +113,15 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
   const [preview, setPreview] = useState<ImportPreviewResult | null>(null);
   const [selectedSheetName, setSelectedSheetName] = useState("");
   const [mapping, setMapping] = useState<Record<string, number>>({});
+  // "" means the project root. Seeded from defaultSuiteId when the modal opens (see the effect
+  // below) but is otherwise the user's own explicit choice from here on — never silently
+  // recomputed from the page's ambient state while the modal is open.
+  const [targetSuiteId, setTargetSuiteId] = useState<string>("");
+  // Captures whatever defaultSuiteId was at the moment the modal opened, without making the
+  // open-effect below re-fire (and clobber the user's in-progress choice) every time the page's
+  // own active-suite state happens to change while the modal is already open.
+  const defaultSuiteIdRef = useRef(defaultSuiteId);
+  defaultSuiteIdRef.current = defaultSuiteId;
   const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomFieldDefinition[]>([]);
   const [customFieldMapping, setCustomFieldMapping] = useState<Record<string, number>>({});
   const [importing, setImporting] = useState(false);
@@ -126,6 +148,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     setDragActive(false);
     setCustomFieldMapping({});
     setShowAllErrorRows(false);
+    setTargetSuiteId("");
   }, []);
 
   useEffect(() => {
@@ -133,10 +156,33 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       reset();
       return;
     }
+    // Re-seeded from whatever suite the user had open at the moment Import was clicked, but stays
+    // a plain, overridable default — never sent to the server until the user confirms it (or
+    // changes it) via the picker below.
+    setTargetSuiteId(defaultSuiteIdRef.current ?? "");
     listCustomFieldDefinitions(projectId, { statuses: ["active"] })
       .then(setCustomFieldDefinitions)
       .catch(() => setCustomFieldDefinitions([]));
   }, [open, projectId, reset]);
+
+  // Suites the user was browsing may since have been renamed or deleted by a teammate; re-deriving
+  // the label from the live suites/suiteNameMap props (rather than freezing it at open-time) means
+  // the picker never shows a stale name, and silently falls back to "no suite" if the previously
+  // selected suite has disappeared entirely. Gated on suitesLoaded so the modal opened during the
+  // page's initial fetch doesn't mistake "not loaded yet" for "doesn't exist".
+  useEffect(() => {
+    if (suitesLoaded && targetSuiteId && !suites.some((s) => s.id === targetSuiteId)) {
+      setTargetSuiteId("");
+    }
+  }, [suites, suitesLoaded, targetSuiteId]);
+
+  const suiteOptions = useMemo(
+    () =>
+      [...suites].sort((a, b) =>
+        (suiteNameMap.get(a.id) ?? a.name).localeCompare(suiteNameMap.get(b.id) ?? b.name)
+      ),
+    [suites, suiteNameMap]
+  );
 
   const normalizeHeader = useCallback((value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ""), []);
 
@@ -430,7 +476,7 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       // Skipped rather than sent when every row was rejected above — the endpoint refuses an empty
       // batch, and there is nothing left for it to do anyway.
       const server = rows.length
-        ? await importTestCases(projectId, { rows, defaultSuiteId })
+        ? await importTestCases(projectId, { rows, defaultSuiteId: targetSuiteId || undefined })
         : { imported: 0, errors: [] as { row: number; message: string }[], expandSuiteIds: [] as string[] };
 
       const res: ImportResult = {
@@ -445,7 +491,15 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       setStep("result");
       onImported(res);
     } catch (err) {
-      setImportError(err instanceof Error ? err.message : "Import failed");
+      const rawMessage = err instanceof Error ? err.message : "Import failed";
+      // The server re-validates the target suite at request time (it can have been deleted by a
+      // teammate after the picker below loaded), and reports it with a raw field name aimed at an
+      // API caller. Reframe it in terms the picker's own user actually sees.
+      setImportError(
+        /defaultSuiteId is not a suite/i.test(rawMessage)
+          ? "The suite you selected no longer exists — it may have just been deleted. Pick another suite and try again."
+          : rawMessage
+      );
     } finally {
       setImporting(false);
     }
@@ -593,6 +647,34 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
             </div>
           ))}
         </div>
+
+        {/* Suite target picker — visible for the whole wizard except the final result screen, so the
+            destination is always explicit and confirmable rather than inferred from whichever suite
+            happened to be open on the page when Import was clicked. */}
+        {step !== "result" && (
+          <div className="border-b border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-6 py-3">
+            <label htmlFor="import-target-suite" className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+              Import into suite
+            </label>
+            <select
+              id="import-target-suite"
+              value={targetSuiteId}
+              disabled={!suitesLoaded || importing}
+              onChange={(e) => setTargetSuiteId(e.target.value)}
+              className="w-full max-w-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm text-[var(--foreground)] disabled:opacity-60"
+            >
+              <option value="">No suite (project root)</option>
+              {suiteOptions.map((suite) => (
+                <option key={suite.id} value={suite.id}>{suiteNameMap.get(suite.id) ?? suite.name}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-[var(--muted)]">
+              {suitesLoaded
+                ? "Rows left blank in the Suite/Component columns land directly here; rows that name their own suite or component are created as children of it."
+                : "Loading suites…"}
+            </p>
+          </div>
+        )}
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-6 py-5">
@@ -829,6 +911,14 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
                       <div className="h-full bg-[var(--success-foreground)]" style={{ width: `${(result.imported / result.total) * 100}%` }} />
                       <div className="h-full bg-[var(--error-foreground)]" style={{ width: `${(result.errors.length / result.total) * 100}%` }} />
                     </div>
+                  )}
+                  {result.imported > 0 && (
+                    <p className={`mt-2 text-xs ${RESULT_STATUS_STYLES[resultStatus].textClass}`}>
+                      Imported into:{" "}
+                      <span className="font-medium">
+                        {targetSuiteId ? suiteNameMap.get(targetSuiteId) ?? "Unknown suite" : "No suite (project root)"}
+                      </span>
+                    </p>
                   )}
                 </div>
               </div>
