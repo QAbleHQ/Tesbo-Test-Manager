@@ -640,4 +640,88 @@ test.describe("test case repository (UI)", () => {
     await expect(row(page, title), "the parent showed no cases though its child has one").toBeVisible();
     await expect(pagination(page)).toContainText("1 result");
   });
+
+  /*
+   * "Select all N matching" (selectAllMatchingCases, page.tsx) re-fetches with the SAME suite
+   * filter as the table it's paging through, to reach rows beyond the loaded page. It has to carry
+   * includeDescendants exactly like the table fetch does — the bug this catches: the button offers
+   * "Select all 3 matching" (suiteCasesTotal, from the now-fixed recursive fetch) but its own fetch
+   * quietly used the old exact-match filter, found zero of the parent's (all on the child) cases,
+   * and silently selected nothing at all.
+   */
+  test("TCR-16 'Select all N matching' reaches a parent suite's descendant cases too", async ({ browser }) => {
+    const parentName = stamp("SelectAllParent");
+    const childName = stamp("SelectAllChild");
+    const parentId = await seedSuite(parentName);
+    const childId = await seedSuite(childName, parentId);
+    const titles = [stamp("SelAllA"), stamp("SelAllB"), stamp("SelAllC")];
+    for (const title of titles) await seedCase(title, { suiteId: childId });
+
+    const page = await openRepository(browser);
+    await page.getByRole("button", { name: new RegExp(parentName) }).click();
+    for (const title of titles) await expect(row(page, title)).toBeVisible();
+
+    // Select just one row by hand, so "Select all N matching" (which only appears while the
+    // selection is smaller than the total) has something to expand.
+    await page.getByRole("row").filter({ hasText: titles[0] }).getByRole("checkbox").first().check();
+    await expect(page.getByText("1 selected")).toBeVisible();
+
+    const selectAllLink = page.getByTestId("select-all-matching");
+    await expect(selectAllLink, "the link should offer to reach all 3 matching cases").toContainText("3");
+    await selectAllLink.click();
+    await expect(
+      page.getByText("3 selected"),
+      "selecting all matching must reach the child's cases, not silently select none",
+    ).toBeVisible();
+
+    await page.getByRole("button", { name: "Bulk actions" }).click();
+    await page.getByRole("combobox").filter({ hasText: /Select an action/ }).selectOption("delete");
+    await expect(page.getByText(/permanently deletes the selected test cases/)).toBeVisible();
+    await page.getByRole("button", { name: "Confirm" }).click();
+
+    for (const title of titles) await expect(row(page, title)).toHaveCount(0);
+    await expect.poll(() => storedCaseCount(), { message: "all 3 must actually be deleted, not just deselected" }).toBe(0);
+  });
+
+  /*
+   * suiteNameMap (page.tsx) used to prepend only one level of parent name ("Parent / Child"). That
+   * was invisible for a 3rd level because a grandchild's case could never appear while browsing an
+   * ancestor at all — the parent-suite rollup bug meant the row itself never showed up. Now that
+   * fetch is recursive, such a row reaches this table for the first time, and a one-level label
+   * would silently read "Child / Grandchild" — missing "Root /" — as if it belonged one level
+   * higher than it does.
+   */
+  test("TCR-17 the Suite column shows the full ancestor path for a case nested three levels deep", async ({
+    browser,
+  }) => {
+    const rootName = stamp("PathRoot");
+    const childName = stamp("PathChild");
+    const grandchildName = stamp("PathGrandchild");
+    const rootId = await seedSuite(rootName);
+    const childId = await seedSuite(childName, rootId);
+    const grandchildId = await seedSuite(grandchildName, childId);
+    const title = stamp("DeepCase");
+    await seedCase(title, { suiteId: grandchildId });
+
+    const page = await openRepository(browser);
+
+    // The tree widget only ever renders 2 levels, so the root is the only way to reach this case at
+    // all — exactly what the parent-suite rollup fix made newly reachable.
+    await page.getByRole("button", { name: new RegExp(rootName) }).click();
+    await expect(row(page, title), "the root should show its grandchild's case").toBeVisible();
+
+    // Suite is hidden by default (RepositoryTestCaseTable's DEFAULT_VISIBLE) — show it.
+    await page.getByRole("button", { name: "Columns", exact: true }).click();
+    const suiteCheckbox = page
+      .getByRole("checkbox")
+      .and(page.locator(`xpath=//label[.//span[text()="Suite"]]//input`));
+    await suiteCheckbox.check();
+    await page.keyboard.press("Escape");
+
+    const targetRow = page.getByRole("row").filter({ hasText: title });
+    await expect(
+      targetRow,
+      "the Suite column truncated to one level, dropping the root",
+    ).toContainText(`${rootName} / ${childName} / ${grandchildName}`);
+  });
 });

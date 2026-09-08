@@ -318,12 +318,37 @@ export default function TestCasesPage() {
   );
   const suiteNameMap = useMemo(() => {
     const byId = new Map(suites.map((s) => [s.id, s]));
-    return new Map(
-      suites.map((s) => {
-        const parent = s.parentId ? byId.get(s.parentId) : undefined;
-        return [s.id, parent ? `${parent.name} / ${s.name}` : s.name];
-      })
-    );
+    /*
+     * Walks the FULL ancestor chain, not just one level up.
+     *
+     * A one-level "Parent / Child" label was enough while a suite 3+ levels deep could never show
+     * up here at all (the parent-suite rollup bug meant a grandchild's case never appeared while
+     * browsing an ancestor). Now that fetch is recursive, such a row is reachable through this
+     * table/TSV export/suite picker for the first time — a one-level label would silently truncate
+     * to "Child / Grandchild", dropping "Root /" and reading as if it belonged one level higher than
+     * it actually does.
+     *
+     * Identical output for every suite at depth <= 2 (the only depths the tree widget itself can
+     * navigate to), so this changes nothing visible for the common case — it only completes the
+     * label for a depth the UI couldn't previously reach in the first place.
+     *
+     * `visited` guards against a cyclic parent_id chain: suites.parent_id has no write-time cycle
+     * guard (createSuite/updateSuite accept any parentId unconditionally — see legacy.service.ts),
+     * so this mirrors the same defensive stance the backend's recursive suite queries already take,
+     * just to stop a client-side loop rather than a SQL recursion.
+     */
+    function pathFor(id: string): string {
+      const segments: string[] = [];
+      const visited = new Set<string>();
+      let current = byId.get(id);
+      while (current && !visited.has(current.id)) {
+        segments.unshift(current.name);
+        visited.add(current.id);
+        current = current.parentId ? byId.get(current.parentId) : undefined;
+      }
+      return segments.join(" / ");
+    }
+    return new Map(suites.map((s) => [s.id, pathFor(s.id)]));
   }, [suites]);
   const selectedSuiteCases = suiteCases;
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
@@ -675,6 +700,11 @@ export default function TestCasesPage() {
           limit: MAX_PAGE_SIZE,
           offset,
           suiteId: activeSuiteId ?? undefined,
+          // Must match loadSelectedSuiteCases' filter exactly — suiteCasesTotal (the "Select all N
+          // matching" label) is computed with this flag on, so leaving it off here under-selects: a
+          // parent suite whose cases live entirely on a child would page through zero rows and select
+          // nothing at all while the button claims all N were selected.
+          includeDescendants: activeSuiteId ? true : undefined,
           status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
           priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
           type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,

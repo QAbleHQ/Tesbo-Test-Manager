@@ -290,6 +290,35 @@ export function seedJiraRequirements(
   );
 }
 
+/** The Linear mirror of seedJiraRequirements — same reasoning, same shape, a different provider. */
+export function seedLinearRequirements(
+  organizationId: string,
+  projectId: string,
+  keys: string[],
+): void {
+  exec(
+    `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+      `VALUES (${literal(organizationId)}, 'linear', 'e2e-screens', 'https://e2e-screens.invalid', 'e2e', '', now() + interval '365 days') ` +
+      `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+  );
+  const connectionId = scalar(
+    `SELECT id FROM integration_connections WHERE organization_id = ${literal(organizationId)} AND provider = 'linear';`,
+  );
+  if (!connectionId) throw new Error("Could not resolve the seeded Linear integration connection");
+
+  const values = keys
+    .map(
+      (key) =>
+        `(${literal(projectId)}, ${literal(connectionId)}, ${literal(key)}, ${literal(key)}, ` +
+        `${literal(`Requirement ${key}`)}, 'Story', 'Todo')`,
+    )
+    .join(", ");
+  exec(
+    `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status) ` +
+      `VALUES ${values} ON CONFLICT DO NOTHING;`,
+  );
+}
+
 /** Backdates rows so the dashboard's 7-day and 14-day windows can be exercised without waiting. */
 export function backdate(
   table: "testcases" | "executions",
