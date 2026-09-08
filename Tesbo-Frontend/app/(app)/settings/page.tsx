@@ -3,7 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { authMe, getWorkspace } from "@/lib/api";
+import { authMe, getBillingInfo, getWorkspace } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import { PageLoader } from "@/components/ui";
@@ -23,6 +23,7 @@ function WorkspaceSettingsContent() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [canManageWorkspace, setCanManageWorkspace] = useState(false);
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
+  const [billingEnabled, setBillingEnabled] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTab | null>(null);
   const { startEl: topBarStartEl, setFilled: setTopBarFilled } = useTopBarSlots();
 
@@ -34,12 +35,12 @@ function WorkspaceSettingsContent() {
             { key: "members", label: "Members" },
             { key: "integrations", label: "Integrations" },
             { key: "ai", label: "AI Providers" },
-            { key: "billing", label: "Billing" },
+            ...(billingEnabled ? ([{ key: "billing", label: "Billing" }] as const) : []),
           ] as const)
         : []),
       ...(isPlatformAdmin ? ([{ key: "admins", label: "Manage Admins" }] as const) : []),
     ],
-    [canManageWorkspace, isPlatformAdmin]
+    [canManageWorkspace, isPlatformAdmin, billingEnabled]
   );
 
   const load = useCallback(async () => {
@@ -60,6 +61,13 @@ function WorkspaceSettingsContent() {
       setWorkspaceName(workspace.name || "");
       setCanManageWorkspace(canManage);
       setIsPlatformAdmin(platformAdmin);
+      try {
+        const billing = await getBillingInfo();
+        // enabled:false → hide tab; enabled:true (or omitted on old servers) → show.
+        setBillingEnabled(billing.enabled !== false);
+      } catch {
+        setBillingEnabled(false);
+      }
       setStatus("ready");
     } catch {
       router.replace("/projects");

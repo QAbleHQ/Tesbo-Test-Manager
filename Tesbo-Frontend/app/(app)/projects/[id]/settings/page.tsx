@@ -269,7 +269,7 @@ export default function ProjectSettingsPage() {
       getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
       getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
       getBillingInfo()
-        .then((billing) => setLinearIsPro(billing.plan === "pro"))
+        .then((billing) => setLinearIsPro(billing.enabled === false || billing.plan === "pro"))
         .catch(() => setLinearIsPro(null));
       listApiKeys(projectId).then((l) => setApiTokenCount(l.length)).catch(() => {});
       listCustomFieldDefinitions(projectId).then((l) => setCustomFieldCount(l.length)).catch(() => {});
