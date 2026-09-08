@@ -187,6 +187,10 @@ describe("Zyra model-response parsing", () => {
   describe("reconcileZyraReply", () => {
     const creates = (n: number) => Array.from({ length: n }, () => ({ type: "create" }));
     const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `tc-${i}` }));
+    // Staged (not yet saved) rows carry a "proposed-*" action, per applyZyraChatOperations' create
+    // branch — this is what proposedCount/reviewHint and the false-completion-claim guard key off,
+    // distinct from `rows()` above which stands in for something genuinely already applied.
+    const stagedRows = (n: number) => Array.from({ length: n }, (_, i) => ({ draftIndex: i, action: "proposed-create" }));
 
     it("passes the reply through when every requested operation was applied", () => {
       const out = internals(svc).reconcileZyraReply(
@@ -194,6 +198,62 @@ describe("Zyra model-response parsing", () => {
         { testcases: rows(3), activity: [] }
       );
       expect(out).toBe("Created 3 test cases.");
+    });
+
+    // The gap item 4 closes: a create/update/archive turn's own reply text was never checked for a
+    // false past-tense completion claim — only the `answer` branch was. A reply saying "Created" for
+    // rows that are still only staged (proposedCount > 0) is exactly as false here as it is on an
+    // `answer` turn, and now gets the same correction banner prepended.
+    it("corrects a create-turn reply that claims completion while its rows are still staged", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Created 3 test cases and saved them to the repository.", actionType: "create", operations: creates(3) },
+        { testcases: stagedRows(3), activity: [] }
+      );
+      expect(out).toContain("Sorry! Nothing was saved");
+      expect(out).toContain("Created 3 test cases and saved them to the repository.");
+      expect(out).toContain("staged for your review");
+    });
+
+    // The banner must not fire on rows that really were written immediately (move_to_suite), even
+    // though the reply text uses the same "saved"/"moved" language — proposedCount is 0 there because
+    // nothing about a move is staged, so the claim is true.
+    it("does not correct a reply whose completion claim is actually true", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Moved 3 test cases into the Login suite.", actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        { testcases: rows(3), activity: [] }
+      );
+      expect(out).not.toContain("Nothing was saved");
+      expect(out).toBe("Moved 3 test cases into the Login suite.");
+    });
+
+    // A reply that already honestly discloses staging (uses "drafted"/"staged" language the system
+    // prompt asks for, or explicitly says nothing is saved yet) must not be double-corrected.
+    it("does not double-correct a reply that already discloses staging honestly", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Drafted 3 test cases for review; nothing was saved yet.", actionType: "create", operations: creates(3) },
+        { testcases: stagedRows(3), activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+    });
+
+    // The near-miss the naive fix for the case above would have caused: generateZyraChatTestcasesWithAi
+    // (the real code that authors a create turn's reply) always says "I drafted N test case(s)
+    // after reading ..." — exactly the wording the system prompt asks for when something IS staged.
+    // A completion-claim check reusing the answer branch's broad ZYRA_COMPLETION_CLAIM (which
+    // treats "drafted"/"staged"/"proposed" as false-claim verbs, correctly so when nothing at all
+    // was applied) would flag every ordinary successful generation as a false claim. Only a verb
+    // implying real persistence (created/saved/archived/updated) is false while staged.
+    it("does not flag the real generation reply's own 'I drafted N test case(s)' wording", () => {
+      const out = internals(svc).reconcileZyraReply(
+        {
+          reply: "I drafted 2 test case(s) after reading 3 knowledge-base item(s), 0 Jira ticket(s) read directly, 4 existing test case(s) to avoid duplicating coverage.\n\nThey're staged as drafts in **Zyra generated test cases** — say \"save them to <suite>\" and I'll file them where they belong.",
+          actionType: "create",
+          operations: creates(2)
+        },
+        { testcases: stagedRows(2), activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+      expect(out).toContain("staged for your review");
     });
 
     it("flags a partial application instead of repeating the model's larger number", () => {
