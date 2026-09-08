@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createBug,
   addBugLink,
@@ -133,6 +133,13 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
   const [bugStagedFiles, setBugStagedFiles] = useState<File[]>([]);
   const [bugBetterbugsUrl, setBugBetterbugsUrl] = useState("");
   const [bugSaving, setBugSaving] = useState(false);
+  // Basecamp: createBug() could succeed and the (unbatched) uploadBugAttachments() that followed
+  // it could then fail — with no catch here, that was an unhandled rejection: the dialog looked
+  // like it silently did nothing, which invited a retry that called createBug() again and produced
+  // a duplicate bug. bugCreatedIdRef remembers the bug from the in-flight/most recent attempt so a
+  // retry only resumes the attachment upload; resetBugDialog()/prepareBugDialog() clear it.
+  const [bugSaveError, setBugSaveError] = useState<string | null>(null);
+  const bugCreatedIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
@@ -141,6 +148,8 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
 
   /* ───── Prefill + open the bug dialog for a given execution ───── */
   function prepareBugDialog(exec: ExecutionItem, titlePrefix: string) {
+    bugCreatedIdRef.current = null;
+    setBugSaveError(null);
     setBugExecution(exec);
     setBugTitle(`${titlePrefix}: ${exec.title || exec.snapshotTitle || "Untitled test case"}`);
     setBugDesc("");
@@ -166,6 +175,8 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
 
   /* ───── Reset & close the bug dialog ───── */
   function resetBugDialog() {
+    bugCreatedIdRef.current = null;
+    setBugSaveError(null);
     setShowBugDialog(false);
     setBugExecution(null);
     setBugTitle("");
@@ -187,25 +198,45 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
   /* ───── Submit bug from dialog (new bug, optionally noting where it's tracked elsewhere) ───── */
   async function handleBugSubmit() {
     if (!bugExecution || !bugTitle.trim() || !bugSeverity) return;
+    // Belt-and-suspenders alongside the button's `disabled={bugSaving}`: guards a re-entrant call
+    // that lands before the disabled state has re-rendered.
+    if (bugSaving) return;
     const selfLogged = (jiraConnected || linearConnected) && bugDestination === "SELF";
     setBugSaving(true);
+    setBugSaveError(null);
     try {
-      const bug = await createBug(projectId, {
-        title: bugTitle.trim(),
-        description: bugDesc.trim(),
-        severity: bugSeverity,
-        priority: bugPriority || null,
-        externalUrl: selfLogged ? bugUrl.trim() : undefined,
-        integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
-        integrationIssueKey: null,
-        betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
-        links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
-      });
+      // A retry after a failed attachment upload must not create a second bug: reuse the bug
+      // created by the previous attempt (if any) instead of calling createBug() again.
+      let bugId = bugCreatedIdRef.current;
+      if (!bugId) {
+        const bug = await createBug(projectId, {
+          title: bugTitle.trim(),
+          description: bugDesc.trim(),
+          severity: bugSeverity,
+          priority: bugPriority || null,
+          externalUrl: selfLogged ? bugUrl.trim() : undefined,
+          integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
+          integrationIssueKey: null,
+          betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
+          links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
+        });
+        bugId = bug.id;
+        bugCreatedIdRef.current = bugId;
+      }
       if (bugEvidenceMode === "FILES" && bugStagedFiles.length) {
-        await uploadBugAttachments(projectId, bug.id, bugStagedFiles);
+        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
+        // only resends the files that never made it, not ones already attached to the bug.
+        await uploadBugAttachments(projectId, bugId, bugStagedFiles, (batch) => {
+          setBugStagedFiles((prev) => prev.slice(batch.length));
+        });
       }
       resetBugDialog();
       onLogged?.();
+    } catch (err) {
+      // The bug itself may already have been created — the evidence upload is the step that
+      // failed. Keep the dialog open with the error shown rather than losing that state, matching
+      // projects/[id]/bugs/page.tsx's create-bug error handling.
+      setBugSaveError(err instanceof Error ? err.message : "Something went wrong while reporting this bug.");
     } finally {
       setBugSaving(false);
     }
@@ -237,6 +268,14 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
         title="Report a Bug"
       >
         <div className="space-y-4">
+          {bugSaveError && (
+            <p
+              data-testid="log-bug-error"
+              className="rounded-[var(--radius-control)] border border-[var(--error)] bg-[var(--error)]/10 px-3 py-2 text-[13px] text-[var(--error-foreground)]"
+            >
+              {bugSaveError}
+            </p>
+          )}
           {/* Themed rather than the literal red-50/red-200 these carried: in dark mode that pale
               block stayed light while its text followed the theme, which is the same mismatch the
               danger Button variant was fixed for. */}

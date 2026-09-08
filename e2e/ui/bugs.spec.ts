@@ -166,6 +166,92 @@ test.describe("bug evidence validation", () => {
     await expect(page.getByRole("button", { name: "Report Bug" }).last()).toBeEnabled();
     await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
   });
+
+  /*
+   * The reported defect: createBug() succeeded, the single unbatched attachments request that
+   * followed it was refused outright by the server's ten-file-per-request cap, and the modal stayed
+   * open with the files still staged — inviting a retry that called createBug() again and produced a
+   * duplicate bug. lib/api.ts's uploadBugAttachments now splits anything over the cap into sequential
+   * requests, so this is the happy-path half of the fix: nothing above ten files should ever reach
+   * that cap in the first place, and one save action still produces exactly one bug.
+   */
+  test("BUG-U-36 reporting a bug with more than ten attachments creates exactly one bug with every file attached", async ({ page }) => {
+    await openReportModal(page, projectId);
+    const title = `E2E Many Attachments ${uniqueSuffix()}`;
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await fileInput(page).setInputFiles(
+      Array.from({ length: 12 }, (_, i) => ({
+        name: `evidence-${i}.png`,
+        mimeType: "image/png",
+        buffer: Buffer.from(`file contents ${i}`),
+      })),
+    );
+
+    const submit = page.getByRole("button", { name: "Report Bug" }).last();
+    await submit.click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+    await expect(page.getByTestId("create-bug-error")).toHaveCount(0);
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const matches = bugs.filter((b: { title: string }) => b.title === title);
+    expect(matches, "a single save action must create exactly one bug").toHaveLength(1);
+
+    const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
+    expect(bug.attachments, "every staged file must reach the bug, not just the first ten").toHaveLength(12);
+  });
+
+  /*
+   * The exact failure mode from the Basecamp report, reproduced directly: the attachment request
+   * fails once (whatever the reason — over the server's cap, a dropped connection, a validation
+   * error), the bug was already created by that same attempt, and the person retries from the still-
+   * open modal. Before the fix, retrying re-ran the whole submit handler and called createBug() a
+   * second time. Now the bug id from the failed attempt is remembered, so a retry only resumes the
+   * attachment upload.
+   */
+  test("BUG-U-37 a retry after a failed attachment upload does not create a duplicate bug", async ({ page }) => {
+    let attempt = 0;
+    await page.route("**/bugs/*/attachments", (route) => {
+      attempt += 1;
+      // The first attachment request this test makes fails; every one after (i.e. the retry) goes
+      // through for real.
+      if (attempt === 1) {
+        return route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Simulated upload failure" }),
+        });
+      }
+      return route.continue();
+    });
+
+    await openReportModal(page, projectId);
+    const title = `E2E Duplicate Guard ${uniqueSuffix()}`;
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    await fileInput(page).setInputFiles(
+      Array.from({ length: 12 }, (_, i) => ({
+        name: `evidence-${i}.png`,
+        mimeType: "image/png",
+        buffer: Buffer.from(`file contents ${i}`),
+      })),
+    );
+
+    const submit = page.getByRole("button", { name: "Report Bug" }).last();
+    await submit.click();
+    const error = page.getByTestId("create-bug-error");
+    await expect(error).toBeVisible();
+    // The modal stays open with the same submit control, exactly what invited the original defect.
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+    await submit.click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const matches = bugs.filter((b: { title: string }) => b.title === title);
+    expect(matches, "the retry must reuse the bug from the failed attempt, not create a second one").toHaveLength(1);
+
+    const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
+    expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(12);
+  });
 });
 
 /*
