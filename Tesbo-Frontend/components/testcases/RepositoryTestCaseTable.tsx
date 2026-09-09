@@ -230,7 +230,6 @@ export function RepositoryTestCaseTable({
   const [visible, setVisible] = useState<Record<RepoDataColumnId, boolean>>(DEFAULT_VISIBLE);
   const [widths, setWidths] = useState<Record<RepoTcColumnId, number>>(DEFAULT_WIDTHS);
   const [prefsReady, setPrefsReady] = useState(false);
-  const [dragOverId, setDragOverId] = useState<RepoDataColumnId | null>(null);
   const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
   const columnsMenuRef = useRef<HTMLDivElement>(null);
 
@@ -317,19 +316,6 @@ export function RepositoryTestCaseTable({
     [orderedColumns, widths],
   );
 
-  const moveColumn = useCallback((from: RepoDataColumnId, to: RepoDataColumnId) => {
-    if (from === to) return;
-    setDataOrder((prev) => {
-      const next = [...prev];
-      const i = next.indexOf(from);
-      const j = next.indexOf(to);
-      if (i === -1 || j === -1) return prev;
-      next.splice(i, 1);
-      next.splice(j, 0, from);
-      return next;
-    });
-  }, []);
-
   const toggleColumnVisible = useCallback((id: RepoDataColumnId) => {
     if (LOCKED_COLUMN_SET.has(id)) return;
     setVisible((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -338,7 +324,6 @@ export function RepositoryTestCaseTable({
   function renderHeaderCell(col: RepoTcColumnId) {
     const w = widths[col];
     const label = COLUMN_LABELS[col];
-    const isData = col !== "select";
     const thSizing = { width: w, minWidth: w, maxWidth: w, position: "relative" as const };
 
     return (
@@ -346,64 +331,8 @@ export function RepositoryTestCaseTable({
         key={col}
         style={thSizing}
         className="align-middle"
-        draggable={isData}
-        onDragStart={
-          isData
-            ? (e) => {
-                e.dataTransfer.effectAllowed = "move";
-                e.dataTransfer.setData("text/plain", col);
-              }
-            : undefined
-        }
-        onDragOver={
-          isData
-            ? (e) => {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "move";
-              }
-            : undefined
-        }
-        onDragEnter={
-          isData
-            ? () => {
-                setDragOverId(col);
-              }
-            : undefined
-        }
-        onDragLeave={
-          isData
-            ? () => {
-                setDragOverId((cur) => (cur === col ? null : cur));
-              }
-            : undefined
-        }
-        onDrop={
-          isData
-            ? (e) => {
-                e.preventDefault();
-                const from = e.dataTransfer.getData("text/plain") as RepoDataColumnId;
-                setDragOverId(null);
-                if (from && DATA_COLUMN_IDS.includes(from)) moveColumn(from, col);
-              }
-            : undefined
-        }
-        onDragEnd={() => setDragOverId(null)}
       >
-        <div
-          className={`flex items-center gap-1.5 pr-2 ${dragOverId === col && isData ? "rounded-md bg-[var(--brand-soft)]" : ""}`}
-        >
-          {isData && (
-            <span className="cursor-grab text-[var(--muted-soft)] select-none active:cursor-grabbing" aria-hidden="true">
-              <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" className="opacity-60">
-                <circle cx="3" cy="3" r="1.25" />
-                <circle cx="7" cy="3" r="1.25" />
-                <circle cx="3" cy="7" r="1.25" />
-                <circle cx="7" cy="7" r="1.25" />
-                <circle cx="3" cy="11" r="1.25" />
-                <circle cx="7" cy="11" r="1.25" />
-              </svg>
-            </span>
-          )}
+        <div className="flex items-center gap-1.5 pr-2">
           {col === "select" ? (
             <input
               type="checkbox"
@@ -609,7 +538,7 @@ export function RepositoryTestCaseTable({
           })}
           <p className="mt-2 border-t border-[var(--border-subtle)] px-3 pt-2 text-[11px] text-[var(--muted)]">
             {
-              "The selection column stays first. Drag headers to reorder data fields, and drag header edges to resize columns."
+              "The selection column stays first. Drag header edges to resize columns."
             }
           </p>
         </div>

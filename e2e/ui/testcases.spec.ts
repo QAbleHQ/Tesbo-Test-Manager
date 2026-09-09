@@ -335,3 +335,51 @@ test.describe("test case detail — linked bugs", () => {
     }
   });
 });
+
+// Regression coverage for: the repository table's column headers used to be draggable (a grip
+// icon plus HTML5 drag-and-drop) so a user could reorder data columns. That reordering was
+// removed; only the per-column resize handle should remain.
+test.describe("test case repository table — column drag-and-drop removed", () => {
+  test("column headers are no longer draggable, and dragging one does not reorder columns", async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+
+    const headerCells = page.locator("table.tc-repo-table thead tr th");
+    // select, ID, Test case title, Priority, Type, Automation Type, Status, Updated (default visible set).
+    await expect(headerCells).toHaveCount(8);
+    const idHeader = headerCells.nth(1);
+    const titleHeader = headerCells.nth(2);
+    await expect(idHeader).toContainText("ID");
+    await expect(titleHeader).toContainText("Test case title");
+
+    // No draggable attribute and no grip icon left behind on any data column header.
+    for (let i = 1; i < 8; i++) {
+      expect(await headerCells.nth(i).getAttribute("draggable")).toBeNull();
+    }
+    await expect(idHeader.locator("svg")).toHaveCount(0);
+
+    // A drag attempt from the title header onto the ID header must be inert now — no dataTransfer
+    // handlers remain, so this is at most a plain mouse drag, and column order stays put.
+    await titleHeader.dragTo(idHeader);
+
+    await expect(headerCells.nth(1)).toContainText("ID");
+    await expect(headerCells.nth(2)).toContainText("Test case title");
+  });
+
+  test("column resize still works after removing drag-and-drop reordering", async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+
+    const idHeader = page.locator("table.tc-repo-table thead tr th").nth(1);
+    const before = await idHeader.evaluate((el) => el.getBoundingClientRect().width);
+
+    const handle = page.getByRole("separator", { name: "Resize ID column" });
+    const box = await handle.boundingBox();
+    if (!box) throw new Error("resize handle for the ID column was not found");
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + 60, box.y + box.height / 2, { steps: 5 });
+    await page.mouse.up();
+
+    const after = await idHeader.evaluate((el) => el.getBoundingClientRect().width);
+    expect(after).toBeGreaterThan(before + 30);
+  });
+});

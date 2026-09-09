@@ -39,8 +39,7 @@ export default function CustomFieldDefinitionList({
 }) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Which non-archived row is currently the drop target, for the highlight — mirrors dragOverId in
-  // RepositoryTestCaseTable.tsx's column drag-and-drop.
+  // Which non-archived row is currently the drop target, for the highlight.
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CustomFieldDefinition | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
