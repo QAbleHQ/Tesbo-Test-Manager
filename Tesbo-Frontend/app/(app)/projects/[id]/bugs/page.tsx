@@ -190,9 +190,12 @@ function KanbanCard({
       className="group bg-[var(--surface)] border border-[var(--border-subtle)] rounded-lg p-3 cursor-pointer hover:border-[var(--brand-primary)]/40 hover:shadow-sm transition-all"
     >
       <div className="flex items-start justify-between gap-2 mb-2">
-        <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
-          {bug.title}
-        </h4>
+        <div className="min-w-0">
+          <p className="font-mono text-[11px] text-[var(--muted-soft)]">{bug.integrationIssueKey || bug.externalId}</p>
+          <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
+            {bug.title}
+          </h4>
+        </div>
         {/*
           * Same defect as the List view's row actions (Basecamp 10226234070 / 10218564160): a
           * 14px glyph in a ~22px box is a hairline nobody can reliably click. Matches the List
@@ -952,6 +955,7 @@ export default function BugsPage() {
                               */}
                             <td>
                               <div className="flex flex-col gap-0.5 max-w-sm">
+                                <span className="font-mono text-[11px] text-[var(--muted-soft)]">{b.integrationIssueKey || b.externalId}</span>
                                 <span
                                   title={b.title}
                                   className="line-clamp-2 text-sm font-medium text-[var(--accent-light)] hover:underline break-words"
@@ -1102,12 +1106,17 @@ export default function BugsPage() {
       >
         {viewBug && (
           <div className="space-y-5">
-            {/* Title + Status */}
+            {/* Bug Key + Title + Status */}
             <div>
               <div className="flex items-start justify-between gap-3">
-                <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
-                  {viewBug.title}
-                </h3>
+                <div className="min-w-0">
+                  {/* Falls back to the bug's own per-project id when it has no external tracker
+                      ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
+                  <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
+                  <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
+                    {viewBug.title}
+                  </h3>
+                </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <BugSeverityBadge severity={viewBug.severity} />
                   <BugPriorityBadge priority={viewBug.priority} />

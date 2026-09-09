@@ -202,6 +202,10 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     // that lands before the disabled state has re-rendered.
     if (bugSaving) return;
     const selfLogged = (jiraConnected || linearConnected) && bugDestination === "SELF";
+    // "Yes, link existing" + a searched Jira/Linear ticket carries its own real key/url/provider
+    // (IssuePickerModal -> bugIssue) — that's the actual source of truth for this bug, not the
+    // self-logged fields below, which only apply to the "No, log a new one" branch.
+    const pickedIssue = bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") ? bugIssue : null;
     setBugSaving(true);
     setBugSaveError(null);
     try {
@@ -214,9 +218,9 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
           description: bugDesc.trim(),
           severity: bugSeverity,
           priority: bugPriority || null,
-          externalUrl: selfLogged ? bugUrl.trim() : undefined,
-          integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
-          integrationIssueKey: null,
+          externalUrl: pickedIssue ? pickedIssue.url : selfLogged ? bugUrl.trim() : undefined,
+          integrationProvider: pickedIssue ? pickedIssue.provider : selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
+          integrationIssueKey: pickedIssue ? pickedIssue.key : null,
           betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
           links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
         });
