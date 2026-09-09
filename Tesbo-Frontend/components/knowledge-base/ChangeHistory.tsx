@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IconCalendar, IconClock } from "@tabler/icons-react";
 import { getKnowledgeDocumentHistory, type KnowledgeDocumentHistoryEntry } from "@/lib/api";
 import { ChangeDiffModal } from "./ChangeDiffModal";
@@ -71,12 +71,50 @@ export function ChangeHistoryList({
   });
   const [diffEntry, setDiffEntry] = useState<KnowledgeDocumentHistoryEntry | null>(null);
 
+  // Page results, keyed by page number, for the lifetime of this mounted instance — the popover
+  // and the History modal both fully unmount on close (Modal.tsx returns null; the popover is only
+  // ever conditionally rendered), so a fresh open always starts from an empty cache, never carries
+  // another document's — or a stale prior session's — pages into a new one.
+  type HistoryPage = { events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean };
+  const cacheRef = useRef<Map<number, HistoryPage>>(new Map());
+  const inFlightRef = useRef<Map<number, Promise<HistoryPage>>>(new Map());
+  // Defensive only: neither call site actually swaps projectId/documentId under an already-mounted
+  // instance today, but if that ever changed, a stale cache must never leak across documents.
+  useEffect(() => {
+    cacheRef.current = new Map();
+    inFlightRef.current = new Map();
+  }, [projectId, documentId]);
+
+  const fetchPage = useCallback(
+    (p: number): Promise<HistoryPage> => {
+      const cached = cacheRef.current.get(p);
+      if (cached) return Promise.resolve(cached);
+      const inFlight = inFlightRef.current.get(p);
+      if (inFlight) return inFlight;
+      const request = getKnowledgeDocumentHistory(projectId, documentId, { limit: CHANGE_HISTORY_PAGE_SIZE, offset: p * CHANGE_HISTORY_PAGE_SIZE })
+        .then((res) => {
+          const result: HistoryPage = { events: res.events, hasMore: res.hasMore };
+          // A failed fetch never reaches here (the rejection skips straight to .finally below), so
+          // a page is only ever cached once it actually has real data to show.
+          cacheRef.current.set(p, result);
+          return result;
+        })
+        .finally(() => {
+          inFlightRef.current.delete(p);
+        });
+      inFlightRef.current.set(p, request);
+      return request;
+    },
+    [projectId, documentId]
+  );
+
   // Deliberately doesn't reset to `loading: true` before the fetch resolves: the previous page's
-  // rows stay on screen until the new page arrives (typically near-instant, a single indexed
-  // query), which reads as an instant page flip rather than a loading flash on every click.
+  // rows stay on screen until the new page arrives, which reads as an instant page flip rather
+  // than a loading flash on every click. A page already sitting in the cache — a repeat visit, or
+  // one the background prefetch below already finished — renders with no request at all.
   useEffect(() => {
     let cancelled = false;
-    getKnowledgeDocumentHistory(projectId, documentId, { limit: CHANGE_HISTORY_PAGE_SIZE, offset: page * CHANGE_HISTORY_PAGE_SIZE })
+    fetchPage(page)
       .then((res) => {
         if (!cancelled) setState({ loading: false, events: res.events, hasMore: res.hasMore, error: false });
       })
@@ -86,9 +124,25 @@ export function ChangeHistoryList({
     return () => {
       cancelled = true;
     };
-  }, [projectId, documentId, page]);
+  }, [page, fetchPage]);
 
-  const showPager = !state.loading && !state.error && (page > 0 || state.hasMore);
+  // Once the current page is actually showing, quietly warm the next one in the background, so
+  // paging forward through a long timeline finds the data already waiting instead of triggering a
+  // fresh request on every click. Never surfaces its own loading/error state: a failed prefetch
+  // just leaves that page uncached, and the effect above fetches (and can show its own error) for
+  // real if the user actually pages there.
+  useEffect(() => {
+    if (!state.loading && !state.error && state.hasMore) {
+      void fetchPage(page + 1).catch(() => undefined);
+    }
+  }, [page, state.loading, state.error, state.hasMore, fetchPage]);
+
+  // A failed fetch for page 2+ must not strand the user: `hasMore` is forced false on error (below),
+  // so Next is already correctly disabled — but the old `!state.error` gate hid Previous too, with
+  // no way back to page 1 short of closing the whole modal. Once on a later page, the pager stays
+  // up through an error so Previous keeps working; only page 0 (nothing earlier to go back to, and
+  // forward is unknown while errored) hides it entirely.
+  const showPager = !state.loading && (page > 0 || (!state.error && state.hasMore));
 
   return (
     <div>
@@ -146,7 +200,7 @@ export function ChangeHistoryList({
                         onClick={() => setDiffEntry(event)}
                         className="shrink-0 font-medium text-[var(--accent-light)] hover:underline"
                       >
-                        View diff
+                        View diff.
                       </button>
                     )}
                   </div>

@@ -7420,10 +7420,12 @@ export class LegacyService implements OnModuleInit {
         version_number: number;
         title: string;
         content_text: string | null;
+        changed_summary: string | null;
+        changed_fields: ChangedField[] | null;
         created_by_name: string | null;
         created_at: string;
       }>(
-        `SELECT v.id, v.version_number, v.title, v.content_text,
+        `SELECT v.id, v.version_number, v.title, v.content_text, v.changed_summary, v.changed_fields,
                 COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS created_by_name, v.created_at
          FROM knowledge_document_versions v
          LEFT JOIN users u ON u.id = v.created_by
@@ -7453,23 +7455,56 @@ export class LegacyService implements OnModuleInit {
     // change, timestamped and attributed to that same row. An edit that lands inside the 15-minute
     // snapshot-throttling window (KB_VERSION_SNAPSHOT_MINUTES) never gets its own row and is folded
     // into whichever transition it happened inside, rather than being silently dropped.
-    const states = [
-      ...versions.map((v) => ({ title: v.title, contentText: v.content_text })),
-      { title: String(doc.title), contentText: (doc.content_text as string | null) ?? null }
-    ];
+    //
+    // That diff is precomputed and stored on the row at write time (updateKnowledgeDocument /
+    // restoreKnowledgeDocumentVersion) — reading it back here is a column read, not a re-run of the
+    // text diff across the whole history on every page view, which is what made a long timeline's
+    // Change History visibly slower to page through the more versions it accumulated. A row written
+    // before that shipped has no stored diff (changed_summary IS NULL): computed inline, just for
+    // that one row, and cached back onto it so it's O(1) on every future read instead of this one.
+    const healPromises: Promise<void>[] = [];
     for (let i = 0; i < versions.length; i++) {
-      const diff = summarizeDocumentChange(states[i], states[i + 1]);
-      if (!diff.fields.length) continue;
+      const v = versions[i];
+      let summary: string;
+      let fields: ChangedField[];
+      if (v.changed_summary !== null && Array.isArray(v.changed_fields)) {
+        summary = v.changed_summary;
+        fields = v.changed_fields;
+      } else {
+        const nextState =
+          i + 1 < versions.length
+            ? { title: versions[i + 1].title, contentText: versions[i + 1].content_text }
+            : { title: String(doc.title), contentText: (doc.content_text as string | null) ?? null };
+        const diff = summarizeDocumentChange({ title: v.title, contentText: v.content_text }, nextState);
+        summary = diff.summary;
+        fields = diff.fields;
+        // Best-effort cache warm: never blocks or fails the read, and only ever fills a row that's
+        // still unhealed — if a concurrent edit already computed a fresher value for this exact row
+        // (the narrow case where it was still the "latest" row at the moment both ran), that value
+        // must win, so this never overwrites a non-NULL changed_summary.
+        healPromises.push(
+          this.db
+            .query("UPDATE knowledge_document_versions SET changed_summary = $2, changed_fields = $3::jsonb WHERE id = $1 AND changed_summary IS NULL", [
+              v.id,
+              summary,
+              JSON.stringify(fields)
+            ])
+            .then(() => undefined)
+            .catch(() => undefined)
+        );
+      }
+      if (!fields.length) continue;
       entries.push({
-        id: versions[i].id,
+        id: v.id,
         eventType: "updated",
-        changedSummary: diff.summary,
-        changedFields: diff.fields,
-        createdAt: new Date(versions[i].created_at).toISOString(),
-        actorName: versions[i].created_by_name || "Deleted user",
-        versionId: versions[i].id
+        changedSummary: summary,
+        changedFields: fields,
+        createdAt: new Date(v.created_at).toISOString(),
+        actorName: v.created_by_name || "Deleted user",
+        versionId: v.id
       });
     }
+    if (healPromises.length) void Promise.all(healPromises);
 
     // Approve/reject already lands in the project activity feed (logProjectActivity), but that feed
     // mixes every kind of activity across the whole project — folding it in here too means this
@@ -7545,8 +7580,8 @@ export class LegacyService implements OnModuleInit {
       nextTitle !== doc.title || nextHtml !== doc.content_html || nextText !== doc.content_text;
 
     if (contentChanged) {
-      const latest = await this.db.query<{ created_at: string }>(
-        "SELECT created_at FROM knowledge_document_versions WHERE document_id = $1 ORDER BY version_number DESC LIMIT 1",
+      const latest = await this.db.query<{ id: string; title: string; content_text: string | null; created_at: string }>(
+        "SELECT id, title, content_text, created_at FROM knowledge_document_versions WHERE document_id = $1 ORDER BY version_number DESC LIMIT 1",
         [documentId]
       );
       const staleMinutes = LegacyService.KB_VERSION_SNAPSHOT_MINUTES;
@@ -7554,6 +7589,13 @@ export class LegacyService implements OnModuleInit {
         !latest.rows[0] ||
         Date.now() - new Date(latest.rows[0].created_at).getTime() > staleMinutes * 60 * 1000;
       if (isStale) {
+        // The new row's own diff (what THIS edit changed, relative to the state it snapshots) is
+        // fully known right now — old content is what's being captured into the row, new content is
+        // nextTitle/nextText — so it's computed once, here, instead of on every future history read.
+        const diff = summarizeDocumentChange(
+          { title: doc.title, contentText: doc.content_text },
+          { title: nextTitle, contentText: nextText }
+        );
         // Serialised per document, and sharing its lock key with restoreKnowledgeDocumentVersion —
         // MAX(version_number)+1 alone lets a concurrent edit and a concurrent restore compute the
         // same next number, and the table has no unique constraint to reject the duplicate insert.
@@ -7564,11 +7606,35 @@ export class LegacyService implements OnModuleInit {
             [documentId]
           );
           await client.query(
-            `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-            [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
+            `INSERT INTO knowledge_document_versions
+               (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+            [
+              documentId,
+              nextVersion.rows[0].max,
+              doc.title,
+              doc.content_json ? JSON.stringify(doc.content_json) : null,
+              doc.content_html,
+              doc.content_text,
+              uid,
+              diff.summary,
+              JSON.stringify(diff.fields)
+            ]
           );
         });
+      } else if (latest.rows[0]) {
+        // No new row this edit (still inside the snapshot-throttling window) — the existing latest
+        // row's "after" state has just moved further along, so its stored diff must move with it.
+        // Whatever was stored for it before (from an earlier edit inside this same window) is now
+        // superseded; only the diff against the true final state of the window matters once it closes.
+        const diff = summarizeDocumentChange(
+          { title: latest.rows[0].title, contentText: latest.rows[0].content_text },
+          { title: nextTitle, contentText: nextText }
+        );
+        await this.db.query(
+          "UPDATE knowledge_document_versions SET changed_summary = $2, changed_fields = $3::jsonb WHERE id = $1",
+          [latest.rows[0].id, diff.summary, JSON.stringify(diff.fields)]
+        );
       }
     }
 
@@ -8350,14 +8416,34 @@ export class LegacyService implements OnModuleInit {
 
       if (!isNoop) {
         // Snapshot the current state before overwriting, so restoring a version is itself reversible.
+        // Its diff (what this restore changes, relative to the state it snapshots) is fully known
+        // right now — cur is the "before", v is the "after" — computed once instead of on every
+        // future history read. The row that was latest before this restore needs no update of its
+        // own: its diff already targets `cur`, since `cur` is exactly the content the last write
+        // (edit or restore) left live, and that's already been finalized as of that write.
         const nextVersion = await client.query<{ max: number }>(
           "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
           [documentId]
         );
+        const diff = summarizeDocumentChange(
+          { title: cur.title, contentText: cur.content_text },
+          { title: v.title, contentText: v.content_text }
+        );
         await client.query(
-          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-          [documentId, nextVersion.rows[0].max, cur.title, cur.content_json ? JSON.stringify(cur.content_json) : null, cur.content_html, cur.content_text, uid]
+          `INSERT INTO knowledge_document_versions
+             (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+          [
+            documentId,
+            nextVersion.rows[0].max,
+            cur.title,
+            cur.content_json ? JSON.stringify(cur.content_json) : null,
+            cur.content_html,
+            cur.content_text,
+            uid,
+            diff.summary,
+            JSON.stringify(diff.fields)
+          ]
         );
       }
 
