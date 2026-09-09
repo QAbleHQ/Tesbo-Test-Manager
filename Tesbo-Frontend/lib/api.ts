@@ -2347,6 +2347,9 @@ export type BugPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface BugItem {
   id: string;
+  /** Per-project sequential key, e.g. "E2E-BUG-14" — always present, unlike integrationIssueKey
+   *  which is only set once the bug is linked to an external tracker (Jira/Linear). */
+  externalId: string;
   title: string;
   description: string;
   externalUrl: string;

@@ -5171,36 +5171,57 @@ export class LegacyService implements OnModuleInit {
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
 
-    const bugId = await this.db.transaction(async (client) => {
-      const res = await client.query(
-        `INSERT INTO bugs (project_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-        [
-          projectId,
-          links[0]?.executionId || null,
-          links[0]?.testcaseId || null,
-          links[0]?.cycleId || null,
-          body.title || "Untitled bug",
-          body.description || "",
-          body.externalUrl || null,
-          body.status || "Open",
-          severity,
-          priority,
-          userId || null,
-          body.integrationProvider || null,
-          body.integrationIssueKey || null,
-          body.betterbugsUrl || null,
-          assigneeId
-        ]
-      );
-      const id = res.rows[0].id;
-      await this.replaceBugLinks(client, id, links);
-      return id;
-    });
+    // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
+    // below, so two bugs filed for the same project at once can both compute the same id;
+    // idx_bugs_project_external then rejects the loser. Retry on exactly that collision,
+    // recomputing the id each time — the same shape createTestCase already uses.
+    let bugId: string | undefined;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        bugId = await this.db.transaction(async (client) => {
+          // Serialize id allocation per project — see insertTestCaseWithClient for why the lock,
+          // not just the retry above, is what makes concurrent creates converge instead of both
+          // reading the same MAX and colliding again.
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`bug-external-id:${projectId}`]);
+          const externalId = await this.nextBugExternalId(projectId, client);
+          const res = await client.query(
+            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+            [
+              projectId,
+              externalId,
+              links[0]?.executionId || null,
+              links[0]?.testcaseId || null,
+              links[0]?.cycleId || null,
+              body.title || "Untitled bug",
+              body.description || "",
+              body.externalUrl || null,
+              body.status || "Open",
+              severity,
+              priority,
+              userId || null,
+              body.integrationProvider || null,
+              body.integrationIssueKey || null,
+              body.betterbugsUrl || null,
+              assigneeId
+            ]
+          );
+          const id = res.rows[0].id;
+          await this.replaceBugLinks(client, id, links);
+          return id;
+        });
+        break;
+      } catch (error) {
+        const collided =
+          (error as { code?: string })?.code === "23505" &&
+          String((error as { constraint?: string })?.constraint || "") === "idx_bugs_project_external";
+        if (!collided || attempt >= 5) throw error;
+      }
+    }
     // After the commit, not inside it: the bug is the record that must exist, and a failure while
     // flipping an execution should not roll back the bug report someone just wrote.
     await this.failLinkedExecutions(projectId, userId, links);
-    return this.getBug(bugId);
+    return this.getBug(bugId as string);
   }
 
   async getBugForUser(userId: string | null | undefined, bugId: string) {
@@ -14533,6 +14554,26 @@ export class LegacyService implements OnModuleInit {
   private async nextExternalId(projectId: string, requestedPrefix?: unknown, runner: QueryRunner = this.db): Promise<string> {
     const key = await this.externalIdPrefix(projectId, requestedPrefix, runner);
     return `${key}-TC-${(await this.maxExternalIdSeq(projectId, key, runner)) + 1}`;
+  }
+
+  // Same shape as maxExternalIdSeq, scoped to bugs and the "-BUG-" infix — every bug gets a
+  // stable per-project id even when it is never linked to an external tracker (integration_issue_key
+  // stays null for a self-logged bug).
+  private async maxBugExternalIdSeq(projectId: string, key: string, runner: QueryRunner = this.db): Promise<number> {
+    const maxRes = await runner.query<{ n: string }>(
+      "SELECT COALESCE(MAX((regexp_match(external_id, '\\d+$'))[1]::int), 0) AS n FROM bugs WHERE project_id = $1 AND external_id LIKE $2",
+      [projectId, `${key}-BUG-%`]
+    );
+    return Number(maxRes.rows[0]?.n || 0);
+  }
+
+  /**
+   * The next free `<KEY>-BUG-<n>` for a project. Reuses externalIdPrefix as-is — it only resolves
+   * the project's configured prefix / key / "TC" fallback, nothing testcase-specific.
+   */
+  private async nextBugExternalId(projectId: string, runner: QueryRunner = this.db): Promise<string> {
+    const key = await this.externalIdPrefix(projectId, undefined, runner);
+    return `${key}-BUG-${(await this.maxBugExternalIdSeq(projectId, key, runner)) + 1}`;
   }
 
   private async groupTestcases(projectId: string, column: string) {
