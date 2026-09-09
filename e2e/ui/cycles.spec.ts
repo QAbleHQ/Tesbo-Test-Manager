@@ -430,6 +430,83 @@ test.describe("Test Run — Priority/Type/Assignee filters", () => {
   });
 });
 
+/*
+ * "Test Run shows fewer test cases than Test Case Repository": the repository screen treats a
+ * selected suite as itself plus every suite nested under it (includeDescendants, see
+ * loadSelectedSuiteCases in app/(app)/projects/[id]/testcases/page.tsx), but the Add Test Cases
+ * picker's own suite filter matched only `tc.suiteId === filterSuiteId` — an approved case filed
+ * under a CHILD suite of the one selected was silently excluded, so a suite the repository reported
+ * as (for example) 170 approved cases offered only 165 in the picker. Fixed by having the picker
+ * walk the already-loaded flat suite list to build the same subtree the repository's
+ * includeDescendants produces server-side.
+ */
+test.describe("Add Test Cases picker — suite filter", () => {
+  test("selecting a parent suite also offers Approved cases filed under its child suite", { tag: '@tesbo.testId("TES-TC-2013")' }, async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let parentSuiteId = "";
+    let childSuiteId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const parentSuiteName = `E2E Picker Parent ${stamp}`;
+      const parentSuite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: parentSuiteName } })
+      ).json();
+      parentSuiteId = parentSuite.id;
+      const childSuite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, {
+          data: { name: `E2E Picker Child ${stamp}`, parentId: parentSuiteId },
+        })
+      ).json();
+      childSuiteId = childSuite.id;
+
+      const parentCaseTitle = `E2E Picker Parent Case ${stamp}`;
+      const childCaseTitle = `E2E Picker Child Case ${stamp}`;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: parentCaseTitle, status: "Approved", suiteId: parentSuiteId },
+              { title: childCaseTitle, status: "Approved", suiteId: childSuiteId },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Suite Filter ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+
+      const suiteSelect = page.locator("select:has(option:text-is('All Suites'))");
+      await suiteSelect.selectOption({ label: parentSuiteName });
+
+      // The regression: filtering to the PARENT suite must also surface the approved case filed
+      // directly under its CHILD suite, not just the parent's own case.
+      await expect(page.getByText(parentCaseTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText(childCaseTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText("0 of 2 selectable selected", { exact: true })).toBeVisible();
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
+      if (childSuiteId) await api.delete(`/api/suites/${childSuiteId}`, { failOnStatusCode: false });
+      if (parentSuiteId) await api.delete(`/api/suites/${parentSuiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
+
 test.describe("Test Run filters — concurrent updates, pagination boundary, and zero-case runs", () => {
   test("an execution reassigned by a concurrent caller is reflected correctly under the Assignee filter after reload", { tag: '@tesbo.testId("TES-TC-2011")' }, async ({ page }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });

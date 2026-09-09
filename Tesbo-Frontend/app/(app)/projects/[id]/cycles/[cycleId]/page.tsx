@@ -452,6 +452,39 @@ export default function TestRunDetailPage() {
     [executions]
   );
 
+  /*
+   * A suite filter has to match the suite AND everything nested under it — same as the repository
+   * screen's `includeDescendants` (Tesbo-Backend-Nest/src/legacy/legacy.service.ts's listTestCases).
+   * Matching only `tc.suiteId === filterSuiteId` silently hid every case filed under a sub-suite,
+   * which is why this picker offered fewer approved cases than the repository reported for the same
+   * suite (e.g. 170 approved in the repository vs. 165 selectable here — the missing 5 lived in a
+   * child suite). `suites` is already loaded flat with `parentId`, so the subtree is walked
+   * client-side rather than adding a second network round trip.
+   */
+  const suiteSubtreeIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!filterSuiteId) return ids;
+    const childrenByParent = new Map<string, string[]>();
+    for (const s of suites) {
+      const key = s.parentId ?? "";
+      const siblings = childrenByParent.get(key);
+      if (siblings) siblings.push(s.id);
+      else childrenByParent.set(key, [s.id]);
+    }
+    const stack = [filterSuiteId];
+    ids.add(filterSuiteId);
+    while (stack.length) {
+      const current = stack.pop()!;
+      for (const childId of childrenByParent.get(current) ?? []) {
+        if (!ids.has(childId)) {
+          ids.add(childId);
+          stack.push(childId);
+        }
+      }
+    }
+    return ids;
+  }, [filterSuiteId, suites]);
+
   /* filtered available cases (not already added) */
   const filteredCases = useMemo(() => {
     return allCases.filter((tc) => {
@@ -459,11 +492,11 @@ export default function TestRunDetailPage() {
       if (filterSearch && !tc.title.toLowerCase().includes(filterSearch.toLowerCase()) && !tc.externalId.toLowerCase().includes(filterSearch.toLowerCase())) return false;
       if (filterPriority && tc.priority !== filterPriority) return false;
       if (filterType && tc.type !== filterType) return false;
-      if (filterSuiteId && tc.suiteId !== filterSuiteId) return false;
+      if (filterSuiteId && !suiteSubtreeIds.has(tc.suiteId ?? "")) return false;
       if (filterStatus && tc.status !== filterStatus) return false;
       return true;
     });
-  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, filterStatus]);
+  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds, filterStatus]);
 
   /* selectable = only Approved cases */
   const selectableCases = useMemo(
