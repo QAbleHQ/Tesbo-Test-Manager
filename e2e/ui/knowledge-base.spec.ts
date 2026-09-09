@@ -1279,6 +1279,47 @@ test.describe("knowledge base (UI)", () => {
     await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
   });
 
+  test("KBU-37b a failed fetch on page 2+ still leaves Previous clickable — it must not strand the user on the errored page", async ({ browser }) => {
+    const title = stamp("E2E-83b: Broken page 2");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-4b", 3, 0);
+    for (let i = 1; i <= 7; i++) seedSyncEvent(documentId, "updated", `Change ${i}`);
+
+    const page = await openKb(browser);
+
+    // Only the page-2 request (offset=5) fails — a transient blip on one page, not the whole
+    // feature being down. route.abort("failed") reproduces the exact browser-level transport
+    // failure, same technique as the other network-error specs in this suite. Registered before
+    // the popover ever opens so it also catches the background prefetch of page 2 that fires
+    // right after page 1 renders (see ChangeHistory.tsx) — otherwise that prefetch would quietly
+    // succeed and cache page 2 before Next is even clicked, and the click would just render the
+    // cached page instead of ever exercising the failure this test is for.
+    await page.route(/\/knowledge-base\/documents\/[^/]+\/history\?/, (route) => {
+      const requestUrl = new URL(route.request().url());
+      return requestUrl.searchParams.get("offset") === "5" ? route.abort("failed") : route.continue();
+    });
+
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel).toBeVisible();
+
+    const nextButton = panel.getByRole("button", { name: "Next" });
+    const previousButton = panel.getByRole("button", { name: "Previous" });
+    await expect(previousButton).toBeDisabled();
+    await expect(nextButton).toBeEnabled();
+
+    await nextButton.click();
+    await expect(panel.getByText("Couldn't load change history.")).toBeVisible();
+    // The bug this guards: the whole pager (Previous included) used to disappear on any fetch
+    // error, trapping the user on the errored page with no way back short of closing the modal.
+    await expect(previousButton).toBeVisible();
+    await expect(previousButton).toBeEnabled();
+    await expect(nextButton).toBeDisabled();
+
+    await previousButton.click();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+  });
+
   test("KBU-38 a synced document's View history shows the change timeline with date/time/who, and a manual document gets the same timeline instead of a bare version list", { tag: '@tesbo.testId("TES-TC-260")' }, async ({ browser }) => {
     const mirrorTitle = stamp("E2E-84: View history mirror");
     const documentId = seedMirrorDocument(mirrorTitle, "kbu-view-history-1", 2, 0);

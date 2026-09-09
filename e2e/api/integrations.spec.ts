@@ -926,6 +926,45 @@ test.describe("integrations — Jira and Linear", () => {
     expect(body.events[0].changedSummary).toBe("Priority updated.");
   });
 
+  test("INT-A-30e a version row with no precomputed diff (written before that existed) self-heals on its first read instead of showing blank/wrong history", async () => {
+    // A manual document's diff is computed once, at write time, and stored on the version row —
+    // this row simulates one written before that shipped: seeded directly with changed_summary/
+    // changed_fields left NULL, exactly what a pre-existing production row looks like. The read
+    // path must still produce the real diff (computed inline, just for this one row) rather than a
+    // blank/placeholder entry, and persist it so the row is O(1) on every read after this first one.
+    const created = await asOwner.post(url("/knowledge-base/documents"), {
+      data: { title: "Self-heals document", folderId: rootFolderId, documentType: "general", contentText: "Current body." },
+      failOnStatusCode: false,
+    });
+    const docId = (await created.json()).id;
+    exec(
+      "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_html, content_text, created_by) VALUES (" +
+        `${literal(docId)}, 1, 'Self-heals document', '<p>Legacy body.</p>', 'Legacy body.', ${literal(tenant!.owner.userId)});`,
+    );
+
+    const first = await (await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false })).json();
+    const legacyEntry = first.events.find((e: any) => e.eventType === "updated");
+    expect(legacyEntry, `expected an 'updated' entry among ${JSON.stringify(first.events)}`).toBeTruthy();
+    expect(legacyEntry.changedSummary).toContain("Details");
+    expect(Array.isArray(legacyEntry.changedFields)).toBe(true);
+    expect(legacyEntry.changedFields[0].oldExcerpt).toContain("Legacy body.");
+    expect(legacyEntry.changedFields[0].newExcerpt).toContain("Current body.");
+
+    // The self-heal write is fire-and-forget from the request's point of view — give it a moment to
+    // land before checking the row directly.
+    await expect(async () => {
+      const stored = scalar(`SELECT changed_summary FROM knowledge_document_versions WHERE document_id = ${literal(docId)};`);
+      expect(stored, "the row must no longer be NULL after its first read").not.toBe("");
+    }).toPass({ timeout: 5_000 });
+
+    // A second read must return the identical diff, now sourced from the column this test just
+    // confirmed got populated, rather than anything changing between the two.
+    const second = await (await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false })).json();
+    const healedEntry = second.events.find((e: any) => e.eventType === "updated");
+    expect(healedEntry.changedSummary).toBe(legacyEntry.changedSummary);
+    expect(healedEntry.changedFields).toEqual(legacyEntry.changedFields);
+  });
+
   test("INT-A-31 a mirror's timeline lists its events newest first, with type and summary", { tag: '@tesbo.testId("TES-TC-253")' }, async () => {
     const doc = seedMirrorDocument("jira", "sync-evt-5", "E2E-70: Has a real timeline");
     seedSyncEvent(doc, "created", null);
