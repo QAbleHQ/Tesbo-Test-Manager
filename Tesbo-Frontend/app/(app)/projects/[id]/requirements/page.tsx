@@ -17,6 +17,7 @@ import {
   listLinkedJiraKeys,
   listLinkedLinearKeys,
   getRequirementsSummary,
+  getKnowledgeFolderTree,
   type LinkedIssueTaskStatus,
   type RequirementsSummary,
   type TicketSourceStats,
@@ -233,6 +234,11 @@ export default function RequirementsPage() {
   // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
   const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>([]);
   const [historicalRemoteId, setHistoricalRemoteId] = useState<string | null>(null);
+  // Knowledge Base folder id for each provider's mirrored tickets (e.g. the "Jira" folder under
+  // the KB root), so "View in Knowledge base" can deep-link into the tab that's actually active
+  // instead of always landing on the root listing. A provider's folder only exists once its first
+  // sync has created it, so an entry here can legitimately be absent.
+  const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>({});
 
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
@@ -358,6 +364,18 @@ export default function RequirementsPage() {
     setSummary(data);
   }, [projectId]);
 
+  // Maps the KB root's direct children back to provider ids by name, matching how
+  // ensureProviderFolder names them on the backend ("Jira" / "Linear").
+  const refreshKbFolders = useCallback(async () => {
+    const root = await getKnowledgeFolderTree(projectId).catch(() => null);
+    const map: Partial<Record<TicketSource, string>> = {};
+    for (const child of root?.children ?? []) {
+      const provider = PROVIDERS.find((p) => p.label === child.name);
+      if (provider) map[provider.id] = child.id;
+    }
+    setProviderFolderIds(map);
+  }, [projectId]);
+
   const refreshHistory = useCallback(async (activeSource: TicketSource) => {
     if (activeSource === "jira") {
       const status = await getJiraStatus(projectId).catch(() => null);
@@ -390,11 +408,11 @@ export default function RequirementsPage() {
       setSource(initialSource);
       await loadTickets(initialSource, 0, "", {});
       if (initialSource !== "all") void refreshHistory(initialSource);
-      await Promise.all([refreshLinkedKeys(), refreshSummary()]);
+      await Promise.all([refreshLinkedKeys(), refreshSummary(), refreshKbFolders()]);
       getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       setLoading(false);
     })();
-  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, router]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router]);
 
   useEffect(() => {
     if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
@@ -408,10 +426,13 @@ export default function RequirementsPage() {
       void loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
       void refreshSummary();
       void refreshLinkedKeys();
+      // A provider's KB folder is created lazily on its first sync, so a run settling is exactly
+      // when a previously-missing folder id can appear.
+      void refreshKbFolders();
       if (source !== "all") void refreshHistory(source);
     }
     syncWasActiveRef.current = anySyncActive;
-  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshHistory]);
+  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshKbFolders, refreshHistory]);
 
   function handleSourceChange(next: Source) {
     setSource(next);
@@ -509,6 +530,7 @@ export default function RequirementsPage() {
                   <button
                     key={tab.id}
                     type="button"
+                    data-testid={`requirements-source-tab-${tab.id}`}
                     onClick={() => handleSourceChange(tab.id)}
                     className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
                       active
@@ -597,7 +619,12 @@ export default function RequirementsPage() {
               </select>
             )}
             <Link
-              href={`/projects/${projectId}/knowledge-base`}
+              href={
+                source !== "all" && providerFolderIds[source]
+                  ? `/projects/${projectId}/knowledge-base?folder=${providerFolderIds[source]}`
+                  : `/projects/${projectId}/knowledge-base`
+              }
+              data-testid="view-in-knowledge-base-link"
               className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
             >
               View in Knowledge base
