@@ -6,6 +6,9 @@ import Link from "next/link";
 import { createPortal } from "react-dom";
 import {
   IconArrowRight,
+  IconArrowsSort,
+  IconSortAscending,
+  IconSortDescending,
   IconBug,
   IconCalendarEvent,
   IconChevronLeft,
@@ -70,6 +73,39 @@ const RUN_TABS = ["All", "Passed", "Failed", "Blocked", "Skipped", "Pending"] as
 const CANONICAL_PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 type RunTab = (typeof RUN_TABS)[number];
 const PAGE_SIZE = 10;
+
+/*
+ * ID column sort: compares by the numeric portion of the external id (e.g. "PRO-TC-9" before
+ * "PRO-TC-10"), not plain string order, which would put "PRO-TC-10" before "PRO-TC-9". Falls back
+ * to a locale string compare when either id has no digits, so the sort stays total and stable
+ * instead of leaving equal-ranked rows in an arbitrary order.
+ */
+function compareExternalId(a: string, b: string): number {
+  const numOf = (id: string) => {
+    const match = id.match(/(\d+)(?!.*\d)/);
+    return match ? parseInt(match[1], 10) : NaN;
+  };
+  const na = numOf(a);
+  const nb = numOf(b);
+  if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+  return a.localeCompare(b);
+}
+
+/*
+ * Priority column sort: follows the app-wide P0 (Critical) -> P3 (Low) convention already used by
+ * the priority filter dropdown just below (CANONICAL_PRIORITIES) rather than the ticket's fallback
+ * P1->P4, since that convention already exists here. A legacy/imported priority string outside the
+ * canonical set sorts after it (alphabetically among themselves); a missing priority sorts last of
+ * all so it doesn't jump to the top under a descending sort.
+ */
+const PRIORITY_RANK: Record<string, number> = Object.fromEntries(CANONICAL_PRIORITIES.map((p, i) => [p, i]));
+function comparePriority(a: string, b: string): number {
+  const rankOf = (p: string) => (p ? (p in PRIORITY_RANK ? PRIORITY_RANK[p] : CANONICAL_PRIORITIES.length) : CANONICAL_PRIORITIES.length + 1);
+  const ra = rankOf(a);
+  const rb = rankOf(b);
+  if (ra !== rb) return ra - rb;
+  return a.localeCompare(b);
+}
 import { avatarColor } from "@/lib/avatarColors";
 
 /* ───── Status tone helpers ───── */
@@ -155,6 +191,40 @@ function MemberAvatar({ name, seed, size = 22 }: { name: string; seed?: string |
     >
       {getInitials(name)}
     </span>
+  );
+}
+
+/* A column header for the run table's ID/Priority sort. Un-highlighted arrows when this column
+   isn't the active sort; a direction-specific icon (and brand color) when it is. */
+function SortableColumnHeader({
+  label,
+  column,
+  runSort,
+  onToggle,
+}: {
+  label: string;
+  column: "id" | "priority";
+  runSort: { column: "id" | "priority"; direction: "asc" | "desc" } | null;
+  onToggle: (column: "id" | "priority") => void;
+}) {
+  const active = runSort?.column === column ? runSort.direction : null;
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(column)}
+      className={`inline-flex items-center gap-1 ${active ? "text-[var(--accent-light)]" : "hover:text-[var(--foreground)]"}`}
+      title={`Sort by ${label}`}
+      aria-label={`Sort by ${label}${active ? `, currently ${active === "asc" ? "ascending" : "descending"}` : ""}`}
+    >
+      {label}
+      {active === "asc" ? (
+        <IconSortAscending size={13} stroke={1.75} />
+      ) : active === "desc" ? (
+        <IconSortDescending size={13} stroke={1.75} />
+      ) : (
+        <IconArrowsSort size={13} stroke={1.75} className="text-[var(--muted-soft)]" />
+      )}
+    </button>
   );
 }
 
@@ -347,6 +417,9 @@ export default function TestRunDetailPage() {
   const [runFilterPriority, setRunFilterPriority] = useState("");
   const [runFilterType, setRunFilterType] = useState("");
   const [runFilterAssignee, setRunFilterAssignee] = useState("");
+  /* ID/Priority column sort — null means "no sort", i.e. the existing (creation) order. Only one
+     column can be active at a time: picking the other column replaces this rather than combining. */
+  const [runSort, setRunSort] = useState<{ column: "id" | "priority"; direction: "asc" | "desc" } | null>(null);
 
   /* test case picker state */
   const [showPicker, setShowPicker] = useState(false);
@@ -429,10 +502,19 @@ export default function TestRunDetailPage() {
     });
   }, [router, load, projectId]);
 
-  /* reset to first page whenever the filter/search changes */
+  /* reset to first page whenever the filter/search/sort changes */
   useEffect(() => {
     setPage(1);
-  }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
+  }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
+
+  /* toggle the ID/Priority column sort: same column clicked again flips direction, the other
+     column replaces it starting at ascending — "only one active sort at a time". */
+  function toggleRunSort(column: "id" | "priority") {
+    setRunSort((prev) => {
+      if (prev?.column === column) return { column, direction: prev.direction === "asc" ? "desc" : "asc" };
+      return { column, direction: "asc" };
+    });
+  }
 
 
   /* ───── Load test cases for picker ───── */
@@ -462,6 +544,39 @@ export default function TestRunDetailPage() {
     [executions]
   );
 
+  /*
+   * A suite filter has to match the suite AND everything nested under it — same as the repository
+   * screen's `includeDescendants` (Tesbo-Backend-Nest/src/legacy/legacy.service.ts's listTestCases).
+   * Matching only `tc.suiteId === filterSuiteId` silently hid every case filed under a sub-suite,
+   * which is why this picker offered fewer approved cases than the repository reported for the same
+   * suite (e.g. 170 approved in the repository vs. 165 selectable here — the missing 5 lived in a
+   * child suite). `suites` is already loaded flat with `parentId`, so the subtree is walked
+   * client-side rather than adding a second network round trip.
+   */
+  const suiteSubtreeIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!filterSuiteId) return ids;
+    const childrenByParent = new Map<string, string[]>();
+    for (const s of suites) {
+      const key = s.parentId ?? "";
+      const siblings = childrenByParent.get(key);
+      if (siblings) siblings.push(s.id);
+      else childrenByParent.set(key, [s.id]);
+    }
+    const stack = [filterSuiteId];
+    ids.add(filterSuiteId);
+    while (stack.length) {
+      const current = stack.pop()!;
+      for (const childId of childrenByParent.get(current) ?? []) {
+        if (!ids.has(childId)) {
+          ids.add(childId);
+          stack.push(childId);
+        }
+      }
+    }
+    return ids;
+  }, [filterSuiteId, suites]);
+
   /* filtered available cases (not already added) */
   const filteredCases = useMemo(() => {
     return allCases.filter((tc) => {
@@ -469,11 +584,11 @@ export default function TestRunDetailPage() {
       if (filterSearch && !tc.title.toLowerCase().includes(filterSearch.toLowerCase()) && !tc.externalId.toLowerCase().includes(filterSearch.toLowerCase())) return false;
       if (filterPriority && tc.priority !== filterPriority) return false;
       if (filterType && tc.type !== filterType) return false;
-      if (filterSuiteId && tc.suiteId !== filterSuiteId) return false;
+      if (filterSuiteId && !suiteSubtreeIds.has(tc.suiteId ?? "")) return false;
       if (filterStatus && tc.status !== filterStatus) return false;
       return true;
     });
-  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, filterStatus]);
+  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds, filterStatus]);
 
   /* selectable = only Approved cases */
   const selectableCases = useMemo(
@@ -838,8 +953,20 @@ export default function TestRunDetailPage() {
           (e.externalId || "").toLowerCase().includes(term)
       );
     }
+    // Applied after every filter/search above (so it always covers the full filtered dataset, not
+    // just the current page) and before pagedExecutions slices it — runSort === null keeps the
+    // existing order untouched, which is also why `list` is copied rather than sorted in place:
+    // `list` can still be the original `executions` reference here when no filter matched anything.
+    if (runSort) {
+      const direction = runSort.direction === "asc" ? 1 : -1;
+      list = [...list].sort((a, b) =>
+        runSort.column === "id"
+          ? direction * compareExternalId(a.externalId || "", b.externalId || "")
+          : direction * comparePriority(a.priority || "", b.priority || "")
+      );
+    }
     return list;
-  }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
+  }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
 
   const pageCount = Math.max(1, Math.ceil(filteredExecutions.length / PAGE_SIZE));
   const pagedExecutions = useMemo(
@@ -1170,9 +1297,13 @@ export default function TestRunDetailPage() {
                         />
                       </th>
                     )}
-                    <th className="px-5 py-2.5 font-semibold">ID</th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="ID" column="id" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
                     <th className="px-5 py-2.5 font-semibold">Test Case</th>
-                    <th className="px-5 py-2.5 font-semibold">Priority</th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="Priority" column="priority" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
                     <th className="px-5 py-2.5 font-semibold">Type</th>
                     <th className="px-5 py-2.5 font-semibold">Assigned To</th>
                     <th className="px-5 py-2.5 text-right font-semibold">Status</th>
