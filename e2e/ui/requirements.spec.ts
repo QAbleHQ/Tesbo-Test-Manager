@@ -9,6 +9,7 @@ import {
   screensTenant,
   seedJiraRequirements,
   seedLinearRequirements,
+  seedProviderKbFolder,
   uniqueSuffix,
 } from "../utils/screens-tenant";
 
@@ -204,6 +205,112 @@ test.describe("requirements page — Zyra status label", () => {
         await expect(rows).toHaveCount(2);
         await expect(rows.filter({ hasText: "In Review" })).toHaveCount(1);
         await expect(rows.filter({ hasText: "Failed" })).toHaveCount(1);
+      } finally {
+        await deleteProjects(api, [project.id]);
+      }
+    },
+  );
+});
+
+/*
+ * "View in Knowledge base" used to always link to the KB root, regardless of which Requirements
+ * tab (Jira / Linear / All Sources) was active. It now resolves the provider's own KB folder — the
+ * "Jira" / "Linear" folder a real sync creates under the root via ensureProviderFolder — and links
+ * straight into it, falling back to the root only when that folder doesn't exist yet (no sync has
+ * run) or when "All Sources" is active, since there is no single provider folder to point at there.
+ */
+test.describe("requirements page — View in Knowledge base follows the active source", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  test("REQ-U-05 the Jira tab links into the Jira KB folder, not the KB root", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Jira connection and its KB folder");
+    const project = await createProject(api);
+    try {
+      seedJiraRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      const jiraFolderId = seedProviderKbFolder(tenant!.organizationId, project.id, "jira");
+
+      // Only Jira is connected, so the page opens straight on that tab — there's no "All Sources"
+      // tab to sit under with a single provider.
+      await page.goto(`/projects/${project.id}/requirements`);
+      const link = page.getByTestId("view-in-knowledge-base-link");
+      await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base?folder=${jiraFolderId}`);
+
+      await link.click();
+      await expect(page.getByRole("heading", { name: "Jira", exact: true })).toBeVisible();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-06 the Linear tab links into the Linear KB folder, not the KB root", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Linear connection and its KB folder");
+    const project = await createProject(api);
+    try {
+      seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      const linearFolderId = seedProviderKbFolder(tenant!.organizationId, project.id, "linear");
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const link = page.getByTestId("view-in-knowledge-base-link");
+      await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base?folder=${linearFolderId}`);
+
+      await link.click();
+      await expect(page.getByRole("heading", { name: "Linear", exact: true })).toBeVisible();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test(
+    "REQ-U-07 All Sources links to the KB root, and switching tabs repoints the link without a reload",
+    async ({ page }) => {
+      test.skip(!dbControlAvailable(), "needs psql access to seed both connections and their KB folders");
+      const project = await createProject(api);
+      try {
+        seedJiraRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+        seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+        const jiraFolderId = seedProviderKbFolder(tenant!.organizationId, project.id, "jira");
+        const linearFolderId = seedProviderKbFolder(tenant!.organizationId, project.id, "linear");
+
+        // Both providers connected -> the page opens on "All Sources".
+        await page.goto(`/projects/${project.id}/requirements`);
+        const link = page.getByTestId("view-in-knowledge-base-link");
+        await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base`);
+
+        await page.getByTestId("requirements-source-tab-jira").click();
+        await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base?folder=${jiraFolderId}`);
+
+        await page.getByTestId("requirements-source-tab-linear").click();
+        await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base?folder=${linearFolderId}`);
+
+        await page.getByTestId("requirements-source-tab-all").click();
+        await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base`);
+      } finally {
+        await deleteProjects(api, [project.id]);
+      }
+    },
+  );
+
+  test(
+    "REQ-U-08 falls back to the KB root when the active provider has no KB folder yet (no sync has run)",
+    async ({ page }) => {
+      test.skip(!dbControlAvailable(), "needs psql access to seed a Jira connection without its KB folder");
+      const project = await createProject(api);
+      try {
+        seedJiraRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+        // Deliberately no seedProviderKbFolder call: the "Jira" folder doesn't exist yet, exactly
+        // as before that project's first sync has ever run.
+
+        await page.goto(`/projects/${project.id}/requirements`);
+        const link = page.getByTestId("view-in-knowledge-base-link");
+        await expect(link).toHaveAttribute("href", `/projects/${project.id}/knowledge-base`);
       } finally {
         await deleteProjects(api, [project.id]);
       }
