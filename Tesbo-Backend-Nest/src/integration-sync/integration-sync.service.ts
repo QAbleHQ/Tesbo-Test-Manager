@@ -324,21 +324,32 @@ export class IntegrationSyncService {
     const rootId = await this.ensureRootFolder(organizationId, projectId, userId);
     const name = PROVIDER_FOLDER_NAMES[provider] || provider;
 
+    // Keyed by source_provider, not name: a user renaming this folder must still be found here on
+    // the next sync, or a second "Jira"/"Linear" folder gets created alongside it — the same
+    // discriminator the disconnect-cleanup path (legacy.service.ts's integrationDisconnect) uses,
+    // so the two never disagree about what identifies "the" provider folder.
     const existing = await this.db.query<{ id: string }>(
-      "SELECT id FROM knowledge_folders WHERE project_id = $1 AND parent_folder_id = $2 AND name = $3 AND is_deleted = false LIMIT 1",
-      [projectId, rootId, name]
+      "SELECT id FROM knowledge_folders WHERE project_id = $1 AND parent_folder_id = $2 AND source_provider = $3 AND is_deleted = false LIMIT 1",
+      [projectId, rootId, provider]
     );
     if (existing.rows[0]) return existing.rows[0].id;
 
-    const inserted = await this.db.query<{ id: string }>(
-      `INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, description, created_by, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $6)
+    const inserted = await this.db.query<{ id: string; source_provider: string | null }>(
+      `INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, description, source_provider, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
        ON CONFLICT (project_id, parent_folder_id, name) WHERE is_deleted = false AND parent_folder_id IS NOT NULL
        DO UPDATE SET updated_at = now()
-       RETURNING id`,
-      [organizationId, projectId, rootId, name, `Tickets synced from ${name}. Mirrored documents here are read-only.`, userId]
+       WHERE knowledge_folders.source_provider IS NULL OR knowledge_folders.source_provider = EXCLUDED.source_provider
+       RETURNING id, source_provider`,
+      [organizationId, projectId, rootId, name, `Tickets synced from ${name}. Mirrored documents here are read-only.`, provider, userId]
     );
-    return inserted.rows[0].id;
+    if (inserted.rows[0]) return inserted.rows[0].id;
+
+    // The name slot is taken by a folder tagged for a DIFFERENT provider — only reachable if a user
+    // renamed some other folder to exactly "Jira"/"Linear". Refusing loudly here is safer than the
+    // alternative silent behavior: reusing that folder would mix this provider's mirrored tickets
+    // into a folder that belongs to a different one.
+    throw new Error(`A folder named "${name}" already exists under this project's Knowledge Base root and belongs to a different provider — rename it before syncing ${name}.`);
   }
 
   private async ensureRootFolder(organizationId: string, projectId: string, userId: string | null): Promise<string> {

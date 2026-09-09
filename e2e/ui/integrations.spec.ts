@@ -26,14 +26,25 @@ const MOCK_AUTHORIZE_URL = "https://example-oauth.invalid/authorize";
 interface IntegrationMock {
   callbackCalls: number;
   connected: boolean;
+  disconnectCalls: number;
 }
 
 /** Mocks the four endpoints this screen calls, entirely in-memory — no real Jira, no DB writes. */
 async function mockIntegrationRoutes(
   context: BrowserContext,
-  opts: { configured?: boolean; failCallback?: string } = {}
+  opts: { configured?: boolean; failCallback?: string; connectedInitially?: boolean; disconnectDelayMs?: number } = {}
 ): Promise<IntegrationMock> {
-  const state: IntegrationMock = { callbackCalls: 0, connected: false };
+  const state: IntegrationMock = { callbackCalls: 0, connected: opts.connectedInitially ?? false, disconnectCalls: 0 };
+
+  await context.route("**/api/workspace/integrations/jira/disconnect", async (route) => {
+    state.disconnectCalls += 1;
+    // A real disconnect isn't instant (advisory lock + the Knowledge Base cleanup, per
+    // legacy.service.ts's integrationDisconnect) — the delay gives a rapid double-click a real
+    // window to fire a second request before React's state update disables the button.
+    if (opts.disconnectDelayMs) await new Promise((resolve) => setTimeout(resolve, opts.disconnectDelayMs));
+    state.connected = false;
+    await route.fulfill({ json: { disconnected: true } });
+  });
 
   await context.route("**/api/workspace/integrations/jira/config", (route) =>
     route.fulfill({
@@ -190,5 +201,67 @@ test.describe("Jira integration — Connect flow (UI)", () => {
     // The specific failure was already shown (and dismissed) in the now-closed tab — the
     // original tab just goes back to idle, it doesn't repeat the error.
     await expect(page.getByRole("button", { name: "Connect Jira" })).toBeVisible({ timeout: 10_000 });
+  });
+});
+
+/*
+ * Disconnect — regression coverage for the fast-double-click race handleDisconnect's synchronous
+ * guard exists for (see WorkspaceIntegrationConfig.tsx): React's `disabled={disconnecting}` only
+ * takes effect on the next render, so two clicks landing before that render both used to reach
+ * `disconnectIntegration()`. What that disconnect call does server-side (soft-deleting the Jira/
+ * Linear Knowledge Base folder, never restorable, never a hard delete) is covered in
+ * e2e/api/integrations.spec.ts (INT-A-43..51) — this file only drives the button itself.
+ */
+test.describe("Jira integration — Disconnect (UI)", () => {
+  test("INT-U-07 a rapid double-click on Disconnect fires exactly one request and the page still settles", async ({ page, context }) => {
+    const mock = await mockIntegrationRoutes(context, { connectedInitially: true, disconnectDelayMs: 300 });
+    await page.goto(JIRA_SETTINGS_URL);
+    await expect(page.getByRole("heading", { name: "Connected" })).toBeVisible();
+
+    const button = page.getByRole("button", { name: "Disconnect Jira" });
+    await expect(button).toBeEnabled();
+    // Two native clicks dispatched synchronously in the page's own JS, before Playwright hands
+    // control back — this is what a real fast double-click looks like from the browser's side:
+    // both fire before React's re-render has a chance to add the `disabled` attribute. A plain
+    // second Playwright `.click()` would instead wait for the button to become actionable again,
+    // which defeats the point of this test.
+    await button.evaluate((el) => {
+      (el as HTMLButtonElement).click();
+      (el as HTMLButtonElement).click();
+    });
+
+    await expect(page.getByRole("heading", { name: "Connect Jira" })).toBeVisible({ timeout: 10_000 });
+    expect(mock.disconnectCalls, "the synchronous guard must stop the second click before it ever reaches the network").toBe(1);
+    // Not left disabled/stuck once settled.
+    await expect(page.getByRole("button", { name: "Connect Jira" })).toBeEnabled();
+  });
+
+  test("INT-U-08 disconnecting from two tabs at once never gets stuck or shows an error in either", async ({ page, context }) => {
+    // The backend's advisory-lock idempotency (legacy.service.ts's integrationDisconnect) means a
+    // second disconnect for the same workspace+provider — the loser of the race between two open
+    // tabs — always answers success too, never an error; this mock mirrors that by always
+    // fulfilling regardless of current state, the same way the real route does.
+    const mock = await mockIntegrationRoutes(context, { connectedInitially: true, disconnectDelayMs: 200 });
+    const pageB = await context.newPage();
+
+    await Promise.all([
+      page.goto(JIRA_SETTINGS_URL),
+      pageB.goto(JIRA_SETTINGS_URL),
+    ]);
+    await expect(page.getByRole("heading", { name: "Connected" })).toBeVisible();
+    await expect(pageB.getByRole("heading", { name: "Connected" })).toBeVisible();
+
+    await Promise.all([
+      page.getByRole("button", { name: "Disconnect Jira" }).click(),
+      pageB.getByRole("button", { name: "Disconnect Jira" }).click(),
+    ]);
+
+    await expect(page.getByRole("heading", { name: "Connect Jira" })).toBeVisible({ timeout: 10_000 });
+    await expect(pageB.getByRole("heading", { name: "Connect Jira" })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/failed|error/i)).toHaveCount(0);
+    await expect(pageB.getByText(/failed|error/i)).toHaveCount(0);
+    expect(mock.disconnectCalls).toBe(2);
+
+    await pageB.close();
   });
 });

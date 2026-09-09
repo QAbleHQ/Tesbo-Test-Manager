@@ -1574,4 +1574,42 @@ test.describe("knowledge base (UI)", () => {
     await expect(smallDialog.getByText("Details updated.", { exact: false })).toBeVisible();
     await expect(smallDialog.getByRole("button", { name: "View diff" })).toHaveCount(0);
   });
+
+  // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder
+  //     created fully visible in this exact screen, looking exactly like a still-connected
+  //     integration. See e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof
+  //     (never a hard delete, never restorable, org-wide, race-safe) — this pins the one thing only
+  //     a browser sees: the folder actually disappears from the tree the user is looking at. ───
+
+  test("KBU-43 the provider folder disappears from the visible tree after disconnecting the integration", async ({ browser }) => {
+    // A crashed prior run could have left this behind (the `finally` below never ran) — clear it
+    // up-front so this test's INSERT never collides with the (organization_id, provider) unique
+    // constraint on integration_connections.
+    exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at, connected_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, 'jira', 'kbu-43-site', 'https://e2e.invalid', 'e2e-not-a-real-token', '', now() + interval '1 hour', ${literal(tenant!.owner.userId)});`,
+    );
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, source_provider, created_by, updated_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, 'Jira', 'jira', ` +
+        `${literal(tenant!.owner.userId)}, ${literal(tenant!.owner.userId)});`,
+    );
+
+    try {
+      const page = await openKb(browser);
+      await expect(treeRow(page, "Jira")).toBeVisible();
+
+      const disconnectRes = await api.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+      expect(disconnectRes.ok(), `disconnect answered ${disconnectRes.status()}: ${await disconnectRes.text()}`).toBe(true);
+
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+      await expect(treeRow(page, "Jira")).toHaveCount(0);
+      // No dangling "0 items" ghost folder anywhere else on the page either.
+      await expect(page.getByText("Jira")).toHaveCount(0);
+    } finally {
+      exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    }
+  });
 });
