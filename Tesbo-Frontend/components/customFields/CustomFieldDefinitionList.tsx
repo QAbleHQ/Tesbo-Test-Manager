@@ -1,7 +1,15 @@
 "use client";
 
 import { useState } from "react";
-import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
+import {
+  IconArchive,
+  IconChevronDown,
+  IconChevronUp,
+  IconPencil,
+  IconPlayerPause,
+  IconPlayerPlay,
+  IconTrash,
+} from "@tabler/icons-react";
 import {
   deleteCustomFieldDefinition,
   reorderCustomFieldDefinitions,
@@ -263,31 +271,65 @@ export default function CustomFieldDefinitionList({
                     </td>
                     <td className="px-4 py-3 text-[var(--muted)]">{definition.isUsed ? "Yes" : "No"}</td>
                     <td className="px-4 py-3 text-right">
-                      <div className="flex justify-end gap-2">
+                      <div className="flex items-center justify-end gap-1">
                         {!isArchived && (
                           <>
-                            <button type="button" onClick={() => onEdit(definition)} disabled={busy} className="text-[var(--accent-light)] hover:underline disabled:opacity-50">
-                              Edit
-                            </button>
-                            <button type="button" onClick={() => toggleActive(definition)} disabled={busy} className="text-[var(--foreground)] hover:underline disabled:opacity-50">
-                              {definition.status === "active" ? "Deactivate" : "Activate"}
-                            </button>
-                            <button type="button" onClick={() => archive(definition)} disabled={busy} className="text-[var(--muted)] hover:underline disabled:opacity-50">
-                              Archive
-                            </button>
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="icon"
+                              onClick={() => onEdit(definition)}
+                              disabled={busy}
+                              title="Edit"
+                              aria-label="Edit"
+                              className="border-[var(--accent-light)] text-[var(--accent-light)] hover:bg-[var(--brand-soft)] hover:text-[var(--accent-light)]"
+                            >
+                              <IconPencil size={14} stroke={1.75} />
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="icon"
+                              onClick={() => toggleActive(definition)}
+                              disabled={busy}
+                              title={definition.status === "active" ? "Deactivate" : "Activate"}
+                              aria-label={definition.status === "active" ? "Deactivate" : "Activate"}
+                              className="text-[var(--foreground)]"
+                            >
+                              {definition.status === "active" ? (
+                                <IconPlayerPause size={14} stroke={1.75} />
+                              ) : (
+                                <IconPlayerPlay size={14} stroke={1.75} />
+                              )}
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="icon"
+                              onClick={() => archive(definition)}
+                              disabled={busy}
+                              title="Archive"
+                              aria-label="Archive"
+                              className="text-[var(--muted)]"
+                            >
+                              <IconArchive size={14} stroke={1.75} />
+                            </Button>
                           </>
                         )}
-                        <button
+                        <Button
                           type="button"
+                          variant="destructive"
+                          size="icon"
                           onClick={() => {
                             setDeleteError(null);
                             setDeleteTarget(definition);
                           }}
                           disabled={busy}
-                          className="text-[var(--error-foreground)] hover:underline disabled:opacity-50"
+                          title="Delete"
+                          aria-label="Delete"
                         >
-                          Delete
-                        </button>
+                          <IconTrash size={14} stroke={1.75} />
+                        </Button>
                       </div>
                     </td>
                   </tr>

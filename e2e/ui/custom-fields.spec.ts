@@ -413,6 +413,24 @@ test.describe("custom fields (UI)", () => {
       .toEqual([archived.id, active.id]);
   });
 
+  test("an active field's row offers Edit, Deactivate, Archive and Delete as accessible, enabled buttons", async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    const row = definitionRow(page, field.name);
+
+    // Icons were added to these buttons for the redesigned Actions column, but the accessible name
+    // must still be exactly the plain label — an icon-only button (accessible name overridden by an
+    // aria-label instead of visible text) would silently break every other test's
+    // `getByRole("button", { name: ... })` locator, so this pins the contract those tests rely on.
+    for (const label of ["Edit", "Deactivate", "Archive", "Delete"]) {
+      const button = row.getByRole("button", { name: label, exact: true });
+      await expect(button).toBeVisible();
+      await expect(button).toBeEnabled();
+    }
+  });
+
   test("a field can be deactivated and reactivated from the list", { tag: '@tesbo.testId("TES-TC-658")' }, async ({ browser }) => {
     const field = await defineField({ fieldType: "text" });
 
