@@ -8,7 +8,9 @@ import {
   listCycleExecutions,
   updateExecution,
   listProjectMembers,
+  listBugs,
   type ExecutionItem,
+  type BugItem,
 } from "@/lib/api";
 import { IconBug } from "@tabler/icons-react";
 import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
@@ -64,12 +66,25 @@ export default function ExecutionDetailPage() {
   const [execution, setExecution] = useState<ExecutionItem | null>(null);
   const [status, setStatus] = useState("");
   const [actualResult, setActualResult] = useState("");
-  const [defectKey, setDefectKey] = useState("");
-  const [defectUrl, setDefectUrl] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [saving, setSaving] = useState(false);
-  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({ projectId, cycleId });
+  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
+     (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
+  const [linkedBug, setLinkedBug] = useState<BugItem | null>(null);
+  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
+    projectId,
+    cycleId,
+    onLogged: () => {
+      if (execution) loadLinkedBug(execution);
+    },
+  });
+
+  function loadLinkedBug(exec: ExecutionItem) {
+    listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
+      .then((bugs) => setLinkedBug(bugs[0] ?? null))
+      .catch(() => setLinkedBug(null));
+  }
 
   useEffect(() => {
     authMe().then((me) => {
@@ -84,14 +99,14 @@ export default function ExecutionDetailPage() {
             setExecution(e);
             setStatus(e.status || "Untested");
             setActualResult(e.actualResult || "");
-            setDefectKey(e.defectKey || "");
-            setDefectUrl(e.defectUrl || "");
             setAssigneeId(e.assigneeId || "");
+            loadLinkedBug(e);
           }
         })
         .catch(() => router.replace("/projects"));
       listProjectMembers(projectId).then(setMembers).catch(() => {});
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cycleId, executionId, projectId, router]);
 
   async function handleSave(e: React.FormEvent) {
@@ -101,8 +116,6 @@ export default function ExecutionDetailPage() {
       await updateExecution(cycleId, executionId, {
         status,
         actualResult,
-        defectKey: defectKey || undefined,
-        defectUrl: defectUrl || undefined,
         assigneeId: assigneeId || null,
       });
       router.push(`/projects/${projectId}/cycles/${cycleId}`);
@@ -248,33 +261,33 @@ export default function ExecutionDetailPage() {
           </div>
 
           {/*
-            * Basecamp 10221790207 — "Only failed test case should show defect key and Defect URL".
-            * A defect reference on a passing case is not just clutter: it flows into the CSV export
-            * and the traceability matrix, where it reads as a bug against a case that passed. The
-            * backend clears the stored values when a status other than Failed is saved, so hiding
-            * the inputs here does not leave data behind invisibly.
+            * Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
+            * rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
+            * not a free-text value typed here, so there's nothing to type into them.
             */}
           <div className="grid grid-cols-2 gap-3" hidden={status !== "Failed"}>
             <div>
               <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Defect Key
+                Bug Key
               </label>
               <Input
                 type="text"
-                value={defectKey}
-                onChange={(e) => setDefectKey(e.target.value)}
+                aria-label="Bug Key"
+                value={linkedBug?.integrationIssueKey || linkedBug?.externalId || ""}
+                readOnly
                 placeholder="e.g. PROJ-123"
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Defect URL
+                Bug Title
               </label>
               <Input
-                type="url"
-                value={defectUrl}
-                onChange={(e) => setDefectUrl(e.target.value)}
-                placeholder="https://…"
+                type="text"
+                aria-label="Bug Title"
+                value={linkedBug?.title || ""}
+                readOnly
+                placeholder="Title of the linked bug"
               />
             </div>
           </div>

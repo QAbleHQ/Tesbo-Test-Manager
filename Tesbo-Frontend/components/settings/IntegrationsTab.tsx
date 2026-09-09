@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getWorkspace,
   getBillingInfo,
@@ -53,6 +53,10 @@ export default function IntegrationsTab() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<IntegrationProvider | null>(null);
+  // A real synchronous guard: two clicks fired before React flushes setDisconnectingProvider both
+  // read the same stale (null) state, so that alone doesn't stop a fast double-click. A ref is
+  // mutated and read back immediately, in the same tick.
+  const disconnectingRef = useRef(false);
   const [pricingOpen, setPricingOpen] = useState(false);
 
   const canManage = workspaceRole === "owner";
@@ -81,6 +85,8 @@ export default function IntegrationsTab() {
 
   async function handleDisconnect(provider: IntegrationProvider) {
     if (!canManage) return;
+    if (disconnectingRef.current) return;
+    disconnectingRef.current = true;
     setDisconnectingProvider(provider);
     setMessage(null);
     setError(null);
@@ -91,6 +97,7 @@ export default function IntegrationsTab() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to disconnect.");
     } finally {
+      disconnectingRef.current = false;
       setDisconnectingProvider(null);
     }
   }

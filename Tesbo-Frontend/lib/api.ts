@@ -5,11 +5,11 @@ export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:700
 
 type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
-type ApiErrorBody = { error?: string; detail?: string; errors?: { field?: string; message?: string }[] };
+type ApiErrorBody = { error?: string; detail?: string; message?: string; errors?: { field?: string; message?: string }[] };
 
 /**
- * A response with no `error`/`errors` body is never something the endpoint chose to say to a
- * user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * A response with no `error`/`errors`/`message` body is never something the endpoint chose to say
+ * to a user — every hand-written throw in the backend sets one (see legacy.service.ts's
  * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
  * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
  * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
@@ -29,7 +29,13 @@ function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
     return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  const msg = body.error || genericStatusMessage(status);
+  // custom-field-validation.ts (definition config checks — e.g. a multi-select's minSelected
+  // exceeding its maxSelected) throws a bare { field, message } object rather than { error }/
+  // { errors }, since it isn't wrapped by anything that reshapes it before it reaches the HTTP
+  // layer. Falling back to `message` here — instead of straight to the generic text — is what
+  // keeps that already-specific backend wording ("Minimum selections cannot be greater than
+  // maximum selections.") from being swallowed into "Something went wrong."
+  const msg = body.error || body.message || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
@@ -2362,6 +2368,9 @@ export type BugPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface BugItem {
   id: string;
+  /** Per-project sequential key, e.g. "E2E-BUG-14" — always present, unlike integrationIssueKey
+   *  which is only set once the bug is linked to an external tracker (Jira/Linear). */
+  externalId: string;
   title: string;
   description: string;
   externalUrl: string;

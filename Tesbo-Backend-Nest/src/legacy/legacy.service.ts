@@ -22,6 +22,7 @@ import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
+import { PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
@@ -5211,36 +5212,57 @@ export class LegacyService implements OnModuleInit {
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
 
-    const bugId = await this.db.transaction(async (client) => {
-      const res = await client.query(
-        `INSERT INTO bugs (project_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-        [
-          projectId,
-          links[0]?.executionId || null,
-          links[0]?.testcaseId || null,
-          links[0]?.cycleId || null,
-          body.title || "Untitled bug",
-          body.description || "",
-          body.externalUrl || null,
-          body.status || "Open",
-          severity,
-          priority,
-          userId || null,
-          body.integrationProvider || null,
-          body.integrationIssueKey || null,
-          body.betterbugsUrl || null,
-          assigneeId
-        ]
-      );
-      const id = res.rows[0].id;
-      await this.replaceBugLinks(client, id, links);
-      return id;
-    });
+    // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
+    // below, so two bugs filed for the same project at once can both compute the same id;
+    // idx_bugs_project_external then rejects the loser. Retry on exactly that collision,
+    // recomputing the id each time — the same shape createTestCase already uses.
+    let bugId: string | undefined;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        bugId = await this.db.transaction(async (client) => {
+          // Serialize id allocation per project — see insertTestCaseWithClient for why the lock,
+          // not just the retry above, is what makes concurrent creates converge instead of both
+          // reading the same MAX and colliding again.
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`bug-external-id:${projectId}`]);
+          const externalId = await this.nextBugExternalId(projectId, client);
+          const res = await client.query(
+            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+            [
+              projectId,
+              externalId,
+              links[0]?.executionId || null,
+              links[0]?.testcaseId || null,
+              links[0]?.cycleId || null,
+              body.title || "Untitled bug",
+              body.description || "",
+              body.externalUrl || null,
+              body.status || "Open",
+              severity,
+              priority,
+              userId || null,
+              body.integrationProvider || null,
+              body.integrationIssueKey || null,
+              body.betterbugsUrl || null,
+              assigneeId
+            ]
+          );
+          const id = res.rows[0].id;
+          await this.replaceBugLinks(client, id, links);
+          return id;
+        });
+        break;
+      } catch (error) {
+        const collided =
+          (error as { code?: string })?.code === "23505" &&
+          String((error as { constraint?: string })?.constraint || "") === "idx_bugs_project_external";
+        if (!collided || attempt >= 5) throw error;
+      }
+    }
     // After the commit, not inside it: the bug is the record that must exist, and a failure while
     // flipping an execution should not roll back the bug report someone just wrote.
     await this.failLinkedExecutions(projectId, userId, links);
-    return this.getBug(bugId);
+    return this.getBug(bugId as string);
   }
 
   async getBugForUser(userId: string | null | undefined, bugId: string) {
@@ -7021,6 +7043,62 @@ export class LegacyService implements OnModuleInit {
     }
   }
 
+  // Recursive descendants CTE shared by every folder-tree cascade below, seeded from one or more
+  // root folder ids at once — a single call can cascade several unrelated provider folders (across
+  // several projects) in one set-based pass instead of one round-trip per folder. Centralized here
+  // so the three previous inline copies of this exact CTE can't drift apart from each other.
+  private static readonly DESCENDANTS_CTE = `WITH RECURSIVE descendants AS (
+    SELECT id FROM knowledge_folders WHERE id = ANY($1::uuid[])
+    UNION ALL
+    SELECT kf.id FROM knowledge_folders kf JOIN descendants d ON kf.parent_folder_id = d.id
+  )`;
+
+  // Soft-deletes one or more folder trees (and every descendant folder/document/file beneath each),
+  // special-casing the Zyra memory document (never deleted, re-homed to its own project's root
+  // instead — a correlated subquery on knowledge_documents.project_id, since a single call here can
+  // span multiple projects). Shared by deleteKnowledgeFolder (deletionReason 'manual') and the
+  // integration-disconnect cleanup (deletionReason 'integration_disconnect') so the two removal
+  // paths can never drift apart in behavior — only in whether the result is restorable, which
+  // restoreKnowledgeFolder decides by reading the reason back.
+  private async cascadeSoftDeleteFolderTree(
+    client: PoolClient,
+    folderIds: string[],
+    uid: string | null,
+    deletionReason: "manual" | "integration_disconnect"
+  ): Promise<void> {
+    if (!folderIds.length) return;
+    const cte = LegacyService.DESCENDANTS_CTE;
+
+    await client.query(
+      `${cte} UPDATE knowledge_folders SET is_deleted = true, deleted_at = now(), deletion_reason = $3, updated_at = now(), updated_by = $2
+       WHERE id IN (SELECT id FROM descendants)`,
+      [folderIds, uid, deletionReason]
+    );
+    await client.query(
+      // The Zyra memory document survives its folder being deleted — otherwise deleting the AI
+      // memory folder is a way around the guard in deleteKnowledgeDocument.
+      `${cte} UPDATE knowledge_documents SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
+       WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false AND title <> '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
+      [folderIds, uid]
+    );
+    await client.query(
+      `${cte} UPDATE knowledge_files SET is_deleted = true, deleted_at = now()
+       WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+      [folderIds]
+    );
+    // The memory document was spared above, so it would now point at a deleted folder and appear in
+    // no listing at all — kept but invisible is worse than a clear refusal. Re-home it to the root
+    // OF ITS OWN PROJECT — folderIds can span multiple projects, so this can't be a single constant
+    // root id the way the single-folder version could.
+    await client.query(
+      `${cte} UPDATE knowledge_documents kd
+          SET folder_id = (SELECT krf.id FROM knowledge_folders krf WHERE krf.project_id = kd.project_id AND krf.is_root = true LIMIT 1),
+              updated_at = now()
+        WHERE kd.folder_id IN (SELECT id FROM descendants) AND kd.title = '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
+      [folderIds]
+    );
+  }
+
   async deleteKnowledgeFolder(projectId: string, userId: string | null | undefined, folderId: string) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
@@ -7029,45 +7107,12 @@ export class LegacyService implements OnModuleInit {
     const role = await this.kbProjectRole(uid, projectId);
     this.kbRequireMutateAccess(role, folder.created_by, uid);
 
-    const descendantsCte = `WITH RECURSIVE descendants AS (
-      SELECT id FROM knowledge_folders WHERE id = $1
-      UNION ALL
-      SELECT kf.id FROM knowledge_folders kf JOIN descendants d ON kf.parent_folder_id = d.id
-    )`;
-
     const filesToPurge = await this.db.query<{ storage_key: string }>(
-      `${descendantsCte} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-      [folderId]
+      `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+      [[folderId]]
     );
 
-    await this.db.transaction(async (client) => {
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_folders SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
-         WHERE id IN (SELECT id FROM descendants)`,
-        [folderId, uid]
-      );
-      await client.query(
-        // The Zyra memory document survives its folder being deleted — otherwise deleting the AI
-        // memory folder is a way around the guard in deleteKnowledgeDocument.
-        `${descendantsCte} UPDATE knowledge_documents SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
-         WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false AND title <> '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
-        [folderId, uid]
-      );
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_files SET is_deleted = true, deleted_at = now()
-         WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-        [folderId]
-      );
-      // The memory document was spared above, so it would now point at a deleted folder and appear in
-      // no listing at all — kept but invisible is worse than a clear refusal. Re-home it to the root.
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_documents
-            SET folder_id = (SELECT id FROM knowledge_folders WHERE project_id = $2 AND is_root = true LIMIT 1),
-                updated_at = now()
-          WHERE folder_id IN (SELECT id FROM descendants) AND title = '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
-        [folderId, projectId]
-      );
-    });
+    await this.db.transaction((client) => this.cascadeSoftDeleteFolderTree(client, [folderId], uid, "manual"));
 
     // Storage cleanup runs after the DB commit and is best-effort: the soft-delete is the
     // source of truth, so a transient S3 failure here shouldn't surface as a failed delete.
@@ -7091,6 +7136,18 @@ export class LegacyService implements OnModuleInit {
     // Restore resolves nothing first (a deleted row is invisible to kbFolder), so the uuid guard
     // has to sit here rather than in the resolver.
     if (!isUuid(folderId)) throw new NotFoundException({ error: "Folder not found" });
+    const existing = await this.db.query<{ deletion_reason: string | null; source_provider: string | null }>(
+      "SELECT deletion_reason, source_provider FROM knowledge_folders WHERE id = $1 AND project_id = $2",
+      [folderId, projectId]
+    );
+    if (!existing.rows[0]) throw new NotFoundException({ error: "Folder not found" });
+    if (existing.rows[0].deletion_reason === "integration_disconnect") {
+      const providerName = PROVIDER_FOLDER_NAMES[existing.rows[0].source_provider || ""];
+      const disconnectedWhat = providerName ? `${providerName} was disconnected` : "the integration was disconnected";
+      throw new BadRequestException({
+        error: `This folder was removed when ${disconnectedWhat} and can't be restored. Reconnect and sync to create a new one.`
+      });
+    }
     const res = await this.db.query(
       "UPDATE knowledge_folders SET is_deleted = false, deleted_at = NULL, updated_by = $2, updated_at = now() WHERE id = $1 AND project_id = $3 RETURNING *",
       [folderId, uid, projectId]
@@ -7420,10 +7477,12 @@ export class LegacyService implements OnModuleInit {
         version_number: number;
         title: string;
         content_text: string | null;
+        changed_summary: string | null;
+        changed_fields: ChangedField[] | null;
         created_by_name: string | null;
         created_at: string;
       }>(
-        `SELECT v.id, v.version_number, v.title, v.content_text,
+        `SELECT v.id, v.version_number, v.title, v.content_text, v.changed_summary, v.changed_fields,
                 COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS created_by_name, v.created_at
          FROM knowledge_document_versions v
          LEFT JOIN users u ON u.id = v.created_by
@@ -7453,23 +7512,56 @@ export class LegacyService implements OnModuleInit {
     // change, timestamped and attributed to that same row. An edit that lands inside the 15-minute
     // snapshot-throttling window (KB_VERSION_SNAPSHOT_MINUTES) never gets its own row and is folded
     // into whichever transition it happened inside, rather than being silently dropped.
-    const states = [
-      ...versions.map((v) => ({ title: v.title, contentText: v.content_text })),
-      { title: String(doc.title), contentText: (doc.content_text as string | null) ?? null }
-    ];
+    //
+    // That diff is precomputed and stored on the row at write time (updateKnowledgeDocument /
+    // restoreKnowledgeDocumentVersion) — reading it back here is a column read, not a re-run of the
+    // text diff across the whole history on every page view, which is what made a long timeline's
+    // Change History visibly slower to page through the more versions it accumulated. A row written
+    // before that shipped has no stored diff (changed_summary IS NULL): computed inline, just for
+    // that one row, and cached back onto it so it's O(1) on every future read instead of this one.
+    const healPromises: Promise<void>[] = [];
     for (let i = 0; i < versions.length; i++) {
-      const diff = summarizeDocumentChange(states[i], states[i + 1]);
-      if (!diff.fields.length) continue;
+      const v = versions[i];
+      let summary: string;
+      let fields: ChangedField[];
+      if (v.changed_summary !== null && Array.isArray(v.changed_fields)) {
+        summary = v.changed_summary;
+        fields = v.changed_fields;
+      } else {
+        const nextState =
+          i + 1 < versions.length
+            ? { title: versions[i + 1].title, contentText: versions[i + 1].content_text }
+            : { title: String(doc.title), contentText: (doc.content_text as string | null) ?? null };
+        const diff = summarizeDocumentChange({ title: v.title, contentText: v.content_text }, nextState);
+        summary = diff.summary;
+        fields = diff.fields;
+        // Best-effort cache warm: never blocks or fails the read, and only ever fills a row that's
+        // still unhealed — if a concurrent edit already computed a fresher value for this exact row
+        // (the narrow case where it was still the "latest" row at the moment both ran), that value
+        // must win, so this never overwrites a non-NULL changed_summary.
+        healPromises.push(
+          this.db
+            .query("UPDATE knowledge_document_versions SET changed_summary = $2, changed_fields = $3::jsonb WHERE id = $1 AND changed_summary IS NULL", [
+              v.id,
+              summary,
+              JSON.stringify(fields)
+            ])
+            .then(() => undefined)
+            .catch(() => undefined)
+        );
+      }
+      if (!fields.length) continue;
       entries.push({
-        id: versions[i].id,
+        id: v.id,
         eventType: "updated",
-        changedSummary: diff.summary,
-        changedFields: diff.fields,
-        createdAt: new Date(versions[i].created_at).toISOString(),
-        actorName: versions[i].created_by_name || "Deleted user",
-        versionId: versions[i].id
+        changedSummary: summary,
+        changedFields: fields,
+        createdAt: new Date(v.created_at).toISOString(),
+        actorName: v.created_by_name || "Deleted user",
+        versionId: v.id
       });
     }
+    if (healPromises.length) void Promise.all(healPromises);
 
     // Approve/reject already lands in the project activity feed (logProjectActivity), but that feed
     // mixes every kind of activity across the whole project — folding it in here too means this
@@ -7545,8 +7637,8 @@ export class LegacyService implements OnModuleInit {
       nextTitle !== doc.title || nextHtml !== doc.content_html || nextText !== doc.content_text;
 
     if (contentChanged) {
-      const latest = await this.db.query<{ created_at: string }>(
-        "SELECT created_at FROM knowledge_document_versions WHERE document_id = $1 ORDER BY version_number DESC LIMIT 1",
+      const latest = await this.db.query<{ id: string; title: string; content_text: string | null; created_at: string }>(
+        "SELECT id, title, content_text, created_at FROM knowledge_document_versions WHERE document_id = $1 ORDER BY version_number DESC LIMIT 1",
         [documentId]
       );
       const staleMinutes = LegacyService.KB_VERSION_SNAPSHOT_MINUTES;
@@ -7554,6 +7646,13 @@ export class LegacyService implements OnModuleInit {
         !latest.rows[0] ||
         Date.now() - new Date(latest.rows[0].created_at).getTime() > staleMinutes * 60 * 1000;
       if (isStale) {
+        // The new row's own diff (what THIS edit changed, relative to the state it snapshots) is
+        // fully known right now — old content is what's being captured into the row, new content is
+        // nextTitle/nextText — so it's computed once, here, instead of on every future history read.
+        const diff = summarizeDocumentChange(
+          { title: doc.title, contentText: doc.content_text },
+          { title: nextTitle, contentText: nextText }
+        );
         // Serialised per document, and sharing its lock key with restoreKnowledgeDocumentVersion —
         // MAX(version_number)+1 alone lets a concurrent edit and a concurrent restore compute the
         // same next number, and the table has no unique constraint to reject the duplicate insert.
@@ -7564,11 +7663,35 @@ export class LegacyService implements OnModuleInit {
             [documentId]
           );
           await client.query(
-            `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-            [documentId, nextVersion.rows[0].max, doc.title, doc.content_json ? JSON.stringify(doc.content_json) : null, doc.content_html, doc.content_text, uid]
+            `INSERT INTO knowledge_document_versions
+               (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+            [
+              documentId,
+              nextVersion.rows[0].max,
+              doc.title,
+              doc.content_json ? JSON.stringify(doc.content_json) : null,
+              doc.content_html,
+              doc.content_text,
+              uid,
+              diff.summary,
+              JSON.stringify(diff.fields)
+            ]
           );
         });
+      } else if (latest.rows[0]) {
+        // No new row this edit (still inside the snapshot-throttling window) — the existing latest
+        // row's "after" state has just moved further along, so its stored diff must move with it.
+        // Whatever was stored for it before (from an earlier edit inside this same window) is now
+        // superseded; only the diff against the true final state of the window matters once it closes.
+        const diff = summarizeDocumentChange(
+          { title: latest.rows[0].title, contentText: latest.rows[0].content_text },
+          { title: nextTitle, contentText: nextText }
+        );
+        await this.db.query(
+          "UPDATE knowledge_document_versions SET changed_summary = $2, changed_fields = $3::jsonb WHERE id = $1",
+          [latest.rows[0].id, diff.summary, JSON.stringify(diff.fields)]
+        );
       }
     }
 
@@ -8350,14 +8473,34 @@ export class LegacyService implements OnModuleInit {
 
       if (!isNoop) {
         // Snapshot the current state before overwriting, so restoring a version is itself reversible.
+        // Its diff (what this restore changes, relative to the state it snapshots) is fully known
+        // right now — cur is the "before", v is the "after" — computed once instead of on every
+        // future history read. The row that was latest before this restore needs no update of its
+        // own: its diff already targets `cur`, since `cur` is exactly the content the last write
+        // (edit or restore) left live, and that's already been finalized as of that write.
         const nextVersion = await client.query<{ max: number }>(
           "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
           [documentId]
         );
+        const diff = summarizeDocumentChange(
+          { title: cur.title, contentText: cur.content_text },
+          { title: v.title, contentText: v.content_text }
+        );
         await client.query(
-          `INSERT INTO knowledge_document_versions (document_id, version_number, title, content_json, content_html, content_text, created_by)
-           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-          [documentId, nextVersion.rows[0].max, cur.title, cur.content_json ? JSON.stringify(cur.content_json) : null, cur.content_html, cur.content_text, uid]
+          `INSERT INTO knowledge_document_versions
+             (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+          [
+            documentId,
+            nextVersion.rows[0].max,
+            cur.title,
+            cur.content_json ? JSON.stringify(cur.content_json) : null,
+            cur.content_html,
+            cur.content_text,
+            uid,
+            diff.summary,
+            JSON.stringify(diff.fields)
+          ]
         );
       }
 
@@ -8705,17 +8848,28 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
     // Settle any in-flight sync before touching the connection, so the sync processor isn't
-    // concurrently writing to a run this same disconnect is about to invalidate.
+    // concurrently writing to a run this same disconnect is about to invalidate. Runs outside the
+    // advisory lock below (taken once the transaction opens) — safe because it's a plain
+    // `WHERE status IN ('queued','running')` UPDATE, so two concurrent disconnects racing here just
+    // both find nothing left to fail the second time; nothing depends on this being serialized.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
     const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
+    const uid = userId || null;
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
     // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
     // live credentials (so it can't be used even if some path forgets to check disconnected_at),
     // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
     // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
-    await this.db.transaction(async (client) => {
+    let filesToPurge: { storage_key: string }[] = [];
+    const affectedFolders = await this.db.transaction(async (client) => {
+      // Serializes concurrent disconnect calls for this workspace+provider (a double-click that
+      // outraces the frontend's disable-while-pending state, or two tabs/admins). The loser waits
+      // here, then its own SELECT below finds nothing left to clean up and this whole call becomes
+      // a harmless no-op — no special-cased "already disconnected" branch needed.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspace.id}:${p}`]);
+
       await client.query(
         "UPDATE integration_connections SET disconnected_at = now(), access_token = '', refresh_token = '', updated_at = now() WHERE organization_id = $1 AND provider = $2",
         [workspace.id, p]
@@ -8727,7 +8881,53 @@ export class LegacyService implements OnModuleInit {
          )`,
         [workspace.id, p]
       );
+
+      // The Knowledge Base folder ensureProviderFolder created is never touched by the updates
+      // above. Find it in every project under this workspace — not only the currently-mapped one,
+      // since a project's mapping can already be disabled (superseded by a different remote
+      // project/team) while its folder and documents still exist — and soft-delete it the same way
+      // a user deleting it by hand would, tagged so it can never be restored back into view.
+      // idx_knowledge_folders_source_provider (V103) backs this lookup.
+      const folders = await client.query<{ id: string; project_id: string; name: string }>(
+        "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id = $1 AND source_provider = $2 AND is_deleted = false",
+        [workspace.id, p]
+      );
+      if (!folders.rows.length) return [];
+
+      const folderIds = folders.rows.map((f) => f.id);
+      // One set-based pass across every affected folder (however many projects they span) instead
+      // of a round-trip per folder — keeps the advisory lock and the connection/mapping row locks
+      // above held for a bounded, small number of queries regardless of workspace size.
+      const purge = await client.query<{ storage_key: string }>(
+        `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+        [folderIds]
+      );
+      filesToPurge = purge.rows;
+      await this.cascadeSoftDeleteFolderTree(client, folderIds, uid, "integration_disconnect");
+
+      return folders.rows;
     });
+
+    // Storage cleanup and activity logging run after the DB commit, same convention as
+    // deleteKnowledgeFolder: the soft-delete is the source of truth, so a transient S3 failure or a
+    // logging hiccup here must never surface as a failed (or half-applied) disconnect.
+    await Promise.all(
+      filesToPurge.map((row) =>
+        this.storage
+          .delete(row.storage_key)
+          .catch((error) => this.logger.warn(`Failed to delete storage object ${row.storage_key}: ${error}`))
+      )
+    );
+    // logProjectActivity swallows its own errors and none of these depend on each other, so they
+    // run concurrently — the KB cleanup above has already committed by this point either way.
+    await Promise.all(
+      affectedFolders.map((folder) =>
+        this.logProjectActivity(folder.project_id, uid, "deleted", "knowledge_folder", folder.id, folder.name, {
+          reason: "integration_disconnected"
+        })
+      )
+    );
+
     return { disconnected: true };
   }
 
@@ -15094,6 +15294,26 @@ export class LegacyService implements OnModuleInit {
   private async nextExternalId(projectId: string, requestedPrefix?: unknown, runner: QueryRunner = this.db): Promise<string> {
     const key = await this.externalIdPrefix(projectId, requestedPrefix, runner);
     return `${key}-TC-${(await this.maxExternalIdSeq(projectId, key, runner)) + 1}`;
+  }
+
+  // Same shape as maxExternalIdSeq, scoped to bugs and the "-BUG-" infix — every bug gets a
+  // stable per-project id even when it is never linked to an external tracker (integration_issue_key
+  // stays null for a self-logged bug).
+  private async maxBugExternalIdSeq(projectId: string, key: string, runner: QueryRunner = this.db): Promise<number> {
+    const maxRes = await runner.query<{ n: string }>(
+      "SELECT COALESCE(MAX((regexp_match(external_id, '\\d+$'))[1]::int), 0) AS n FROM bugs WHERE project_id = $1 AND external_id LIKE $2",
+      [projectId, `${key}-BUG-%`]
+    );
+    return Number(maxRes.rows[0]?.n || 0);
+  }
+
+  /**
+   * The next free `<KEY>-BUG-<n>` for a project. Reuses externalIdPrefix as-is — it only resolves
+   * the project's configured prefix / key / "TC" fallback, nothing testcase-specific.
+   */
+  private async nextBugExternalId(projectId: string, runner: QueryRunner = this.db): Promise<string> {
+    const key = await this.externalIdPrefix(projectId, undefined, runner);
+    return `${key}-BUG-${(await this.maxBugExternalIdSeq(projectId, key, runner)) + 1}`;
   }
 
   private async groupTestcases(projectId: string, column: string) {

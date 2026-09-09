@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   authMe,
   getWorkspace,
@@ -47,6 +47,11 @@ function WorkspaceIntegrationConfigInner({
   const [status, setStatus] = useState<IntegrationConnectionStatus | null>(null);
   const [config, setConfig] = useState<IntegrationOAuthConfig | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
+  // A real synchronous guard: two clicks fired before React flushes setDisconnecting(true) both
+  // read the same stale `disconnecting` state (still false), so that alone doesn't stop a fast
+  // double-click. A ref is mutated and read back immediately, in the same tick — see
+  // restoreInFlightRef in the KB document editor for the same pattern and the same reason.
+  const disconnectingRef = useRef(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [workspaceName, setWorkspaceName] = useState("");
 
@@ -88,6 +93,8 @@ function WorkspaceIntegrationConfigInner({
   const connecting = connectPhase === "opening" || connectPhase === "waiting";
 
   async function handleDisconnect() {
+    if (disconnectingRef.current) return;
+    disconnectingRef.current = true;
     setDisconnecting(true);
     setMessage(null);
     try {
@@ -97,6 +104,7 @@ function WorkspaceIntegrationConfigInner({
     } catch (err) {
       setMessage({ type: "error", text: err instanceof Error ? err.message : `Failed to disconnect ${label}.` });
     } finally {
+      disconnectingRef.current = false;
       setDisconnecting(false);
     }
   }
