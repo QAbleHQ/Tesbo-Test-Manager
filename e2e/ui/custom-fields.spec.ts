@@ -216,6 +216,86 @@ test.describe("custom fields (UI)", () => {
     expect(await listFields()).toHaveLength(1);
   });
 
+  /*
+   * A multiselect's minSelected/maxSelected inversion (min=4, max=3) validates correctly on the
+   * backend (custom-field-validation.ts's validateConfigShape), but the thrown BadRequestException
+   * carries a bare { field, message } body — not the { error }/{ errors } shape lib/api.ts's
+   * formatApiError otherwise recognizes — so the message was silently dropped in favor of the
+   * generic "Something went wrong. Please try again." fallback. Covers the exact scenario the
+   * ticket described, plus that a valid min/max still saves normally and that the fix generalizes
+   * to another field type's own min/max check (not just this one message).
+   */
+  test(
+    "a multiselect whose minimum exceeds its maximum reports the specific reason, not a generic failure",
+    async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await page.goto(settingsUrl());
+      await page.getByRole("button", { name: "Add custom field" }).click();
+
+      const form = modal(page, CREATE_MODAL_TITLE);
+      const name = fieldName("UI Multiselect Inverted");
+      await control(form, "Field name").fill(name);
+      await control(form, "Field type", "select").selectOption("multi_select");
+      for (const label of ["One", "Two", "Three"]) {
+        await form.getByPlaceholder("Add an option").fill(label);
+        await form.getByRole("button", { name: "Add", exact: true }).click();
+      }
+      await control(form, "Minimum selections").fill("4");
+      await control(form, "Maximum selections").fill("3");
+      await form.getByRole("button", { name: "Create field" }).click();
+
+      const alert = form.getByRole("alert");
+      await expect(alert).toContainText("Minimum selections cannot be greater than maximum selections.");
+      await expect(alert).not.toContainText("Something went wrong");
+      await expect(form).toBeVisible();
+      expect(await listFields()).toHaveLength(0);
+    },
+  );
+
+  test("a multiselect with a valid minimum/maximum saves normally", async ({ browser }) => {
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    await page.getByRole("button", { name: "Add custom field" }).click();
+
+    const form = modal(page, CREATE_MODAL_TITLE);
+    const name = fieldName("UI Multiselect Valid");
+    await control(form, "Field name").fill(name);
+    await control(form, "Field type", "select").selectOption("multi_select");
+    for (const label of ["One", "Two", "Three"]) {
+      await form.getByPlaceholder("Add an option").fill(label);
+      await form.getByRole("button", { name: "Add", exact: true }).click();
+    }
+    await control(form, "Minimum selections").fill("1");
+    await control(form, "Maximum selections").fill("3");
+    await form.getByRole("button", { name: "Create field" }).click();
+
+    await expect(form).toBeHidden();
+    const [persisted] = await listFields();
+    expect(persisted).toMatchObject({ name, fieldType: "multi_select" });
+    expect(persisted.config.minSelected).toBe(1);
+    expect(persisted.config.maxSelected).toBe(3);
+  });
+
+  test("a number field's own inverted min/max also reports its specific reason, not a generic failure", async ({ browser }) => {
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    await page.getByRole("button", { name: "Add custom field" }).click();
+
+    const form = modal(page, CREATE_MODAL_TITLE);
+    const name = fieldName("UI Number Inverted");
+    await control(form, "Field name").fill(name);
+    await control(form, "Field type", "select").selectOption("number");
+    await control(form, "Minimum value").fill("10");
+    await control(form, "Maximum value").fill("1");
+    await form.getByRole("button", { name: "Create field" }).click();
+
+    const alert = form.getByRole("alert");
+    await expect(alert).toContainText("min cannot exceed max");
+    await expect(alert).not.toContainText("Something went wrong");
+    await expect(form).toBeVisible();
+    expect(await listFields()).toHaveLength(0);
+  });
+
   test("the order arrows move a field, and the new order is what the project keeps", { tag: '@tesbo.testId("TES-TC-657")' }, async ({ browser }) => {
     const first = await defineField({ fieldType: "text" });
     const second = await defineField({ fieldType: "text" });
