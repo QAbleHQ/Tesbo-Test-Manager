@@ -30,12 +30,30 @@ export default function CustomFieldOptionsEditor({
   disabled?: boolean;
 }) {
   const [newLabel, setNewLabel] = useState("");
+  // Which option is currently the drop target, for the highlight — mirrors dragOverId in
+  // RepositoryTestCaseTable.tsx's column drag-and-drop.
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
   function move(index: number, direction: -1 | 1) {
     const target = index + direction;
     if (target < 0 || target >= options.length) return;
     const next = [...options];
     [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  }
+
+  // Drag-and-drop counterpart to move() — same onChange(next) flow (still local until the
+  // surrounding form is saved), but the dragged option can land at any position instead of
+  // swapping with one neighbor. Dropping on itself is a no-op; dropping outside a valid option row
+  // never reaches this function since only option rows wire up an onDrop handler.
+  function moveTo(fromKey: string, toKey: string) {
+    if (fromKey === toKey) return;
+    const fromIndex = options.findIndex((o) => o.localKey === fromKey);
+    const toIndex = options.findIndex((o) => o.localKey === toKey);
+    if (fromIndex === -1 || toIndex === -1) return;
+    const next = [...options];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
     onChange(next);
   }
 
@@ -67,7 +85,56 @@ export default function CustomFieldOptionsEditor({
     <div className="space-y-2">
       {options.length === 0 && <p className="text-[13px] text-[var(--muted)]">No options yet — add at least one below.</p>}
       {options.map((option, index) => (
-        <div key={option.localKey} className="flex items-center gap-1.5">
+        <div
+          key={option.localKey}
+          draggable={!disabled}
+          onDragStart={
+            !disabled
+              ? (e) => {
+                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.setData("text/plain", option.localKey);
+                }
+              : undefined
+          }
+          onDragOver={
+            !disabled
+              ? (e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                }
+              : undefined
+          }
+          onDragEnter={!disabled ? () => setDragOverKey(option.localKey) : undefined}
+          onDragLeave={
+            !disabled ? () => setDragOverKey((cur) => (cur === option.localKey ? null : cur)) : undefined
+          }
+          onDrop={
+            !disabled
+              ? (e) => {
+                  e.preventDefault();
+                  const fromKey = e.dataTransfer.getData("text/plain");
+                  setDragOverKey(null);
+                  if (fromKey) moveTo(fromKey, option.localKey);
+                }
+              : undefined
+          }
+          onDragEnd={() => setDragOverKey(null)}
+          className={`flex items-center gap-1.5 rounded-md ${dragOverKey === option.localKey ? "bg-[var(--brand-soft)]" : ""}`}
+        >
+          <span
+            className="cursor-grab text-[var(--muted-soft)] select-none active:cursor-grabbing"
+            aria-hidden="true"
+            title="Drag to reorder"
+          >
+            <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" className="opacity-60">
+              <circle cx="3" cy="3" r="1.25" />
+              <circle cx="7" cy="3" r="1.25" />
+              <circle cx="3" cy="7" r="1.25" />
+              <circle cx="7" cy="7" r="1.25" />
+              <circle cx="3" cy="11" r="1.25" />
+              <circle cx="7" cy="11" r="1.25" />
+            </svg>
+          </span>
           <div className="flex flex-col">
             <button
               type="button"
