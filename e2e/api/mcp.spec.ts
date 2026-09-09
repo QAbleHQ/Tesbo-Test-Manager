@@ -44,6 +44,23 @@ async function callMcpTool(
   return JSON.parse(body.result.content[0].text);
 }
 
+/** Same call as callMcpTool, but for cases expected to fail — returns the JSON-RPC error object. */
+async function callMcpToolExpectError(
+  request: import("@playwright/test").APIRequestContext,
+  token: string,
+  toolName: string,
+  args: Record<string, unknown> = {},
+) {
+  const res = await request.post(`/api/projects/${ctx.projectId}/mcp`, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: args } },
+  });
+  expect(res.ok()).toBeTruthy();
+  const body = await res.json();
+  expect(body.error).toBeDefined();
+  return body.error as { code: number; message: string };
+}
+
 test.describe("MCP list_testcases and the repository total agree on Archived cases", () => {
   test("includeArchived lets an MCP caller reach the same total the repository summary counts", async ({
     request,
@@ -169,6 +186,313 @@ test.describe("MCP create_testcase normalizes step field synonyms", () => {
         await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
       }
       if (createdId) await deleteCase(request, createdId);
+      await mcpApi.dispose();
+    }
+  });
+});
+
+test.describe("MCP search_knowledge_base", () => {
+  test("finds a Knowledge Base document created via REST, scoped to the token's project", async ({ request }) => {
+    const title = `E2E MCP KB ${Date.now()}`;
+    let tokenId: string | undefined;
+    let documentId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const treeRes = await request.get(`/api/projects/${ctx.projectId}/knowledge-base/folders/tree`);
+      expect(treeRes.ok()).toBeTruthy();
+      const rootFolderId = (await treeRes.json()).id;
+
+      const docRes = await request.post(`/api/projects/${ctx.projectId}/knowledge-base/documents`, {
+        data: { title, folderId: rootFolderId, contentText: "Steps to reset a forgotten password" },
+      });
+      expect(docRes.ok()).toBeTruthy();
+      documentId = (await docRes.json()).id;
+
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP KB token ${Date.now()}`, scopes: ["read"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      const found = await callMcpTool(mcpApi, token, "search_knowledge_base", { q: title });
+      expect(found.list.some((item: { id: string; type: string }) => item.id === documentId && item.type === "document")).toBe(
+        true,
+      );
+
+      const empty = await callMcpTool(mcpApi, token, "search_knowledge_base", { q: `no-such-title-${Date.now()}` });
+      expect(empty.total).toBe(0);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      if (documentId) {
+        await request.delete(`/api/projects/${ctx.projectId}/knowledge-base/documents/${documentId}`, {
+          failOnStatusCode: false,
+        });
+      }
+      await mcpApi.dispose();
+    }
+  });
+
+  test("rejects a call missing the required q argument", async ({ request }) => {
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP KB validation token ${Date.now()}`, scopes: ["read"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      const error = await callMcpToolExpectError(mcpApi, token, "search_knowledge_base", {});
+      expect(error.message).toMatch(/"q"/i);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      await mcpApi.dispose();
+    }
+  });
+});
+
+/*
+ * MCP write access to Knowledge Base: create/update/move documents and folders. Every tool is a
+ * thin passthrough to the same LegacyService methods the REST knowledge-base endpoints already
+ * use (mcp.tools.ts), so the role/ownership gate (kbRequireMutateAccess — a qa_engineer may only
+ * mutate what they created; owner/manager may mutate anything) and the KB-specific business rules
+ * (root folder immovable, no moving a folder into its own subtree, sync-mirror read-only lock,
+ * duplicate sibling names) are unchanged and already covered end-to-end at the REST layer in
+ * api/knowledge-base.spec.ts. What's new here is the MCP transport and attribution (ctx.userId,
+ * since knowledge_documents/knowledge_folders.created_by references users(id) like bugs.reported_by
+ * — see mcp.tools.ts's module doc comment), so these tests focus on that: the tools actually
+ * persist through to REST, required-argument validation, and not-found/guard handling.
+ */
+test.describe("MCP Knowledge Base write tools", () => {
+  test("creates, updates, and moves a document and a folder, persisted via REST", async ({ request }) => {
+    const stamp = Date.now();
+    let tokenId: string | undefined;
+    let folderAId: string | undefined;
+    let folderBId: string | undefined;
+    let documentId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const treeRes = await request.get(`/api/projects/${ctx.projectId}/knowledge-base/folders/tree`);
+      expect(treeRes.ok()).toBeTruthy();
+      const rootFolderId = (await treeRes.json()).id;
+
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP KB write token ${stamp}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      // create_knowledge_folder: two sibling folders under root.
+      const folderA = await callMcpTool(mcpApi, token, "create_knowledge_folder", {
+        name: `E2E MCP KB Folder A ${stamp}`,
+        parentFolderId: rootFolderId,
+      });
+      folderAId = folderA.id;
+      const folderB = await callMcpTool(mcpApi, token, "create_knowledge_folder", {
+        name: `E2E MCP KB Folder B ${stamp}`,
+        parentFolderId: rootFolderId,
+      });
+      folderBId = folderB.id;
+
+      const fetchedFolderA = await request.get(`/api/projects/${ctx.projectId}/knowledge-base/folders/${folderAId}`);
+      expect(fetchedFolderA.ok()).toBeTruthy();
+      expect((await fetchedFolderA.json()).name).toBe(`E2E MCP KB Folder A ${stamp}`);
+
+      // create_knowledge_document: inside folder A.
+      const doc = await callMcpTool(mcpApi, token, "create_knowledge_document", {
+        title: `E2E MCP KB Doc ${stamp}`,
+        folderId: folderAId,
+        contentText: "Original content",
+      });
+      documentId = doc.id;
+      const fetchedDoc = await request.get(`/api/projects/${ctx.projectId}/knowledge-base/documents/${documentId}`);
+      expect(fetchedDoc.ok()).toBeTruthy();
+      let docBody = await fetchedDoc.json();
+      expect(docBody.folderId).toBe(folderAId);
+      expect(docBody.contentText).toBe("Original content");
+
+      // update_knowledge_document: title and content change, persisted.
+      await callMcpTool(mcpApi, token, "update_knowledge_document", {
+        documentId,
+        title: `E2E MCP KB Doc Updated ${stamp}`,
+        contentText: "Updated content",
+      });
+      docBody = await (await request.get(`/api/projects/${ctx.projectId}/knowledge-base/documents/${documentId}`)).json();
+      expect(docBody.title).toBe(`E2E MCP KB Doc Updated ${stamp}`);
+      expect(docBody.contentText).toBe("Updated content");
+
+      // move_knowledge_document: from folder A to folder B.
+      await callMcpTool(mcpApi, token, "move_knowledge_document", { documentId, folderId: folderBId });
+      docBody = await (await request.get(`/api/projects/${ctx.projectId}/knowledge-base/documents/${documentId}`)).json();
+      expect(docBody.folderId).toBe(folderBId);
+
+      // update_knowledge_folder: rename folder A.
+      await callMcpTool(mcpApi, token, "update_knowledge_folder", {
+        folderId: folderAId,
+        name: `E2E MCP KB Folder A Renamed ${stamp}`,
+      });
+      const renamedFolderA = await (
+        await request.get(`/api/projects/${ctx.projectId}/knowledge-base/folders/${folderAId}`)
+      ).json();
+      expect(renamedFolderA.name).toBe(`E2E MCP KB Folder A Renamed ${stamp}`);
+
+      // move_knowledge_folder: nest folder A under folder B.
+      await callMcpTool(mcpApi, token, "move_knowledge_folder", { folderId: folderAId, parentFolderId: folderBId });
+      const movedFolderA = await (
+        await request.get(`/api/projects/${ctx.projectId}/knowledge-base/folders/${folderAId}`)
+      ).json();
+      expect(movedFolderA.parentFolderId).toBe(folderBId);
+
+      // Guard: folder B cannot be moved into its own subtree (folder A is now its child).
+      const subtreeError = await callMcpToolExpectError(mcpApi, token, "move_knowledge_folder", {
+        folderId: folderBId,
+        parentFolderId: folderAId,
+      });
+      expect(subtreeError.message).toMatch(/cannot be moved into itself or one of its subfolders/i);
+
+      // Guard: the project's root folder cannot be moved at all.
+      const rootMoveError = await callMcpToolExpectError(mcpApi, token, "move_knowledge_folder", {
+        folderId: rootFolderId,
+        parentFolderId: folderAId,
+      });
+      expect(rootMoveError.message).toMatch(/root folder cannot be moved/i);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      if (documentId) {
+        await request.delete(`/api/projects/${ctx.projectId}/knowledge-base/documents/${documentId}`, {
+          failOnStatusCode: false,
+        });
+      }
+      // Folder A is nested under folder B by the time cleanup runs; delete the child before the parent.
+      if (folderAId) {
+        await request.delete(`/api/projects/${ctx.projectId}/knowledge-base/folders/${folderAId}`, {
+          failOnStatusCode: false,
+        });
+      }
+      if (folderBId) {
+        await request.delete(`/api/projects/${ctx.projectId}/knowledge-base/folders/${folderBId}`, {
+          failOnStatusCode: false,
+        });
+      }
+      await mcpApi.dispose();
+    }
+  });
+
+  test("rejects each Knowledge Base write tool call missing its required argument(s)", async ({ request }) => {
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP KB validation token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      expect((await callMcpToolExpectError(mcpApi, token, "create_knowledge_document", { folderId: "f1" })).message).toMatch(
+        /"title"/i,
+      );
+      expect((await callMcpToolExpectError(mcpApi, token, "create_knowledge_document", { title: "T" })).message).toMatch(
+        /"folderId"/i,
+      );
+      expect((await callMcpToolExpectError(mcpApi, token, "update_knowledge_document", { title: "T" })).message).toMatch(
+        /"documentId"/i,
+      );
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "move_knowledge_document", { documentId: "d1" })).message,
+      ).toMatch(/"folderId"/i);
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "move_knowledge_document", { folderId: "f1" })).message,
+      ).toMatch(/"documentId"/i);
+      expect((await callMcpToolExpectError(mcpApi, token, "create_knowledge_folder", {})).message).toMatch(/"name"/i);
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "update_knowledge_folder", { name: "N" })).message,
+      ).toMatch(/"folderId"/i);
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "move_knowledge_folder", { folderId: "f1" })).message,
+      ).toMatch(/"parentFolderId"/i);
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "move_knowledge_folder", { parentFolderId: "f2" })).message,
+      ).toMatch(/"folderId"/i);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      await mcpApi.dispose();
+    }
+  });
+
+  test("rejects update/move on a Knowledge Base document or folder that does not exist", async ({ request }) => {
+    const ghostId = "00000000-0000-0000-0000-000000000000";
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP KB not-found token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      expect(
+        (
+          await callMcpToolExpectError(mcpApi, token, "update_knowledge_document", { documentId: ghostId, title: "x" })
+        ).message,
+      ).toMatch(/document not found/i);
+      expect(
+        (
+          await callMcpToolExpectError(mcpApi, token, "move_knowledge_document", { documentId: ghostId, folderId: ghostId })
+        ).message,
+      ).toMatch(/document not found|folder not found/i);
+      expect(
+        (await callMcpToolExpectError(mcpApi, token, "update_knowledge_folder", { folderId: ghostId, name: "x" })).message,
+      ).toMatch(/folder not found/i);
+      expect(
+        (
+          await callMcpToolExpectError(mcpApi, token, "move_knowledge_folder", {
+            folderId: ghostId,
+            parentFolderId: ghostId,
+          })
+        ).message,
+      ).toMatch(/folder not found/i);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
       await mcpApi.dispose();
     }
   });

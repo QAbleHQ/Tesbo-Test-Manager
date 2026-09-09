@@ -15,6 +15,13 @@ function makeLegacy(overrides: Partial<Record<string, jest.Mock>> = {}) {
     updateExecution: jest.fn().mockResolvedValue(undefined),
     createBug: jest.fn().mockResolvedValue({ id: "bug-new" }),
     requirementMatrix: jest.fn().mockResolvedValue({ rows: [] }),
+    searchKnowledgeBase: jest.fn().mockResolvedValue({ list: [], total: 0 }),
+    createKnowledgeDocument: jest.fn().mockResolvedValue({ id: "kb-doc-new" }),
+    updateKnowledgeDocument: jest.fn().mockResolvedValue({ id: "kb-doc-1" }),
+    moveKnowledgeDocument: jest.fn().mockResolvedValue({ id: "kb-doc-1" }),
+    createKnowledgeFolder: jest.fn().mockResolvedValue({ id: "kb-folder-new" }),
+    updateKnowledgeFolder: jest.fn().mockResolvedValue({ id: "kb-folder-1" }),
+    moveKnowledgeFolder: jest.fn().mockResolvedValue({ id: "kb-folder-1" }),
     ...overrides
   } as unknown as LegacyService;
 }
@@ -83,7 +90,14 @@ describe("McpService", () => {
           "create_cycle_from_plan",
           "record_execution_result",
           "create_bug",
-          "get_requirement_matrix"
+          "get_requirement_matrix",
+          "search_knowledge_base",
+          "create_knowledge_document",
+          "update_knowledge_document",
+          "move_knowledge_document",
+          "create_knowledge_folder",
+          "update_knowledge_folder",
+          "move_knowledge_folder"
         ])
       );
       for (const t of res.result.tools) {
@@ -188,6 +202,219 @@ describe("McpService", () => {
       );
       expect((legacy as any).listTestCases).toHaveBeenCalledWith("proj-1", { status: "Active" });
     });
+
+    it("passes the token's project and user into search_knowledge_base", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "search_knowledge_base", arguments: { q: "login" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).searchKnowledgeBase).toHaveBeenCalledWith("proj-1", "user-7", { q: "login" });
+    });
+  });
+
+  describe("Knowledge Base write tools", () => {
+    it("attributes create_knowledge_document to the token's user, not the agent actor", async () => {
+      // The engine resolves an MCP actor for every write-scope tool regardless of whether the
+      // handler uses it (mcp.service.ts callTool) — the assertion that matters here is which id
+      // Knowledge Base's created_by/updated_by columns actually receive: the human user, per the
+      // module doc comment, since those columns reference users(id) rather than actors(id).
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "create_knowledge_document", arguments: { title: "Runbook", folderId: "folder-1" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).createKnowledgeDocument).toHaveBeenCalledWith("proj-1", "user-7", {
+        title: "Runbook",
+        folderId: "folder-1"
+      });
+    });
+
+    it("rejects create_knowledge_document without folderId", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "create_knowledge_document", arguments: { title: "Runbook" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"folderId"/i);
+    });
+
+    it("passes documentId and args through to update_knowledge_document", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "update_knowledge_document", arguments: { documentId: "doc-1", title: "New title" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).updateKnowledgeDocument).toHaveBeenCalledWith("proj-1", "user-7", "doc-1", {
+        documentId: "doc-1",
+        title: "New title"
+      });
+    });
+
+    it("rejects update_knowledge_document without documentId", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "update_knowledge_document", arguments: { title: "New title" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"documentId"/i);
+    });
+
+    it("surfaces the read-only-mirror rejection from updateKnowledgeDocument as a ToolExecutionError", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy({
+        updateKnowledgeDocument: jest.fn().mockRejectedValue({
+          getResponse: () => ({ error: "synced from Jira and its body can't be edited" })
+        })
+      });
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "update_knowledge_document", arguments: { documentId: "doc-1", title: "x" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/synced from Jira/i);
+    });
+
+    it("passes documentId and folderId through to move_knowledge_document", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "move_knowledge_document", arguments: { documentId: "doc-1", folderId: "folder-2" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).moveKnowledgeDocument).toHaveBeenCalledWith("proj-1", "user-7", "doc-1", {
+        documentId: "doc-1",
+        folderId: "folder-2"
+      });
+    });
+
+    it("rejects move_knowledge_document without folderId", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "move_knowledge_document", arguments: { documentId: "doc-1" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"folderId"/i);
+    });
+
+    it("passes the token's user through to create_knowledge_folder", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "create_knowledge_folder", arguments: { name: "Release Notes 2" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).createKnowledgeFolder).toHaveBeenCalledWith("proj-1", "user-7", {
+        name: "Release Notes 2"
+      });
+    });
+
+    it("rejects create_knowledge_folder without name", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "create_knowledge_folder", arguments: {} }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"name"/i);
+    });
+
+    it("passes folderId and args through to update_knowledge_folder", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "update_knowledge_folder", arguments: { folderId: "folder-1", name: "Renamed" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).updateKnowledgeFolder).toHaveBeenCalledWith("proj-1", "user-7", "folder-1", {
+        folderId: "folder-1",
+        name: "Renamed"
+      });
+    });
+
+    it("rejects update_knowledge_folder without folderId", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "update_knowledge_folder", arguments: { name: "Renamed" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"folderId"/i);
+    });
+
+    it("passes folderId and parentFolderId through to move_knowledge_folder", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      await svc.handleRequest(
+        rpc("tools/call", { name: "move_knowledge_folder", arguments: { folderId: "folder-1", parentFolderId: "folder-2" } }),
+        principal({ userId: "user-7" }),
+        "proj-1"
+      );
+      expect((legacy as any).moveKnowledgeFolder).toHaveBeenCalledWith("proj-1", "user-7", "folder-1", {
+        folderId: "folder-1",
+        parentFolderId: "folder-2"
+      });
+    });
+
+    it("rejects move_knowledge_folder without parentFolderId", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "move_knowledge_folder", arguments: { folderId: "folder-1" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"parentFolderId"/i);
+    });
+
+    it("surfaces a role/ownership rejection (Forbidden) from a KB mutate method as a ToolExecutionError", async () => {
+      const { db } = makeDb();
+      const legacy = makeLegacy({
+        moveKnowledgeFolder: jest.fn().mockRejectedValue({
+          getResponse: () => ({ error: "You can only modify items you created" })
+        })
+      });
+      const svc = new McpService(legacy, db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "move_knowledge_folder", arguments: { folderId: "folder-1", parentFolderId: "folder-2" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/only modify items you created/i);
+    });
   });
 
   describe("actor attribution", () => {
@@ -287,6 +514,18 @@ describe("McpService", () => {
       );
       expect(res.error.code).toBe(RpcCode.ToolExecutionError);
       expect(res.error.message).toMatch(/title/i);
+    });
+
+    it("rejects search_knowledge_base without q", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "search_knowledge_base", arguments: {} }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.code).toBe(RpcCode.ToolExecutionError);
+      expect(res.error.message).toMatch(/"q"/i);
     });
 
     it("maps an underlying service exception onto a ToolExecutionError", async () => {
