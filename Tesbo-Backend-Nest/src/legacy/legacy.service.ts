@@ -22,6 +22,7 @@ import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
+import { PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
@@ -7021,6 +7022,62 @@ export class LegacyService implements OnModuleInit {
     }
   }
 
+  // Recursive descendants CTE shared by every folder-tree cascade below, seeded from one or more
+  // root folder ids at once — a single call can cascade several unrelated provider folders (across
+  // several projects) in one set-based pass instead of one round-trip per folder. Centralized here
+  // so the three previous inline copies of this exact CTE can't drift apart from each other.
+  private static readonly DESCENDANTS_CTE = `WITH RECURSIVE descendants AS (
+    SELECT id FROM knowledge_folders WHERE id = ANY($1::uuid[])
+    UNION ALL
+    SELECT kf.id FROM knowledge_folders kf JOIN descendants d ON kf.parent_folder_id = d.id
+  )`;
+
+  // Soft-deletes one or more folder trees (and every descendant folder/document/file beneath each),
+  // special-casing the Zyra memory document (never deleted, re-homed to its own project's root
+  // instead — a correlated subquery on knowledge_documents.project_id, since a single call here can
+  // span multiple projects). Shared by deleteKnowledgeFolder (deletionReason 'manual') and the
+  // integration-disconnect cleanup (deletionReason 'integration_disconnect') so the two removal
+  // paths can never drift apart in behavior — only in whether the result is restorable, which
+  // restoreKnowledgeFolder decides by reading the reason back.
+  private async cascadeSoftDeleteFolderTree(
+    client: PoolClient,
+    folderIds: string[],
+    uid: string | null,
+    deletionReason: "manual" | "integration_disconnect"
+  ): Promise<void> {
+    if (!folderIds.length) return;
+    const cte = LegacyService.DESCENDANTS_CTE;
+
+    await client.query(
+      `${cte} UPDATE knowledge_folders SET is_deleted = true, deleted_at = now(), deletion_reason = $3, updated_at = now(), updated_by = $2
+       WHERE id IN (SELECT id FROM descendants)`,
+      [folderIds, uid, deletionReason]
+    );
+    await client.query(
+      // The Zyra memory document survives its folder being deleted — otherwise deleting the AI
+      // memory folder is a way around the guard in deleteKnowledgeDocument.
+      `${cte} UPDATE knowledge_documents SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
+       WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false AND title <> '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
+      [folderIds, uid]
+    );
+    await client.query(
+      `${cte} UPDATE knowledge_files SET is_deleted = true, deleted_at = now()
+       WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+      [folderIds]
+    );
+    // The memory document was spared above, so it would now point at a deleted folder and appear in
+    // no listing at all — kept but invisible is worse than a clear refusal. Re-home it to the root
+    // OF ITS OWN PROJECT — folderIds can span multiple projects, so this can't be a single constant
+    // root id the way the single-folder version could.
+    await client.query(
+      `${cte} UPDATE knowledge_documents kd
+          SET folder_id = (SELECT krf.id FROM knowledge_folders krf WHERE krf.project_id = kd.project_id AND krf.is_root = true LIMIT 1),
+              updated_at = now()
+        WHERE kd.folder_id IN (SELECT id FROM descendants) AND kd.title = '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
+      [folderIds]
+    );
+  }
+
   async deleteKnowledgeFolder(projectId: string, userId: string | null | undefined, folderId: string) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
@@ -7029,45 +7086,12 @@ export class LegacyService implements OnModuleInit {
     const role = await this.kbProjectRole(uid, projectId);
     this.kbRequireMutateAccess(role, folder.created_by, uid);
 
-    const descendantsCte = `WITH RECURSIVE descendants AS (
-      SELECT id FROM knowledge_folders WHERE id = $1
-      UNION ALL
-      SELECT kf.id FROM knowledge_folders kf JOIN descendants d ON kf.parent_folder_id = d.id
-    )`;
-
     const filesToPurge = await this.db.query<{ storage_key: string }>(
-      `${descendantsCte} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-      [folderId]
+      `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+      [[folderId]]
     );
 
-    await this.db.transaction(async (client) => {
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_folders SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
-         WHERE id IN (SELECT id FROM descendants)`,
-        [folderId, uid]
-      );
-      await client.query(
-        // The Zyra memory document survives its folder being deleted — otherwise deleting the AI
-        // memory folder is a way around the guard in deleteKnowledgeDocument.
-        `${descendantsCte} UPDATE knowledge_documents SET is_deleted = true, deleted_at = now(), updated_at = now(), updated_by = $2
-         WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false AND title <> '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
-        [folderId, uid]
-      );
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_files SET is_deleted = true, deleted_at = now()
-         WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-        [folderId]
-      );
-      // The memory document was spared above, so it would now point at a deleted folder and appear in
-      // no listing at all — kept but invisible is worse than a clear refusal. Re-home it to the root.
-      await client.query(
-        `${descendantsCte} UPDATE knowledge_documents
-            SET folder_id = (SELECT id FROM knowledge_folders WHERE project_id = $2 AND is_root = true LIMIT 1),
-                updated_at = now()
-          WHERE folder_id IN (SELECT id FROM descendants) AND title = '${LegacyService.ZYRA_MEMORY_DOC_TITLE}'`,
-        [folderId, projectId]
-      );
-    });
+    await this.db.transaction((client) => this.cascadeSoftDeleteFolderTree(client, [folderId], uid, "manual"));
 
     // Storage cleanup runs after the DB commit and is best-effort: the soft-delete is the
     // source of truth, so a transient S3 failure here shouldn't surface as a failed delete.
@@ -7091,6 +7115,18 @@ export class LegacyService implements OnModuleInit {
     // Restore resolves nothing first (a deleted row is invisible to kbFolder), so the uuid guard
     // has to sit here rather than in the resolver.
     if (!isUuid(folderId)) throw new NotFoundException({ error: "Folder not found" });
+    const existing = await this.db.query<{ deletion_reason: string | null; source_provider: string | null }>(
+      "SELECT deletion_reason, source_provider FROM knowledge_folders WHERE id = $1 AND project_id = $2",
+      [folderId, projectId]
+    );
+    if (!existing.rows[0]) throw new NotFoundException({ error: "Folder not found" });
+    if (existing.rows[0].deletion_reason === "integration_disconnect") {
+      const providerName = PROVIDER_FOLDER_NAMES[existing.rows[0].source_provider || ""];
+      const disconnectedWhat = providerName ? `${providerName} was disconnected` : "the integration was disconnected";
+      throw new BadRequestException({
+        error: `This folder was removed when ${disconnectedWhat} and can't be restored. Reconnect and sync to create a new one.`
+      });
+    }
     const res = await this.db.query(
       "UPDATE knowledge_folders SET is_deleted = false, deleted_at = NULL, updated_by = $2, updated_at = now() WHERE id = $1 AND project_id = $3 RETURNING *",
       [folderId, uid, projectId]
@@ -8791,17 +8827,28 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
     // Settle any in-flight sync before touching the connection, so the sync processor isn't
-    // concurrently writing to a run this same disconnect is about to invalidate.
+    // concurrently writing to a run this same disconnect is about to invalidate. Runs outside the
+    // advisory lock below (taken once the transaction opens) — safe because it's a plain
+    // `WHERE status IN ('queued','running')` UPDATE, so two concurrent disconnects racing here just
+    // both find nothing left to fail the second time; nothing depends on this being serialized.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
     const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
+    const uid = userId || null;
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
     // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
     // live credentials (so it can't be used even if some path forgets to check disconnected_at),
     // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
     // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
-    await this.db.transaction(async (client) => {
+    let filesToPurge: { storage_key: string }[] = [];
+    const affectedFolders = await this.db.transaction(async (client) => {
+      // Serializes concurrent disconnect calls for this workspace+provider (a double-click that
+      // outraces the frontend's disable-while-pending state, or two tabs/admins). The loser waits
+      // here, then its own SELECT below finds nothing left to clean up and this whole call becomes
+      // a harmless no-op — no special-cased "already disconnected" branch needed.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspace.id}:${p}`]);
+
       await client.query(
         "UPDATE integration_connections SET disconnected_at = now(), access_token = '', refresh_token = '', updated_at = now() WHERE organization_id = $1 AND provider = $2",
         [workspace.id, p]
@@ -8813,7 +8860,53 @@ export class LegacyService implements OnModuleInit {
          )`,
         [workspace.id, p]
       );
+
+      // The Knowledge Base folder ensureProviderFolder created is never touched by the updates
+      // above. Find it in every project under this workspace — not only the currently-mapped one,
+      // since a project's mapping can already be disabled (superseded by a different remote
+      // project/team) while its folder and documents still exist — and soft-delete it the same way
+      // a user deleting it by hand would, tagged so it can never be restored back into view.
+      // idx_knowledge_folders_source_provider (V103) backs this lookup.
+      const folders = await client.query<{ id: string; project_id: string; name: string }>(
+        "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id = $1 AND source_provider = $2 AND is_deleted = false",
+        [workspace.id, p]
+      );
+      if (!folders.rows.length) return [];
+
+      const folderIds = folders.rows.map((f) => f.id);
+      // One set-based pass across every affected folder (however many projects they span) instead
+      // of a round-trip per folder — keeps the advisory lock and the connection/mapping row locks
+      // above held for a bounded, small number of queries regardless of workspace size.
+      const purge = await client.query<{ storage_key: string }>(
+        `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
+        [folderIds]
+      );
+      filesToPurge = purge.rows;
+      await this.cascadeSoftDeleteFolderTree(client, folderIds, uid, "integration_disconnect");
+
+      return folders.rows;
     });
+
+    // Storage cleanup and activity logging run after the DB commit, same convention as
+    // deleteKnowledgeFolder: the soft-delete is the source of truth, so a transient S3 failure or a
+    // logging hiccup here must never surface as a failed (or half-applied) disconnect.
+    await Promise.all(
+      filesToPurge.map((row) =>
+        this.storage
+          .delete(row.storage_key)
+          .catch((error) => this.logger.warn(`Failed to delete storage object ${row.storage_key}: ${error}`))
+      )
+    );
+    // logProjectActivity swallows its own errors and none of these depend on each other, so they
+    // run concurrently — the KB cleanup above has already committed by this point either way.
+    await Promise.all(
+      affectedFolders.map((folder) =>
+        this.logProjectActivity(folder.project_id, uid, "deleted", "knowledge_folder", folder.id, folder.name, {
+          reason: "integration_disconnected"
+        })
+      )
+    );
+
     return { disconnected: true };
   }
 
