@@ -17,6 +17,7 @@ import {
   listLinkedJiraKeys,
   listLinkedLinearKeys,
   getRequirementsSummary,
+  getKnowledgeFolderTree,
   type LinkedIssueTaskStatus,
   type RequirementsSummary,
   type TicketSourceStats,
@@ -233,6 +234,11 @@ export default function RequirementsPage() {
   // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
   const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>([]);
   const [historicalRemoteId, setHistoricalRemoteId] = useState<string | null>(null);
+  // Knowledge Base folder id for each provider's mirrored tickets (e.g. the "Jira" folder under
+  // the KB root), so "View in Knowledge base" can deep-link into the tab that's actually active
+  // instead of always landing on the root listing. A provider's folder only exists once its first
+  // sync has created it, so an entry here can legitimately be absent.
+  const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>({});
 
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
@@ -271,6 +277,15 @@ export default function RequirementsPage() {
     const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
     if (!task || normalizeTaskStatus(task.status) === "done") return undefined;
     return task;
+  }
+
+  // Unlike activeTaskFor (which hides once a task is "done" so the Action column can hand off to
+  // "N saved"/"Regenerate"), this is the persistent, always-on label: every requirement is always
+  // somewhere in the Zyra pipeline, including before any task exists at all ("Not started").
+  function zyraStatusFor(req: Requirement): { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" } {
+    const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
+    if (!task) return { label: "Not started", tone: "neutral" };
+    return { label: taskStatusLabel(task.status), tone: taskStatusTone(task.status) };
   }
 
   const loadTickets = useCallback(
@@ -349,6 +364,18 @@ export default function RequirementsPage() {
     setSummary(data);
   }, [projectId]);
 
+  // Maps the KB root's direct children back to provider ids by name, matching how
+  // ensureProviderFolder names them on the backend ("Jira" / "Linear").
+  const refreshKbFolders = useCallback(async () => {
+    const root = await getKnowledgeFolderTree(projectId).catch(() => null);
+    const map: Partial<Record<TicketSource, string>> = {};
+    for (const child of root?.children ?? []) {
+      const provider = PROVIDERS.find((p) => p.label === child.name);
+      if (provider) map[provider.id] = child.id;
+    }
+    setProviderFolderIds(map);
+  }, [projectId]);
+
   const refreshHistory = useCallback(async (activeSource: TicketSource) => {
     if (activeSource === "jira") {
       const status = await getJiraStatus(projectId).catch(() => null);
@@ -381,11 +408,11 @@ export default function RequirementsPage() {
       setSource(initialSource);
       await loadTickets(initialSource, 0, "", {});
       if (initialSource !== "all") void refreshHistory(initialSource);
-      await Promise.all([refreshLinkedKeys(), refreshSummary()]);
+      await Promise.all([refreshLinkedKeys(), refreshSummary(), refreshKbFolders()]);
       getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       setLoading(false);
     })();
-  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, router]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router]);
 
   useEffect(() => {
     if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
@@ -399,10 +426,13 @@ export default function RequirementsPage() {
       void loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
       void refreshSummary();
       void refreshLinkedKeys();
+      // A provider's KB folder is created lazily on its first sync, so a run settling is exactly
+      // when a previously-missing folder id can appear.
+      void refreshKbFolders();
       if (source !== "all") void refreshHistory(source);
     }
     syncWasActiveRef.current = anySyncActive;
-  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshHistory]);
+  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshKbFolders, refreshHistory]);
 
   function handleSourceChange(next: Source) {
     setSource(next);
@@ -500,6 +530,7 @@ export default function RequirementsPage() {
                   <button
                     key={tab.id}
                     type="button"
+                    data-testid={`requirements-source-tab-${tab.id}`}
                     onClick={() => handleSourceChange(tab.id)}
                     className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
                       active
@@ -588,7 +619,12 @@ export default function RequirementsPage() {
               </select>
             )}
             <Link
-              href={`/projects/${projectId}/knowledge-base`}
+              href={
+                source !== "all" && providerFolderIds[source]
+                  ? `/projects/${projectId}/knowledge-base?folder=${providerFolderIds[source]}`
+                  : `/projects/${projectId}/knowledge-base`
+              }
+              data-testid="view-in-knowledge-base-link"
               className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
             >
               View in Knowledge base
@@ -753,6 +789,7 @@ export default function RequirementsPage() {
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-20">Priority</th>
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-32">Assignee</th>
                   <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-24">Coverage</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-28">Zyra Status</th>
                   <th className="text-right px-4 py-2.5 font-medium text-[var(--muted-soft)] w-64">Action</th>
                 </tr>
               </thead>
@@ -761,6 +798,7 @@ export default function RequirementsPage() {
                   const linked = isLinked(ticket);
                   const tcCount = tcCountFor(ticket);
                   const activeTask = activeTaskFor(ticket);
+                  const zyraStatus = zyraStatusFor(ticket);
                   return (
                     <React.Fragment key={ticket.id}>
                       <tr
@@ -808,6 +846,11 @@ export default function RequirementsPage() {
                             <span className="text-[11px] text-[var(--muted-soft)]">—</span>
                           )}
                         </td>
+                        <td className="px-4 py-2.5">
+                          <StatusChip tone={zyraStatus.tone} title="Zyra's test-generation status for this requirement">
+                            {zyraStatus.label}
+                          </StatusChip>
+                        </td>
                         <td className="px-4 py-2.5 text-right">
                           <div className="inline-flex items-center gap-2">
                             {linked && (
@@ -828,16 +871,13 @@ export default function RequirementsPage() {
                               </Link>
                             )}
                             {activeTask ? (
-                              <>
-                                <StatusChip tone={taskStatusTone(activeTask.status)}>{taskStatusLabel(activeTask.status)}</StatusChip>
-                                <Link
-                                  href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
-                                  onClick={(e) => e.stopPropagation()}
-                                  className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
-                                >
-                                  View task
-                                </Link>
-                              </>
+                              <Link
+                                href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View task
+                              </Link>
                             ) : linked ? (
                               <button
                                 type="button"
@@ -868,7 +908,7 @@ export default function RequirementsPage() {
                       </tr>
                       {expandedId === ticket.id && (
                         <tr key={`${ticket.id}-detail`} className="bg-[var(--surface-secondary)]/20">
-                          <td colSpan={8} className="px-4 py-4">
+                          <td colSpan={9} className="px-4 py-4">
                             <div className="space-y-3">
                               {ticket.description && (
                                 <div>

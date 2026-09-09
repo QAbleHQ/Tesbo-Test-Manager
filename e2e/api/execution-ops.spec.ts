@@ -443,6 +443,53 @@ test.describe("execution bulk operations, schedules and share links", () => {
     }
   });
 
+  /*
+   * EXO-A-11: "Run At" (a one-time schedule's fire time) must not accept a past instant.
+   *
+   * Unlike EXO-A-07/08/10 above, this is not part of the missing scheduling feature — it is real,
+   * unconditional validation added ahead of persistence (LegacyController.validateScheduleRunAt), so
+   * a caller bypassing the UI's own datetime-local `min` and submit-time check still cannot submit a
+   * past or malformed instant. It runs before the 501, so these assert real 400s, not "not
+   * implemented yet". recurring schedules carry no runAt at all, so they are unaffected.
+   */
+  test("EXO-A-11 a one-time schedule refuses a past or malformed Run At", { tag: '@tesbo.testId("TES-TC-2200")' }, async () => {
+    const pastDate = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    // "Today with an earlier time" — a past instant that is not a different calendar day at all.
+    const earlierToday = new Date(Date.now() - 60 * 1000).toISOString();
+
+    for (const [label, runAt] of [
+      ["a full day in the past", pastDate],
+      ["earlier today", earlierToday],
+      ["not a date at all", "not-a-date"],
+      ["an empty string", ""],
+    ] as const) {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles/schedules`, {
+        data: { name: stamp("bad-run-at"), scheduleType: "one_time", runAt, cycleId: "irrelevant", timezone: "UTC" },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${label} (${JSON.stringify(runAt)}) must be refused, not 501: ${await res.text()}`).toBe(400);
+    }
+  });
+
+  test("EXO-A-12 a one-time schedule with a future Run At is accepted by validation (still 501, not 400)", { tag: '@tesbo.testId("TES-TC-2201")' }, async () => {
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles/schedules`, {
+      data: { name: stamp("future-run-at"), scheduleType: "one_time", runAt: future, cycleId: "irrelevant", timezone: "UTC" },
+      failOnStatusCode: false,
+    });
+    // Validation must not reject a genuinely future instant — it clears the new check and reaches the
+    // same "not implemented yet" the rest of this feature answers with, per EXO-A-08b.
+    expect(res.status(), `a future Run At must pass validation: ${await res.text()}`).toBe(501);
+  });
+
+  test("EXO-A-13 a recurring schedule needs no Run At and is unaffected by the check", { tag: '@tesbo.testId("TES-TC-2202")' }, async () => {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles/schedules`, {
+      data: { name: stamp("recurring"), scheduleType: "recurring", intervalMinutes: 60, cycleId: "irrelevant", timezone: "UTC" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `a recurring schedule must not be judged by Run At: ${await res.text()}`).toBe(501);
+  });
+
   // ─── Share links ──────────────────────────────────────────────────────────
 
   test("EXO-A-11 sharing a run mints a token that serves the run publicly", { tag: '@tesbo.testId("TES-TC-185")' }, async () => {

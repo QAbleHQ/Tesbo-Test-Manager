@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
 import { exec, literal, scalar } from "../utils/psql";
 import {
   loginAs,
@@ -434,5 +435,393 @@ test.describe("zyra chat ↔ repository consistency", () => {
     } finally {
       await asGuest.dispose();
     }
+  });
+});
+
+/*
+ * "Zyra says test cases were generated for identified coverage gaps, but nothing is created" —
+ * reported three times over (Basecamp 10231190735 and its recurrences). Every prior fix worked at
+ * the annotation/reply-guard layer and could only be verified against hand-built `applied` objects,
+ * never against a real turn — this suite's own header above says why: every path that decides
+ * whether to create runs behind a live provider call, and there was no fake one.
+ *
+ * This describe block is that fake provider (utils/fake-ai-server.ts) driving REAL turns through
+ * the REAL code: buildZyraChatDecision, the confirmation retry in sendZyraChatMessage,
+ * applyZyraChatOperations, and reconcileZyraReply. It asserts on the actual `ai_generation_requests`
+ * / `testcases` rows afterward, not on a hand-built `applied` object — the thing three prior fixes
+ * could not do.
+ */
+test.describe("zyra chat — confirmation retry (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-chat");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    // This describe block, unlike the one above, mints its own AI key per test (it needs one
+    // pointed at the fake server's baseUrl) — clean up so a re-run doesn't accumulate rows in this
+    // tenant's org, and so a stale key never gets picked over the one the next test allocates.
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  /** Points this tenant's project at the fake provider — same routes api/zyra.spec.ts uses. */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ZCC fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  async function sendMessage(sessionId: string, message: string): Promise<{ status: number; body: Record<string, unknown> }> {
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, failOnStatusCode: false });
+    return { status: res.status(), body: await res.json().catch(() => ({})) };
+  }
+
+  function liveCaseCount(): number {
+    return Number(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND deleted_at IS NULL;`));
+  }
+
+  function reviewRequestFor(sessionId: string): { taskStatus: string; generatedCount: number; payloadLength: number } | null {
+    const row = scalar(
+      `SELECT task_status || '|' || generated_count || '|' || jsonb_array_length(generated_payload) ` +
+        `FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    if (!row) return null;
+    const [taskStatus, generatedCount, payloadLength] = row.split("|");
+    return { taskStatus, generatedCount: Number(generatedCount), payloadLength: Number(payloadLength) };
+  }
+
+  const GAP_OFFER_REPLY =
+    "I reviewed the password-reset test cases and found 2 coverage gaps: no test for an expired reset " +
+    "token, and no test for a reset token being reused after it was already consumed. Would you like me " +
+    "to generate test cases for these gaps?";
+
+  const DRAFTS = [
+    {
+      title: "Expired reset token is rejected",
+      preconditions: "A password reset token exists and has expired.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the expired reset token with a new password", expectedResult: "The reset is rejected with an expired-token error" }]),
+      testData: "An expired reset token.",
+      expectedSummary: "Expired tokens cannot be used to reset a password.",
+      priority: "P2",
+      tags: ["zyra"],
+    },
+    {
+      title: "Reused reset token is rejected",
+      preconditions: "A password reset token has already been used once.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Submit the already-used reset token again", expectedResult: "The reset is rejected because the token was already consumed" }]),
+      testData: "A reset token that was already redeemed once.",
+      expectedSummary: "A reset token cannot be reused after consumption.",
+      priority: "P2",
+      tags: ["zyra"],
+    },
+  ];
+
+  test("ZCC-B-01 confirming a gap-analysis offer stages test cases via the retry, without writing to testcases", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai retry");
+    const before = liveCaseCount();
+
+    // Turn 1: gap analysis, ending in an offer. Routes `answer` correctly (nothing to apply yet).
+    ai.queueReply({ reply: GAP_OFFER_REPLY, reasoningSummary: "Reviewed existing coverage and found 2 gaps.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn1 = await sendMessage(sessionId, "Review my password-reset test cases and identify coverage gaps.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    // Turn 2: "yes" — first response reproduces the exact reported bug (the model answers again
+    // without emitting any operation despite the confirmation), which is what the retry exists for.
+    ai.queueReply({ reply: "Sure — let me know and I can generate those for you.", reasoningSummary: "Acknowledged.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    // The retry's router response: routes to create now that the hint names the unresolved offer.
+    ai.queueReply({ reply: "", reasoningSummary: "Confirmed the offer; generating test cases for the identified gaps.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 2, exhaustive: false });
+    // The generation call zyraHandleChatCreate makes once routed to create.
+    ai.queueReply({ drafts: DRAFTS });
+    const turn2 = await sendMessage(sessionId, "yes");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    expect(ai.requests.length, "router (turn 1) + router (turn 2) + retry router + generation").toBe(4);
+
+    const review = reviewRequestFor(sessionId);
+    expect(review, "the confirmed generation should stage a review request").toBeTruthy();
+    expect(review!.taskStatus).toBe("in_review");
+    expect(review!.generatedCount).toBe(2);
+    expect(review!.payloadLength, "both drafts should be staged in one batch").toBe(2);
+
+    // The exact invariant three prior fixes needed and could never prove: staged, not created.
+    expect(liveCaseCount(), "confirming generation must stage, never write testcases directly").toBe(before);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(session.status()).toBe(200);
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+
+    expect(
+      String(lastAssistant.reasoningSummary || ""),
+      "the retry must leave an observable marker instead of silently succeeding or silently failing",
+    ).toContain("[confirmation-retry:fired]");
+    expect(String(lastAssistant.content || "")).toContain("staged for your review");
+    expect(String(lastAssistant.content || ""), "the reply must not claim permanence for a staged batch").not.toContain("Sorry! Nothing was saved");
+
+    const testcases = lastAssistant.testcases as Array<Record<string, unknown>>;
+    expect(testcases).toHaveLength(2);
+    for (const tc of testcases) {
+      expect(tc.id, "a staged row must not carry a real id").toBeFalsy();
+      expect(String(tc.action || "")).toBe("proposed-create");
+    }
+  });
+
+  test("ZCC-B-02 an unrelated 'yes' with no prior offer or proposal never triggers the retry", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai no antecedent");
+
+    // No offer, no proposal — just an ordinary answer with nothing pending.
+    ai.queueReply({ reply: "This project currently has 12 test cases covering login.", reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn1 = await sendMessage(sessionId, "How many test cases cover login?");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    // A bare "yes" with nothing to confirm. If the retry over-fired, it would consume a second
+    // queued reply here; queuing only one for this turn makes an over-fire fail loudly (the fake
+    // server falls back to its "no scripted response was queued" reply, which routes to `answer`
+    // with zero operations, so an over-fire would surface as an extra request rather than a subtle
+    // false pass).
+    ai.queueReply({ reply: "Sorry, I'm not sure what you'd like me to confirm.", reasoningSummary: "No pending offer or proposal in context.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn2 = await sendMessage(sessionId, "yes");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    expect(ai.requests.length, "no retry should fire with nothing pending to confirm").toBe(2);
+    expect(reviewRequestFor(sessionId)).toBeNull();
+  });
+
+  test("ZCC-B-03 an archive op targeting a testcase that no longer exists is named, not silently dropped", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai archive gap");
+
+    const kept = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: `E2E ZCC Archive Kept ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(kept.status()).toBe(201);
+    const keptExternalId = (await kept.json()).externalId as string;
+
+    // One op targets a real testcase, the other names an external id that was never created — the
+    // exact shape applyZyraChatOperations used to drop with no activity entry at all (see the
+    // comment at its `if (!found) continue;` — this test pins the fix, item 3 of this change).
+    ai.queueReply({
+      reply: "Archiving the confirmed test case and the one you mentioned.",
+      reasoningSummary: "Archiving 2 confirmed test cases.",
+      action: "archive",
+      actionType: "archive",
+      operations: [
+        { type: "archive", externalId: keptExternalId, reason: "confirmed" },
+        { type: "archive", externalId: "TC-DOES-NOT-EXIST", reason: "confirmed" },
+      ],
+      testcases: [],
+    });
+    const turn = await sendMessage(sessionId, "archive both of those, please");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const activity = (assistant.activity as Array<{ title?: string; detail?: string }>) ?? [];
+
+    expect(
+      activity.some((a) => /could not archive/i.test(String(a.title || "")) && /TC-DOES-NOT-EXIST/.test(String(a.detail || ""))),
+      `the dropped op must be named in activity — got: ${JSON.stringify(activity)}`,
+    ).toBe(true);
+    // The reply itself must surface the reason too (reconcileZyraReply's partial-count branch pulls
+    // it straight from activity), not just the activity log a user may never open.
+    expect(String(assistant.content || "")).toContain("1 of 2");
+  });
+
+  /*
+   * fromLastPlan — Basecamp-adjacent, found by architecture audit rather than a report. A `create` op
+   * has been staged-not-written since the 2026-09-03 review-panel change, so `applied.testcases[].id`
+   * is always null for one; the code that recorded `zyra_chat_sessions.last_completed_plan` still
+   * tried to read a real id off that array, so the field stayed permanently empty and
+   * `move_to_suite ... fromLastPlan=true` — the system prompt's own documented way to handle "save
+   * them to <suite>" right after a generation — always resolved to zero targets. These two tests pin
+   * both halves of the fix: re-pointing a still-PENDING batch's suite (patches the draft directly,
+   * never auto-saves it), and moving an ALREADY-SAVED batch for real (using the id zyraSaveAttempt
+   * now records at the moment it first becomes real).
+   */
+  test("ZCC-B-04 'save them to <suite>' right after a generation re-points the still-pending draft, never auto-saving it", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai fromLastPlan pending");
+    const before = liveCaseCount();
+
+    // Turn 1: generate one test case, no suite named — lands as an unfiled, unsaved draft.
+    ai.queueReply({ reply: "", reasoningSummary: "Generating a checkout test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout completes with a valid card",
+        preconditions: "The cart has at least one item.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Complete checkout with a valid card", expectedResult: "The order confirmation page is shown" }]),
+        testData: "",
+        expectedSummary: "Checkout succeeds with a valid card.",
+        priority: "P2",
+        tags: ["zyra"],
+      }],
+    });
+    const turn1 = await sendMessage(sessionId, "Generate 1 test case for checkout.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+    expect(liveCaseCount(), "a staged create must not write to testcases").toBe(before);
+
+    const reviewRow = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    expect(reviewRow).toBeTruthy();
+
+    // Turn 2: "save them to the Checkout suite" — the batch from turn 1 is still only staged, so
+    // there is no real row anywhere for a DB move to act on. A move_to_suite op with fromLastPlan=true
+    // needs no generation call, only the router.
+    ai.queueReply({
+      reply: "Filing the checkout test case into the Checkout suite.",
+      reasoningSummary: "Confirmed the suite for the last generated batch.",
+      action: "suite",
+      actionType: "suite",
+      operations: [{ type: "move_to_suite", suiteName: "Checkout", fromLastPlan: true, reason: "user asked to file the last batch" }],
+      testcases: [],
+    });
+    const turn2 = await sendMessage(sessionId, "save them to the Checkout suite");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+    expect(ai.requests.length, "router (turn 1) + generation (turn 1) + router (turn 2, no generation for a move)").toBe(3);
+
+    // Still nothing written to testcases — re-pointing a pending draft's suite must never auto-save it.
+    expect(liveCaseCount(), "fromLastPlan against a pending batch must only patch the draft, never save it").toBe(before);
+
+    const suiteId = scalar(`SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = 'Checkout';`);
+    expect(suiteId, "move_to_suite auto-creates the named suite even for a pending-draft match").toBeTruthy();
+
+    const payload = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(reviewRow)};`));
+    expect(payload).toHaveLength(1);
+    expect(payload[0].draft.suiteId, "the pending draft itself must be repointed at the new suite").toBe(suiteId);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    expect(String(lastAssistant.content || ""), "the reply must not claim permanence for a still-unsaved draft").not.toContain("Nothing was saved");
+    expect(String(lastAssistant.content || "")).toContain("staged for your review");
+    // A suite touched ONLY via the pending-draft patch must never appear in the DB-truth "Moved to
+    // suites (actual)" footer — moveTargetIds never got this suite's id (nothing was actually moved
+    // in the DB), so a naive "register every targeted suite" would read "Checkout: 0 (none matched)"
+    // directly next to the true "staged for your review" line above: a self-contradiction of exactly
+    // the shape the moveBreakdown footer exists to prevent, just reintroduced from a different angle.
+    expect(String(lastAssistant.content || ""), "a pending-only match must not also claim 'none matched' in the moveBreakdown footer").not.toContain("none matched");
+    expect(String(lastAssistant.content || "")).not.toContain("Moved to suites (actual)");
+
+    // Prove the whole point of patching rather than ignoring: Save now actually lands the row in
+    // the suite the follow-up message asked for, with no suiteId passed in the save call itself.
+    const saveRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/ai/generation-history/${reviewRow}/save`, {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(saveRes.status(), `saving the repointed draft — ${await saveRes.text()}`).toBeLessThan(300);
+    const saveBody = await saveRes.json();
+    expect(saveBody.savedCount).toBe(1);
+    expect(liveCaseCount()).toBe(before + 1);
+    const savedSuiteId = scalar(`SELECT suite_id::text FROM testcases WHERE id = ${literal(String(saveBody.testcases[0].id))};`);
+    expect(savedSuiteId, "the saved row must land in the suite the pending draft was repointed to").toBe(suiteId);
+  });
+
+  test("ZCC-B-05 'move them to <suite>' after the batch was already saved does a real move, using the id recorded at save time", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai fromLastPlan saved");
+    const before = liveCaseCount();
+
+    ai.queueReply({ reply: "", reasoningSummary: "Generating a refund test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: "Refund is issued for a cancelled order",
+        preconditions: "An order was placed and paid for.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Cancel the order and process a refund", expectedResult: "The refund is issued to the original payment method" }]),
+        testData: "",
+        expectedSummary: "A cancelled order is refunded.",
+        priority: "P2",
+        tags: ["zyra"],
+      }],
+    });
+    const turn1 = await sendMessage(sessionId, "Generate 1 test case for order refunds.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    const reviewRow = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    const saveRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/ai/generation-history/${reviewRow}/save`, {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBeLessThan(300);
+    expect(liveCaseCount()).toBe(before + 1);
+    const savedId = String((await saveRes.json()).testcases[0].id);
+
+    // zyraSaveAttempt is where a create's id first becomes real — this is what the fix records into
+    // last_completed_plan, and what fromLastPlan needs to find on the next turn.
+    const plan = JSON.parse(scalar(`SELECT coalesce(last_completed_plan::text, '{}') FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`));
+    expect(plan.testcaseIds, "zyraSaveAttempt must record the real id once the draft is actually saved").toContain(savedId);
+    expect(plan.pendingReviewRequestIds || [], "a fully-saved batch must drop out of the pending pointer").not.toContain(reviewRow);
+
+    // Turn 2: now ask to move the (already saved) last batch — fromLastPlan must resolve against
+    // the real id recorded above; there is no pending draft left to patch.
+    ai.queueReply({
+      reply: "Moving the refund test case into the Payments suite.",
+      reasoningSummary: "Moving the last saved batch.",
+      action: "suite",
+      actionType: "suite",
+      operations: [{ type: "move_to_suite", suiteName: "Payments", fromLastPlan: true, reason: "user asked to file the last batch" }],
+      testcases: [],
+    });
+    const turn2 = await sendMessage(sessionId, "move that to the Payments suite");
+    expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
+
+    const suiteId = scalar(`SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = 'Payments';`);
+    const movedSuiteId = scalar(`SELECT suite_id::text FROM testcases WHERE id = ${literal(savedId)};`);
+    expect(movedSuiteId, "a real move against an already-saved batch must actually update the row").toBe(suiteId);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+    expect(String(lastAssistant.content || "")).toContain("Moved to suites (actual)");
+    expect(String(lastAssistant.content || "")).toContain("Payments: 1");
   });
 });

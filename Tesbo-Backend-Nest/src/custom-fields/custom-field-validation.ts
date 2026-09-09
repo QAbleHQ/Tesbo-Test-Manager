@@ -94,7 +94,7 @@ export function validateConfigShape(fieldType: FieldType, rawConfig: unknown): F
             throw new BadRequestException({ field: "maxSelected", message: "maxSelected must be between 1 and the number of options" });
           }
           if (config.minSelected != null && config.minSelected > config.maxSelected) {
-            throw new BadRequestException({ field: "minSelected", message: "minSelected cannot exceed maxSelected" });
+            throw new BadRequestException({ field: "minSelected", message: "Minimum selections cannot be greater than maximum selections." });
           }
         }
         if (config.defaultOptionIds != null) {

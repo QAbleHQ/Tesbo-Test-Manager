@@ -283,3 +283,14 @@ export function validateEnvironmentUrl(value: string, existing: { url: string }[
   }
   return "";
 }
+
+// Mirrors LegacyController.validateScheduleRunAt (Tesbo-Backend-Nest) — a datetime-local value has
+// no timezone offset of its own, so both sides parse it as the browser's/server's local wall-clock
+// time and compare it to "now" as an instant, which is timezone-safe either way.
+export function validateScheduleRunAt(value: string): string {
+  if (!value) return "Run At is required";
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return "Run At must be a valid date and time";
+  if (ms <= Date.now()) return "Run At must be in the future";
+  return "";
+}

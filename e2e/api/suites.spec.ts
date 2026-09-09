@@ -327,4 +327,43 @@ test.describe("recursive descendant rollup (parent suites show their sub-suites'
       expect(await nonexistent.json()).toEqual([]);
     }
   });
+
+  test("pagination across a recursively-expanded parent has no duplicates and no gaps", async ({ request }) => {
+    // The WHERE-clause change is the only thing that differs from the pre-fix query — ORDER BY
+    // created_at DESC, id DESC and LIMIT/OFFSET are untouched — but this proves that composition
+    // rather than assuming it, since a parent suite can now legitimately span far more rows per
+    // page than direct-only matching ever produced.
+    const stamp = Date.now();
+    const parent = await createSuite(request, `E2E Pagination Parent ${stamp}`);
+    const child = await createSuite(request, `E2E Pagination Child ${stamp}`, parent.id);
+    const cases = [];
+    for (let i = 0; i < 5; i++) {
+      // Alternate direct/descendant so both contribute rows to the same paginated walk.
+      cases.push(await createCase(request, `E2E Pagination Case ${stamp} ${i}`, i % 2 === 0 ? parent.id : child.id));
+    }
+
+    try {
+      const pageSize = 2;
+      const seen: string[] = [];
+      for (let offset = 0; offset < cases.length + pageSize; offset += pageSize) {
+        const res = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+          params: { suiteId: parent.id, includeDescendants: "true", limit: pageSize, offset },
+        });
+        const page = (await res.json()).map((tc: { id: string }) => tc.id);
+        if (!page.length) break;
+        seen.push(...page);
+      }
+      expect(new Set(seen), "every case must be reachable exactly once across pages").toEqual(
+        new Set(cases.map((c) => c.id)),
+      );
+      expect(seen.length, "no row should be repeated across two pages").toBe(cases.length);
+    } finally {
+      for (const c of cases) {
+        await request.delete(`/api/projects/${ctx.projectId}/testcases/${c.id}`, { failOnStatusCode: false });
+      }
+      for (const s of [child, parent]) {
+        await request.delete(`/api/suites/${s.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
 });

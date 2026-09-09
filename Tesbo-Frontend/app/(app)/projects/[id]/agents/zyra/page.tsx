@@ -26,6 +26,7 @@ import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, ty
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
+import { ZyraCitationsList } from "@/components/agents/ZyraCitations";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -161,12 +162,13 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
                 <td className="max-w-[220px] px-3 py-3 text-[11px] leading-snug text-[var(--muted)]">
                   <div className="line-clamp-2">{firstStepPreview(row.stepsJson)}</div>
                 </td>
-                <td className="px-3 py-3">
-                  <div className="flex flex-col gap-0.5">
+                <td className="max-w-[220px] px-3 py-3">
+                  <div className="flex flex-col gap-1">
                     <span className={`text-[11px] font-semibold capitalize ${actionColor(row.action)}`}>
                       {row.action || "suggested"}
                     </span>
                     <span className="text-[10px] text-[var(--muted)]">AI · Zyra chat</span>
+                    <ZyraCitationsList refs={row.sourceRefs} />
                   </div>
                 </td>
               </tr>
