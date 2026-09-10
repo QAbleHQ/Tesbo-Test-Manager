@@ -61,6 +61,59 @@ test.describe("bug CRUD", () => {
     expect(getAfterDeleteRes.status()).toBe(404);
   });
 
+  /*
+   * Every bug gets a stable per-project key (`<KEY>-BUG-<n>`), the same scheme test cases already
+   * have (`<KEY>-TC-<n>`) — so "Bug Key" in the Test Run / Test Case Detail / Bugs page UI always
+   * has something real to show, even for a bug that was never linked to Jira/Linear and so has no
+   * integrationIssueKey at all.
+   */
+  test("a created bug gets a per-project sequential external id, even with no external tracker", async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug External Id ${Date.now()}`, severity: "Medium" },
+      })
+    ).json();
+    try {
+      expect(created.externalId).toMatch(/^.+-BUG-\d+$/);
+      expect(created.integrationIssueKey).toBeNull();
+
+      // Persisted and returned consistently by both single-bug and list reads, not just at
+      // creation time.
+      const getRes = await request.get(`/api/bugs/${created.id}`);
+      expect((await getRes.json()).externalId).toBe(created.externalId);
+
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/bugs`);
+      const listed = (await listRes.json()).find((b: { id: string }) => b.id === created.id);
+      expect(listed.externalId).toBe(created.externalId);
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("two bugs created back-to-back in the same project get distinct, increasing sequential ids", async ({ request }) => {
+    const first = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Seq A ${Date.now()}`, severity: "Low" },
+      })
+    ).json();
+    const second = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Seq B ${Date.now()}`, severity: "Low" },
+      })
+    ).json();
+    try {
+      const prefixOf = (externalId: string) => externalId.replace(/-\d+$/, "");
+      const seqOf = (externalId: string) => Number(externalId.match(/(\d+)$/)?.[1]);
+
+      expect(prefixOf(second.externalId)).toBe(prefixOf(first.externalId));
+      expect(second.externalId).not.toBe(first.externalId);
+      expect(seqOf(second.externalId)).toBeGreaterThan(seqOf(first.externalId));
+    } finally {
+      await request.delete(`/api/bugs/${first.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/bugs/${second.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("creating a bug with a link populates it, and addBugLink/removeBugLink manage further links", { tag: '@tesbo.testId("TES-TC-100")' }, async ({
     request,
   }) => {

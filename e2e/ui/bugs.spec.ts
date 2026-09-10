@@ -1063,3 +1063,59 @@ test.describe("bugs — header status counts", () => {
     }
   });
 });
+
+/*
+ * A bug never linked to Jira/Linear has no integrationIssueKey, and until now "Bug Key" had
+ * nothing else to show for it anywhere in the app (Test Run, Test Case Detail, and this page all
+ * left it blank). Every bug now gets its own per-project sequential id (`<KEY>-BUG-<n>`, the same
+ * scheme test cases already have), and these three surfaces — board card, list row, details modal
+ * — fall back to it.
+ */
+test.describe("bug external id (Bug Key fallback)", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-38 the board card, list row, and details modal all show the bug's own external id when it has no tracker key", async ({ page }) => {
+    const title = `E2E Bug Key Fallback ${uniqueSuffix()}`;
+    // Not the createBug() helper above — it deliberately returns only { id, title } for its many
+    // other callers here, and this test needs the full record (integrationIssueKey, externalId).
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title, severity: "Medium" } })
+    ).json();
+    expect(bug.integrationIssueKey, "fixture bug must have no tracker key for this test to mean anything").toBeFalsy();
+    expect(bug.externalId).toMatch(/^.+-BUG-\d+$/);
+
+    await page.goto(`/projects/${projectId}/bugs`);
+
+    // Board view (default) — the card shows the id above the title.
+    await expect(page.getByText(bug.externalId, { exact: true }).first()).toBeVisible();
+
+    // List view — same id, in the title cell.
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await expect(row.getByText(bug.externalId, { exact: true })).toBeVisible();
+
+    // Details modal — a dedicated "Bug Key" line, not folded into the Jira/Linear link section
+    // (which stays hidden here since this bug has no externalUrl).
+    await row.click();
+    await expect(page.getByText(bug.externalId, { exact: true })).toBeVisible();
+  });
+});

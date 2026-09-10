@@ -349,67 +349,85 @@ test.describe("account screen and password reset (UI)", () => {
   });
   // ─── The profile card ──────────────────────────────────────────────────────
 
-  test("ACU-11 the profile shows the name captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
+  test("ACU-11 the profile shows the first name and surname captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
     /*
      * Basecamp 10212498688 — "Profile page should have user name and surname and mobile number fields
      * fetched during sign up". The Profile card rendered nothing but the email.
      *
-     * The name half was a pure display gap: /signup collects First name and Last name, sends them as
-     * one `name`, and GET /me has always returned it — the screen just never read it. Asserted against
-     * the value the API reports rather than a hard-coded string, so this stays true for any tenant.
-     * The name field is now an editable input (see ACU-13/ACU-14 below for the PATCH round trip), so
-     * this reads its `value` rather than text content.
+     * /signup collects First name and Last name separately, sends them as one `name`, and GET /me now
+     * splits that stored value back into firstName/lastName (auth.service.ts `me()`) so the screen can
+     * show the two fields signup actually collected instead of one merged string. Asserted against the
+     * value the API reports rather than a hard-coded string, so this stays true for any tenant. Both
+     * are editable inputs (see ACU-13/ACU-14 below for the PATCH round trip), so this reads `value`
+     * rather than text content.
      *
-     * The mobile number is deliberately NOT asserted: signup never collects one, there is no column
-     * and no value to fetch, so there is nothing to display. That half is a separate feature and is
-     * recorded on the card for Specification — not silently rendered as an empty row.
+     * The mobile number is asserted only for visibility, not a specific value: signup collects it as
+     * optional, so this tenant's user may legitimately have none on file.
      */
     const page = await openAccount(browser);
 
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; email?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; email?: string | null })
+        : null;
     });
     expect(reported, "GET /me did not answer").not.toBeNull();
-    const expectedName = (reported!.name ?? "").trim();
-    expect(expectedName, "this tenant's user has no name stored, so the test proves nothing").not.toBe("");
+    const expectedFirstName = (reported!.firstName ?? "").trim();
+    const expectedLastName = (reported!.lastName ?? "").trim();
+    expect(expectedFirstName, "this tenant's user has no first name stored, so the test proves nothing").not.toBe("");
+    expect(expectedLastName, "this tenant's user has no last name stored, so the test proves nothing").not.toBe("");
 
-    // The name is on the screen, and labelled — not just present somewhere in the markup.
-    const nameValue = page.locator("#account-name");
-    await expect(nameValue, "the profile card shows no name field").toBeVisible();
-    await expect(nameValue).toHaveValue(expectedName);
+    // First name and last name are on the screen, each labelled — not just present somewhere in the markup.
+    const firstNameValue = page.locator("#account-first-name");
+    await expect(firstNameValue, "the profile card shows no first name field").toBeVisible();
+    await expect(firstNameValue).toHaveValue(expectedFirstName);
+
+    const lastNameValue = page.locator("#account-last-name");
+    await expect(lastNameValue, "the profile card shows no last name field").toBeVisible();
+    await expect(lastNameValue).toHaveValue(expectedLastName);
 
     // The email it used to show alone is still there.
     await expect(page.locator("#account-email")).toHaveText((reported!.email ?? "").trim());
+
+    // Mobile number now has a real column and a field on the card — whatever this tenant's value is
+    // (signup collects it as optional, so it may legitimately be unset), the field itself must render.
+    await expect(page.locator("#account-mobile-number"), "the profile card shows no mobile number field").toBeVisible();
   });
 
   // ─── Editing the profile ────────────────────────────────────────────────────
 
-  test("ACU-21 the name field is read-only until its pencil button is clicked", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+  test("ACU-21 the first/last name fields are read-only until the pencil button is clicked", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
     const page = await openAccount(browser);
-    const nameInput = page.locator("#account-name");
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
     const editButton = page.getByRole("button", { name: "Edit name" });
 
-    await expect(nameInput).toHaveAttribute("readonly", "");
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
     await expect(editButton).toBeVisible();
 
     await editButton.click();
 
-    await expect(nameInput).not.toHaveAttribute("readonly", "");
-    await expect(nameInput).toBeFocused();
+    // Both unlock together — they're saved as a pair, not independently.
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(firstNameInput).toBeFocused();
     // The pencil is only for entering edit mode — once editing, it has nothing left to do.
     await expect(editButton).toHaveCount(0);
   });
 
-  test("ACU-13 the name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
+  test("ACU-13 the first name, last name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
     const page = await openAccount(browser);
-    const newName = `E2E Updated Name ${Date.now()}`;
+    const newFirstName = `E2EFirst${Date.now()}`;
+    const newLastName = `E2ELast${Date.now()}`;
     // Typed with the formatting a real user would use — the screen strips it before sending, so the
     // value that actually persists (asserted below) is the normalized "+14155550132".
     const typedMobileNumber = "+1 415 555 0132";
     const normalizedMobileNumber = "+14155550132";
 
-    const nameInput = page.locator("#account-name");
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
     const mobileInput = page.locator("#account-mobile-number");
     const saveButton = page.getByRole("button", { name: "Save profile" });
 
@@ -419,12 +437,13 @@ test.describe("account screen and password reset (UI)", () => {
     // Nothing changed yet, so saving is disabled — this must not be a no-op button on load.
     await expect(saveButton).toBeDisabled();
 
-    // Name reads read-only until its pencil button is clicked.
-    await expect(nameInput).toHaveAttribute("readonly", "");
+    // Names read read-only until the pencil button is clicked.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
     await page.getByRole("button", { name: "Edit name" }).click();
-    await expect(nameInput).not.toHaveAttribute("readonly", "");
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
 
-    await nameInput.fill(newName);
+    await firstNameInput.fill(newFirstName);
+    await lastNameInput.fill(newLastName);
     await mobileInput.fill(typedMobileNumber);
     await expect(saveButton).toBeEnabled();
     await saveButton.click();
@@ -435,34 +454,45 @@ test.describe("account screen and password reset (UI)", () => {
     // formatting, since that's what the API stores and the CHECK constraint on users.mobile_number
     // requires.
     await page.reload();
-    await expect(page.locator("#account-name")).toHaveValue(newName);
+    await expect(page.locator("#account-first-name")).toHaveValue(newFirstName);
+    await expect(page.locator("#account-last-name")).toHaveValue(newLastName);
     await expect(page.locator("#account-mobile-number")).toHaveValue(normalizedMobileNumber);
 
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; mobileNumber?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
     });
-    expect(reported?.name).toBe(newName);
+    expect(reported?.firstName).toBe(newFirstName);
+    expect(reported?.lastName).toBe(newLastName);
     expect(reported?.mobileNumber).toBe(normalizedMobileNumber);
   });
 
-  test("ACU-14 an empty name or an out-of-range mobile number is rejected inline", { tag: '@tesbo.testId("TES-TC-1401")' }, async ({ browser }) => {
+  test("ACU-14 an empty first/last name or an out-of-range mobile number is rejected inline", { tag: '@tesbo.testId("TES-TC-1401")' }, async ({ browser }) => {
     const page = await openAccount(browser);
 
-    const nameInput = page.locator("#account-name");
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
     const mobileInput = page.locator("#account-mobile-number");
     const saveButton = page.getByRole("button", { name: "Save profile" });
 
     await page.getByRole("button", { name: "Edit name" }).click();
 
-    // Empty / whitespace-only name.
-    await nameInput.fill("   ");
+    // Empty / whitespace-only first name.
+    await firstNameInput.fill("   ");
     await expect(saveButton).toBeEnabled();
     await saveButton.click();
-    await expect(page.getByText("Name cannot be empty")).toBeVisible();
+    await expect(page.getByText("First name is required")).toBeVisible();
+
+    // Empty / whitespace-only last name.
+    await firstNameInput.fill("E2E Valid First");
+    await lastNameInput.fill("   ");
+    await saveButton.click();
+    await expect(page.getByText("Last name is required")).toBeVisible();
 
     // Too few digits to be a real number — rejected rather than silently stored.
-    await nameInput.fill("E2E Valid Name");
+    await lastNameInput.fill("E2E Valid Last");
     await mobileInput.fill("12345");
     await saveButton.click();
     await expect(page.getByText(/mobile number/i)).toBeVisible();
@@ -476,9 +506,12 @@ test.describe("account screen and password reset (UI)", () => {
     // None of the rejected attempts reached the server: GET /me still reports the original values.
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; mobileNumber?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
     });
-    expect(reported?.name).not.toBe("");
+    expect(reported?.firstName).not.toBe("");
+    expect(reported?.lastName).not.toBe("");
     expect(reported?.mobileNumber ?? "").not.toBe("14155550132");
   });
 

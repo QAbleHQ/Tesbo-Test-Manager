@@ -2161,40 +2161,39 @@ export default function TestCasesPage() {
                                       <SeverityBadge severity={bug.severity} />
                                     </div>
                                   </div>
-                                  {(bug.integrationIssueKey || bug.externalUrl) && (
-                                    <div className="grid gap-3 sm:grid-cols-2">
-                                      {bug.integrationIssueKey && (
-                                        <div>
-                                          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug Key</label>
-                                          {bug.externalUrl ? (
-                                            <a
-                                              href={bug.externalUrl}
-                                              target="_blank"
-                                              rel="noopener noreferrer"
-                                              className="break-all text-sm text-[var(--accent-light)] hover:underline"
-                                            >
-                                              {bug.integrationIssueKey}
-                                            </a>
-                                          ) : (
-                                            <p className="text-sm text-[var(--foreground)]">{bug.integrationIssueKey}</p>
-                                          )}
-                                        </div>
-                                      )}
-                                      {bug.externalUrl && (
-                                        <div>
-                                          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug URL</label>
-                                          <a
-                                            href={bug.externalUrl}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="break-all text-sm text-[var(--accent-light)] hover:underline"
-                                          >
-                                            {bug.externalUrl}
-                                          </a>
-                                        </div>
+                                  <div className="grid gap-3 sm:grid-cols-2">
+                                    <div>
+                                      {/* Falls back to the bug's own per-project id (e.g. "E2E-BUG-14")
+                                          when it was never linked to an external tracker — Bug Key is
+                                          never blank just because a bug has no Jira/Linear ticket. */}
+                                      <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug Key</label>
+                                      {bug.externalUrl ? (
+                                        <a
+                                          href={bug.externalUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="break-all text-sm text-[var(--accent-light)] hover:underline"
+                                        >
+                                          {bug.integrationIssueKey || bug.externalId}
+                                        </a>
+                                      ) : (
+                                        <p className="text-sm text-[var(--foreground)]">{bug.integrationIssueKey || bug.externalId}</p>
                                       )}
                                     </div>
-                                  )}
+                                    {bug.externalUrl && (
+                                      <div>
+                                        <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Bug URL</label>
+                                        <a
+                                          href={bug.externalUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="break-all text-sm text-[var(--accent-light)] hover:underline"
+                                        >
+                                          {bug.externalUrl}
+                                        </a>
+                                      </div>
+                                    )}
+                                  </div>
                                 </div>
                               ))}
                             </div>

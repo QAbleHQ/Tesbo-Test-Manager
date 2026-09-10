@@ -49,10 +49,12 @@ import {
   listPlans,
   getProject,
   toggleTestRunShare,
+  listBugs,
   type TestRunDetail,
   type ExecutionItem,
   type TestCaseListItem,
   type SuiteNode,
+  type BugItem,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer, PriorityBadge, type Priority } from "@/components/ui";
@@ -444,10 +446,11 @@ export default function TestRunDetailPage() {
   const [panelExecution, setPanelExecution] = useState<ExecutionItem | null>(null);
   const [panelStatus, setPanelStatus] = useState("Untested");
   const [panelActualResult, setPanelActualResult] = useState("");
-  const [panelDefectKey, setPanelDefectKey] = useState("");
-  const [panelDefectUrl, setPanelDefectUrl] = useState("");
   const [panelAssigneeId, setPanelAssigneeId] = useState("");
   const [panelSaving, setPanelSaving] = useState(false);
+  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
+     (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
+  const [panelBug, setPanelBug] = useState<BugItem | null>(null);
 
   /* sharing state */
   const [showShare, setShowShare] = useState(false);
@@ -470,7 +473,14 @@ export default function TestRunDetailPage() {
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
 
-  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({ projectId, cycleId, onLogged: load });
+  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
+    projectId,
+    cycleId,
+    onLogged: () => {
+      load();
+      if (panelExecution) loadPanelBug(panelExecution);
+    },
+  });
 
 
   useEffect(() => {
@@ -677,17 +687,24 @@ export default function TestRunDetailPage() {
   }
 
   /* ───── Right-side test case detail panel ───── */
+  function loadPanelBug(exec: ExecutionItem) {
+    listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
+      .then((bugs) => setPanelBug(bugs[0] ?? null))
+      .catch(() => setPanelBug(null));
+  }
+
   function openExecutionPanel(exec: ExecutionItem) {
     setPanelExecution(exec);
     setPanelStatus(exec.status || "Untested");
     setPanelActualResult(exec.actualResult || "");
-    setPanelDefectKey(exec.defectKey || "");
-    setPanelDefectUrl(exec.defectUrl || "");
     setPanelAssigneeId(exec.assigneeId || "");
+    setPanelBug(null);
+    loadPanelBug(exec);
   }
 
   function closeExecutionPanel() {
     setPanelExecution(null);
+    setPanelBug(null);
   }
 
   async function handlePanelSave() {
@@ -697,14 +714,12 @@ export default function TestRunDetailPage() {
       await updateExecution(cycleId, panelExecution.id, {
         status: panelStatus,
         actualResult: panelActualResult,
-        defectKey: panelDefectKey || undefined,
-        defectUrl: panelDefectUrl || undefined,
         assigneeId: panelAssigneeId || null,
       });
       setExecutions((prev) =>
         prev.map((e) =>
           e.id === panelExecution.id
-            ? { ...e, status: panelStatus, actualResult: panelActualResult, defectKey: panelDefectKey, defectUrl: panelDefectUrl, assigneeId: panelAssigneeId || null }
+            ? { ...e, status: panelStatus, actualResult: panelActualResult, assigneeId: panelAssigneeId || null }
             : e
         )
       );
@@ -1927,17 +1942,17 @@ export default function TestRunDetailPage() {
                 />
               </div>
 
-              {/* Defect key/url — Failed only (Basecamp 10221790207). Same rule as the full-page
-                  execute screen: a defect reference on a passing case ends up in the export and the
-                  traceability matrix, so the backend clears it when a non-Failed status is saved. */}
+              {/* Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
+                  rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
+                  not a free-text value typed here, so there's nothing to type into them. */}
               <div className="space-y-3" hidden={panelStatus !== "Failed"}>
                 <div>
-                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Defect Key</label>
-                  <Input type="text" value={panelDefectKey} onChange={(e) => setPanelDefectKey(e.target.value)} placeholder="e.g. PROJ-123" />
+                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Key</label>
+                  <Input type="text" aria-label="Bug Key" value={panelBug?.integrationIssueKey || panelBug?.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
                 </div>
                 <div>
-                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Defect URL</label>
-                  <Input type="url" value={panelDefectUrl} onChange={(e) => setPanelDefectUrl(e.target.value)} placeholder="https://…" />
+                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Title</label>
+                  <Input type="text" aria-label="Bug Title" value={panelBug?.title || ""} readOnly placeholder="Title of the linked bug" />
                 </div>
               </div>
 

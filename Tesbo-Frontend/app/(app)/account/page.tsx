@@ -10,7 +10,9 @@ import {
   normalizeMobileNumber,
   PASSWORD_MAX_LENGTH,
   PASSWORD_RULES_HINT,
+  SIGNUP_NAME_MAX_LENGTH,
   validateMobileNumber,
+  validateName,
   validatePasswordValue,
 } from "@/lib/validation";
 
@@ -18,19 +20,22 @@ export default function AccountPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
   const [mobileNumber, setMobileNumber] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
 
-  const [nameDraft, setNameDraft] = useState("");
+  const [firstNameDraft, setFirstNameDraft] = useState("");
+  const [lastNameDraft, setLastNameDraft] = useState("");
   const [mobileNumberDraft, setMobileNumberDraft] = useState("");
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [profileSuccess, setProfileSuccess] = useState(false);
-  // Name reads as plain, non-editable text until the pencil button is clicked — matches the
-  // read-only-by-default treatment Email already has, instead of an always-open text box.
+  // First/last name read as plain, non-editable text until the pencil button is clicked — matches
+  // the read-only-by-default treatment Email already has, instead of an always-open text box. They
+  // share one edit toggle since they're saved together as a pair, not independently.
   const [isEditingName, setIsEditingName] = useState(false);
-  const nameInputRef = useRef<HTMLInputElement>(null);
+  const firstNameInputRef = useRef<HTMLInputElement>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -48,23 +53,27 @@ export default function AccountPage() {
       return;
     }
     setEmail(me.email ?? "");
-    const trimmedName = (me.name ?? "").trim();
-    setName(trimmedName);
-    setNameDraft(trimmedName);
-    setMobileNumber(me.mobileNumber ?? "");
-    setMobileNumberDraft(me.mobileNumber ?? "");
+    const trimmedFirstName = (me.firstName ?? "").trim();
+    const trimmedLastName = (me.lastName ?? "").trim();
+    setFirstName(trimmedFirstName);
+    setFirstNameDraft(trimmedFirstName);
+    setLastName(trimmedLastName);
+    setLastNameDraft(trimmedLastName);
+    setMobileNumber((me.mobileNumber ?? "").trim());
+    setMobileNumberDraft((me.mobileNumber ?? "").trim());
     setHasPassword(Boolean(me.hasPassword));
     setLoading(false);
   }, [router]);
 
   useEffect(() => { void load(); }, [load]);
 
-  const profileDirty = nameDraft.trim() !== name || mobileNumberDraft.trim() !== mobileNumber;
+  const profileDirty =
+    firstNameDraft.trim() !== firstName || lastNameDraft.trim() !== lastName || mobileNumberDraft.trim() !== mobileNumber;
 
   function startEditingName() {
     setIsEditingName(true);
     // readOnly doesn't block focusing (only `disabled` would), so this can run immediately.
-    nameInputRef.current?.focus();
+    firstNameInputRef.current?.focus();
   }
 
   async function handleProfileSubmit(e: React.FormEvent) {
@@ -72,13 +81,16 @@ export default function AccountPage() {
     setProfileError("");
     setProfileSuccess(false);
 
-    const trimmedName = nameDraft.trim();
-    if (!trimmedName) {
-      setProfileError("Name cannot be empty");
+    const trimmedFirstName = firstNameDraft.trim();
+    const firstNameError = validateName(trimmedFirstName, "First name", SIGNUP_NAME_MAX_LENGTH);
+    if (firstNameError) {
+      setProfileError(firstNameError);
       return;
     }
-    if (trimmedName.length > 255) {
-      setProfileError("Name must be at most 255 characters");
+    const trimmedLastName = lastNameDraft.trim();
+    const lastNameError = validateName(trimmedLastName, "Last name", SIGNUP_NAME_MAX_LENGTH);
+    if (lastNameError) {
+      setProfileError(lastNameError);
       return;
     }
     const mobileError = validateMobileNumber(mobileNumberDraft);
@@ -90,9 +102,15 @@ export default function AccountPage() {
 
     setProfileSaving(true);
     try {
-      const updated = await updateProfile({ name: trimmedName, mobileNumber: normalizedMobileNumber });
-      setName((updated.name ?? "").trim());
-      setNameDraft((updated.name ?? "").trim());
+      const updated = await updateProfile({
+        firstName: trimmedFirstName,
+        lastName: trimmedLastName,
+        mobileNumber: normalizedMobileNumber,
+      });
+      setFirstName((updated.firstName ?? "").trim());
+      setFirstNameDraft((updated.firstName ?? "").trim());
+      setLastName((updated.lastName ?? "").trim());
+      setLastNameDraft((updated.lastName ?? "").trim());
       setMobileNumber(updated.mobileNumber ?? "");
       setMobileNumberDraft(updated.mobileNumber ?? "");
       setProfileSuccess(true);
@@ -197,9 +215,11 @@ export default function AccountPage() {
           <h2 className="text-base font-semibold text-[var(--foreground)]">Profile</h2>
         </div>
         {/*
-          * Basecamp 10212498688 — the profile showed nothing but the email. Signup collects First name
-          * and Last name and GET /me has always returned them as a single `name`; this screen simply
-          * never rendered it. Name and mobile number are now editable through PATCH /api/auth/me.
+          * Basecamp 10212498688 — the profile showed nothing but the email. First name, Last name and
+          * Mobile number are collected at signup, invite registration, and (via the one-time
+          * /complete-profile step) passwordless OTP sign-in — see SignupService, AuthService.me/
+          * completeProfile, and app/complete-profile/page.tsx. They're also editable here afterward
+          * through PATCH /api/auth/me, for anyone who mistyped at signup or wants to update them.
           *
           * No profile picture field here: avatar_url exists on the users table but is intentionally
           * not exposed through this screen — the top-right avatar and every other avatar in the app
@@ -207,22 +227,22 @@ export default function AccountPage() {
           */}
         <form onSubmit={handleProfileSubmit} className="space-y-4">
           <Field>
-            <FieldLabel htmlFor="account-name">Name</FieldLabel>
+            <FieldLabel htmlFor="account-first-name">First name</FieldLabel>
             <div className="flex items-center gap-2">
               <Input
-                id="account-name"
-                ref={nameInputRef}
+                id="account-first-name"
+                ref={firstNameInputRef}
                 type="text"
-                value={nameDraft}
+                value={firstNameDraft}
                 onChange={(e) => {
-                  setNameDraft(e.target.value);
+                  setFirstNameDraft(e.target.value);
                   if (profileError) setProfileError("");
                   setProfileSuccess(false);
                 }}
-                placeholder="Your name"
+                placeholder="Your first name"
                 readOnly={!isEditingName}
                 disabled={profileSaving}
-                maxLength={255}
+                maxLength={SIGNUP_NAME_MAX_LENGTH}
                 className={!isEditingName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
               />
               {!isEditingName && (
@@ -240,6 +260,25 @@ export default function AccountPage() {
                 </Button>
               )}
             </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-last-name">Last name</FieldLabel>
+            <Input
+              id="account-last-name"
+              type="text"
+              value={lastNameDraft}
+              onChange={(e) => {
+                setLastNameDraft(e.target.value);
+                if (profileError) setProfileError("");
+                setProfileSuccess(false);
+              }}
+              placeholder="Your last name"
+              readOnly={!isEditingName}
+              disabled={profileSaving}
+              maxLength={SIGNUP_NAME_MAX_LENGTH}
+              className={!isEditingName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+            />
           </Field>
 
           <Field>

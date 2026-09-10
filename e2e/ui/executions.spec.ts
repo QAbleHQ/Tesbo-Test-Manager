@@ -248,6 +248,70 @@ test.describe("auto bug-filing on Failed", () => {
       await cleanUp(cycle.id, testcase.id);
     }
   });
+
+  /*
+   * Regression: "Yes, link existing" -> search and pick a real Jira/Linear ticket used to be a
+   * dead end. The dialog echoed the picked ticket back as a chip ("PROJ-123 — summary"), but
+   * handleBugSubmit() never read it — it always sent integrationIssueKey: null, silently
+   * discarding the exact ticket the user just searched for and selected.
+   */
+  test("linking an already-logged Jira ticket carries its real key/url into the created bug", async ({ page }) => {
+    const title = `UI Bug Jira Link ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    await page.route(`**/api/projects/${ctx.projectId}/jira/status`, (route) =>
+      route.fulfill({ json: { connected: true } }),
+    );
+    await page.route(`**/api/projects/${ctx.projectId}/linear/status`, (route) =>
+      route.fulfill({ json: { connected: false } }),
+    );
+    await page.route(`**/api/projects/${ctx.projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: {
+          list: [
+            { provider: "JIRA", key: "PROJ-4242", summary: "Login button does nothing", status: "Open", url: "https://e2e.atlassian.net/browse/PROJ-4242" },
+          ],
+        },
+      }),
+    );
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      // Scoped to the row, not page.getByRole("combobox").first() — the page's own "Filter by
+      // priority" combobox sits above the table and is always first in DOM order, so an
+      // unscoped .first() silently grabs that instead of this row's status <select>.
+      await page.getByRole("row", { name: title }).getByRole("combobox").selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.getByRole("button", { name: "Yes, link existing" }).click();
+      // exact: true — "Jira ticket" is otherwise a substring match of "Search Jira tickets…" too.
+      await page.getByRole("button", { name: "Jira ticket", exact: true }).click();
+      await page.getByRole("button", { name: "Search Jira tickets…" }).click();
+
+      await expect(page.getByRole("heading", { name: "Link a ticket" })).toBeVisible();
+      const resultButton = page.getByRole("button", { name: "PROJ-4242 — Login button does nothing" });
+      await expect(resultButton).toBeVisible();
+      await resultButton.click();
+
+      await expect(page.getByText("PROJ-4242 — Login button does nothing")).toBeVisible();
+      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const filedBug = bugs.find((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(filedBug, "the bug filed against this execution").toBeTruthy();
+        expect(filedBug.integrationProvider).toBe("JIRA");
+        expect(filedBug.integrationIssueKey).toBe("PROJ-4242");
+        expect(filedBug.externalUrl).toBe("https://e2e.atlassian.net/browse/PROJ-4242");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
 });
 
 /*
@@ -578,7 +642,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
     }
   });
 
-  test("EXE-U-31 defect fields appear only once the case is marked Failed", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
+  test("EXE-U-31 Bug Key/Bug Title fields appear only once the case is marked Failed", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
     const { cycle, testcase } = await setUpCycleWithOneCase(`UI Defect Visibility ${Date.now()}`);
     try {
       // Driven from the full-page execute screen rather than the run's side panel: the panel opens
@@ -591,16 +655,99 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
       await expect(page.getByText(testcase.title).first()).toBeVisible();
 
-      // Opens on Untested: a defect reference would be meaningless, so the fields are not offered.
-      await expect(page.getByText("Defect Key")).toBeHidden();
+      // Opens on Untested: a bug reference would be meaningless, so the fields are not offered.
+      await expect(page.getByText("Bug Key")).toBeHidden();
 
       await page.getByRole("button", { name: "Failed", exact: true }).first().click();
-      await expect(page.getByText("Defect Key")).toBeVisible();
-      await expect(page.getByText("Defect URL")).toBeVisible();
+      await expect(page.getByText("Bug Key")).toBeVisible();
+      await expect(page.getByText("Bug Title")).toBeVisible();
 
       await page.getByRole("button", { name: "Passed", exact: true }).first().click();
-      await expect(page.getByText("Defect Key")).toBeHidden();
+      await expect(page.getByText("Bug Key")).toBeHidden();
     } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Bug Key/Bug Title used to be free-text "Defect Key"/"Defect URL" inputs bound only to
+   * executions.defect_key/defect_url — typing a value there never touched an actual bug, so a bug
+   * filed via "Log bug" on this exact screen never showed up here. They now read the real
+   * bugs/bug_links relationship (the same one the Test Case Detail Bugs tab reads), and are
+   * read-only: there's nothing to type into a field that mirrors an existing bug's own data.
+   */
+  /*
+   * Test-case titles here deliberately avoid the substring "Bug Key" — the run table's row
+   * checkbox carries aria-label="Select {title}", and a title containing that phrase makes
+   * getByLabel("Bug Key") ambiguously match both the checkbox and the actual input (strict-mode
+   * violation). Read-only-ness is asserted purely via the `readonly` attribute rather than by
+   * attempting `.fill()` against the field: Playwright's fill() waits for the target to become
+   * editable, which a readonly input never does, so it hangs for the whole test timeout instead
+   * of failing fast — the attribute check already proves the point.
+   */
+  test("EXE-U-31b Bug Key and Bug Title reflect the actual linked bug, and are read-only", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Linked Bug Fields ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      await api.patch(`/api/cycles/${cycle.id}/executions/${execution.id}`, { data: { status: "Failed" } });
+      const bugTitle = `E2E Execute Linked Bug ${Date.now()}`;
+      await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: bugTitle,
+          integrationProvider: "JIRA",
+          integrationIssueKey: "PROJ-5566",
+          externalUrl: "https://example.atlassian.net/browse/PROJ-5566",
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id, executionId: execution.id }],
+        },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      // The execute page's own listBugs fetch fires after several other requests on this page
+      // (auth, executions, members, jira/linear status) resolve first, so it can genuinely take
+      // longer than the default 10s expect timeout under load — confirmed via a direct network
+      // trace (the same request returned correct data at 933ms standalone, but took over 6s and
+      // under 20s through this page under heavy local load). Longer timeout here, not everywhere.
+      await expect(bugKeyInput).toHaveValue("PROJ-5566", { timeout: 20_000 });
+      await expect(bugTitleInput).toHaveValue(bugTitle, { timeout: 20_000 });
+      await expect(bugKeyInput).toHaveAttribute("readonly", "");
+      await expect(bugTitleInput).toHaveAttribute("readonly", "");
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("EXE-U-31c the run drawer also shows Bug Key/Bug Title, read-only, from the same linked bug", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Drawer Linked Bug Fields ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      await api.patch(`/api/cycles/${cycle.id}/executions/${execution.id}`, { data: { status: "Failed" } });
+      const bugTitle = `E2E Drawer Linked Bug ${Date.now()}`;
+      await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: bugTitle,
+          integrationProvider: "LINEAR",
+          integrationIssueKey: "ENG-7788",
+          externalUrl: "https://linear.app/example/issue/ENG-7788",
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id, executionId: execution.id }],
+        },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      await expect(bugKeyInput).toHaveValue("ENG-7788");
+      await expect(bugTitleInput).toHaveValue(bugTitle);
+      await expect(bugKeyInput).toHaveAttribute("readonly", "");
+      await expect(bugTitleInput).toHaveAttribute("readonly", "");
+    } finally {
+      await api.dispose();
       await cleanUp(cycle.id, testcase.id);
     }
   });

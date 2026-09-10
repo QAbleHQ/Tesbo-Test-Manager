@@ -5,7 +5,7 @@ import type { FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { IconMailOpened } from "@tabler/icons-react";
-import { requestOtp, verifyOtp } from "@/lib/api";
+import { authMe, requestOtp, verifyOtp } from "@/lib/api";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { OtpBoxInput } from "@/components/auth/OtpBoxInput";
 import { AuthLoadingScreen } from "@/components/auth/AuthLoadingScreen";
@@ -34,7 +34,15 @@ function VerifyOtpForm() {
     setLoading(true);
     try {
       await verifyOtp(email, code.trim());
-      router.push(redirectParam || "/onboarding");
+      const destination = redirectParam || "/onboarding";
+      // A brand-new account created by this OTP sign-in (OtpService.findOrCreateUser) has no name on
+      // file yet — detour through the one-time profile step before continuing on to `destination`.
+      const me = await authMe();
+      if (me && !me.profileComplete) {
+        router.push(`/complete-profile?redirect=${encodeURIComponent(destination)}`);
+      } else {
+        router.push(destination);
+      }
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Invalid or expired code");

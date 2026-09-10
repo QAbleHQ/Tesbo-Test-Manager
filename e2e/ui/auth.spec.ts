@@ -9,8 +9,8 @@ test.describe("login", () => {
 
   test("a user can sign in with the seeded smoke-test account", { tag: '@tesbo.testId("TES-TC-625")' }, async ({ page }) => {
     await page.goto("/login");
-    await page.getByLabel("Email", { exact: true }).fill(env.testEmail);
-    await page.getByLabel("Password", { exact: true }).fill(env.testPassword);
+    await page.getByLabel("Email *", { exact: true }).fill(env.testEmail);
+    await page.getByLabel("Password *", { exact: true }).fill(env.testPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await page.waitForURL(/\/projects/);
@@ -19,8 +19,8 @@ test.describe("login", () => {
 
   test("rejects an incorrect password", { tag: '@tesbo.testId("TES-TC-626")' }, async ({ page }) => {
     await page.goto("/login");
-    await page.getByLabel("Email", { exact: true }).fill(env.testEmail);
-    await page.getByLabel("Password", { exact: true }).fill("definitely-wrong-password");
+    await page.getByLabel("Email *", { exact: true }).fill(env.testEmail);
+    await page.getByLabel("Password *", { exact: true }).fill("definitely-wrong-password");
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await expect(page.locator("p[role=\"alert\"]")).toBeVisible();
@@ -29,8 +29,8 @@ test.describe("login", () => {
 
   test("rejects an unregistered email", { tag: '@tesbo.testId("TES-TC-627")' }, async ({ page }) => {
     await page.goto("/login");
-    await page.getByLabel("Email", { exact: true }).fill(disposableEmail("no-such-user"));
-    await page.getByLabel("Password", { exact: true }).fill("whatever-password-123");
+    await page.getByLabel("Email *", { exact: true }).fill(disposableEmail("no-such-user"));
+    await page.getByLabel("Password *", { exact: true }).fill("whatever-password-123");
     await page.getByRole("button", { name: "Sign in" }).click();
 
     // Same generic error as a wrong password — the API must not reveal whether the
@@ -41,7 +41,7 @@ test.describe("login", () => {
 
   test("requires an email before submitting", { tag: '@tesbo.testId("TES-TC-628")' }, async ({ page }) => {
     await page.goto("/login");
-    await page.getByLabel("Password", { exact: true }).fill(env.testPassword);
+    await page.getByLabel("Password *", { exact: true }).fill(env.testPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await expect(page.locator("p[role=\"alert\"]")).toHaveText("Email is required");
@@ -50,7 +50,7 @@ test.describe("login", () => {
 
   test("requires a password before submitting", { tag: '@tesbo.testId("TES-TC-629")' }, async ({ page }) => {
     await page.goto("/login");
-    await page.getByLabel("Email", { exact: true }).fill(env.testEmail);
+    await page.getByLabel("Email *", { exact: true }).fill(env.testEmail);
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await expect(page.locator("p[role=\"alert\"]")).toHaveText("Password is required");
@@ -59,15 +59,15 @@ test.describe("login", () => {
 
   test("switching to Email code mode hides the password field", { tag: '@tesbo.testId("TES-TC-630")' }, async ({ page }) => {
     await page.goto("/login");
-    await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("Password *", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 
     await page.getByRole("button", { name: "Email code" }).click();
-    await expect(page.getByLabel("Password", { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel("Password *", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send login code" })).toBeVisible();
 
     await page.getByRole("button", { name: "Password" }).click();
-    await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("Password *", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
   });
 });
@@ -85,7 +85,7 @@ test.describe("otp login", () => {
   async function requestOtpCode(page: import("@playwright/test").Page, email: string) {
     await page.goto("/login");
     await page.getByRole("button", { name: "Email code" }).click();
-    await page.getByLabel("Email", { exact: true }).fill(email);
+    await page.getByLabel("Email *", { exact: true }).fill(email);
     await page.getByRole("button", { name: "Send login code" }).click();
     await page.waitForURL(/\/verify-otp/);
   }
@@ -160,5 +160,40 @@ test.describe("otp login", () => {
 
     await page.getByRole("link", { name: "Use a different email" }).click();
     await expect(page).toHaveURL(/\/login/);
+  });
+
+  test("inviting a teammate from onboarding creates a real invitation, not a silent membership grant", { tag: '@tesbo.testId("TES-TC-3010")' }, async ({ page }) => {
+    // Regression: the onboarding "Invite your team" step used to call addWorkspaceMember (POST
+    // /api/workspace/members), which upserts the invitee straight into organization_members with no
+    // password and never touches the invitations table or sends email — so "the recipient does not
+    // receive an invitation link" was because none was ever generated. The fix points onboarding at
+    // the same createInvitation endpoint Settings > Members already uses successfully.
+    const ownerEmail = disposableEmail("otp-onboarding-owner");
+    await requestOtpCode(page, ownerEmail);
+    seedOtpCode(ownerEmail, "135791");
+    await fillOtpCode(page, "135791");
+    await page.getByRole("button", { name: "Verify and sign in" }).click();
+
+    await page.waitForURL(/\/onboarding/);
+    await page.getByLabel("Organization / workspace name *").fill(`E2E Onboarding Invite ${Date.now()}`);
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    await expect(page.getByRole("heading", { name: "Invite your team (optional)" })).toBeVisible();
+    const inviteeEmail = disposableEmail("otp-onboarding-invitee");
+    await page.getByLabel("Team member emails").fill(inviteeEmail);
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    await page.waitForURL(/\/projects/);
+
+    const invites = await (await page.request.get(`${env.apiBaseUrl}/api/workspace/invitations`)).json();
+    const created = invites.find((i: any) => i.email === inviteeEmail);
+    expect(created, "onboarding must create a real pending invitation for the invited email").toBeTruthy();
+    expect(created.status).toBe("pending");
+
+    const members = await (await page.request.get(`${env.apiBaseUrl}/api/workspace/members`)).json();
+    expect(
+      members.map((m: any) => m.email),
+      "the invitee must not be granted membership before accepting the invite",
+    ).not.toContain(inviteeEmail);
   });
 });
