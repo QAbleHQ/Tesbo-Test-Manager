@@ -2,6 +2,8 @@ import path from "node:path";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import { dbControlAvailable } from "../utils/psql";
 import {
+  addProjectMember,
+  createBug,
   createPlan,
   createProject,
   deleteProjects,
@@ -229,6 +231,246 @@ test.describe("side navigation — project mode", () => {
     // why the sidebar has no entry of its own for it.
     await page.goto(projectPath("/members"));
     await page.waitForURL(/\/settings\?tab=members$/);
+  });
+});
+
+/*
+ * Root cause of the reported bug ("clicking any sidebar item always shows a loading spinner, even
+ * revisiting a page from seconds ago"): every project page reset loading=true and re-fetched from
+ * scratch on every mount. The fix is a small in-memory cache (Tesbo-Frontend/lib/pageDataCache.ts)
+ * that seeds a revisit's initial render from the last-known data while the page still revalidates
+ * in the background — never a cache-only shortcut. These tests prove the mechanism, not just that
+ * pages "look fast": hanging every API request before a revisit (rather than asserting on timing,
+ * which would be flaky against real network latency) is what actually proves a render came from the
+ * cache and not from a fast round trip.
+ */
+test.describe("side navigation — page cache", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  const projectPath = (suffix = "") => `/projects/${tenant!.projectId}${suffix}`;
+
+  const destinations: { label: string; url: RegExp; heading: RegExp }[] = [
+    { label: "Project home", url: /\/dashboard$/, heading: /Recent test runs/ },
+    { label: "Activity stream", url: /\/activity$/, heading: /Activity/ },
+    { label: "Requirements", url: /\/requirements$/, heading: /Requirement/ },
+    { label: "Test cases", url: /\/testcases$/, heading: /Test case/i },
+    { label: "Test plans", url: /\/plans$/, heading: /[Tt]est [Pp]lan/ },
+    { label: "Runs", url: /\/cycles$/, heading: /[Tt]est [Rr]un/ },
+    { label: "Bugs", url: /\/bugs$/, heading: /Bug/ },
+    { label: "Insights", url: /\/reports$/, heading: /Insight|Report|Health/ },
+    { label: "Agents", url: /\/agents$/, heading: /Agent/ },
+    { label: "Knowledge base", url: /\/knowledge-base$/, heading: /Knowledge/ },
+  ];
+
+  function heading(page: Page, pattern: RegExp) {
+    return page.locator("main, body").first().getByText(pattern).first();
+  }
+
+  /**
+   * Holds every request to this app's API behind a gate instead of aborting or truly hanging
+   * forever: an aborted request would trip a page's own error-handling path (some pages redirect
+   * away on a failed revalidation), and a request that never settles at all permanently occupies
+   * one of the browser's limited per-origin connection slots — across this suite's loop over every
+   * destination, enough of those pile up to starve later iterations' legitimate, unblocked fetches.
+   * Call the returned `release` once the cache-hit assertion has run, so the held requests complete
+   * normally afterward and free their connections before the next iteration.
+   */
+  async function hangApiRequests(page: Page): Promise<() => Promise<void>> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(
+      (url) => url.pathname.startsWith("/api/"),
+      async (route) => {
+        await gate;
+        await route.continue().catch(() => {});
+      },
+    );
+    return async () => {
+      release();
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    };
+  }
+
+  test("NAV-CACHE-01 every sidebar destination renders on a revisit even with the network cut off", async ({ page }) => {
+    await page.goto(projectPath("/dashboard"));
+
+    for (const destination of destinations) {
+      // A different hub to bounce through so leaving-and-returning is a real transition even for
+      // the "Project home" destination itself.
+      const hub = destination.label === "Project home"
+        ? { label: "Activity stream", url: /\/activity$/ }
+        : { label: "Project home", url: /\/dashboard$/ };
+
+      // First visit: a real fetch, warms this page's cache. Generous, like the logout flows
+      // below: this test shares the stack with the rest of the suite, and a real backend round
+      // trip can occasionally run past the default 10s under load.
+      await navLink(page, destination.label).click();
+      await expect(page).toHaveURL(destination.url);
+      await expect(heading(page, destination.heading)).toBeVisible({ timeout: 20_000 });
+
+      await navLink(page, hub.label).click();
+      await page.waitForURL(hub.url);
+
+      const release = await hangApiRequests(page);
+      await navLink(page, destination.label).click();
+      await expect(
+        heading(page, destination.heading),
+        `${destination.label} did not render from its cache with the network cut off`,
+      ).toBeVisible({ timeout: 2000 });
+
+      await release();
+      // Releasing lets every request this iteration hung dispatch for real all at once, competing
+      // with the next iteration's own first-visit fetch for the browser's small per-origin
+      // connection limit. A short settle pause here — not a longer per-assertion timeout — is what
+      // actually fixes that queuing, since the contention is between iterations, not within one.
+      await page.waitForTimeout(500);
+    }
+  });
+
+  test("NAV-CACHE-02 a page with no prior visit still shows the loading state, not a false cache hit", async ({ page }) => {
+    // Each test gets a fresh page (a fresh JS realm), so this page's cache starts empty — delaying
+    // (not hanging) the response proves the loading UI still appears on a true first visit, then
+    // clears once the real fetch resolves. Guards against the cache check being accidentally
+    // truthy for a miss. Gating every /api/ call (not just this page's own) also holds up
+    // AppDataProvider's and ProjectDataProvider's own shell-level fetches, so the loading text that
+    // appears first may be theirs rather than the page's own PageLoader — any of them is valid proof
+    // a loading state rendered instead of a false cache hit. 10s matches this suite's usual expect
+    // timeout rather than a tighter one, since this environment's latency varies with load.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(
+      (url) => url.pathname.startsWith("/api/"),
+      async (route) => {
+        await gate;
+        await route.continue().catch(() => {});
+      },
+    );
+
+    await page.goto(projectPath("/testcases"));
+    // Not getByRole("status"): AppDataProvider — which gates the whole app shell behind auth, above
+    // PageLoader/ProjectDataProvider — renders its own plain `<p>Loading…</p>` with no ARIA role, so
+    // a hung authMe() call surfaces that text, never a "status" role. Matching on visible text is
+    // what actually covers every one of this app's loading states, not just PageLoader's.
+    await expect(page.getByText(/Loading/i).first()).toBeVisible({ timeout: 10_000 });
+
+    release();
+    await expect(heading(page, /Test case/i)).toBeVisible();
+    await page.unrouteAll({ behavior: "ignoreErrors" });
+  });
+
+  test("NAV-CACHE-03 two projects' cached data never mix", async ({ page }) => {
+    const api = await screensApi();
+    let otherId: string | undefined;
+    try {
+      // Project names are capped at 30 characters server-side.
+      const other = await createProject(api, { name: `E2E Iso ${Date.now()}` });
+      otherId = other.id;
+      const onlyThere = await createBug(api, other.id, { title: `Only in ${other.name} ${Date.now()}` });
+
+      // Warm this project's own bugs cache first.
+      await page.goto(projectPath("/bugs"));
+      await expect(heading(page, /Bug/)).toBeVisible();
+
+      // A different project, visited directly (there is no sidebar link between projects).
+      await page.goto(`/projects/${otherId}/bugs`);
+      await expect(page.getByText(onlyThere.title)).toBeVisible();
+
+      // Back to the original project — the other project's bug must never leak into this cache/view.
+      await page.goto(projectPath("/bugs"));
+      await expect(page.getByText(onlyThere.title)).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [otherId]);
+      await api.dispose();
+    }
+  });
+
+  test("NAV-CACHE-04 a revisit shows cached data first, then updates with what changed via the API meanwhile", async ({ page }) => {
+    const api = await screensApi();
+    let bugId: string | undefined;
+    try {
+      await page.goto(projectPath("/bugs"));
+      await expect(heading(page, /Bug/)).toBeVisible();
+
+      await navLink(page, "Project home").click();
+      await page.waitForURL(/\/dashboard$/);
+
+      const bug = await createBug(api, tenant!.projectId);
+      bugId = bug.id;
+
+      // The cache-hit render doesn't have this bug yet; the background revalidation fetch this
+      // effect still fires does, and the list is expected to pick it up without a manual reload.
+      await navLink(page, "Bugs").click();
+      await expect(page.getByText(bug.title)).toBeVisible({ timeout: 5000 });
+    } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false }).catch(() => {});
+      await api.dispose();
+    }
+  });
+
+  test("NAV-CACHE-05 a filtered Activity search is never served from the cached default view", async ({ page }) => {
+    const api = await screensApi();
+    let planId: string | undefined;
+    try {
+      // Warm the default (unfiltered) cache before the plan that the filter will search for exists.
+      await page.goto(projectPath("/activity"));
+      await expect(heading(page, /Activity/)).toBeVisible();
+
+      const plan = await createPlan(api, tenant!.projectId, { name: `E2E Cache Filter ${Date.now()}` });
+      planId = plan.id;
+
+      await page.goto(projectPath("/activity"));
+      await page.getByPlaceholder("Search activity…").fill(plan.name);
+      // Only reachable by an actual filtered fetch — the cached default view was warmed before this
+      // plan existed, so seeing it here proves the filter bypassed that cache.
+      await expect(page.getByText(plan.name)).toBeVisible({ timeout: 5000 });
+    } finally {
+      if (planId) await api.delete(`/api/plans/${planId}`, { failOnStatusCode: false }).catch(() => {});
+      await api.dispose();
+    }
+  });
+
+  test("NAV-CACHE-06 logging out clears the cache so the next session in this tab renders fresh, not a stale hit", async ({ browser }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a disposable user to log out with");
+    const member = await seedWorkspaceMember(tenant!.organizationId, "member");
+    const context = await browser.newContext({ storageState: member.storageStatePath });
+    const page = await context.newPage();
+    try {
+      const owner = await screensApi();
+      try {
+        await addProjectMember(owner, tenant!.projectId, member.userId);
+      } finally {
+        await owner.dispose();
+      }
+
+      await page.goto(projectPath("/dashboard"));
+      await expect(heading(page, /Recent test runs/)).toBeVisible();
+
+      await page.getByRole("button", { name: "Logout" }).click();
+      await page.getByRole("button", { name: "Yes" }).click();
+      await page.waitForURL("**/login", { timeout: 30_000 });
+
+      await page.getByLabel("Email *", { exact: true }).fill(member.email);
+      await page.getByLabel("Password *", { exact: true }).fill(member.password);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await page.waitForURL(/\/projects/, { timeout: 30_000 });
+
+      // Same tab, same JS module realm as before logout — if the cache survived, this would render
+      // instantly from the previous session's warmed entry despite the network being cut off. 10s
+      // matches this suite's usual expect timeout: gating every /api/ call also holds up
+      // AppDataProvider's and ProjectDataProvider's own shell-level fetches, so whichever loading
+      // text appears first is valid proof a loading state rendered, not a stale cache hit.
+      const release = await hangApiRequests(page);
+      await page.goto(projectPath("/dashboard"));
+      // Not getByRole("status"): AppDataProvider — which gates the whole app shell behind auth, above
+    // PageLoader/ProjectDataProvider — renders its own plain `<p>Loading…</p>` with no ARIA role, so
+    // a hung authMe() call surfaces that text, never a "status" role. Matching on visible text is
+    // what actually covers every one of this app's loading states, not just PageLoader's.
+    await expect(page.getByText(/Loading/i).first()).toBeVisible({ timeout: 10_000 });
+      await release();
+    } finally {
+      await context.close();
+      removeWorkspaceMember(member.userId, member.storageStatePath);
+    }
   });
 });
 

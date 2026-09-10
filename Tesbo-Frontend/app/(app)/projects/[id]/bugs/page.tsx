@@ -41,6 +41,11 @@ import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker"
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface BugsData {
+  bugs: BugItem[];
+}
 
 type ViewMode = "kanban" | "list";
 
@@ -415,8 +420,14 @@ export default function BugsPage() {
   const { project, projectMembers: members } = useProjectData();
   const projectName = String(project.name || "");
 
-  const [bugs, setBugs] = useState<BugItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `bugs:${projectId}`;
+  const cached = getPageCache<BugsData>(cacheKey);
+
+  const [bugs, setBugs] = useState<BugItem[]>(cached?.bugs ?? []);
+  // Only the true first visit to this project's bugs list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [filterStatus, setFilterStatus] = useState("");
   /*
    * Basecamp 10226242373 ("Severity filter is missing"). Severity is a first-class field — it has its
@@ -503,17 +514,26 @@ export default function BugsPage() {
 
   const load = useCallback(() => {
     listBugs(projectId)
-      .then(setBugs)
+      .then((bugsData) => {
+        setPageCache(`bugs:${projectId}`, { bugs: bugsData });
+        setBugs(bugsData);
+      })
       .finally(() => setLoading(false));
   }, [projectId]);
 
   useEffect(() => {
+    const key = `bugs:${projectId}`;
+    const existing = getPageCache<BugsData>(key);
+    if (existing) {
+      setBugs(existing.bugs);
+      setLoading(false);
+    }
     if (!currentUser) {
       router.replace("/login");
       return;
     }
     load();
-  }, [router, load, currentUser]);
+  }, [projectId, router, load, currentUser]);
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
@@ -753,7 +773,7 @@ export default function BugsPage() {
   }
 
   if (loading) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (

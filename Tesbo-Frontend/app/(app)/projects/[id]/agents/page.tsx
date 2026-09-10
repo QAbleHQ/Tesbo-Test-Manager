@@ -26,6 +26,11 @@ import { Modal, PageLoader, StatusChip } from "@/components/ui";
 import { ListWorkspaceLayout, PageHeader, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface AgentsPageData {
+  state: ZyraAgentState;
+}
 
 type ChipIcon = ComponentType<{ size?: number; stroke?: number; className?: string }>;
 
@@ -106,8 +111,13 @@ export default function AgentsPage() {
   const { currentUser } = useAppData();
   const { project } = useProjectData();
   const projectName = String(project.name || "");
-  const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `agents:${projectId}`;
+  const cached = getPageCache<AgentsPageData>(cacheKey);
+  const [state, setState] = useState<ZyraAgentState | null>(cached?.state ?? null);
+  // Only the true first visit to this project's agents page has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -116,6 +126,7 @@ export default function AgentsPage() {
       const data = await getZyraAgent(projectId);
       setState(data);
       setError(null);
+      setPageCache(`agents:${projectId}`, { state: data });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load agents.");
     } finally {
@@ -124,9 +135,17 @@ export default function AgentsPage() {
   }, [projectId]);
 
   useEffect(() => {
+    const key = `agents:${projectId}`;
+    const existing = getPageCache<AgentsPageData>(key);
+    if (existing) {
+      setState(existing.state);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     if (!currentUser) router.replace("/login");
     else void loadData();
-  }, [loadData, router, currentUser]);
+  }, [loadData, router, currentUser, projectId]);
 
   const stats = useMemo(() => (state ? deriveZyraStats(state.tasks, state.testcasesCreated ?? 0) : null), [state]);
   const capabilityChips = useMemo(() => {
