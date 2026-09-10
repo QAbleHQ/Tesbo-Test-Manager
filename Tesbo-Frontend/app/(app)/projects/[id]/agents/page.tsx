@@ -21,9 +21,11 @@ import {
   IconWand,
   IconX,
 } from "@tabler/icons-react";
-import { authMe, getProject, getZyraAgent, type ZyraAgentState, type ZyraCapabilities, type ZyraTask } from "@/lib/api";
+import { getZyraAgent, type ZyraAgentState, type ZyraCapabilities, type ZyraTask } from "@/lib/api";
 import { Modal, PageLoader, StatusChip } from "@/components/ui";
 import { ListWorkspaceLayout, PageHeader, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 type ChipIcon = ComponentType<{ size?: number; stroke?: number; className?: string }>;
 
@@ -101,11 +103,13 @@ export default function AgentsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
   const [state, setState] = useState<ZyraAgentState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [projectName, setProjectName] = useState("");
 
   const loadData = useCallback(async () => {
     try {
@@ -120,15 +124,9 @@ export default function AgentsPage() {
   }, [projectId]);
 
   useEffect(() => {
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-  }, [projectId]);
-
-  useEffect(() => {
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-  }, [loadData, router]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, currentUser]);
 
   const stats = useMemo(() => (state ? deriveZyraStats(state.tasks, state.testcasesCreated ?? 0) : null), [state]);
   const capabilityChips = useMemo(() => {

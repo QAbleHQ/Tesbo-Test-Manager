@@ -34,7 +34,6 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import {
-  authMe,
   getTestRun,
   updateTestRun,
   listCycleExecutions,
@@ -45,9 +44,7 @@ import {
   removeTestCasesFromRun,
   listTestCases,
   listSuites,
-  listProjectMembers,
   listPlans,
-  getProject,
   toggleTestRunShare,
   listBugs,
   type TestRunDetail,
@@ -64,6 +61,8 @@ import { AutomationResultMeta, AutomationRunProvenance } from "@/components/Auto
 import { useLogBugDialog } from "@/components/LogBugDialog";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -382,6 +381,9 @@ export default function TestRunDetailPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
   const cycleId = params.cycleId as string;
 
   const { startEl: topBarStartEl, endEl: topBarEndEl, setFilled: setTopBarFilled } = useTopBarSlots();
@@ -402,10 +404,11 @@ export default function TestRunDetailPage() {
   const [bulkAssigning, setBulkAssigning] = useState(false);
   const [bulkAssignError, setBulkAssignError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [memberNames, setMemberNames] = useState<Record<string, string>>({});
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
+  const memberNames = useMemo(
+    () => Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
+    [members]
+  );
   const [planNames, setPlanNames] = useState<Record<string, string>>({});
-  const [projectName, setProjectName] = useState("");
 
   /* test cases table: tab filter, search, pagination */
   const [activeTab, setActiveTab] = useState<RunTab>("All");
@@ -461,13 +464,12 @@ export default function TestRunDetailPage() {
   const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
-    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId), getProject(projectId)])
-      .then(([r, e, project]) => {
+    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId)])
+      .then(([r, e]) => {
         setRun(r);
         setExecutions(e);
         setShareEnabled(r.shareEnabled ?? false);
         setShareToken(r.shareToken ?? null);
-        setProjectName(String(project.name || ""));
       })
       .catch(() => router.replace(`/projects/${projectId}/cycles`))
       .finally(() => setLoading(false));
@@ -484,23 +486,15 @@ export default function TestRunDetailPage() {
 
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-      listProjectMembers(projectId)
-        .then((members) => {
-          setMembers(members);
-          setMemberNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
-        })
-        .catch(() => {});
-      listPlans(projectId)
-        .then((plans) => setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name]))))
-        .catch(() => {});
-    });
-  }, [router, load, projectId]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+    listPlans(projectId)
+      .then((plans) => setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name]))))
+      .catch(() => {});
+  }, [router, load, projectId, currentUser]);
 
   /* reset to first page whenever the filter/search/sort changes */
   useEffect(() => {

@@ -4,7 +4,6 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { IconActivity, IconSearch, IconLock } from "@tabler/icons-react";
 import {
-  authMe,
   getWorkspace,
   getWorkspaceActivitySummary,
   listWorkspaceActivity,
@@ -23,6 +22,7 @@ import {
   groupByDate,
   sinceFor,
 } from "@/components/activity/activityShared";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 const TYPE_FILTERS = [
   { value: "", label: "All types" },
@@ -48,6 +48,7 @@ const PAGE_SIZE = 30;
 
 export default function WorkspaceActivityPage() {
   const router = useRouter();
+  const { currentUser } = useAppData();
 
   const [checkingAccess, setCheckingAccess] = useState(true);
   const [allowed, setAllowed] = useState(false);
@@ -102,31 +103,29 @@ export default function WorkspaceActivityPage() {
   );
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      getWorkspace()
-        .then((ws) => {
-          setWorkspaceName(ws.name ?? "Workspace");
-          const isOwner = normalizeRole(ws.role) === "owner";
-          setAllowed(isOwner);
-          if (isOwner) {
-            listWorkspaceMembers()
-              .then((list) => setMembers(list))
-              .catch(() => setMembers([]));
-            listProjects()
-              .then((list) => setProjects(list))
-              .catch(() => setProjects([]));
-            getWorkspaceActivitySummary()
-              .then((s) => setSummary(s))
-              .catch(() => setSummary(null));
-          }
-        })
-        .finally(() => setCheckingAccess(false));
-    });
-  }, [router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    getWorkspace()
+      .then((ws) => {
+        setWorkspaceName(ws.name ?? "Workspace");
+        const isOwner = normalizeRole(ws.role) === "owner";
+        setAllowed(isOwner);
+        if (isOwner) {
+          listWorkspaceMembers()
+            .then((list) => setMembers(list))
+            .catch(() => setMembers([]));
+          listProjects()
+            .then((list) => setProjects(list))
+            .catch(() => setProjects([]));
+          getWorkspaceActivitySummary()
+            .then((s) => setSummary(s))
+            .catch(() => setSummary(null));
+        }
+      })
+      .finally(() => setCheckingAccess(false));
+  }, [router, currentUser]);
 
   useEffect(() => {
     if (!allowed) return;

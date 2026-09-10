@@ -21,8 +21,6 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   listTestCases,
   listSuites,
   createSuite,
@@ -69,6 +67,8 @@ import {
   FieldError,
   FieldHint,
 } from "@/components/ui";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import ImportTestCasesModal from "@/components/ImportTestCasesModal";
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
 import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilterPopover";
@@ -140,6 +140,7 @@ export default function TestCasesPage() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { currentUser } = useAppData();
   const projectId = params.id as string;
   const activeSuiteId = searchParams.get("suiteId");
   /*
@@ -167,8 +168,13 @@ export default function TestCasesPage() {
   // inline beside the type/status/priority dropdowns instead of in its own strip.
   const [columnsSlotEl, setColumnsSlotEl] = useState<HTMLElement | null>(null);
 
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
+  const defaultTestcaseIdPrefix = useMemo(
+    () => normalizeTestcaseIdPrefix(String(parseProjectSettings(project.settings).testcaseIdPrefix || project.key || "TC")) || "TC",
+    [project]
+  );
   const [suites, setSuites] = useState<SuiteNode[]>([]);
-  const [projectName, setProjectName] = useState("");
   const [repoSummary, setRepoSummary] = useState<RepositorySummary | null>(null);
   const [suitePanelOpen, setSuitePanelOpen] = useState(true);
   const [suiteCases, setSuiteCases] = useState<TestCaseListItem[]>([]);
@@ -210,8 +216,7 @@ export default function TestCasesPage() {
   const [component, setComponent] = useState("");
   const [severity, setSeverity] = useState("");
   const [suiteId, setSuiteId] = useState("");
-  const [defaultTestcaseIdPrefix, setDefaultTestcaseIdPrefix] = useState("TC");
-  const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("TC");
+  const [testcaseIdPrefix, setTestcaseIdPrefix] = useState(defaultTestcaseIdPrefix);
   const [panelJiraIssueKey, setPanelJiraIssueKey] = useState("");
   const [panelJiraUrl, setPanelJiraUrl] = useState("");
 
@@ -266,33 +271,25 @@ export default function TestCasesPage() {
   }
 
   const loadData = useCallback(async () => {
-    const [suiteList, project, summary, activeCustomFields] = await Promise.all([
+    const [suiteList, summary, activeCustomFields] = await Promise.all([
       listSuites(projectId),
-      getProject(projectId),
       getRepositorySummary(projectId).catch(() => null),
       listCustomFieldDefinitions(projectId, { statuses: ["active"] }).catch(() => []),
     ]);
-    const settings = parseProjectSettings(project.settings);
-    const prefix = normalizeTestcaseIdPrefix(String(settings.testcaseIdPrefix || project.key || "TC")) || "TC";
     setSuites(suiteList);
-    setProjectName(String(project.name || ""));
     setRepoSummary(summary);
-    setDefaultTestcaseIdPrefix(prefix);
-    setTestcaseIdPrefix(prefix);
     setCustomFieldDefinitions(activeCustomFields);
   }, [projectId]);
 
   useEffect(() => {
     const saved = readStoredValue("tesbo_tc_suite_panel");
     if (saved === "closed") setSuitePanelOpen(false);
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
-    });
-  }, [router, loadData, projectId]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
+  }, [router, loadData, projectId, currentUser]);
 
   function toggleSuitePanel() {
     setSuitePanelOpen((prev) => {

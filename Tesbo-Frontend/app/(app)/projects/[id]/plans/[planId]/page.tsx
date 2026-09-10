@@ -24,7 +24,6 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import {
-  authMe,
   getPlan,
   updatePlan,
   deletePlan,
@@ -34,9 +33,7 @@ import {
   createCycleFromPlan,
   associateRunWithPlan,
   dissociateRunFromPlan,
-  getProject,
   listPlans,
-  listProjectMembers,
   type PlanListItem,
   type PlanRunItem,
   type PlanProgress,
@@ -47,6 +44,8 @@ import { computePassRate, computeExecutionProgress } from "@/lib/executionMetric
 import { Button, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { useAppData } from "@/components/app/AppDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import { planStatus, formatLastRun, OwnerAvatar, PlanStatusBadge } from "@/components/testplans/PlanCard";
 import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
@@ -120,6 +119,9 @@ export default function PlanDetailPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const planId = params.planId as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers } = useProjectData();
+  const projectName = String(project.name || "");
 
   const { startEl: topBarStartEl, endEl: topBarEndEl, setFilled: setTopBarFilled } = useTopBarSlots();
   useEffect(() => {
@@ -143,16 +145,13 @@ export default function PlanDetailPage() {
    * (passed + failed + blocked + skipped), so a run's figure and the plan's cannot diverge.
    */
   const [progress, setProgress] = useState<PlanProgress | null>(null);
-  const [projectName, setProjectName] = useState("");
   const [allPlans, setAllPlans] = useState<PlanListItem[]>([]);
-  const [ownerNames, setOwnerNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
 
   // Create cycle from plan
   const [creatingCycle, setCreatingCycle] = useState(false);
   const [newCycleName, setNewCycleName] = useState("");
   const [showCreateCycle, setShowCreateCycle] = useState(false);
-  const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
   const [selectedEnvironment, setSelectedEnvironment] = useState("");
 
   // Associate existing run
@@ -190,43 +189,46 @@ export default function PlanDetailPage() {
       .filter((item): item is TestEnvironmentSetting => item !== null);
   }
 
+  const environmentOptions = useMemo(
+    () => normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments),
+    [project]
+  );
+  const ownerNames = useMemo(
+    () => Object.fromEntries(projectMembers.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
+    [projectMembers]
+  );
+
+  useEffect(() => {
+    setSelectedEnvironment((prev) => {
+      if (prev && environmentOptions.some((item) => item.name === prev)) return prev;
+      return environmentOptions[0]?.name ?? "";
+    });
+  }, [environmentOptions]);
+
   const loadData = useCallback(async () => {
     try {
-      const [p, r, pg, project, plansList, members] = await Promise.all([
+      const [p, r, pg, plansList] = await Promise.all([
         getPlan(planId),
         listPlanRuns(planId),
         getPlanProgress(planId),
-        getProject(projectId),
         listPlans(projectId),
-        listProjectMembers(projectId).catch(() => []),
       ]);
       setPlan(p);
       setRuns(r);
       setProgress(pg);
-      setProjectName(String(project.name || ""));
       setAllPlans(plansList);
-      setOwnerNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
-      const parsedSettings = parseProjectSettings(project.settings);
-      const environments = normalizeTestRunEnvironments(parsedSettings.testRunEnvironments);
-      setEnvironmentOptions(environments);
-      setSelectedEnvironment((prev) => {
-        if (prev && environments.some((item) => item.name === prev)) return prev;
-        return environments[0]?.name ?? "";
-      });
     } catch {
       router.replace("/projects");
     }
   }, [planId, projectId, router]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      loadData().finally(() => setLoading(false));
-    });
-  }, [loadData, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    loadData().finally(() => setLoading(false));
+  }, [loadData, router, currentUser]);
 
   async function handleCreateCycle(e: React.FormEvent) {
     e.preventDefault();

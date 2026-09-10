@@ -5,8 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconChevronDown, IconDownload } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getExecutionReport,
   getRequirementMatrix,
   getRepositorySummary,
@@ -17,7 +15,6 @@ import {
   listPlans,
   listTestRuns,
   listSuites,
-  listProjectMembers,
   listBugs,
   type ExecutionReportRow,
   type RequirementMatrixRow,
@@ -31,6 +28,8 @@ import { computePassRate } from "@/lib/executionMetrics";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { PageLoader } from "@/components/ui";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { ReportsNav, type ReportView } from "@/components/reports/ReportsNav";
 import { OverviewTab } from "@/components/reports/OverviewTab";
 import { ExecutionReportTab } from "@/components/reports/ExecutionReportTab";
@@ -63,15 +62,15 @@ export default function ReportsPage() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [auth, setAuth] = useState<{ userId: string } | null>(null);
-  const [projectName, setProjectName] = useState("");
+  const { currentUser: auth } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
   const [activeView, setActiveView] = useState<ReportView>("overview");
 
   // Shared filter-option lists (used by Execution Report tab)
   const [plans, setPlans] = useState<{ id: string; name: string }[]>([]);
   const [runs, setRuns] = useState<{ id: string; name: string }[]>([]);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
-  const [members, setMembers] = useState<{ userId: string; name: string; email: string }[]>([]);
   const [openBugCount, setOpenBugCount] = useState(0);
 
   // Overview + AI Insights are cheap aggregate queries — load eagerly so the header
@@ -102,28 +101,21 @@ export default function ReportsPage() {
   const [trendsLoading, setTrendsLoading] = useState(false);
 
   useEffect(() => {
-    authMe().then((me) => {
-      setAuth(me);
-      if (!me) router.replace("/login");
-    });
-  }, [router]);
+    if (!auth) router.replace("/login");
+  }, [router, auth]);
 
   useEffect(() => {
     if (!auth) return;
     Promise.all([
-      getProject(projectId),
       listPlans(projectId),
       listTestRuns(projectId),
       listSuites(projectId),
-      listProjectMembers(projectId),
       listBugs(projectId),
     ])
-      .then(([project, pl, rn, su, mb, bugs]) => {
-        setProjectName(String(project.name || ""));
+      .then(([pl, rn, su, bugs]) => {
         setPlans(Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : []);
         setRuns(Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : []);
         setSuites(su);
-        setMembers(mb);
         setOpenBugCount(bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length);
       })
       .catch(() => {});

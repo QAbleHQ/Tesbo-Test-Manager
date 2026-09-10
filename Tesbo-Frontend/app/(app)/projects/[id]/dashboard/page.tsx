@@ -17,8 +17,6 @@ import {
   IconActivity,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   listCycles,
   listActivity,
   getProjectDashboardSummary,
@@ -28,6 +26,8 @@ import {
 } from "@/lib/api";
 import { Card, PageLoader, StatusChip, type StatusChipProps } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { OwnerAvatar } from "@/components/testplans/PlanCard";
 
 /* ───── shared small helpers ───── */
@@ -153,8 +153,9 @@ export default function ProjectDashboardPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
 
-  const [project, setProject] = useState<Record<string, unknown> | null>(null);
   const [summary, setSummary] = useState<ProjectDashboardSummary | null>(null);
   const [runs, setRuns] = useState<TestRunListItem[]>([]);
   const [activities, setActivities] = useState<ActivityLogItem[]>([]);
@@ -168,44 +169,35 @@ export default function ProjectDashboardPage() {
     // would clobber state that belongs to the new project. `cancelled` guards against that race.
     let cancelled = false;
     setLoading(true);
-    setProject(null);
     setSummary(null);
-    authMe().then((me) => {
-      if (cancelled) return;
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      getProject(projectId)
-        .then((p) => {
-          if (cancelled) return undefined;
-          setProject(p);
-          return Promise.all([
-            getProjectDashboardSummary(projectId),
-            listCycles(projectId),
-            listActivity(projectId, { limit: 10 }),
-          ]);
-        })
-        .then((res) => {
-          if (cancelled || !res) return;
-          const [summaryRes, cyclesRes, activityRes] = res;
-          setSummary(summaryRes);
-          setRuns(cyclesRes.slice(0, 4));
-          setActivities(activityRes.list);
-        })
-        .catch(() => {
-          if (!cancelled) router.replace("/projects");
-        })
-        .finally(() => {
-          if (!cancelled) setLoading(false);
-        });
-    });
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    Promise.all([
+      getProjectDashboardSummary(projectId),
+      listCycles(projectId),
+      listActivity(projectId, { limit: 10 }),
+    ])
+      .then((res) => {
+        if (cancelled) return;
+        const [summaryRes, cyclesRes, activityRes] = res;
+        setSummary(summaryRes);
+        setRuns(cyclesRes.slice(0, 4));
+        setActivities(activityRes.list);
+      })
+      .catch(() => {
+        if (!cancelled) router.replace("/projects");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
     return () => {
       cancelled = true;
     };
-  }, [projectId, router]);
+  }, [projectId, router, currentUser]);
 
-  if (loading || !project || !summary) {
+  if (loading || !summary) {
     return <PageLoader variant="screen" label="Loading project…" />;
   }
 

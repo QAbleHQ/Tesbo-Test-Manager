@@ -3,8 +3,9 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { authMe, getWorkspace } from "@/lib/api";
+import { getWorkspace } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { useAppData } from "@/components/app/AppDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import { PageLoader } from "@/components/ui";
 import GeneralTab from "@/components/settings/GeneralTab";
@@ -19,6 +20,7 @@ type SettingsTab = "general" | "members" | "integrations" | "ai" | "billing" | "
 function WorkspaceSettingsContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { currentUser } = useAppData();
   const [status, setStatus] = useState<"loading" | "ready" | "denied">("loading");
   const [workspaceName, setWorkspaceName] = useState("");
   const [canManageWorkspace, setCanManageWorkspace] = useState(false);
@@ -43,8 +45,7 @@ function WorkspaceSettingsContent() {
   );
 
   const load = useCallback(async () => {
-    const me = await authMe();
-    if (!me) {
+    if (!currentUser) {
       router.replace("/login");
       return;
     }
@@ -52,7 +53,7 @@ function WorkspaceSettingsContent() {
       const workspace = await getWorkspace();
       const role = String(workspace.role || "qa_engineer").toLowerCase();
       const canManage = role === "owner" || role === "manager";
-      const platformAdmin = Boolean(me.isPlatformAdmin);
+      const platformAdmin = Boolean(currentUser.isPlatformAdmin);
       if (!canManage && !platformAdmin) {
         router.replace("/projects");
         return;
@@ -64,7 +65,7 @@ function WorkspaceSettingsContent() {
     } catch {
       router.replace("/projects");
     }
-  }, [router]);
+  }, [router, currentUser]);
 
   useEffect(() => { void load(); }, [load]);
 
