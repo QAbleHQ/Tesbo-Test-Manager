@@ -18,6 +18,12 @@ import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTas
 import { renderMarkdown } from "@/lib/markdown";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface AgentsTasksPageData {
+  state: ZyraAgentState;
+  knowledgeItems: KnowledgeDocument[];
+}
 
 const columns = [
   { key: "todo", label: "To Do", dot: "var(--muted-soft)" },
@@ -94,8 +100,10 @@ export default function ZyraTasksPage() {
   const { currentUser } = useAppData();
   const { project } = useProjectData();
   const projectName = String(project.name || "");
-  const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>([]);
+  const cacheKey = `agents-tasks:${projectId}`;
+  const cached = getPageCache<AgentsTasksPageData>(cacheKey);
+  const [state, setState] = useState<ZyraAgentState | null>(cached?.state ?? null);
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>(cached?.knowledgeItems ?? []);
   const [story, setStory] = useState("");
   const [context, setContext] = useState("");
   // Context is prone to holding a large Jira/Linear-synced Markdown dump (see
@@ -104,7 +112,10 @@ export default function ZyraTasksPage() {
   const [contextEditing, setContextEditing] = useState(false);
   const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [selectedKnowledgeItemIds, setSelectedKnowledgeItemIds] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Only the true first visit to this project's task board has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [working, setWorking] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [activeView, setActiveView] = useState<TaskView>("tasks");
@@ -125,8 +136,10 @@ export default function ZyraTasksPage() {
       const agentState = await getZyraAgent(projectId);
       setState(agentState);
       const kb = await listKnowledgeDocuments(projectId).catch(() => ({ list: [], total: 0 }));
-      setKnowledgeItems(kb.list || []);
+      const items = kb.list || [];
+      setKnowledgeItems(items);
       setError(null);
+      setPageCache(`agents-tasks:${projectId}`, { state: agentState, knowledgeItems: items });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load agent tasks.");
     } finally {
@@ -135,6 +148,15 @@ export default function ZyraTasksPage() {
   }, [projectId]);
 
   useEffect(() => {
+    const key = `agents-tasks:${projectId}`;
+    const existing = getPageCache<AgentsTasksPageData>(key);
+    if (existing) {
+      setState(existing.state);
+      setKnowledgeItems(existing.knowledgeItems);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     if (!currentUser) router.replace("/login");
     else void loadData();
   }, [loadData, router, projectId, currentUser]);

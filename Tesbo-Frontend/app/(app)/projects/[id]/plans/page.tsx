@@ -23,6 +23,7 @@ import {
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { PlanCard, planStatus, type PlanStatus } from "@/components/testplans/PlanCard";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 import {
   IconArrowsSort,
   IconChevronDown,
@@ -33,6 +34,10 @@ import {
   IconSearch,
   IconX,
 } from "@tabler/icons-react";
+
+interface PlansData {
+  plans: PlanListItem[];
+}
 
 type StatusFilter = "all" | PlanStatus;
 // Exact same option set as the Projects list's sort menu (app/(app)/projects/page.tsx).
@@ -120,8 +125,14 @@ export default function PlansPage() {
     () => Object.fromEntries(projectMembers.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
     [projectMembers]
   );
-  const [plans, setPlans] = useState<PlanListItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `plans:${projectId}`;
+  const cached = getPageCache<PlansData>(cacheKey);
+
+  const [plans, setPlans] = useState<PlanListItem[]>(cached?.plans ?? []);
+  // Only the true first visit to this project's plans list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -152,12 +163,22 @@ export default function PlansPage() {
   }, [searchParams]);
 
   useEffect(() => {
+    const key = `plans:${projectId}`;
+    const existing = getPageCache<PlansData>(key);
+    if (existing) {
+      setPlans(existing.plans);
+      setLoading(false);
+    }
     if (!currentUser) {
       router.replace("/login");
       return;
     }
     listPlans(projectId)
-      .then((plansData) => setPlans(plansData))
+      .then((plansData) => {
+        const next: PlansData = { plans: plansData };
+        setPageCache(key, next);
+        setPlans(next.plans);
+      })
       .catch(() => router.replace("/projects"))
       .finally(() => setLoading(false));
   }, [projectId, router, currentUser]);
@@ -240,7 +261,7 @@ export default function PlansPage() {
   const passRate = overallPassRate(plans);
 
   if (loading) {
-    return <PageLoader variant="screen" label="Loading plans…" />;
+    return <PageLoader variant="content" label="Loading plans…" />;
   }
 
   return (

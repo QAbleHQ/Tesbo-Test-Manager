@@ -37,6 +37,23 @@ import { TraceabilityTab } from "@/components/reports/TraceabilityTab";
 import { RepositoryTab } from "@/components/reports/RepositoryTab";
 import { AIInsightsTab } from "@/components/reports/AIInsightsTab";
 import { TrendsTab } from "@/components/reports/TrendsTab";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+// The two eager, unconditional-on-mount fetches (overview+insights, and the shared filter-option
+// lists) are what the header stat chips and nav badge render every visit — cached separately since
+// they're independent effects/promises, under distinct suffixes of the same page key, per the
+// dashboard reference pattern in app/(app)/projects/[id]/dashboard/page.tsx.
+interface ReportsOverviewData {
+  overview: ReportsOverview | null;
+  insights: ReportsInsights | null;
+}
+
+interface ReportsFiltersData {
+  plans: { id: string; name: string }[];
+  runs: { id: string; name: string }[];
+  suites: SuiteNode[];
+  openBugCount: number;
+}
 
 /*
  * Named per view because the export is per view — the file says which report it is, and the menu
@@ -68,17 +85,21 @@ export default function ReportsPage() {
   const [activeView, setActiveView] = useState<ReportView>("overview");
 
   // Shared filter-option lists (used by Execution Report tab)
-  const [plans, setPlans] = useState<{ id: string; name: string }[]>([]);
-  const [runs, setRuns] = useState<{ id: string; name: string }[]>([]);
-  const [suites, setSuites] = useState<SuiteNode[]>([]);
-  const [openBugCount, setOpenBugCount] = useState(0);
+  const filtersCacheKey = `reports:${projectId}:filters`;
+  const cachedFilters = getPageCache<ReportsFiltersData>(filtersCacheKey);
+  const [plans, setPlans] = useState<{ id: string; name: string }[]>(cachedFilters?.plans ?? []);
+  const [runs, setRuns] = useState<{ id: string; name: string }[]>(cachedFilters?.runs ?? []);
+  const [suites, setSuites] = useState<SuiteNode[]>(cachedFilters?.suites ?? []);
+  const [openBugCount, setOpenBugCount] = useState(cachedFilters?.openBugCount ?? 0);
 
   // Overview + AI Insights are cheap aggregate queries — load eagerly so the header
   // stat chips and the nav's flaky-count badge are available regardless of active tab.
-  const [overview, setOverview] = useState<ReportsOverview | null>(null);
-  const [overviewLoading, setOverviewLoading] = useState(true);
-  const [insights, setInsights] = useState<ReportsInsights | null>(null);
-  const [insightsLoading, setInsightsLoading] = useState(true);
+  const overviewCacheKey = `reports:${projectId}`;
+  const cachedOverview = getPageCache<ReportsOverviewData>(overviewCacheKey);
+  const [overview, setOverview] = useState<ReportsOverview | null>(cachedOverview?.overview ?? null);
+  const [overviewLoading, setOverviewLoading] = useState(!cachedOverview);
+  const [insights, setInsights] = useState<ReportsInsights | null>(cachedOverview?.insights ?? null);
+  const [insightsLoading, setInsightsLoading] = useState(!cachedOverview);
 
   // Execution Report state
   const [execFilterBy, setExecFilterBy] = useState("overall");
@@ -106,6 +127,14 @@ export default function ReportsPage() {
 
   useEffect(() => {
     if (!auth) return;
+    const key = `reports:${projectId}:filters`;
+    const existing = getPageCache<ReportsFiltersData>(key);
+    if (existing) {
+      setPlans(existing.plans);
+      setRuns(existing.runs);
+      setSuites(existing.suites);
+      setOpenBugCount(existing.openBugCount);
+    }
     Promise.all([
       listPlans(projectId),
       listTestRuns(projectId),
@@ -113,20 +142,48 @@ export default function ReportsPage() {
       listBugs(projectId),
     ])
       .then(([pl, rn, su, bugs]) => {
-        setPlans(Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : []);
-        setRuns(Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : []);
-        setSuites(su);
-        setOpenBugCount(bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length);
+        const next: ReportsFiltersData = {
+          plans: Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : [],
+          runs: Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : [],
+          suites: su,
+          openBugCount: bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length,
+        };
+        setPageCache(key, next);
+        setPlans(next.plans);
+        setRuns(next.runs);
+        setSuites(next.suites);
+        setOpenBugCount(next.openBugCount);
       })
       .catch(() => {});
   }, [auth, projectId]);
 
   useEffect(() => {
     if (!auth) return;
-    setOverviewLoading(true);
-    getReportsOverview(projectId).then(setOverview).catch(() => setOverview(null)).finally(() => setOverviewLoading(false));
-    setInsightsLoading(true);
-    getReportsInsights(projectId).then(setInsights).catch(() => setInsights(null)).finally(() => setInsightsLoading(false));
+    const key = `reports:${projectId}`;
+    const existing = getPageCache<ReportsOverviewData>(key);
+    if (existing) {
+      setOverview(existing.overview);
+      setInsights(existing.insights);
+      setOverviewLoading(false);
+      setInsightsLoading(false);
+    } else {
+      setOverviewLoading(true);
+      setInsightsLoading(true);
+    }
+    getReportsOverview(projectId)
+      .then((res) => {
+        setOverview(res);
+        setPageCache(key, { overview: res, insights: getPageCache<ReportsOverviewData>(key)?.insights ?? null });
+      })
+      .catch(() => setOverview(null))
+      .finally(() => setOverviewLoading(false));
+    getReportsInsights(projectId)
+      .then((res) => {
+        setInsights(res);
+        setPageCache(key, { overview: getPageCache<ReportsOverviewData>(key)?.overview ?? null, insights: res });
+      })
+      .catch(() => setInsights(null))
+      .finally(() => setInsightsLoading(false));
   }, [auth, projectId]);
 
   const loadExecReport = useCallback(() => {
@@ -214,7 +271,7 @@ export default function ReportsPage() {
       : undefined;
 
   if (!auth) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (
