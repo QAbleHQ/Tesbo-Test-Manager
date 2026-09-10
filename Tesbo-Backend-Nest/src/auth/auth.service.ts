@@ -11,6 +11,7 @@ import { AuthenticatedRequest } from "../common/request.types";
 import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { SuperAdminService } from "../admin/super-admin.service";
+import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
 import { OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
@@ -149,7 +150,10 @@ export class AuthService {
   async me(userId: string) {
     const [isPlatformAdmin, userRow, hasPassword] = await Promise.all([
       this.superAdmin.isPlatformAdmin(userId),
-      this.db.query<{ email: string; name: string | null }>("SELECT email, name FROM users WHERE id = $1", [userId]),
+      this.db.query<{ email: string; name: string | null; mobile_number: string | null }>(
+        "SELECT email, name, mobile_number FROM users WHERE id = $1",
+        [userId]
+      ),
       this.password.hasPassword(userId)
     ]);
     return {
@@ -157,8 +161,44 @@ export class AuthService {
       isPlatformAdmin,
       email: userRow.rows[0]?.email ?? null,
       name: userRow.rows[0]?.name ?? null,
+      mobileNumber: userRow.rows[0]?.mobile_number ?? null,
       hasPassword
     };
+  }
+
+  /**
+   * Only `name` and `mobileNumber` are editable here — every other users column (email, avatar_url,
+   * password_hash, active_organization_id, ...) has its own dedicated flow elsewhere, isn't exposed
+   * through this feature, or is not user-editable at all.
+   */
+  async updateProfile(userId: string, name: string | undefined, mobileNumber: string | undefined) {
+    const sets: string[] = [];
+    const values: unknown[] = [];
+
+    if (name !== undefined) {
+      const trimmed = name.trim();
+      if (!trimmed) throw new BadRequestException({ error: "Name cannot be empty" });
+      if (trimmed.length > 255) throw new BadRequestException({ error: "Name must be at most 255 characters" });
+      values.push(trimmed);
+      sets.push(`name = $${values.length}`);
+    }
+
+    if (mobileNumber !== undefined) {
+      // Matches the CHECK constraint on users.mobile_number (V105_user_profile_fields.sql) and the
+      // signup-time validator in mobile-number.util.ts: an already-normalized "+<country
+      // code><digits>" string. The frontend strips spaces/dashes/parens before sending it, so a
+      // malformed value here means the input truly doesn't parse as a phone number.
+      const validated = validateMobileNumber(mobileNumber);
+      values.push(validated);
+      sets.push(`mobile_number = $${values.length}`);
+    }
+
+    if (sets.length === 0) throw new BadRequestException({ error: "Nothing to update" });
+
+    values.push(userId);
+    await this.db.query(`UPDATE users SET ${sets.join(", ")}, updated_at = now() WHERE id = $${values.length}`, values);
+
+    return this.me(userId);
   }
 
   private setSessionCookie(req: AuthenticatedRequest, res: Response, token: string, maxAgeSeconds: number) {

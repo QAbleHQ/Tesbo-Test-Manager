@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { Response } from "express";
 import { AuthenticatedRequest } from "../common/request.types";
 import { AuthService } from "./auth.service";
@@ -8,6 +8,7 @@ type VerifyOtpBody = { email?: string; code?: string };
 type PasswordLoginBody = { email?: string; password?: string };
 type ResetPasswordBody = { token?: string; password?: string };
 type ChangePasswordBody = { currentPassword?: string; newPassword?: string };
+type UpdateProfileBody = { name?: string; mobileNumber?: string };
 
 @Controller("/api/auth")
 export class AuthController {
@@ -70,5 +71,11 @@ export class AuthController {
   me(@Req() req: AuthenticatedRequest) {
     if (!req.userId) throw new UnauthorizedException("Not authenticated");
     return this.auth.me(req.userId);
+  }
+
+  @Patch("/me")
+  updateMe(@Body() body: UpdateProfileBody, @Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    return this.auth.updateProfile(req.userId, body.name, body.mobileNumber);
   }
 }

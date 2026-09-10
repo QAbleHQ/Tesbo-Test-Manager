@@ -113,6 +113,7 @@ export async function authMe(): Promise<{
   userId: string;
   email: string | null;
   name: string | null;
+  mobileNumber: string | null;
   isPlatformAdmin?: boolean;
   hasPassword?: boolean;
 } | null> {
@@ -121,12 +122,24 @@ export async function authMe(): Promise<{
       userId: string;
       email: string | null;
       name: string | null;
+      mobileNumber: string | null;
       isPlatformAdmin?: boolean;
       hasPassword?: boolean;
     }>("/api/auth/me");
   } catch {
     return null;
   }
+}
+
+export async function updateProfile(data: { name?: string; mobileNumber?: string }): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  mobileNumber: string | null;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+}> {
+  return api("/api/auth/me", { method: "PATCH", body: data });
 }
 
 // --- Platform Admin APIs ---

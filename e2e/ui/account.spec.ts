@@ -357,6 +357,8 @@ test.describe("account screen and password reset (UI)", () => {
      * The name half was a pure display gap: /signup collects First name and Last name, sends them as
      * one `name`, and GET /me has always returned it — the screen just never read it. Asserted against
      * the value the API reports rather than a hard-coded string, so this stays true for any tenant.
+     * The name field is now an editable input (see ACU-13/ACU-14 below for the PATCH round trip), so
+     * this reads its `value` rather than text content.
      *
      * The mobile number is deliberately NOT asserted: signup never collects one, there is no column
      * and no value to fetch, so there is nothing to display. That half is a separate feature and is
@@ -375,10 +377,135 @@ test.describe("account screen and password reset (UI)", () => {
     // The name is on the screen, and labelled — not just present somewhere in the markup.
     const nameValue = page.locator("#account-name");
     await expect(nameValue, "the profile card shows no name field").toBeVisible();
-    await expect(nameValue).toHaveText(expectedName);
+    await expect(nameValue).toHaveValue(expectedName);
 
     // The email it used to show alone is still there.
     await expect(page.locator("#account-email")).toHaveText((reported!.email ?? "").trim());
+  });
+
+  // ─── Editing the profile ────────────────────────────────────────────────────
+
+  test("ACU-21 the name field is read-only until its pencil button is clicked", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const nameInput = page.locator("#account-name");
+    const editButton = page.getByRole("button", { name: "Edit name" });
+
+    await expect(nameInput).toHaveAttribute("readonly", "");
+    await expect(editButton).toBeVisible();
+
+    await editButton.click();
+
+    await expect(nameInput).not.toHaveAttribute("readonly", "");
+    await expect(nameInput).toBeFocused();
+    // The pencil is only for entering edit mode — once editing, it has nothing left to do.
+    await expect(editButton).toHaveCount(0);
+  });
+
+  test("ACU-13 the name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const newName = `E2E Updated Name ${Date.now()}`;
+    // Typed with the formatting a real user would use — the screen strips it before sending, so the
+    // value that actually persists (asserted below) is the normalized "+14155550132".
+    const typedMobileNumber = "+1 415 555 0132";
+    const normalizedMobileNumber = "+14155550132";
+
+    const nameInput = page.locator("#account-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    // No profile picture field of any kind on this screen — that feature was removed.
+    await expect(page.getByText(/profile picture/i)).toHaveCount(0);
+
+    // Nothing changed yet, so saving is disabled — this must not be a no-op button on load.
+    await expect(saveButton).toBeDisabled();
+
+    // Name reads read-only until its pencil button is clicked.
+    await expect(nameInput).toHaveAttribute("readonly", "");
+    await page.getByRole("button", { name: "Edit name" }).click();
+    await expect(nameInput).not.toHaveAttribute("readonly", "");
+
+    await nameInput.fill(newName);
+    await mobileInput.fill(typedMobileNumber);
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Persisted server-side, not just in local component state — and normalized, not the raw typed
+    // formatting, since that's what the API stores and the CHECK constraint on users.mobile_number
+    // requires.
+    await page.reload();
+    await expect(page.locator("#account-name")).toHaveValue(newName);
+    await expect(page.locator("#account-mobile-number")).toHaveValue(normalizedMobileNumber);
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok ? ((await res.json()) as { name?: string | null; mobileNumber?: string | null }) : null;
+    });
+    expect(reported?.name).toBe(newName);
+    expect(reported?.mobileNumber).toBe(normalizedMobileNumber);
+  });
+
+  test("ACU-14 an empty name or an out-of-range mobile number is rejected inline", { tag: '@tesbo.testId("TES-TC-1401")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+
+    const nameInput = page.locator("#account-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit name" }).click();
+
+    // Empty / whitespace-only name.
+    await nameInput.fill("   ");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("Name cannot be empty")).toBeVisible();
+
+    // Too few digits to be a real number — rejected rather than silently stored.
+    await nameInput.fill("E2E Valid Name");
+    await mobileInput.fill("12345");
+    await saveButton.click();
+    await expect(page.getByText(/mobile number/i)).toBeVisible();
+
+    // A plausible-looking number missing its country code — the constraint requires an explicit
+    // leading '+', so this is rejected inline rather than silently normalized to one.
+    await mobileInput.fill("14155550132");
+    await saveButton.click();
+    await expect(page.getByText(/country code/i)).toBeVisible();
+
+    // None of the rejected attempts reached the server: GET /me still reports the original values.
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok ? ((await res.json()) as { name?: string | null; mobileNumber?: string | null }) : null;
+    });
+    expect(reported?.name).not.toBe("");
+    expect(reported?.mobileNumber ?? "").not.toBe("14155550132");
+  });
+
+  test("ACU-15 a mobile number is optional — clearing it back to blank is allowed and persists", { tag: '@tesbo.testId("TES-TC-1407")' }, async ({ browser }) => {
+    // Existing users (and this tenant's owner before this test) have no mobile number on file —
+    // saving the profile must not force one to be entered, and an explicit clear must stick.
+    const page = await openAccount(browser);
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await mobileInput.fill("+1 415 555 0199");
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    await mobileInput.fill("");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator("#account-mobile-number")).toHaveValue("");
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok ? ((await res.json()) as { mobileNumber?: string | null }) : null;
+    });
+    expect(reported?.mobileNumber).toBeNull();
   });
 
   // ─── Cross-device session invalidation ─────────────────────────────────────

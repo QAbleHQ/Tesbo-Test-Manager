@@ -1,17 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { authMe, changePassword } from "@/lib/api";
-import { Button, Card, Field, FieldError, FieldHint, FieldLabel, PageLoader, PasswordInput } from "@/components/ui";
-import { PASSWORD_MAX_LENGTH, PASSWORD_RULES_HINT, validatePasswordValue } from "@/lib/validation";
+import { IconPencil } from "@tabler/icons-react";
+import { authMe, changePassword, updateProfile } from "@/lib/api";
+import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, PageLoader, PasswordInput } from "@/components/ui";
+import {
+  MOBILE_NUMBER_MAX_LENGTH,
+  normalizeMobileNumber,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_RULES_HINT,
+  validateMobileNumber,
+  validatePasswordValue,
+} from "@/lib/validation";
 
 export default function AccountPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
+  const [mobileNumber, setMobileNumber] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
+
+  const [nameDraft, setNameDraft] = useState("");
+  const [mobileNumberDraft, setMobileNumberDraft] = useState("");
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSuccess, setProfileSuccess] = useState(false);
+  // Name reads as plain, non-editable text until the pencil button is clicked — matches the
+  // read-only-by-default treatment Email already has, instead of an always-open text box.
+  const [isEditingName, setIsEditingName] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -29,12 +48,61 @@ export default function AccountPage() {
       return;
     }
     setEmail(me.email ?? "");
-    setName((me.name ?? "").trim());
+    const trimmedName = (me.name ?? "").trim();
+    setName(trimmedName);
+    setNameDraft(trimmedName);
+    setMobileNumber(me.mobileNumber ?? "");
+    setMobileNumberDraft(me.mobileNumber ?? "");
     setHasPassword(Boolean(me.hasPassword));
     setLoading(false);
   }, [router]);
 
   useEffect(() => { void load(); }, [load]);
+
+  const profileDirty = nameDraft.trim() !== name || mobileNumberDraft.trim() !== mobileNumber;
+
+  function startEditingName() {
+    setIsEditingName(true);
+    // readOnly doesn't block focusing (only `disabled` would), so this can run immediately.
+    nameInputRef.current?.focus();
+  }
+
+  async function handleProfileSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setProfileError("");
+    setProfileSuccess(false);
+
+    const trimmedName = nameDraft.trim();
+    if (!trimmedName) {
+      setProfileError("Name cannot be empty");
+      return;
+    }
+    if (trimmedName.length > 255) {
+      setProfileError("Name must be at most 255 characters");
+      return;
+    }
+    const mobileError = validateMobileNumber(mobileNumberDraft);
+    if (mobileError) {
+      setProfileError(mobileError);
+      return;
+    }
+    const normalizedMobileNumber = normalizeMobileNumber(mobileNumberDraft);
+
+    setProfileSaving(true);
+    try {
+      const updated = await updateProfile({ name: trimmedName, mobileNumber: normalizedMobileNumber });
+      setName((updated.name ?? "").trim());
+      setNameDraft((updated.name ?? "").trim());
+      setMobileNumber(updated.mobileNumber ?? "");
+      setMobileNumberDraft(updated.mobileNumber ?? "");
+      setProfileSuccess(true);
+      setIsEditingName(false);
+    } catch (err) {
+      setProfileError(err instanceof Error ? err.message : "Failed to save profile");
+    } finally {
+      setProfileSaving(false);
+    }
+  }
 
   function clearErrors() {
     setCurrentPasswordError("");
@@ -131,24 +199,85 @@ export default function AccountPage() {
         {/*
           * Basecamp 10212498688 — the profile showed nothing but the email. Signup collects First name
           * and Last name and GET /me has always returned them as a single `name`; this screen simply
-          * never rendered it. Read-only for now: there is no PATCH /me to save an edit through.
+          * never rendered it. Name and mobile number are now editable through PATCH /api/auth/me.
           *
-          * The mobile number the card also asks for is NOT shown, because signup never collects one —
-          * there is no field, no column and no value to fetch. Raised separately for Specification
-          * rather than rendered as a permanently empty row.
+          * No profile picture field here: avatar_url exists on the users table but is intentionally
+          * not exposed through this screen — the top-right avatar and every other avatar in the app
+          * show initials only.
           */}
-        <Field>
-          <FieldLabel htmlFor="account-name">Name</FieldLabel>
-          <div id="account-name" className="text-sm text-[var(--foreground)]">
-            {name || <span className="text-[var(--muted-soft)]">Not set</span>}
+        <form onSubmit={handleProfileSubmit} className="space-y-4">
+          <Field>
+            <FieldLabel htmlFor="account-name">Name</FieldLabel>
+            <div className="flex items-center gap-2">
+              <Input
+                id="account-name"
+                ref={nameInputRef}
+                type="text"
+                value={nameDraft}
+                onChange={(e) => {
+                  setNameDraft(e.target.value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                placeholder="Your name"
+                readOnly={!isEditingName}
+                disabled={profileSaving}
+                maxLength={255}
+                className={!isEditingName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+              />
+              {!isEditingName && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingName}
+                  disabled={profileSaving}
+                  title="Edit name"
+                  aria-label="Edit name"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-email">Email</FieldLabel>
+            <div id="account-email" className="text-sm text-[var(--foreground)]">
+              {email}
+            </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
+            <Input
+              id="account-mobile-number"
+              type="tel"
+              value={mobileNumberDraft}
+              onChange={(e) => {
+                setMobileNumberDraft(e.target.value);
+                if (profileError) setProfileError("");
+                setProfileSuccess(false);
+              }}
+              placeholder="e.g. +1 415 555 0132"
+              disabled={profileSaving}
+              maxLength={MOBILE_NUMBER_MAX_LENGTH}
+            />
+            <FieldHint>Optional. Include a country code for numbers outside your own.</FieldHint>
+          </Field>
+
+          {profileError && <FieldError>{profileError}</FieldError>}
+          {profileSuccess && !profileError && (
+            <p className="text-[13px] text-[var(--success-foreground)]">Profile updated.</p>
+          )}
+
+          <div className="flex justify-end">
+            <Button type="submit" disabled={profileSaving || !profileDirty}>
+              {profileSaving ? "Saving…" : "Save profile"}
+            </Button>
           </div>
-        </Field>
-        <Field>
-          <FieldLabel htmlFor="account-email">Email</FieldLabel>
-          <div id="account-email" className="text-sm text-[var(--foreground)]">
-            {email}
-          </div>
-        </Field>
+        </form>
       </Card>
 
       <Card className="p-5">
