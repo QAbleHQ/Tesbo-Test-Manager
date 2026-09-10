@@ -19,7 +19,7 @@ import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AccountPage() {
   const router = useRouter();
-  const { currentUser } = useAppData();
+  const { currentUser, refetchCurrentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [firstName, setFirstName] = useState("");
@@ -33,11 +33,16 @@ export default function AccountPage() {
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [profileSuccess, setProfileSuccess] = useState(false);
-  // First/last name read as plain, non-editable text until the pencil button is clicked — matches
-  // the read-only-by-default treatment Email already has, instead of an always-open text box. They
-  // share one edit toggle since they're saved together as a pair, not independently.
-  const [isEditingName, setIsEditingName] = useState(false);
+  // First name, last name, and mobile number each read as a plain, locked field until their own
+  // pencil button is clicked — matching the read-only treatment Email already has, instead of
+  // always-open inputs. Each field has its own independent edit flag: clicking one field's pencil
+  // must not unlock the others (Basecamp report — a single shared flag used to do exactly that).
+  // They still save together through one "Save profile" submission regardless of which are unlocked.
+  const [isEditingFirstName, setIsEditingFirstName] = useState(false);
+  const [isEditingLastName, setIsEditingLastName] = useState(false);
+  const [isEditingMobile, setIsEditingMobile] = useState(false);
   const firstNameInputRef = useRef<HTMLInputElement>(null);
+  const lastNameInputRef = useRef<HTMLInputElement>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -68,13 +73,24 @@ export default function AccountPage() {
 
   useEffect(() => { load(); }, [load]);
 
-  const profileDirty =
-    firstNameDraft.trim() !== firstName || lastNameDraft.trim() !== lastName || mobileNumberDraft.trim() !== mobileNumber;
+  // Save is enabled the moment any field is unlocked for editing — not gated on an actual value
+  // change — so clicking a pencil and immediately hitting Save (a no-op resubmit of the same,
+  // already-valid value) is a normal, safe path rather than a dead button.
+  const anyFieldEditing = isEditingFirstName || isEditingLastName || isEditingMobile;
 
-  function startEditingName() {
-    setIsEditingName(true);
+  function startEditingFirstName() {
+    setIsEditingFirstName(true);
     // readOnly doesn't block focusing (only `disabled` would), so this can run immediately.
     firstNameInputRef.current?.focus();
+  }
+
+  function startEditingLastName() {
+    setIsEditingLastName(true);
+    lastNameInputRef.current?.focus();
+  }
+
+  function startEditingMobile() {
+    setIsEditingMobile(true);
   }
 
   async function handleProfileSubmit(e: React.FormEvent) {
@@ -115,7 +131,13 @@ export default function AccountPage() {
       setMobileNumber(updated.mobileNumber ?? "");
       setMobileNumberDraft(updated.mobileNumber ?? "");
       setProfileSuccess(true);
-      setIsEditingName(false);
+      setIsEditingFirstName(false);
+      setIsEditingLastName(false);
+      setIsEditingMobile(false);
+      // AppDataProvider's currentUser is fetched once on mount and otherwise never updated — without
+      // this, the TopBar/Sidebar avatar initials would keep showing the pre-edit name, and returning
+      // to this page after navigating away would read the stale value straight back out of context.
+      refetchCurrentUser();
     } catch (err) {
       setProfileError(err instanceof Error ? err.message : "Failed to save profile");
     } finally {
@@ -241,20 +263,20 @@ export default function AccountPage() {
                   setProfileSuccess(false);
                 }}
                 placeholder="Your first name"
-                readOnly={!isEditingName}
+                readOnly={!isEditingFirstName}
                 disabled={profileSaving}
                 maxLength={SIGNUP_NAME_MAX_LENGTH}
-                className={!isEditingName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+                className={!isEditingFirstName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
               />
-              {!isEditingName && (
+              {!isEditingFirstName && (
                 <Button
                   type="button"
                   variant="secondary"
                   size="icon"
-                  onClick={startEditingName}
+                  onClick={startEditingFirstName}
                   disabled={profileSaving}
-                  title="Edit name"
-                  aria-label="Edit name"
+                  title="Edit first name"
+                  aria-label="Edit first name"
                   className="shrink-0"
                 >
                   <IconPencil size={14} stroke={1.75} />
@@ -265,21 +287,38 @@ export default function AccountPage() {
 
           <Field>
             <FieldLabel htmlFor="account-last-name">Last name</FieldLabel>
-            <Input
-              id="account-last-name"
-              type="text"
-              value={lastNameDraft}
-              onChange={(e) => {
-                setLastNameDraft(e.target.value);
-                if (profileError) setProfileError("");
-                setProfileSuccess(false);
-              }}
-              placeholder="Your last name"
-              readOnly={!isEditingName}
-              disabled={profileSaving}
-              maxLength={SIGNUP_NAME_MAX_LENGTH}
-              className={!isEditingName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
-            />
+            <div className="flex items-center gap-2">
+              <Input
+                id="account-last-name"
+                ref={lastNameInputRef}
+                type="text"
+                value={lastNameDraft}
+                onChange={(e) => {
+                  setLastNameDraft(e.target.value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                placeholder="Your last name"
+                readOnly={!isEditingLastName}
+                disabled={profileSaving}
+                maxLength={SIGNUP_NAME_MAX_LENGTH}
+                className={!isEditingLastName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+              />
+              {!isEditingLastName && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingLastName}
+                  disabled={profileSaving}
+                  title="Edit last name"
+                  aria-label="Edit last name"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
           </Field>
 
           <Field>
@@ -291,17 +330,34 @@ export default function AccountPage() {
 
           <Field>
             <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
-            <PhoneInput
-              id="account-mobile-number"
-              value={mobileNumberDraft}
-              onChange={(value) => {
-                setMobileNumberDraft(value);
-                if (profileError) setProfileError("");
-                setProfileSuccess(false);
-              }}
-              disabled={profileSaving}
-              maxLength={MOBILE_NUMBER_MAX_LENGTH}
-            />
+            <div className="flex items-center gap-2">
+              <PhoneInput
+                id="account-mobile-number"
+                value={mobileNumberDraft}
+                onChange={(value) => {
+                  setMobileNumberDraft(value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                disabled={profileSaving || !isEditingMobile}
+                maxLength={MOBILE_NUMBER_MAX_LENGTH}
+                className="flex-1"
+              />
+              {!isEditingMobile && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingMobile}
+                  disabled={profileSaving}
+                  title="Edit mobile number"
+                  aria-label="Edit mobile number"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
             <FieldHint>Optional.</FieldHint>
           </Field>
 
@@ -311,7 +367,7 @@ export default function AccountPage() {
           )}
 
           <div className="flex justify-end">
-            <Button type="submit" disabled={profileSaving || !profileDirty}>
+            <Button type="submit" disabled={profileSaving || !anyFieldEditing}>
               {profileSaving ? "Saving…" : "Save profile"}
             </Button>
           </div>
@@ -330,7 +386,7 @@ export default function AccountPage() {
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="max-w-md space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-4">
           {hasPassword && (
             <Field>
               <FieldLabel htmlFor="current-password">Current password</FieldLabel>

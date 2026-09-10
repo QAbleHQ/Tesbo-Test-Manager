@@ -397,24 +397,72 @@ test.describe("account screen and password reset (UI)", () => {
 
   // ─── Editing the profile ────────────────────────────────────────────────────
 
-  test("ACU-21 the first/last name fields are read-only until the pencil button is clicked", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+  test("ACU-21 each field's pencil unlocks only that field, independently of the others", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+    /*
+     * Regression cover: all three fields used to share one edit flag, so clicking any single
+     * pencil (e.g. Mobile number's) unlocked First name and Last name right along with it. Each
+     * field now owns its own flag — this pins that clicking one row's pencil affects only that row.
+     */
     const page = await openAccount(browser);
     const firstNameInput = page.locator("#account-first-name");
     const lastNameInput = page.locator("#account-last-name");
-    const editButton = page.getByRole("button", { name: "Edit name" });
+    const mobileInput = page.locator("#account-mobile-number");
+    const editFirstName = page.getByRole("button", { name: "Edit first name" });
+    const editLastName = page.getByRole("button", { name: "Edit last name" });
+    const editMobile = page.getByRole("button", { name: "Edit mobile number" });
+    const saveButton = page.getByRole("button", { name: "Save profile" });
 
     await expect(firstNameInput).toHaveAttribute("readonly", "");
     await expect(lastNameInput).toHaveAttribute("readonly", "");
-    await expect(editButton).toBeVisible();
+    await expect(mobileInput).toBeDisabled();
+    await expect(saveButton).toBeDisabled();
 
-    await editButton.click();
+    // First name's pencil unlocks only First name.
+    await editFirstName.click();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(firstNameInput).toBeFocused();
+    await expect(editFirstName).toHaveCount(0);
+    await expect(editLastName).toBeVisible();
+    await expect(editMobile).toBeVisible();
+    // Save enables the moment a field is unlocked, even before any value has actually changed.
+    await expect(saveButton).toBeEnabled();
 
-    // Both unlock together — they're saved as a pair, not independently.
+    // Last name's pencil unlocks Last name too, without relocking or affecting First name.
+    await editLastName.click();
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toBeFocused();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(editLastName).toHaveCount(0);
+    await expect(editMobile).toBeVisible();
+
+    // Mobile number's pencil unlocks it too, without touching the other two.
+    await editMobile.click();
+    await expect(mobileInput).toBeEnabled();
     await expect(firstNameInput).not.toHaveAttribute("readonly", "");
     await expect(lastNameInput).not.toHaveAttribute("readonly", "");
-    await expect(firstNameInput).toBeFocused();
-    // The pencil is only for entering edit mode — once editing, it has nothing left to do.
-    await expect(editButton).toHaveCount(0);
+    await expect(editMobile).toHaveCount(0);
+  });
+
+  test("ACU-22 saving with a field unlocked but unchanged succeeds safely and relocks the form", { tag: '@tesbo.testId("TES-TC-1414")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const firstNameInput = page.locator("#account-first-name");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await expect(saveButton).toBeEnabled();
+
+    // No typing at all — a pure no-op resubmit of the already-valid, unchanged value must not
+    // error or hang.
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Back to locked, its pencil restored, and Save disabled again.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Edit first name" })).toBeVisible();
+    await expect(saveButton).toBeDisabled();
   });
 
   test("ACU-13 the first name, last name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
@@ -437,9 +485,11 @@ test.describe("account screen and password reset (UI)", () => {
     // Nothing changed yet, so saving is disabled — this must not be a no-op button on load.
     await expect(saveButton).toBeDisabled();
 
-    // Names read read-only until the pencil button is clicked.
+    // Each field reads read-only until its own pencil button is clicked.
     await expect(firstNameInput).toHaveAttribute("readonly", "");
-    await page.getByRole("button", { name: "Edit name" }).click();
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
     await expect(firstNameInput).not.toHaveAttribute("readonly", "");
 
     await firstNameInput.fill(newFirstName);
@@ -477,7 +527,9 @@ test.describe("account screen and password reset (UI)", () => {
     const mobileInput = page.locator("#account-mobile-number");
     const saveButton = page.getByRole("button", { name: "Save profile" });
 
-    await page.getByRole("button", { name: "Edit name" }).click();
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
 
     // Empty / whitespace-only first name.
     await firstNameInput.fill("   ");
@@ -522,10 +574,14 @@ test.describe("account screen and password reset (UI)", () => {
     const mobileInput = page.locator("#account-mobile-number");
     const saveButton = page.getByRole("button", { name: "Save profile" });
 
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+
     await mobileInput.fill("+1 415 555 0199");
     await saveButton.click();
     await expect(page.getByText("Profile updated.")).toBeVisible();
 
+    // A successful save locks the fields again, same as the name fields — re-open before clearing.
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
     await mobileInput.fill("");
     await expect(saveButton).toBeEnabled();
     await saveButton.click();

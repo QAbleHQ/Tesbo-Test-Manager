@@ -11,6 +11,7 @@ type AppData = {
   workspace: WorkspaceInfo | null;
   projects: ProjectSummary[];
   refetchProjects: () => void;
+  refetchCurrentUser: () => void;
 };
 
 const AppDataContext = createContext<AppData | null>(null);
@@ -54,6 +55,18 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
     listProjects().then(setProjects).catch(() => undefined);
   }, []);
 
+  // Only currentUser is ever mutated after this provider's initial load (the Account page's
+  // PATCH /api/auth/me) — projects and workspace change through other pages' own create/update
+  // flows, which already refetchProjects()/reload where needed. Without this, a saved profile edit
+  // would look right on /account until the next navigation, then silently revert to the stale
+  // pre-edit name/mobile number (and the TopBar/Sidebar avatar initials would keep showing the old
+  // name the whole time) because currentUser is otherwise fetched once, on mount, and never again.
+  const refetchCurrentUser = useCallback(() => {
+    authMe().then((me) => {
+      if (me) setCurrentUser(me);
+    }).catch(() => undefined);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     Promise.all([authMe(), getWorkspace().catch(() => null), listProjects().catch(() => [])]).then(
@@ -76,8 +89,8 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
   }, [router]);
 
   const value = useMemo<AppData>(
-    () => ({ currentUser, workspace, projects, refetchProjects }),
-    [currentUser, workspace, projects, refetchProjects]
+    () => ({ currentUser, workspace, projects, refetchProjects, refetchCurrentUser }),
+    [currentUser, workspace, projects, refetchProjects, refetchCurrentUser]
   );
 
   if (status !== "authenticated") {
