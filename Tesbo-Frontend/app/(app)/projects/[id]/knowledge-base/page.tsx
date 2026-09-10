@@ -23,8 +23,6 @@ import {
   IconInfoCircle,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getKnowledgeFolderTree,
   listKnowledgeFolderItems,
   createKnowledgeFolder,
@@ -54,6 +52,8 @@ import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { FolderTreeNodeRow, flattenFolders, findAncestorIds, type FolderAction } from "@/components/knowledge-base/FolderTree";
 import {
   KB_ACCEPT_ATTR,
@@ -885,6 +885,9 @@ function KnowledgeBasePageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
   const folderParam = searchParams.get("folder");
   const appliedFolderParam = useRef<string | null>(null);
 
@@ -897,7 +900,6 @@ function KnowledgeBasePageInner() {
   }, [setTopBarFilled]);
 
   const [loading, setLoading] = useState(true);
-  const [projectName, setProjectName] = useState("");
   const [summary, setSummary] = useState<KnowledgeBaseSummary | null>(null);
   const [tree, setTree] = useState<KnowledgeFolderTreeNode | null>(null);
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -962,14 +964,12 @@ function KnowledgeBasePageInner() {
     const savedPanel = readStoredValue("tesbo_kb_tree_panel");
     if (savedPanel === "closed") setTreePanelOpen(false);
     (async () => {
-      const me = await authMe();
-      if (!me) {
+      if (!currentUser) {
         router.replace("/login");
         return;
       }
       try {
-        const [project, root] = await Promise.all([getProject(projectId), loadTree()]);
-        setProjectName(String(project.name || ""));
+        const root = await loadTree();
         void loadSummary();
         const initialFolderId = folderParam || root.id;
         appliedFolderParam.current = folderParam;
@@ -984,7 +984,7 @@ function KnowledgeBasePageInner() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUser]);
 
   // Keep the selected folder in sync with the URL, so links from elsewhere (e.g. a
   // document's "Back to folder") and the browser's back/forward buttons work correctly.

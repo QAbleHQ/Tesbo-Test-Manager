@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { IconPencil } from "@tabler/icons-react";
-import { authMe, changePassword, updateProfile } from "@/lib/api";
-import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, PageLoader, PasswordInput } from "@/components/ui";
+import { changePassword, updateProfile } from "@/lib/api";
+import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, PageLoader, PasswordInput, PhoneInput } from "@/components/ui";
 import {
   MOBILE_NUMBER_MAX_LENGTH,
   normalizeMobileNumber,
@@ -15,9 +15,11 @@ import {
   validateName,
   validatePasswordValue,
 } from "@/lib/validation";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AccountPage() {
   const router = useRouter();
+  const { currentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [firstName, setFirstName] = useState("");
@@ -46,26 +48,25 @@ export default function AccountPage() {
   const [confirmPasswordError, setConfirmPasswordError] = useState("");
   const [formError, setFormError] = useState("");
 
-  const load = useCallback(async () => {
-    const me = await authMe();
-    if (!me) {
+  const load = useCallback(() => {
+    if (!currentUser) {
       router.replace("/login");
       return;
     }
-    setEmail(me.email ?? "");
-    const trimmedFirstName = (me.firstName ?? "").trim();
-    const trimmedLastName = (me.lastName ?? "").trim();
+    setEmail(currentUser.email ?? "");
+    const trimmedFirstName = (currentUser.firstName ?? "").trim();
+    const trimmedLastName = (currentUser.lastName ?? "").trim();
     setFirstName(trimmedFirstName);
     setFirstNameDraft(trimmedFirstName);
     setLastName(trimmedLastName);
     setLastNameDraft(trimmedLastName);
-    setMobileNumber((me.mobileNumber ?? "").trim());
-    setMobileNumberDraft((me.mobileNumber ?? "").trim());
-    setHasPassword(Boolean(me.hasPassword));
+    setMobileNumber((currentUser.mobileNumber ?? "").trim());
+    setMobileNumberDraft((currentUser.mobileNumber ?? "").trim());
+    setHasPassword(Boolean(currentUser.hasPassword));
     setLoading(false);
-  }, [router]);
+  }, [router, currentUser]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   const profileDirty =
     firstNameDraft.trim() !== firstName || lastNameDraft.trim() !== lastName || mobileNumberDraft.trim() !== mobileNumber;
@@ -290,20 +291,18 @@ export default function AccountPage() {
 
           <Field>
             <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
-            <Input
+            <PhoneInput
               id="account-mobile-number"
-              type="tel"
               value={mobileNumberDraft}
-              onChange={(e) => {
-                setMobileNumberDraft(e.target.value);
+              onChange={(value) => {
+                setMobileNumberDraft(value);
                 if (profileError) setProfileError("");
                 setProfileSuccess(false);
               }}
-              placeholder="e.g. +1 415 555 0132"
               disabled={profileSaving}
               maxLength={MOBILE_NUMBER_MAX_LENGTH}
             />
-            <FieldHint>Optional. Include a country code for numbers outside your own.</FieldHint>
+            <FieldHint>Optional.</FieldHint>
           </Field>
 
           {profileError && <FieldError>{profileError}</FieldError>}

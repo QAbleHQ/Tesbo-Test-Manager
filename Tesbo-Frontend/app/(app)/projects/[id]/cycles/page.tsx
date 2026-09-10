@@ -22,18 +22,17 @@ import {
   IconTrash,
 } from "@tabler/icons-react";
 import {
-  authMe,
   listTestRuns,
   createTestRun,
   updateTestRun,
   deleteTestRun,
-  getProject,
-  listProjectMembers,
   listPlans,
   type TestRunListItem,
   type TestEnvironmentSetting,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
   Button,
   Input,
@@ -102,11 +101,13 @@ export default function TestRunsPage() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { currentUser } = useAppData();
+  const { project, projectMembers } = useProjectData();
   const projectId = params.id as string;
+  const projectName = String(project.name || "");
 
   const [runs, setRuns] = useState<TestRunListItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [ownerNames, setOwnerNames] = useState<Record<string, string>>({});
   const [planNames, setPlanNames] = useState<Record<string, string>>({});
 
   const [statusFilter, setStatusFilter] = useState("all");
@@ -124,9 +125,6 @@ export default function TestRunsPage() {
   const [buildVersion, setBuildVersion] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [environmentOptions, setEnvironmentOptions] = useState<TestEnvironmentSetting[]>([]);
-  const [canManageRuns, setCanManageRuns] = useState(false);
-  const [projectName, setProjectName] = useState("");
 
   useEffect(() => {
     if (searchParams.get("create") === "1") {
@@ -159,36 +157,36 @@ export default function TestRunsPage() {
       .filter((item): item is TestEnvironmentSetting => item !== null);
   }
 
+  const environmentOptions = useMemo(
+    () => normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments),
+    [project]
+  );
+  const canManageRuns = useMemo(() => {
+    const myRole = typeof project.myRole === "string" ? project.myRole.toLowerCase() : "";
+    return !myRole || ["owner", "admin", "manager"].includes(myRole);
+  }, [project]);
+  const ownerNames = useMemo(
+    () => Object.fromEntries(projectMembers.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
+    [projectMembers]
+  );
+
   const load = useCallback(() => {
-    Promise.all([
-      listTestRuns(projectId),
-      getProject(projectId),
-      listProjectMembers(projectId).catch(() => []),
-      listPlans(projectId).catch(() => []),
-    ])
-      .then(([runsData, project, members, plans]) => {
+    Promise.all([listTestRuns(projectId), listPlans(projectId).catch(() => [])])
+      .then(([runsData, plans]) => {
         setRuns(runsData);
-        const parsedSettings = parseProjectSettings(project.settings);
-        setEnvironmentOptions(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
-        const myRole = typeof project.myRole === "string" ? project.myRole.toLowerCase() : "";
-        setCanManageRuns(!myRole || ["owner", "admin", "manager"].includes(myRole));
-        setOwnerNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
         setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name])));
-        setProjectName(String(project.name || ""));
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-    });
-  }, [router, load]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [router, load, currentUser]);
 
   const visibleRuns = useMemo(() => {
     const filtered = statusFilter === "all" ? runs : runs.filter((r) => r.status === statusFilter);

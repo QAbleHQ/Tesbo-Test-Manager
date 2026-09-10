@@ -3,9 +3,10 @@
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { authMe, getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
+import { getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
 import { Card, PageLoader } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 /*
  * Basecamp 10221720616 ("[Dashboard] Execution progress bar colours are not visible").
@@ -70,30 +71,27 @@ function statusStyle(status: string) {
 
 export default function DashboardPage() {
   const router = useRouter();
-  const [auth, setAuth] = useState<{ userId: string } | null>(null);
+  const { currentUser } = useAppData();
   const [workspaceName, setWorkspaceName] = useState<string | null>(null);
   const [analytics, setAnalytics] = useState<WorkspaceAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    authMe().then((me) => {
-      setAuth(me);
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      Promise.all([getWorkspace(), getWorkspaceAnalytics()])
-        .then(([workspace, data]) => {
-          setWorkspaceName((workspace as WorkspaceInfo).name ?? "Workspace");
-          setAnalytics(data);
-        })
-        .catch((e) => setError(e instanceof Error ? e.message : "Failed to load analytics"))
-        .finally(() => setLoading(false));
-    });
-  }, [router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    Promise.all([getWorkspace(), getWorkspaceAnalytics()])
+      .then(([workspace, data]) => {
+        setWorkspaceName((workspace as WorkspaceInfo).name ?? "Workspace");
+        setAnalytics(data);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load analytics"))
+      .finally(() => setLoading(false));
+  }, [router, currentUser]);
 
-  if (!auth) {
+  if (!currentUser) {
     return <PageLoader variant="screen" />;
   }
 

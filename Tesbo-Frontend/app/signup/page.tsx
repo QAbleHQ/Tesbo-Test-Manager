@@ -9,7 +9,7 @@ import { requestOtp, startSignup, verifySignup } from "@/lib/api";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { AuthModeToggle, type AuthMode } from "@/components/auth/AuthModeToggle";
 import { OtpBoxInput } from "@/components/auth/OtpBoxInput";
-import { Button, Field, FieldError, FieldHint, FieldLabel, Input, PasswordInput } from "@/components/ui";
+import { Button, Field, FieldError, FieldHint, FieldLabel, Input, PasswordInput, PhoneInput } from "@/components/ui";
 import {
   EMAIL_MAX_LENGTH,
   MOBILE_NUMBER_MAX_LENGTH,
@@ -219,17 +219,13 @@ export default function SignupPage() {
             </div>
             <Field>
               <FieldLabel htmlFor="signup-mobile">Mobile number</FieldLabel>
-              <Input
+              <PhoneInput
                 id="signup-mobile"
-                type="tel"
-                autoComplete="tel"
                 value={mobileNumber}
-                onChange={(e) => {
-                  const value = e.target.value;
+                onChange={(value) => {
                   setMobileNumber(value);
                   if (mobileNumberError && !validateMobileNumber(value)) setMobileNumberError("");
                 }}
-                placeholder="+14155551234"
                 disabled={submitting}
                 maxLength={MOBILE_NUMBER_MAX_LENGTH}
                 aria-invalid={Boolean(mobileNumberError)}
@@ -237,7 +233,7 @@ export default function SignupPage() {
               {mobileNumberError ? (
                 <FieldError>{mobileNumberError}</FieldError>
               ) : (
-                <FieldHint>Optional. Include a country code, e.g. +1 for the US.</FieldHint>
+                <FieldHint>Optional.</FieldHint>
               )}
             </Field>
             <Field>

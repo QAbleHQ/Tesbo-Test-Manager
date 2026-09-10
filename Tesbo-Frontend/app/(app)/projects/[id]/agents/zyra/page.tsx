@@ -6,10 +6,8 @@ import { createPortal } from "react-dom";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
 import {
-  authMe,
   continueZyraChatMessage,
   createZyraChatSession,
-  getProject,
   getZyraAgent,
   getZyraChatSession,
   listZyraChatSessions,
@@ -29,6 +27,8 @@ import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { ZyraCitationsList } from "@/components/agents/ZyraCitations";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
 function ZyraMark({ size = 24 }: { size?: number }) {
@@ -505,6 +505,9 @@ export default function ZyraChatPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // matching the full-bleed IDE-workspace pattern used by the Test Cases / Plan Details screens.
@@ -514,7 +517,6 @@ export default function ZyraChatPage() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [projectName, setProjectName] = useState("");
   const [agent, setAgent] = useState<ZyraAgentState | null>(null);
   const [sessions, setSessions] = useState<ZyraChatSession[]>([]);
   const [activeSession, setActiveSession] = useState<ZyraChatSession | null>(null);
@@ -571,12 +573,10 @@ export default function ZyraChatPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [project, agentData, sessionData] = await Promise.all([
-        getProject(projectId),
+      const [agentData, sessionData] = await Promise.all([
         getZyraAgent(projectId),
         refreshSessions(),
       ]);
-      setProjectName(String(project.name || ""));
       setAgent(agentData);
       if (sessionData[0]) await openSession(sessionData[0].id);
       else await createSession();
@@ -591,11 +591,9 @@ export default function ZyraChatPage() {
   useEffect(() => {
     if (loadStartedRef.current) return;
     loadStartedRef.current = true;
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-  }, [loadData, router]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, currentUser]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });

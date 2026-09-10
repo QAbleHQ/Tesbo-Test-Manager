@@ -17,9 +17,6 @@ import {
   IconMessagePlus,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
-  listProjectMembers,
   getKnowledgeDocument,
   updateKnowledgeDocument,
   duplicateKnowledgeDocument,
@@ -37,6 +34,8 @@ import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 type SaveStatus = "saved" | "saving" | "unsaved";
 
@@ -176,11 +175,13 @@ export default function KnowledgeDocumentPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const documentId = params.documentId as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [loading, setLoading] = useState(true);
   const [doc, setDoc] = useState<KnowledgeDocument | null>(null);
   const [breadcrumb, setBreadcrumb] = useState<KnowledgeBreadcrumbEntry[]>([]);
-  const [projectName, setProjectName] = useState("");
   const [title, setTitle] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [error, setError] = useState<string | null>(null);
@@ -223,12 +224,11 @@ export default function KnowledgeDocumentPage() {
 
   useEffect(() => {
     (async () => {
-      const me = await authMe();
-      if (!me) {
+      if (!currentUser) {
         router.replace("/login");
         return;
       }
-      setCurrentUserId(me.userId);
+      setCurrentUserId(currentUser.userId);
       try {
         const data = await getKnowledgeDocument(projectId, documentId);
         setDoc(data);
@@ -239,10 +239,8 @@ export default function KnowledgeDocumentPage() {
         } catch {
           // Private browsing / storage disabled — fall back to the default title-or-content rule.
         }
-        const members = await listProjectMembers(projectId).catch(() => []);
-        const role = normalizeRole(members.find((m) => m.userId === me.userId)?.role ?? "qa_engineer");
+        const role = normalizeRole(projectMembers.find((m) => m.userId === currentUser.userId)?.role ?? "qa_engineer");
         setCanApprove(role === "owner" || role === "manager");
-        getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load document.");
       } finally {
@@ -250,7 +248,7 @@ export default function KnowledgeDocumentPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, documentId]);
+  }, [projectId, documentId, currentUser]);
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
