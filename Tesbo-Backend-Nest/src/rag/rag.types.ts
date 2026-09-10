@@ -21,3 +21,9 @@ export interface RetrievedKnowledgeItem {
   citation: { sourceType: RagSourceType; sourceId: string; headingPath: string | null };
   score: number;
 }
+
+// "none": no semantic score to judge by (ANN never ran, or nothing cleared RAG_MIN_SIMILARITY) —
+// any items present came from keyword (FTS) matching alone.
+// "weak": the top semantic match cleared RAG_MIN_SIMILARITY but not RAG_CONFIDENT_SIMILARITY.
+// "strong": the top semantic match cleared RAG_CONFIDENT_SIMILARITY.
+export type RagRetrievalConfidence = "none" | "weak" | "strong";
