@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { Response } from "express";
 import { AuthenticatedRequest } from "../common/request.types";
 import { validatePersonName } from "../common/person-name.util";
@@ -10,6 +10,7 @@ type VerifyOtpBody = { email?: string; code?: string };
 type PasswordLoginBody = { email?: string; password?: string };
 type ResetPasswordBody = { token?: string; password?: string };
 type ChangePasswordBody = { currentPassword?: string; newPassword?: string };
+type UpdateProfileBody = { firstName?: string; lastName?: string; mobileNumber?: string };
 type CompleteProfileBody = { firstName?: string; lastName?: string; mobileNumber?: string };
 
 @Controller("/api/auth")
@@ -73,6 +74,14 @@ export class AuthController {
   me(@Req() req: AuthenticatedRequest) {
     if (!req.userId) throw new UnauthorizedException("Not authenticated");
     return this.auth.me(req.userId);
+  }
+
+  @Patch("/me")
+  updateMe(@Body() body: UpdateProfileBody, @Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    const firstName = body.firstName !== undefined ? validatePersonName(body.firstName, "First name", 50) : undefined;
+    const lastName = body.lastName !== undefined ? validatePersonName(body.lastName, "Last name", 50) : undefined;
+    return this.auth.updateProfile(req.userId, firstName, lastName, body.mobileNumber);
   }
 
   @Post("/complete-profile")

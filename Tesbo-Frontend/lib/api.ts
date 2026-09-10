@@ -137,6 +137,20 @@ export async function authMe(): Promise<{
   }
 }
 
+export async function updateProfile(data: { firstName?: string; lastName?: string; mobileNumber?: string }): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+}> {
+  return api("/api/auth/me", { method: "PATCH", body: data });
+}
+
 export async function completeProfile(data: { firstName: string; lastName: string; mobileNumber?: string }): Promise<void> {
   await api("/api/auth/complete-profile", { method: "POST", body: data });
 }

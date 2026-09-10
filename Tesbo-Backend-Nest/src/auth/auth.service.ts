@@ -11,6 +11,7 @@ import { AuthenticatedRequest } from "../common/request.types";
 import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { SuperAdminService } from "../admin/super-admin.service";
+import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
 import { OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
@@ -179,10 +180,55 @@ export class AuthService {
   }
 
   /**
+   * Edits the profile of an account that has already completed the one-time step below (or never
+   * needed to). `firstName`/`lastName`/`mobileNumber` are each independently optional so the Account
+   * page can save just the field(s) that changed; every other users column (email, avatar_url,
+   * password_hash, active_organization_id, ...) has its own dedicated flow elsewhere, isn't exposed
+   * through this feature, or is not user-editable at all. `name` is kept in sync alongside
+   * first/last, since it's still what member lists, bug reporter/assignee, and the activity feed
+   * read.
+   */
+  async updateProfile(
+    userId: string,
+    firstName: string | undefined,
+    lastName: string | undefined,
+    mobileNumber: string | undefined
+  ) {
+    if (firstName === undefined && lastName === undefined && mobileNumber === undefined) {
+      throw new BadRequestException({ error: "Nothing to update" });
+    }
+
+    if (firstName !== undefined || lastName !== undefined) {
+      const current = await this.db.query<{ first_name: string | null; last_name: string | null }>(
+        "SELECT first_name, last_name FROM users WHERE id = $1",
+        [userId]
+      );
+      const nextFirstName = firstName ?? current.rows[0]?.first_name ?? "";
+      const nextLastName = lastName ?? current.rows[0]?.last_name ?? "";
+      const name = [nextFirstName, nextLastName].filter(Boolean).join(" ");
+      await this.db.query(
+        "UPDATE users SET first_name = $1, last_name = $2, name = $3, updated_at = now() WHERE id = $4",
+        [nextFirstName || null, nextLastName || null, name, userId]
+      );
+    }
+
+    if (mobileNumber !== undefined) {
+      // Matches the CHECK constraint on users.mobile_number (V105_user_profile_fields.sql) and the
+      // signup-time validator in mobile-number.util.ts: an already-normalized "+<country
+      // code><digits>" string. The frontend strips spaces/dashes/parens before sending it, so a
+      // malformed value here means the input truly doesn't parse as a phone number.
+      const validated = validateMobileNumber(mobileNumber);
+      await this.db.query("UPDATE users SET mobile_number = $1, updated_at = now() WHERE id = $2", [validated, userId]);
+    }
+
+    return this.me(userId);
+  }
+
+  /**
    * Finishes the one-time profile step for an account created via passwordless OTP sign-in, which
    * collects no name/mobile up front (OtpService.findOrCreateUser). Every other account-creation path
    * already sets profile_completed_at at INSERT time, so this only ever succeeds once per account —
-   * it is not a general "edit your profile" endpoint (there is deliberately no PATCH /me for that).
+   * updateProfile() above is the general-purpose edit, once this has run (or never had to).
    */
   async completeProfile(userId: string, firstName: string, lastName: string, mobileNumber: string | null) {
     const name = `${firstName} ${lastName}`;
