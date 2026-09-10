@@ -23,6 +23,8 @@ export { Field, FieldLabel, FieldHint, FieldError } from "@/components/ui/Field"
 export { default as Input } from "@/components/ui/Input";
 export type { InputProps } from "@/components/ui/Input";
 export { default as PasswordInput } from "@/components/ui/PasswordInput";
+export { default as PhoneInput } from "@/components/ui/PhoneInput";
+export type { PhoneInputProps } from "@/components/ui/PhoneInput";
 export { default as Select } from "@/components/ui/Select";
 export type { SelectProps } from "@/components/ui/Select";
 export { default as Textarea } from "@/components/ui/Textarea";

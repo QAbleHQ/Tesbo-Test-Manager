@@ -6,7 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { authMe, completeProfile } from "@/lib/api";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { AuthLoadingScreen } from "@/components/auth/AuthLoadingScreen";
-import { Button, Field, FieldError, FieldHint, FieldLabel, Input } from "@/components/ui";
+import { Button, Field, FieldError, FieldHint, FieldLabel, Input, PhoneInput } from "@/components/ui";
 import {
   MOBILE_NUMBER_MAX_LENGTH,
   SIGNUP_NAME_MAX_LENGTH,
@@ -143,17 +143,13 @@ function CompleteProfileForm() {
 
           <Field>
             <FieldLabel htmlFor="complete-mobile">Mobile number</FieldLabel>
-            <Input
+            <PhoneInput
               id="complete-mobile"
-              type="tel"
-              autoComplete="tel"
               value={mobileNumber}
-              onChange={(e) => {
-                const value = e.target.value;
+              onChange={(value) => {
                 setMobileNumber(value);
                 if (mobileNumberError && !validateMobileNumber(value)) setMobileNumberError("");
               }}
-              placeholder="+14155551234"
               disabled={submitting}
               maxLength={MOBILE_NUMBER_MAX_LENGTH}
               aria-invalid={Boolean(mobileNumberError)}
@@ -161,7 +157,7 @@ function CompleteProfileForm() {
             {mobileNumberError ? (
               <FieldError>{mobileNumberError}</FieldError>
             ) : (
-              <FieldHint>Optional. Include a country code, e.g. +1 for the US.</FieldHint>
+              <FieldHint>Optional.</FieldHint>
             )}
           </Field>
 

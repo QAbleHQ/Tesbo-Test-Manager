@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { authMe, changePassword } from "@/lib/api";
+import { changePassword } from "@/lib/api";
 import { Button, Card, Field, FieldError, FieldHint, FieldLabel, PageLoader, PasswordInput } from "@/components/ui";
 import { PASSWORD_MAX_LENGTH, PASSWORD_RULES_HINT, validatePasswordValue } from "@/lib/validation";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AccountPage() {
   const router = useRouter();
+  const { currentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [firstName, setFirstName] = useState("");
@@ -24,21 +26,20 @@ export default function AccountPage() {
   const [confirmPasswordError, setConfirmPasswordError] = useState("");
   const [formError, setFormError] = useState("");
 
-  const load = useCallback(async () => {
-    const me = await authMe();
-    if (!me) {
+  const load = useCallback(() => {
+    if (!currentUser) {
       router.replace("/login");
       return;
     }
-    setEmail(me.email ?? "");
-    setFirstName((me.firstName ?? "").trim());
-    setLastName((me.lastName ?? "").trim());
-    setMobileNumber((me.mobileNumber ?? "").trim());
-    setHasPassword(Boolean(me.hasPassword));
+    setEmail(currentUser.email ?? "");
+    setFirstName((currentUser.firstName ?? "").trim());
+    setLastName((currentUser.lastName ?? "").trim());
+    setMobileNumber((currentUser.mobileNumber ?? "").trim());
+    setHasPassword(Boolean(currentUser.hasPassword));
     setLoading(false);
-  }, [router]);
+  }, [router, currentUser]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   function clearErrors() {
     setCurrentPasswordError("");

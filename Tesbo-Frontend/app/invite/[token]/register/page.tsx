@@ -12,7 +12,7 @@ import {
   type InviteDetails,
 } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
-import { Button, Card, CardBody, CardHeader, CardTitle, Field, FieldError, FieldLabel, FieldHint, Input } from "@/components/ui";
+import { Button, Card, CardBody, CardHeader, CardTitle, Field, FieldError, FieldLabel, FieldHint, Input, PhoneInput } from "@/components/ui";
 import {
   MOBILE_NUMBER_MAX_LENGTH,
   SIGNUP_NAME_MAX_LENGTH,
@@ -317,16 +317,13 @@ export default function RegisterFromInvitePage() {
 
               <Field>
                 <FieldLabel htmlFor="reg-mobile">Mobile number</FieldLabel>
-                <Input
+                <PhoneInput
                   id="reg-mobile"
-                  type="tel"
-                  autoComplete="tel"
                   value={mobileNumber}
-                  onChange={(e) => {
-                    setMobileNumber(e.target.value);
+                  onChange={(value) => {
+                    setMobileNumber(value);
                     if (mobileNumberError) setMobileNumberError("");
                   }}
-                  placeholder="+14155551234"
                   disabled={submitting}
                   maxLength={MOBILE_NUMBER_MAX_LENGTH}
                   aria-invalid={Boolean(mobileNumberError)}
@@ -334,7 +331,7 @@ export default function RegisterFromInvitePage() {
                 {mobileNumberError ? (
                   <FieldError>{mobileNumberError}</FieldError>
                 ) : (
-                  <FieldHint>Optional. Include a country code, e.g. +1 for the US.</FieldHint>
+                  <FieldHint>Optional.</FieldHint>
                 )}
               </Field>
 
@@ -469,16 +466,13 @@ export default function RegisterFromInvitePage() {
 
               <Field>
                 <FieldLabel htmlFor="reg-otp-mobile">Mobile number</FieldLabel>
-                <Input
+                <PhoneInput
                   id="reg-otp-mobile"
-                  type="tel"
-                  autoComplete="tel"
                   value={mobileNumber}
-                  onChange={(e) => {
-                    setMobileNumber(e.target.value);
+                  onChange={(value) => {
+                    setMobileNumber(value);
                     if (otpMobileNumberError) setOtpMobileNumberError("");
                   }}
-                  placeholder="+14155551234"
                   disabled={submitting}
                   maxLength={MOBILE_NUMBER_MAX_LENGTH}
                   aria-invalid={Boolean(otpMobileNumberError)}
@@ -486,7 +480,7 @@ export default function RegisterFromInvitePage() {
                 {otpMobileNumberError ? (
                   <FieldError>{otpMobileNumberError}</FieldError>
                 ) : (
-                  <FieldHint>Optional. Include a country code, e.g. +1 for the US.</FieldHint>
+                  <FieldHint>Optional.</FieldHint>
                 )}
               </Field>
 
