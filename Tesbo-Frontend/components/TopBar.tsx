@@ -7,6 +7,8 @@ import type { AppNotification, ProjectSummary } from "@/lib/api";
 import { listNotifications } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useAppData } from "@/components/app/AppDataProvider";
+import { useLogout } from "@/lib/useLogout";
+import ThemeToggle from "@/components/ThemeToggle";
 
 const MAX_RESULTS = 8;
 
@@ -35,6 +37,10 @@ export default function TopBar() {
   const [notifLoading, setNotifLoading] = useState(false);
   const [notifError, setNotifError] = useState<string | null>(null);
   const notifBoxRef = useRef<HTMLDivElement>(null);
+
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+  const { isLoggingOut, logout: onLogout } = useLogout();
 
   // Only used for the tooltip text on the search button — the ⌘K/Ctrl+K shortcut itself works on
   // every platform regardless. Resolved after mount so SSR and the first client render still match.
@@ -79,6 +85,22 @@ export default function TopBar() {
       document.removeEventListener("keydown", handleEscape);
     };
   }, [notifOpen]);
+
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    function handleOutsideClick(e: MouseEvent) {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) setUserMenuOpen(false);
+    }
+    function handleEscape(e: KeyboardEvent) {
+      if (e.key === "Escape") setUserMenuOpen(false);
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [userMenuOpen]);
 
   async function loadNotifications() {
     setNotifLoading(true);
@@ -271,22 +293,73 @@ export default function TopBar() {
             </div>
           )}
         </div>
-        <span
-          title={displayName || undefined}
-          /*
-           * Seeded from the identity, not a flat brand fill.
-           *
-           * Basecamp 10198836413 — "Display picture initials show different colours across the
-           * website". One person's initials were painted five different ways: the seeded palette on
-           * cycles and plan cards, a flat --cta-primary here and in the workspace switcher, a flat
-           * --brand-soft in knowledge base comments, and a flat --surface-tertiary in Manage Admins.
-           * avatarColor() is the single source, and every swatch in it clears 4.5:1 under white text.
-           */
-          className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-full text-[11px] font-semibold text-white"
-          style={{ backgroundColor: avatarColor(avatarSeed || "?") }}
-        >
-          {displayName ? getInitials(displayName) : ""}
-        </span>
+        <div ref={userMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setUserMenuOpen((o) => !o)}
+            title={displayName || undefined}
+            aria-label="User menu"
+            aria-haspopup="true"
+            aria-expanded={userMenuOpen}
+            className="shrink-0 rounded-full"
+          >
+            <span
+              /*
+               * Seeded from the identity, not a flat brand fill.
+               *
+               * Basecamp 10198836413 — "Display picture initials show different colours across the
+               * website". One person's initials were painted five different ways: the seeded palette on
+               * cycles and plan cards, a flat --cta-primary here and in the workspace switcher, a flat
+               * --brand-soft in knowledge base comments, and a flat --surface-tertiary in Manage Admins.
+               * avatarColor() is the single source, and every swatch in it clears 4.5:1 under white text.
+               */
+              className="grid h-[30px] w-[30px] place-items-center rounded-full text-[11px] font-semibold text-white"
+              style={{ backgroundColor: avatarColor(avatarSeed || "?") }}
+            >
+              {displayName ? getInitials(displayName) : ""}
+            </span>
+          </button>
+
+          {userMenuOpen && (
+            <div
+              role="menu"
+              aria-label="User menu"
+              className="absolute right-0 top-full z-40 mt-1 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  router.push("/account");
+                }}
+                className="block w-full px-3 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                Profile Settings
+              </button>
+
+              <div role="none" className="flex items-center justify-between gap-3 px-3 py-2">
+                <p className="text-[13px] text-[var(--foreground)]">Theme</p>
+                <ThemeToggle />
+              </div>
+
+              <div role="none" className="my-1 border-t border-[var(--border-subtle)]" />
+
+              <button
+                type="button"
+                role="menuitem"
+                disabled={isLoggingOut}
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  void onLogout();
+                }}
+                className="block w-full px-3 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isLoggingOut ? "Logging out…" : "Logout"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </header>
   );

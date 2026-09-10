@@ -13,13 +13,22 @@ import {
   IconPlug,
   IconSparkles,
 } from "@tabler/icons-react";
-import { authMe, getProject, getZyraAgent, updateZyraSettings, testZyraAiConnection, type ZyraAgentState, type ZyraCapabilities } from "@/lib/api";
+import { getZyraAgent, updateZyraSettings, testZyraAiConnection, type ZyraAgentState, type ZyraCapabilities } from "@/lib/api";
 import { Button, Card, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 type ConnectionResult = { ok: boolean; provider: string; model: string; error?: string; latencyMs: number } | null;
 
 type TestcaseRange = "minimum" | "1-10" | "10-30" | "all";
+
+interface ZyraSettingsData {
+  state: ZyraAgentState;
+  testcaseRange: TestcaseRange;
+  capabilities: ZyraCapabilities;
+}
 
 const RANGE_OPTIONS: { value: TestcaseRange; num: string; label: string; description: string }[] = [
   { value: "minimum", num: "1–3",   label: "Minimum",    description: "Critical path scenarios only" },
@@ -77,26 +86,38 @@ export default function ZyraSettingsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
-  const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [testcaseRange, setTestcaseRange] = useState<TestcaseRange>(DEFAULT_TESTCASE_RANGE);
-  const [capabilities, setCapabilities] = useState<ZyraCapabilities>(DEFAULT_CAPABILITIES);
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
+
+  const cacheKey = `agents-zyra-settings:${projectId}`;
+  const cached = getPageCache<ZyraSettingsData>(cacheKey);
+
+  const [state, setState] = useState<ZyraAgentState | null>(cached?.state ?? null);
+  const [testcaseRange, setTestcaseRange] = useState<TestcaseRange>(cached?.testcaseRange ?? DEFAULT_TESTCASE_RANGE);
+  const [capabilities, setCapabilities] = useState<ZyraCapabilities>(cached?.capabilities ?? DEFAULT_CAPABILITIES);
   const [dirty, setDirty] = useState(false);
-  const [loading, setLoading] = useState(true);
+  // Only the true first visit to this project's Zyra settings has no cache to seed from — every
+  // later visit renders the last-known settings immediately while the effect below revalidates
+  // them in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [connectionResult, setConnectionResult] = useState<ConnectionResult>(null);
   const [error, setError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
 
   const loadData = useCallback(async () => {
     try {
       const data = await getZyraAgent(projectId);
+      const range = (data.settings.testcaseRange as TestcaseRange) || DEFAULT_TESTCASE_RANGE;
+      const caps = { ...DEFAULT_CAPABILITIES, ...(data.settings.capabilities || {}) };
       setState(data);
-      setTestcaseRange((data.settings.testcaseRange as TestcaseRange) || DEFAULT_TESTCASE_RANGE);
-      setCapabilities({ ...DEFAULT_CAPABILITIES, ...(data.settings.capabilities || {}) });
+      setTestcaseRange(range);
+      setCapabilities(caps);
       setDirty(false);
       setError(null);
+      setPageCache(`agents-zyra-settings:${projectId}`, { state: data, testcaseRange: range, capabilities: caps });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load Zyra settings.");
     } finally {
@@ -105,12 +126,23 @@ export default function ZyraSettingsPage() {
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-  }, [loadData, router, projectId]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    // A cache hit renders the last-known settings immediately (no spinner); loadData still runs
+    // right after to revalidate in the background, so this is stale-while-revalidate, not a
+    // cache-only shortcut.
+    const existing = getPageCache<ZyraSettingsData>(`agents-zyra-settings:${projectId}`);
+    if (existing) {
+      setState(existing.state);
+      setTestcaseRange(existing.testcaseRange);
+      setCapabilities(existing.capabilities);
+      setDirty(false);
+      setLoading(false);
+    }
+    void loadData();
+  }, [loadData, router, projectId, currentUser]);
 
   function updateCapability(key: keyof ZyraCapabilities, value: boolean) {
     setCapabilities((prev) => ({ ...prev, [key]: value }));

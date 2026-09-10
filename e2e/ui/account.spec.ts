@@ -349,36 +349,252 @@ test.describe("account screen and password reset (UI)", () => {
   });
   // ─── The profile card ──────────────────────────────────────────────────────
 
-  test("ACU-11 the profile shows the name captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
+  test("ACU-11 the profile shows the first name and surname captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
     /*
      * Basecamp 10212498688 — "Profile page should have user name and surname and mobile number fields
      * fetched during sign up". The Profile card rendered nothing but the email.
      *
-     * The name half was a pure display gap: /signup collects First name and Last name, sends them as
-     * one `name`, and GET /me has always returned it — the screen just never read it. Asserted against
-     * the value the API reports rather than a hard-coded string, so this stays true for any tenant.
+     * /signup collects First name and Last name separately, sends them as one `name`, and GET /me now
+     * splits that stored value back into firstName/lastName (auth.service.ts `me()`) so the screen can
+     * show the two fields signup actually collected instead of one merged string. Asserted against the
+     * value the API reports rather than a hard-coded string, so this stays true for any tenant. Both
+     * are editable inputs (see ACU-13/ACU-14 below for the PATCH round trip), so this reads `value`
+     * rather than text content.
      *
-     * The mobile number is deliberately NOT asserted: signup never collects one, there is no column
-     * and no value to fetch, so there is nothing to display. That half is a separate feature and is
-     * recorded on the card for Specification — not silently rendered as an empty row.
+     * The mobile number is asserted only for visibility, not a specific value: signup collects it as
+     * optional, so this tenant's user may legitimately have none on file.
      */
     const page = await openAccount(browser);
 
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; email?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; email?: string | null })
+        : null;
     });
     expect(reported, "GET /me did not answer").not.toBeNull();
-    const expectedName = (reported!.name ?? "").trim();
-    expect(expectedName, "this tenant's user has no name stored, so the test proves nothing").not.toBe("");
+    const expectedFirstName = (reported!.firstName ?? "").trim();
+    const expectedLastName = (reported!.lastName ?? "").trim();
+    expect(expectedFirstName, "this tenant's user has no first name stored, so the test proves nothing").not.toBe("");
+    expect(expectedLastName, "this tenant's user has no last name stored, so the test proves nothing").not.toBe("");
 
-    // The name is on the screen, and labelled — not just present somewhere in the markup.
-    const nameValue = page.locator("#account-name");
-    await expect(nameValue, "the profile card shows no name field").toBeVisible();
-    await expect(nameValue).toHaveText(expectedName);
+    // First name and last name are on the screen, each labelled — not just present somewhere in the markup.
+    const firstNameValue = page.locator("#account-first-name");
+    await expect(firstNameValue, "the profile card shows no first name field").toBeVisible();
+    await expect(firstNameValue).toHaveValue(expectedFirstName);
+
+    const lastNameValue = page.locator("#account-last-name");
+    await expect(lastNameValue, "the profile card shows no last name field").toBeVisible();
+    await expect(lastNameValue).toHaveValue(expectedLastName);
 
     // The email it used to show alone is still there.
     await expect(page.locator("#account-email")).toHaveText((reported!.email ?? "").trim());
+
+    // Mobile number now has a real column and a field on the card — whatever this tenant's value is
+    // (signup collects it as optional, so it may legitimately be unset), the field itself must render.
+    await expect(page.locator("#account-mobile-number"), "the profile card shows no mobile number field").toBeVisible();
+  });
+
+  // ─── Editing the profile ────────────────────────────────────────────────────
+
+  test("ACU-21 each field's pencil unlocks only that field, independently of the others", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+    /*
+     * Regression cover: all three fields used to share one edit flag, so clicking any single
+     * pencil (e.g. Mobile number's) unlocked First name and Last name right along with it. Each
+     * field now owns its own flag — this pins that clicking one row's pencil affects only that row.
+     */
+    const page = await openAccount(browser);
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const editFirstName = page.getByRole("button", { name: "Edit first name" });
+    const editLastName = page.getByRole("button", { name: "Edit last name" });
+    const editMobile = page.getByRole("button", { name: "Edit mobile number" });
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(saveButton).toBeDisabled();
+
+    // First name's pencil unlocks only First name.
+    await editFirstName.click();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(firstNameInput).toBeFocused();
+    await expect(editFirstName).toHaveCount(0);
+    await expect(editLastName).toBeVisible();
+    await expect(editMobile).toBeVisible();
+    // Save enables the moment a field is unlocked, even before any value has actually changed.
+    await expect(saveButton).toBeEnabled();
+
+    // Last name's pencil unlocks Last name too, without relocking or affecting First name.
+    await editLastName.click();
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toBeFocused();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(editLastName).toHaveCount(0);
+    await expect(editMobile).toBeVisible();
+
+    // Mobile number's pencil unlocks it too, without touching the other two.
+    await editMobile.click();
+    await expect(mobileInput).toBeEnabled();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(editMobile).toHaveCount(0);
+  });
+
+  test("ACU-22 saving with a field unlocked but unchanged succeeds safely and relocks the form", { tag: '@tesbo.testId("TES-TC-1414")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const firstNameInput = page.locator("#account-first-name");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await expect(saveButton).toBeEnabled();
+
+    // No typing at all — a pure no-op resubmit of the already-valid, unchanged value must not
+    // error or hang.
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Back to locked, its pencil restored, and Save disabled again.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Edit first name" })).toBeVisible();
+    await expect(saveButton).toBeDisabled();
+  });
+
+  test("ACU-13 the first name, last name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const newFirstName = `E2EFirst${Date.now()}`;
+    const newLastName = `E2ELast${Date.now()}`;
+    // Typed with the formatting a real user would use — the screen strips it before sending, so the
+    // value that actually persists (asserted below) is the normalized "+14155550132".
+    const typedMobileNumber = "+1 415 555 0132";
+    const normalizedMobileNumber = "+14155550132";
+
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    // No profile picture field of any kind on this screen — that feature was removed.
+    await expect(page.getByText(/profile picture/i)).toHaveCount(0);
+
+    // Nothing changed yet, so saving is disabled — this must not be a no-op button on load.
+    await expect(saveButton).toBeDisabled();
+
+    // Each field reads read-only until its own pencil button is clicked.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+
+    await firstNameInput.fill(newFirstName);
+    await lastNameInput.fill(newLastName);
+    await mobileInput.fill(typedMobileNumber);
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Persisted server-side, not just in local component state — and normalized, not the raw typed
+    // formatting, since that's what the API stores and the CHECK constraint on users.mobile_number
+    // requires.
+    await page.reload();
+    await expect(page.locator("#account-first-name")).toHaveValue(newFirstName);
+    await expect(page.locator("#account-last-name")).toHaveValue(newLastName);
+    await expect(page.locator("#account-mobile-number")).toHaveValue(normalizedMobileNumber);
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
+    });
+    expect(reported?.firstName).toBe(newFirstName);
+    expect(reported?.lastName).toBe(newLastName);
+    expect(reported?.mobileNumber).toBe(normalizedMobileNumber);
+  });
+
+  test("ACU-14 an empty first/last name or an out-of-range mobile number is rejected inline", { tag: '@tesbo.testId("TES-TC-1401")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+
+    // Empty / whitespace-only first name.
+    await firstNameInput.fill("   ");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("First name is required")).toBeVisible();
+
+    // Empty / whitespace-only last name.
+    await firstNameInput.fill("E2E Valid First");
+    await lastNameInput.fill("   ");
+    await saveButton.click();
+    await expect(page.getByText("Last name is required")).toBeVisible();
+
+    // Too few digits to be a real number — rejected rather than silently stored.
+    await lastNameInput.fill("E2E Valid Last");
+    await mobileInput.fill("12345");
+    await saveButton.click();
+    await expect(page.getByText(/mobile number/i)).toBeVisible();
+
+    // A plausible-looking number missing its country code — the constraint requires an explicit
+    // leading '+', so this is rejected inline rather than silently normalized to one.
+    await mobileInput.fill("14155550132");
+    await saveButton.click();
+    await expect(page.getByText(/country code/i)).toBeVisible();
+
+    // None of the rejected attempts reached the server: GET /me still reports the original values.
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
+    });
+    expect(reported?.firstName).not.toBe("");
+    expect(reported?.lastName).not.toBe("");
+    expect(reported?.mobileNumber ?? "").not.toBe("14155550132");
+  });
+
+  test("ACU-15 a mobile number is optional — clearing it back to blank is allowed and persists", { tag: '@tesbo.testId("TES-TC-1407")' }, async ({ browser }) => {
+    // Existing users (and this tenant's owner before this test) have no mobile number on file —
+    // saving the profile must not force one to be entered, and an explicit clear must stick.
+    const page = await openAccount(browser);
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+
+    await mobileInput.fill("+1 415 555 0199");
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // A successful save locks the fields again, same as the name fields — re-open before clearing.
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+    await mobileInput.fill("");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator("#account-mobile-number")).toHaveValue("");
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok ? ((await res.json()) as { mobileNumber?: string | null }) : null;
+    });
+    expect(reported?.mobileNumber).toBeNull();
   });
 
   // ─── Cross-device session invalidation ─────────────────────────────────────
@@ -400,5 +616,101 @@ test.describe("account screen and password reset (UI)", () => {
       async () => (await fetch("/api/auth/me", { credentials: "include" })).status,
     );
     expect(status, "a different device's session should be signed out too").toBe(401);
+  });
+
+  // ─── Top bar user menu ──────────────────────────────────────────────────────
+
+  /** Same disposable owner as the rest of this suite, landed on a page other than /account. */
+  async function openProjects(browser: Browser): Promise<Page> {
+    const state = await writeStorageState(tenant!.owner, `account-ui-owner-topbar-${contexts.length}`);
+    const ctx = await browser.newContext({ storageState: state });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto("/projects");
+    return page;
+  }
+
+  const userMenuTrigger = (page: Page) => page.getByRole("button", { name: "User menu" });
+  const userMenu = (page: Page) => page.locator('[role="menu"][aria-label="User menu"]');
+
+  test("ACU-16 the user menu opens on click and contains exactly Profile Settings, Theme, and Logout", { tag: '@tesbo.testId("TES-TC-1408")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await expect(userMenu(page)).toBeHidden();
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+
+    await expect(userMenu(page).getByRole("menuitem", { name: "Profile Settings" })).toBeVisible();
+    await expect(userMenu(page).getByText("Theme", { exact: true })).toBeVisible();
+    await expect(userMenu(page).getByRole("button", { name: "Use light theme" })).toBeVisible();
+    await expect(userMenu(page).getByRole("button", { name: "Use dark theme" })).toBeVisible();
+    await expect(userMenu(page).getByRole("menuitem", { name: "Logout" })).toBeVisible();
+    // Exactly the two navigational/action items — the theme switcher is deliberately not a
+    // menuitem itself (it holds its own interactive buttons, which nested ARIA menuitems can't).
+    await expect(userMenu(page).getByRole("menuitem")).toHaveCount(2);
+  });
+
+  test("ACU-17 the user menu closes on outside click and on Escape", { tag: '@tesbo.testId("TES-TC-1409")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    // Deep inside the main content area — clear of both the sidebar's own links and the menu
+    // itself, so this is unambiguously an "outside" click rather than a navigation.
+    await page.mouse.click(700, 400);
+    await expect(userMenu(page)).toBeHidden();
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-18 Profile Settings navigates to /account and closes the menu", { tag: '@tesbo.testId("TES-TC-1410")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Profile Settings" }).click();
+
+    await page.waitForURL(/\/account$/);
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-19 switching theme from the user menu applies dark mode and persists across reload", { tag: '@tesbo.testId("TES-TC-1411")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("button", { name: "Use dark theme" }).click();
+
+    await expect(page.locator("html")).toHaveClass(/dark/);
+    await expect(userMenu(page).getByRole("button", { name: "Use dark theme" })).toHaveAttribute("aria-pressed", "true");
+
+    // The sidebar renders its own separate <ThemeToggle/> instance at the same time as the user
+    // menu's — with no shared context between them, this only reflects the change if the two are
+    // kept in sync (lib/theme.ts's THEME_CHANGE_EVENT), not just the instance that was clicked.
+    const sidebarDarkButton = page.locator("aside").getByRole("button", { name: "Use dark theme" });
+    await expect(sidebarDarkButton).toHaveAttribute("aria-pressed", "true");
+
+    // Persists via the app's existing mechanism (localStorage), not a new one, and survives reload.
+    const stored = await page.evaluate(() => window.localStorage.getItem("tesbo-theme"));
+    expect(stored).toBe("dark");
+    await page.reload();
+    await expect(page.locator("html")).toHaveClass(/dark/);
+
+    // Leave it back on light so this disposable context doesn't affect anything reused later.
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("button", { name: "Use light theme" }).click();
+    await expect(page.locator("html")).not.toHaveClass(/dark/);
+  });
+
+  test("ACU-20 Logout from the user menu signs the session out and redirects to /login", { tag: '@tesbo.testId("TES-TC-1412")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+
+    await page.waitForURL(/\/login/);
+    const status = await page.evaluate(async () => (await fetch("/api/auth/me", { credentials: "include" })).status);
+    expect(status, "the session should be invalidated server-side, not just redirected client-side").toBe(401);
   });
 });

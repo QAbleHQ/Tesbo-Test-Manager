@@ -23,8 +23,6 @@ import {
   IconInfoCircle,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getKnowledgeFolderTree,
   listKnowledgeFolderItems,
   createKnowledgeFolder,
@@ -54,6 +52,8 @@ import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { FolderTreeNodeRow, flattenFolders, findAncestorIds, type FolderAction } from "@/components/knowledge-base/FolderTree";
 import {
   KB_ACCEPT_ATTR,
@@ -67,6 +67,7 @@ import {
   blankDocumentFlagKey,
 } from "@/lib/validation";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -880,11 +881,29 @@ function UploadModal({
 
 // ─── Main page ──────────────────────────────────────────────────────────────
 
+// The shape of the initial-load bundle for this page, keyed per-project. `summary` is left out
+// on purpose: it's fetched fire-and-forget (`void loadSummary()`, never awaited) and never gates
+// `loading`, so it isn't part of what blocks render — caching it would mean racing its resolution
+// against the rest of this effect, which risks reordering work the "no parallelism changes" rule
+// rules out. Leaving it live-only just means the stat bar's placeholder briefly shows on a cache
+// hit too, exactly like it already does on a first visit.
+interface KnowledgeBaseData {
+  tree: KnowledgeFolderTreeNode;
+  selectedFolderId: string;
+  expanded: Set<string>;
+  breadcrumb: KnowledgeBreadcrumbEntry[];
+  folderName: string;
+  items: KnowledgeItem[];
+}
+
 function KnowledgeBasePageInner() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
   const folderParam = searchParams.get("folder");
   const appliedFolderParam = useRef<string | null>(null);
 
@@ -896,15 +915,20 @@ function KnowledgeBasePageInner() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [loading, setLoading] = useState(true);
-  const [projectName, setProjectName] = useState("");
+  const cacheKey = `knowledge-base:${projectId}`;
+  const cached = getPageCache<KnowledgeBaseData>(cacheKey);
+
+  // Only the true first visit to this project's knowledge base has no cache to seed from — every
+  // later visit renders the last-known folder tree/contents immediately while the effect below
+  // revalidates them in the background, instead of blocking behind the spinner on every click.
+  const [loading, setLoading] = useState(!cached);
   const [summary, setSummary] = useState<KnowledgeBaseSummary | null>(null);
-  const [tree, setTree] = useState<KnowledgeFolderTreeNode | null>(null);
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [breadcrumb, setBreadcrumb] = useState<KnowledgeBreadcrumbEntry[]>([]);
-  const [folderName, setFolderName] = useState("");
-  const [items, setItems] = useState<KnowledgeItem[]>([]);
+  const [tree, setTree] = useState<KnowledgeFolderTreeNode | null>(cached?.tree ?? null);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(cached?.selectedFolderId ?? null);
+  const [expanded, setExpanded] = useState<Set<string>>(cached?.expanded ?? new Set());
+  const [breadcrumb, setBreadcrumb] = useState<KnowledgeBreadcrumbEntry[]>(cached?.breadcrumb ?? []);
+  const [folderName, setFolderName] = useState(cached?.folderName ?? "");
+  const [items, setItems] = useState<KnowledgeItem[]>(cached?.items ?? []);
   const [itemsLoading, setItemsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -949,6 +973,9 @@ function KnowledgeBasePageInner() {
         setBreadcrumb(data.folder.breadcrumb);
         setFolderName(data.folder.isRoot ? "Knowledge base" : data.folder.name);
         setPage(1);
+        // Returned (in addition to the setState calls above, unchanged) so the initial-load
+        // effect can build the page cache entry from the same fetch, without a second request.
+        return data;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load folder contents.");
       } finally {
@@ -961,22 +988,49 @@ function KnowledgeBasePageInner() {
   useEffect(() => {
     const savedPanel = readStoredValue("tesbo_kb_tree_panel");
     if (savedPanel === "closed") setTreePanelOpen(false);
+
+    // A cache hit renders the last-known tree/folder contents immediately (no spinner); the fetch
+    // below still runs right after to revalidate in the background, so this is
+    // stale-while-revalidate, not a cache-only shortcut.
+    const key = `knowledge-base:${projectId}`;
+    const existing = getPageCache<KnowledgeBaseData>(key);
+    if (existing) {
+      setTree(existing.tree);
+      setSelectedFolderId(existing.selectedFolderId);
+      setExpanded(existing.expanded);
+      setBreadcrumb(existing.breadcrumb);
+      setFolderName(existing.folderName);
+      setItems(existing.items);
+      setLoading(false);
+    }
+
     (async () => {
-      const me = await authMe();
-      if (!me) {
+      if (!currentUser) {
         router.replace("/login");
         return;
       }
       try {
-        const [project, root] = await Promise.all([getProject(projectId), loadTree()]);
-        setProjectName(String(project.name || ""));
+        const root = await loadTree();
         void loadSummary();
         const initialFolderId = folderParam || root.id;
         appliedFolderParam.current = folderParam;
         setSelectedFolderId(initialFolderId);
         const ancestors = findAncestorIds(root, initialFolderId) || [];
         if (ancestors.length) setExpanded((prev) => new Set([...prev, ...ancestors]));
-        await loadFolder(initialFolderId);
+        // Same union the setExpanded call above applies to state — recomputed here (rather than
+        // read back from state) so the cache entry below can be built from values already in hand.
+        const nextExpanded = ancestors.length ? new Set([...expanded, ...ancestors]) : expanded;
+        const folderData = await loadFolder(initialFolderId);
+        if (folderData) {
+          setPageCache(key, {
+            tree: root,
+            selectedFolderId: initialFolderId,
+            expanded: nextExpanded,
+            breadcrumb: folderData.folder.breadcrumb,
+            folderName: folderData.folder.isRoot ? "Knowledge base" : folderData.folder.name,
+            items: folderData.items,
+          });
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load knowledge base.");
       } finally {
@@ -984,7 +1038,7 @@ function KnowledgeBasePageInner() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUser]);
 
   // Keep the selected folder in sync with the URL, so links from elsewhere (e.g. a
   // document's "Back to folder") and the browser's back/forward buttons work correctly.
@@ -1245,7 +1299,7 @@ function KnowledgeBasePageInner() {
   }
 
   if (loading) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   const baseItems = searchResults ?? items;

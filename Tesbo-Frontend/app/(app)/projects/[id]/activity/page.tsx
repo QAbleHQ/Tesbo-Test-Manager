@@ -4,11 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { IconActivity, IconSearch } from "@tabler/icons-react";
 import {
-  authMe,
   getActivitySummary,
-  getProject,
   listActivity,
-  listProjectMembers,
   type ActivitySummary,
   type ActivityLogItem,
 } from "@/lib/api";
@@ -21,6 +18,16 @@ import {
   groupByDate,
   sinceFor,
 } from "@/components/activity/activityShared";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface ActivityPageData {
+  summary: ActivitySummary | null;
+  activities: ActivityLogItem[];
+  total: number;
+  offset: number;
+}
 
 const TYPE_FILTERS = [
   { value: "", label: "All types" },
@@ -39,15 +46,21 @@ export default function ActivityPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
 
-  const [project, setProject] = useState<Record<string, unknown> | null>(null);
-  const [members, setMembers] = useState<{ userId: string; name: string; email: string }[]>([]);
-  const [summary, setSummary] = useState<ActivitySummary | null>(null);
-  const [activities, setActivities] = useState<ActivityLogItem[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `activity:${projectId}`;
+  const cached = getPageCache<ActivityPageData>(cacheKey);
+
+  const [summary, setSummary] = useState<ActivitySummary | null>(cached?.summary ?? null);
+  const [activities, setActivities] = useState<ActivityLogItem[]>(cached?.activities ?? []);
+  const [total, setTotal] = useState(cached?.total ?? 0);
+  // Only the true first visit to this project's activity feed has no cache to seed from — every
+  // later visit renders the last-known default (unfiltered) view immediately while the effects
+  // below revalidate it in the background, instead of blocking behind a spinner on every click.
+  const [loading, setLoading] = useState(!cached);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [offset, setOffset] = useState(0);
+  const [offset, setOffset] = useState(cached?.offset ?? 0);
 
   const [typeFilter, setTypeFilter] = useState("");
   const [actorFilter, setActorFilter] = useState("");
@@ -61,9 +74,15 @@ export default function ActivityPage() {
   }, [searchInput]);
 
   const fetchActivities = useCallback(
-    async (reset: boolean, currentOffset: number) => {
-      if (reset) setLoading(true);
-      else setLoadingMore(true);
+    // `silent` is set only by the cache-hit path below: state was already seeded from cache and
+    // `loading` is already false, so this revalidation fetch must not flip it back to true and
+    // re-show the spinner over data the user can already see.
+    async (reset: boolean, currentOffset: number, options?: { silent?: boolean }) => {
+      if (reset) {
+        if (!options?.silent) setLoading(true);
+      } else {
+        setLoadingMore(true);
+      }
       try {
         const res = await listActivity(projectId, {
           limit: PAGE_SIZE,
@@ -76,6 +95,17 @@ export default function ActivityPage() {
         setActivities((prev) => (reset ? res.list : [...prev, ...res.list]));
         setTotal(res.total);
         setOffset(currentOffset + res.list.length);
+        // Only the default (unfiltered, first-page) view is cached — a filtered search or a
+        // "load more" page must never overwrite what a bare revisit to this page should show.
+        if (reset && currentOffset === 0 && !typeFilter && !actorFilter && !search && !dateFilter) {
+          const existing = getPageCache<ActivityPageData>(cacheKey);
+          setPageCache<ActivityPageData>(cacheKey, {
+            summary: existing?.summary ?? null,
+            activities: res.list,
+            total: res.total,
+            offset: res.list.length,
+          });
+        }
       } catch {
         if (reset) setActivities([]);
       } finally {
@@ -83,35 +113,53 @@ export default function ActivityPage() {
         setLoadingMore(false);
       }
     },
-    [projectId, typeFilter, actorFilter, search, dateFilter]
+    [projectId, typeFilter, actorFilter, search, dateFilter, cacheKey]
   );
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      getProject(projectId)
-        .then((p) => setProject(p))
-        .catch(() => router.replace("/projects"));
-      listProjectMembers(projectId)
-        .then((list) => setMembers(list))
-        .catch(() => setMembers([]));
-      getActivitySummary(projectId)
-        .then((s) => setSummary(s))
-        .catch(() => setSummary(null));
-    });
-  }, [projectId, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    getActivitySummary(projectId)
+      .then((s) => {
+        setSummary(s);
+        // The summary isn't filter-dependent, so it can always be merged into whatever
+        // activities/total/offset the other effect below has already cached.
+        const existing = getPageCache<ActivityPageData>(cacheKey);
+        setPageCache<ActivityPageData>(cacheKey, {
+          summary: s,
+          activities: existing?.activities ?? [],
+          total: existing?.total ?? 0,
+          offset: existing?.offset ?? 0,
+        });
+      })
+      .catch(() => setSummary(null));
+  }, [projectId, router, currentUser, cacheKey]);
 
   useEffect(() => {
+    // A cache hit only applies to the default (unfiltered) view — the same view seeded into
+    // state above — so a filter change always falls through to the normal fetch-and-spin path.
+    const isDefaultView = !typeFilter && !actorFilter && !search && !dateFilter;
+    if (isDefaultView) {
+      const existing = getPageCache<ActivityPageData>(cacheKey);
+      if (existing) {
+        setSummary(existing.summary);
+        setActivities(existing.activities);
+        setTotal(existing.total);
+        setOffset(existing.offset);
+        setLoading(false);
+        fetchActivities(true, 0, { silent: true });
+        return;
+      }
+    }
     fetchActivities(true, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, typeFilter, actorFilter, search, dateFilter]);
 
   const hasMore = activities.length < total;
   const groups = useMemo(() => groupByDate(activities), [activities]);
-  const projectName = project ? ((project.name as string) ?? "") : "";
+  const projectName = (project.name as string) ?? "";
 
   const breadcrumb = (
     <Breadcrumbs

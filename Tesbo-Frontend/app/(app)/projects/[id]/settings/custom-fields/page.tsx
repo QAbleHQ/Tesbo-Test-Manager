@@ -4,11 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { IconStack2 } from "@tabler/icons-react";
 import {
-  authMe,
   getBillingInfo,
-  getProject,
   listCustomFieldDefinitions,
-  listProjectMembers,
   type BillingInfo,
   type CustomFieldDefinition,
 } from "@/lib/api";
@@ -17,8 +14,8 @@ import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workfl
 import CustomFieldDefinitionList from "@/components/customFields/CustomFieldDefinitionList";
 import CustomFieldDefinitionFormModal from "@/components/customFields/CustomFieldDefinitionFormModal";
 import PricingModal from "@/components/PricingModal";
-
-type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
   const n = (role ?? "").trim().toLowerCase().replace(/-/g, "_").replace(/ /g, "_");
@@ -31,9 +28,11 @@ export default function CustomFieldsSettingsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-  const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [definitions, setDefinitions] = useState<CustomFieldDefinition[]>([]);
   const [loading, setLoading] = useState(true);
@@ -41,7 +40,6 @@ export default function CustomFieldsSettingsPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<CustomFieldDefinition | null>(null);
   const [pricingOpen, setPricingOpen] = useState(false);
-  const [projectName, setProjectName] = useState("");
 
   const loadDefinitions = useCallback(async () => {
     try {
@@ -56,18 +54,14 @@ export default function CustomFieldsSettingsPage() {
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      setCurrentUserId(me.userId);
-      listProjectMembers(projectId).then(setProjectMembers).catch(() => {});
-      getBillingInfo().then(setBillingInfo).catch(() => {});
-      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-      loadDefinitions().catch(() => {});
-    });
-  }, [loadDefinitions, projectId, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    setCurrentUserId(currentUser.userId);
+    getBillingInfo().then(setBillingInfo).catch(() => {});
+    loadDefinitions().catch(() => {});
+  }, [loadDefinitions, projectId, router, currentUser]);
 
   const currentUserRole = currentUserId
     ? normalizeRole(projectMembers.find((m) => m.userId === currentUserId)?.role ?? "qa_engineer")

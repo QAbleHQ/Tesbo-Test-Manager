@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { applyTheme, persistTheme, readStoredTheme, type ThemeMode } from "@/lib/theme";
+import { applyTheme, persistTheme, readStoredTheme, THEME_CHANGE_EVENT, type ThemeMode } from "@/lib/theme";
 
 function ThemeIcon({ mode }: { mode: ThemeMode }) {
   if (mode === "light") {
@@ -26,6 +26,17 @@ export default function ThemeToggle({ isCollapsed = false }: { isCollapsed?: boo
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // Two instances can be mounted at once (the sidebar footer and the top-bar user menu) — without
+  // this, switching from one leaves the other showing a stale active button until it remounts.
+  useEffect(() => {
+    function handleExternalChange(e: Event) {
+      const next = (e as CustomEvent<ThemeMode>).detail;
+      if (next) setTheme(next);
+    }
+    window.addEventListener(THEME_CHANGE_EVENT, handleExternalChange);
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, handleExternalChange);
+  }, []);
 
   const setMode = (nextTheme: ThemeMode) => {
     setTheme(nextTheme);

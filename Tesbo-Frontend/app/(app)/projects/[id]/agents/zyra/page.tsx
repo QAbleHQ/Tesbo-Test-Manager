@@ -6,10 +6,8 @@ import { createPortal } from "react-dom";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
 import {
-  authMe,
   continueZyraChatMessage,
   createZyraChatSession,
-  getProject,
   getZyraAgent,
   getZyraChatSession,
   listZyraChatSessions,
@@ -29,6 +27,8 @@ import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { ZyraCitationsList } from "@/components/agents/ZyraCitations";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
 function ZyraMark({ size = 24 }: { size?: number }) {
@@ -391,6 +391,23 @@ function MessageBubble({
   // save) instead of the plain read-only table, and don't count toward "View test cases" below.
   const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
   const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
+  // Defense-in-depth, independent of the backend guard: a reply that routed as a mutation but carries
+  // no rows and no review panel to show is a sign something upstream failed silently — surface that
+  // instead of leaving the bubble looking like an ordinary, uneventful answer. Never fires for a
+  // healthy turn: a genuine create/update/archive always carries either applied rows or a
+  // reviewRequestId with proposed rows.
+  //
+  // Found by review: "mixed" — reachable whenever the router's intent is create/update/archive and
+  // the model itself reports actionType "mixed" (normalizeZyraChatDecision trusts that value as-is)
+  // — was missing from this list, leaving exactly the same phantom-success shape unguarded for a
+  // mixed-operation turn (e.g. "create + archive in one request") whose operations end up filtered
+  // to nothing. "suite" is deliberately still excluded: create_suite/move_to_suite write
+  // immediately, so a suite-only turn legitimately has no testcases row to show.
+  const missingStructuredData =
+    !isUser &&
+    ["create", "update", "archive", "mixed"].includes(message.actionType || "") &&
+    testcases.length === 0 &&
+    !message.reviewRequestId;
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -419,6 +436,11 @@ function MessageBubble({
       <TestcaseTable rows={appliedRows} />
       {message.reviewRequestId && proposedRows.length > 0 && (
         <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      )}
+      {missingStructuredData && (
+        <p className="mt-1 flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          ⚠️ Zyra didn&apos;t return structured data for this reply — nothing above should be treated as saved or staged. Try asking again.
+        </p>
       )}
 
       <div className="flex items-center gap-2">
@@ -505,6 +527,9 @@ export default function ZyraChatPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // matching the full-bleed IDE-workspace pattern used by the Test Cases / Plan Details screens.
@@ -514,7 +539,6 @@ export default function ZyraChatPage() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [projectName, setProjectName] = useState("");
   const [agent, setAgent] = useState<ZyraAgentState | null>(null);
   const [sessions, setSessions] = useState<ZyraChatSession[]>([]);
   const [activeSession, setActiveSession] = useState<ZyraChatSession | null>(null);
@@ -571,12 +595,10 @@ export default function ZyraChatPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [project, agentData, sessionData] = await Promise.all([
-        getProject(projectId),
+      const [agentData, sessionData] = await Promise.all([
         getZyraAgent(projectId),
         refreshSessions(),
       ]);
-      setProjectName(String(project.name || ""));
       setAgent(agentData);
       if (sessionData[0]) await openSession(sessionData[0].id);
       else await createSession();
@@ -591,11 +613,9 @@ export default function ZyraChatPage() {
   useEffect(() => {
     if (loadStartedRef.current) return;
     loadStartedRef.current = true;
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-  }, [loadData, router]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, currentUser]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });

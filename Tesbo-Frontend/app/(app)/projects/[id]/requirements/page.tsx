@@ -6,8 +6,6 @@ import Link from "next/link";
 import React from "react";
 import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getJiraStatus,
   getLinearStatus,
   createZyraTask,
@@ -26,6 +24,9 @@ import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 const PAGE_SIZE = 25;
 
@@ -107,6 +108,25 @@ function joinLabels(labels: string[]): string {
 }
 
 const EMPTY_STATS: TicketSourceStats = { total: 0, covered: 0, uncovered: 0, types: [], statuses: [] };
+
+// The subset of state this page's single initial-load effect (below) populates — everything
+// downstream of a filter change, tab switch, or sync run is intentionally excluded, since this
+// cache exists only to make a bare revisit render the last-known initial view instantly.
+interface RequirementsPageData {
+  connectedSources: TicketSource[];
+  source: Source;
+  tickets: Requirement[];
+  total: number;
+  sourceHistory: HistoricalSource[];
+  linkedJiraKeys: Set<string>;
+  jiraKeyCounts: Record<string, number>;
+  jiraTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  linkedLinearKeys: Set<string>;
+  linearKeyCounts: Record<string, number>;
+  linearTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  summary: RequirementsSummary | null;
+  providerFolderIds: Partial<Record<TicketSource, string>>;
+}
 
 function jiraStatusTone(status: string): "neutral" | "success" | "warning" | "info" {
   const s = status.toLowerCase();
@@ -207,13 +227,22 @@ export default function RequirementsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
-  const [loading, setLoading] = useState(true);
-  const [source, setSource] = useState<Source>("all");
-  const [connectedSources, setConnectedSources] = useState<TicketSource[]>([]);
-  const [summary, setSummary] = useState<RequirementsSummary | null>(null);
-  const [tickets, setTickets] = useState<Requirement[]>([]);
-  const [total, setTotal] = useState(0);
+  const cacheKey = `requirements:${projectId}`;
+  const cached = getPageCache<RequirementsPageData>(cacheKey);
+
+  // Only the true first visit to this project's requirements page has no cache to seed from —
+  // every later visit renders the last-known initial view immediately while the effect below
+  // revalidates it in the background, instead of blocking behind the spinner on every click.
+  const [loading, setLoading] = useState(!cached);
+  const [source, setSource] = useState<Source>(cached?.source ?? "all");
+  const [connectedSources, setConnectedSources] = useState<TicketSource[]>(cached?.connectedSources ?? []);
+  const [summary, setSummary] = useState<RequirementsSummary | null>(cached?.summary ?? null);
+  const [tickets, setTickets] = useState<Requirement[]>(cached?.tickets ?? []);
+  const [total, setTotal] = useState(cached?.total ?? 0);
   const [page, setPage] = useState(0);
   const [search, setSearch] = useState("");
   const [searchInput, setSearchInput] = useState("");
@@ -221,24 +250,23 @@ export default function RequirementsPage() {
   const [statusFilter, setStatusFilter] = useState("");
   const [coverageFilter, setCoverageFilter] = useState<"" | "covered" | "uncovered">("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [linkedJiraKeys, setLinkedJiraKeys] = useState<Set<string>>(new Set());
-  const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>({});
-  const [jiraTaskStatuses, setJiraTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>({});
-  const [linkedLinearKeys, setLinkedLinearKeys] = useState<Set<string>>(new Set());
-  const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>({});
-  const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>({});
+  const [linkedJiraKeys, setLinkedJiraKeys] = useState<Set<string>>(cached?.linkedJiraKeys ?? new Set());
+  const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>(cached?.jiraKeyCounts ?? {});
+  const [jiraTaskStatuses, setJiraTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.jiraTaskStatuses ?? {});
+  const [linkedLinearKeys, setLinkedLinearKeys] = useState<Set<string>>(cached?.linkedLinearKeys ?? new Set());
+  const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>(cached?.linearKeyCounts ?? {});
+  const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.linearTaskStatuses ?? {});
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
   // Past mappings for whichever single-provider tab is active — tickets from these are never
   // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
-  const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>([]);
+  const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>(cached?.sourceHistory ?? []);
   const [historicalRemoteId, setHistoricalRemoteId] = useState<string | null>(null);
   // Knowledge Base folder id for each provider's mirrored tickets (e.g. the "Jira" folder under
   // the KB root), so "View in Knowledge base" can deep-link into the tab that's actually active
   // instead of always landing on the root listing. A provider's folder only exists once its first
   // sync has created it, so an entry here can legitimately be absent.
-  const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>({});
+  const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>(cached?.providerFolderIds ?? {});
 
   // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
   // their own fetching on whether that provider is connected.
@@ -295,7 +323,7 @@ export default function RequirementsPage() {
       query: string,
       filters: { issueType?: string; status?: string; coverage?: "" | "covered" | "uncovered" },
       remoteId?: string
-    ) => {
+    ): Promise<{ tickets: Requirement[]; total: number } | undefined> => {
       const listParams = {
         limit: PAGE_SIZE,
         offset: pageNum * PAGE_SIZE,
@@ -310,37 +338,38 @@ export default function RequirementsPage() {
       try {
         if (activeSource === "all") {
           const data = await listAllTickets(projectId, listParams);
-          setTickets(
-            data.list.map((t) => ({
-              id: t.id, source: t.source, key: t.key, summary: t.summary, description: t.description,
-              issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
-              reporter: t.reporter, labels: t.labels, url: t.url, createdAt: t.createdAt, updatedAt: t.updatedAt,
-            }))
-          );
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: t.source, key: t.key, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.url, createdAt: t.createdAt, updatedAt: t.updatedAt,
+          }));
+          setTickets(mapped);
           setTotal(data.total);
+          return { tickets: mapped, total: data.total };
         } else if (activeSource === "jira") {
           const data = await listJiraTickets(projectId, listParams);
-          setTickets(
-            data.list.map((t) => ({
-              id: t.id, source: "jira", key: t.jiraIssueKey, summary: t.summary, description: t.description,
-              issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
-              reporter: t.reporter, labels: t.labels, url: t.jiraUrl, createdAt: t.jiraCreatedAt, updatedAt: t.jiraUpdatedAt,
-            }))
-          );
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "jira" as const, key: t.jiraIssueKey, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.jiraUrl, createdAt: t.jiraCreatedAt, updatedAt: t.jiraUpdatedAt,
+          }));
+          setTickets(mapped);
           setTotal(data.total);
+          return { tickets: mapped, total: data.total };
         } else {
           const data = await listLinearTickets(projectId, listParams);
-          setTickets(
-            data.list.map((t) => ({
-              id: t.id, source: "linear", key: t.linearIssueKey, summary: t.summary, description: t.description,
-              issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
-              reporter: t.reporter, labels: t.labels, url: t.linearUrl, createdAt: t.linearCreatedAt, updatedAt: t.linearUpdatedAt,
-            }))
-          );
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "linear" as const, key: t.linearIssueKey, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.linearUrl, createdAt: t.linearCreatedAt, updatedAt: t.linearUpdatedAt,
+          }));
+          setTickets(mapped);
           setTotal(data.total);
+          return { tickets: mapped, total: data.total };
         }
       } catch {
         /* ignore */
+        return undefined;
       }
     },
     [projectId]
@@ -351,17 +380,32 @@ export default function RequirementsPage() {
       listLinkedJiraKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
       listLinkedLinearKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
     ]);
-    setLinkedJiraKeys(new Set(jiraKeysRes.keys));
-    setJiraKeyCounts(jiraKeysRes.counts ?? {});
-    setJiraTaskStatuses(jiraKeysRes.tasks ?? {});
-    setLinkedLinearKeys(new Set(linearKeysRes.keys));
-    setLinearKeyCounts(linearKeysRes.counts ?? {});
-    setLinearTaskStatuses(linearKeysRes.tasks ?? {});
+    const linkedJira = new Set(jiraKeysRes.keys);
+    const jiraCounts = jiraKeysRes.counts ?? {};
+    const jiraTasks = jiraKeysRes.tasks ?? {};
+    const linkedLinear = new Set(linearKeysRes.keys);
+    const linearCounts = linearKeysRes.counts ?? {};
+    const linearTasks = linearKeysRes.tasks ?? {};
+    setLinkedJiraKeys(linkedJira);
+    setJiraKeyCounts(jiraCounts);
+    setJiraTaskStatuses(jiraTasks);
+    setLinkedLinearKeys(linkedLinear);
+    setLinearKeyCounts(linearCounts);
+    setLinearTaskStatuses(linearTasks);
+    return {
+      linkedJiraKeys: linkedJira,
+      jiraKeyCounts: jiraCounts,
+      jiraTaskStatuses: jiraTasks,
+      linkedLinearKeys: linkedLinear,
+      linearKeyCounts: linearCounts,
+      linearTaskStatuses: linearTasks,
+    };
   }, [projectId]);
 
   const refreshSummary = useCallback(async () => {
     const data = await getRequirementsSummary(projectId).catch(() => null);
     setSummary(data);
+    return data;
   }, [projectId]);
 
   // Maps the KB root's direct children back to provider ids by name, matching how
@@ -374,28 +418,55 @@ export default function RequirementsPage() {
       if (provider) map[provider.id] = child.id;
     }
     setProviderFolderIds(map);
+    return map;
   }, [projectId]);
 
   const refreshHistory = useCallback(async (activeSource: TicketSource) => {
+    let history: HistoricalSource[];
     if (activeSource === "jira") {
       const status = await getJiraStatus(projectId).catch(() => null);
-      setSourceHistory(
-        (status?.history ?? []).map((h) => ({ remoteId: h.jiraProjectId, remoteKey: h.jiraProjectKey, remoteName: h.jiraProjectName }))
-      );
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.jiraProjectId, remoteKey: h.jiraProjectKey, remoteName: h.jiraProjectName }));
     } else {
       const status = await getLinearStatus(projectId).catch(() => null);
-      setSourceHistory(
-        (status?.history ?? []).map((h) => ({ remoteId: h.linearTeamId, remoteKey: h.linearTeamKey, remoteName: h.linearTeamName }))
-      );
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.linearTeamId, remoteKey: h.linearTeamKey, remoteName: h.linearTeamName }));
     }
+    setSourceHistory(history);
+    // The initial-load effect fires this without awaiting it (so a slow history lookup never
+    // blocks the page's loading spinner), so if it resolves after that effect has already written
+    // the page cache, patch just this field in rather than leaving the cache's history stale until
+    // the next full reload. If no cache entry exists yet, there's nothing to patch — the initial
+    // load's own write (once it completes) is what seeds the entry.
+    const key = `requirements:${projectId}`;
+    const existing = getPageCache<RequirementsPageData>(key);
+    if (existing) {
+      setPageCache<RequirementsPageData>(key, { ...existing, sourceHistory: history });
+    }
+    return history;
   }, [projectId]);
 
   useEffect(() => {
     (async () => {
-      const me = await authMe();
-      if (!me) {
+      if (!currentUser) {
         router.replace("/login");
         return;
+      }
+      const key = `requirements:${projectId}`;
+      const existing = getPageCache<RequirementsPageData>(key);
+      if (existing) {
+        setConnectedSources(existing.connectedSources);
+        setSource(existing.source);
+        setTickets(existing.tickets);
+        setTotal(existing.total);
+        setSourceHistory(existing.sourceHistory);
+        setLinkedJiraKeys(existing.linkedJiraKeys);
+        setJiraKeyCounts(existing.jiraKeyCounts);
+        setJiraTaskStatuses(existing.jiraTaskStatuses);
+        setLinkedLinearKeys(existing.linkedLinearKeys);
+        setLinearKeyCounts(existing.linearKeyCounts);
+        setLinearTaskStatuses(existing.linearTaskStatuses);
+        setSummary(existing.summary);
+        setProviderFolderIds(existing.providerFolderIds);
+        setLoading(false);
       }
       const statuses = await Promise.all(
         PROVIDERS.map((p) => p.getStatus(projectId).catch(() => ({ connected: false })))
@@ -406,13 +477,34 @@ export default function RequirementsPage() {
       // straight onto that provider and keep the active tab in sync with what's rendered.
       const initialSource: Source = connected.length === 1 ? connected[0] : "all";
       setSource(initialSource);
-      await loadTickets(initialSource, 0, "", {});
+      const ticketsResult = await loadTickets(initialSource, 0, "", {});
       if (initialSource !== "all") void refreshHistory(initialSource);
-      await Promise.all([refreshLinkedKeys(), refreshSummary(), refreshKbFolders()]);
-      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
+      const [linkedResult, summaryResult, kbFoldersResult] = await Promise.all([
+        refreshLinkedKeys(),
+        refreshSummary(),
+        refreshKbFolders(),
+      ]);
       setLoading(false);
+      // refreshHistory above is intentionally not awaited (see its own comment), so this write
+      // carries forward whatever history the cache already had rather than blocking on it; that
+      // function patches the history field in on its own once it resolves.
+      setPageCache<RequirementsPageData>(key, {
+        connectedSources: connected,
+        source: initialSource,
+        tickets: ticketsResult?.tickets ?? [],
+        total: ticketsResult?.total ?? 0,
+        sourceHistory: existing?.sourceHistory ?? [],
+        linkedJiraKeys: linkedResult.linkedJiraKeys,
+        jiraKeyCounts: linkedResult.jiraKeyCounts,
+        jiraTaskStatuses: linkedResult.jiraTaskStatuses,
+        linkedLinearKeys: linkedResult.linkedLinearKeys,
+        linearKeyCounts: linkedResult.linearKeyCounts,
+        linearTaskStatuses: linkedResult.linearTaskStatuses,
+        summary: summaryResult,
+        providerFolderIds: kbFoldersResult,
+      });
     })();
-  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router, currentUser]);
 
   useEffect(() => {
     if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
@@ -488,7 +580,7 @@ export default function RequirementsPage() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   if (loading) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (

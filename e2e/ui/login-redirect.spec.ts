@@ -161,8 +161,8 @@ test.describe("login redirect after signing in through the form", () => {
 
   test("honours a legitimate redirect", { tag: '@tesbo.testId("TES-TC-1034")' }, async ({ page }) => {
     await page.goto("/login?redirect=%2Fsettings");
-    await page.getByLabel("Email", { exact: true }).fill(env.testEmail);
-    await page.getByLabel("Password", { exact: true }).fill(env.testPassword);
+    await page.getByLabel("Email *", { exact: true }).fill(env.testEmail);
+    await page.getByLabel("Password *", { exact: true }).fill(env.testPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await page.waitForURL(/\/settings/);
@@ -172,8 +172,8 @@ test.describe("login redirect after signing in through the form", () => {
     const offSite = await blockOffSiteNavigation(page);
 
     await page.goto("/login?redirect=%2F%2Fexample.com");
-    await page.getByLabel("Email", { exact: true }).fill(env.testEmail);
-    await page.getByLabel("Password", { exact: true }).fill(env.testPassword);
+    await page.getByLabel("Email *", { exact: true }).fill(env.testEmail);
+    await page.getByLabel("Password *", { exact: true }).fill(env.testPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await page.waitForURL(/\/projects/);
@@ -256,7 +256,7 @@ test.describe("login reached from an already-accepted invite", () => {
       await page.waitForURL(/\/login/);
 
       // The whole point of the ticket: a form, not a permanent loading screen.
-      await expect(page.getByLabel("Email", { exact: true })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByLabel("Email *", { exact: true })).toBeVisible({ timeout: 15_000 });
       await expect(page.getByRole("button", { name: "Sign in" })).toBeEnabled();
       await expect(page.getByText("Loading...")).toHaveCount(0);
     } finally {
@@ -274,8 +274,8 @@ test.describe("login reached from an already-accepted invite", () => {
       await page.getByRole("button", { name: "Sign in" }).click();
       await page.waitForURL(/\/login/);
 
-      await page.getByLabel("Email", { exact: true }).fill(email);
-      await page.getByLabel("Password", { exact: true }).fill(FIXTURE_PASSWORD);
+      await page.getByLabel("Email *", { exact: true }).fill(email);
+      await page.getByLabel("Password *", { exact: true }).fill(FIXTURE_PASSWORD);
       await page.getByRole("button", { name: "Sign in" }).click();
 
       // They are already a member, so signing in must land them inside the app rather than back on
@@ -361,7 +361,7 @@ test.describe("login reached from an invite while signed in as a different email
 
       // The whole point of this test: the email-locked OTP form loads normally...
       await expect(page.getByRole("button", { name: "Send login code" })).toBeVisible();
-      await expect(page.getByLabel("Email", { exact: true })).toHaveValue(email);
+      await expect(page.getByLabel("Email *", { exact: true })).toHaveValue(email);
       // ...with no leftover "could not open" (or any other) alert sitting above it.
       await expect(page.locator('p[role="alert"]')).toHaveCount(0);
     } finally {

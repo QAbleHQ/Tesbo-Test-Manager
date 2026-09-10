@@ -4,7 +4,6 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { IconPencil, IconTrash } from "@tabler/icons-react";
 import {
-  authMe,
   listBugs,
   createBug,
   updateBug,
@@ -15,8 +14,6 @@ import {
   deleteBugAttachment,
   getBugAttachmentDownloadUrl,
   listTestRuns,
-  listProjectMembers,
-  getProject,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -37,11 +34,18 @@ import {
   SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface BugsData {
+  bugs: BugItem[];
+}
 
 type ViewMode = "kanban" | "list";
 
@@ -412,9 +416,18 @@ export default function BugsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
 
-  const [bugs, setBugs] = useState<BugItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `bugs:${projectId}`;
+  const cached = getPageCache<BugsData>(cacheKey);
+
+  const [bugs, setBugs] = useState<BugItem[]>(cached?.bugs ?? []);
+  // Only the true first visit to this project's bugs list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [filterStatus, setFilterStatus] = useState("");
   /*
    * Basecamp 10226242373 ("Severity filter is missing"). Severity is a first-class field — it has its
@@ -440,8 +453,6 @@ export default function BugsPage() {
      mandatory when there's actually something to pick, so reporting a bug is never blocked
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
-  const [projectName, setProjectName] = useState("");
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -503,26 +514,31 @@ export default function BugsPage() {
 
   const load = useCallback(() => {
     listBugs(projectId)
-      .then(setBugs)
+      .then((bugsData) => {
+        setPageCache(`bugs:${projectId}`, { bugs: bugsData });
+        setBugs(bugsData);
+      })
       .finally(() => setLoading(false));
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-    });
-  }, [router, load]);
+    const key = `bugs:${projectId}`;
+    const existing = getPageCache<BugsData>(key);
+    if (existing) {
+      setBugs(existing.bugs);
+      setLoading(false);
+    }
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [projectId, router, load, currentUser]);
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
-    listProjectMembers(projectId).then(setMembers).catch(() => {});
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
   }, [projectId]);
 
   /* filtered list */
@@ -757,7 +773,7 @@ export default function BugsPage() {
   }
 
   if (loading) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (

@@ -4,8 +4,6 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
-  authMe,
-  getProject,
   listTestRuns,
   listTestRunSchedules,
   createTestRunSchedule,
@@ -17,6 +15,8 @@ import {
 import { Button, Input, Card, Field, FieldLabel, FieldError, Select } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { validateScheduleRunAt } from "@/lib/validation";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 /** The browser's own local "now", formatted for a datetime-local input's value/min attribute. */
 function toDatetimeLocalValue(date: Date): string {
@@ -48,13 +48,15 @@ export default function ScheduleRunsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [runs, setRuns] = useState<TestRunListItem[]>([]);
   const [schedules, setSchedules] = useState<TestRunSchedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
 
   const [name, setName] = useState("");
   const [cycleId, setCycleId] = useState("");
@@ -90,15 +92,12 @@ export default function ScheduleRunsPage() {
   }, [projectId, cycleId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-    });
-  }, [router, load, projectId]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [router, load, projectId, currentUser]);
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();

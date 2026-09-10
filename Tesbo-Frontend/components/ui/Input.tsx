@@ -1,11 +1,12 @@
-import type { InputHTMLAttributes } from "react";
+import { forwardRef, type InputHTMLAttributes } from "react";
 import { cx } from "@/components/ui/cx";
 
 export type InputProps = InputHTMLAttributes<HTMLInputElement>;
 
-export default function Input({ className, ...props }: InputProps) {
+const Input = forwardRef<HTMLInputElement, InputProps>(function Input({ className, ...props }, ref) {
   return (
     <input
+      ref={ref}
       className={cx(
         "h-9 w-full rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface)] px-3 text-[14px] text-[var(--foreground)] placeholder:text-[var(--ink-300)]",
         "transition-[border-color,box-shadow,background-color] duration-150",
@@ -16,4 +17,6 @@ export default function Input({ className, ...props }: InputProps) {
       {...props}
     />
   );
-}
+});
+
+export default Input;

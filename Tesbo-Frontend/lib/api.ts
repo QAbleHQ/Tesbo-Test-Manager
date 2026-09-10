@@ -113,6 +113,10 @@ export async function authMe(): Promise<{
   userId: string;
   email: string | null;
   name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
   isPlatformAdmin?: boolean;
   hasPassword?: boolean;
 } | null> {
@@ -121,12 +125,34 @@ export async function authMe(): Promise<{
       userId: string;
       email: string | null;
       name: string | null;
+      firstName: string | null;
+      lastName: string | null;
+      mobileNumber: string | null;
+      profileComplete: boolean;
       isPlatformAdmin?: boolean;
       hasPassword?: boolean;
     }>("/api/auth/me");
   } catch {
     return null;
   }
+}
+
+export async function updateProfile(data: { firstName?: string; lastName?: string; mobileNumber?: string }): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+}> {
+  return api("/api/auth/me", { method: "PATCH", body: data });
+}
+
+export async function completeProfile(data: { firstName: string; lastName: string; mobileNumber?: string }): Promise<void> {
+  await api("/api/auth/complete-profile", { method: "POST", body: data });
 }
 
 // --- Platform Admin APIs ---
@@ -209,7 +235,13 @@ export async function changePassword(currentPassword: string | null, newPassword
   });
 }
 
-export async function startSignup(data: { firstName: string; lastName: string; email: string; password: string }): Promise<void> {
+export async function startSignup(data: {
+  firstName: string;
+  lastName: string;
+  mobileNumber?: string;
+  email: string;
+  password: string;
+}): Promise<void> {
   await api("/api/auth/signup/start", { method: "POST", body: data });
 }
 
@@ -217,7 +249,10 @@ export async function verifySignup(email: string, code: string): Promise<{ ok: b
   return api("/api/auth/signup/verify", { method: "POST", body: { email, code } });
 }
 
-export async function startInviteRegistration(token: string, data: { name: string; password: string }): Promise<void> {
+export async function startInviteRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string; password: string }
+): Promise<void> {
   await api(`/api/invitations/${token}/register/start`, { method: "POST", body: data });
 }
 
@@ -228,7 +263,10 @@ export async function verifyInviteRegistration(
   return api(`/api/invitations/${token}/register/verify`, { method: "POST", body: { code } });
 }
 
-export async function startInviteOtpRegistration(token: string, data: { name: string }): Promise<void> {
+export async function startInviteOtpRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string }
+): Promise<void> {
   await api(`/api/invitations/${token}/register/otp/start`, { method: "POST", body: data });
 }
 

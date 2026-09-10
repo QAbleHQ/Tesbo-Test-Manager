@@ -9,13 +9,16 @@ import { requestOtp, startSignup, verifySignup } from "@/lib/api";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { AuthModeToggle, type AuthMode } from "@/components/auth/AuthModeToggle";
 import { OtpBoxInput } from "@/components/auth/OtpBoxInput";
-import { Button, Field, FieldError, FieldHint, FieldLabel, Input, PasswordInput } from "@/components/ui";
+import { Button, Field, FieldError, FieldHint, FieldLabel, Input, PasswordInput, PhoneInput } from "@/components/ui";
 import {
   EMAIL_MAX_LENGTH,
+  MOBILE_NUMBER_MAX_LENGTH,
   SIGNUP_NAME_MAX_LENGTH,
   PASSWORD_MAX_LENGTH,
   PASSWORD_RULES_HINT,
+  normalizeMobileNumber,
   validateEmailValue,
+  validateMobileNumber,
   validateName,
   validatePasswordValue,
 } from "@/lib/validation";
@@ -28,6 +31,7 @@ export default function SignupPage() {
   const [step, setStep] = useState<Step>("form");
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
+  const [mobileNumber, setMobileNumber] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
@@ -35,6 +39,7 @@ export default function SignupPage() {
   const [error, setError] = useState("");
   const [firstNameError, setFirstNameError] = useState("");
   const [lastNameError, setLastNameError] = useState("");
+  const [mobileNumberError, setMobileNumberError] = useState("");
   const [emailError, setEmailError] = useState("");
   const [passwordError, setPasswordError] = useState("");
   const [formError, setFormError] = useState("");
@@ -42,6 +47,7 @@ export default function SignupPage() {
   function clearFormErrors() {
     setFirstNameError("");
     setLastNameError("");
+    setMobileNumberError("");
     setEmailError("");
     setPasswordError("");
     setFormError("");
@@ -61,21 +67,31 @@ export default function SignupPage() {
     // needs fixing in one pass instead of one error at a time.
     const firstNameValidationError = validateName(firstName, "First name", SIGNUP_NAME_MAX_LENGTH) || "";
     const lastNameValidationError = validateName(lastName, "Last name", SIGNUP_NAME_MAX_LENGTH) || "";
+    const mobileNumberValidationError = validateMobileNumber(mobileNumber) || "";
     const emailValidationError = validateEmailValue(email) || "";
     const passwordValidationError = validatePasswordValue(password) || "";
-    if (firstNameValidationError || lastNameValidationError || emailValidationError || passwordValidationError) {
+    if (
+      firstNameValidationError ||
+      lastNameValidationError ||
+      mobileNumberValidationError ||
+      emailValidationError ||
+      passwordValidationError
+    ) {
       setFirstNameError(firstNameValidationError);
       setLastNameError(lastNameValidationError);
+      setMobileNumberError(mobileNumberValidationError);
       setEmailError(emailValidationError);
       setPasswordError(passwordValidationError);
       return;
     }
 
+    const normalizedMobile = mobileNumber.trim() ? normalizeMobileNumber(mobileNumber.trim()) : undefined;
     setSubmitting(true);
     try {
       await startSignup({
         firstName: firstName.trim(),
         lastName: lastName.trim(),
+        mobileNumber: normalizedMobile,
         email: email.trim().toLowerCase(),
         password,
       });
@@ -201,6 +217,25 @@ export default function SignupPage() {
                 {lastNameError && <FieldError>{lastNameError}</FieldError>}
               </Field>
             </div>
+            <Field>
+              <FieldLabel htmlFor="signup-mobile">Mobile number</FieldLabel>
+              <PhoneInput
+                id="signup-mobile"
+                value={mobileNumber}
+                onChange={(value) => {
+                  setMobileNumber(value);
+                  if (mobileNumberError && !validateMobileNumber(value)) setMobileNumberError("");
+                }}
+                disabled={submitting}
+                maxLength={MOBILE_NUMBER_MAX_LENGTH}
+                aria-invalid={Boolean(mobileNumberError)}
+              />
+              {mobileNumberError ? (
+                <FieldError>{mobileNumberError}</FieldError>
+              ) : (
+                <FieldHint>Optional.</FieldHint>
+              )}
+            </Field>
             <Field>
               <FieldLabel htmlFor="signup-email">Work email *</FieldLabel>
               <Input

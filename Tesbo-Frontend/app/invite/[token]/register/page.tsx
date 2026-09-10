@@ -12,8 +12,17 @@ import {
   type InviteDetails,
 } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
-import { Button, Card, CardBody, CardHeader, CardTitle, Field, FieldError, FieldLabel, FieldHint, Input } from "@/components/ui";
-import { NAME_MAX_LENGTH, PASSWORD_MAX_LENGTH, PASSWORD_RULES_HINT, validateName, validatePasswordValue } from "@/lib/validation";
+import { Button, Card, CardBody, CardHeader, CardTitle, Field, FieldError, FieldLabel, FieldHint, Input, PhoneInput } from "@/components/ui";
+import {
+  MOBILE_NUMBER_MAX_LENGTH,
+  SIGNUP_NAME_MAX_LENGTH,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_RULES_HINT,
+  normalizeMobileNumber,
+  validateMobileNumber,
+  validateName,
+  validatePasswordValue,
+} from "@/lib/validation";
 
 type Mode = "password" | "otp";
 type Step = "form" | "code";
@@ -34,17 +43,23 @@ export default function RegisterFromInvitePage() {
   const [inviteState, setInviteState] = useState<"loading" | "valid" | "invalid">("loading");
   const [mode, setMode] = useState<Mode>("password");
   const [step, setStep] = useState<Step>("form");
-  const [name, setName] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [mobileNumber, setMobileNumber] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [code, setCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [nameError, setNameError] = useState("");
+  const [firstNameError, setFirstNameError] = useState("");
+  const [lastNameError, setLastNameError] = useState("");
+  const [mobileNumberError, setMobileNumberError] = useState("");
   const [passwordError, setPasswordError] = useState("");
   const [confirmPasswordError, setConfirmPasswordError] = useState("");
   const [formError, setFormError] = useState("");
-  const [otpNameError, setOtpNameError] = useState("");
+  const [otpFirstNameError, setOtpFirstNameError] = useState("");
+  const [otpLastNameError, setOtpLastNameError] = useState("");
+  const [otpMobileNumberError, setOtpMobileNumberError] = useState("");
 
   useEffect(() => {
     getInvitationByToken(token)
@@ -68,23 +83,33 @@ export default function RegisterFromInvitePage() {
     setMode(next);
     setStep("form");
     setError("");
-    setNameError("");
+    setFirstNameError("");
+    setLastNameError("");
+    setMobileNumberError("");
     setPasswordError("");
     setConfirmPasswordError("");
     setFormError("");
-    setOtpNameError("");
+    setOtpFirstNameError("");
+    setOtpLastNameError("");
+    setOtpMobileNumberError("");
   }
 
   async function handlePasswordFormSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setNameError("");
+    setFirstNameError("");
+    setLastNameError("");
+    setMobileNumberError("");
     setPasswordError("");
     setConfirmPasswordError("");
     setFormError("");
 
     let valid = true;
-    const nameMsg = validateName(name, "Name");
-    if (nameMsg) { setNameError(nameMsg); valid = false; }
+    const firstNameMsg = validateName(firstName, "First name", SIGNUP_NAME_MAX_LENGTH);
+    if (firstNameMsg) { setFirstNameError(firstNameMsg); valid = false; }
+    const lastNameMsg = validateName(lastName, "Last name", SIGNUP_NAME_MAX_LENGTH);
+    if (lastNameMsg) { setLastNameError(lastNameMsg); valid = false; }
+    const mobileMsg = validateMobileNumber(mobileNumber);
+    if (mobileMsg) { setMobileNumberError(mobileMsg); valid = false; }
     const passwordMsg = validatePasswordValue(password);
     if (passwordMsg) {
       setPasswordError(passwordMsg);
@@ -100,7 +125,12 @@ export default function RegisterFromInvitePage() {
 
     setSubmitting(true);
     try {
-      await startInviteRegistration(token, { name: name.trim(), password });
+      await startInviteRegistration(token, {
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        mobileNumber: mobileNumber.trim() ? normalizeMobileNumber(mobileNumber.trim()) : undefined,
+        password,
+      });
       setStep("code");
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "Failed to start signup");
@@ -127,13 +157,27 @@ export default function RegisterFromInvitePage() {
 
   async function handleOtpFormSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setOtpNameError("");
+    setOtpFirstNameError("");
+    setOtpLastNameError("");
+    setOtpMobileNumberError("");
     setError("");
-    const nameMsg = validateName(name, "Name");
-    if (nameMsg) { setOtpNameError(nameMsg); return; }
+
+    let valid = true;
+    const firstNameMsg = validateName(firstName, "First name", SIGNUP_NAME_MAX_LENGTH);
+    if (firstNameMsg) { setOtpFirstNameError(firstNameMsg); valid = false; }
+    const lastNameMsg = validateName(lastName, "Last name", SIGNUP_NAME_MAX_LENGTH);
+    if (lastNameMsg) { setOtpLastNameError(lastNameMsg); valid = false; }
+    const mobileMsg = validateMobileNumber(mobileNumber);
+    if (mobileMsg) { setOtpMobileNumberError(mobileMsg); valid = false; }
+    if (!valid) return;
+
     setSubmitting(true);
     try {
-      await startInviteOtpRegistration(token, { name: name.trim() });
+      await startInviteOtpRegistration(token, {
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        mobileNumber: mobileNumber.trim() ? normalizeMobileNumber(mobileNumber.trim()) : undefined,
+      });
       setStep("code");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to send code");
@@ -233,23 +277,62 @@ export default function RegisterFromInvitePage() {
 
           {mode === "password" && step === "form" && (
             <form onSubmit={handlePasswordFormSubmit} className="space-y-4">
+              <div className="flex gap-3">
+                <Field className="flex-1">
+                  <FieldLabel htmlFor="reg-first-name">First name</FieldLabel>
+                  <Input
+                    id="reg-first-name"
+                    type="text"
+                    value={firstName}
+                    onChange={(e) => {
+                      setFirstName(e.target.value);
+                      if (firstNameError) setFirstNameError("");
+                    }}
+                    placeholder="Jane"
+                    disabled={submitting}
+                    maxLength={SIGNUP_NAME_MAX_LENGTH}
+                    autoFocus
+                    aria-invalid={Boolean(firstNameError)}
+                  />
+                  {firstNameError && <FieldError>{firstNameError}</FieldError>}
+                </Field>
+                <Field className="flex-1">
+                  <FieldLabel htmlFor="reg-last-name">Last name</FieldLabel>
+                  <Input
+                    id="reg-last-name"
+                    type="text"
+                    value={lastName}
+                    onChange={(e) => {
+                      setLastName(e.target.value);
+                      if (lastNameError) setLastNameError("");
+                    }}
+                    placeholder="Smith"
+                    disabled={submitting}
+                    maxLength={SIGNUP_NAME_MAX_LENGTH}
+                    aria-invalid={Boolean(lastNameError)}
+                  />
+                  {lastNameError && <FieldError>{lastNameError}</FieldError>}
+                </Field>
+              </div>
+
               <Field>
-                <FieldLabel htmlFor="reg-name">Full name</FieldLabel>
-                <Input
-                  id="reg-name"
-                  type="text"
-                  value={name}
-                  onChange={(e) => {
-                    setName(e.target.value);
-                    if (nameError) setNameError("");
+                <FieldLabel htmlFor="reg-mobile">Mobile number</FieldLabel>
+                <PhoneInput
+                  id="reg-mobile"
+                  value={mobileNumber}
+                  onChange={(value) => {
+                    setMobileNumber(value);
+                    if (mobileNumberError) setMobileNumberError("");
                   }}
-                  placeholder="Your name"
                   disabled={submitting}
-                  maxLength={NAME_MAX_LENGTH}
-                  autoFocus
-                  aria-invalid={Boolean(nameError)}
+                  maxLength={MOBILE_NUMBER_MAX_LENGTH}
+                  aria-invalid={Boolean(mobileNumberError)}
                 />
-                {nameError && <FieldError>{nameError}</FieldError>}
+                {mobileNumberError ? (
+                  <FieldError>{mobileNumberError}</FieldError>
+                ) : (
+                  <FieldHint>Optional.</FieldHint>
+                )}
               </Field>
 
               <Field>
@@ -343,23 +426,62 @@ export default function RegisterFromInvitePage() {
 
           {mode === "otp" && step === "form" && (
             <form onSubmit={handleOtpFormSubmit} className="space-y-4">
+              <div className="flex gap-3">
+                <Field className="flex-1">
+                  <FieldLabel htmlFor="reg-otp-first-name">First name</FieldLabel>
+                  <Input
+                    id="reg-otp-first-name"
+                    type="text"
+                    value={firstName}
+                    onChange={(e) => {
+                      setFirstName(e.target.value);
+                      if (otpFirstNameError) setOtpFirstNameError("");
+                    }}
+                    placeholder="Jane"
+                    disabled={submitting}
+                    maxLength={SIGNUP_NAME_MAX_LENGTH}
+                    autoFocus
+                    aria-invalid={Boolean(otpFirstNameError)}
+                  />
+                  {otpFirstNameError && <FieldError>{otpFirstNameError}</FieldError>}
+                </Field>
+                <Field className="flex-1">
+                  <FieldLabel htmlFor="reg-otp-last-name">Last name</FieldLabel>
+                  <Input
+                    id="reg-otp-last-name"
+                    type="text"
+                    value={lastName}
+                    onChange={(e) => {
+                      setLastName(e.target.value);
+                      if (otpLastNameError) setOtpLastNameError("");
+                    }}
+                    placeholder="Smith"
+                    disabled={submitting}
+                    maxLength={SIGNUP_NAME_MAX_LENGTH}
+                    aria-invalid={Boolean(otpLastNameError)}
+                  />
+                  {otpLastNameError && <FieldError>{otpLastNameError}</FieldError>}
+                </Field>
+              </div>
+
               <Field>
-                <FieldLabel htmlFor="reg-otp-name">Full name</FieldLabel>
-                <Input
-                  id="reg-otp-name"
-                  type="text"
-                  value={name}
-                  onChange={(e) => {
-                    setName(e.target.value);
-                    if (otpNameError) setOtpNameError("");
+                <FieldLabel htmlFor="reg-otp-mobile">Mobile number</FieldLabel>
+                <PhoneInput
+                  id="reg-otp-mobile"
+                  value={mobileNumber}
+                  onChange={(value) => {
+                    setMobileNumber(value);
+                    if (otpMobileNumberError) setOtpMobileNumberError("");
                   }}
-                  placeholder="Your name"
                   disabled={submitting}
-                  maxLength={NAME_MAX_LENGTH}
-                  autoFocus
-                  aria-invalid={Boolean(otpNameError)}
+                  maxLength={MOBILE_NUMBER_MAX_LENGTH}
+                  aria-invalid={Boolean(otpMobileNumberError)}
                 />
-                {otpNameError && <FieldError>{otpNameError}</FieldError>}
+                {otpMobileNumberError ? (
+                  <FieldError>{otpMobileNumberError}</FieldError>
+                ) : (
+                  <FieldHint>Optional.</FieldHint>
+                )}
               </Field>
 
               <Field>

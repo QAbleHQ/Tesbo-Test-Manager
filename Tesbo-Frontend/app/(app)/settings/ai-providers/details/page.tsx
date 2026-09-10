@@ -3,12 +3,14 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { authMe, getWorkspace, listWorkspaceAiKeys, type WorkspaceAiKey } from "@/lib/api";
+import { getWorkspace, listWorkspaceAiKeys, type WorkspaceAiKey } from "@/lib/api";
 import { Card, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AiProviderDetailsPage() {
   const router = useRouter();
+  const { currentUser } = useAppData();
   const [keys, setKeys] = useState<WorkspaceAiKey[]>([]);
   const [role, setRole] = useState("member");
   const [workspaceName, setWorkspaceName] = useState("");
@@ -30,11 +32,9 @@ export default function AiProviderDetailsPage() {
   }, []);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-  }, [loadData, router]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, currentUser]);
 
   const breadcrumb = (
     <Breadcrumbs

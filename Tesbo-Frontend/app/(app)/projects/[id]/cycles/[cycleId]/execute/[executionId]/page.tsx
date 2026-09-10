@@ -4,10 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  authMe,
   listCycleExecutions,
   updateExecution,
-  listProjectMembers,
   listBugs,
   type ExecutionItem,
   type BugItem,
@@ -18,6 +16,8 @@ import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
 import { useLogBugDialog } from "@/components/LogBugDialog";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
@@ -62,12 +62,13 @@ export default function ExecutionDetailPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const cycleId = params.cycleId as string;
+  const { currentUser } = useAppData();
+  const { projectMembers: members } = useProjectData();
   const executionId = params.executionId as string;
   const [execution, setExecution] = useState<ExecutionItem | null>(null);
   const [status, setStatus] = useState("");
   const [actualResult, setActualResult] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [saving, setSaving] = useState(false);
   /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
      (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
@@ -87,27 +88,24 @@ export default function ExecutionDetailPage() {
   }
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      listCycleExecutions(cycleId)
-        .then((list) => {
-          const e = list.find((x) => x.id === executionId);
-          if (e) {
-            setExecution(e);
-            setStatus(e.status || "Untested");
-            setActualResult(e.actualResult || "");
-            setAssigneeId(e.assigneeId || "");
-            loadLinkedBug(e);
-          }
-        })
-        .catch(() => router.replace("/projects"));
-      listProjectMembers(projectId).then(setMembers).catch(() => {});
-    });
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    listCycleExecutions(cycleId)
+      .then((list) => {
+        const e = list.find((x) => x.id === executionId);
+        if (e) {
+          setExecution(e);
+          setStatus(e.status || "Untested");
+          setActualResult(e.actualResult || "");
+          setAssigneeId(e.assigneeId || "");
+          loadLinkedBug(e);
+        }
+      })
+      .catch(() => router.replace("/projects"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cycleId, executionId, projectId, router]);
+  }, [cycleId, executionId, projectId, router, currentUser]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
