@@ -4,7 +4,6 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { IconPencil, IconTrash } from "@tabler/icons-react";
 import {
-  authMe,
   listBugs,
   createBug,
   updateBug,
@@ -15,8 +14,6 @@ import {
   deleteBugAttachment,
   getBugAttachmentDownloadUrl,
   listTestRuns,
-  listProjectMembers,
-  getProject,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -37,6 +34,8 @@ import {
   SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
@@ -412,6 +411,9 @@ export default function BugsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [bugs, setBugs] = useState<BugItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -440,8 +442,6 @@ export default function BugsPage() {
      mandatory when there's actually something to pick, so reporting a bug is never blocked
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
-  const [projectName, setProjectName] = useState("");
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -508,21 +508,17 @@ export default function BugsPage() {
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-    });
-  }, [router, load]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [router, load, currentUser]);
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
-    listProjectMembers(projectId).then(setMembers).catch(() => {});
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
   }, [projectId]);
 
   /* filtered list */

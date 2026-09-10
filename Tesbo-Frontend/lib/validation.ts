@@ -34,6 +34,29 @@ export function validatePasswordValue(value: string): string | null {
   return null;
 }
 
+// Matches the CHECK constraint on users.mobile_number (Tesbo-Backend-Nest/migrations/
+// V105_user_profile_fields.sql) and Tesbo-Backend-Nest/src/common/mobile-number.util.ts: stored
+// already normalized as "+<country code><digits>", no separators. VARCHAR(20) comfortably covers
+// E.164's max 15 digits plus the leading '+'.
+export const MOBILE_NUMBER_MAX_LENGTH = 20;
+
+const MOBILE_NUMBER_RE = /^\+[1-9]\d{6,14}$/;
+
+// People paste/type a number with spaces, hyphens, parens or dots — strip that formatting before
+// validating and sending, so the stored value matches what the backend and the DB constraint expect.
+export function normalizeMobileNumber(value: string): string {
+  return value.trim().replace(/[\s\-().]/g, "");
+}
+
+export function validateMobileNumber(value: string): string | null {
+  const normalized = normalizeMobileNumber(value);
+  if (!normalized) return null; // optional — clears the stored number
+  if (!MOBILE_NUMBER_RE.test(normalized)) {
+    return "Mobile number must include a country code, e.g. +14155551234";
+  }
+  return null;
+}
+
 export function validateEmailValue(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return "Email is required";

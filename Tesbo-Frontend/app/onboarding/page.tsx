@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { addWorkspaceMember, authMe, createWorkspace, getWorkspace } from "@/lib/api";
+import { authMe, createWorkspace, createWorkspaceInvitation, getWorkspace } from "@/lib/api";
 import { countryOptions } from "@/lib/countries";
 import { Button, Field, FieldError, FieldHint, FieldLabel, Input, Select, Textarea } from "@/components/ui";
 
@@ -91,7 +91,7 @@ export default function OnboardingPage() {
       );
 
       for (const email of emails) {
-        await addWorkspaceMember({ email, role: "qa_engineer" });
+        await createWorkspaceInvitation({ email, role: "qa_engineer" });
       }
 
       router.push("/projects?create=1&fromOnboarding=1");

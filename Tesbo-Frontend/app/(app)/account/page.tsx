@@ -1,17 +1,48 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { authMe, changePassword } from "@/lib/api";
-import { Button, Card, Field, FieldError, FieldHint, FieldLabel, PageLoader, PasswordInput } from "@/components/ui";
-import { PASSWORD_MAX_LENGTH, PASSWORD_RULES_HINT, validatePasswordValue } from "@/lib/validation";
+import { IconPencil } from "@tabler/icons-react";
+import { changePassword, updateProfile } from "@/lib/api";
+import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, PageLoader, PasswordInput, PhoneInput } from "@/components/ui";
+import {
+  MOBILE_NUMBER_MAX_LENGTH,
+  normalizeMobileNumber,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_RULES_HINT,
+  SIGNUP_NAME_MAX_LENGTH,
+  validateMobileNumber,
+  validateName,
+  validatePasswordValue,
+} from "@/lib/validation";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AccountPage() {
   const router = useRouter();
+  const { currentUser, refetchCurrentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [mobileNumber, setMobileNumber] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
+
+  const [firstNameDraft, setFirstNameDraft] = useState("");
+  const [lastNameDraft, setLastNameDraft] = useState("");
+  const [mobileNumberDraft, setMobileNumberDraft] = useState("");
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSuccess, setProfileSuccess] = useState(false);
+  // First name, last name, and mobile number each read as a plain, locked field until their own
+  // pencil button is clicked — matching the read-only treatment Email already has, instead of
+  // always-open inputs. Each field has its own independent edit flag: clicking one field's pencil
+  // must not unlock the others (Basecamp report — a single shared flag used to do exactly that).
+  // They still save together through one "Save profile" submission regardless of which are unlocked.
+  const [isEditingFirstName, setIsEditingFirstName] = useState(false);
+  const [isEditingLastName, setIsEditingLastName] = useState(false);
+  const [isEditingMobile, setIsEditingMobile] = useState(false);
+  const firstNameInputRef = useRef<HTMLInputElement>(null);
+  const lastNameInputRef = useRef<HTMLInputElement>(null);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -22,19 +53,97 @@ export default function AccountPage() {
   const [confirmPasswordError, setConfirmPasswordError] = useState("");
   const [formError, setFormError] = useState("");
 
-  const load = useCallback(async () => {
-    const me = await authMe();
-    if (!me) {
+  const load = useCallback(() => {
+    if (!currentUser) {
       router.replace("/login");
       return;
     }
-    setEmail(me.email ?? "");
-    setName((me.name ?? "").trim());
-    setHasPassword(Boolean(me.hasPassword));
+    setEmail(currentUser.email ?? "");
+    const trimmedFirstName = (currentUser.firstName ?? "").trim();
+    const trimmedLastName = (currentUser.lastName ?? "").trim();
+    setFirstName(trimmedFirstName);
+    setFirstNameDraft(trimmedFirstName);
+    setLastName(trimmedLastName);
+    setLastNameDraft(trimmedLastName);
+    setMobileNumber((currentUser.mobileNumber ?? "").trim());
+    setMobileNumberDraft((currentUser.mobileNumber ?? "").trim());
+    setHasPassword(Boolean(currentUser.hasPassword));
     setLoading(false);
-  }, [router]);
+  }, [router, currentUser]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { load(); }, [load]);
+
+  // Save is enabled the moment any field is unlocked for editing — not gated on an actual value
+  // change — so clicking a pencil and immediately hitting Save (a no-op resubmit of the same,
+  // already-valid value) is a normal, safe path rather than a dead button.
+  const anyFieldEditing = isEditingFirstName || isEditingLastName || isEditingMobile;
+
+  function startEditingFirstName() {
+    setIsEditingFirstName(true);
+    // readOnly doesn't block focusing (only `disabled` would), so this can run immediately.
+    firstNameInputRef.current?.focus();
+  }
+
+  function startEditingLastName() {
+    setIsEditingLastName(true);
+    lastNameInputRef.current?.focus();
+  }
+
+  function startEditingMobile() {
+    setIsEditingMobile(true);
+  }
+
+  async function handleProfileSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setProfileError("");
+    setProfileSuccess(false);
+
+    const trimmedFirstName = firstNameDraft.trim();
+    const firstNameError = validateName(trimmedFirstName, "First name", SIGNUP_NAME_MAX_LENGTH);
+    if (firstNameError) {
+      setProfileError(firstNameError);
+      return;
+    }
+    const trimmedLastName = lastNameDraft.trim();
+    const lastNameError = validateName(trimmedLastName, "Last name", SIGNUP_NAME_MAX_LENGTH);
+    if (lastNameError) {
+      setProfileError(lastNameError);
+      return;
+    }
+    const mobileError = validateMobileNumber(mobileNumberDraft);
+    if (mobileError) {
+      setProfileError(mobileError);
+      return;
+    }
+    const normalizedMobileNumber = normalizeMobileNumber(mobileNumberDraft);
+
+    setProfileSaving(true);
+    try {
+      const updated = await updateProfile({
+        firstName: trimmedFirstName,
+        lastName: trimmedLastName,
+        mobileNumber: normalizedMobileNumber,
+      });
+      setFirstName((updated.firstName ?? "").trim());
+      setFirstNameDraft((updated.firstName ?? "").trim());
+      setLastName((updated.lastName ?? "").trim());
+      setLastNameDraft((updated.lastName ?? "").trim());
+      setMobileNumber(updated.mobileNumber ?? "");
+      setMobileNumberDraft(updated.mobileNumber ?? "");
+      setProfileSuccess(true);
+      setIsEditingFirstName(false);
+      setIsEditingLastName(false);
+      setIsEditingMobile(false);
+      // AppDataProvider's currentUser is fetched once on mount and otherwise never updated — without
+      // this, the TopBar/Sidebar avatar initials would keep showing the pre-edit name, and returning
+      // to this page after navigating away would read the stale value straight back out of context.
+      refetchCurrentUser();
+    } catch (err) {
+      setProfileError(err instanceof Error ? err.message : "Failed to save profile");
+    } finally {
+      setProfileSaving(false);
+    }
+  }
 
   function clearErrors() {
     setCurrentPasswordError("");
@@ -129,26 +238,140 @@ export default function AccountPage() {
           <h2 className="text-base font-semibold text-[var(--foreground)]">Profile</h2>
         </div>
         {/*
-          * Basecamp 10212498688 — the profile showed nothing but the email. Signup collects First name
-          * and Last name and GET /me has always returned them as a single `name`; this screen simply
-          * never rendered it. Read-only for now: there is no PATCH /me to save an edit through.
+          * Basecamp 10212498688 — the profile showed nothing but the email. First name, Last name and
+          * Mobile number are collected at signup, invite registration, and (via the one-time
+          * /complete-profile step) passwordless OTP sign-in — see SignupService, AuthService.me/
+          * completeProfile, and app/complete-profile/page.tsx. They're also editable here afterward
+          * through PATCH /api/auth/me, for anyone who mistyped at signup or wants to update them.
           *
-          * The mobile number the card also asks for is NOT shown, because signup never collects one —
-          * there is no field, no column and no value to fetch. Raised separately for Specification
-          * rather than rendered as a permanently empty row.
+          * No profile picture field here: avatar_url exists on the users table but is intentionally
+          * not exposed through this screen — the top-right avatar and every other avatar in the app
+          * show initials only.
           */}
-        <Field>
-          <FieldLabel htmlFor="account-name">Name</FieldLabel>
-          <div id="account-name" className="text-sm text-[var(--foreground)]">
-            {name || <span className="text-[var(--muted-soft)]">Not set</span>}
+        <form onSubmit={handleProfileSubmit} className="space-y-4">
+          <Field>
+            <FieldLabel htmlFor="account-first-name">First name</FieldLabel>
+            <div className="flex items-center gap-2">
+              <Input
+                id="account-first-name"
+                ref={firstNameInputRef}
+                type="text"
+                value={firstNameDraft}
+                onChange={(e) => {
+                  setFirstNameDraft(e.target.value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                placeholder="Your first name"
+                readOnly={!isEditingFirstName}
+                disabled={profileSaving}
+                maxLength={SIGNUP_NAME_MAX_LENGTH}
+                className={!isEditingFirstName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+              />
+              {!isEditingFirstName && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingFirstName}
+                  disabled={profileSaving}
+                  title="Edit first name"
+                  aria-label="Edit first name"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-last-name">Last name</FieldLabel>
+            <div className="flex items-center gap-2">
+              <Input
+                id="account-last-name"
+                ref={lastNameInputRef}
+                type="text"
+                value={lastNameDraft}
+                onChange={(e) => {
+                  setLastNameDraft(e.target.value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                placeholder="Your last name"
+                readOnly={!isEditingLastName}
+                disabled={profileSaving}
+                maxLength={SIGNUP_NAME_MAX_LENGTH}
+                className={!isEditingLastName ? "cursor-default bg-[var(--surface-secondary)]" : undefined}
+              />
+              {!isEditingLastName && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingLastName}
+                  disabled={profileSaving}
+                  title="Edit last name"
+                  aria-label="Edit last name"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-email">Email</FieldLabel>
+            <div id="account-email" className="text-sm text-[var(--foreground)]">
+              {email}
+            </div>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
+            <div className="flex items-center gap-2">
+              <PhoneInput
+                id="account-mobile-number"
+                value={mobileNumberDraft}
+                onChange={(value) => {
+                  setMobileNumberDraft(value);
+                  if (profileError) setProfileError("");
+                  setProfileSuccess(false);
+                }}
+                disabled={profileSaving || !isEditingMobile}
+                maxLength={MOBILE_NUMBER_MAX_LENGTH}
+                className="flex-1"
+              />
+              {!isEditingMobile && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={startEditingMobile}
+                  disabled={profileSaving}
+                  title="Edit mobile number"
+                  aria-label="Edit mobile number"
+                  className="shrink-0"
+                >
+                  <IconPencil size={14} stroke={1.75} />
+                </Button>
+              )}
+            </div>
+            <FieldHint>Optional.</FieldHint>
+          </Field>
+
+          {profileError && <FieldError>{profileError}</FieldError>}
+          {profileSuccess && !profileError && (
+            <p className="text-[13px] text-[var(--success-foreground)]">Profile updated.</p>
+          )}
+
+          <div className="flex justify-end">
+            <Button type="submit" disabled={profileSaving || !anyFieldEditing}>
+              {profileSaving ? "Saving…" : "Save profile"}
+            </Button>
           </div>
-        </Field>
-        <Field>
-          <FieldLabel htmlFor="account-email">Email</FieldLabel>
-          <div id="account-email" className="text-sm text-[var(--foreground)]">
-            {email}
-          </div>
-        </Field>
+        </form>
       </Card>
 
       <Card className="p-5">
@@ -163,7 +386,7 @@ export default function AccountPage() {
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="max-w-md space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-4">
           {hasPassword && (
             <Field>
               <FieldLabel htmlFor="current-password">Current password</FieldLabel>

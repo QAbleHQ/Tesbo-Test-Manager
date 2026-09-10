@@ -232,8 +232,8 @@ test.describe("theme toggle", () => {
     // Still dark with nobody signed in — the login screen follows the same stored choice.
     expect((await readAppliedTheme(page)).dataset).toBe("dark");
 
-    await page.getByLabel("Email", { exact: true }).fill(member.email);
-    await page.getByLabel("Password", { exact: true }).fill(member.password);
+    await page.getByLabel("Email *", { exact: true }).fill(member.email);
+    await page.getByLabel("Password *", { exact: true }).fill(member.password);
     await page.getByRole("button", { name: "Sign in" }).click();
     await page.waitForURL(/\/projects/);
 

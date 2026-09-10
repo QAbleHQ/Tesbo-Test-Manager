@@ -6,14 +6,11 @@ import Link from "next/link";
 import { createPortal } from "react-dom";
 import { IconKey, IconSettings, IconStack2, IconTrash } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   updateProject,
   deleteProject as deleteProjectRequest,
   getJiraStatus,
   getBillingInfo,
   getLinearStatus,
-  listProjectMembers,
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
@@ -25,6 +22,8 @@ import {
   type TestEnvironmentSetting,
 } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import {
   Button,
@@ -37,7 +36,6 @@ import {
   Field,
   FieldError,
   FieldLabel,
-  PageLoader,
 } from "@/components/ui";
 import { ProjectIconPicker, type ProjectIconValue } from "@/components/ProjectIconPicker";
 import { avatarColor } from "@/lib/avatarColors";
@@ -52,8 +50,6 @@ import {
   validateEnvironmentName,
   validateEnvironmentUrl,
 } from "@/lib/validation";
-
-const EMPTY_ICON: ProjectIconValue = { color: null, glyph: null };
 
 function extractProjectIcon(raw: unknown): ProjectIcon | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -108,15 +104,23 @@ export default function ProjectSettingsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
-  const [project, setProject] = useState<Record<string, unknown> | null>(null);
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
+  const { currentUser } = useAppData();
+  const { project, projectMembers, refetchProject, refetchMembers } = useProjectData();
+  const [name, setName] = useState(() => (project.name as string) ?? "");
+  const [description, setDescription] = useState(() => (project.description as string) ?? "");
   const [nameError, setNameError] = useState("");
   const [descriptionError, setDescriptionError] = useState("");
-  const [icon, setIcon] = useState<ProjectIconValue>(EMPTY_ICON);
+  const [icon, setIcon] = useState<ProjectIconValue>(() => {
+    const savedIcon = extractProjectIcon(parseProjectSettings(project.settings));
+    return { color: savedIcon?.color ?? null, glyph: savedIcon?.glyph ?? null };
+  });
   const [iconGlyphError, setIconGlyphError] = useState("");
-  const [testcaseIdPrefix, setTestcaseIdPrefix] = useState("");
-  const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>([]);
+  const [testcaseIdPrefix, setTestcaseIdPrefix] = useState(() =>
+    normalizeTestcaseIdPrefix(String(parseProjectSettings(project.settings).testcaseIdPrefix || project.key || "TC"))
+  );
+  const [testRunEnvironments, setTestRunEnvironments] = useState<TestEnvironmentSetting[]>(() =>
+    normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments)
+  );
   const [newEnvironmentName, setNewEnvironmentName] = useState("");
   const [newEnvironmentUrl, setNewEnvironmentUrl] = useState("");
   const [newEnvironmentNameError, setNewEnvironmentNameError] = useState("");
@@ -142,7 +146,6 @@ export default function ProjectSettingsPage() {
   const [linearIsPro, setLinearIsPro] = useState<boolean | null>(null);
   const linearLocked = linearIsPro === false && !linearStatus?.connected;
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
-  const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMember[]>([]);
   const [membersLoading, setMembersLoading] = useState(true);
   const [memberError, setMemberError] = useState<string | null>(null);
@@ -233,13 +236,9 @@ export default function ProjectSettingsPage() {
     return value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3);
   }
 
-  const loadMembers = useCallback(async () => {
+  const loadWorkspaceMembers = useCallback(async () => {
     try {
-      const [projectList, workspaceList] = await Promise.all([
-        listProjectMembers(projectId),
-        listWorkspaceMembers().catch(() => []),
-      ]);
-      setProjectMembers(projectList as ProjectMember[]);
+      const workspaceList = await listWorkspaceMembers().catch(() => []);
       setWorkspaceMembers(workspaceList as WorkspaceMember[]);
       setMemberError(null);
     } catch {
@@ -247,35 +246,23 @@ export default function ProjectSettingsPage() {
     } finally {
       setMembersLoading(false);
     }
-  }, [projectId]);
+  }, []);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      setCurrentUserId(me.userId);
-      getProject(projectId).then((p) => {
-        setProject(p);
-        setName((p.name as string) ?? "");
-        setDescription((p.description as string) ?? "");
-        const parsedSettings = parseProjectSettings(p.settings);
-        setTestcaseIdPrefix(normalizeTestcaseIdPrefix(String(parsedSettings.testcaseIdPrefix || p.key || "TC")));
-        setTestRunEnvironments(normalizeTestRunEnvironments(parsedSettings.testRunEnvironments));
-        const savedIcon = extractProjectIcon(parsedSettings);
-        setIcon({ color: savedIcon?.color ?? null, glyph: savedIcon?.glyph ?? null });
-      }).catch(() => router.replace("/projects"));
-      getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
-      getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
-      getBillingInfo()
-        .then((billing) => setLinearIsPro(billing.plan === "pro"))
-        .catch(() => setLinearIsPro(null));
-      listApiKeys(projectId).then((l) => setApiTokenCount(l.length)).catch(() => {});
-      listCustomFieldDefinitions(projectId).then((l) => setCustomFieldCount(l.length)).catch(() => {});
-      loadMembers().catch(() => {});
-    });
-  }, [loadMembers, projectId, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    setCurrentUserId(currentUser.userId);
+    getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
+    getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
+    getBillingInfo()
+      .then((billing) => setLinearIsPro(billing.plan === "pro"))
+      .catch(() => setLinearIsPro(null));
+    listApiKeys(projectId).then((l) => setApiTokenCount(l.length)).catch(() => {});
+    listCustomFieldDefinitions(projectId).then((l) => setCustomFieldCount(l.length)).catch(() => {});
+    loadWorkspaceMembers().catch(() => {});
+  }, [loadWorkspaceMembers, projectId, router, currentUser]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -316,7 +303,7 @@ export default function ProjectSettingsPage() {
       if (hasDraftEnvironment) {
         environmentsToSave.push({ name: draftName, url: draftUrl });
       }
-      const currentSettings = parseProjectSettings(project?.settings);
+      const currentSettings = parseProjectSettings(project.settings);
       const nextSettings: ProjectSettingsPayload = {
         ...currentSettings,
         testcaseIdPrefix: normalizeTestcaseIdPrefix(testcaseIdPrefix) || "TC",
@@ -331,8 +318,7 @@ export default function ProjectSettingsPage() {
         settings: JSON.stringify(nextSettings),
         icon: { color: icon.color, glyph: icon.glyph?.trim() || null },
       });
-      const refreshed = await getProject(projectId);
-      setProject(refreshed);
+      const refreshed = await refetchProject();
       const refreshedSettings = parseProjectSettings(refreshed.settings);
       setTestcaseIdPrefix(normalizeTestcaseIdPrefix(String(refreshedSettings.testcaseIdPrefix || refreshed.key || "TC")));
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
@@ -429,7 +415,7 @@ export default function ProjectSettingsPage() {
       await addProjectMember(projectId, { userId: addUserId, role: addRole });
       setAddUserId("");
       setAddRole("qa_engineer");
-      await loadMembers();
+      await refetchMembers();
     } catch {
       setAddMemberError("Failed to add project member.");
     } finally {
@@ -442,7 +428,7 @@ export default function ProjectSettingsPage() {
     setMemberError(null);
     try {
       await addProjectMember(projectId, { userId, role: newRole });
-      await loadMembers();
+      await refetchMembers();
     } catch (err) {
       const text = err instanceof Error ? err.message : "Failed to change member role.";
       setMemberError(text);
@@ -461,7 +447,7 @@ export default function ProjectSettingsPage() {
     setMemberError(null);
     try {
       await removeProjectMember(projectId, userId);
-      setProjectMembers((prev) => prev.filter((member) => member.userId !== userId));
+      await refetchMembers();
       showToast("Member removed from project");
     } catch {
       setMemberError("Failed to remove project member.");
@@ -469,10 +455,6 @@ export default function ProjectSettingsPage() {
       setRemovingMemberId(null);
       setPendingMemberRemoval(null);
     }
-  }
-
-  if (!project) {
-    return <PageLoader variant="screen" label="Loading project settings…" />;
   }
 
   const projectName = typeof project.name === "string" ? project.name : "";

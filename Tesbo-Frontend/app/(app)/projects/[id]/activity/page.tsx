@@ -4,11 +4,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { IconActivity, IconSearch } from "@tabler/icons-react";
 import {
-  authMe,
   getActivitySummary,
-  getProject,
   listActivity,
-  listProjectMembers,
   type ActivitySummary,
   type ActivityLogItem,
 } from "@/lib/api";
@@ -21,6 +18,8 @@ import {
   groupByDate,
   sinceFor,
 } from "@/components/activity/activityShared";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const TYPE_FILTERS = [
   { value: "", label: "All types" },
@@ -39,9 +38,9 @@ export default function ActivityPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
 
-  const [project, setProject] = useState<Record<string, unknown> | null>(null);
-  const [members, setMembers] = useState<{ userId: string; name: string; email: string }[]>([]);
   const [summary, setSummary] = useState<ActivitySummary | null>(null);
   const [activities, setActivities] = useState<ActivityLogItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -87,22 +86,14 @@ export default function ActivityPage() {
   );
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      getProject(projectId)
-        .then((p) => setProject(p))
-        .catch(() => router.replace("/projects"));
-      listProjectMembers(projectId)
-        .then((list) => setMembers(list))
-        .catch(() => setMembers([]));
-      getActivitySummary(projectId)
-        .then((s) => setSummary(s))
-        .catch(() => setSummary(null));
-    });
-  }, [projectId, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    getActivitySummary(projectId)
+      .then((s) => setSummary(s))
+      .catch(() => setSummary(null));
+  }, [projectId, router, currentUser]);
 
   useEffect(() => {
     fetchActivities(true, 0);
@@ -111,7 +102,7 @@ export default function ActivityPage() {
 
   const hasMore = activities.length < total;
   const groups = useMemo(() => groupByDate(activities), [activities]);
-  const projectName = project ? ((project.name as string) ?? "") : "";
+  const projectName = (project.name as string) ?? "";
 
   const breadcrumb = (
     <Breadcrumbs

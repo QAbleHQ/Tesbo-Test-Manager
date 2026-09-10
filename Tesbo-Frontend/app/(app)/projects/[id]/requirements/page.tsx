@@ -6,8 +6,6 @@ import Link from "next/link";
 import React from "react";
 import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getJiraStatus,
   getLinearStatus,
   createZyraTask,
@@ -26,6 +24,8 @@ import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const PAGE_SIZE = 25;
 
@@ -207,6 +207,9 @@ export default function RequirementsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [loading, setLoading] = useState(true);
   const [source, setSource] = useState<Source>("all");
@@ -229,7 +232,6 @@ export default function RequirementsPage() {
   const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>({});
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
   // Past mappings for whichever single-provider tab is active — tickets from these are never
   // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
   const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>([]);
@@ -392,8 +394,7 @@ export default function RequirementsPage() {
 
   useEffect(() => {
     (async () => {
-      const me = await authMe();
-      if (!me) {
+      if (!currentUser) {
         router.replace("/login");
         return;
       }
@@ -409,10 +410,9 @@ export default function RequirementsPage() {
       await loadTickets(initialSource, 0, "", {});
       if (initialSource !== "all") void refreshHistory(initialSource);
       await Promise.all([refreshLinkedKeys(), refreshSummary(), refreshKbFolders()]);
-      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
       setLoading(false);
     })();
-  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router]);
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router, currentUser]);
 
   useEffect(() => {
     if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);

@@ -11,6 +11,7 @@ import { AuthenticatedRequest } from "../common/request.types";
 import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { SuperAdminService } from "../admin/super-admin.service";
+import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
 import { OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
@@ -149,16 +150,98 @@ export class AuthService {
   async me(userId: string) {
     const [isPlatformAdmin, userRow, hasPassword] = await Promise.all([
       this.superAdmin.isPlatformAdmin(userId),
-      this.db.query<{ email: string; name: string | null }>("SELECT email, name FROM users WHERE id = $1", [userId]),
+      this.db.query<{
+        email: string;
+        name: string | null;
+        first_name: string | null;
+        last_name: string | null;
+        mobile_number: string | null;
+        profile_completed_at: Date | null;
+      }>(
+        "SELECT email, name, first_name, last_name, mobile_number, profile_completed_at FROM users WHERE id = $1",
+        [userId]
+      ),
       this.password.hasPassword(userId)
     ]);
+    const row = userRow.rows[0];
     return {
       userId,
       isPlatformAdmin,
-      email: userRow.rows[0]?.email ?? null,
-      name: userRow.rows[0]?.name ?? null,
+      email: row?.email ?? null,
+      name: row?.name ?? null,
+      firstName: row?.first_name ?? null,
+      lastName: row?.last_name ?? null,
+      mobileNumber: row?.mobile_number ?? null,
+      // false only for a passwordless-OTP first-time account that hasn't been through
+      // /auth/complete-profile yet (see OtpService.findOrCreateUser and SignupService.insertUser).
+      profileComplete: row?.profile_completed_at != null,
       hasPassword
     };
+  }
+
+  /**
+   * Edits the profile of an account that has already completed the one-time step below (or never
+   * needed to). `firstName`/`lastName`/`mobileNumber` are each independently optional so the Account
+   * page can save just the field(s) that changed; every other users column (email, avatar_url,
+   * password_hash, active_organization_id, ...) has its own dedicated flow elsewhere, isn't exposed
+   * through this feature, or is not user-editable at all. `name` is kept in sync alongside
+   * first/last, since it's still what member lists, bug reporter/assignee, and the activity feed
+   * read.
+   */
+  async updateProfile(
+    userId: string,
+    firstName: string | undefined,
+    lastName: string | undefined,
+    mobileNumber: string | undefined
+  ) {
+    if (firstName === undefined && lastName === undefined && mobileNumber === undefined) {
+      throw new BadRequestException({ error: "Nothing to update" });
+    }
+
+    if (firstName !== undefined || lastName !== undefined) {
+      const current = await this.db.query<{ first_name: string | null; last_name: string | null }>(
+        "SELECT first_name, last_name FROM users WHERE id = $1",
+        [userId]
+      );
+      const nextFirstName = firstName ?? current.rows[0]?.first_name ?? "";
+      const nextLastName = lastName ?? current.rows[0]?.last_name ?? "";
+      const name = [nextFirstName, nextLastName].filter(Boolean).join(" ");
+      await this.db.query(
+        "UPDATE users SET first_name = $1, last_name = $2, name = $3, updated_at = now() WHERE id = $4",
+        [nextFirstName || null, nextLastName || null, name, userId]
+      );
+    }
+
+    if (mobileNumber !== undefined) {
+      // Matches the CHECK constraint on users.mobile_number (V105_user_profile_fields.sql) and the
+      // signup-time validator in mobile-number.util.ts: an already-normalized "+<country
+      // code><digits>" string. The frontend strips spaces/dashes/parens before sending it, so a
+      // malformed value here means the input truly doesn't parse as a phone number.
+      const validated = validateMobileNumber(mobileNumber);
+      await this.db.query("UPDATE users SET mobile_number = $1, updated_at = now() WHERE id = $2", [validated, userId]);
+    }
+
+    return this.me(userId);
+  }
+
+  /**
+   * Finishes the one-time profile step for an account created via passwordless OTP sign-in, which
+   * collects no name/mobile up front (OtpService.findOrCreateUser). Every other account-creation path
+   * already sets profile_completed_at at INSERT time, so this only ever succeeds once per account —
+   * updateProfile() above is the general-purpose edit, once this has run (or never had to).
+   */
+  async completeProfile(userId: string, firstName: string, lastName: string, mobileNumber: string | null) {
+    const name = `${firstName} ${lastName}`;
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE users
+       SET first_name = $1, last_name = $2, mobile_number = $3, name = $4, profile_completed_at = now(), updated_at = now()
+       WHERE id = $5 AND profile_completed_at IS NULL
+       RETURNING id`,
+      [firstName, lastName, mobileNumber, name, userId]
+    );
+    if (!result.rows[0]) {
+      throw new BadRequestException({ error: "Profile is already complete" });
+    }
   }
 
   private setSessionCookie(req: AuthenticatedRequest, res: Response, token: string, maxAgeSeconds: number) {
