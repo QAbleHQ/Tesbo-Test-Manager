@@ -148,6 +148,20 @@ test.describe("custom fields (UI)", () => {
     return page.locator("tbody tr").filter({ hasText: name });
   }
 
+  /*
+   * One option row inside CustomFieldOptionsEditor — the row div carries `rounded-md` (used for the
+   * drag-over highlight) and contains that option's label <input>, which is how it's told apart
+   * from the "Add an option…" row (a sibling div with no `rounded-md` class).
+   */
+  function optionRow(scope: Locator, label: string): Locator {
+    return scope.locator("div.rounded-md").filter({ has: scope.locator(`input[value="${label}"]`) });
+  }
+
+  /** DOM order of every saved option row's label, read straight from the inputs. */
+  function optionLabelsInDom(scope: Locator): Promise<string[]> {
+    return scope.locator("div.rounded-md input[type='text']").evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value));
+  }
+
   // ─── The settings screen ───────────────────────────────────────────────────
 
   test("an owner can add a custom field and see it listed", { tag: '@tesbo.testId("TES-TC-654")' }, async ({ browser }) => {
@@ -198,6 +212,38 @@ test.describe("custom fields (UI)", () => {
     const [persisted] = await listFields();
     expect(persisted.config.options.map((o: any) => o.label)).toEqual(["Low", "High"]);
     await expect(definitionRow(page, name)).toContainText("Single-Select Dropdown");
+  });
+
+  test("multiselect options can be dragged to a new position, and the order persists through save and reopening the field", async ({ browser }) => {
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+
+    await page.getByRole("button", { name: "Add custom field" }).click();
+    const form = modal(page, CREATE_MODAL_TITLE);
+    const name = fieldName("UI Option Drag");
+    await control(form, "Field name").fill(name);
+    await control(form, "Field type", "select").selectOption("multi_select");
+    for (const label of ["Chrome", "Edge", "Firefox", "Safari"]) {
+      await form.getByPlaceholder("Add an option").fill(label);
+      await form.getByRole("button", { name: "Add", exact: true }).click();
+    }
+
+    // Mirrors the ticket's own example: drag "Safari" to the top.
+    await optionRow(form, "Safari").dragTo(optionRow(form, "Chrome"));
+    expect(await optionLabelsInDom(form)).toEqual(["Safari", "Chrome", "Edge", "Firefox"]);
+
+    await form.getByRole("button", { name: "Create field" }).click();
+    await expect(form).toBeHidden();
+
+    const [persisted] = await listFields();
+    expect(persisted.config.options.map((o: any) => o.label)).toEqual(["Safari", "Chrome", "Edge", "Firefox"]);
+
+    // Reopening the field for edit re-sorts by the persisted `order`, so this proves the order
+    // survived the round trip through the database — not just that local state looked right
+    // before the save request was even sent.
+    await definitionRow(page, name).getByRole("button", { name: "Edit" }).click();
+    const editForm = modal(page, "Edit custom field");
+    expect(await optionLabelsInDom(editForm)).toEqual(["Safari", "Chrome", "Edge", "Firefox"]);
   });
 
   test("a name the server refuses is reported in the form, and nothing is created", { tag: '@tesbo.testId("TES-TC-656")' }, async ({ browser }) => {
@@ -310,6 +356,79 @@ test.describe("custom fields (UI)", () => {
     await expect
       .poll(async () => (await listFields()).map((d) => d.id))
       .toEqual([second.id, first.id]);
+  });
+
+  test("a field can be dragged to a new position, and the order persists after reload", async ({ browser }) => {
+    const first = await defineField({ fieldType: "text" });
+    const second = await defineField({ fieldType: "text" });
+    const third = await defineField({ fieldType: "text" });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    await expect(definitionRow(page, third.name)).toBeVisible();
+
+    // Mirrors the ticket's own example: dragging the last row onto the first row's position moves
+    // it to the top, shifting the others down by one — not a swap with one neighbor.
+    await definitionRow(page, third.name).dragTo(definitionRow(page, first.name));
+
+    await expect
+      .poll(async () => (await listFields()).map((d) => d.id))
+      .toEqual([third.id, first.id, second.id]);
+    await expect(page.locator("tbody tr").first()).toContainText(third.name);
+
+    // Persists across a reload, not just in the in-memory list the drop already updated.
+    await page.reload();
+    await expect(page.locator("tbody tr").first()).toContainText(third.name);
+    await expect(page.locator("tbody tr").nth(1)).toContainText(first.name);
+    await expect(page.locator("tbody tr").nth(2)).toContainText(second.name);
+  });
+
+  test("an archived field cannot be dragged, and dropping onto its row does nothing", async ({ browser }) => {
+    const archived = await defineField({ fieldType: "text" });
+    const active = await defineField({ fieldType: "text" });
+    await api.patch(`${definitionsUrl()}/${archived.id}/status`, { data: { status: "archived" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    const archivedRow = definitionRow(page, archived.name);
+    await expect(archivedRow).toContainText("Archived");
+
+    // No drag handle, no up/down controls — same affordance gap the buttons already had.
+    await expect(archivedRow.getByRole("button", { name: "Move up" })).toHaveCount(0);
+    await expect(archivedRow.locator("[title='Drag to reorder']")).toHaveCount(0);
+    await expect(archivedRow).toHaveAttribute("draggable", "false");
+
+    // Attempting to drag the archived row onto the active one is a no-op: nothing is draggable
+    // there, so no dragstart ever fires and the order is unaffected.
+    await archivedRow.dragTo(definitionRow(page, active.name));
+    await expect
+      .poll(async () => (await listFields()).map((d) => d.id))
+      .toEqual([archived.id, active.id]);
+
+    // And the reverse — dropping an active row onto the archived one — is refused the same way:
+    // the archived row wires up no onDrop handler, so the browser never allows the drop.
+    await definitionRow(page, active.name).dragTo(archivedRow);
+    await expect
+      .poll(async () => (await listFields()).map((d) => d.id))
+      .toEqual([archived.id, active.id]);
+  });
+
+  test("an active field's row offers Edit, Deactivate, Archive and Delete as accessible, enabled buttons", async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(settingsUrl());
+    const row = definitionRow(page, field.name);
+
+    // Icons were added to these buttons for the redesigned Actions column, but the accessible name
+    // must still be exactly the plain label — an icon-only button (accessible name overridden by an
+    // aria-label instead of visible text) would silently break every other test's
+    // `getByRole("button", { name: ... })` locator, so this pins the contract those tests rely on.
+    for (const label of ["Edit", "Deactivate", "Archive", "Delete"]) {
+      const button = row.getByRole("button", { name: label, exact: true });
+      await expect(button).toBeVisible();
+      await expect(button).toBeEnabled();
+    }
   });
 
   test("a field can be deactivated and reactivated from the list", { tag: '@tesbo.testId("TES-TC-658")' }, async ({ browser }) => {
