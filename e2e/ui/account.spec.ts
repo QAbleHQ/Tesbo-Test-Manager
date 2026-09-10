@@ -528,4 +528,100 @@ test.describe("account screen and password reset (UI)", () => {
     );
     expect(status, "a different device's session should be signed out too").toBe(401);
   });
+
+  // ─── Top bar user menu ──────────────────────────────────────────────────────
+
+  /** Same disposable owner as the rest of this suite, landed on a page other than /account. */
+  async function openProjects(browser: Browser): Promise<Page> {
+    const state = await writeStorageState(tenant!.owner, `account-ui-owner-topbar-${contexts.length}`);
+    const ctx = await browser.newContext({ storageState: state });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto("/projects");
+    return page;
+  }
+
+  const userMenuTrigger = (page: Page) => page.getByRole("button", { name: "User menu" });
+  const userMenu = (page: Page) => page.locator('[role="menu"][aria-label="User menu"]');
+
+  test("ACU-16 the user menu opens on click and contains exactly Profile Settings, Theme, and Logout", { tag: '@tesbo.testId("TES-TC-1408")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await expect(userMenu(page)).toBeHidden();
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+
+    await expect(userMenu(page).getByRole("menuitem", { name: "Profile Settings" })).toBeVisible();
+    await expect(userMenu(page).getByText("Theme", { exact: true })).toBeVisible();
+    await expect(userMenu(page).getByRole("button", { name: "Use light theme" })).toBeVisible();
+    await expect(userMenu(page).getByRole("button", { name: "Use dark theme" })).toBeVisible();
+    await expect(userMenu(page).getByRole("menuitem", { name: "Logout" })).toBeVisible();
+    // Exactly the two navigational/action items — the theme switcher is deliberately not a
+    // menuitem itself (it holds its own interactive buttons, which nested ARIA menuitems can't).
+    await expect(userMenu(page).getByRole("menuitem")).toHaveCount(2);
+  });
+
+  test("ACU-17 the user menu closes on outside click and on Escape", { tag: '@tesbo.testId("TES-TC-1409")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    // Deep inside the main content area — clear of both the sidebar's own links and the menu
+    // itself, so this is unambiguously an "outside" click rather than a navigation.
+    await page.mouse.click(700, 400);
+    await expect(userMenu(page)).toBeHidden();
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-18 Profile Settings navigates to /account and closes the menu", { tag: '@tesbo.testId("TES-TC-1410")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Profile Settings" }).click();
+
+    await page.waitForURL(/\/account$/);
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-19 switching theme from the user menu applies dark mode and persists across reload", { tag: '@tesbo.testId("TES-TC-1411")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("button", { name: "Use dark theme" }).click();
+
+    await expect(page.locator("html")).toHaveClass(/dark/);
+    await expect(userMenu(page).getByRole("button", { name: "Use dark theme" })).toHaveAttribute("aria-pressed", "true");
+
+    // The sidebar renders its own separate <ThemeToggle/> instance at the same time as the user
+    // menu's — with no shared context between them, this only reflects the change if the two are
+    // kept in sync (lib/theme.ts's THEME_CHANGE_EVENT), not just the instance that was clicked.
+    const sidebarDarkButton = page.locator("aside").getByRole("button", { name: "Use dark theme" });
+    await expect(sidebarDarkButton).toHaveAttribute("aria-pressed", "true");
+
+    // Persists via the app's existing mechanism (localStorage), not a new one, and survives reload.
+    const stored = await page.evaluate(() => window.localStorage.getItem("tesbo-theme"));
+    expect(stored).toBe("dark");
+    await page.reload();
+    await expect(page.locator("html")).toHaveClass(/dark/);
+
+    // Leave it back on light so this disposable context doesn't affect anything reused later.
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("button", { name: "Use light theme" }).click();
+    await expect(page.locator("html")).not.toHaveClass(/dark/);
+  });
+
+  test("ACU-20 Logout from the user menu signs the session out and redirects to /login", { tag: '@tesbo.testId("TES-TC-1412")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+
+    await page.waitForURL(/\/login/);
+    const status = await page.evaluate(async () => (await fetch("/api/auth/me", { credentials: "include" })).status);
+    expect(status, "the session should be invalidated server-side, not just redirected client-side").toBe(401);
+  });
 });

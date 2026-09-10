@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 import {
   IconHome,
@@ -25,11 +25,10 @@ import {
   IconFolders,
   IconUserCircle,
 } from "@tabler/icons-react";
-import { logout } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
 import ThemeToggle from "@/components/ThemeToggle";
 import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
-import { removeStoredValue } from "@/lib/storage";
+import { useLogout } from "@/lib/useLogout";
 import { Button, Modal } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
 
@@ -178,7 +177,6 @@ function BackToProjects({ collapsed }: { collapsed: boolean }) {
 
 function SidebarContent() {
   const pathname = usePathname();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const projectMatch = pathname?.match(/^\/projects\/([^/]+)/);
   const projectId = projectMatch?.[1] ?? null;
@@ -186,8 +184,7 @@ function SidebarContent() {
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
   const [isCollapsed, setIsCollapsed] = useState(false);
-  const [isLoggingOut, setIsLoggingOut] = useState(false);
-  const [logoutError, setLogoutError] = useState<string | null>(null);
+  const { isLoggingOut, error: logoutError, logout: onLogout, resetError: resetLogoutError } = useLogout();
   const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
   const { workspace } = useAppData();
   const isWorkspaceOwner = (workspace?.role ?? "").trim().toLowerCase() === "owner";
@@ -211,7 +208,7 @@ function SidebarContent() {
 
   const openLogoutConfirm = () => {
     if (isLoggingOut) return;
-    setLogoutError(null);
+    resetLogoutError();
     setIsLogoutConfirmOpen(true);
   };
 
@@ -220,24 +217,7 @@ function SidebarContent() {
     // in flight, and pulling the dialog out from under it would strand the button state.
     if (isLoggingOut) return;
     setIsLogoutConfirmOpen(false);
-    setLogoutError(null);
-  };
-
-  const onLogout = async () => {
-    if (isLoggingOut) return;
-    setLogoutError(null);
-    setIsLoggingOut(true);
-    try {
-      await logout();
-      if (typeof window !== "undefined") removeStoredValue("token");
-      router.replace("/login");
-      router.refresh();
-    } catch {
-      // Left open on failure, not dismissed: the user is one click away from retrying
-      // without having to re-open the confirmation from the footer button.
-      setLogoutError("Could not log out. Please try again.");
-      setIsLoggingOut(false);
-    }
+    resetLogoutError();
   };
 
   const showProjectNav = !isInSettings && isInProject && Boolean(projectId);
