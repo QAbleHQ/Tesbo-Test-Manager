@@ -24,3 +24,27 @@ export const RAG_FTS_CANDIDATES = 20;
 export const RAG_RRF_K = 60;
 export const RAG_MAX_SOURCES = 8;
 export const RAG_CONTEXT_CHAR_BUDGET = 6000;
+
+// Minimum cosine similarity (the raw ANN score, before RRF fusion) for a semantic match to count as
+// relevant at all, rather than merely the least-bad candidate in an otherwise weak pool. RRF's own
+// score (1/(k+rank+1)) is a rank position, not a relevance magnitude — without this floor, the 8th
+// candidate out of 8 unrelated ones still gets a nonzero RRF score and fills the context budget
+// exactly like a strong match would.
+//
+// 0.5 is a conservative starting point, not tuned against this project's live query traffic — no
+// empirical score-distribution sample was pulled before shipping this (see the phase-4 changelog
+// entry in docs/langfuse-observability-plan.md for why: pulling one would have meant issuing a real
+// embedding-provider call, spending an actual workspace's provider budget on a one-off dev-time
+// sample, which needed asking first rather than assuming). Common practice for cosine similarity on
+// normalized text-embedding models treats >0.7 as a strong match, 0.5-0.7 as plausibly related, and
+// below 0.5 as no more related than chance for typical short-query/long-document pairs.
+// recordKnowledgeContext (ai-trace.ts) now traces the top raw score per query specifically so this
+// can be revisited against real distributions once traces accumulate, rather than adjusted again
+// from first principles.
+export const RAG_MIN_SIMILARITY = 0.5;
+
+// Below this top score, retrieval is reported as "weak" rather than "grounded" even when it returned
+// results above RAG_MIN_SIMILARITY — see generateZyraChatTestcasesWithAi's ungrounded check.
+// Deliberately higher than RAG_MIN_SIMILARITY: a single candidate that just clears the relevance
+// floor is still a shaky foundation to call "coverage", not the same as having nothing.
+export const RAG_CONFIDENT_SIMILARITY = 0.65;

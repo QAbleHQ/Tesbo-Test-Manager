@@ -226,6 +226,13 @@ export function recordKnowledgeContext(
     retrieved: Array<{ title: string; sourceType?: string; sourceId?: string; score?: number }>;
     folderMatched: Array<{ title: string }>;
     fallbackUsed: boolean;
+    // The top raw semantic score and the confidence bucket it maps to (see RAG_MIN_SIMILARITY /
+    // RAG_CONFIDENT_SIMILARITY, rag.constants.ts) — "8 items" and "8 items, top score 0.89" used to
+    // be indistinguishable on this trace; a weak-but-nonzero retrieval and a genuinely empty one both
+    // read as "documentCount: 0" once the relevance floor excludes everything. `topScore` is reported
+    // even when every candidate got filtered out, specifically so the two remain distinguishable here.
+    topScore?: number | null;
+    confidence?: "none" | "weak" | "strong";
   }
 ): void {
   if (!turn.span) return;
@@ -245,13 +252,16 @@ export function recordKnowledgeContext(
           matchedByFolderName: data.folderMatched.map((item) => item.title),
           semanticSearchRan: data.semanticSearchRan,
           reason: data.reason,
-          fellBackToRecentDocuments: data.fallbackUsed
+          fellBackToRecentDocuments: data.fallbackUsed,
+          topScore: typeof data.topScore === "number" ? Number(data.topScore.toFixed(5)) : null,
+          confidence: data.confidence ?? "none"
         },
         metadata: {
           documentCount: String(data.retrieved.length),
           semanticSearchRan: String(data.semanticSearchRan),
           fellBackToRecentDocuments: String(data.fallbackUsed),
-          reason: shorten(data.reason)
+          reason: shorten(data.reason),
+          confidence: data.confidence ?? "none"
         }
       },
       { asType: "retriever" }
@@ -287,7 +297,28 @@ export function recordExistingCoverage(turn: TurnHandle, data: { searchTerms: st
   }
 }
 
-/** One model call, with usage so cost aggregates per workspace. */
+/** Cap for the raw provider completion text in a trace — generous (a full router JSON envelope
+ *  with reasoning can run long), unlike META_MAX which is Langfuse's separate, much stricter limit
+ *  on OTel span *attributes* used for trace-level propagated metadata (see stampTraceIdentity) and
+ *  does not apply to an observation's input/output body. */
+const RAW_OUTPUT_MAX = 8000;
+
+/**
+ * One model call, with usage so cost aggregates per workspace.
+ *
+ * `rawOutput`, when given, is the LITERAL provider completion text before parseModelJson touched
+ * it — the one thing a trace could not show before this: `output` alone is the already-parsed (or
+ * salvaged) decision object, indistinguishable from a clean response once truncation or malformed
+ * JSON has already been silently repaired or salvaged away. Placed inside `output` (never
+ * `metadata`) specifically because the `mask` hook only covers input/output (measured,
+ * docs/langfuse-observability-plan.md §7.2) — a raw completion could in principle echo a provider
+ * key back, the same risk class already flagged there for ordinary prompt bodies.
+ *
+ * `salvaged`, when true, means this call's `output` was recovered via salvageJsonStringFields, not
+ * a clean parse — surfaced as its own metadata boolean (metadata is NOT masked, but this is a
+ * boolean flag, not content) so traces can be filtered on "needed salvage" as a leading indicator,
+ * before it becomes a support ticket.
+ */
 export function recordGeneration(
   turn: TurnHandle,
   data: {
@@ -296,20 +327,32 @@ export function recordGeneration(
     model: string;
     input?: unknown;
     output?: unknown;
+    rawOutput?: string;
+    salvaged?: boolean;
     usage?: { input?: number; output?: number; cached?: number };
     errorMessage?: string;
   }
 ): void {
   if (!turn.span) return;
   try {
+    // rawOutput takes priority over the generic {error} shape: for a salvaged/malformed response
+    // the raw completion text IS the diagnostic content, not a plain fetch/timeout failure with
+    // nothing to show — those still fall through to the plain {error} object below.
+    let output: unknown = data.output;
+    if (data.rawOutput) output = { parsed: data.output, rawCompletion: shorten(data.rawOutput, RAW_OUTPUT_MAX), ...(data.errorMessage ? { note: data.errorMessage } : {}) };
+    else if (data.errorMessage) output = { error: data.errorMessage };
     const child = (turn.span as Observation).startObservation(
       data.name,
       {
         model: data.model,
         input: data.input,
-        output: data.errorMessage ? { error: data.errorMessage } : data.output,
+        output,
         ...(data.usage ? { usageDetails: { input: data.usage.input ?? 0, output: data.usage.output ?? 0 } } : {}),
-        metadata: { provider: data.provider, ...(data.usage?.cached ? { cachedInputTokens: String(data.usage.cached) } : {}) },
+        metadata: {
+          provider: data.provider,
+          ...(data.usage?.cached ? { cachedInputTokens: String(data.usage.cached) } : {}),
+          ...(data.salvaged !== undefined ? { salvaged: String(data.salvaged) } : {})
+        },
         ...(data.errorMessage ? { level: "ERROR", statusMessage: shorten(data.errorMessage) } : {})
       },
       { asType: "generation" }
@@ -318,6 +361,68 @@ export function recordGeneration(
     child.end();
   } catch (err) {
     logger.warn(`recordGeneration failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
+ * What reconcileZyraReply decided about the reply's own honesty, and why — filed as its own
+ * `[guardrail]` observation under the turn's trace.
+ *
+ * Deliberately does NOT take a `TurnHandle`. reconcileZyraReply runs in sendZyraChatMessage, after
+ * buildZyraChatDecision has already returned and ended its own root span via endZyraTurn — by
+ * design, that root span is closed the moment the router's decision is known, before
+ * applyZyraChatOperations or reconciliation exist to report on. Re-opening or extending that span
+ * would mean restructuring who owns ending the trace across every one of buildZyraChatDecision's
+ * return paths (several of which — the degraded/capability-disabled ones — do not even call
+ * endZyraTurn today, a pre-existing gap noted here rather than silently worked around). Instead this
+ * attaches its own observation directly to the SAME deterministic trace id
+ * (`createTraceId(messageId)`, the same derivation startZyraTurn uses) — the same pattern that
+ * bootstraps the trace in the first place, just called a second time for a later moment in the same
+ * turn. It lands under the same trace either way; a viewer sees it start after the root span's own
+ * end time, which is a cosmetic ordering quirk, not a correctness one.
+ */
+export async function recordReconciliation(
+  ctx: { messageId: string; sessionId: string; projectId: string; userId?: string | null },
+  data: {
+    bannerFired: string | null;
+    reason: string;
+    requested: number;
+    appliedCount: number;
+    proposedCount: number;
+    reply: string;
+  }
+): Promise<void> {
+  if (!isTracingEnabled()) return;
+  try {
+    const { startObservation, createTraceId } = await import("@langfuse/tracing");
+    const traceId = await createTraceId(ctx.messageId);
+    const span = startObservation(
+      "reply-reconciliation",
+      {
+        input: {
+          requested: data.requested,
+          appliedCount: data.appliedCount,
+          proposedCount: data.proposedCount
+        },
+        output: {
+          bannerFired: data.bannerFired,
+          reason: data.reason,
+          finalReply: shorten(data.reply, 2000)
+        },
+        metadata: {
+          projectId: ctx.projectId,
+          sessionId: ctx.sessionId,
+          messageId: ctx.messageId,
+          bannerFired: String(!!data.bannerFired)
+        }
+      },
+      { asType: "guardrail", parentSpanContext: { traceId, spanId: "0000000000000001", traceFlags: 1 } }
+    ) as unknown as Observation;
+    const turn: TurnHandle = { span, traceId, sessionId: ctx.sessionId, userId: ctx.userId ?? null };
+    stampTraceIdentity(span, turn);
+    span.end();
+  } catch (err) {
+    logger.warn(`recordReconciliation failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 

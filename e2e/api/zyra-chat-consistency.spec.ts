@@ -472,6 +472,12 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const reason = rbacSuiteSkipReason(tenant);
     test.skip(reason !== null, reason ?? "");
     if (tenant) purge();
+    // Found by review: `ai.requests` is append-only for the life of the server, and every test in
+    // this describe block shares the one instance created in beforeAll (fullyParallel: false
+    // serialises them in one worker) — without this, every `expect(ai.requests.length).toBe(N)`
+    // below asserts against the CUMULATIVE count across every prior test in this file, not this
+    // test's own count. See FakeAiServer.reset()'s own doc comment.
+    ai?.reset();
   });
 
   test.afterEach(() => {
@@ -583,7 +589,11 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const turn2 = await sendMessage(sessionId, "yes");
     expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
 
-    expect(ai.requests.length, "router (turn 1) + router (turn 2) + retry router + generation").toBe(4);
+    // Found by review: generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn after
+    // every successful generation (its own summarization pass, a real call to the same provider) —
+    // an easy thing to miss counting since it's not part of the router/generation contract this
+    // suite otherwise scripts explicitly. This count was previously 4, missing that fifth call.
+    expect(ai.requests.length, "router (turn 1) + router (turn 2) + retry router + generation + rememberZyraTurn's own summarization call").toBe(5);
 
     const review = reviewRequestFor(sessionId);
     expect(review, "the confirmed generation should stage a review request").toBeTruthy();
@@ -727,7 +737,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     });
     const turn2 = await sendMessage(sessionId, "save them to the Checkout suite");
     expect(turn2.status, JSON.stringify(turn2.body)).toBeLessThan(300);
-    expect(ai.requests.length, "router (turn 1) + generation (turn 1) + router (turn 2, no generation for a move)").toBe(3);
+    // See the identical rememberZyraTurn note on ZCC-B-01 — generation (turn 1) is followed by its
+    // own unscripted summarization call.
+    expect(ai.requests.length, "router (turn 1) + generation (turn 1) + rememberZyraTurn + router (turn 2, no generation for a move)").toBe(4);
 
     // Still nothing written to testcases — re-pointing a pending draft's suite must never auto-save it.
     expect(liveCaseCount(), "fromLastPlan against a pending batch must only patch the draft, never save it").toBe(before);
@@ -823,5 +835,310 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
     expect(String(lastAssistant.content || "")).toContain("Moved to suites (actual)");
     expect(String(lastAssistant.content || "")).toContain("Payments: 1");
+  });
+
+  /*
+   * The bug this file was originally opened to reproduce, from the OTHER angle: not a confirmation
+   * with no antecedent, but a router completion that is itself unparseable JSON. parseModelJson falls
+   * back to salvageJsonStringFields, which recovers only `reply`/`reasoningSummary` — a fully
+   * confident, detailed narrative with zero `action`/`operations` behind it. Reported directly: "8
+   * flight booking test cases drafted and staged for your review" with no table, no review panel,
+   * nothing persisted. buildZyraChatDecision now retries once on `raw.__salvaged`; these two tests
+   * drive that through the REAL HTTP stack (not a mocked service method) using a raw, deliberately
+   * truncated string reply — fake-ai-server.ts serves it verbatim as `choices[0].message.content`,
+   * exactly reproducing what a truncated provider completion looks like on the wire.
+   */
+  const TRUNCATED_ROUTER_RESPONSE =
+    '{"reply":"Here are 8 flight booking test cases drafted and staged for your review.","reasoningSummary":"Sources used: KAN-1. I focus on gaps: passenger details, payment, confirmation.","operations":[{"type":"create","draft":{"title":"Search flights';
+
+  test("ZCC-B-06 a truncated router response retries once and the salvaged narrative never reaches the user", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai salvage retry");
+    const before = liveCaseCount();
+
+    ai.queueReply(TRUNCATED_ROUTER_RESPONSE);
+    ai.queueReply({
+      reply: "There are no flight booking test cases yet in this project.",
+      reasoningSummary: "No matching coverage found.",
+      action: "answer",
+      actionType: "answer",
+      operations: [],
+      testcases: [],
+    });
+    const turn = await sendMessage(sessionId, "generate flight booking test cases");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    expect(ai.requests.length, "router attempt 1 (salvaged) + router attempt 2 (clean retry)").toBe(2);
+
+    // Nothing was ever staged or written — the retry's clean "answer" made no operations either.
+    expect(liveCaseCount()).toBe(before);
+    const review = reviewRequestFor(sessionId);
+    expect(review, "a clean retry that routes answer must stage nothing").toBeNull();
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+
+    // The exact invariant the reported bug violated: the salvaged narrative from the FIRST
+    // (discarded) attempt must never reach the user.
+    expect(String(lastAssistant.content || "")).not.toContain("flight booking test cases drafted");
+    expect(String(lastAssistant.content || "")).toContain("There are no flight booking test cases yet");
+    expect(lastAssistant.testcases).toEqual([]);
+    expect(lastAssistant.reviewRequestId ?? null).toBeNull();
+  });
+
+  test("ZCC-B-07 a router response truncated on both attempts returns an honest failure, never a phantom success", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC fake ai salvage double failure");
+    const before = liveCaseCount();
+
+    ai.queueReply(TRUNCATED_ROUTER_RESPONSE);
+    ai.queueReply(TRUNCATED_ROUTER_RESPONSE);
+    const turn = await sendMessage(sessionId, "generate flight booking test cases");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    expect(ai.requests.length, "router attempt 1 (salvaged) + router attempt 2 (salvaged again, no third attempt)").toBe(2);
+
+    expect(liveCaseCount()).toBe(before);
+    expect(reviewRequestFor(sessionId), "two salvaged attempts must stage nothing").toBeNull();
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
+
+    // Never the salvaged narrative pretending to be a real decision, and never the false-success
+    // phrasing the reported bug produced.
+    expect(String(lastAssistant.content || "")).not.toContain("flight booking test cases drafted");
+    expect(String(lastAssistant.content || "")).not.toContain("staged for your review");
+    expect(String(lastAssistant.content || "")).toMatch(/cut off|try again/i);
+    expect(lastAssistant.testcases).toEqual([]);
+    expect(lastAssistant.reviewRequestId ?? null).toBeNull();
+
+    // Found by review: scoped only to project_id, this assertion is vacuous on any run after the
+    // first against the same tenant — provisionRbacTenant caches (and reuses) a tenant per `kind`
+    // across runs, audit_logs is append-only and purge() correctly never touches it, so an earlier
+    // run's row alone satisfies ">0" even if this code path stopped logging entirely. Scoped to this
+    // turn's own session (logProjectActivity's entityId) so the assertion is about THIS call.
+    const failureLogged = scalar(
+      `SELECT COUNT(*) FROM audit_logs WHERE project_id = ${literal(tenant!.mainProjectId)} AND entity_id = ${literal(sessionId)} ` +
+        `AND action = 'zyra_chat_ai_failed' AND diff->>'stage' = 'routing_salvaged';`,
+    );
+    expect(Number(failureLogged), "the double-salvage must be observable, not just silently absorbed").toBeGreaterThan(0);
+  });
+
+  /*
+   * Multi-batch "generate all possible cases" plan lifecycle — previously had ZERO e2e coverage
+   * anywhere in this repo (confirmed by grep before writing these). Written alongside the
+   * zyraPlanTransition row-lock fix (legacy.service.ts — closes a confirmed race between
+   * continueZyraChatPlan, the background batch loop, and an interactive sendZyraChatMessage call on
+   * the same session) specifically to prove the refactored commit path — atomic
+   * "check plan still current → post message → update active_plan" under one row lock — still
+   * produces the exact same observable plan behaviour as before. The concurrent-interleaving
+   * property itself (two commits racing for the same row) is proven deterministically at the unit
+   * level in zyra-plan-concurrency.spec.ts, which controls real Promise interleaving directly — a
+   * live HTTP + fake-provider race would depend on wall-clock scheduling and be flaky by
+   * construction, so it is deliberately not attempted here.
+   */
+  function scenarioDraft(title: string) {
+    return {
+      title,
+      preconditions: "",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: `Exercise: ${title}`, expectedResult: "Behaves as expected" }]),
+      testData: "",
+      expectedSummary: title,
+      priority: "P2",
+      tags: ["zyra"],
+    };
+  }
+
+  test("ZCC-B-08 a multi-batch plan generates every batch and clears itself when done", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC multi-batch plan");
+
+    // Router: exhaustive create. Scenario planner: 7 scenarios (5 fit the first batch,
+    // ZYRA_PLAN_BATCH_SIZE, leaving 2 for the background loop's one remaining batch).
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    // Found by review: generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn right
+    // after this (synchronous) first batch, BEFORE the background loop even starts — without this
+    // placeholder, that call would silently consume the batch-2 reply queued right after it, so the
+    // background loop's own generation call would hit an empty queue, get the "no drafts" default,
+    // throw, and the plan would pause on error instead of ever completing — this test would have
+    // hung until the 30s poll timeout on a real run.
+    ai.queueReply("Noted.");
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+
+    const turn1 = await sendMessage(sessionId, "Generate all possible test cases for the login flow.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    // The background batch is fire-and-forget — poll until it has actually landed rather than
+    // assuming it finished by the time sendMessage returned.
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must clear itself once the last batch is posted",
+        timeout: 30_000,
+      })
+      .toBeNull();
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const assistantTurns = messages.filter((m) => m.role === "assistant");
+    // Turn 1 (first batch, 5 drafts) + the background loop's one remaining batch (2 drafts).
+    expect(assistantTurns.length, "both batches must be posted as their own messages").toBe(2);
+    expect(String(assistantTurns[0].content || "")).toContain("first 5");
+    expect(String(assistantTurns[1].content || "")).toContain("all 7 scenarios are now covered");
+
+    // Both batches staged (not written) as their own review batches — the plan feature stages
+    // exactly like a single-turn create, per applyZyraChatOperations.
+    const batchCount = scalar(`SELECT COUNT(*) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`);
+    expect(Number(batchCount)).toBe(2);
+    const totalDrafts = scalar(
+      `SELECT COALESCE(SUM(jsonb_array_length(generated_payload)), 0) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`,
+    );
+    expect(Number(totalDrafts)).toBe(7);
+  });
+
+  /*
+   * A second review pass, and direct code re-verification, found this test's ORIGINAL premise false:
+   * `continueZyraChatPlan`'s top-of-loop guard checked only `planId`, never `status` — `stopZyraChatPlan`
+   * set `status: "paused"` but the loop never consulted it, so it ran every remaining batch to
+   * completion regardless of when Stop was called. That was a real, pre-existing product bug
+   * (unrelated to the zyraPlanTransition locking work — the same unchecked condition existed before
+   * it), fixed directly as a result of this test exposing it: `continueZyraChatPlan`'s guard is now
+   * `!plan || plan.planId !== planId || plan.status !== "running"`.
+   *
+   * This test now PROVES the fix deterministically, rather than asserting a race's ambiguous outcome.
+   * `delayNextReplyMs` holds the background loop's first batch response open just long enough to
+   * confirm — via `ai.requests.length`, not a wall-clock guess — that the call has genuinely arrived
+   * at the fake provider (i.e. this batch is unambiguously "in flight") before Stop is called. The
+   * three-batch shape (5 sync + 5 background + 2 background) exists specifically so there is a THIRD
+   * batch — one that has not started yet and is therefore still within this process's control — to
+   * prove does NOT run.
+   */
+  test("ZCC-B-09 stop lets an in-flight batch finish but stops the next one from starting", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC plan stop interrupts the next batch");
+
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 12 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    const turn1 = await sendMessage(sessionId, "Generate all possible test cases for the login flow.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+    // 4 requests so far: router, scenario plan, first (synchronous) batch, and — easy to miss —
+    // generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn after every successful
+    // generation (its own summarization call to the same provider). Nothing was queued for it here,
+    // so it took the fake server's harmless "no scripted response" default — safe, since nothing
+    // else is queued yet for it to steal.
+    const requestsAfterTurn1 = ai.requests.length;
+    expect(requestsAfterTurn1).toBe(4);
+
+    // The background loop's first batch (5 of the remaining 7 scenarios) — held open so this test
+    // can observe it arriving before deciding to stop. A placeholder reply is queued for THIS
+    // batch's own rememberZyraTurn call too — without it, that call would consume the batch-3 reply
+    // queued right after it, corrupting the very thing this test is trying to prove.
+    ai.delayNextReplyMs(2_000);
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+    ai.queueReply("Noted."); // consumed by this batch's own rememberZyraTurn call
+    // The background loop's SECOND remaining batch (2 scenarios) — must never be consumed if the fix
+    // holds. Queued now, upfront, specifically so there is no ambiguity about why it wasn't used: an
+    // empty queue would also produce a failure, which would prove nothing about this fix.
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 11}`)) });
+
+    await expect
+      .poll(() => ai.requests.length, { message: "the background loop's first batch must actually reach the fake provider before this test stops the plan", timeout: 10_000 })
+      .toBe(requestsAfterTurn1 + 1);
+
+    // The in-flight batch's response is still being held (delayNextReplyMs) at this exact point —
+    // stopping now is unambiguously "while a batch is genuinely mid-request", the scenario this
+    // whole test exists to prove is handled correctly.
+    const stopRes = await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
+    expect(stopRes.status(), `stopping the plan — ${await stopRes.text()}`).toBeLessThan(300);
+
+    // The in-flight batch finishes and posts normally — not aborted mid-request, per the documented
+    // design — and its commit preserves the "paused" status the stop call already set (zyraPlanTransition
+    // spreads the freshly-locked `current`, not a stale pre-generation snapshot).
+    await expect
+      .poll(() => scalar(`SELECT active_plan->>'status' FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the in-flight batch must finish and the plan must land 'paused', not vanish or stay 'running'",
+        timeout: 15_000,
+      })
+      .toBe("paused");
+
+    // rememberZyraTurn for the in-flight batch fires right after it finishes — wait for it too,
+    // rather than asserting on ai.requests.length the instant the plan flips to 'paused' (the two
+    // happen in close succession but not atomically together).
+    await expect
+      .poll(() => ai.requests.length, { message: "the in-flight batch's own rememberZyraTurn call must also complete before asserting the final count", timeout: 5_000 })
+      .toBe(requestsAfterTurn1 + 2);
+
+    // The proof: only 2 batches exist (sync + the one in-flight when Stop landed) — the third,
+    // not-yet-started batch never ran, even though its reply was sitting ready in the queue the
+    // whole time.
+    const batchCount = scalar(`SELECT COUNT(*) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`);
+    expect(Number(batchCount), "the third batch must not have started").toBe(2);
+    const totalDrafts = scalar(
+      `SELECT COALESCE(SUM(jsonb_array_length(generated_payload)), 0) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`,
+    );
+    expect(Number(totalDrafts), "5 (sync) + 5 (in-flight) — the last 2 were never generated").toBe(10);
+    // Still exactly 2 past the in-flight batch's own pair (generation + remember) — the third
+    // batch's queued reply was never touched.
+    expect(ai.requests.length, "the third batch must never have been requested at all").toBe(requestsAfterTurn1 + 2);
+
+    const remainingScenarios = JSON.parse(scalar(`SELECT active_plan->'remainingScenarios' FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`) ?? "[]");
+    expect(remainingScenarios).toHaveLength(2);
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    expect(messages.some((m) => String(m.content || "").includes("Stopped at your request")), "the stop endpoint's own message must still post").toBe(true);
+
+    // Resuming picks up exactly where Stop actually left it — the 2 scenarios the third batch would
+    // have covered, using the reply already queued above (still unconsumed). Its own rememberZyraTurn
+    // call is left to the harmless default — nothing follows it in this test to corrupt.
+    const resumeRes = await asOwner.post(url(`/chat/sessions/${sessionId}/resume-plan`), { failOnStatusCode: false });
+    expect(resumeRes.status(), `resuming — ${await resumeRes.text()}`).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "resuming must finish the plan using the one batch Stop genuinely prevented",
+        timeout: 15_000,
+      })
+      .toBeNull();
+    const finalBatchCount = scalar(`SELECT COUNT(*) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`);
+    expect(Number(finalBatchCount)).toBe(3);
+    const finalTotalDrafts = scalar(
+      `SELECT COALESCE(SUM(jsonb_array_length(generated_payload)), 0) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`,
+    );
+    expect(Number(finalTotalDrafts)).toBe(12);
+  });
+
+  test("ZCC-B-10 stopping an already-completed plan is a safe no-op", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC stop after completion");
+
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    // See ZCC-B-08's identical comment — the first batch's own rememberZyraTurn call fires
+    // synchronously right after it, before the background loop starts, and would otherwise consume
+    // the batch-2 reply queued next.
+    ai.queueReply("Noted.");
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+    const turn1 = await sendMessage(sessionId, "Generate all possible test cases for the login flow.");
+    expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
+
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must fully complete before this test calls stop-plan on it",
+        timeout: 30_000,
+      })
+      .toBeNull();
+
+    const stopRes = await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
+    expect(stopRes.status(), `stopping an already-finished plan must still return success — ${await stopRes.text()}`).toBeLessThan(300);
+
+    // No new message, no resurrected plan — stopZyraChatPlan's `if (plan && plan.status !== "paused")`
+    // guard is a no-op once active_plan is already null.
+    expect(scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBeNull();
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    expect(messages.some((m) => String(m.content || "").includes("Stopped at your request")), "no-op means no new message either").toBe(false);
   });
 });
