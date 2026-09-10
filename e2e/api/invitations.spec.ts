@@ -6,7 +6,6 @@ import {
   clearInvitations,
   detachUserByEmail,
   expireInvite,
-  FIXTURE_PASSWORD,
   inviteStatus,
   loginAs,
   mintInviteToken,
@@ -479,7 +478,7 @@ test.describe("invitations", () => {
     const email = uniqueEmail("register");
     const { id, token } = await invite(email, { role: "manager", projectIds: [tenant!.mainProjectId] });
 
-    const password = "E2E-Register-Pass-1!";
+    const password = "E2E-Reg-Pass-1!";
     const res = await anon.post(`/api/invitations/${token}/register`, {
       data: { name: "EndToEnd Registered Invitee", password },
       failOnStatusCode: false,
@@ -527,8 +526,8 @@ test.describe("invitations", () => {
    * There are three ways to become a member from an invite, not one. POST /register (above) is the
    * single-shot path; these two are the staged ones the invite landing page actually drives:
    *
-   *   /register/start      {name, password} → 204, OTP emailed → /register/verify {code}
-   *   /register/otp/start  {name}           → 204, OTP emailed → /register/otp/verify {code}
+   *   /register/start      {firstName, lastName, mobileNumber?, password} → 204, OTP emailed → /register/verify {code}
+   *   /register/otp/start  {firstName, lastName, mobileNumber?}           → 204, OTP emailed → /register/otp/verify {code}
    *
    * Both stash a row in pending_signups keyed to the invitation, and both verify steps sign the new
    * user in, so a fresh context is used per flow and disposed — reusing the file's shared `anon`
@@ -549,11 +548,11 @@ test.describe("invitations", () => {
     test("the password flow creates the account, joins the workspace and signs the user in", { tag: '@tesbo.testId("TES-TC-273")' }, async () => {
       const email = uniqueEmail("otp-pw");
       const { id, token } = await invite(email, { role: "manager", projectIds: [tenant!.mainProjectId] });
-      const password = "E2E-Otp-Register-1!";
+      const password = "E2E-Otp-Reg-1!";
       const ctx = await anonymousContext();
       try {
         const start = await ctx.post(`/api/invitations/${token}/register/start`, {
-          data: { name: "EndToEnd OTP Invitee", password },
+          data: { firstName: "EndToEnd", lastName: "OTP Invitee", mobileNumber: "+14155550100", password },
           failOnStatusCode: false,
         });
         expect(start.status(), `start failed: ${await start.text()}`).toBe(204);
@@ -576,7 +575,15 @@ test.describe("invitations", () => {
         // login screen after completing registration would be a dead end for a new teammate.
         const me = await ctx.get("/api/auth/me", { failOnStatusCode: false });
         expect(me.ok()).toBeTruthy();
-        expect((await me.json()).email).toBe(email);
+        const meBody = await me.json();
+        expect(meBody.email).toBe(email);
+        // The firstName/lastName/mobileNumber collected at registration/start come back as the
+        // structured fields the Account page reads — not just folded into the combined `name` — and
+        // this path already collected them, so profileComplete must be true immediately.
+        expect(meBody.firstName).toBe("EndToEnd");
+        expect(meBody.lastName).toBe("OTP Invitee");
+        expect(meBody.mobileNumber).toBe("+14155550100");
+        expect(meBody.profileComplete).toBe(true);
 
         // And the password they chose has to be the password they can sign in with later.
         const login = await anon.post("/api/auth/password/login", {
@@ -597,7 +604,7 @@ test.describe("invitations", () => {
       const ctx = await anonymousContext();
       try {
         const start = await ctx.post(`/api/invitations/${token}/register/otp/start`, {
-          data: { name: "EndToEnd Passwordless Invitee" },
+          data: { firstName: "EndToEnd", lastName: "Passwordless Invitee" },
           failOnStatusCode: false,
         });
         expect(start.status()).toBe(204);
@@ -655,7 +662,7 @@ test.describe("invitations", () => {
         expect(
           (
             await ctx.post(`/api/invitations/${token}/register/start`, {
-              data: { name: "EndToEnd Bad Code", password: "E2E-Otp-Register-1!" },
+              data: { firstName: "EndToEnd", lastName: "Bad Code", password: "E2E-Otp-Reg-1!" },
             })
           ).status(),
         ).toBe(204);
@@ -701,10 +708,10 @@ test.describe("invitations", () => {
       const ctx = await anonymousContext();
       try {
         await ctx.post(`/api/invitations/${mineInvite.token}/register/start`, {
-          data: { name: "EndToEnd Mine", password: "E2E-Otp-Register-1!" },
+          data: { firstName: "EndToEnd", lastName: "Mine", password: "E2E-Otp-Register-1!" },
         });
         await ctx.post(`/api/invitations/${theirsInvite.token}/register/start`, {
-          data: { name: "EndToEnd Theirs", password: "E2E-Otp-Register-1!" },
+          data: { firstName: "EndToEnd", lastName: "Theirs", password: "E2E-Otp-Register-1!" },
         });
         seedOtpCode(mine, "121212");
 
@@ -724,15 +731,17 @@ test.describe("invitations", () => {
       }
     });
 
-    test("the staged flows validate the name and password before sending a code", { tag: '@tesbo.testId("TES-TC-278")' }, async () => {
+    test("the staged flows validate first/last name, mobile number and password before sending a code", { tag: '@tesbo.testId("TES-TC-278")' }, async () => {
       const email = uniqueEmail("validate");
       const { token } = await invite(email);
       try {
         for (const data of [
-          { name: "", password: "E2E-Otp-Register-1!" },
-          { name: "   ", password: "E2E-Otp-Register-1!" },
-          { name: "EndToEnd No Password", password: "" },
-          { name: "EndToEnd Short Password", password: "short" },
+          { firstName: "", lastName: "Register", password: "E2E-Otp-Register-1!" },
+          { firstName: "   ", lastName: "Register", password: "E2E-Otp-Register-1!" },
+          { firstName: "EndToEnd", lastName: "", password: "E2E-Otp-Register-1!" },
+          { firstName: "EndToEnd", lastName: "No Password", password: "" },
+          { firstName: "EndToEnd", lastName: "Short Password", password: "short" },
+          { firstName: "EndToEnd", lastName: "Bad Mobile", mobileNumber: "not-a-number", password: "E2E-Otp-Register-1!" },
         ]) {
           const res = await anon.post(`/api/invitations/${token}/register/start`, {
             data,
@@ -741,11 +750,17 @@ test.describe("invitations", () => {
           expect(res.status(), `${JSON.stringify(data)} should be refused`).toBe(400);
         }
 
-        const noName = await anon.post(`/api/invitations/${token}/register/otp/start`, {
-          data: { name: "" },
+        const noFirstName = await anon.post(`/api/invitations/${token}/register/otp/start`, {
+          data: { firstName: "", lastName: "Register" },
           failOnStatusCode: false,
         });
-        expect(noName.status()).toBe(400);
+        expect(noFirstName.status()).toBe(400);
+
+        const badMobile = await anon.post(`/api/invitations/${token}/register/otp/start`, {
+          data: { firstName: "EndToEnd", lastName: "Register", mobileNumber: "555-not-e164" },
+          failOnStatusCode: false,
+        });
+        expect(badMobile.status()).toBe(400);
       } finally {
         clearOtpRateLimit(email);
       }
@@ -758,7 +773,7 @@ test.describe("invitations", () => {
 
       for (const path of ["register/start", "register/otp/start"]) {
         const res = await anon.post(`/api/invitations/${token}/${path}`, {
-          data: { name: "EndToEnd Cancelled", password: "E2E-Otp-Register-1!" },
+          data: { firstName: "EndToEnd", lastName: "Cancelled", password: "E2E-Otp-Register-1!" },
           failOnStatusCode: false,
         });
         expect(res.status(), `${path} on a cancelled invite should be refused`).toBe(400);
@@ -771,7 +786,7 @@ test.describe("invitations", () => {
       const { token } = await invite(email);
       try {
         const res = await anon.post(`/api/invitations/${token}/register/start`, {
-          data: { name: "EndToEnd Duplicate", password: "E2E-Otp-Register-1!" },
+          data: { firstName: "EndToEnd", lastName: "Duplicate", password: "E2E-Otp-Register-1!" },
           failOnStatusCode: false,
         });
         expect(res.status()).toBe(400);
@@ -788,7 +803,7 @@ test.describe("invitations", () => {
 
     try {
       const res = await anon.post(`/api/invitations/${token}/register`, {
-        data: { name: "EndToEnd Duplicate", password: FIXTURE_PASSWORD },
+        data: { name: "EndToEnd Duplicate", password: "E2E-Reg-Pass-1!" },
         failOnStatusCode: false,
       });
       expect(res.status()).toBe(400);

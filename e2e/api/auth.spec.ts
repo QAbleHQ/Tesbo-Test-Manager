@@ -19,6 +19,25 @@ test.describe("auth", () => {
     expect(body.email).toBe(env.testEmail);
   });
 
+  test("GET /me splits the stored name into firstName/lastName for the Account screen", { tag: '@tesbo.testId("TES-TC-1311")' }, async ({ request }) => {
+    // Basecamp 10212498688 — auth.service.ts me() now derives firstName/lastName from the single
+    // `name` column signup writes, so the Account page can show them as separate fields. Asserted
+    // against the value the API itself reports for `name`, not a hard-coded fixture string, so this
+    // stays true regardless of what the smoke tenant happens to be named.
+    const res = await request.get("/api/auth/me");
+    expect(res.ok()).toBeTruthy();
+    const body = await res.json();
+
+    const storedName = (body.name ?? "").trim();
+    expect(storedName, "this tenant's user has no name stored, so the test proves nothing").not.toBe("");
+    const spaceIndex = storedName.indexOf(" ");
+    const expectedFirstName = spaceIndex === -1 ? storedName : storedName.slice(0, spaceIndex);
+    const expectedLastName = spaceIndex === -1 ? null : storedName.slice(spaceIndex + 1);
+
+    expect(body.firstName).toBe(expectedFirstName);
+    expect(body.lastName).toBe(expectedLastName);
+  });
+
   test("an unauthenticated request is rejected", { tag: '@tesbo.testId("TES-TC-25")' }, async ({ playwright }) => {
     const anon = await anonContext(playwright);
     const res = await anon.get("/api/auth/me");

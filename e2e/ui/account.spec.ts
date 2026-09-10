@@ -349,14 +349,15 @@ test.describe("account screen and password reset (UI)", () => {
   });
   // ─── The profile card ──────────────────────────────────────────────────────
 
-  test("ACU-11 the profile shows the name captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
+  test("ACU-11 the profile shows the first name and surname captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
     /*
      * Basecamp 10212498688 — "Profile page should have user name and surname and mobile number fields
      * fetched during sign up". The Profile card rendered nothing but the email.
      *
-     * The name half was a pure display gap: /signup collects First name and Last name, sends them as
-     * one `name`, and GET /me has always returned it — the screen just never read it. Asserted against
-     * the value the API reports rather than a hard-coded string, so this stays true for any tenant.
+     * /signup collects First name and Last name separately, sends them as one `name`, and GET /me now
+     * splits that stored value back into firstName/lastName (auth.service.ts `me()`) so the screen can
+     * show the two fields signup actually collected instead of one merged string. Asserted against the
+     * value the API reports rather than a hard-coded string, so this stays true for any tenant.
      *
      * The mobile number is deliberately NOT asserted: signup never collects one, there is no column
      * and no value to fetch, so there is nothing to display. That half is a separate feature and is
@@ -366,19 +367,31 @@ test.describe("account screen and password reset (UI)", () => {
 
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; email?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; email?: string | null })
+        : null;
     });
     expect(reported, "GET /me did not answer").not.toBeNull();
-    const expectedName = (reported!.name ?? "").trim();
-    expect(expectedName, "this tenant's user has no name stored, so the test proves nothing").not.toBe("");
+    const expectedFirstName = (reported!.firstName ?? "").trim();
+    const expectedLastName = (reported!.lastName ?? "").trim();
+    expect(expectedFirstName, "this tenant's user has no first name stored, so the test proves nothing").not.toBe("");
+    expect(expectedLastName, "this tenant's user has no last name stored, so the test proves nothing").not.toBe("");
 
-    // The name is on the screen, and labelled — not just present somewhere in the markup.
-    const nameValue = page.locator("#account-name");
-    await expect(nameValue, "the profile card shows no name field").toBeVisible();
-    await expect(nameValue).toHaveText(expectedName);
+    // First name and surname are on the screen, each labelled — not just present somewhere in the markup.
+    const firstNameValue = page.locator("#account-first-name");
+    await expect(firstNameValue, "the profile card shows no first name field").toBeVisible();
+    await expect(firstNameValue).toHaveText(expectedFirstName);
+
+    const lastNameValue = page.locator("#account-last-name");
+    await expect(lastNameValue, "the profile card shows no surname field").toBeVisible();
+    await expect(lastNameValue).toHaveText(expectedLastName);
 
     // The email it used to show alone is still there.
     await expect(page.locator("#account-email")).toHaveText((reported!.email ?? "").trim());
+
+    // Mobile number now has a real column and a row on the card — whatever this tenant's value is
+    // (signup collects it as optional, so it may legitimately be unset), the row itself must render.
+    await expect(page.locator("#account-mobile"), "the profile card shows no mobile number field").toBeVisible();
   });
 
   // ─── Cross-device session invalidation ─────────────────────────────────────

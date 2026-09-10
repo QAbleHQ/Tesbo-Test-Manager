@@ -8,6 +8,7 @@ import { PasswordService } from "../auth/password.service";
 import { AppConfigService } from "../config/app-config.service";
 import { AuthenticatedRequest } from "../common/request.types";
 import { validatePersonName } from "../common/person-name.util";
+import { validateMobileNumber } from "../common/mobile-number.util";
 import { DatabaseService } from "../database/database.service";
 import { InvitationRow, LegacyService } from "./legacy.service";
 
@@ -18,6 +19,9 @@ interface PendingSignupRow {
   id: string;
   email: string;
   name: string;
+  first_name: string | null;
+  last_name: string | null;
+  mobile_number: string | null;
   password_hash: string | null;
   invitation_id: string | null;
 }
@@ -37,6 +41,7 @@ export class SignupService {
   async startSelfServeSignup(
     firstName: string | undefined,
     lastName: string | undefined,
+    mobileNumber: string | undefined,
     rawEmail: string | undefined,
     password: string | undefined,
     ip: string,
@@ -49,13 +54,14 @@ export class SignupService {
     const trimmedFirstName = validatePersonName(firstName, "First name", 50);
     const trimmedLastName = validatePersonName(lastName, "Last name", 50);
     const trimmedName = `${trimmedFirstName} ${trimmedLastName}`;
+    const trimmedMobile = validateMobileNumber(mobileNumber);
     this.validatePassword(password);
 
     const existing = await this.db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email]);
     if (existing.rows[0]) throw new BadRequestException({ error: "An account with this email already exists. Please sign in instead." });
 
     const passwordHash = this.password.hashPassword(password!.trim());
-    await this.insertPendingSignup(email, trimmedName, passwordHash, null);
+    await this.insertPendingSignup(email, trimmedName, trimmedFirstName, trimmedLastName, trimmedMobile, passwordHash, null);
 
     await this.sendOtp(email, ip, ua);
     await this.audit.log(null, "signup_started", "auth", email, "{}", ip, ua);
@@ -75,24 +81,45 @@ export class SignupService {
     return { ok: true, userId };
   }
 
-  async startInviteRegistration(token: string, name: string | undefined, password: string | undefined, ip: string, ua?: string | null): Promise<void> {
+  async startInviteRegistration(
+    token: string,
+    firstName: string | undefined,
+    lastName: string | undefined,
+    mobileNumber: string | undefined,
+    password: string | undefined,
+    ip: string,
+    ua?: string | null
+  ): Promise<void> {
     const inv = await this.legacy.getInvitationRowOrThrow(token);
-    const trimmedName = this.validateName(name);
+    const trimmedFirstName = validatePersonName(firstName, "First name", 50);
+    const trimmedLastName = validatePersonName(lastName, "Last name", 50);
+    const trimmedName = `${trimmedFirstName} ${trimmedLastName}`;
+    const trimmedMobile = validateMobileNumber(mobileNumber);
     this.validatePassword(password);
     await this.assertEmailNotTaken(inv.email);
 
     const passwordHash = this.password.hashPassword(password!.trim());
-    await this.insertPendingSignup(inv.email, trimmedName, passwordHash, inv.id);
+    await this.insertPendingSignup(inv.email, trimmedName, trimmedFirstName, trimmedLastName, trimmedMobile, passwordHash, inv.id);
 
     await this.sendOtp(inv.email, ip, ua);
   }
 
-  async startInviteOtpRegistration(token: string, name: string | undefined, ip: string, ua?: string | null): Promise<void> {
+  async startInviteOtpRegistration(
+    token: string,
+    firstName: string | undefined,
+    lastName: string | undefined,
+    mobileNumber: string | undefined,
+    ip: string,
+    ua?: string | null
+  ): Promise<void> {
     const inv = await this.legacy.getInvitationRowOrThrow(token);
-    const trimmedName = this.validateName(name);
+    const trimmedFirstName = validatePersonName(firstName, "First name", 50);
+    const trimmedLastName = validatePersonName(lastName, "Last name", 50);
+    const trimmedName = `${trimmedFirstName} ${trimmedLastName}`;
+    const trimmedMobile = validateMobileNumber(mobileNumber);
     await this.assertEmailNotTaken(inv.email);
 
-    await this.insertPendingSignup(inv.email, trimmedName, null, inv.id);
+    await this.insertPendingSignup(inv.email, trimmedName, trimmedFirstName, trimmedLastName, trimmedMobile, null, inv.id);
 
     await this.sendOtp(inv.email, ip, ua);
   }
@@ -121,7 +148,15 @@ export class SignupService {
 
   private async completeInviteRegistration(inv: InvitationRow, pending: PendingSignupRow): Promise<string> {
     const userId = await this.db.transaction(async (client) => {
-      const userId = await this.insertUser(client, pending.email, pending.name, pending.password_hash);
+      const userId = await this.insertUser(
+        client,
+        pending.email,
+        pending.name,
+        pending.first_name,
+        pending.last_name,
+        pending.mobile_number,
+        pending.password_hash
+      );
       await client.query(
         "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, $3)",
         [inv.organization_id, userId, inv.role]
@@ -156,17 +191,38 @@ export class SignupService {
 
   private async createUserFromPending(pending: PendingSignupRow): Promise<string> {
     return this.db.transaction(async (client) => {
-      const userId = await this.insertUser(client, pending.email, pending.name, pending.password_hash);
+      const userId = await this.insertUser(
+        client,
+        pending.email,
+        pending.name,
+        pending.first_name,
+        pending.last_name,
+        pending.mobile_number,
+        pending.password_hash
+      );
       await client.query("UPDATE pending_signups SET consumed_at = now() WHERE id = $1", [pending.id]);
       return userId;
     });
   }
 
-  private async insertUser(client: PoolClient, email: string, name: string, passwordHash: string | null): Promise<string> {
+  private async insertUser(
+    client: PoolClient,
+    email: string,
+    name: string,
+    firstName: string | null,
+    lastName: string | null,
+    mobileNumber: string | null,
+    passwordHash: string | null
+  ): Promise<string> {
     try {
+      // profile_completed_at is set here because every path that reaches insertUser (self-serve
+      // signup, invite registration) already collected first/last name up front — only the
+      // passwordless-OTP first-time path (OtpService.findOrCreateUser) leaves it NULL, which is what
+      // the Account page / complete-profile flow use to detect an unfinished profile.
       const result = await client.query<{ id: string }>(
-        "INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id",
-        [email, name, passwordHash]
+        `INSERT INTO users (email, name, first_name, last_name, mobile_number, password_hash, profile_completed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now()) RETURNING id`,
+        [email, name, firstName, lastName, mobileNumber, passwordHash]
       );
       return result.rows[0].id;
     } catch (error) {
@@ -177,17 +233,26 @@ export class SignupService {
     }
   }
 
-  private async insertPendingSignup(email: string, name: string, passwordHash: string | null, invitationId: string | null): Promise<void> {
+  private async insertPendingSignup(
+    email: string,
+    name: string,
+    firstName: string | null,
+    lastName: string | null,
+    mobileNumber: string | null,
+    passwordHash: string | null,
+    invitationId: string | null
+  ): Promise<void> {
     const expiresAt = new Date(Date.now() + this.config.otpExpiryMinutes * 60_000);
     await this.db.query(
-      "INSERT INTO pending_signups (email, name, password_hash, invitation_id, expires_at) VALUES ($1, $2, $3, $4, $5)",
-      [email, name, passwordHash, invitationId, expiresAt]
+      `INSERT INTO pending_signups (email, name, first_name, last_name, mobile_number, password_hash, invitation_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [email, name, firstName, lastName, mobileNumber, passwordHash, invitationId, expiresAt]
     );
   }
 
   private async findPendingSignup(email: string, invitationId: string | null): Promise<PendingSignupRow | null> {
     const result = await this.db.query<PendingSignupRow>(
-      `SELECT id, email, name, password_hash, invitation_id FROM pending_signups
+      `SELECT id, email, name, first_name, last_name, mobile_number, password_hash, invitation_id FROM pending_signups
        WHERE email = $1 AND invitation_id IS NOT DISTINCT FROM $2 AND consumed_at IS NULL AND expires_at > now()
        ORDER BY created_at DESC LIMIT 1`,
       [email, invitationId]
@@ -217,10 +282,6 @@ export class SignupService {
       throw new BadRequestException({ error: `Email must be at most ${EMAIL_MAX_LENGTH} characters` });
     }
     return email;
-  }
-
-  private validateName(name: string | undefined): string {
-    return validatePersonName(name, "Name");
   }
 
   private validatePassword(password: string | undefined): void {

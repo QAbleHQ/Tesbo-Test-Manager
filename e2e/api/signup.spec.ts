@@ -138,7 +138,7 @@ test.describe("self-serve signup", () => {
 
   test("SGN-A-01 signup/start refuses a missing or malformed email and writes nothing", { tag: '@tesbo.testId("TES-TC-516")' }, async () => {
     for (const email of [undefined, "", "   ", "not-an-email", "missing@tld", "@nodomain.com", "spaces in@x.com"]) {
-      const res = await start({ name: "EndToEnd Signup", email, password: "E2E-Signup-Pass-9f3!" });
+      const res = await start({ firstName: "EndToEnd", lastName: "Signup", email, password: "E2eSignPass9f3!" });
       expect(res.status(), `email ${JSON.stringify(email)} was accepted: ${await res.text()}`).toBe(400);
       expect(JSON.stringify(await res.json())).toContain("invalid email");
     }
@@ -149,12 +149,17 @@ test.describe("self-serve signup", () => {
     ).toBe(0);
   });
 
-  test("SGN-A-02 signup/start requires a name", { tag: '@tesbo.testId("TES-TC-517")' }, async () => {
+  test("SGN-A-02 signup/start requires a first and a last name", { tag: '@tesbo.testId("TES-TC-517")' }, async () => {
     const email = signupEmail("noname");
-    for (const name of [undefined, "", "   ", "\t\n"]) {
-      const res = await start({ name, email, password: "E2E-Signup-Pass-9f3!" });
-      expect(res.status(), `name ${JSON.stringify(name)} was accepted`).toBe(400);
-      expect(JSON.stringify(await res.json())).toContain("name is required");
+    for (const firstName of [undefined, "", "   ", "\t\n"]) {
+      const res = await start({ firstName, lastName: "Signup", email, password: "E2eSignPass9f3!" });
+      expect(res.status(), `first name ${JSON.stringify(firstName)} was accepted`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("First name is required");
+    }
+    for (const lastName of [undefined, "", "   ", "\t\n"]) {
+      const res = await start({ firstName: "EndToEnd", lastName, email, password: "E2eSignPass9f3!" });
+      expect(res.status(), `last name ${JSON.stringify(lastName)} was accepted`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("Last name is required");
     }
     expect(pendingCount(email)).toBe(0);
   });
@@ -164,7 +169,7 @@ test.describe("self-serve signup", () => {
     // 7 characters is refused, and the message says what the rule is — a password rule the user has to
     // guess at is a rule they will fight.
     for (const password of [undefined, "", "short", "1234567", "       "]) {
-      const res = await start({ name: "EndToEnd Signup", email, password });
+      const res = await start({ firstName: "EndToEnd", lastName: "Signup", email, password });
       expect(res.status(), `password ${JSON.stringify(password)} was accepted`).toBe(400);
       expect(JSON.stringify(await res.json())).toContain("8 characters");
     }
@@ -177,7 +182,7 @@ test.describe("self-serve signup", () => {
     expect(existing, "no seeded account to test against").toBeTruthy();
 
     const pendingBefore = pendingCount(existing);
-    const res = await start({ name: "EndToEnd Duplicate", email: existing, password: "E2E-Signup-Pass-9f3!" });
+    const res = await start({ firstName: "EndToEnd", lastName: "Duplicate", email: existing, password: "E2eSignPass9f3!" });
     expect(res.status()).toBe(400);
     const message = JSON.stringify(await res.json());
     expect(message).toContain("already exists");
@@ -197,7 +202,7 @@ test.describe("self-serve signup", () => {
   test("SGN-A-05 the email is normalised, so case and padding cannot create a second account", { tag: '@tesbo.testId("TES-TC-520")' }, async () => {
     const existing = scalar("SELECT email FROM users WHERE email LIKE 'e2e-%' ORDER BY created_at LIMIT 1;");
     for (const variant of [existing.toUpperCase(), `  ${existing}  `]) {
-      const res = await start({ name: "EndToEnd Duplicate", email: variant, password: "E2E-Signup-Pass-9f3!" });
+      const res = await start({ firstName: "EndToEnd", lastName: "Duplicate", email: variant, password: "E2eSignPass9f3!" });
       // validateEmail lowercases and trims before the existence check, so a shouted or padded address
       // is the same address — otherwise one person could hold two accounts differing only in case.
       expect(res.status(), `${JSON.stringify(variant)} was treated as a new address`).toBe(400);
@@ -255,9 +260,15 @@ test.describe("self-serve signup", () => {
 
   test("SGN-A-10 a signup completes end to end and signs the new user in", { tag: '@tesbo.testId("TES-TC-525")' }, async () => {
     const email = signupEmail("happy");
-    const password = "E2E-Signup-Pass-9f3!";
+    const password = "E2eSignPass9f3!";
 
-    const started = await start({ name: "EndToEnd Happy Signup", email, password });
+    const started = await start({
+      firstName: "EndToEnd",
+      lastName: "Happy Signup",
+      mobileNumber: "+14155550123",
+      email,
+      password,
+    });
     // 204: the response deliberately carries nothing, because saying whether the address was new
     // would make this endpoint an account-existence oracle for anyone who asks.
     expect(started.status(), `signup/start — ${await started.text()}`).toBe(204);
@@ -285,6 +296,15 @@ test.describe("self-serve signup", () => {
     // The account exists, the pending row is consumed, and the response set a session cookie so the
     // user lands signed in rather than at a login form.
     expect(userCount(email)).toBe(1);
+    // The structured first/last name and mobile number collected at signup/start round-trip onto the
+    // finished account — not just folded into the combined `name` — and this path already collected
+    // them, so the Account page / complete-profile step must never ask again for this user.
+    expect(scalar(`SELECT first_name FROM users WHERE email = ${literal(email.toLowerCase())};`)).toBe("EndToEnd");
+    expect(scalar(`SELECT last_name FROM users WHERE email = ${literal(email.toLowerCase())};`)).toBe("Happy Signup");
+    expect(scalar(`SELECT mobile_number FROM users WHERE email = ${literal(email.toLowerCase())};`)).toBe("+14155550123");
+    expect(
+      scalar(`SELECT profile_completed_at IS NOT NULL FROM users WHERE email = ${literal(email.toLowerCase())};`),
+    ).toBe("t");
     // Consumed rather than deleted, so it can never be verified a second time but the record of the
     // signup survives.
     expect(usablePendingCount(email), "the pending signup was not consumed").toBe(0);
@@ -316,22 +336,29 @@ test.describe("self-serve signup", () => {
 
   test("SGN-A-11 starting twice for the same address leaves one usable pending signup", { tag: '@tesbo.testId("TES-TC-526")' }, async () => {
     const email = signupEmail("restart");
-    const first = await start({ name: "EndToEnd Restart", email, password: "E2E-Signup-Pass-9f3!" });
+    const first = await start({ firstName: "EndToEnd", lastName: "Restart", email, password: "E2eSignPass9f3!" });
     expect(first.status()).toBe(204);
 
     // A user who misses the first email and asks again must not be locked out — whatever the row
     // count, the latest code has to work.
-    const second = await start({ name: "EndToEnd Restart", email, password: "E2E-Signup-Pass-9f3!" });
+    const second = await start({ firstName: "EndToEnd", lastName: "Restart", email, password: "E2eSignPass9f3!" });
     expect(second.status(), `a second signup/start answered ${second.status()}: ${await second.text()}`).toBe(204);
 
     // Two starts leave two pending rows; findPendingSignup takes the newest usable one, which is what
     // makes the second code the one that works.
     expect(usablePendingCount(email)).toBeGreaterThanOrEqual(1);
 
+    // Neither start() call set a mobile number — proves the field is genuinely optional rather than
+    // defaulted to something, without spending a fifth rate-limited attempt on a dedicated test.
+    expect(
+      scalar(`SELECT mobile_number IS NULL FROM pending_signups WHERE email = ${literal(email.toLowerCase())} ORDER BY created_at DESC LIMIT 1;`),
+    ).toBe("t");
+
     seedOtpCode(email, "555555");
     const verified = await verify({ email, code: "555555" });
     expect(verified.status(), `verify after a restarted signup — ${await verified.text()}`).toBe(201);
     expect(userCount(email)).toBe(1);
+    expect(scalar(`SELECT mobile_number IS NULL FROM users WHERE email = ${literal(email.toLowerCase())};`)).toBe("t");
   });
   // ─── Field rules (BetterBugs 6a7c621b) ─────────────────────────────────────
   //
@@ -356,52 +383,67 @@ test.describe("self-serve signup", () => {
       "Name_With_Underscore",
       "Name+Plus",
     ];
-    for (const name of rejected) {
-      const res = await start({ name, email, password: "E2E-Signup-Pass-9f3!" });
-      expect(res.status(), `name ${JSON.stringify(name)} was accepted`).toBe(400);
+    for (const firstName of rejected) {
+      const res = await start({ firstName, lastName: "Valid", email, password: "E2eSignPass9f3!" });
+      expect(res.status(), `first name ${JSON.stringify(firstName)} was accepted`).toBe(400);
       expect(JSON.stringify(await res.json())).toContain("can only contain letters");
     }
+    // Last name is validated independently of first name — one representative case is enough here,
+    // since it's the same validatePersonName rule SGN-A-12's first-name loop already exercises fully.
+    const badLastName = await start({ firstName: "Valid", lastName: "N4me", email, password: "E2eSignPass9f3!" });
+    expect(badLastName.status()).toBe(400);
+    expect(JSON.stringify(await badLastName.json())).toContain("can only contain letters");
     expect(pendingCount(email)).toBe(0);
   });
 
   test("SGN-A-13 the punctuation real names use is still accepted", { tag: '@tesbo.testId("TES-TC-953")' }, async () => {
-    // The rule has to reject digits without rejecting people, so one accepted name carries every
-    // allowed class at once: an accented letter, a space, a hyphen, an apostrophe and a period.
+    // The rule has to reject digits without rejecting people, so the accepted first/last name pair
+    // carries every allowed class between them: an accented letter, a hyphen, an apostrophe and a
+    // period.
     //
     // Exactly ONE successful start in this whole block, on purpose. A start that passes validation
     // reaches sendOtp and spends from the 5-attempt IP allowance (OTP_MAX_ATTEMPTS) that every
     // worker shares — and a rate-limited start still answers 204 while storing no pending row, so
     // overspending here would not fail loudly, it would make these assertions flaky by file order.
     const email = signupEmail("goodname");
-    const name = "José Mary-Jane O'Neill Jr.";
-    const res = await start({ name, email, password: "E2E-Signup-Pass-9f3!" });
-    expect(res.status(), `name ${JSON.stringify(name)} was refused: ${await res.text()}`).toBe(204);
+    const firstName = "José Mary-Jane";
+    const lastName = "O'Neill Jr.";
+    const res = await start({ firstName, lastName, email, password: "E2eSignPass9f3!" });
+    expect(res.status(), `name ${JSON.stringify({ firstName, lastName })} was refused: ${await res.text()}`).toBe(204);
 
-    // Stored trimmed, so padding never becomes part of the person's name.
-    expect(
-      scalar(
-        `SELECT name FROM pending_signups WHERE email = ${literal(email.toLowerCase())} ORDER BY created_at DESC LIMIT 1;`,
-      ),
-    ).toBe(name);
+    // Stored trimmed and split, so padding never becomes part of the person's name and the combined
+    // `name` other read paths (Members tab, activity feed) still see stays in sync.
+    const row = `SELECT first_name || '|' || last_name || '|' || name FROM pending_signups
+      WHERE email = ${literal(email.toLowerCase())} ORDER BY created_at DESC LIMIT 1;`;
+    expect(scalar(row)).toBe(`${firstName}|${lastName}|${firstName} ${lastName}`);
   });
 
-  test("SGN-A-14 a name longer than 100 characters is refused", { tag: '@tesbo.testId("TES-TC-954")' }, async () => {
+  test("SGN-A-14 a first or last name longer than 50 characters is refused", { tag: '@tesbo.testId("TES-TC-954")' }, async () => {
+    // Self-serve signup caps First/Last name at 50, tighter than person-name.util's shared 100-char
+    // default every other "Name" field here uses (SignupService.startSelfServeSignup) — so the
+    // boundary that actually applies at this endpoint is 50, not 100.
     const email = signupEmail("longname");
-    const res = await start({ name: "A".repeat(101), email, password: "E2E-Signup-Pass-9f3!" });
-    expect(res.status(), `a 101-character name — ${await res.text()}`).toBe(400);
-    expect(JSON.stringify(await res.json())).toContain("at most 100 characters");
+    const tooLong = await start({ firstName: "A".repeat(51), lastName: "Valid", email, password: "E2eSignPass9f3!" });
+    expect(tooLong.status(), `a 51-character first name — ${await tooLong.text()}`).toBe(400);
+    expect(JSON.stringify(await tooLong.json())).toContain("at most 50 characters");
+
+    const tooLongLast = await start({ firstName: "Valid", lastName: "A".repeat(51), email, password: "E2eSignPass9f3!" });
+    expect(tooLongLast.status(), `a 51-character last name — ${await tooLongLast.text()}`).toBe(400);
+    expect(JSON.stringify(await tooLongLast.json())).toContain("at most 50 characters");
+
     expect(pendingCount(email)).toBe(0);
     // The accepting side of the boundary is not exercised here — it would cost another
     // rate-limited attempt (see SGN-A-13). SGN-A-10 already proves a legal name signs up.
   });
 
-  test("SGN-A-15 a password over 128 characters is refused rather than silently truncated", { tag: '@tesbo.testId("TES-TC-955")' }, async () => {
+  test("SGN-A-15 a password over 16 characters is refused rather than silently truncated", { tag: '@tesbo.testId("TES-TC-955")' }, async () => {
     const email = signupEmail("longpass");
-    // Silent truncation would be the dangerous outcome: the user would set a 200-character password
-    // and later be unable to sign in with it.
-    const res = await start({ name: "EndToEnd Signup", email, password: `Aa1${"x".repeat(126)}` });
-    expect(res.status(), `a 129-character password — ${await res.text()}`).toBe(400);
-    expect(JSON.stringify(await res.json())).toContain("at most 128 characters");
+    // Silent truncation would be the dangerous outcome: the user would set a 20-character password
+    // and later be unable to sign in with it. 16 is PasswordService's real MAX_LENGTH — mirrored by
+    // the frontend's PASSWORD_MAX_LENGTH — not the 128 this test used to assume.
+    const res = await start({ firstName: "EndToEnd", lastName: "Signup", email, password: "Aa1xxxxxxxxxxxxxx" });
+    expect(res.status(), `a 17-character password — ${await res.text()}`).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain("at most 16 characters");
     expect(pendingCount(email)).toBe(0);
   });
 
@@ -413,7 +455,7 @@ test.describe("self-serve signup", () => {
       ["NoDigitsAtAll", "number"],
     ];
     for (const [password, expected] of cases) {
-      const res = await start({ name: "EndToEnd Signup", email, password });
+      const res = await start({ firstName: "EndToEnd", lastName: "Signup", email, password });
       expect(res.status(), `password ${JSON.stringify(password)} was accepted`).toBe(400);
       // The message has to name the missing class — "invalid password" makes the user guess.
       expect(JSON.stringify(await res.json()).toLowerCase()).toContain(expected);
@@ -424,7 +466,24 @@ test.describe("self-serve signup", () => {
   test("SGN-A-17 an email longer than 255 characters is refused", { tag: '@tesbo.testId("TES-TC-957")' }, async () => {
     // users.email is VARCHAR(255); without the check the insert would fail as a 500 rather than a 400.
     const local = "a".repeat(250);
-    const res = await start({ name: "EndToEnd Signup", email: `${local}@${emailDomain}`, password: "E2E-Signup-Pass-9f3!" });
+    const res = await start({
+      firstName: "EndToEnd",
+      lastName: "Signup",
+      email: `${local}@${emailDomain}`,
+      password: "E2eSignPass9f3!",
+    });
     expect(res.status(), `a ${local.length + emailDomain.length + 1}-character email — ${await res.text()}`).toBe(400);
+  });
+
+  // ─── The new mobile number field ───────────────────────────────────────────
+
+  test("SGN-A-18 a malformed mobile number is refused before the rate limit is touched", { tag: '@tesbo.testId("TES-TC-1312")' }, async () => {
+    const email = signupEmail("badmobile");
+    for (const mobileNumber of ["not-a-number", "5551234567", "+1", "+0123456789", "++14155551234", "abc123"]) {
+      const res = await start({ firstName: "EndToEnd", lastName: "Signup", mobileNumber, email, password: "E2eSignPass9f3!" });
+      expect(res.status(), `mobile number ${JSON.stringify(mobileNumber)} was accepted`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("country code");
+    }
+    expect(pendingCount(email)).toBe(0);
   });
 });

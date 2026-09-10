@@ -149,16 +149,53 @@ export class AuthService {
   async me(userId: string) {
     const [isPlatformAdmin, userRow, hasPassword] = await Promise.all([
       this.superAdmin.isPlatformAdmin(userId),
-      this.db.query<{ email: string; name: string | null }>("SELECT email, name FROM users WHERE id = $1", [userId]),
+      this.db.query<{
+        email: string;
+        name: string | null;
+        first_name: string | null;
+        last_name: string | null;
+        mobile_number: string | null;
+        profile_completed_at: Date | null;
+      }>(
+        "SELECT email, name, first_name, last_name, mobile_number, profile_completed_at FROM users WHERE id = $1",
+        [userId]
+      ),
       this.password.hasPassword(userId)
     ]);
+    const row = userRow.rows[0];
     return {
       userId,
       isPlatformAdmin,
-      email: userRow.rows[0]?.email ?? null,
-      name: userRow.rows[0]?.name ?? null,
+      email: row?.email ?? null,
+      name: row?.name ?? null,
+      firstName: row?.first_name ?? null,
+      lastName: row?.last_name ?? null,
+      mobileNumber: row?.mobile_number ?? null,
+      // false only for a passwordless-OTP first-time account that hasn't been through
+      // /auth/complete-profile yet (see OtpService.findOrCreateUser and SignupService.insertUser).
+      profileComplete: row?.profile_completed_at != null,
       hasPassword
     };
+  }
+
+  /**
+   * Finishes the one-time profile step for an account created via passwordless OTP sign-in, which
+   * collects no name/mobile up front (OtpService.findOrCreateUser). Every other account-creation path
+   * already sets profile_completed_at at INSERT time, so this only ever succeeds once per account —
+   * it is not a general "edit your profile" endpoint (there is deliberately no PATCH /me for that).
+   */
+  async completeProfile(userId: string, firstName: string, lastName: string, mobileNumber: string | null) {
+    const name = `${firstName} ${lastName}`;
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE users
+       SET first_name = $1, last_name = $2, mobile_number = $3, name = $4, profile_completed_at = now(), updated_at = now()
+       WHERE id = $5 AND profile_completed_at IS NULL
+       RETURNING id`,
+      [firstName, lastName, mobileNumber, name, userId]
+    );
+    if (!result.rows[0]) {
+      throw new BadRequestException({ error: "Profile is already complete" });
+    }
   }
 
   private setSessionCookie(req: AuthenticatedRequest, res: Response, token: string, maxAgeSeconds: number) {

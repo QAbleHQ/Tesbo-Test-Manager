@@ -1,6 +1,8 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { Response } from "express";
 import { AuthenticatedRequest } from "../common/request.types";
+import { validatePersonName } from "../common/person-name.util";
+import { validateMobileNumber } from "../common/mobile-number.util";
 import { AuthService } from "./auth.service";
 
 type EmailBody = { email?: string };
@@ -8,6 +10,7 @@ type VerifyOtpBody = { email?: string; code?: string };
 type PasswordLoginBody = { email?: string; password?: string };
 type ResetPasswordBody = { token?: string; password?: string };
 type ChangePasswordBody = { currentPassword?: string; newPassword?: string };
+type CompleteProfileBody = { firstName?: string; lastName?: string; mobileNumber?: string };
 
 @Controller("/api/auth")
 export class AuthController {
@@ -70,5 +73,15 @@ export class AuthController {
   me(@Req() req: AuthenticatedRequest) {
     if (!req.userId) throw new UnauthorizedException("Not authenticated");
     return this.auth.me(req.userId);
+  }
+
+  @Post("/complete-profile")
+  @HttpCode(204)
+  completeProfile(@Body() body: CompleteProfileBody, @Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    const firstName = validatePersonName(body.firstName, "First name", 50);
+    const lastName = validatePersonName(body.lastName, "Last name", 50);
+    const mobileNumber = validateMobileNumber(body.mobileNumber);
+    return this.auth.completeProfile(req.userId, firstName, lastName, mobileNumber);
   }
 }

@@ -10,7 +10,9 @@ export default function AccountPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [mobileNumber, setMobileNumber] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
 
   const [currentPassword, setCurrentPassword] = useState("");
@@ -29,7 +31,9 @@ export default function AccountPage() {
       return;
     }
     setEmail(me.email ?? "");
-    setName((me.name ?? "").trim());
+    setFirstName((me.firstName ?? "").trim());
+    setLastName((me.lastName ?? "").trim());
+    setMobileNumber((me.mobileNumber ?? "").trim());
     setHasPassword(Boolean(me.hasPassword));
     setLoading(false);
   }, [router]);
@@ -129,18 +133,28 @@ export default function AccountPage() {
           <h2 className="text-base font-semibold text-[var(--foreground)]">Profile</h2>
         </div>
         {/*
-          * Basecamp 10212498688 — the profile showed nothing but the email. Signup collects First name
-          * and Last name and GET /me has always returned them as a single `name`; this screen simply
-          * never rendered it. Read-only for now: there is no PATCH /me to save an edit through.
-          *
-          * The mobile number the card also asks for is NOT shown, because signup never collects one —
-          * there is no field, no column and no value to fetch. Raised separately for Specification
-          * rather than rendered as a permanently empty row.
+          * Basecamp 10212498688 — the profile showed nothing but the email. First name, Last name and
+          * Mobile number are now collected at signup, invite registration, and (via the one-time
+          * /complete-profile step) passwordless OTP sign-in — see SignupService, AuthService.me/
+          * completeProfile, and app/complete-profile/page.tsx. Read-only for now: there is no PATCH
+          * /me to edit these after the fact.
           */}
         <Field>
-          <FieldLabel htmlFor="account-name">Name</FieldLabel>
-          <div id="account-name" className="text-sm text-[var(--foreground)]">
-            {name || <span className="text-[var(--muted-soft)]">Not set</span>}
+          <FieldLabel htmlFor="account-first-name">First name</FieldLabel>
+          <div id="account-first-name" className="text-sm text-[var(--foreground)]">
+            {firstName || <span className="text-[var(--muted-soft)]">Not set</span>}
+          </div>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="account-last-name">Surname</FieldLabel>
+          <div id="account-last-name" className="text-sm text-[var(--foreground)]">
+            {lastName || <span className="text-[var(--muted-soft)]">Not set</span>}
+          </div>
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="account-mobile">Mobile number</FieldLabel>
+          <div id="account-mobile" className="text-sm text-[var(--foreground)]">
+            {mobileNumber || <span className="text-[var(--muted-soft)]">Not set</span>}
           </div>
         </Field>
         <Field>

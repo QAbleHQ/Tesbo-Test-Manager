@@ -42,6 +42,24 @@ export function validateEmailValue(value: string): string | null {
   return null;
 }
 
+// Mirrors Tesbo-Backend-Nest/src/common/mobile-number.util.ts. Optional everywhere it's collected —
+// an empty value is valid — so callers should skip this when the field was left blank rather than
+// treat null back from normalizeMobileNumber() as an error.
+export const MOBILE_NUMBER_MAX_LENGTH = 20;
+const MOBILE_NUMBER_RE = /^\+[1-9]\d{6,14}$/;
+
+/** Strips spaces/dashes/parens so "+1 (415) 555-1234" and "+14155551234" validate the same way. */
+export function normalizeMobileNumber(value: string): string {
+  return value.replace(/[\s().-]/g, "");
+}
+
+export function validateMobileNumber(value: string): string | null {
+  const normalized = normalizeMobileNumber(value.trim());
+  if (!normalized) return null;
+  if (!MOBILE_NUMBER_RE.test(normalized)) return "Enter a mobile number with a country code, e.g. +14155551234";
+  return null;
+}
+
 // Mirrors Tesbo-Backend-Nest/src/legacy/legacy.service.ts (createProject / updateProject).
 // PROJECT_NAME_MAX_LENGTH is a product-chosen cap, well under the projects.name VARCHAR(255)
 // column — keep in sync with the backend constant, not the column limit.
