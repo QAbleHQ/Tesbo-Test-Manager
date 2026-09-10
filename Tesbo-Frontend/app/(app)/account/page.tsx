@@ -19,7 +19,7 @@ import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AccountPage() {
   const router = useRouter();
-  const { currentUser } = useAppData();
+  const { currentUser, refetchCurrentUser } = useAppData();
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [firstName, setFirstName] = useState("");
@@ -116,6 +116,10 @@ export default function AccountPage() {
       setMobileNumberDraft(updated.mobileNumber ?? "");
       setProfileSuccess(true);
       setIsEditingName(false);
+      // AppDataProvider's currentUser is fetched once on mount and otherwise never updated — without
+      // this, the TopBar/Sidebar avatar initials would keep showing the pre-edit name, and returning
+      // to this page after navigating away would read the stale value straight back out of context.
+      refetchCurrentUser();
     } catch (err) {
       setProfileError(err instanceof Error ? err.message : "Failed to save profile");
     } finally {
