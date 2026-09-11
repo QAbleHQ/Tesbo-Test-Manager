@@ -11,6 +11,9 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 type Route = { match: string; rows?: Record<string, unknown>[]; handler?: (params: unknown[]) => { rows: Record<string, unknown>[] } };
 
@@ -27,6 +30,7 @@ function makeDb(routes: Route[] = []) {
 }
 
 function makeLegacy(db: DatabaseService): LegacyService {
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
   return new LegacyService(
     db,
     {} as unknown as EmailService,
@@ -38,6 +42,9 @@ function makeLegacy(db: DatabaseService): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
     {} as unknown as CustomFieldsService
   );
 }

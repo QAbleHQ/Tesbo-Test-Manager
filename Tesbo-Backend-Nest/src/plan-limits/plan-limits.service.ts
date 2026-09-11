@@ -2,6 +2,8 @@ import { ForbiddenException, Injectable } from "@nestjs/common";
 import { EmailService } from "../auth/email.service";
 import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { EntitlementCacheService } from "../cache/entitlement-cache.service";
 
 export type Plan = "launch" | "pro";
 
@@ -54,7 +56,9 @@ export class PlanLimitsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly config: AppConfigService,
-    private readonly email: EmailService
+    private readonly email: EmailService,
+    private readonly requestCache: RequestCacheService,
+    private readonly entitlementCache: EntitlementCacheService
   ) {}
 
   /**
@@ -74,7 +78,31 @@ export class PlanLimitsService {
    * same way — it is an ordinary value in `plan` — except that a grant carrying an expiry is retired
    * here the moment it lapses, on the same lazy principle.
    */
+  // Memoized for the rest of THIS request only — every entitlement check for one organization (the
+  // write-lock guard, custom-fields gating, integration gating, storage checks) used to independently
+  // re-read `organizations` and re-run expireAdminOverride's lazy write. Two calls in one request can
+  // no longer observe two different answers if a Stripe webhook happens to land mid-request; they now
+  // both see whichever snapshot was read first, which trades a rare inconsistency for a rare
+  // (never wrong) staleness bounded to this one request. See B1 of the platform performance
+  // remediation plan.
   private async getEntitlement(organizationId: string): Promise<Entitlement> {
+    return this.requestCache.remember(`entitlement:${organizationId}`, () => this.loadEntitlement(organizationId));
+  }
+
+  // Redis-backed, underneath the request-scoped memoization above: this collapses repeat entitlement
+  // reads ACROSS requests (that one only collapses repeats WITHIN one request). Short TTL (see
+  // EntitlementCacheService) since this is deliberately not zero-tolerance staleness — a cache error
+  // or miss falls straight through to computeEntitlement, so this can only make things faster, never
+  // wrong beyond the documented, bounded staleness window.
+  private async loadEntitlement(organizationId: string): Promise<Entitlement> {
+    const cached = await this.entitlementCache.get<Entitlement>(organizationId);
+    if (cached) return cached;
+    const computed = await this.computeEntitlement(organizationId);
+    await this.entitlementCache.set(organizationId, computed);
+    return computed;
+  }
+
+  private async computeEntitlement(organizationId: string): Promise<Entitlement> {
     const res = await this.db.query<{
       plan: string;
       plan_grace_ends_at: string | null;
@@ -102,6 +130,18 @@ export class PlanLimitsService {
 
     const inGracePeriod = plan === "launch" && !!graceEndsAt && new Date(graceEndsAt).getTime() > Date.now();
     return { plan, effectivePlan: inGracePeriod ? "pro" : plan, inGracePeriod, graceEndsAt };
+  }
+
+  /**
+   * Called by BillingService on every write to plan / plan_grace_ends_at / plan_source /
+   * plan_override_* (checkout completing, a subscription's state changing) — everything that
+   * changes what getEntitlement() would compute. Drops both the cross-request Redis cache and this
+   * request's own memoized copy, so a webhook handler that happens to also check entitlement after
+   * the write never sees its own stale pre-write snapshot.
+   */
+  async invalidateEntitlementCache(organizationId: string): Promise<void> {
+    this.requestCache.invalidate(`entitlement:${organizationId}`);
+    await this.entitlementCache.invalidate(organizationId);
   }
 
   /**

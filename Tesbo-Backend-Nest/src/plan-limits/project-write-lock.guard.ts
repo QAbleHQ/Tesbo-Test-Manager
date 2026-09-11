@@ -1,6 +1,6 @@
 import { CanActivate, ExecutionContext, Injectable } from "@nestjs/common";
 import type { Request } from "express";
-import { DatabaseService } from "../database/database.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { PlanLimitsService } from "./plan-limits.service";
 
 /**
@@ -24,7 +24,7 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 @Injectable()
 export class ProjectWriteLockGuard implements CanActivate {
   constructor(
-    private readonly db: DatabaseService,
+    private readonly projectLookup: ProjectLookupService,
     private readonly planLimits: PlanLimitsService
   ) {}
 
@@ -40,16 +40,16 @@ export class ProjectWriteLockGuard implements CanActivate {
     // Archiving the project is the documented way out of the lock — never block it.
     if (req.method === "DELETE" && (!rest || rest === "/")) return true;
 
-    const res = await this.db.query<{ organization_id: string }>(
-      "SELECT organization_id FROM projects WHERE id = $1 AND archived_at IS NULL",
-      [projectId]
-    );
-    const organizationId = res.rows[0]?.organization_id;
+    // Same project row ProjectLookupService's other callers (loadWriteContext, externalIdPrefix)
+    // read for this request — memoized there, not re-queried here. The archived_at check that used
+    // to be a WHERE clause is applied here instead, since the shared lookup reads the row
+    // unconditionally: an archived project must be treated exactly like a missing one.
+    const project = await this.projectLookup.getProjectBasics(projectId);
     // Unknown or archived project: let the handler produce its own 404 rather than a confusing
     // plan-limit error.
-    if (!organizationId) return true;
+    if (!project || project.archivedAt) return true;
 
-    await this.planLimits.assertProjectWritable(organizationId, projectId);
+    await this.planLimits.assertProjectWritable(project.organizationId, projectId);
     return true;
   }
 }

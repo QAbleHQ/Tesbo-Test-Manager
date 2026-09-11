@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
+import { getWorkspaceAnalytics, type WorkspaceAnalytics } from "@/lib/api";
 import { Card, PageLoader } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
@@ -71,8 +71,7 @@ function statusStyle(status: string) {
 
 export default function DashboardPage() {
   const router = useRouter();
-  const { currentUser } = useAppData();
-  const [workspaceName, setWorkspaceName] = useState<string | null>(null);
+  const { currentUser, workspace } = useAppData();
   const [analytics, setAnalytics] = useState<WorkspaceAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -82,11 +81,8 @@ export default function DashboardPage() {
       router.replace("/login");
       return;
     }
-    Promise.all([getWorkspace(), getWorkspaceAnalytics()])
-      .then(([workspace, data]) => {
-        setWorkspaceName((workspace as WorkspaceInfo).name ?? "Workspace");
-        setAnalytics(data);
-      })
+    getWorkspaceAnalytics()
+      .then((data) => setAnalytics(data))
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load analytics"))
       .finally(() => setLoading(false));
   }, [router, currentUser]);
@@ -120,7 +116,7 @@ export default function DashboardPage() {
           breadcrumb={(
             <Breadcrumbs
               items={[
-                { label: workspaceName || "Workspace", href: "/dashboard" },
+                { label: workspace?.name || "Workspace", href: "/dashboard" },
                 { label: "Dashboard" },
               ]}
             />
