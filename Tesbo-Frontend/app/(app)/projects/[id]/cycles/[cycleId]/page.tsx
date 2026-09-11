@@ -105,6 +105,11 @@ function comparePriority(a: string, b: string): number {
   if (ra !== rb) return ra - rb;
   return a.localeCompare(b);
 }
+
+/* Test Case column sort: plain alphabetical by title, case-insensitive. */
+function compareTestCaseTitle(a: string, b: string): number {
+  return a.toLowerCase().localeCompare(b.toLowerCase());
+}
 import { avatarColor } from "@/lib/avatarColors";
 
 /* ───── Status tone helpers ───── */
@@ -193,8 +198,8 @@ function MemberAvatar({ name, seed, size = 22 }: { name: string; seed?: string |
   );
 }
 
-/* A column header for the run table's ID/Priority sort. Un-highlighted arrows when this column
-   isn't the active sort; a direction-specific icon (and brand color) when it is. */
+/* A column header for the run table's ID/Priority/Test Case sort. Un-highlighted arrows when this
+   column isn't the active sort; a direction-specific icon (and brand color) when it is. */
 function SortableColumnHeader({
   label,
   column,
@@ -202,9 +207,9 @@ function SortableColumnHeader({
   onToggle,
 }: {
   label: string;
-  column: "id" | "priority";
-  runSort: { column: "id" | "priority"; direction: "asc" | "desc" } | null;
-  onToggle: (column: "id" | "priority") => void;
+  column: "id" | "priority" | "testCase";
+  runSort: { column: "id" | "priority" | "testCase"; direction: "asc" | "desc" } | null;
+  onToggle: (column: "id" | "priority" | "testCase") => void;
 }) {
   const active = runSort?.column === column ? runSort.direction : null;
   return (
@@ -420,9 +425,10 @@ export default function TestRunDetailPage() {
   const [runFilterPriority, setRunFilterPriority] = useState("");
   const [runFilterType, setRunFilterType] = useState("");
   const [runFilterAssignee, setRunFilterAssignee] = useState("");
-  /* ID/Priority column sort — null means "no sort", i.e. the existing (creation) order. Only one
-     column can be active at a time: picking the other column replaces this rather than combining. */
-  const [runSort, setRunSort] = useState<{ column: "id" | "priority"; direction: "asc" | "desc" } | null>(null);
+  /* ID/Priority/Test Case column sort — null means "no sort", i.e. the existing (creation) order.
+     Only one column can be active at a time: picking another column replaces this rather than
+     combining. */
+  const [runSort, setRunSort] = useState<{ column: "id" | "priority" | "testCase"; direction: "asc" | "desc" } | null>(null);
 
   /* test case picker state */
   const [showPicker, setShowPicker] = useState(false);
@@ -501,9 +507,9 @@ export default function TestRunDetailPage() {
     setPage(1);
   }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
 
-  /* toggle the ID/Priority column sort: same column clicked again flips direction, the other
-     column replaces it starting at ascending — "only one active sort at a time". */
-  function toggleRunSort(column: "id" | "priority") {
+  /* toggle the ID/Priority/Test Case column sort: same column clicked again flips direction, the
+     other column replaces it starting at ascending — "only one active sort at a time". */
+  function toggleRunSort(column: "id" | "priority" | "testCase") {
     setRunSort((prev) => {
       if (prev?.column === column) return { column, direction: prev.direction === "asc" ? "desc" : "asc" };
       return { column, direction: "asc" };
@@ -953,11 +959,11 @@ export default function TestRunDetailPage() {
     // `list` can still be the original `executions` reference here when no filter matched anything.
     if (runSort) {
       const direction = runSort.direction === "asc" ? 1 : -1;
-      list = [...list].sort((a, b) =>
-        runSort.column === "id"
-          ? direction * compareExternalId(a.externalId || "", b.externalId || "")
-          : direction * comparePriority(a.priority || "", b.priority || "")
-      );
+      list = [...list].sort((a, b) => {
+        if (runSort.column === "id") return direction * compareExternalId(a.externalId || "", b.externalId || "");
+        if (runSort.column === "priority") return direction * comparePriority(a.priority || "", b.priority || "");
+        return direction * compareTestCaseTitle(a.title || a.snapshotTitle || "", b.title || b.snapshotTitle || "");
+      });
     }
     return list;
   }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
@@ -1294,7 +1300,9 @@ export default function TestRunDetailPage() {
                     <th className="px-5 py-2.5 font-semibold">
                       <SortableColumnHeader label="ID" column="id" runSort={runSort} onToggle={toggleRunSort} />
                     </th>
-                    <th className="px-5 py-2.5 font-semibold">Test Case</th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="Test Case" column="testCase" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
                     <th className="px-5 py-2.5 font-semibold">
                       <SortableColumnHeader label="Priority" column="priority" runSort={runSort} onToggle={toggleRunSort} />
                     </th>
