@@ -1,6 +1,13 @@
 # Langfuse integration plan — full traceability for Zyra and every other model call
 
-Status: **proposal, awaiting approval.** No product code has been changed.
+Status: **Phase 1 shipped, partially.** `src/observability/` (`langfuse.ts`, `ai-trace.ts`) exists and
+is wired into `buildZyraChatDecision`: session/user identity, Jira context, knowledge context,
+existing-coverage, the router call, the generator call (`generateZyraChatTestcasesWithAi`), and a
+`reply-reconciliation` guardrail span are all traced today. **Not yet done**, still matching this
+doc's original Phase 1–4 scope below: model-price seeding (§3.5), the remaining call sites in §1.1
+(#2, #3, #6–9), scores/evals (Phase 3), and dashboards/alerts (Phase 4). This header was stale for a
+while — it read "no product code has been changed" after Phase 1's module had already shipped; keep
+it in sync with reality going forward rather than treating this doc as a proposal once code exists.
 Target instance: **self-hosted Langfuse OSS v4.17.0**, project `Tesbo Test Manager` (org `Tesbo`).
 
 Scope: end-to-end observability (traces, token/cost accounting, quality scores) over every LLM and
@@ -44,17 +51,20 @@ Each item is something we currently **cannot answer** about our own production b
 
 ### 1.1 Nine model call sites, none correlated
 
+Line numbers below are as of the 2026-08-25 spike and have drifted since (the file has grown past
+15,000 lines) — the call sites and their names are still current, the exact `:N` addresses are not.
+
 | # | Call site | File / line | Traced today |
 |---|-----------|-------------|--------------|
-| 1 | Zyra chat router | `legacy.service.ts:11010` / `:11040` | no |
-| 2 | Tool-decision finalizer | `legacy.service.ts:9496` | no |
-| 3 | Scenario planner | `legacy.service.ts:10796` → `:10743` | no |
-| 4 | Testcase generator (OpenAI wire) | `legacy.service.ts:10822` | usage parsed, discarded |
-| 5 | Testcase generator (Anthropic wire) | `legacy.service.ts:10878` | usage parsed, discarded |
-| 6 | Agent memory summariser | `legacy.service.ts:10047` | no |
-| 7 | Knowledge-file transcription | `legacy.service.ts:6960` | no |
-| 8 | RAG embeddings | `rag/rag-ai-allocation.ts:44` | no |
-| 9 | Integration sync decisions | `integration-sync-decisions.ts:131` / `:160` | no |
+| 1 | Zyra chat router (`zyraChatWithOpenAi`/`zyraChatWithAnthropic`) | `legacy.service.ts` | **yes** — router span, raw pre-parse completion text + `__salvaged` flag, `reply-reconciliation` guardrail span |
+| 2 | Tool-decision finalizer | `legacy.service.ts` | no |
+| 3 | Scenario planner (`planZyraChatScenarios`) | `legacy.service.ts` | no |
+| 4 | Testcase generator (`generateZyraChatTestcasesWithAi` → `generateZyraWithProvider`) | `legacy.service.ts` | **yes**, for the interactive turn (including a plan's first, synchronous batch) — the background continuation loop (`continueZyraChatPlan`) still has no open trace to attach to, unchanged from before |
+| 5 | Testcase generator (Anthropic wire) | `legacy.service.ts` | same as #4 — one call site, both provider wires |
+| 6 | Agent memory summariser | `legacy.service.ts` | no |
+| 7 | Knowledge-file transcription | `legacy.service.ts` | no |
+| 8 | RAG embeddings | `rag/rag-ai-allocation.ts` | no |
+| 9 | Integration sync decisions | `integration-sync-decisions.ts` | no |
 
 `testZyraAiConnection` (`:8316`) is a health probe — deliberately excluded, it would skew every
 error-rate panel.
@@ -269,16 +279,34 @@ reasons for this work (§1.3), seeding model definitions via `POST /api/public/m
 Completed while writing this plan: version pinned, ingestion proven, trace hierarchy proven, masking
 behaviour characterised, cost gap found. Findings are §0 and §7. No repo changes.
 
-### Phase 1 — Module + Zyra chat path (~2–3 days)
+### Phase 1 — Module + Zyra chat path (~2–3 days) — 🟡 partially shipped
 
-1. `src/observability/` per §3.2, registered globally, with the `NodeSDK` exporter guard.
-2. `AppConfigService` additions (§6), inert when `LANGFUSE_ENABLED=false`.
-3. Seed model-price definitions for the 8 unpriced models (§3.5).
-4. Instrument, in order: `sendZyraChatMessage` (`:8495`) → `buildZyraChatDecision` (`:8642`) →
-   `finalizeZyraToolDecisionWithAi` (`:9496`) → `startZyraChatPlan` / `continueZyraChatPlan`
-   (`:9269` / `:9382`) → `generateZyraWithProvider` (`:10484`) → `applyZyraChatOperations` (`:8904`).
-5. Shutdown flush in `main.ts` (§8).
-6. e2e coverage per §9, run and green.
+1. `src/observability/` per §3.2, registered globally, with the `NodeSDK` exporter guard. **Done.**
+2. `AppConfigService` additions (§6), inert when `LANGFUSE_ENABLED=false`. **Done.**
+3. Seed model-price definitions for the 8 unpriced models (§3.5). **Not done** — cost still computes
+   to zero for the models this catalog actually serves; still a required task, not optional.
+4. Instrument, in order: `sendZyraChatMessage` → `buildZyraChatDecision` →
+   `finalizeZyraToolDecisionWithAi` → `startZyraChatPlan` / `continueZyraChatPlan` →
+   `generateZyraWithProvider` → `applyZyraChatOperations`.
+   **Done**: `buildZyraChatDecision` (router span, raw completion + `__salvaged`, reconciliation
+   guardrail span), `generateZyraWithProvider` for the interactive path (including a plan's first
+   batch). **Not done**: `finalizeZyraToolDecisionWithAi` (the `jira_pending_testcases` tool path),
+   `continueZyraChatPlan`'s own background batches (no open trace to attach to — each batch would
+   need its own trace, not a child of one that already ended), `applyZyraChatOperations` as its own
+   `[tool]` span (its outcome is currently only visible via the reconciliation guardrail span's
+   `appliedCount`/`proposedCount`, not as a distinct observation).
+5. Shutdown flush in `main.ts` (§8). Not verified as part of this pass — check before relying on it.
+6. e2e coverage per §9 (local capture stub against the real HTTP stack, fail-closed base URL,
+   Langfuse-unreachable failure isolation, etc.): **still not written, not run.** What this pass did
+   add is `src/observability/ai-trace.spec.ts` — previously nonexistent (§3.2 named
+   `ai-trace.service.spec.ts` as a Phase 1 deliverable that never got written) — unit-testing
+   `ai-trace.ts`'s own contract directly with `@langfuse/tracing` and `isTracingEnabled` mocked: the
+   raw completion lands in `output.rawCompletion` (never `metadata`, matching the §7.2 masking
+   constraint) alongside the parsed decision, `salvaged`/`bannerFired` land in metadata as plain
+   booleans/strings, `recordReconciliation` derives the identical trace id `startZyraTurn` would for
+   the same messageId (asserted directly, not assumed), and every function stays a no-op that never
+   throws when tracing is off or the SDK itself throws. This proves ai-trace.ts's own behavior
+   correctly; it does not prove the real SDK/network path, which is what §9's e2e list is for.
 
 ### Phase 2 — Remaining call sites (~1 day)
 
@@ -539,3 +567,26 @@ Not included: putting TLS in front of the Langfuse instance (§7.1), which is an
   migration V84 dropped in favour of deterministic `createTraceId`; `mask` measured to cover only
   input/output; v4 `events_only` read-API change documented; 8-of-11 model price definitions found
   missing; plain-HTTP transport raised as D4.
+- **2026-09-10** — Phase 1's `src/observability/` module and its wiring into `buildZyraChatDecision`
+  shipped at some point after the above (this doc's header wasn't updated then — fixed now). Found
+  three real gaps in what shipped while investigating a phantom-success bug report ("Zyra said 8 test
+  cases were staged for review; nothing existed") and closed the two directly relevant to it:
+  (1) `recordGeneration`'s `output` for the router call was always the *parsed* decision, never the
+  literal completion text — so a trace for exactly this bug class would have shown the same lossy
+  salvaged fragment already visible in the reply, not the malformed JSON that caused it. Fixed:
+  `recordGeneration` gained `rawOutput`/`salvaged` fields, routed through `output` (masked) never
+  `metadata` (not masked, per §7.2). (2) The generator call
+  (`generateZyraChatTestcasesWithAi`/`generateZyraWithProvider`) — the one that actually authors
+  drafts — had no span at all; now traced for the interactive path (a background plan batch still has
+  no open trace to attach to — noted in §4 rather than silently left undocumented).
+  (3) `reconcileZyraReply`'s decision (which banner fired, requested/applied/proposed counts) was
+  invisible on the trace, and — found while wiring this — could not simply become a child of the
+  router's own span: that span's root observation is already ended (`endZyraTurn`) by the time
+  reconciliation runs in the caller, several turns' worth of return paths earlier. Rather than
+  restructure who owns ending the trace across `buildZyraChatDecision`'s ~10 return points (invasive,
+  and several of those paths — capability-disabled, degraded-mode — don't call `endZyraTurn` at all
+  today, itself a pre-existing gap left as-is), `recordReconciliation` opens its own observation
+  attached to the SAME deterministic trace id (`createTraceId(messageId)`), the same bootstrap
+  `startZyraTurn` itself uses. Added `src/observability/ai-trace.spec.ts` (previously nonexistent —
+  see §3.2's original, never-fulfilled `ai-trace.service.spec.ts` line item) covering all of the
+  above at the unit level, `@langfuse/tracing` mocked. §9's actual e2e list is still not written.

@@ -1800,6 +1800,10 @@ test.describe("zyra chat — citations (fake provider)", () => {
   });
 
   test.beforeEach(() => {
+    // See FakeAiServer.reset()'s doc comment — this describe block's `ai` instance is shared across
+    // every test in it (one beforeAll), so a later test asserting on `ai.requests.length` would
+    // otherwise see the cumulative count across every prior test in this block.
+    ai?.reset();
     const reason = rbacSuiteSkipReason(tenant);
     test.skip(reason !== null, reason ?? "");
     if (tenant) purge();
@@ -1935,7 +1939,10 @@ test.describe("zyra chat — citations (fake provider)", () => {
       failOnStatusCode: false,
     });
     expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
-    expect(ai.requests.length, "router + generation").toBe(2);
+    // Found by review: generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn after
+    // a successful generation (its own summarization call to the same provider) — an easy count to
+    // miss since it's not part of the router/generation contract this suite otherwise scripts.
+    expect(ai.requests.length, "router + generation + rememberZyraTurn's own summarization call").toBe(3);
 
     const testcases = await lastAssistantTestcases(sessionId);
     expect(testcases).toHaveLength(1);
@@ -2032,6 +2039,10 @@ test.describe("zyra chat — progress streaming (fake provider)", () => {
     const reason = rbacSuiteSkipReason(tenant);
     test.skip(reason !== null, reason ?? "");
     if (tenant) purge();
+    // See FakeAiServer.reset()'s doc comment — this describe block's `ai` instance is shared across
+    // every test in it (one beforeAll), so a later test asserting on `ai.requests.length` would
+    // otherwise see the cumulative count across every prior test in this block.
+    ai?.reset();
   });
 
   test.afterEach(() => {

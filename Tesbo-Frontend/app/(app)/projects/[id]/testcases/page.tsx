@@ -1,6 +1,7 @@
 "use client";
 
 import { useParams, useRouter, useSearchParams } from "next/navigation";
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -69,13 +70,19 @@ import {
 } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
-import ImportTestCasesModal from "@/components/ImportTestCasesModal";
+// Dynamically imported: a 978-line modal only ~1% of visits ever open, previously bundled into
+// every load of this route regardless. Deferring it to the first "Import" click keeps it out of
+// the page-switch chunk without changing when or how it renders once opened (`open` still gates
+// its own visibility exactly as before; ssr:false is safe since it never renders anything at
+// open=false, so there's no hydration mismatch to worry about).
+const ImportTestCasesModal = dynamic(() => import("@/components/ImportTestCasesModal"), { ssr: false });
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
 import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilterPopover";
 import { getConfiguredDefaultValue, validateCustomFieldValues } from "@/components/customFields/customFieldTypes";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { toTsv } from "@/lib/tsv";
 import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 // 500 is the server's per-request ceiling (listTestCases clamps `limit`), so it is the largest
 // page we can offer. Paired with "select all matching" below, a 500-case suite no longer has to
@@ -102,6 +109,15 @@ type PanelTab = "overview" | "steps" | "customFields" | "bugs";
 type BulkAction = "" | "delete" | "update" | "archive" | "move";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
+
+// The subset of state that `loadData` (the effect gating the whole page behind `loading`)
+// populates — the suite-cases list, panel state, filters, and every mutation-handler field are
+// deliberately excluded, since this cache exists only to make a bare revisit render instantly.
+interface TestCasesPageData {
+  suites: SuiteNode[];
+  repoSummary: RepositorySummary | null;
+  customFieldDefinitions: CustomFieldDefinition[];
+}
 
 function normalizeTestcaseIdPrefix(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3);
@@ -174,8 +190,11 @@ export default function TestCasesPage() {
     () => normalizeTestcaseIdPrefix(String(parseProjectSettings(project.settings).testcaseIdPrefix || project.key || "TC")) || "TC",
     [project]
   );
-  const [suites, setSuites] = useState<SuiteNode[]>([]);
-  const [repoSummary, setRepoSummary] = useState<RepositorySummary | null>(null);
+  const cacheKey = `testcases:${projectId}`;
+  const cached = getPageCache<TestCasesPageData>(cacheKey);
+
+  const [suites, setSuites] = useState<SuiteNode[]>(cached?.suites ?? []);
+  const [repoSummary, setRepoSummary] = useState<RepositorySummary | null>(cached?.repoSummary ?? null);
   const [suitePanelOpen, setSuitePanelOpen] = useState(true);
   const [suiteCases, setSuiteCases] = useState<TestCaseListItem[]>([]);
   const [suiteCasesTotal, setSuiteCasesTotal] = useState(0);
@@ -183,7 +202,10 @@ export default function TestCasesPage() {
   const [suiteCasesError, setSuiteCasesError] = useState<string | null>(null);
   const [suiteCasesPage, setSuiteCasesPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
-  const [loading, setLoading] = useState(true);
+  // Only the true first visit to this project's testcases repository has no cache to seed from —
+  // every later visit renders the last-known suite tree/summary immediately while the effect below
+  // revalidates it in the background, instead of blocking behind the spinner on every click.
+  const [loading, setLoading] = useState(!cached);
 
   const [isAddSuiteModalOpen, setIsAddSuiteModalOpen] = useState(false);
   const [newSuiteName, setNewSuiteName] = useState("");
@@ -227,7 +249,7 @@ export default function TestCasesPage() {
   // definitions (used for the create form and as the base for edit-mode merging).
   // `panelCustomFields` is the edit-mode merge of definitions + this test case's stored
   // values (including archived/inactive fields that still hold a historical value).
-  const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomFieldDefinition[]>([]);
+  const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomFieldDefinition[]>(cached?.customFieldDefinitions ?? []);
   const [panelCustomFields, setPanelCustomFields] = useState<CustomFieldValue[]>([]);
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, unknown>>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
@@ -276,9 +298,11 @@ export default function TestCasesPage() {
       getRepositorySummary(projectId).catch(() => null),
       listCustomFieldDefinitions(projectId, { statuses: ["active"] }).catch(() => []),
     ]);
-    setSuites(suiteList);
-    setRepoSummary(summary);
-    setCustomFieldDefinitions(activeCustomFields);
+    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions: activeCustomFields };
+    setPageCache(`testcases:${projectId}`, next);
+    setSuites(next.suites);
+    setRepoSummary(next.repoSummary);
+    setCustomFieldDefinitions(next.customFieldDefinitions);
   }, [projectId]);
 
   useEffect(() => {
@@ -287,6 +311,14 @@ export default function TestCasesPage() {
     if (!currentUser) {
       router.replace("/login");
       return;
+    }
+    const key = `testcases:${projectId}`;
+    const existing = getPageCache<TestCasesPageData>(key);
+    if (existing) {
+      setSuites(existing.suites);
+      setRepoSummary(existing.repoSummary);
+      setCustomFieldDefinitions(existing.customFieldDefinitions);
+      setLoading(false);
     }
     loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
   }, [router, loadData, projectId, currentUser]);

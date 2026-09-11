@@ -41,6 +41,26 @@ export interface FakeAiServer {
   queueReply(content: Record<string, unknown> | string): void;
   /** Set to a status code to make the NEXT call fail (consumed once), exercising the error path. */
   failNextWith(status: number, message?: string): void;
+  /**
+   * Delays the NEXT call's response by `ms` (consumed once), so a test can deterministically observe
+   * "this call is genuinely still in flight" — e.g. asserting that stopping a background batch plan
+   * while one of its batches is mid-request lets that one finish but stops the next — without racing
+   * real wall-clock timing against however fast this server happens to answer.
+   */
+  delayNextReplyMs(ms: number): void;
+  /**
+   * Clears the queued replies and the request log (`requests.length = 0` in place — existing
+   * references to `ai.requests` keep working after a reset) and cancels any pending `failNextWith`.
+   *
+   * Found by review, before a real run ever caught it: `requests` is append-only for the life of
+   * the server, and every describe block here shares ONE server instance across all its tests
+   * (`fullyParallel: false` serialises them in one worker, so nothing else resets it between tests)
+   * — every `expect(ai.requests.length).toBe(N)` assertion in this suite was actually asserting
+   * against the CUMULATIVE count across every test that ran before it in the same file, not the
+   * count for that one test. Call this in `beforeEach` for any describe block that asserts on
+   * `ai.requests.length`.
+   */
+  reset(): void;
   close(): Promise<void>;
 }
 
@@ -49,6 +69,7 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
   const requests: FakeAiRequest[] = [];
   let failStatus: number | null = null;
   let failMessage = "stubbed provider failure";
+  let delayMs: number | null = null;
 
   const server: Server = createServer((req, res) => {
     if (req.method !== "POST") {
@@ -58,13 +79,8 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
     let raw = "";
     req.on("data", (chunk) => (raw += chunk));
     req.on("end", () => {
-      if (failStatus !== null) {
-        const status = failStatus;
-        failStatus = null;
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: failMessage } }));
-        return;
-      }
+      const thisDelay = delayMs;
+      delayMs = null;
       let body: FakeAiRequest;
       try {
         body = JSON.parse(raw || "{}");
@@ -73,23 +89,38 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
         res.end(JSON.stringify({ error: { message: "invalid JSON body" } }));
         return;
       }
+      // Logged the moment the request body has fully arrived, BEFORE any delay — this is what makes
+      // delayNextReplyMs useful: a test can poll `ai.requests.length` to learn "this call has
+      // definitely started" and act (e.g. call stop-plan) while the RESPONSE is still being held
+      // back, rather than only finding out once it's too late to matter.
       requests.push({ model: String(body.model || ""), messages: Array.isArray(body.messages) ? body.messages : [] });
-      const next = queue.shift();
-      const content = next ?? JSON.stringify({
-        reply: "fake-ai-server: no scripted response was queued for this call.",
-        reasoningSummary: "fake-ai-server exhausted its queue.",
-        action: "answer",
-        actionType: "answer",
-        operations: [],
-        testcases: []
-      });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        id: "fake-chatcmpl",
-        object: "chat.completion",
-        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
-      }));
+      const respond = () => {
+        if (failStatus !== null) {
+          const status = failStatus;
+          failStatus = null;
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: failMessage } }));
+          return;
+        }
+        const next = queue.shift();
+        const content = next ?? JSON.stringify({
+          reply: "fake-ai-server: no scripted response was queued for this call.",
+          reasoningSummary: "fake-ai-server exhausted its queue.",
+          action: "answer",
+          actionType: "answer",
+          operations: [],
+          testcases: []
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "fake-chatcmpl",
+          object: "chat.completion",
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+        }));
+      };
+      if (thisDelay && thisDelay > 0) setTimeout(respond, thisDelay);
+      else respond();
     });
   });
 
@@ -105,6 +136,16 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
     failNextWith(status, message) {
       failStatus = status;
       if (message) failMessage = message;
+    },
+    delayNextReplyMs(ms) {
+      delayMs = ms;
+    },
+    reset() {
+      queue.length = 0;
+      requests.length = 0;
+      failStatus = null;
+      failMessage = "stubbed provider failure";
+      delayMs = null;
     },
     close() {
       return new Promise<void>((resolve, reject) => {
