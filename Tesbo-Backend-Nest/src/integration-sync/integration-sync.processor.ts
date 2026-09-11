@@ -7,7 +7,7 @@ import { truncateForColumn } from "../common/integration-text.util";
 import { summarizeTextChange } from "../common/text-diff.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
-import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
+import { IntegrationConnectionInvalidError, IntegrationSyncClient, LinearEntityNotFoundError } from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
 import { IntegrationSyncService } from "./integration-sync.service";
@@ -234,7 +234,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
       this.logger.warn(
         err instanceof IntegrationConnectionInvalidError
           ? `Sync run ${runId} could not use its ${provider} connection: ${message}`
-          : `Sync run ${runId} failed: ${message}`
+          : err instanceof LinearEntityNotFoundError
+            ? `Sync run ${runId} has a stale Linear mapping: ${message}`
+            : `Sync run ${runId} failed: ${message}`
       );
       await this.runs.failRun(runId, message);
     }
