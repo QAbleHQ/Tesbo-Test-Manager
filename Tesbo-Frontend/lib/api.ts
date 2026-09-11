@@ -1075,6 +1075,17 @@ export async function getZyraChatSession(projectId: string, sessionId: string): 
   return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`);
 }
 
+export async function renameZyraChatSession(projectId: string, sessionId: string, title: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: { title },
+  });
+}
+
+export async function deleteZyraChatSession(projectId: string, sessionId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
+}
+
 export async function sendZyraChatMessage(
   projectId: string,
   sessionId: string,

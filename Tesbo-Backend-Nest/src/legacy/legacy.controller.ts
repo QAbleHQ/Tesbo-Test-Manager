@@ -1256,6 +1256,21 @@ export class LegacyController {
     return this.legacy.zyraChatSession(projectId, req.userId, sessionId);
   }
 
+  @Patch("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  renameZyraChatSession(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.renameZyraChatSession(projectId, req.userId, sessionId, body);
+  }
+
+  @Delete("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  deleteZyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("sessionId") sessionId: string) {
+    return this.legacy.deleteZyraChatSession(projectId, req.userId, sessionId);
+  }
+
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
   async sendZyraChatMessage(
     @Req() req: AuthenticatedRequest,
