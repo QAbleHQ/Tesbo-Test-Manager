@@ -1,9 +1,9 @@
 export const THEME_STORAGE_KEY = "tesbo-theme";
 
 // Dispatched by persistTheme() so every mounted ThemeToggle stays in sync — there is no shared
-// context, so without this, changing the theme from one instance (e.g. the top bar's user menu)
-// would leave a second instance on the same page (e.g. the sidebar footer) showing a stale active
-// state until it remounts, even though the applied theme itself is already correct everywhere.
+// context, so without this, changing the theme from one instance would leave any other mounted
+// instance showing a stale toggle position until it remounts, even though the applied theme
+// itself is already correct everywhere.
 export const THEME_CHANGE_EVENT = "tesbo-theme-change";
 
 export type ThemeMode = "light" | "dark";

@@ -57,9 +57,13 @@ async function setStoredTheme(page: Page, value: string) {
   );
 }
 
-/** The toggle lives in the sidebar footer; both buttons are icon-only. */
-function themeButton(page: Page, mode: "light" | "dark") {
-  return page.getByRole("button", { name: `Use ${mode} theme` });
+/**
+ * The toggle lives in the top bar's own row (TopBar.tsx) as a single switch, not two separate
+ * light/dark buttons — clicking it always flips to the opposite theme rather than selecting one
+ * of two named targets.
+ */
+function themeSwitch(page: Page) {
+  return page.getByRole("switch");
 }
 
 test.describe("theme toggle", () => {
@@ -67,7 +71,8 @@ test.describe("theme toggle", () => {
 
   test("THM-01 a browser that has never chosen renders light", { tag: '@tesbo.testId("TES-TC-837")' }, async ({ page }) => {
     await page.goto("/projects");
-    await expect(themeButton(page, "light")).toBeVisible();
+    await expect(themeSwitch(page)).toBeVisible();
+    await expect(themeSwitch(page)).toHaveAttribute("aria-checked", "false");
 
     const applied = await readAppliedTheme(page);
     expect(applied.dataset).toBe("light");
@@ -80,35 +85,33 @@ test.describe("theme toggle", () => {
   test("THM-02/03 switching to dark and back applies and reverses all three signals", { tag: '@tesbo.testId("TES-TC-838")' }, async ({ page }) => {
     await page.goto("/projects");
 
-    await themeButton(page, "dark").click();
+    await themeSwitch(page).click();
     await expect.poll(async () => (await readAppliedTheme(page)).dataset).toBe("dark");
     const dark = await readAppliedTheme(page);
     expect(dark.hasDarkClass).toBe(true);
     expect(dark.colorScheme).toBe("dark");
 
-    await themeButton(page, "light").click();
+    await themeSwitch(page).click();
     await expect.poll(async () => (await readAppliedTheme(page)).dataset).toBe("light");
     const light = await readAppliedTheme(page);
     expect(light.hasDarkClass).toBe(false);
     expect(light.colorScheme).toBe("light");
   });
 
-  test("THM-04 exactly one of the two buttons reads as pressed", { tag: '@tesbo.testId("TES-TC-839")' }, async ({ page }) => {
+  test("THM-04 the switch's aria-checked always reflects the current theme", { tag: '@tesbo.testId("TES-TC-839")' }, async ({ page }) => {
     await setStoredTheme(page, "dark");
     await page.goto("/projects");
 
-    await expect(themeButton(page, "dark")).toHaveAttribute("aria-pressed", "true");
-    await expect(themeButton(page, "light")).toHaveAttribute("aria-pressed", "false");
+    await expect(themeSwitch(page)).toHaveAttribute("aria-checked", "true");
 
-    await themeButton(page, "light").click();
-    await expect(themeButton(page, "light")).toHaveAttribute("aria-pressed", "true");
-    await expect(themeButton(page, "dark")).toHaveAttribute("aria-pressed", "false");
+    await themeSwitch(page).click();
+    await expect(themeSwitch(page)).toHaveAttribute("aria-checked", "false");
   });
 
   test("THM-05 the choice is persisted and survives a reload", { tag: '@tesbo.testId("TES-TC-840")' }, async ({ page }) => {
     await page.goto("/projects");
 
-    await themeButton(page, "dark").click();
+    await themeSwitch(page).click();
     await expect.poll(async () => (await readAppliedTheme(page)).stored).toBe("dark");
 
     await page.reload();
@@ -183,7 +186,7 @@ test.describe("theme toggle", () => {
     ).toHaveCount(0);
     expect(pageErrors, "unguarded localStorage access escaped to the window").toEqual([]);
 
-    await themeButton(page, "dark").click();
+    await themeSwitch(page).click();
     await expect.poll(async () => (await readAppliedTheme(page)).dataset).toBe("dark");
   });
 
@@ -226,8 +229,10 @@ test.describe("theme toggle", () => {
     await page.goto("/projects");
     expect((await readAppliedTheme(page)).dataset).toBe("dark");
 
-    await page.getByRole("button", { name: /Logout/ }).click();
-    await page.getByRole("button", { name: "Yes" }).click();
+    // Logout lives in the top bar's user menu now, not the sidebar footer, and clicking it logs
+    // out directly — there is no separate confirmation dialog to accept first.
+    await page.getByRole("button", { name: "User menu" }).click();
+    await page.getByRole("menuitem", { name: "Logout" }).click();
     await page.waitForURL("**/login");
     // Still dark with nobody signed in — the login screen follows the same stored choice.
     expect((await readAppliedTheme(page)).dataset).toBe("dark");
