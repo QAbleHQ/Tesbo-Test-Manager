@@ -12,6 +12,9 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 // A key just needs to decode to 32 bytes for aes-256-gcm; this is a throwaway test-only key
 // (crypto.util lazily loads it on first encrypt/decrypt call, so setting it at module scope
@@ -79,6 +82,7 @@ async function validState(svc: LegacyService, provider: "jira" | "linear"): Prom
 }
 
 function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyncService> = {}): LegacyService {
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
   return new LegacyService(
     db,
     {} as unknown as EmailService,
@@ -90,6 +94,9 @@ function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyn
     integrationSync as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     { assertIntegrationAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
     {} as unknown as CustomFieldsService
   );
 }

@@ -4,7 +4,6 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   authMe,
-  getWorkspace,
   getIntegrationConfig,
   getIntegrationStatus,
   disconnectIntegration,
@@ -15,6 +14,7 @@ import {
 import { Button, Card } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 function isValidProjectId(value: string | null): value is string {
   return !!value && /^[a-zA-Z0-9-]+$/.test(value);
@@ -39,11 +39,11 @@ function WorkspaceIntegrationConfigInner({
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { workspace } = useAppData();
   const returnProjectIdParam = searchParams.get("returnProjectId");
   const returnProjectId = isValidProjectId(returnProjectIdParam) ? returnProjectIdParam : null;
 
   const [loading, setLoading] = useState(true);
-  const [canManage, setCanManage] = useState(false);
   const [status, setStatus] = useState<IntegrationConnectionStatus | null>(null);
   const [config, setConfig] = useState<IntegrationOAuthConfig | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -53,17 +53,16 @@ function WorkspaceIntegrationConfigInner({
   // restoreInFlightRef in the KB document editor for the same pattern and the same reason.
   const disconnectingRef = useRef(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
-  const [workspaceName, setWorkspaceName] = useState("");
+
+  const canManage = (workspace?.role || "member").toLowerCase() === "owner";
+  const workspaceName = String(workspace?.name || "");
 
   const loadData = useCallback(async () => {
     try {
-      const [workspace, statusRes, configRes] = await Promise.all([
-        getWorkspace(),
+      const [statusRes, configRes] = await Promise.all([
         getIntegrationStatus(provider),
         getIntegrationConfig(provider).catch(() => null),
       ]);
-      setCanManage((workspace.role || "member").toLowerCase() === "owner");
-      setWorkspaceName(String(workspace.name || ""));
       setStatus(statusRes);
       setConfig(configRes);
     } catch {

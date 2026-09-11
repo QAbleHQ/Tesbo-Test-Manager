@@ -3,25 +3,22 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { getWorkspace, listWorkspaceAiKeys, type WorkspaceAiKey } from "@/lib/api";
+import { listWorkspaceAiKeys, type WorkspaceAiKey } from "@/lib/api";
 import { Card, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 
 export default function AiProviderDetailsPage() {
   const router = useRouter();
-  const { currentUser } = useAppData();
+  const { currentUser, workspace } = useAppData();
   const [keys, setKeys] = useState<WorkspaceAiKey[]>([]);
-  const [role, setRole] = useState("member");
-  const [workspaceName, setWorkspaceName] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const role = (workspace?.role || "member").toLowerCase();
 
   const loadData = useCallback(async () => {
     try {
-      const [workspace, aiData] = await Promise.all([getWorkspace(), listWorkspaceAiKeys()]);
-      setRole((workspace.role || "member").toLowerCase());
-      setWorkspaceName(workspace.name || "");
+      const aiData = await listWorkspaceAiKeys();
       setKeys(aiData.keys || []);
       setError(null);
     } catch (err) {
@@ -39,7 +36,7 @@ export default function AiProviderDetailsPage() {
   const breadcrumb = (
     <Breadcrumbs
       items={[
-        { label: workspaceName || "Workspace", href: "/dashboard" },
+        { label: workspace?.name || "Workspace", href: "/dashboard" },
         { label: "Workspace settings", href: "/settings?tab=ai" },
         { label: "AI provider details" },
       ]}

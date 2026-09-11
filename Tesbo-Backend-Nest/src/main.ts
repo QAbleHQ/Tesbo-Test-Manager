@@ -26,6 +26,7 @@ import { EmailDeliveryPolicy } from "./config/email-delivery.policy";
 import { HttpExceptionFilter } from "./common/http-exception.filter";
 import { assertEncryptionKeyConfigured } from "./common/crypto.util";
 import type { AuthenticatedRequest } from "./common/request.types";
+import { RequestCacheService } from "./request-cache/request-cache.service";
 
 async function bootstrap() {
   assertEncryptionKeyConfigured();
@@ -67,6 +68,21 @@ async function bootstrap() {
   );
   app.use(urlencoded({ extended: true, limit: config.maxRequestBodySize }));
   app.use(cookieParser());
+
+  // Wraps the rest of the request (every downstream middleware, guard, and handler) in an
+  // AsyncLocalStorage context so RequestCacheService can memoize repeated reads (the same
+  // project/org row read 5+ times across unrelated guards/services) for exactly this request's
+  // lifetime — see request-cache/request-cache.service.ts. Must be registered before anything it's
+  // meant to cover, which is why it sits here rather than as a Nest module-level middleware: Nest's
+  // own module-registered middlewares (e.g. AuthMiddleware, via consumer.apply().forRoutes("*"))
+  // bind during app.listen()/init(), after these app.use() calls have already taken their place in
+  // the underlying Express stack — the same ordering this file already relies on for body parsing
+  // and cookies needing to run before AuthMiddleware reads them.
+  const requestCache = app.get(RequestCacheService);
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    requestCache.run(() => next());
+  });
+
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader("X-Request-Id", randomUUID());
     const forwardedProto = req.header("x-forwarded-proto");

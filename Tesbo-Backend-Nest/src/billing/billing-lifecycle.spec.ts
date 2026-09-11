@@ -129,7 +129,9 @@ function build(opts: {
   const countries = {
     resolve: jest.fn().mockResolvedValue({ country: hard, source: "ip", detected: hard })
   } as unknown as CountryDetectionService;
-  const planLimits = {} as unknown as PlanLimitsService;
+  const planLimits = {
+    invalidateEntitlementCache: jest.fn().mockResolvedValue(undefined)
+  } as unknown as PlanLimitsService;
 
   const service = new BillingService(db, makeConfig(opts.config), stripe.provider, legacy, planLimits, countries, email);
   return { service, query, calls, stripe, email };

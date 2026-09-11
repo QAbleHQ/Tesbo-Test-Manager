@@ -39,20 +39,26 @@ import { AIInsightsTab } from "@/components/reports/AIInsightsTab";
 import { TrendsTab } from "@/components/reports/TrendsTab";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
-// The two eager, unconditional-on-mount fetches (overview+insights, and the shared filter-option
-// lists) are what the header stat chips and nav badge render every visit — cached separately since
-// they're independent effects/promises, under distinct suffixes of the same page key, per the
-// dashboard reference pattern in app/(app)/projects/[id]/dashboard/page.tsx.
+// Two of these four caches are eager, unconditional-on-mount fetches — what the header stat chips
+// and nav badge render every visit, regardless of which tab is open. The other (execFilters) is
+// deferred: nothing outside the Execution Report tab reads plans/suites, so a visit that never opens
+// that tab never pays for them. All are cached separately, under distinct suffixes of the same page
+// key, per the dashboard reference pattern in app/(app)/projects/[id]/dashboard/page.tsx.
 interface ReportsOverviewData {
   overview: ReportsOverview | null;
   insights: ReportsInsights | null;
 }
 
-interface ReportsFiltersData {
-  plans: { id: string; name: string }[];
+/** Eager: feeds the always-visible header chips (Runs count, Open bugs) regardless of active tab. */
+interface ReportsHeaderStatsData {
   runs: { id: string; name: string }[];
-  suites: SuiteNode[];
   openBugCount: number;
+}
+
+/** Deferred: read only by the Execution Report tab's Group-by filter. */
+interface ReportsExecFiltersData {
+  plans: { id: string; name: string }[];
+  suites: SuiteNode[];
 }
 
 /*
@@ -84,13 +90,24 @@ export default function ReportsPage() {
   const projectName = String(project.name || "");
   const [activeView, setActiveView] = useState<ReportView>("overview");
 
-  // Shared filter-option lists (used by Execution Report tab)
-  const filtersCacheKey = `reports:${projectId}:filters`;
-  const cachedFilters = getPageCache<ReportsFiltersData>(filtersCacheKey);
-  const [plans, setPlans] = useState<{ id: string; name: string }[]>(cachedFilters?.plans ?? []);
-  const [runs, setRuns] = useState<{ id: string; name: string }[]>(cachedFilters?.runs ?? []);
-  const [suites, setSuites] = useState<SuiteNode[]>(cachedFilters?.suites ?? []);
-  const [openBugCount, setOpenBugCount] = useState(cachedFilters?.openBugCount ?? 0);
+  // Header-stat lists (Runs count, Open bugs) — eager, feeds the chips visible on every tab.
+  const headerStatsCacheKey = `reports:${projectId}:headerStats`;
+  const cachedHeaderStats = getPageCache<ReportsHeaderStatsData>(headerStatsCacheKey);
+  const [runs, setRuns] = useState<{ id: string; name: string }[]>(cachedHeaderStats?.runs ?? []);
+  const [openBugCount, setOpenBugCount] = useState(cachedHeaderStats?.openBugCount ?? 0);
+
+  // Execution Report's own filter-option lists — deferred to that tab's first visit (see the effect
+  // below). Seeded from a same-session cache hit if one already exists, so a user who visited
+  // Execution earlier this session and comes back doesn't wait again.
+  const execFiltersCacheKey = `reports:${projectId}:execFilters`;
+  const cachedExecFilters = getPageCache<ReportsExecFiltersData>(execFiltersCacheKey);
+  const [plans, setPlans] = useState<{ id: string; name: string }[]>(cachedExecFilters?.plans ?? []);
+  const [suites, setSuites] = useState<SuiteNode[]>(cachedExecFilters?.suites ?? []);
+  // Tracks "have we ever successfully populated plans/suites this mount" (cache-seeded counts),
+  // separately from `execFiltersLoading` ("is a fetch for them in flight right now") — the Execution
+  // tab's dropdown uses the loading flag to show a placeholder instead of vanishing while empty.
+  const [execFiltersLoaded, setExecFiltersLoaded] = useState(!!cachedExecFilters);
+  const [execFiltersLoading, setExecFiltersLoading] = useState(false);
 
   // Overview + AI Insights are cheap aggregate queries — load eagerly so the header
   // stat chips and the nav's flaky-count badge are available regardless of active tab.
@@ -125,37 +142,51 @@ export default function ReportsPage() {
     if (!auth) router.replace("/login");
   }, [router, auth]);
 
+  // Eager, unconditional on mount: runs.length and openBugCount feed the always-visible header
+  // chips, so they load regardless of which tab is active — same timing as before this split.
   useEffect(() => {
     if (!auth) return;
-    const key = `reports:${projectId}:filters`;
-    const existing = getPageCache<ReportsFiltersData>(key);
+    const key = headerStatsCacheKey;
+    const existing = getPageCache<ReportsHeaderStatsData>(key);
     if (existing) {
-      setPlans(existing.plans);
       setRuns(existing.runs);
-      setSuites(existing.suites);
       setOpenBugCount(existing.openBugCount);
     }
-    Promise.all([
-      listPlans(projectId),
-      listTestRuns(projectId),
-      listSuites(projectId),
-      listBugs(projectId),
-    ])
-      .then(([pl, rn, su, bugs]) => {
-        const next: ReportsFiltersData = {
-          plans: Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : [],
+    Promise.all([listTestRuns(projectId), listBugs(projectId)])
+      .then(([rn, bugs]) => {
+        const next: ReportsHeaderStatsData = {
           runs: Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : [],
-          suites: su,
           openBugCount: bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length,
         };
         setPageCache(key, next);
-        setPlans(next.plans);
         setRuns(next.runs);
-        setSuites(next.suites);
         setOpenBugCount(next.openBugCount);
       })
       .catch(() => {});
-  }, [auth, projectId]);
+  }, [auth, projectId, headerStatsCacheKey]);
+
+  // Deferred: plans/suites are read only by the Execution Report tab's Group-by filter, so they're
+  // fetched on that tab's first visit rather than on every Reports mount — matching the existing lazy
+  // pattern already used below for matrix/repository/trends. `execFiltersLoaded` gates against
+  // re-fetching on every subsequent switch back to this tab within the same mount (same as those
+  // three), and against re-fetching at all when a same-session cache hit already seeded the state.
+  useEffect(() => {
+    if (!auth || activeView !== "execution" || execFiltersLoaded || execFiltersLoading) return;
+    setExecFiltersLoading(true);
+    Promise.all([listPlans(projectId), listSuites(projectId)])
+      .then(([pl, su]) => {
+        const next: ReportsExecFiltersData = {
+          plans: Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : [],
+          suites: su,
+        };
+        setPageCache(execFiltersCacheKey, next);
+        setPlans(next.plans);
+        setSuites(next.suites);
+        setExecFiltersLoaded(true);
+      })
+      .catch(() => {})
+      .finally(() => setExecFiltersLoading(false));
+  }, [auth, activeView, projectId, execFiltersCacheKey, execFiltersLoaded, execFiltersLoading]);
 
   useEffect(() => {
     if (!auth) return;
@@ -399,6 +430,7 @@ export default function ReportsPage() {
                 runs={runs}
                 suites={suites}
                 members={members}
+                filtersLoading={execFiltersLoading}
               />
             )}
             {activeView === "matrix" && <TraceabilityTab rows={matrixRows} loading={matrixLoading} search={matrixSearch} onSearchChange={setMatrixSearch} />}

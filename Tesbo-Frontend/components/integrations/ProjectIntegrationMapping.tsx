@@ -5,7 +5,6 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
   authMe,
-  getWorkspace,
   getProject,
   getIntegrationConfig,
   isSyncRunActive,
@@ -15,6 +14,7 @@ import { Button, Card } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 interface RemoteItem {
   id: string;
@@ -59,10 +59,11 @@ export function ProjectIntegrationMapping({
 }) {
   const params = useParams();
   const router = useRouter();
+  const { workspace } = useAppData();
   const projectId = params.id as string;
 
+  const canManage = (workspace?.role || "member").toLowerCase() === "owner";
   const [loading, setLoading] = useState(true);
-  const [canManage, setCanManage] = useState(false);
   const [oauthConfigured, setOauthConfigured] = useState(false);
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
   const [remoteItems, setRemoteItems] = useState<RemoteItem[]>([]);
@@ -81,8 +82,7 @@ export function ProjectIntegrationMapping({
         router.replace("/login");
         return;
       }
-      const [workspace, statusRes, project] = await Promise.all([getWorkspace(), fetchStatus(projectId), getProject(projectId).catch(() => null)]);
-      setCanManage((workspace.role || "member").toLowerCase() === "owner");
+      const [statusRes, project] = await Promise.all([fetchStatus(projectId), getProject(projectId).catch(() => null)]);
       setStatus(statusRes);
       setProjectName(project ? String(project.name || "") : "");
 
