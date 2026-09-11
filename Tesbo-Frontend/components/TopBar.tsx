@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { IconBell, IconSearch, IconX } from "@tabler/icons-react";
+import { IconBell, IconLogout, IconSearch, IconUserCircle, IconX } from "@tabler/icons-react";
 import type { AppNotification, ProjectSummary } from "@/lib/api";
 import { listNotifications } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -40,7 +40,7 @@ export default function TopBar() {
 
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const userMenuRef = useRef<HTMLDivElement>(null);
-  const { isLoggingOut, logout: onLogout } = useLogout();
+  const { isLoggingOut, error: logoutError, logout: onLogout } = useLogout();
 
   // Only used for the tooltip text on the search button — the ⌘K/Ctrl+K shortcut itself works on
   // every platform regardless. Resolved after mount so SSR and the first client render still match.
@@ -170,7 +170,8 @@ export default function TopBar() {
   const avatarSeed = user?.userId || user?.email || user?.name || "";
 
   return (
-    <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center gap-4 border-b border-[var(--border-subtle)] bg-[var(--surface)] px-8">
+    <header className="sticky top-0 z-20 h-14 shrink-0 border-b border-[var(--border-subtle)] bg-[var(--surface)]">
+      <div className="tesbo-topbar-inset flex h-full items-center gap-4">
       <div className="flex min-w-0 flex-1 items-center gap-3">
         {/* Page-provided start slot (e.g. breadcrumb). Fills via a portal from the page. */}
         <div ref={bindStart} className="flex min-w-0 items-center" />
@@ -178,6 +179,7 @@ export default function TopBar() {
         {!filled && (
           <label
             ref={searchBoxRef}
+            title={isMac ? "Search (⌘K)" : "Search (Ctrl+K)"}
             className="relative flex h-8 w-[260px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]"
           >
             <IconSearch size={14} stroke={1.75} className="shrink-0" />
@@ -192,9 +194,16 @@ export default function TopBar() {
               onFocus={() => setOpen(true)}
               onKeyDown={handleKeyDown}
               placeholder="Search projects…"
-              className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none placeholder:text-[var(--muted-soft)]"
+              className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
             />
-            {query ? (
+            {/*
+             * Only the clear (X) affordance is a real button — clicking anywhere in the label
+             * already focuses the input, so a second magnifying-glass icon-button here just to
+             * refocus was a redundant twin of the decorative one on the left with nothing of its
+             * own to do. The keyboard-shortcut hint that used to live in its title now lives on
+             * the label itself, so it's not lost.
+             */}
+            {query && (
               <button
                 type="button"
                 aria-label="Clear search"
@@ -204,17 +213,6 @@ export default function TopBar() {
                 className="flex shrink-0 items-center justify-center rounded-[3px] p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
               >
                 <IconX size={14} stroke={1.75} />
-              </button>
-            ) : (
-              <button
-                type="button"
-                aria-label="Search"
-                title={isMac ? "Search (⌘K)" : "Search (Ctrl+K)"}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => inputRef.current?.focus()}
-                className="flex shrink-0 items-center justify-center rounded-[3px] p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-              >
-                <IconSearch size={14} stroke={1.75} />
               </button>
             )}
 
@@ -249,6 +247,7 @@ export default function TopBar() {
       <div className="flex items-center gap-2">
         {/* Page-provided end slot (e.g. page actions). Fills via a portal from the page. */}
         <div ref={bindEnd} className="flex items-center gap-2 empty:hidden" />
+        <ThemeToggle />
         <div ref={notifBoxRef} className="relative">
           <button
             type="button"
@@ -256,7 +255,7 @@ export default function TopBar() {
             aria-haspopup="true"
             aria-expanded={notifOpen}
             onClick={toggleNotifications}
-            className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)]"
+            className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-white hover:bg-[var(--surface-secondary)]"
           >
             <IconBell size={16} stroke={1.75} />
           </button>
@@ -324,7 +323,20 @@ export default function TopBar() {
             <div
               role="menu"
               aria-label="User menu"
-              className="absolute right-0 top-full z-40 mt-1 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]"
+              /*
+               * p-1 (not py-1 + item-level px-3): every item's hover/focus highlight is now inset by
+               * exactly this padding on all four sides, so it reads as a clean rounded chip with no
+               * sliver of uncovered background left between it and the menu's own edge or the divider
+               * above/below — the gap the previous py-1-only version left uncovered on hover.
+               */
+              /*
+               * fade-in (globals.css) is the app's existing subtle-entrance utility, already used by
+               * the reports tabs — reused here rather than a new animation, so opening the menu isn't
+               * an instant hard cut. No exit animation: the menu unmounts immediately on close so
+               * Playwright's/AT's visibility checks (and every e2e assertion keyed on that) still see
+               * a true, instant hide rather than a lingering fading-out element.
+               */
+              className="fade-in absolute right-0 top-full z-40 mt-1.5 w-60 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-elevated)]"
             >
               <button
                 type="button"
@@ -333,15 +345,11 @@ export default function TopBar() {
                   setUserMenuOpen(false);
                   router.push("/account");
                 }}
-                className="block w-full px-3 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
               >
-                Profile Settings
+                <IconUserCircle size={16} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
+                My Account
               </button>
-
-              <div role="none" className="flex items-center justify-between gap-3 px-3 py-2">
-                <p className="text-[13px] text-[var(--foreground)]">Theme</p>
-                <ThemeToggle />
-              </div>
 
               <div role="none" className="my-1 border-t border-[var(--border-subtle)]" />
 
@@ -349,17 +357,33 @@ export default function TopBar() {
                 type="button"
                 role="menuitem"
                 disabled={isLoggingOut}
-                onClick={() => {
-                  setUserMenuOpen(false);
-                  void onLogout();
-                }}
-                className="block w-full px-3 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:opacity-60"
+                /*
+                 * Deliberately not closing the menu here: a successful logout redirects to /login,
+                 * which unmounts this menu anyway, but a failed one leaves the user on the same page
+                 * with useLogout's error set — closing the menu on click would hide that error and
+                 * the retry affordance right along with it, the same silent-failure gap that keeping
+                 * the old sidebar's confirmation dialog open on failure was there to avoid.
+                 *
+                 * Styled as a destructive action throughout — red label at rest (text-[var(--error-
+                 * foreground)]) AND a red-tinted hover (bg-[var(--error-soft)] instead of the neutral
+                 * hover every other item uses) — the same convention as Button's own "danger" variant,
+                 * so Logout reads unmistakably differently from "My Account" in every state.
+                 */
+                onClick={() => void onLogout()}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)] disabled:cursor-not-allowed disabled:opacity-60"
               >
+                <IconLogout size={16} stroke={1.75} className="shrink-0" />
                 {isLoggingOut ? "Logging out…" : "Logout"}
               </button>
+              {logoutError && (
+                <p role="none" className="px-2.5 pb-1.5 pt-1 text-[13px] text-[var(--error-foreground)]">
+                  {logoutError}
+                </p>
+              )}
             </div>
           )}
         </div>
+      </div>
       </div>
     </header>
   );

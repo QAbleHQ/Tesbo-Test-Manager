@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { IconPencil } from "@tabler/icons-react";
 import { changePassword, updateProfile } from "@/lib/api";
-import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, PageLoader, PasswordInput, PhoneInput } from "@/components/ui";
+import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, Modal, PageLoader, PasswordInput, PhoneInput } from "@/components/ui";
 import {
   MOBILE_NUMBER_MAX_LENGTH,
   normalizeMobileNumber,
@@ -44,6 +44,7 @@ export default function AccountPage() {
   const firstNameInputRef = useRef<HTMLInputElement>(null);
   const lastNameInputRef = useRef<HTMLInputElement>(null);
 
+  const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -150,6 +151,18 @@ export default function AccountPage() {
     setNewPasswordError("");
     setConfirmPasswordError("");
     setFormError("");
+  }
+
+  function openChangePassword() {
+    setCurrentPassword("");
+    setNewPassword("");
+    setConfirmPassword("");
+    clearErrors();
+    setIsChangePasswordOpen(true);
+  }
+
+  function closeChangePassword() {
+    setIsChangePasswordOpen(false);
   }
 
   // Maps server-side rejections (auth.service.ts changePassword) back to the field they concern,
@@ -322,14 +335,9 @@ export default function AccountPage() {
           </Field>
 
           <Field>
-            <FieldLabel htmlFor="account-email">Email</FieldLabel>
-            <div id="account-email" className="text-sm text-[var(--foreground)]">
-              {email}
-            </div>
-          </Field>
-
-          <Field>
-            <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
+            <FieldLabel htmlFor="account-mobile-number">
+              Mobile number <span className="font-normal text-[var(--muted-soft)]">(Optional)</span>
+            </FieldLabel>
             <div className="flex items-center gap-2">
               <PhoneInput
                 id="account-mobile-number"
@@ -340,6 +348,7 @@ export default function AccountPage() {
                   setProfileSuccess(false);
                 }}
                 disabled={profileSaving || !isEditingMobile}
+                locked={!isEditingMobile}
                 maxLength={MOBILE_NUMBER_MAX_LENGTH}
                 className="flex-1"
               />
@@ -358,7 +367,39 @@ export default function AccountPage() {
                 </Button>
               )}
             </div>
-            <FieldHint>Optional.</FieldHint>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-email">Email</FieldLabel>
+            <Input
+              id="account-email"
+              type="email"
+              value={email}
+              readOnly
+              disabled={profileSaving}
+              className="cursor-default bg-[var(--surface-secondary)]"
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="account-password">Password</FieldLabel>
+            <div className="flex items-center gap-2">
+              <Input
+                id="account-password"
+                type="text"
+                value="••••••••••••"
+                readOnly
+                disabled
+                className="cursor-default bg-[var(--surface-secondary)] tracking-widest"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={openChangePassword}
+              className="w-fit text-[13px] font-medium text-[var(--accent-light)] hover:underline"
+            >
+              {hasPassword ? "Change password" : "Set a password"}
+            </button>
           </Field>
 
           {profileError && <FieldError>{profileError}</FieldError>}
@@ -374,17 +415,16 @@ export default function AccountPage() {
         </form>
       </Card>
 
-      <Card className="p-5">
-        <div className="mb-4">
-          <h2 className="text-base font-semibold text-[var(--foreground)]">
-            {hasPassword ? "Change password" : "Set a password"}
-          </h2>
-          <p className="mt-1 text-sm text-[var(--muted)]">
-            {hasPassword
-              ? "You'll be signed out everywhere, including here, after changing your password."
-              : "You signed in with a one-time code so far. Set a password to also sign in that way — you'll be signed out everywhere afterward, so you can sign back in with it."}
-          </p>
-        </div>
+      <Modal
+        open={isChangePasswordOpen}
+        onClose={closeChangePassword}
+        title={hasPassword ? "Change password" : "Set a password"}
+      >
+        <p className="mb-4 text-sm text-[var(--muted)]">
+          {hasPassword
+            ? "You'll be signed out everywhere, including here, after changing your password."
+            : "You signed in with a one-time code so far. Set a password to also sign in that way — you'll be signed out everywhere afterward, so you can sign back in with it."}
+        </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
           {hasPassword && (
@@ -449,13 +489,16 @@ export default function AccountPage() {
 
           {formError && <FieldError>{formError}</FieldError>}
 
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={closeChangePassword} disabled={saving}>
+              Cancel
+            </Button>
             <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : hasPassword ? "Change password" : "Set password"}
             </Button>
           </div>
         </form>
-      </Card>
+      </Modal>
     </div>
   );
 }

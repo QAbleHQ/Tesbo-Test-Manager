@@ -18,6 +18,13 @@ export interface PhoneInputProps {
   onChange: (value: string) => void;
   placeholder?: string;
   disabled?: boolean;
+  /**
+   * Matches the read-only look other account fields switch to when locked (Input's own
+   * `bg-[var(--surface-secondary)]` override) — a separate flag from `disabled` because `disabled`
+   * elsewhere on this component also covers transient states (e.g. a form mid-submit) that should
+   * stay dimmed, not repainted as if the field were locked shut.
+   */
+  locked?: boolean;
   maxLength?: number;
   autoComplete?: string;
   "aria-invalid"?: boolean;
@@ -35,6 +42,7 @@ export default function PhoneInput({
   onChange,
   placeholder = "4155551234",
   disabled,
+  locked,
   maxLength,
   autoComplete = "tel",
   "aria-invalid": ariaInvalid,
@@ -107,7 +115,10 @@ export default function PhoneInput({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={`Country code: ${country.name} ${country.dialCode}`}
-        className="flex h-9 shrink-0 items-center gap-1.5 rounded-l-[var(--radius-control)] border border-r-0 border-[var(--border)] bg-[var(--surface)] px-2.5 text-[14px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:opacity-60"
+        className={cx(
+          "flex h-9 shrink-0 items-center gap-1.5 rounded-l-[var(--radius-control)] border border-r-0 border-[var(--border)] px-2.5 text-[14px] text-[var(--foreground)] transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+          locked ? "cursor-default bg-[var(--surface-secondary)]" : "bg-[var(--surface)] hover:bg-[var(--surface-secondary)]",
+        )}
       >
         <span className="text-base leading-none">{country.flag}</span>
         <span className="text-[var(--muted)]">{country.dialCode}</span>
@@ -125,10 +136,11 @@ export default function PhoneInput({
         maxLength={maxNationalDigits}
         aria-invalid={ariaInvalid}
         className={cx(
-          "h-9 w-full min-w-0 rounded-r-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface)] px-3 text-[14px] text-[var(--foreground)] placeholder:text-[var(--ink-300)]",
+          "h-9 w-full min-w-0 rounded-r-[var(--radius-control)] border border-[var(--border)] px-3 text-[14px] text-[var(--foreground)] placeholder:text-[var(--ink-300)]",
           "transition-[border-color,box-shadow,background-color] duration-150",
           "focus:border-[var(--denim-200)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--denim-200)_22%,transparent)]",
           "disabled:cursor-not-allowed disabled:opacity-60",
+          locked ? "cursor-default bg-[var(--surface-secondary)]" : "bg-[var(--surface)]",
         )}
       />
       {open && (

@@ -10086,6 +10086,40 @@ export class LegacyService implements OnModuleInit {
     return { ...toCamel(res.rows[0]), messages: [] };
   }
 
+  async renameZyraChatSession(projectId: string, userId: string | null | undefined, sessionId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
+    const title = String(body.title ?? "").trim().slice(0, 240);
+    if (!title) throw new BadRequestException({ error: "title is required" });
+    const res = await this.db.query(
+      `UPDATE zyra_chat_sessions SET title = $3, updated_at = now()
+       WHERE id = $1 AND project_id = $2
+       RETURNING id, project_id, user_id, title, created_at, updated_at`,
+      [sessionId, projectId, title]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    return toCamel(res.rows[0]);
+  }
+
+  async deleteZyraChatSession(projectId: string, userId: string | null | undefined, sessionId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
+    const existing = await this.db.query<{ active_plan: { status?: string } | null }>(
+      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId]
+    );
+    if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    if (existing.rows[0].active_plan?.status === "running") {
+      throw new ConflictException({ error: "Stop the running generation plan before deleting this conversation." });
+    }
+    // Messages (zyra_chat_messages.session_id) and any staged review batches
+    // (ai_generation_requests.chat_session_id) are both ON DELETE CASCADE — nothing else to clean up.
+    await this.db.query("DELETE FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    return { success: true };
+  }
+
   async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body, onStage?: ZyraOnStage) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);

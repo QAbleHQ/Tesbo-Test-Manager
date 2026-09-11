@@ -26,10 +26,7 @@ import {
   IconUserCircle,
 } from "@tabler/icons-react";
 import { BrandLogo } from "@/components/BrandLogo";
-import ThemeToggle from "@/components/ThemeToggle";
 import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
-import { useLogout } from "@/lib/useLogout";
-import { Button, Modal } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
 
 type NavItemConfig = {
@@ -184,8 +181,6 @@ function SidebarContent() {
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
   const [isCollapsed, setIsCollapsed] = useState(false);
-  const { isLoggingOut, error: logoutError, logout: onLogout, resetError: resetLogoutError } = useLogout();
-  const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
   const { workspace } = useAppData();
   const isWorkspaceOwner = (workspace?.role ?? "").trim().toLowerCase() === "owner";
 
@@ -204,20 +199,6 @@ function SidebarContent() {
       }
     }
     return true;
-  };
-
-  const openLogoutConfirm = () => {
-    if (isLoggingOut) return;
-    resetLogoutError();
-    setIsLogoutConfirmOpen(true);
-  };
-
-  const closeLogoutConfirm = () => {
-    // Ignore Escape/backdrop dismissal mid-request: the session logout call is already
-    // in flight, and pulling the dialog out from under it would strand the button state.
-    if (isLoggingOut) return;
-    setIsLogoutConfirmOpen(false);
-    resetLogoutError();
   };
 
   const showProjectNav = !isInSettings && isInProject && Boolean(projectId);
@@ -349,15 +330,12 @@ function SidebarContent() {
         )}
       </nav>
 
-      {/* Footer */}
+      {/*
+       * Footer — Project/Workspace settings only. My Account, the theme toggle, and Logout used
+       * to live here too, but they're duplicates of the top-right user menu (TopBar.tsx) now that
+       * it exists, so they were removed from this second location rather than kept in both places.
+       */}
       <div className="space-y-1 border-t border-[var(--glass-border)] p-2.5">
-        <NavLink
-          href="/account"
-          label="My Account"
-          icon="account"
-          active={pathname === "/account"}
-          collapsed={isCollapsed}
-        />
         {!isInSettings && !isInProject && (
           <NavLink
             href="/settings"
@@ -375,38 +353,7 @@ function SidebarContent() {
             collapsed={isCollapsed}
           />
         )}
-        <div className={`flex items-center ${isCollapsed ? "flex-col gap-1" : "gap-2"}`}>
-          <ThemeToggle isCollapsed={isCollapsed} />
-          <button
-            type="button"
-            onClick={openLogoutConfirm}
-            disabled={isLoggingOut}
-            className={`flex items-center rounded-[6px] border border-transparent py-1.5 text-[13px] text-[var(--muted)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)] disabled:opacity-60 ${
-              isCollapsed ? "justify-center px-2" : "flex-1 gap-2 px-2"
-            }`}
-            aria-label={isLoggingOut ? "Logging out" : "Logout"}
-          >
-            <MenuIcon name="logout" className="h-[18px] w-[18px] shrink-0 text-[var(--ink-300)]" />
-            {!isCollapsed && <span>{isLoggingOut ? "Logging out..." : "Logout"}</span>}
-            {isCollapsed && <span className="sr-only">{isLoggingOut ? "Logging out..." : "Logout"}</span>}
-          </button>
-        </div>
       </div>
-
-      <Modal open={isLogoutConfirmOpen} onClose={closeLogoutConfirm} title="Logout">
-        <div className="space-y-4">
-          <p className="text-sm text-[var(--muted)]">Are you sure you want to logout?</p>
-          {logoutError && <p className="text-sm text-[var(--error-foreground)]">{logoutError}</p>}
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="secondary" onClick={closeLogoutConfirm} disabled={isLoggingOut}>
-              No
-            </Button>
-            <Button type="button" variant="primary" onClick={onLogout} disabled={isLoggingOut}>
-              {isLoggingOut ? "Logging out…" : "Yes"}
-            </Button>
-          </div>
-        </div>
-      </Modal>
     </aside>
   );
 }
