@@ -42,6 +42,24 @@ export class IntegrationConnectionInvalidError extends Error {
 }
 
 /**
+ * Thrown when Linear's GraphQL API says the mapped team/project id itself doesn't resolve —
+ * `Entity not found: Team`/`Entity not found: Project`, a distinct failure from an invalid token.
+ * Reconnecting Linear OAuth (what IntegrationConnectionInvalidError's message tells the user to do)
+ * would do nothing here: the connection is fine, but linear_project_mappings still points at a
+ * team/project that no longer exists in the currently-connected workspace — e.g. the team was
+ * deleted, or Linear was reconnected to a different workspace without re-picking a team. Without
+ * this, the raw GraphQL error (`linear request failed: [{"message":"Entity not found: Team",...}]`)
+ * leaks verbatim into the run's `error` field, same class of defect IntegrationConnectionInvalidError
+ * exists to avoid for auth failures.
+ */
+export class LinearEntityNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LinearEntityNotFoundError";
+  }
+}
+
+/**
  * Provider API access for the sync processors.
  *
  * Deliberately re-implements connection loading + Jira token refresh rather than importing
@@ -339,6 +357,22 @@ export class IntegrationSyncClient {
         return ext?.code === "AUTHENTICATION_ERROR" || ext?.statusCode === 401 || ext?.statusCode === 403;
       });
       if (authFailure) throw new IntegrationConnectionInvalidError(`${PROVIDER_FOLDER_NAMES.linear} needs to be reconnected to this workspace.`);
+
+      // Linear's `team(id: ...)`/`project(id: ...)` root fields throw this GraphQL error — rather
+      // than resolving to null — when the id doesn't exist in the connected workspace at all (as
+      // opposed to existing-but-archived, which does resolve to null; see fetchLinearTickets). Only
+      // matched on the exact "Entity not found: Team"/"Entity not found: Project" message these two
+      // root fields produce, so an unrelated "Entity not found: Issue" from fetchLinearComments (a
+      // deleted ticket, already tolerated elsewhere) is left to the generic error path below.
+      const entityKind = errors
+        .map((e) => /^Entity not found: (Team|Project)$/i.exec(String((e as Row)?.message || "")))
+        .find((m): m is RegExpExecArray => !!m)?.[1]
+        ?.toLowerCase();
+      if (entityKind) {
+        throw new LinearEntityNotFoundError(
+          `The Linear ${entityKind} linked to this project could not be found — it may have been deleted, or this workspace's Linear connection no longer has access to it. Open this project's Linear Integration settings and re-select a ${entityKind}.`
+        );
+      }
       throw new Error(`linear request failed: ${JSON.stringify(payload.errors).slice(0, 300)}`);
     }
     return payload.data as T;
