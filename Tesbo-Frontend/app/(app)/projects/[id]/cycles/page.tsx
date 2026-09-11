@@ -48,6 +48,12 @@ import {
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { getInitials, statusTone, formatDuration, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface CyclesData {
+  runs: TestRunListItem[];
+  planNames: Record<string, string>;
+}
 
 const STATUS_FILTERS: { value: string; label: string; dot: string }[] = [
   { value: "all", label: "All", dot: "var(--ink-400)" },
@@ -106,9 +112,15 @@ export default function TestRunsPage() {
   const projectId = params.id as string;
   const projectName = String(project.name || "");
 
-  const [runs, setRuns] = useState<TestRunListItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [planNames, setPlanNames] = useState<Record<string, string>>({});
+  const cacheKey = `cycles:${projectId}`;
+  const cached = getPageCache<CyclesData>(cacheKey);
+
+  const [runs, setRuns] = useState<TestRunListItem[]>(cached?.runs ?? []);
+  // Only the true first visit to this project's runs list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
+  const [planNames, setPlanNames] = useState<Record<string, string>>(cached?.planNames ?? {});
 
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortBy, setSortBy] = useState<SortOption>("newest");
@@ -173,20 +185,30 @@ export default function TestRunsPage() {
   const load = useCallback(() => {
     Promise.all([listTestRuns(projectId), listPlans(projectId).catch(() => [])])
       .then(([runsData, plans]) => {
-        setRuns(runsData);
-        setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name])));
+        const planNamesData = Object.fromEntries(plans.map((p) => [p.id, p.name]));
+        const next: CyclesData = { runs: runsData, planNames: planNamesData };
+        setPageCache(`cycles:${projectId}`, next);
+        setRuns(next.runs);
+        setPlanNames(next.planNames);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [projectId]);
 
   useEffect(() => {
+    const key = `cycles:${projectId}`;
+    const existing = getPageCache<CyclesData>(key);
+    if (existing) {
+      setRuns(existing.runs);
+      setPlanNames(existing.planNames);
+      setLoading(false);
+    }
     if (!currentUser) {
       router.replace("/login");
       return;
     }
     load();
-  }, [router, load, currentUser]);
+  }, [projectId, router, load, currentUser]);
 
   const visibleRuns = useMemo(() => {
     const filtered = statusFilter === "all" ? runs : runs.filter((r) => r.status === statusFilter);
@@ -297,7 +319,7 @@ export default function TestRunsPage() {
   }
 
   if (loading) {
-    return <PageLoader variant="screen" label="Loading runs…" />;
+    return <PageLoader variant="content" label="Loading runs…" />;
   }
 
   const emptyIcon = <IconPlayerPlay size={48} stroke={1.25} className="text-[var(--ink-300)]" />;
