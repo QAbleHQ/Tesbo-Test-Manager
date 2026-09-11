@@ -810,6 +810,13 @@ export default function TestCasesPage() {
     setPanelTestcaseId(testcaseId);
     setPanelMode("edit");
     setPanelTab("overview");
+    // Cleared up front, not just left over from whatever case (if any) was last successfully loaded.
+    // fillFormFromTestCase below is the only place that sets these back to real values, so if this
+    // fetch fails, panelOriginalStatus stays null instead of silently holding a PREVIOUS test case's
+    // values — handlePanelSubmit's edit branch checks for exactly that null to know its computed
+    // suites/repoSummary patch would be based on stale data, and falls back to a real refetch instead.
+    setPanelOriginalStatus(null);
+    setPanelOriginalSuiteId(null);
     setCustomFieldErrors({});
     try {
       const [data, customFields, bugs] = await Promise.all([
@@ -1289,14 +1296,26 @@ export default function TestCasesPage() {
         // loadSelectedSuiteCases() still runs for real: this edit can change fields the CURRENT
         // filters key on (status, suite, priority, type, automation...), so which rows still match
         // isn't something this patch can safely compute — only suites/repoSummary are patched here.
-        applyTestCasesPatch(
-          applyTestCaseEditDelta(suites, repoSummary, {
-            oldStatus: panelOriginalStatus ?? status,
-            newStatus: status,
-            oldSuiteId: panelOriginalSuiteId,
-            newSuiteId: suiteId || null,
-          })
-        );
+        //
+        // panelOriginalStatus is null whenever this open of the panel never got a confirmed-fresh
+        // fetch for THIS testcaseId (openViewPanel resets it before every fetch, fillFormFromTestCase
+        // is the only thing that sets it back) — e.g. the load failed after switching from a
+        // different case, or raced with switching to a different case. Computing a delta from stale
+        // "original" values in that situation would silently corrupt suites/repoSummary counts with
+        // no self-correction, unlike every other unknown-prior-state case in this file — so this one
+        // real refetch (matching pre-existing behavior for exactly this edge case) is intentional.
+        if (panelOriginalStatus === null) {
+          await loadSuitesAndSummary();
+        } else {
+          applyTestCasesPatch(
+            applyTestCaseEditDelta(suites, repoSummary, {
+              oldStatus: panelOriginalStatus,
+              newStatus: status,
+              oldSuiteId: panelOriginalSuiteId,
+              newSuiteId: suiteId || null,
+            })
+          );
+        }
         const savedTab = panelTab;
         await loadSelectedSuiteCases();
         await openViewPanel(panelTestcaseId);
