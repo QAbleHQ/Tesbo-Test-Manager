@@ -2,10 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, forwardRef,
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import ExcelJS from "exceljs";
 import archiver from "archiver";
-import pdfParse from "pdf-parse";
-import * as mammoth from "mammoth";
 import { createWorker } from "tesseract.js";
 import type { PoolClient, QueryResultRow } from "pg";
 import { EmailService } from "../auth/email.service";
@@ -25,10 +22,27 @@ import type { RagRetrievalConfidence } from "../rag/rag.types";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
 import { PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
+import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 type Body = Record<string, any>;
+
+/** Everything processZyraSaveEntriesSequential/Batched need that isn't `selected` or `client` itself. */
+interface ZyraSaveEntryContext {
+  projectId: string;
+  uid: string;
+  taskId: string;
+  chatSessionId: string | null;
+  batchSuiteId: string | null;
+  jiraIssueKey: string | null;
+  jiraUrl: string | null;
+  linearIssueKey: string | null;
+  linearUrl: string | null;
+  existingLinked: { rows: Body[] };
+}
 
 /** The four buckets V67's bugs_severity_check allows, and the four the dashboard reports. */
 const BUG_SEVERITIES = ["Critical", "High", "Medium", "Low"] as const;
@@ -1064,6 +1078,9 @@ export class LegacyService implements OnModuleInit {
     private readonly integrationSync: IntegrationSyncService,
     private readonly apiTokens: ApiTokenService,
     private readonly planLimits: PlanLimitsService,
+    private readonly requestCache: RequestCacheService,
+    private readonly projectLookup: ProjectLookupService,
+    private readonly kbExtractionRunner: KbExtractionRunnerService,
     @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService
   ) {}
 
@@ -1531,6 +1548,9 @@ export class LegacyService implements OnModuleInit {
         "DELETE FROM project_members WHERE user_id = $2 AND project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
         [workspace.id, targetUserId]
       );
+      // This spans every project in the workspace for one user rather than one known project id, so
+      // there's no single project-id prefix to invalidate against — match on the user instead.
+      this.requestCache.invalidateWhere((key) => key.startsWith("access:") && key.endsWith(`:${targetUserId}`));
     });
     await this.logWorkspaceActivity(workspace.id, uid, "workspace_member_removed", "workspace_member", targetUserId, targetMember.rows[0].email, { role: targetMember.rows[0].role });
   }
@@ -1844,6 +1864,7 @@ export class LegacyService implements OnModuleInit {
             "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role",
             [projectId, uid, inv.role]
           );
+          this.invalidateProjectAccessCache(projectId);
         }
       }
       await client.query(
@@ -2453,14 +2474,27 @@ export class LegacyService implements OnModuleInit {
     // in Postgres and every project-scoped endpoint answers a typo with a 500.
     if (!isUuid(projectId)) throw new NotFoundException({ error: "Project not found" });
     const workspace = await this.workspace(uid);
-    const res = await this.db.query(
-      `SELECT p.*, pm.role AS caller_role FROM projects p
-       JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $2
-       WHERE p.id = $1 AND p.archived_at IS NULL AND p.organization_id = $3`,
-      [projectId, uid, workspace.id]
-    );
-    if (!res.rows[0]) throw new NotFoundException({ error: "Project not found" });
-    return res.rows[0];
+    // Memoized for the rest of THIS request only (see B1 of the platform performance remediation
+    // plan — this was independently re-run by projectDashboardSummary and requirementsSummary in
+    // one dashboard load). Invalidated within the request the instant this same request writes to
+    // `projects` or `project_members` for this id (updateProject/deleteProject/membership changes),
+    // so a read-then-write-then-reread inside one request never sees a stale row.
+    const row = await this.requestCache.remember(`access:${projectId}:${uid}`, async () => {
+      const res = await this.db.query(
+        `SELECT p.*, pm.role AS caller_role FROM projects p
+         JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $2
+         WHERE p.id = $1 AND p.archived_at IS NULL AND p.organization_id = $3`,
+        [projectId, uid, workspace.id]
+      );
+      return res.rows[0] ?? null;
+    });
+    if (!row) throw new NotFoundException({ error: "Project not found" });
+    return row;
+  }
+
+  /** Drops every memoized requireProjectAccess result for this project within the current request. */
+  private invalidateProjectAccessCache(projectId: string): void {
+    this.requestCache.invalidatePrefix(`access:${projectId}:`);
   }
 
   async getProjectForUser(userId: string | null | undefined, id: string) {
@@ -2491,6 +2525,11 @@ export class LegacyService implements OnModuleInit {
         [id, JSON.stringify(icon)]
       );
     }
+    // This request's own memoized project row (key/settings/organization_id) is now stale — drop it
+    // so anything reading it later in this same request (externalIdPrefix after a testcaseIdPrefix
+    // change, requireProjectAccess after a rename) sees the write that just happened.
+    this.requestCache.invalidate(`projectBasics:${id}`);
+    this.invalidateProjectAccessCache(id);
   }
 
   // Membership alone is not enough to reconfigure a project. Every neighbouring administrative
@@ -2505,6 +2544,8 @@ export class LegacyService implements OnModuleInit {
 
   async deleteProject(id: string) {
     await this.db.query("UPDATE projects SET archived_at = now(), updated_at = now() WHERE id = $1", [id]);
+    this.requestCache.invalidate(`projectBasics:${id}`);
+    this.invalidateProjectAccessCache(id);
   }
 
   async deleteProjectForUser(userId: string | null | undefined, id: string) {
@@ -2566,6 +2607,7 @@ export class LegacyService implements OnModuleInit {
       "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role",
       [projectId, targetUserId, requestedRole]
     );
+    this.invalidateProjectAccessCache(projectId);
     await this.logProjectActivity(
       projectId,
       uid,
@@ -2610,6 +2652,7 @@ export class LegacyService implements OnModuleInit {
      */
     await this.db.transaction(async (client) => {
       await client.query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2", [projectId, targetUserId]);
+      this.invalidateProjectAccessCache(projectId);
       await client.query(
         `UPDATE executions e SET assignee_id = NULL, updated_at = now()
            FROM cycle_items ci JOIN cycles c ON c.id = ci.cycle_id
@@ -3262,7 +3305,12 @@ export class LegacyService implements OnModuleInit {
     const row = res.rows[0];
     // "skip-if-disabled": on a Launch-plan project this silently no-ops rather than
     // throwing, so ordinary test case creation is never blocked by billing state.
-    await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled");
+    // testCaseIsNew: true — row.id was just returned by the INSERT above in this same
+    // transaction, so it cannot already have custom field values; skips the pointless
+    // "existing values" read setValuesWithContext would otherwise always find empty.
+    await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled", {
+      testCaseIsNew: true
+    });
     return row;
   }
 
@@ -3383,7 +3431,11 @@ export class LegacyService implements OnModuleInit {
         if (!values || typeof values !== "object" || !Object.keys(values).length) continue;
         const testcaseId = idByExternalId.get(payload[index].external_id);
         if (!testcaseId) continue;
-        await this.customFields.setValuesForTestCase(uid, projectId, testcaseId, values, client, "skip-if-disabled");
+        // testCaseIsNew: true — testcaseId came straight out of the bulk INSERT's own
+        // RETURNING rows a few lines up, in this same transaction: it cannot have prior values.
+        await this.customFields.setValuesForTestCase(uid, projectId, testcaseId, values, client, "skip-if-disabled", {
+          testCaseIsNew: true
+        });
       }
       return res.rows;
     });
@@ -6000,25 +6052,33 @@ export class LegacyService implements OnModuleInit {
   }
 
   async repositorySummary(projectId: string) {
-    const total = await this.db.query<{ count: string }>("SELECT COUNT(*) AS count FROM testcases_active WHERE project_id = $1", [projectId]);
-    const byStatus = await this.groupTestcases(projectId, "status");
-    const byPriority = await this.groupTestcases(projectId, "priority");
-    const bySuite = await this.db.query<{ name: string; count: string }>(
-      `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
+    // Six independent reads — none depends on another's result — so they're safe to run
+    // concurrently. Built as thunks rather than started immediately so the kill switch can still
+    // genuinely run them one at a time (each query only starts once its thunk is invoked), not just
+    // await already-started promises in sequence.
+    const totalQuery = () =>
+      this.db.query<{ count: string }>("SELECT COUNT(*) AS count FROM testcases_active WHERE project_id = $1", [projectId]);
+    const byStatusQuery = () => this.groupTestcases(projectId, "status");
+    const byPriorityQuery = () => this.groupTestcases(projectId, "priority");
+    const bySuiteQuery = () =>
+      this.db.query<{ name: string; count: string }>(
+        `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
        FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id
        WHERE t.project_id = $1 GROUP BY s.name ORDER BY s.name`,
-      [projectId]
-    );
-    const updatedCounts = await this.db.query<{ today: string; this_week: string; this_month: string }>(
-      `SELECT
+        [projectId]
+      );
+    const updatedCountsQuery = () =>
+      this.db.query<{ today: string; this_week: string; this_month: string }>(
+        `SELECT
          COUNT(*) FILTER (WHERE updated_at >= now() - interval '1 day')::int AS today,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('week', now()))::int AS this_week,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('month', now()))::int AS this_month
        FROM testcases_active WHERE project_id = $1`,
-      [projectId]
-    );
-    const addedByDate = await this.db.query<{ date: string; count: string }>(
-      `SELECT to_char(d::date, 'YYYY-MM-DD') AS date, COALESCE(t.cnt, 0)::int AS count
+        [projectId]
+      );
+    const addedByDateQuery = () =>
+      this.db.query<{ date: string; count: string }>(
+        `SELECT to_char(d::date, 'YYYY-MM-DD') AS date, COALESCE(t.cnt, 0)::int AS count
        FROM generate_series((now()::date - interval '29 days'), now()::date, interval '1 day') AS d
        LEFT JOIN (
          SELECT date_trunc('day', created_at) AS day, COUNT(*) AS cnt
@@ -6026,8 +6086,32 @@ export class LegacyService implements OnModuleInit {
          GROUP BY 1
        ) t ON t.day = d
        ORDER BY d`,
-      [projectId]
-    );
+        [projectId]
+      );
+
+    let total: Awaited<ReturnType<typeof totalQuery>>;
+    let byStatus: Awaited<ReturnType<typeof byStatusQuery>>;
+    let byPriority: Awaited<ReturnType<typeof byPriorityQuery>>;
+    let bySuite: Awaited<ReturnType<typeof bySuiteQuery>>;
+    let updatedCounts: Awaited<ReturnType<typeof updatedCountsQuery>>;
+    let addedByDate: Awaited<ReturnType<typeof addedByDateQuery>>;
+    if (this.config.enableQueryParallelization) {
+      [total, byStatus, byPriority, bySuite, updatedCounts, addedByDate] = await Promise.all([
+        totalQuery(),
+        byStatusQuery(),
+        byPriorityQuery(),
+        bySuiteQuery(),
+        updatedCountsQuery(),
+        addedByDateQuery()
+      ]);
+    } else {
+      total = await totalQuery();
+      byStatus = await byStatusQuery();
+      byPriority = await byPriorityQuery();
+      bySuite = await bySuiteQuery();
+      updatedCounts = await updatedCountsQuery();
+      addedByDate = await addedByDateQuery();
+    }
     return {
       totalTestCases: Number(total.rows[0]?.count || 0),
       bySuite: bySuite.rows.map((r) => ({ name: r.name, count: Number(r.count) })),
@@ -8078,50 +8162,28 @@ export class LegacyService implements OnModuleInit {
   // exceljs models a row as a sparse array, so cells are read positionally up to the sheet's column
   // count rather than by iterating only the cells that exist — otherwise a row with a gap in the
   // middle would shift every later column one to the left.
-  private static worksheetToCsv(sheet: ExcelJS.Worksheet): string {
-    const lines: string[] = [];
-    sheet.eachRow({ includeEmpty: true }, (row) => {
-      const cells: string[] = [];
-      for (let column = 1; column <= sheet.columnCount; column += 1) {
-        // `.text` flattens every shape a cell value can take — rich text, a hyperlink, a formula's
-        // cached result, a date — into the string a reader would see in Excel.
-        const text = row.getCell(column).text ?? "";
-        cells.push(/[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
-      }
-      lines.push(cells.join(","));
-    });
-    return lines.join("\n");
-  }
-
   // Best-effort text extraction so Zyra's knowledge-base context can include file contents,
-  // not just file names. Runs synchronously in the upload request — everything here is local
-  // CPU/WASM work with no network call. Audio/video transcription is handled separately
-  // (transcribeKnowledgeFile) since it calls out to an AI provider and can take a while.
+  // not just file names. Audio/video transcription is handled separately (transcribeKnowledgeFile)
+  // since it calls out to an AI provider and can take a while.
+  //
+  // XLSX/PDF/DOCX (the CPU/WASM-heavy formats) run through KbExtractionRunnerService, which offloads
+  // them onto a worker_threads pool so a large upload no longer blocks every other concurrent
+  // request on this process — only the uploader's own response still waits for the result, exactly
+  // as before. Plain text is a trivial buffer.toString slice, not worth a worker round trip; image
+  // OCR already runs inside its own tesseract.js worker via ocrImageText below.
   private async extractKnowledgeFileText(buffer: Buffer, ext: string): Promise<string | null> {
     try {
       if (LegacyService.KB_PLAINTEXT_EXTENSIONS.has(ext)) {
         return buffer.toString("utf8").slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
       if (LegacyService.KB_SPREADSHEET_EXTENSIONS.has(ext)) {
-        const workbook = new ExcelJS.Workbook();
-        // exceljs's own index.d.ts is a module, so its unwrapped `declare interface Buffer
-        // extends ArrayBuffer {}` fallback (for consumers without @types/node) shadows the
-        // real Buffer only inside that file — `load()`'s parameter type is that local,
-        // permanently-incompatible stub, not Node's Buffer, so no cast to `Buffer` can ever
-        // satisfy it. `any` is required to bypass the structural check entirely.
-        await workbook.xlsx.load(buffer as any);
-        const text = workbook.worksheets
-          .map((sheet) => `Sheet: ${sheet.name}\n${LegacyService.worksheetToCsv(sheet)}`)
-          .join("\n\n");
-        return text.slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
+        return await this.kbExtractionRunner.extract(buffer, "xlsx", LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
       if (LegacyService.KB_PDF_EXTENSIONS.has(ext)) {
-        const data = await pdfParse(buffer);
-        return String(data.text || "").slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
+        return await this.kbExtractionRunner.extract(buffer, "pdf", LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
       if (LegacyService.KB_DOCX_EXTENSIONS.has(ext)) {
-        const result = await mammoth.extractRawText({ buffer });
-        return String(result.value || "").slice(0, LegacyService.KB_EXTRACTED_TEXT_LIMIT);
+        return await this.kbExtractionRunner.extract(buffer, "docx", LegacyService.KB_EXTRACTED_TEXT_LIMIT);
       }
       if (LegacyService.KB_IMAGE_OCR_EXTENSIONS.has(ext)) {
         return await this.ocrImageText(buffer);
@@ -10056,6 +10118,11 @@ export class LegacyService implements OnModuleInit {
     });
     settings.zyraAgent = { ...current, testcaseCount: requestedCount, testcaseRange, capabilities };
     await this.db.query("UPDATE projects SET settings = $2::jsonb, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(settings)]);
+    this.requestCache.invalidate(`projectBasics:${projectId}`);
+    // requireProjectAccess (line above, at entry) memoized this project's row including the settings
+    // just overwritten — without this, a second requireProjectAccess call later in this same request
+    // would still see the pre-write settings, same hazard updateProject/deleteProject already guard.
+    this.invalidateProjectAccessCache(projectId);
     return { testcaseCount: requestedCount, testcaseRange, capabilities };
   }
 
@@ -12988,74 +13055,25 @@ export class LegacyService implements OnModuleInit {
         }
       }
 
-      const created: Body[] = [];
-      const touched: Body[] = [];
-      // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
-      // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
-      // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
-      // assumption every entry was a create (true for every Task-board batch, the only source that
-      // ever populates jiraIssueKey/linearIssueKey in the first place). A running counter here keeps
-      // that same pairing correct even though `selected` can now also hold update/archive entries.
-      let createPosition = 0;
-      for (const entry of selected) {
-        const opType = entry.opType || "create";
-        if (opType === "update" || opType === "archive") {
-          await this.patchTestCaseFromZyraWithClient(client, entry.testcaseId, uid, entry.fields || {});
-          const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
-          const row = toCamel(refreshed.rows[0]);
-          touched.push(row);
-          await this.logProjectActivity(
-            projectId, uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
-            `${row.externalId} - ${row.title}`, { source: existing.chat_session_id ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
-          );
-          continue;
-        }
-        const linkedIndex = createPosition++;
-        const draft = entry.draft || entry;
-        const targetSuiteId = draft.suiteId || batchSuiteId;
-        const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
-        const tags = Array.from(new Set([
-          ...baseTags,
-          "zyra",
-          ...(jiraIssueKey ? [`jira:${jiraIssueKey}`] : []),
-          ...(linearIssueKey ? [`linear:${linearIssueKey}`] : []),
-          existingLinked.rows[linkedIndex]?.id ? "zyra-regenerated" : "zyra-generated"
-        ])).join(",");
-        const payload = {
-          suiteId: targetSuiteId,
-          title: draft.title,
-          description: draft.description || draft.expectedSummary || "",
-          preconditions: draft.preconditions || "",
-          stepsJson: this.safeSteps(draft.stepsJson),
-          testData: draft.testData || "",
-          priority: draft.priority || "P2",
-          type: draft.type || "Functional",
-          status: draft.status || "Draft",
-          automationTags: tags,
-          jiraIssueKey: draft.jiraIssueKey || jiraIssueKey,
-          jiraUrl,
-          linearIssueKey,
-          linearUrl,
-          // Carried from the staged draft (already resolved+verified at generation time) onto the
-          // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
-          // no sourceRefs ever attached) simply carries none, same as it always has.
-          sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
-        };
-        this.assertTestcaseFieldLengths(payload);
-        if (existingLinked.rows[linkedIndex]?.id) {
-          const linkedId = existingLinked.rows[linkedIndex].id;
-          const row = toCamel(await this.updateTestCaseWithClient(client, projectId, linkedId, uid, payload));
-          touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId });
-        } else {
-          const row = toCamel(await this.insertTestCaseWithClient(client, projectId, uid, payload));
-          // The same audit action chat mode writes in applyZyraChatOperations. Both modes have to be
-          // recorded identically or the agent's "tests generated" tile can only ever see one of them
-          // — Basecamp 10212918496, where 33 chat-created cases were reported as 0.
-          await this.logProjectActivity(projectId, uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: existing.chat_session_id ? "zyra_chat" : "zyra_task", taskId, reason: draft.reason || entry.reason || null });
-          created.push(row);
-          touched.push(row);
-        }
-      }
+      const entryCtx: ZyraSaveEntryContext = {
+        projectId,
+        uid,
+        taskId,
+        chatSessionId: existing.chat_session_id ?? null,
+        batchSuiteId,
+        jiraIssueKey,
+        jiraUrl,
+        linearIssueKey,
+        linearUrl,
+        existingLinked
+      };
+      // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
+      // implementations return the identical { created, touched } shape and must stay behaviorally
+      // interchangeable; the batched one only changes how genuinely-new testcases are written
+      // (one INSERT instead of N), never what gets written or in what order the response reflects it.
+      const { created, touched } = this.config.zyraSetBasedSaveEnabled
+        ? await this.processZyraSaveEntriesBatched(client, selected, entryCtx)
+        : await this.processZyraSaveEntriesSequential(client, selected, entryCtx);
 
       const savedAt = new Date().toISOString();
       const events = [{ suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
@@ -13113,6 +13131,282 @@ export class LegacyService implements OnModuleInit {
       }
       return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, remaining: remainingPayload.length };
     });
+  }
+
+  /**
+   * processZyraSaveEntriesSequential and processZyraSaveEntriesBatched both implement the same
+   * per-entry loop that used to live inline in zyraSaveAttempt, selected by ZYRA_SET_BASED_SAVE_ENABLED.
+   * Sequential is that original loop, extracted verbatim — every expression, default, and side effect
+   * is unchanged, just reading its free variables off `ctx` instead of the enclosing closure.
+   */
+  private async processZyraSaveEntriesSequential(
+    client: PoolClient,
+    selected: Body[],
+    ctx: ZyraSaveEntryContext
+  ): Promise<{ created: Body[]; touched: Body[] }> {
+    const created: Body[] = [];
+    const touched: Body[] = [];
+    // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
+    // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
+    // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
+    // assumption every entry was a create (true for every Task-board batch, the only source that
+    // ever populates jiraIssueKey/linearIssueKey in the first place). A running counter here keeps
+    // that same pairing correct even though `selected` can now also hold update/archive entries.
+    let createPosition = 0;
+    for (const entry of selected) {
+      const opType = entry.opType || "create";
+      if (opType === "update" || opType === "archive") {
+        await this.patchTestCaseFromZyraWithClient(client, entry.testcaseId, ctx.uid, entry.fields || {});
+        const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
+        const row = toCamel(refreshed.rows[0]);
+        touched.push(row);
+        await this.logProjectActivity(
+          ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
+          `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
+        );
+        continue;
+      }
+      const linkedIndex = createPosition++;
+      const draft = entry.draft || entry;
+      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
+      const tags = Array.from(new Set([
+        ...baseTags,
+        "zyra",
+        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
+        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
+        ctx.existingLinked.rows[linkedIndex]?.id ? "zyra-regenerated" : "zyra-generated"
+      ])).join(",");
+      const payload = {
+        suiteId: targetSuiteId,
+        title: draft.title,
+        description: draft.description || draft.expectedSummary || "",
+        preconditions: draft.preconditions || "",
+        stepsJson: this.safeSteps(draft.stepsJson),
+        testData: draft.testData || "",
+        priority: draft.priority || "P2",
+        type: draft.type || "Functional",
+        status: draft.status || "Draft",
+        automationTags: tags,
+        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
+        jiraUrl: ctx.jiraUrl,
+        linearIssueKey: ctx.linearIssueKey,
+        linearUrl: ctx.linearUrl,
+        // Carried from the staged draft (already resolved+verified at generation time) onto the
+        // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
+        // no sourceRefs ever attached) simply carries none, same as it always has.
+        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+      };
+      this.assertTestcaseFieldLengths(payload);
+      if (ctx.existingLinked.rows[linkedIndex]?.id) {
+        const linkedId = ctx.existingLinked.rows[linkedIndex].id;
+        const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
+        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId });
+      } else {
+        const row = toCamel(await this.insertTestCaseWithClient(client, ctx.projectId, ctx.uid, payload));
+        // The same audit action chat mode writes in applyZyraChatOperations. Both modes have to be
+        // recorded identically or the agent's "tests generated" tile can only ever see one of them
+        // — Basecamp 10212918496, where 33 chat-created cases were reported as 0.
+        await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entry.reason || null });
+        created.push(row);
+        touched.push(row);
+      }
+    }
+    return { created, touched };
+  }
+
+  /**
+   * Same contract as processZyraSaveEntriesSequential (identical inputs, identical
+   * { created, touched } shape, identical `touched` ORDER — see the touchedSlots comment below for
+   * why order needs explicit care here). Update/archive and "resolves to an existing linked testcase"
+   * entries are handled exactly as the sequential version, unchanged. Only genuinely-new testcases
+   * are handled differently: instead of one insertTestCaseWithClient call per entry, they're collected
+   * and written as a single batch via zyraBatchInsertTestCases — the actual point of this phase.
+   */
+  private async processZyraSaveEntriesBatched(
+    client: PoolClient,
+    selected: Body[],
+    ctx: ZyraSaveEntryContext
+  ): Promise<{ created: Body[]; touched: Body[] }> {
+    const created: Body[] = [];
+    // Preserves selected's original order: a deferred create's slot is filled in AFTER the batch
+    // insert runs, so the final `touched` array (which the response and the save_events/activity_log
+    // history both key off) comes out in the same order as the sequential path, not "everything else,
+    // then every batch-inserted row appended at the end."
+    const touchedSlots: Array<Body | null> = new Array(selected.length).fill(null);
+    const toInsert: Array<{ slot: number; payload: Body; draft: Body; entryReason: unknown }> = [];
+    let createPosition = 0;
+
+    for (let slot = 0; slot < selected.length; slot += 1) {
+      const entry = selected[slot];
+      const opType = entry.opType || "create";
+      if (opType === "update" || opType === "archive") {
+        await this.patchTestCaseFromZyraWithClient(client, entry.testcaseId, ctx.uid, entry.fields || {});
+        const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
+        const row = toCamel(refreshed.rows[0]);
+        touchedSlots[slot] = row;
+        await this.logProjectActivity(
+          ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
+          `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
+        );
+        continue;
+      }
+
+      const linkedIndex = createPosition++;
+      const draft = entry.draft || entry;
+      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
+      const tags = Array.from(new Set([
+        ...baseTags,
+        "zyra",
+        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
+        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
+        ctx.existingLinked.rows[linkedIndex]?.id ? "zyra-regenerated" : "zyra-generated"
+      ])).join(",");
+      const payload = {
+        suiteId: targetSuiteId,
+        title: draft.title,
+        description: draft.description || draft.expectedSummary || "",
+        preconditions: draft.preconditions || "",
+        stepsJson: this.safeSteps(draft.stepsJson),
+        testData: draft.testData || "",
+        priority: draft.priority || "P2",
+        type: draft.type || "Functional",
+        status: draft.status || "Draft",
+        automationTags: tags,
+        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
+        jiraUrl: ctx.jiraUrl,
+        linearIssueKey: ctx.linearIssueKey,
+        linearUrl: ctx.linearUrl,
+        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+      };
+      this.assertTestcaseFieldLengths(payload);
+
+      if (ctx.existingLinked.rows[linkedIndex]?.id) {
+        const linkedId = ctx.existingLinked.rows[linkedIndex].id;
+        const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
+        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId };
+      } else {
+        // Deferred — actually written once, below, as a single batch insert by
+        // zyraBatchInsertTestCases. See that method's own comment for the rest of the story
+        // (external-id allocation, column defaults, RETURNING-order handling).
+        toInsert.push({ slot, payload, draft, entryReason: entry.reason });
+      }
+    }
+
+    if (toInsert.length > 0) {
+      const insertedRows = await this.zyraBatchInsertTestCases(client, ctx.projectId, ctx.uid, toInsert.map((item) => item.payload));
+      // insertedRows is already reordered to match toInsert's order (see zyraBatchInsertTestCases) —
+      // safe to zip positionally here.
+      for (let i = 0; i < toInsert.length; i += 1) {
+        const { slot, draft, entryReason } = toInsert[i];
+        const row = toCamel(insertedRows[i]);
+        // Required so every newly-created row still goes through the SAME required-custom-field
+        // enforcement insertTestCaseWithClient's own call to this would have applied — Zyra never
+        // supplies customFieldValues itself, but a project with an active required custom field and
+        // no default must still reject the save exactly as it does on the sequential path, not
+        // silently start accepting it because this path bypassed insertTestCaseWithClient.
+        // testCaseIsNew: true is safe for the same reason it is on the single-row path: row.id was
+        // just returned by the INSERT above, in this same transaction — it cannot already have values.
+        await this.customFields.setValuesForTestCase(ctx.uid, ctx.projectId, row.id, {}, client, "skip-if-disabled", { testCaseIsNew: true });
+        // The same audit action chat mode writes in applyZyraChatOperations — see the sequential
+        // path's identical comment (Basecamp 10212918496).
+        await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entryReason || null });
+        created.push(row);
+        touchedSlots[slot] = row;
+      }
+    }
+
+    const touched = touchedSlots.filter((row): row is Body => row !== null);
+    return { created, touched };
+  }
+
+  /**
+   * Batched equivalent of insertTestCaseWithClient for Zyra's genuinely-new testcase entries only —
+   * mirrors bulkCreateTestCases's own external-id-block-allocation + jsonb_to_recordset INSERT
+   * pattern (same advisory lock, same "claim a contiguous block, then batch-insert" shape), extended
+   * with source_refs (Zyra always carries citations; bulkCreateTestCases's own column list omits it,
+   * since plain imports never do) and estimated_duration (included for full column parity with
+   * insertTestCaseWithClient, even though Zyra's payload never sets it).
+   *
+   * Deliberately NOT a shared refactor of insertTestCaseWithClient's per-row defaulting logic: this
+   * is a fully separate, Zyra-only path, gated behind ZYRA_SET_BASED_SAVE_ENABLED, so a mistake here
+   * can only ever affect this one path — never the single-row create endpoint every other caller
+   * (including Zyra's own sequential fallback) still uses. Every default below is a direct,
+   * line-by-line copy of insertTestCaseWithClient's own `body.x || y` expression for the one field
+   * Zyra's payload construction (processZyraSaveEntriesBatched, above) never sets.
+   *
+   * Custom-field values and the per-row activity log are NOT handled here — the caller does both
+   * per returned row, matching bulkCreateTestCases's own established "custom fields stay per-row"
+   * parity bar and the requirement that Zyra creates keep one audit_logs row each, not one for the
+   * whole batch.
+   */
+  private async zyraBatchInsertTestCases(client: PoolClient, projectId: string, uid: string, payloads: Body[]): Promise<Body[]> {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`testcase-external-id:${projectId}`]);
+    const key = await this.externalIdPrefix(projectId, undefined, client);
+    const startSeq = await this.maxExternalIdSeq(projectId, key, client);
+
+    const rows = payloads.map((payload, index) => ({
+      external_id: `${key}-TC-${startSeq + index + 1}`,
+      suite_id: payload.suiteId || null,
+      // insertTestCaseWithClient: body.title || "Untitled test case" — the one field Zyra's own
+      // payload construction (above) does not already default before calling here.
+      title: payload.title || "Untitled test case",
+      description: payload.description || "",
+      preconditions: payload.preconditions || "",
+      postconditions: "",
+      steps: payload.stepsJson || [],
+      test_data: payload.testData || "",
+      priority: payload.priority || "P2",
+      severity: null,
+      type: payload.type || "Functional",
+      automation_status: "Not Automated",
+      automation_repo: null,
+      automation_path: null,
+      automation_test_name: null,
+      automation_framework: null,
+      automation_tags: payload.automationTags || null,
+      owner_id: null,
+      component: null,
+      status: payload.status || "Draft",
+      jira_issue_key: payload.jiraIssueKey || null,
+      jira_url: payload.jiraUrl || null,
+      linear_issue_key: payload.linearIssueKey || null,
+      linear_url: payload.linearUrl || null,
+      attachments: null,
+      estimated_duration: null,
+      source_refs: Array.isArray(payload.sourceRefs) ? payload.sourceRefs : []
+    }));
+
+    const res = await client.query(
+      `INSERT INTO testcases
+         (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
+          priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
+          automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
+          linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
+       SELECT $1::uuid, r.suite_id, r.external_id, r.title, r.description, r.preconditions, r.postconditions,
+              r.steps, r.test_data, r.priority, r.severity, r.type, r.automation_status, r.automation_repo,
+              r.automation_path, r.automation_test_name, r.automation_framework, r.automation_tags, r.owner_id,
+              r.component, r.status, r.jira_issue_key, r.jira_url, r.linear_issue_key, r.linear_url,
+              r.attachments, $2::uuid, $2::uuid, r.estimated_duration, r.source_refs
+       FROM jsonb_to_recordset($3::jsonb) AS r(
+         suite_id uuid, external_id text, title text, description text, preconditions text,
+         postconditions text, steps jsonb, test_data text, priority text, severity text, type text,
+         automation_status text, automation_repo text, automation_path text, automation_test_name text,
+         automation_framework text, automation_tags text, owner_id uuid, component text, status text,
+         jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, attachments text,
+         estimated_duration text, source_refs jsonb
+       )
+       RETURNING *`,
+      [projectId, uid, JSON.stringify(rows)]
+    );
+
+    // external_id was allocated deterministically above (startSeq + index + 1), so it doubles as the
+    // key back to each row's original position — RETURNING order from a jsonb_to_recordset-driven
+    // INSERT is not guaranteed to match input order (same caveat bulkCreateTestCases's own comment
+    // already documents for itself, and the same fix: map by a value we assigned, don't trust order).
+    const rowByExternalId = new Map(res.rows.map((row) => [row.external_id as string, row]));
+    return rows.map((row) => rowByExternalId.get(row.external_id)!);
   }
 
   async zyraSave(projectId: string, userId: string | null | undefined, taskId: string, body: Body) {
@@ -15781,11 +16075,15 @@ export class LegacyService implements OnModuleInit {
 
   /** The `<KEY>` half of `<KEY>-TC-<n>`: the project's configured prefix, its key, or "TC". */
   private async externalIdPrefix(projectId: string, requestedPrefix?: unknown, runner: QueryRunner = this.db): Promise<string> {
-    const project = await runner.query<{ key: string; settings: unknown }>("SELECT key, settings FROM projects WHERE id = $1", [projectId]);
-    const settings = parseSettings(project.rows[0]?.settings);
+    // Memoized per-request only when reading through the plain pool (runner is the default `this.db`);
+    // when called with an explicit transaction client — as insertTestCase does, to read through the
+    // SAME transaction that holds the testcase-external-id advisory lock — this reads live through
+    // that client instead, unmemoized, so it can never see a value cached from outside the lock.
+    const project = await this.projectLookup.getProjectBasics(projectId, runner === this.db ? undefined : runner);
+    const settings = parseSettings(project?.settings);
     return normalizeTestcaseIdPrefix(requestedPrefix)
       || normalizeTestcaseIdPrefix(settings.testcaseIdPrefix)
-      || normalizeTestcaseIdPrefix(project.rows[0]?.key)
+      || normalizeTestcaseIdPrefix(project?.key)
       || "TC";
   }
 

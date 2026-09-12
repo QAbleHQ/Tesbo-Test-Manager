@@ -11,6 +11,9 @@ import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 /**
  * DB test double for the invitation surface of LegacyService.
@@ -99,6 +102,7 @@ function makeService(dbOpts: Parameters<typeof makeDb>[0] = {}, emailOverrides: 
     ...emailOverrides
   } as unknown as EmailService;
   const config = { frontendUrl: "https://app.tesbo.io" } as unknown as AppConfigService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
   const svc = new LegacyService(
     db,
     email,
@@ -110,6 +114,9 @@ function makeService(dbOpts: Parameters<typeof makeDb>[0] = {}, emailOverrides: 
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
     {} as unknown as CustomFieldsService
   );
   return { svc, db, query, txQuery, email };

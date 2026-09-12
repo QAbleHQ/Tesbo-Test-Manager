@@ -97,6 +97,34 @@ export class AppConfigService {
   readonly planGraceDays = this.integer("PLAN_GRACE_DAYS", 30);
   // Where "need more storage?" and other billing dead-ends point people.
   readonly supportContactEmail = this.string("SUPPORT_CONTACT_EMAIL", "support@tryqable.com");
+  // Kill switch for RequestCacheService's per-request memoization (see request-cache/). Off falls
+  // straight through to an uncached lookup at every call site — never staleness, just no dedup.
+  readonly enableRequestScopedCache = this.string("ENABLE_REQUEST_SCOPED_CACHE", "true").trim().toLowerCase() !== "false";
+  // Kill switch for running independent read queries concurrently (Promise.all) instead of one at a
+  // time in a few hot summary endpoints. Off reverts to the original sequential awaits — a pure
+  // scheduling change either way, so this is safe to flip without redeploying calling code.
+  readonly enableQueryParallelization = this.string("ENABLE_QUERY_PARALLELIZATION", "true").trim().toLowerCase() !== "false";
+  // Kill switches for the Redis-backed session/entitlement caches (src/cache/). Independently
+  // toggleable since they have different risk profiles — off, either falls straight through to
+  // today's uncached Postgres read, exactly as if this feature had never shipped.
+  readonly sessionCacheEnabled = this.string("SESSION_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  readonly entitlementCacheEnabled = this.string("ENTITLEMENT_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for offloading knowledge-base XLSX/PDF/DOCX text extraction onto worker_threads
+  // (src/legacy/kb-extraction-runner.service.ts). Off runs the identical extraction function inline
+  // on the request's own thread, exactly as before this phase shipped.
+  readonly kbExtractionWorkerThreadsEnabled = this.string("KB_EXTRACTION_WORKER_THREADS_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Bounds how many extraction worker threads may run at once — excess uploads queue (still
+  // "synchronous-feeling" to that uploader) rather than spawning unboundedly under concurrent load.
+  readonly kbExtractionWorkerPoolSize = this.integer("KB_EXTRACTION_WORKER_POOL_SIZE", 4);
+  // A pathological file could otherwise hang a worker (and, before this phase, the whole process)
+  // indefinitely — this is a strict new protection, not a preserved timing contract.
+  readonly kbExtractionTimeoutMs = this.integer("KB_EXTRACTION_TIMEOUT_MS", 30_000);
+  // Kill switch for Zyra batch-save's set-based create path (legacy.service.ts's
+  // processZyraSaveEntriesBatched/zyraBatchInsertTestCases). Defaults OFF, unlike this remediation's
+  // other flags: this is the highest-risk change in the plan (no existing test coverage for
+  // zyraSaveAttempt at all), so today's exact per-row behavior stays the default until this has been
+  // explicitly verified and someone deliberately opts in.
+  readonly zyraSetBasedSaveEnabled = this.string("ZYRA_SET_BASED_SAVE_ENABLED", "false").trim().toLowerCase() === "true";
 
   private loadEnv(): Record<string, string | undefined> {
     const dotenvPath = this.findDotEnvPath();

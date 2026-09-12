@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  getWorkspace,
   getBillingInfo,
   getIntegrationStatus,
   disconnectIntegration,
@@ -13,6 +12,7 @@ import {
 } from "@/lib/api";
 import { Button, Card, PageLoader } from "@/components/ui";
 import PricingModal from "@/components/PricingModal";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 const PROVIDERS: {
   id: IntegrationProvider;
@@ -46,7 +46,7 @@ const PROVIDERS: {
 ];
 
 export default function IntegrationsTab() {
-  const [workspaceRole, setWorkspaceRole] = useState<string>("member");
+  const { workspace } = useAppData();
   const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [statuses, setStatuses] = useState<Record<string, IntegrationConnectionStatus>>({});
   const [loading, setLoading] = useState(true);
@@ -59,18 +59,16 @@ export default function IntegrationsTab() {
   const disconnectingRef = useRef(false);
   const [pricingOpen, setPricingOpen] = useState(false);
 
-  const canManage = workspaceRole === "owner";
+  const canManage = (workspace?.role || "member").toLowerCase() === "owner";
   const isPro = billingInfo?.plan === "pro";
 
   const loadData = useCallback(async () => {
     try {
-      const [workspace, billing, jira, linear] = await Promise.all([
-        getWorkspace(),
+      const [billing, jira, linear] = await Promise.all([
         getBillingInfo().catch(() => null),
         getIntegrationStatus("jira").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
         getIntegrationStatus("linear").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
       ]);
-      setWorkspaceRole((workspace.role || "member").toLowerCase());
       setBillingInfo(billing);
       setStatuses({ jira, linear });
       setError(null);

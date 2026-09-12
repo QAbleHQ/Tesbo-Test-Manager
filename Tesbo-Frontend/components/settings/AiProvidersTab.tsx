@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import {
-  getWorkspace,
   listWorkspaceAiKeys,
   createWorkspaceAiKey,
   deleteWorkspaceAiKey,
@@ -16,12 +15,13 @@ import {
   type WorkspaceAiProjectAllocation,
 } from "@/lib/api";
 import { Button, Card, Field, FieldLabel, Input, Select } from "@/components/ui";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 /** Sentinel option that switches the model dropdown to free-text entry. */
 const MANUAL_MODEL_VALUE = "__manual__";
 
 export default function AiProvidersTab() {
-  const [workspaceRole, setWorkspaceRole] = useState<string>("member");
+  const { workspace } = useAppData();
   const [keys, setKeys] = useState<WorkspaceAiKey[]>([]);
   const [projects, setProjects] = useState<WorkspaceAiProjectAllocation[]>([]);
   const [loading, setLoading] = useState(true);
@@ -46,7 +46,7 @@ export default function AiProvidersTab() {
   const [loadingModels, setLoadingModels] = useState(false);
   const [manualModelEntry, setManualModelEntry] = useState(false);
 
-  const canManageKeys = workspaceRole === "owner";
+  const canManageKeys = (workspace?.role || "member").toLowerCase() === "owner";
   const providerValue = newProvider === "custom" ? newCustomProvider.trim().toLowerCase() : newProvider;
   const catalogProvider = providerCatalog.find((p) => p.id === providerValue);
   // Base URL is asked for when it can't be derived: user-defined gateways, per-resource
@@ -59,13 +59,11 @@ export default function AiProvidersTab() {
 
   const loadData = useCallback(async () => {
     try {
-      const [workspace, aiData, catalog] = await Promise.all([
-        getWorkspace(),
+      const [aiData, catalog] = await Promise.all([
         listWorkspaceAiKeys(),
         // Failure here only costs the prefills — the form still works with free text.
         listAiProviders().catch(() => ({ providers: [] })),
       ]);
-      setWorkspaceRole((workspace.role || "member").toLowerCase());
       setKeys(aiData.keys || []);
       setProjects(aiData.projects || []);
       setProviderCatalog(catalog.providers || []);

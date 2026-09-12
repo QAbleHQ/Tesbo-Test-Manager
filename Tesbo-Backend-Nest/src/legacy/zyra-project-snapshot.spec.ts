@@ -10,6 +10,9 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -20,8 +23,10 @@ process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 // These tests pin the snapshot's arithmetic so the model is always given a number that reconciles
 // the total against the per-suite rows, instead of a gap it has to be asked about to explain.
 function makeLegacy(query: jest.Mock): LegacyService {
+  const db = { query } as unknown as DatabaseService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
   return new LegacyService(
-    { query } as unknown as DatabaseService,
+    db,
     {} as unknown as EmailService,
     {} as unknown as PasswordService,
     {} as unknown as AppConfigService,
@@ -31,6 +36,9 @@ function makeLegacy(query: jest.Mock): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
     {} as unknown as CustomFieldsService
   );
 }

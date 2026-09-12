@@ -10,7 +10,7 @@ type AppData = {
   currentUser: CurrentUser;
   workspace: WorkspaceInfo | null;
   projects: ProjectSummary[];
-  refetchProjects: () => void;
+  refetchProjects: () => Promise<ProjectSummary[]>;
   refetchCurrentUser: () => void;
 };
 
@@ -51,16 +51,23 @@ export function AppDataProvider({ children }: { children: React.ReactNode }) {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
 
-  const refetchProjects = useCallback(() => {
-    listProjects().then(setProjects).catch(() => undefined);
-  }, []);
+  // Awaitable and state-returning (mirrors ProjectDataProvider's refetchProject/refetchMembers) so a
+  // caller can await the refreshed list before navigating away — e.g. creating or deleting a project
+  // and then routing off this page, where a fire-and-forget refresh would leave the TopBar project
+  // switcher showing stale data until some later, unrelated remount happened to re-fetch it.
+  const refetchProjects = useCallback(async () => {
+    const list = await listProjects().catch(() => undefined);
+    if (list) setProjects(list);
+    return list ?? projects;
+  }, [projects]);
 
   // Only currentUser is ever mutated after this provider's initial load (the Account page's
-  // PATCH /api/auth/me) — projects and workspace change through other pages' own create/update
-  // flows, which already refetchProjects()/reload where needed. Without this, a saved profile edit
-  // would look right on /account until the next navigation, then silently revert to the stale
-  // pre-edit name/mobile number (and the TopBar/Sidebar avatar initials would keep showing the old
-  // name the whole time) because currentUser is otherwise fetched once, on mount, and never again.
+  // PATCH /api/auth/me) — projects and workspace change through the create/update/delete flows in
+  // projects/page.tsx and projects/[id]/settings/page.tsx, which call refetchProjects()/
+  // refetchProject() themselves after a successful write. Without this, a saved profile edit would
+  // look right on /account until the next navigation, then silently revert to the stale pre-edit
+  // name/mobile number (and the TopBar/Sidebar avatar initials would keep showing the old name the
+  // whole time) because currentUser is otherwise fetched once, on mount, and never again.
   const refetchCurrentUser = useCallback(() => {
     authMe().then((me) => {
       if (me) setCurrentUser(me);
