@@ -1314,6 +1314,9 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
+    sortBy?: "id" | "title" | "priority";
+    sortDir?: "asc" | "desc";
   }
 ): Promise<{ list: TestCaseListItem[]; total: number }> {
   const sp = new URLSearchParams();
@@ -1329,6 +1332,8 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
+  if (params?.sortBy) sp.set("sortBy", params.sortBy);
+  if (params?.sortDir) sp.set("sortDir", params.sortDir);
   const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/testcases?${sp}`, { credentials: "include" });
   const list = await res.json();
   if (!res.ok) {
