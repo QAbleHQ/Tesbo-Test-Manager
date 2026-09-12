@@ -27,6 +27,9 @@ import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
 
 type Body = Record<string, any>;
 
@@ -136,6 +139,22 @@ interface ImportContext {
   suiteIdByKey: Map<string, string>;
   expandSuiteIds: Set<string>;
   customFieldContext: CustomFieldWriteContext | null;
+}
+
+/**
+ * The per-project aggregate half of projectsOverview's response — everything except the raw project
+ * row (name/key/role/...) itself, which always comes fresh from listProjects and is never cached.
+ * Identical for every member of a project (see ProjectOverviewCacheService's own doc comment), which
+ * is what makes a plain per-project Redis cache of exactly this shape sound.
+ */
+interface ProjectOverviewFields {
+  testCaseCount: number;
+  suiteCount: number;
+  teamMembers: { userId: string; name: string }[];
+  lastActivityAt: string | null;
+  status: "setup_required" | "active" | "configured";
+  runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+  currentPassRate: number | null;
 }
 
 function parseSettings(raw: unknown): Body {
@@ -1081,6 +1100,9 @@ export class LegacyService implements OnModuleInit {
     private readonly requestCache: RequestCacheService,
     private readonly projectLookup: ProjectLookupService,
     private readonly kbExtractionRunner: KbExtractionRunnerService,
+    private readonly suitesCache: SuitesCacheService,
+    private readonly testcasesListCache: TestcasesListCacheService,
+    private readonly projectOverviewCache: ProjectOverviewCacheService,
     @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService
   ) {}
 
@@ -2249,10 +2271,35 @@ export class LegacyService implements OnModuleInit {
    */
   async projectsOverview(userId: string | null | undefined) {
     const uid = this.requireUser(userId);
+    // Never cached — always this user's own current membership set, fresh every call.
     const projects = await this.listProjects(uid);
     if (!projects.length) return [];
     const ids = projects.map((p: Record<string, any>) => String(p.id));
 
+    // Per-project aggregate fields are identical for every member of a project (every query below
+    // filters only on project_id, never on uid — confirmed directly against this same SQL), so they
+    // can be shared across users via a plain per-project cache. listProjects/ids above are never part
+    // of what's cached; only the aggregate half below is.
+    const cached = await this.projectOverviewCache.getMany<ProjectOverviewFields>(ids);
+    const missingIds = ids.filter((id) => !cached.has(id));
+    const computed = missingIds.length
+      ? await this.computeProjectOverviewFields(missingIds)
+      : new Map<string, ProjectOverviewFields>();
+    if (computed.size) await this.projectOverviewCache.setMany(computed);
+
+    return projects.map((project: Record<string, any>) => {
+      const id = String(project.id);
+      const fields = cached.get(id) ?? computed.get(id);
+      return { ...project, ...fields };
+    });
+  }
+
+  /**
+   * The five aggregate queries `projectsOverview` needs, scoped to exactly the given ids — callers
+   * pass only the ids that missed the cache, so a 100% cache hit skips this (and every query in it)
+   * entirely, and a 100% miss runs it exactly as it always has, for the full id list.
+   */
+  private async computeProjectOverviewFields(ids: string[]): Promise<Map<string, ProjectOverviewFields>> {
     const [cases, suites, members, runs, activity] = await Promise.all([
       // Mirrors listTestCases' default filters: live rows only, and Archived is not part of the
       // working repository (see the comment on listTestCases).
@@ -2332,8 +2379,8 @@ export class LegacyService implements OnModuleInit {
       membersByProject.set(row.project_id, list);
     }
 
-    return projects.map((project: Record<string, any>) => {
-      const id = String(project.id);
+    const result = new Map<string, ProjectOverviewFields>();
+    for (const id of ids) {
       const testCaseCount = caseCounts.get(id) ?? 0;
       const lastActivityAt = lastActivity.get(id) ?? null;
       const run = runByProject.get(id);
@@ -2346,8 +2393,7 @@ export class LegacyService implements OnModuleInit {
             totalCases: run.total_cases
           })
         : null;
-      return {
-        ...project,
+      result.set(id, {
         testCaseCount,
         suiteCount: suiteCounts.get(id) ?? 0,
         teamMembers: membersByProject.get(id) ?? [],
@@ -2361,8 +2407,9 @@ export class LegacyService implements OnModuleInit {
         // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A run that is nothing
         // but Skipped cases has no settled verdict, so this is null (rendered as "—"), not 0%.
         currentPassRate: metrics ? metrics.passRate : null
-      };
-    });
+      });
+    }
+    return result;
   }
 
   async createProject(userId: string | null | undefined, body: Body) {
@@ -2705,6 +2752,14 @@ export class LegacyService implements OnModuleInit {
    * at another project's suite, so the recursion re-scopes itself rather than trusting the chain.
    */
   async listSuites(projectId: string) {
+    const cached = await this.suitesCache.get<ReturnType<typeof toCamel>[]>(projectId);
+    if (cached !== undefined) return cached;
+    const rows = await this.listSuitesUncached(projectId);
+    await this.suitesCache.set(projectId, rows);
+    return rows;
+  }
+
+  private async listSuitesUncached(projectId: string) {
     const res = await this.db.query(
       `WITH RECURSIVE descendants AS (
          SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1
@@ -2755,23 +2810,29 @@ export class LegacyService implements OnModuleInit {
       "INSERT INTO suites (project_id, parent_id, name, position) VALUES ($1, $2, $3, $4) RETURNING id, parent_id, name, position, created_at",
       [projectId, body.parentId || null, name, Number(body.position || 0)]
     );
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
     return { ...toCamel(res.rows[0]), testCaseCount: 0, recursiveTestCaseCount: 0 };
   }
 
   async updateSuite(userId: string | null | undefined, suiteId: string, body: Body) {
-    await this.requireSuiteAccess(userId, suiteId);
+    const projectId = await this.requireSuiteAccess(userId, suiteId);
     validateBoundedField(body.name, "Suite name", SUITE_NAME_MAX_LENGTH);
     await this.db.query(
       "UPDATE suites SET name = COALESCE($2, name), parent_id = $3, position = COALESCE($4, position), updated_at = now() WHERE id = $1",
       [suiteId, body.name ?? null, body.parentId ?? null, body.position ?? null]
     );
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
   }
 
   async deleteSuite(userId: string | null | undefined, suiteId: string, mode = "moveToDefault") {
-    await this.requireSuiteAccess(userId, suiteId);
+    const projectId = await this.requireSuiteAccess(userId, suiteId);
     if (mode === "deleteTestcases") await this.db.query("DELETE FROM testcases WHERE suite_id = $1", [suiteId]);
     else await this.db.query("UPDATE testcases SET suite_id = NULL WHERE suite_id = $1", [suiteId]);
     await this.db.query("DELETE FROM suites WHERE id = $1", [suiteId]);
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
   }
 
   async listTestCasesForUser(userId: string | null | undefined, projectId: string, query: Body) {
@@ -2803,6 +2864,38 @@ export class LegacyService implements OnModuleInit {
   async listTestCases(projectId: string, query: Body) {
     const limit = pageNumber(query.limit, 100, 0, 500);
     const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    // Cacheable only when every filter dimension is absent — i.e. plain pagination through the whole
+    // (non-archived) repository, the shape a fresh page load and ordinary "next page" browsing both
+    // send. Checked against the raw query fields listTestCasesUncached itself branches on below, not
+    // a guessed subset — see Phase Set C's C2 for why includeArchived in particular had to be added
+    // here (it's a separate field from `status` that also widens the result set).
+    const cacheable = LegacyService.isNoFilterTestcasesQuery(query);
+    if (cacheable) {
+      const cached = await this.testcasesListCache.get<{ rows: Body[]; total: number }>(projectId, limit, offset);
+      if (cached !== undefined) return cached;
+    }
+    const result = await this.listTestCasesUncached(projectId, query, limit, offset);
+    if (cacheable) await this.testcasesListCache.set(projectId, limit, offset, result);
+    return result;
+  }
+
+  private static isNoFilterTestcasesQuery(query: Body): boolean {
+    return (
+      !query.suiteId &&
+      !query.includeDescendants &&
+      !query.status &&
+      !query.priority &&
+      !query.type &&
+      !query.automationStatus &&
+      !query.jiraIssueKey &&
+      !query.linearIssueKey &&
+      !query.search &&
+      !query.customFieldFilters &&
+      String(query.includeArchived ?? "").toLowerCase() !== "true"
+    );
+  }
+
+  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
     const filters: string[] = ["project_id = $1", "deleted_at IS NULL"];
     const values: any[] = [projectId];
     /*
@@ -3284,6 +3377,8 @@ export class LegacyService implements OnModuleInit {
   private async insertTestCase(projectId: string, uid: string, body: Body) {
     const created = await this.db.transaction(async (client) => this.insertTestCaseWithClient(client, projectId, uid, body));
     await this.logProjectActivity(projectId, uid, "testcase_created", "testcase", created.id, `${created.external_id} - ${created.title}`, { after: toCamel(created) });
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
     return toCamel(created);
   }
 
@@ -3413,6 +3508,8 @@ export class LegacyService implements OnModuleInit {
       testcaseIds: created.map((row) => row.id),
       count: created.length
     });
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
     return { created: created.map(toCamel), createdCount: created.length };
   }
 
@@ -3571,6 +3668,11 @@ export class LegacyService implements OnModuleInit {
           errors.push(...replay.errors);
         }
       });
+      // Per chunk, not once after the whole loop — a later chunk failing (and falling back to the
+      // row-by-row replay above) must not suppress invalidation for earlier chunks that already
+      // committed real testcases/suites writes.
+      await this.suitesCache.invalidate(projectId);
+      await this.testcasesListCache.invalidate(projectId);
     }
 
     errors.sort((a, b) => a.row - b.row);
@@ -4035,6 +4137,8 @@ export class LegacyService implements OnModuleInit {
       before: toCamel(before.rows[0]),
       after: toCamel(after)
     });
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
   }
 
   // No duplicate/clone endpoint existed before this feature. Added so "custom field
@@ -4094,6 +4198,8 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(src.project_id, uid, "testcase_duplicated", "testcase", duplicated.id, `${duplicated.external_id} - ${duplicated.title}`, {
       sourceId: id
     });
+    await this.suitesCache.invalidate(src.project_id);
+    await this.testcasesListCache.invalidate(src.project_id);
     return toCamel(duplicated);
   }
 
@@ -4108,6 +4214,8 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(before.rows[0].project_id, uid, "testcase_deleted", "testcase", id, `${before.rows[0].external_id} - ${before.rows[0].title}`, {
       before: toCamel(before.rows[0])
     });
+    await this.suitesCache.invalidate(before.rows[0].project_id);
+    await this.testcasesListCache.invalidate(before.rows[0].project_id);
   }
 
   async bulkUpdateTestCases(projectId: string, actorId: string | null | undefined, body: Body) {
@@ -4152,6 +4260,8 @@ export class LegacyService implements OnModuleInit {
       testcaseIds: ids,
       fields: { priority: body.priority || null, suiteId: body.suiteId || null, status: body.status || null, ownerId: body.ownerId || null, automationStatus: body.automationStatus || null }
     });
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
   }
 
   async bulkDeleteTestCases(projectId: string, actorId: string | null | undefined, ids: string[]) {
@@ -4163,6 +4273,8 @@ export class LegacyService implements OnModuleInit {
       [ids, uid]
     );
     await this.logProjectActivity(projectId, uid, "testcase_bulk_deleted", "testcase", null, null, { testcaseIds: ids });
+    await this.suitesCache.invalidate(projectId);
+    await this.testcasesListCache.invalidate(projectId);
   }
 
   /**
@@ -11329,6 +11441,8 @@ export class LegacyService implements OnModuleInit {
           }
           activity.push({ actor: "agent", title: `Moved ${movedIds.length} testcase(s) to suite`, detail: `${suite.name}${"created" in suite && suite.created ? " (created)" : ""}`, createdAt: new Date().toISOString() });
           await this.logProjectActivity(projectId, actorId, "zyra_moved_to_suite", "suite", suite.id, suite.name, { source: "zyra_chat", movedCount: movedIds.length, testcaseIds: movedIds, reason: op.reason || null });
+          await this.suitesCache.invalidate(projectId);
+          await this.testcasesListCache.invalidate(projectId);
         }
 
         // zyraMoveBreakdownSuffix's footer is DB-move ground truth ("Moved to suites (actual)") — it
@@ -13359,7 +13473,14 @@ export class LegacyService implements OnModuleInit {
 
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.zyraSaveAttempt(projectId, uid, taskId, body, selectedIndexes);
+        const result = await this.zyraSaveAttempt(projectId, uid, taskId, body, selectedIndexes);
+        // One call per whole save, not per entry — every per-entry write inside zyraSaveAttempt
+        // shares that single transaction, so this only runs once the entire batch has committed.
+        // Placed after the attempt succeeds (not in a finally/outside the loop), so a collision that
+        // triggers a retry below never fires a premature invalidation for the discarded attempt.
+        await this.suitesCache.invalidate(projectId);
+        await this.testcasesListCache.invalidate(projectId);
+        return result;
       } catch (error) {
         const collided =
           (error as { code?: string })?.code === "23505" &&

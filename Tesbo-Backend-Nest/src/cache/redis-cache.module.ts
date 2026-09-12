@@ -3,6 +3,9 @@ import Redis from "ioredis";
 import { AppConfigService } from "../config/app-config.service";
 import { EntitlementCacheService } from "./entitlement-cache.service";
 import { SessionCacheService } from "./session-cache.service";
+import { SuitesCacheService } from "./suites-cache.service";
+import { TestcasesListCacheService } from "./testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "./project-overview-cache.service";
 import { REDIS_CACHE_CLIENT } from "./redis-cache.tokens";
 
 const logger = new Logger("RedisCache");
@@ -45,9 +48,12 @@ export function buildRedisCacheClient(config: AppConfigService): Redis {
       useFactory: (config: AppConfigService) => buildRedisCacheClient(config)
     },
     SessionCacheService,
-    EntitlementCacheService
+    EntitlementCacheService,
+    SuitesCacheService,
+    TestcasesListCacheService,
+    ProjectOverviewCacheService
   ],
-  exports: [SessionCacheService, EntitlementCacheService]
+  exports: [SessionCacheService, EntitlementCacheService, SuitesCacheService, TestcasesListCacheService, ProjectOverviewCacheService]
 })
 export class RedisCacheModule implements OnApplicationShutdown {
   constructor(@Inject(REDIS_CACHE_CLIENT) private readonly client: Redis) {}
