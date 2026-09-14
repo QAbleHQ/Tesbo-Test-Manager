@@ -794,7 +794,7 @@ export class LegacyController {
       throw new BadRequestException({ error: "Run At must be a valid date and time" });
     }
     if (Date.parse(raw) <= Date.now()) {
-      throw new BadRequestException({ error: "Run At must be in the future" });
+      throw new BadRequestException({ error: "Date and time must be in future" });
     }
   }
 

@@ -351,11 +351,16 @@ test.describe("test case repository table — column drag-and-drop removed", () 
     await expect(idHeader).toContainText("ID");
     await expect(titleHeader).toContainText("Test case title");
 
-    // No draggable attribute and no grip icon left behind on any data column header.
+    // No draggable attribute left behind on any data column header.
     for (let i = 1; i < 8; i++) {
       expect(await headerCells.nth(i).getAttribute("draggable")).toBeNull();
     }
-    await expect(idHeader.locator("svg")).toHaveCount(0);
+    // The ID header does carry an icon again now — a sort-toggle icon (ID/Test case title/Priority
+    // are sortable columns), added after this test last ran green. That's a different icon for a
+    // different, intentional feature, not a regression of the removed drag grip: this asserts it's
+    // specifically the sort control (no IconGripVertical import exists anywhere in the component
+    // any more) rather than re-asserting "no icon of any kind" in that header.
+    await expect(idHeader.getByRole("button", { name: "Sort by ID" })).toBeVisible();
 
     // A drag attempt from the title header onto the ID header must be inert now — no dataTransfer
     // handlers remain, so this is at most a plain mouse drag, and column order stays put.
@@ -381,5 +386,99 @@ test.describe("test case repository table — column drag-and-drop removed", () 
 
     const after = await idHeader.evaluate((el) => el.getBoundingClientRect().width);
     expect(after).toBeGreaterThan(before + 30);
+  });
+});
+
+// The repository's ID/Test case title/Priority column sort, added to match the Test Runs table's
+// own column sort (testcases/page.tsx toggleSuiteCasesSort). listTestCases's sortBy/sortDir
+// (legacy.service.ts, see api/testcases.spec.ts's "sort" describe) is a real, tested server
+// capability, but the screen no longer calls it for this: an initial report that sorting "took too
+// long" traced back to every click being its own full refetch, so the page now loads the whole
+// filtered batch once (up to MAX_PAGE_SIZE) and sorts/paginates it entirely client-side afterward —
+// same architecture the Test Runs table already used. These UI tests cover what the API tests
+// can't: that a click actually reorders what's on screen with no fetch at all, and that the one
+// thing that still does refetch (an actual filter change) doesn't blank the table while in flight.
+test.describe("test case repository table — column sort", () => {
+  test("the Test case title header sorts the visible rows ascending, then descending on a second click", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Sort Title ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      for (const suffix of ["Zeta", "Alpha", "Mango"]) {
+        const res = await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${marker} ${suffix}` } });
+        created.push((await res.json()).id);
+      }
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      // Title cells render as a <button> whose text is the title; the ID column's own button holds
+      // only the external id (e.g. "PRO-TC-42"), which never contains this marker, so filtering on
+      // marker text is unambiguous regardless of which column position title happens to be in.
+      const titleButtons = () => page.locator("table.tc-repo-table tbody tr td button", { hasText: marker });
+      await expect(titleButtons()).toHaveCount(3);
+
+      // Once the filtered batch has landed, sorting must not issue any further request to the
+      // testcases list endpoint at all — this is the whole point of the fix (a sort click used to be
+      // its own full refetch, which is what made it feel slow).
+      let listRequestsAfterInitialLoad = 0;
+      page.on("request", (req) => {
+        if (req.method() === "GET" && new URL(req.url()).pathname === `/api/projects/${ctx.projectId}/testcases`) {
+          listRequestsAfterInitialLoad += 1;
+        }
+      });
+
+      const sortByTitle = page.getByRole("button", { name: "Sort by Test case title" });
+      await expect(sortByTitle).toBeVisible();
+      await sortByTitle.click();
+
+      await expect(page.getByRole("button", { name: "Sort by Test case title, currently ascending" })).toBeVisible();
+      // Polled rather than a one-shot read: the row order updates the instant the click is handled
+      // (a client-side derive, not awaiting any response), and while that's effectively synchronous
+      // with the click, polling avoids any flakiness in exactly when Playwright observes it.
+      await expect.poll(() => titleButtons().allTextContents()).toEqual([`${marker} Alpha`, `${marker} Mango`, `${marker} Zeta`]);
+
+      await sortByTitle.click();
+      await expect(page.getByRole("button", { name: "Sort by Test case title, currently descending" })).toBeVisible();
+      await expect.poll(() => titleButtons().allTextContents()).toEqual([`${marker} Zeta`, `${marker} Mango`, `${marker} Alpha`]);
+
+      expect(listRequestsAfterInitialLoad, "sorting should not refetch the list from the server").toBe(0);
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("changing a filter keeps the existing rows on screen during the refetch, instead of replacing the table with a loading message", async ({
+    page,
+  }) => {
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+    const firstRow = page.locator("table.tc-repo-table tbody tr").first();
+    await expect(firstRow).toBeVisible();
+
+    // Slows down just the repository list's own GET (not the same path's POST, which creates a
+    // test case) so the in-flight state can be observed deterministically instead of racing a
+    // normally-fast local response.
+    await page.route(
+      (url) => url.pathname === `/api/projects/${ctx.projectId}/testcases`,
+      async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        await route.continue();
+      }
+    );
+
+    // Sort and pagination no longer touch the network at all (see the test above), so a filter
+    // change is the one thing left that still refetches — this is what exercises that refetch path.
+    await page.getByPlaceholder("Search by ID, title, or type").fill("zzz-unlikely-to-match-anything-at-all");
+
+    // While that delayed request is in flight: the table's own rows are still there — not torn down
+    // and replaced by the full-page "Loading test cases..." message, which only ever applies to the
+    // very first load — and a small, non-blocking indicator says a refresh is under way.
+    await expect(page.getByText("Loading test cases...")).toHaveCount(0);
+    await expect(firstRow).toBeVisible();
+    await expect(page.getByText("Updating…")).toBeVisible();
+
+    // And once the delayed response lands, the indicator clears again.
+    await expect(page.getByText("Updating…")).toHaveCount(0, { timeout: 5000 });
   });
 });

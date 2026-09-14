@@ -1347,6 +1347,9 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
+    sortBy?: "id" | "title" | "priority";
+    sortDir?: "asc" | "desc";
   }
 ): Promise<{ list: TestCaseListItem[]; total: number }> {
   const sp = new URLSearchParams();
@@ -1362,6 +1365,8 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
+  if (params?.sortBy) sp.set("sortBy", params.sortBy);
+  if (params?.sortDir) sp.set("sortDir", params.sortDir);
   const path = `/api/projects/${projectId}/testcases?${sp}`;
   // This function hand-rolls its own fetch (X-Total-Count header, a different error shape) instead
   // of going through api() above, so it needs its own dedupeInFlight call to get the same

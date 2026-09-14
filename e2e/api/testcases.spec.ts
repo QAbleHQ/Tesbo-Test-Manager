@@ -1288,3 +1288,138 @@ test.describe("pagination", () => {
     }
   });
 });
+
+test.describe("sort", () => {
+  /*
+   * The repository table's ID/Test case title/Priority column sort (frontend: RepositoryTestCaseTable,
+   * toggled from testcases/page.tsx and backed by legacy.service.ts listTestCases's new `sortBy`/
+   * `sortDir` params). Added to give the repository the same sort affordance the Test Runs table
+   * already had — see cycles/[cycleId]/page.tsx's SortableColumnHeader/toggleRunSort for the pattern
+   * this mirrors. Unlike the Test Runs table (which sorts a fully-loaded, unpaginated list
+   * client-side), the repository is server-paginated, so the sort has to be a real ORDER BY, not a
+   * client-side re-sort of whatever page happened to load — these tests exercise the query params
+   * directly rather than the screen.
+   */
+  const numericSuffix = (externalId: string): number => {
+    const match = String(externalId).match(/(\d+)(?!.*\d)/);
+    return match ? parseInt(match[1], 10) : NaN;
+  };
+
+  test("sortBy=id orders by the numeric ID sequence in both directions, and the two directions are exact reverses", async ({ request }) => {
+    const marker = `E2E Sort Id ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      for (let i = 0; i < 5; i++) created.push((await createCase(request, { title: `${marker} ${i}` })).id);
+
+      const listExternalIds = async (sortDir: "asc" | "desc") => {
+        const res = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+          params: { search: marker, sortBy: "id", sortDir },
+        });
+        expect(res.ok(), `sortBy=id&sortDir=${sortDir} — ${await res.text()}`).toBeTruthy();
+        return (await res.json()).map((tc: { externalId: string }) => tc.externalId);
+      };
+
+      const ascending = await listExternalIds("asc");
+      const descending = await listExternalIds("desc");
+      expect(ascending, "should return every fixture row").toHaveLength(5);
+
+      // A true ID sequence, not a lexical string sort — the numeric suffix must be non-decreasing.
+      const ascNumbers = ascending.map(numericSuffix);
+      for (let i = 1; i < ascNumbers.length; i++) {
+        expect(ascNumbers[i], `row ${i} (${ascending[i]}) is out of numeric sequence after ${ascending[i - 1]}`).toBeGreaterThan(
+          ascNumbers[i - 1]
+        );
+      }
+      // desc is exactly asc reversed, not an independently-computed (and possibly divergent) order.
+      expect(descending).toEqual([...ascending].reverse());
+    } finally {
+      for (const id of created) await deleteCase(request, id);
+    }
+  });
+
+  test("sortBy=title sorts alphabetically, case-insensitively, independent of creation order", async ({ request }) => {
+    const marker = `e2e-sort-title-${Date.now()}`;
+    // Deliberately created out of alphabetical order, and mixed-case, so a passing sort can only be
+    // the result of actually sorting rather than happening to match insertion order.
+    const titles = [`${marker} Zebra`, `${marker} apple`, `${marker} Mango`, `${marker} banana`];
+    const created: string[] = [];
+    try {
+      for (const title of titles) created.push((await createCase(request, { title })).id);
+
+      const listTitles = async (sortDir: "asc" | "desc") => {
+        const res = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+          params: { search: marker, sortBy: "title", sortDir },
+        });
+        expect(res.ok(), `sortBy=title&sortDir=${sortDir} — ${await res.text()}`).toBeTruthy();
+        return (await res.json()).map((tc: { title: string }) => tc.title);
+      };
+
+      const expectedAscending = [...titles].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+      expect(await listTitles("asc")).toEqual(expectedAscending);
+      expect(await listTitles("desc")).toEqual([...expectedAscending].reverse());
+    } finally {
+      for (const id of created) await deleteCase(request, id);
+    }
+  });
+
+  test("sortBy=priority ranks P0 (Critical) through P3 (Low), with no priority sorting last regardless of direction", async ({
+    request,
+  }) => {
+    const marker = `E2E Sort Priority ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      // Created in a deliberately scrambled order, and one row left with no priority at all — the
+      // canonical rank must win over both creation order and plain alphabetical priority order
+      // (which would put "P3" before "P0" only by coincidence, so this also covers that).
+      const noPriority = (await createCase(request, { title: `${marker} none` })).id;
+      const p2 = (await createCase(request, { title: `${marker} p2`, priority: "P2" })).id;
+      const p0 = (await createCase(request, { title: `${marker} p0`, priority: "P0" })).id;
+      const p3 = (await createCase(request, { title: `${marker} p3`, priority: "P3" })).id;
+      const p1 = (await createCase(request, { title: `${marker} p1`, priority: "P1" })).id;
+      created.push(noPriority, p2, p0, p3, p1);
+
+      const listIds = async (sortDir: "asc" | "desc") => {
+        const res = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+          params: { search: marker, sortBy: "priority", sortDir },
+        });
+        expect(res.ok(), `sortBy=priority&sortDir=${sortDir} — ${await res.text()}`).toBeTruthy();
+        return (await res.json()).map((tc: { id: string }) => tc.id);
+      };
+
+      expect(await listIds("asc")).toEqual([p0, p1, p2, p3, noPriority]);
+      // Descending flips the canonical ranking, but "no priority" still sorts last, not first —
+      // it is excluded from the field being reversed, the same way the frontend's comparePriority()
+      // ranks a missing priority one past the end of the canonical set in both directions.
+      expect(await listIds("desc")).toEqual([p3, p2, p1, p0, noPriority]);
+    } finally {
+      for (const id of created) await deleteCase(request, id);
+    }
+  });
+
+  test("omitting sortBy, or sending an unrecognized one, falls back to the existing default order rather than erroring", async ({
+    request,
+  }) => {
+    const marker = `E2E Sort Default ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      created.push((await createCase(request, { title: `${marker} a` })).id);
+      created.push((await createCase(request, { title: `${marker} b` })).id);
+      const newestFirst = [...created].reverse();
+
+      const noSortBy = await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { search: marker } });
+      expect(noSortBy.ok()).toBeTruthy();
+      expect((await noSortBy.json()).map((tc: { id: string }) => tc.id)).toEqual(newestFirst);
+
+      // An unrecognized column name is not forwarded into SQL (see the allow-list in
+      // legacy.service.ts) — it degrades to the default order instead of a 500 or a 400.
+      const bogus = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: marker, sortBy: "'; DROP TABLE testcases; --" },
+        failOnStatusCode: false,
+      });
+      expect(bogus.status(), `an unrecognized sortBy should not error — ${await bogus.text()}`).toBe(200);
+      expect((await bogus.json()).map((tc: { id: string }) => tc.id)).toEqual(newestFirst);
+    } finally {
+      for (const id of created) await deleteCase(request, id);
+    }
+  });
+});
