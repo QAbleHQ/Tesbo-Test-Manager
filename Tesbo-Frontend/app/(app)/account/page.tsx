@@ -250,7 +250,7 @@ export default function AccountPage() {
           */}
         <form onSubmit={handleProfileSubmit} className="space-y-4">
           <Field>
-            <FieldLabel htmlFor="account-first-name">First name</FieldLabel>
+            <FieldLabel htmlFor="account-first-name">First Name</FieldLabel>
             <div className="flex items-center gap-2">
               <Input
                 id="account-first-name"
@@ -286,7 +286,7 @@ export default function AccountPage() {
           </Field>
 
           <Field>
-            <FieldLabel htmlFor="account-last-name">Last name</FieldLabel>
+            <FieldLabel htmlFor="account-last-name">Last Name</FieldLabel>
             <div className="flex items-center gap-2">
               <Input
                 id="account-last-name"
@@ -329,7 +329,7 @@ export default function AccountPage() {
           </Field>
 
           <Field>
-            <FieldLabel htmlFor="account-mobile-number">Mobile number</FieldLabel>
+            <FieldLabel htmlFor="account-mobile-number">Mobile Number</FieldLabel>
             <div className="flex items-center gap-2">
               <PhoneInput
                 id="account-mobile-number"
@@ -368,7 +368,7 @@ export default function AccountPage() {
 
           <div className="flex justify-end">
             <Button type="submit" disabled={profileSaving || !anyFieldEditing}>
-              {profileSaving ? "Saving…" : "Save profile"}
+              {profileSaving ? "Saving…" : "Save Profile"}
             </Button>
           </div>
         </form>
@@ -377,7 +377,7 @@ export default function AccountPage() {
       <Card className="p-5">
         <div className="mb-4">
           <h2 className="text-base font-semibold text-[var(--foreground)]">
-            {hasPassword ? "Change password" : "Set a password"}
+            {hasPassword ? "Change Password" : "Set a password"}
           </h2>
           <p className="mt-1 text-sm text-[var(--muted)]">
             {hasPassword
