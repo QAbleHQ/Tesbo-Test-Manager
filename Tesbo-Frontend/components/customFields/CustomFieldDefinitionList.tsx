@@ -172,7 +172,7 @@ export default function CustomFieldDefinitionList({
                 <th className="px-4 py-3 font-medium">Required</th>
                 <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium">In use</th>
-                <th className="px-4 py-3 font-medium text-right">Actions</th>
+                <th className="px-4 py-3 font-medium text-center">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -269,8 +269,8 @@ export default function CustomFieldDefinitionList({
                       </StatusChip>
                     </td>
                     <td className="px-4 py-3 text-[var(--muted)]">{definition.isUsed ? "Yes" : "No"}</td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex items-center justify-end gap-1">
+                    <td className="px-4 py-3 text-center">
+                      <div className="flex items-center justify-center gap-1">
                         {!isArchived && (
                           <>
                             <Button
@@ -351,8 +351,8 @@ export default function CustomFieldDefinitionList({
                       </StatusChip>
                     </td>
                     <td className="px-4 py-3 text-[var(--muted)]">{definition.isUsed ? "Yes" : "No"}</td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex justify-end gap-2">
+                    <td className="px-4 py-3 text-center">
+                      <div className="flex justify-center gap-2">
                         <button
                           type="button"
                           onClick={() => undoDelete(definition)}

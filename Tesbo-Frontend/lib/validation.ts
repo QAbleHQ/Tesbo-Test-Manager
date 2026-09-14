@@ -314,6 +314,6 @@ export function validateScheduleRunAt(value: string): string {
   if (!value) return "Run At is required";
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) return "Run At must be a valid date and time";
-  if (ms <= Date.now()) return "Run At must be in the future";
+  if (ms <= Date.now()) return "Date and time must be in future";
   return "";
 }

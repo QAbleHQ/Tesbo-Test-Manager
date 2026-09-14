@@ -244,7 +244,7 @@ export default function ScheduleRunsPage() {
                   min={toDatetimeLocalValue(new Date())}
                   onChange={(e) => {
                     setRunAt(e.target.value);
-                    if (runAtError && !validateScheduleRunAt(e.target.value)) setRunAtError("");
+                    setRunAtError(validateScheduleRunAt(e.target.value));
                   }}
                   required
                 />
