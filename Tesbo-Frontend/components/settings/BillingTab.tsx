@@ -8,7 +8,6 @@ import {
   getBillingInfo,
   getBillingInvoices,
   getBillingUsage,
-  getWorkspace,
   reconcileBilling,
   type BillingHistoryEntry,
   type BillingInfo,
@@ -18,6 +17,7 @@ import {
 import { Button, Card, PageLoader } from "@/components/ui";
 import { cx } from "@/components/ui/cx";
 import PricingModal from "@/components/PricingModal";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 function formatDate(iso: string | null): string {
   if (!iso) return "";
@@ -82,8 +82,8 @@ function UsageBar({ label, used, limit, usedLabel, limitLabel }: {
 export default function BillingTab() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { workspace } = useAppData();
   const [loading, setLoading] = useState(true);
-  const [isOwner, setIsOwner] = useState(false);
   const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [usage, setUsage] = useState<PlanUsageSummary | null>(null);
   const [history, setHistory] = useState<BillingHistoryEntry[]>([]);
@@ -93,10 +93,11 @@ export default function BillingTab() {
   const [redirecting, setRedirecting] = useState(false);
   const [pricingOpen, setPricingOpen] = useState(false);
 
+  const isOwner = (workspace?.role || "").toLowerCase() === "owner";
+
   const load = useCallback(async () => {
     try {
-      const [workspace, billing, usageSummary] = await Promise.all([getWorkspace(), getBillingInfo(), getBillingUsage()]);
-      setIsOwner((workspace.role || "").toLowerCase() === "owner");
+      const [billing, usageSummary] = await Promise.all([getBillingInfo(), getBillingUsage()]);
       setBillingInfo(billing);
       setUsage(usageSummary);
       // Secondary panels: a failure here shouldn't blank the plan card above it, so they settle

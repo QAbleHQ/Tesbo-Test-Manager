@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, forwardRef, Inject, Injectable
 import { randomBytes, randomUUID } from "crypto";
 import { DatabaseService } from "../database/database.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { isUuid, LegacyService } from "../legacy/legacy.service";
 import { buildCustomFieldFiltersSql } from "./custom-field-filters";
 import { applyDefaultIfMissing, isEmptyValue, validateAndNormalizeValue, validateConfigShape } from "./custom-field-validation";
@@ -99,6 +100,7 @@ export class CustomFieldsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly planLimits: PlanLimitsService,
+    private readonly projectLookup: ProjectLookupService,
     @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService
   ) {}
 
@@ -495,7 +497,8 @@ export class CustomFieldsService {
     testcaseId: string,
     values: Body,
     runner: QueryRunner = this.db,
-    mode: "enforce" | "skip-if-disabled" = "enforce"
+    mode: "enforce" | "skip-if-disabled" = "enforce",
+    options: { testCaseIsNew?: boolean } = {}
   ): Promise<void> {
     if (mode === "enforce") {
       await this.legacy.requireProjectAccess(actorId, projectId);
@@ -513,7 +516,7 @@ export class CustomFieldsService {
 
     const context = await this.loadWriteContext(projectId, runner, mode);
     if (!context) return;
-    await this.setValuesWithContext(actorId, projectId, testcaseId, values, context, runner);
+    await this.setValuesWithContext(actorId, projectId, testcaseId, values, context, runner, options);
   }
 
   /**
@@ -533,8 +536,12 @@ export class CustomFieldsService {
     mode: "enforce" | "skip-if-disabled" = "skip-if-disabled"
   ): Promise<CustomFieldWriteContext | null> {
     try {
-      const orgRes = await runner.query<{ organization_id: string }>("SELECT organization_id FROM projects WHERE id = $1", [projectId]);
-      const organizationId = orgRes.rows[0]?.organization_id;
+      // Memoized per-request by ProjectLookupService when `runner` is the default pool (the common
+      // case here); bypassed to a live read through `runner` untouched when a caller passes an
+      // explicit transaction client, so this never serves a stale value to a caller reading inside
+      // the testcase-external-id advisory lock (see ProjectLookupService's own doc comment).
+      const project = await this.projectLookup.getProjectBasics(projectId, runner === this.db ? undefined : runner);
+      const organizationId = project?.organizationId;
       if (organizationId) await this.planLimits.assertCustomFieldsEnabled(organizationId);
     } catch (err) {
       if (mode === "skip-if-disabled") return null;

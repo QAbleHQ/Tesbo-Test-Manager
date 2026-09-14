@@ -3,13 +3,15 @@ import { randomBytes, randomInt, createHash } from "crypto";
 import { DatabaseService } from "../database/database.service";
 import { AppConfigService } from "../config/app-config.service";
 import { EmailService } from "./email.service";
+import { SessionCacheService } from "../cache/session-cache.service";
 
 @Injectable()
 export class OtpService {
   constructor(
     private readonly db: DatabaseService,
     private readonly config: AppConfigService,
-    private readonly email: EmailService
+    private readonly email: EmailService,
+    private readonly sessionCache: SessionCacheService
   ) {}
 
   async requestOtp(rawEmail: string, _ipAddress?: string | null, _userAgent?: string | null): Promise<boolean> {
@@ -64,21 +66,38 @@ export class OtpService {
 
   async resolveSession(sessionToken: string): Promise<string | null> {
     if (!sessionToken?.trim()) return null;
-    const result = await this.db.query<{ user_id: string }>(
-      "SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > now()",
-      [this.hash(sessionToken)]
+    const tokenHash = this.hash(sessionToken);
+
+    // Redis-backed cache, checked before Postgres: undefined = miss (fall through below), null =
+    // known-invalid, string = the cached userId. A cache error already reads as undefined (miss), so
+    // this is never worse than skipping the cache entirely.
+    const cached = await this.sessionCache.get(tokenHash);
+    if (cached !== undefined) return cached;
+
+    const result = await this.db.query<{ user_id: string; expires_at: string }>(
+      "SELECT user_id, expires_at FROM sessions WHERE token_hash = $1 AND expires_at > now()",
+      [tokenHash]
     );
-    return result.rows[0]?.user_id ?? null;
+    const row = result.rows[0];
+    if (!row) {
+      await this.sessionCache.setInvalid(tokenHash);
+      return null;
+    }
+    await this.sessionCache.setValid(tokenHash, row.user_id, new Date(row.expires_at));
+    return row.user_id;
   }
 
   async invalidateSession(sessionToken: string): Promise<void> {
     if (!sessionToken?.trim()) return;
-    await this.db.query("DELETE FROM sessions WHERE token_hash = $1", [this.hash(sessionToken)]);
+    const tokenHash = this.hash(sessionToken);
+    await this.db.query("DELETE FROM sessions WHERE token_hash = $1", [tokenHash]);
+    await this.sessionCache.invalidateToken(tokenHash);
   }
 
   /** Signs the user out of every session, including the one making this call. */
   async invalidateAllSessions(userId: string): Promise<void> {
     await this.db.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+    await this.sessionCache.invalidateAllForUser(userId);
   }
 
   private async markOtpUsed(otpId: string): Promise<void> {
