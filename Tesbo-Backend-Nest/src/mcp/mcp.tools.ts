@@ -184,7 +184,12 @@ export function buildMcpTools(): McpTool[] {
         if (projectId !== ctx.projectId) {
           throw new McpError(RpcCode.ProjectScopeDenied, "Execution belongs to a different project than this token");
         }
-        await ctx.legacy.updateExecution(executionId, ctx.actorId, args);
+        // updateExecution's second argument must be a real user id: it runs requireProjectAccess
+        // (workspace/organization_members lookup) before writing, and also stores it as
+        // executions.executed_by, which — unlike testcases/bugs' created_by — references users(id),
+        // not actors(id). ctx.actorId (the "tesbo-mcp" agent) has no organization_members row, so
+        // passing it here 404'd as "Workspace not found" for every caller, every time.
+        await ctx.legacy.updateExecution(executionId, ctx.userId, args);
         return { ok: true, executionId, status: args.status };
       }
     },
