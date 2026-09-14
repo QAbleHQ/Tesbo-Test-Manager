@@ -125,6 +125,18 @@ export class AppConfigService {
   // zyraSaveAttempt at all), so today's exact per-row behavior stays the default until this has been
   // explicitly verified and someone deliberately opts in.
   readonly zyraSetBasedSaveEnabled = this.string("ZYRA_SET_BASED_SAVE_ENABLED", "false").trim().toLowerCase() === "true";
+  // Kill switch for the Redis-backed suites-tree read cache (src/cache/suites-cache.service.ts).
+  // Off falls straight through to today's uncached listSuites() query on every call, exactly as if
+  // this phase had never shipped.
+  readonly suitesCacheEnabled = this.string("SUITES_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for the Redis-backed unfiltered-testcases-list cache (src/cache/testcases-list-cache.service.ts).
+  // Off falls straight through to today's uncached listTestCases() query for every call, exactly as
+  // if this optional phase had never shipped.
+  readonly testcasesListCacheEnabled = this.string("TESTCASES_LIST_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for the Redis-backed per-project overview cache (src/cache/project-overview-cache.service.ts).
+  // TTL-only by design (see that file's own comment) — off falls straight through to today's
+  // always-fresh listProjects()+5-query-batch, exactly as if this phase had never shipped.
+  readonly projectOverviewCacheEnabled = this.string("PROJECT_OVERVIEW_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
 
   private loadEnv(): Record<string, string | undefined> {
     const dotenvPath = this.findDotEnvPath();

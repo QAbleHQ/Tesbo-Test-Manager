@@ -14,6 +14,10 @@ import { CustomFieldsService } from "../custom-fields/custom-fields.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 /**
  * DB test double for the invitation surface of LegacyService.
@@ -103,6 +107,9 @@ function makeService(dbOpts: Parameters<typeof makeDb>[0] = {}, emailOverrides: 
   } as unknown as EmailService;
   const config = { frontendUrl: "https://app.tesbo.io" } as unknown as AppConfigService;
   const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   const svc = new LegacyService(
     db,
     email,
@@ -117,6 +124,9 @@ function makeService(dbOpts: Parameters<typeof makeDb>[0] = {}, emailOverrides: 
     requestCache,
     new ProjectLookupService(db, requestCache),
     {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
   return { svc, db, query, txQuery, email };
