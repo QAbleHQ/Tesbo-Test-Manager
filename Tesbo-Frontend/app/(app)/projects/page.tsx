@@ -12,8 +12,9 @@ import {
   IconPlus,
   IconSearch,
 } from "@tabler/icons-react";
-import { listProjects, listProjectsOverview, createProject, getWorkspace } from "@/lib/api";
-import type { ProjectIcon, ProjectSummary, ProjectType } from "@/lib/api";
+import { listProjectsOverview, createProject } from "@/lib/api";
+import type { ProjectIcon, ProjectOverview, ProjectSummary, ProjectType } from "@/lib/api";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 import {
   Button,
   Card,
@@ -115,6 +116,15 @@ function sortProjects(projects: ProjectWithStats[], sortBy: SortOption): Project
 
 function projectColor(seed: string): string {
   return avatarColor(seed);
+}
+
+/** Merges a fetched-or-cached overview onto the base list, same shape either way. */
+function applyOverviewStats(list: ProjectWithStats[], overview: ProjectOverview[]): ProjectWithStats[] {
+  const stats = new Map(overview.map((o) => [o.id, o]));
+  return list.map((p) => {
+    const s = stats.get(p.id);
+    return s ? { ...p, ...s, projectType: p.projectType, statsLoaded: true } : p;
+  });
 }
 
 const STATUS_META: Record<ProjectStatus, { label: string; text: string; dot: string; fill: string }> = {
@@ -326,7 +336,7 @@ function ProjectsToolbar({
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search projects"
             aria-label="Search projects by name or keyword"
-            className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none placeholder:text-[var(--muted-soft)]"
+            className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
           />
         </label>
         <SortMenu sortBy={sortBy} onSortChange={onSortChange} />
@@ -359,7 +369,7 @@ function ProjectsToolbar({
 
 function ProjectsPageContent() {
   const router = useRouter();
-  const { currentUser } = useAppData();
+  const { currentUser, workspace, projects: appProjects, refetchProjects } = useAppData();
   const searchParams = useSearchParams();
   const [projects, setProjects] = useState<ProjectWithStats[]>([]);
   const [loading, setLoading] = useState(true);
@@ -403,61 +413,48 @@ function ProjectsPageContent() {
       return;
     }
     /*
-     * First paint depends on these two calls and nothing else.
-     *
-     * It used to depend on seventy-eight: the list, then five stat calls per project, all awaited
-     * before `setLoading(false)` ran in the outer chain's `finally`. The per-call `.catch()`
-     * guards below survive from that version and are still worth having, but a catch protects
-     * against a rejection, not against latency — one slow call held the spinner and the page
-     * showed nothing at all until the slowest of seventy-five returned.
-     *
-     * So the cards render from `/api/projects` as soon as it lands, and the stats arrive
-     * afterwards from a single `/api/projects/overview`. A slow or failed overview now costs the
-     * numbers on the cards, not the list.
+     * First paint depends on nothing but what AppDataProvider already fetched — workspace and the
+     * project list are already resolved by the time this page mounts (it renders inside the same
+     * (app) layout that blocks on them), so the cards paint synchronously from context instead of
+     * waiting on this page's own getWorkspace()+listProjects() call, which used to gate first paint
+     * here. Only the per-project stats still cost a network call, via listProjectsOverview() below —
+     * seeded from a same-session cache hit if one exists (same seed-then-revalidate pattern as
+     * dashboard/testcases), so a revisit within this SPA session shows real numbers immediately
+     * instead of every card's "—" placeholders while listProjectsOverview() is in flight again.
      */
-    Promise.all([getWorkspace().catch(() => null), listProjects()])
-      .then(([workspace, list]) => {
-        if (cancelled) return;
-        setWorkspaceRole((workspace?.role || "").toLowerCase());
-        setProjects(
-          list.map((p) => ({
-            ...p,
-            projectType: (p.projectType || "tesbox") as ProjectType,
-            statsLoaded: false,
-            testCaseCount: 0,
-            suiteCount: 0,
-            teamMembers: [],
-            lastActivityAt: null,
-            status: "configured" as ProjectStatus,
-            runCounts: null,
-            currentPassRate: null,
-          })),
-        );
-        setLoading(false);
+    setWorkspaceRole((workspace?.role || "").toLowerCase());
+    const baseList: ProjectWithStats[] = appProjects.map((p) => ({
+      ...p,
+      projectType: (p.projectType || "tesbox") as ProjectType,
+      statsLoaded: false,
+      testCaseCount: 0,
+      suiteCount: 0,
+      teamMembers: [],
+      lastActivityAt: null,
+      status: "configured" as ProjectStatus,
+      runCounts: null,
+      currentPassRate: null,
+    }));
+    const overviewCacheKey = `projects:overview:${workspace?.id ?? "default"}`;
+    const cachedOverview = getPageCache<ProjectOverview[]>(overviewCacheKey);
+    setProjects(cachedOverview ? applyOverviewStats(baseList, cachedOverview) : baseList);
+    setLoading(false);
 
-        return listProjectsOverview()
-          .then((overview) => {
-            if (cancelled) return;
-            const stats = new Map(overview.map((o) => [o.id, o]));
-            setProjects((current) =>
-              current.map((p) => {
-                const s = stats.get(p.id);
-                return s ? { ...p, ...s, projectType: p.projectType, statsLoaded: true } : p;
-              }),
-            );
-          })
-          // A failed overview leaves the cards on the list's own fields rather than blanking
-          // them — the same "degrade one thing, not the whole list" rule the old per-call
-          // catches enforced, applied to the call that replaced them.
-          .catch(() => undefined);
+    listProjectsOverview()
+      .then((overview) => {
+        if (cancelled) return;
+        setPageCache(overviewCacheKey, overview);
+        setProjects((current) => applyOverviewStats(current, overview));
       })
-      .catch(() => {
-        if (!cancelled) setLoading(false);
-      });
+      // A failed overview leaves the cards on the list's own (or cached) fields rather than
+      // blanking them — the same "degrade one thing, not the whole list" rule the old per-call
+      // catches enforced, applied to the call that replaced them.
+      .catch(() => undefined);
+
     return () => {
       cancelled = true;
     };
-  }, [router, currentUser]);
+  }, [router, currentUser, workspace, appProjects]);
 
   /*
    * Closing discards the draft. Leaving it behind meant reopening the modal showed the abandoned
@@ -526,6 +523,10 @@ function ProjectsPageContent() {
       setCreateKeyError("");
       setCreateDescriptionError("");
       setCreateIconGlyphError("");
+      // Awaited so the workspace-level project list (TopBar's switcher, and this page on a later
+      // back-navigation) already includes the new project by the time we leave this page — a
+      // fire-and-forget refresh would leave both stale until some unrelated remount refetched them.
+      await refetchProjects();
       router.push(`/projects/${created.id}/dashboard`);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create project");

@@ -6,6 +6,8 @@ import { ProjectWriteLockGuard } from "./plan-limits/project-write-lock.guard";
 import { ConfigModule } from "./config/config.module";
 import { AppConfigService } from "./config/app-config.service";
 import { DatabaseModule } from "./database/database.module";
+import { RequestCacheModule } from "./request-cache/request-cache.module";
+import { RedisCacheModule } from "./cache/redis-cache.module";
 import { AuditModule } from "./audit/audit.module";
 import { AuthModule } from "./auth/auth.module";
 import { SetupModule } from "./setup/setup.module";
@@ -21,6 +23,8 @@ import { AutomationModule } from "./automation/automation.module";
   imports: [
     ConfigModule,
     DatabaseModule,
+    RequestCacheModule,
+    RedisCacheModule,
     BullModule.forRootAsync({
       inject: [AppConfigService],
       useFactory: (config: AppConfigService) => ({ connection: { url: config.redisUrl } })

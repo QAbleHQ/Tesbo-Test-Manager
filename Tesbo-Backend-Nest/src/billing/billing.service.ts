@@ -442,6 +442,7 @@ export class BillingService {
               WHERE id = $2`,
             [subscriptionId, organizationId]
           );
+          await this.planLimits.invalidateEntitlementCache(organizationId);
           /*
            * The upgrade is recorded HERE, not in applySubscriptionState.
            *
@@ -1005,6 +1006,7 @@ export class BillingService {
         organizationId
       ]
     );
+    await this.planLimits.invalidateEntitlementCache(organizationId);
 
     // History entries, so the workspace can see what changed and when without reading Stripe.
     const intervalLabel = billingInterval ?? "";

@@ -104,7 +104,7 @@ export default function ProjectSettingsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
-  const { currentUser } = useAppData();
+  const { currentUser, refetchProjects } = useAppData();
   const { project, projectMembers, refetchProject, refetchMembers } = useProjectData();
   const [name, setName] = useState(() => (project.name as string) ?? "");
   const [description, setDescription] = useState(() => (project.description as string) ?? "");
@@ -319,6 +319,9 @@ export default function ProjectSettingsPage() {
         icon: { color: icon.color, glyph: icon.glyph?.trim() || null },
       });
       const refreshed = await refetchProject();
+      // The workspace-level project list (TopBar's switcher) carries this project's name/icon too —
+      // without this it keeps showing the pre-rename value until some unrelated remount refetches it.
+      await refetchProjects();
       const refreshedSettings = parseProjectSettings(refreshed.settings);
       setTestcaseIdPrefix(normalizeTestcaseIdPrefix(String(refreshedSettings.testcaseIdPrefix || refreshed.key || "TC")));
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
@@ -352,6 +355,9 @@ export default function ProjectSettingsPage() {
       await deleteProjectRequest(projectId);
       setDeleteProjectModalOpen(false);
       setDeleteProjectTypedName("");
+      // Awaited so /projects doesn't render the just-deleted project for an instant after landing —
+      // a fire-and-forget refresh would leave the workspace-level list one refresh behind.
+      await refetchProjects();
       router.replace("/projects");
     } catch (error) {
       const text = error instanceof Error ? error.message : "Failed to delete project.";

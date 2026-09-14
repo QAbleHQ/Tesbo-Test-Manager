@@ -383,6 +383,24 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   }
 }
 
+/* Same horizontal max-width + centering + padding as .tesbo-page, so the sticky top bar's
+   content lines up with the page content beneath it on every viewport width. The header can't
+   just use .tesbo-page directly — that also carries vertical padding sized for a scrolling page,
+   not a fixed-height toolbar — and matching only the horizontal values at one breakpoint isn't
+   enough either: .tesbo-page centers its content once the viewport passes --content-max, so
+   anything wider than that needs the same margin-inline: auto, not just the same padding. */
+.tesbo-topbar-inset {
+  margin-inline: auto;
+  width: 100%;
+  max-width: var(--content-max);
+  padding-inline: 1.5rem;
+}
+@media (min-width: 768px) {
+  .tesbo-topbar-inset {
+    padding-inline: 2rem;
+  }
+}
+
 @keyframes tesbo-fade-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
@@ -590,6 +608,16 @@ a.group:hover > .tesbo-card {
   color: var(--ink-400);
   padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--border-subtle);
+}
+/* `.tesbo-table th` above beats Tailwind's `.text-right`/`.text-center` on specificity alone (one
+   more element selector), so a column header using either utility was silently forced left no
+   matter what the consuming component's className said, while the cells below it aligned
+   correctly — label and content ended up on opposite sides of the column. */
+.tesbo-table th.text-right {
+  text-align: right;
+}
+.tesbo-table th.text-center {
+  text-align: center;
 }
 .tesbo-table td {
   padding: 0 1rem;

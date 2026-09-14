@@ -14,6 +14,7 @@ import {
   IconFolders,
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
+  IconLoader2,
   IconPencil,
   IconPlus,
   IconSearch,
@@ -49,7 +50,7 @@ import {
   type CustomFieldFilterCondition,
   type BugItem,
 } from "@/lib/api";
-import { RepositoryTestCaseTable } from "@/components/testcases/RepositoryTestCaseTable";
+import { RepositoryTestCaseTable, type RepoTcSort, type RepoTcSortColumn } from "@/components/testcases/RepositoryTestCaseTable";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import {
@@ -123,6 +124,52 @@ function normalizeTestcaseIdPrefix(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3);
 }
 
+/*
+ * Client-side mirrors of the ORDER BY the repository's ID/Test case title/Priority column sort
+ * applies server-side (legacy.service.ts listTestCases) — same logic as cycles/[cycleId]/page.tsx's
+ * compareExternalId/comparePriority/compareTestCaseTitle for the Test Runs table's own column sort.
+ *
+ * Used only to optimistically re-order the rows already on screen the instant a sort header is
+ * clicked (see toggleSuiteCasesSort below), so the table reorders immediately instead of sitting on
+ * the round trip — the repository is server-paginated, so that round trip still has to happen for
+ * the authoritative order across the whole filtered set, not just this page, but the click no longer
+ * has to wait for it to feel like something happened.
+ */
+function compareExternalId(a: string, b: string): number {
+  const numOf = (id: string) => {
+    const match = id.match(/(\d+)(?!.*\d)/);
+    return match ? parseInt(match[1], 10) : NaN;
+  };
+  const na = numOf(a);
+  const nb = numOf(b);
+  if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+  return a.localeCompare(b);
+}
+
+const CANONICAL_PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
+const PRIORITY_RANK: Record<string, number> = Object.fromEntries(CANONICAL_PRIORITIES.map((p, i) => [p, i]));
+function comparePriority(a: string, b: string): number {
+  const rankOf = (p: string) => (p ? (p in PRIORITY_RANK ? PRIORITY_RANK[p] : CANONICAL_PRIORITIES.length) : CANONICAL_PRIORITIES.length + 1);
+  const ra = rankOf(a);
+  const rb = rankOf(b);
+  if (ra !== rb) return ra - rb;
+  return a.localeCompare(b);
+}
+
+function compareTestCaseTitle(a: string, b: string): number {
+  return a.toLowerCase().localeCompare(b.toLowerCase());
+}
+
+function sortTestCases(cases: TestCaseListItem[], sort: RepoTcSort): TestCaseListItem[] {
+  if (!sort) return cases;
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return [...cases].sort((a, b) => {
+    if (sort.column === "id") return direction * compareExternalId(a.externalId || "", b.externalId || "");
+    if (sort.column === "priority") return direction * comparePriority(a.priority || "", b.priority || "");
+    return direction * compareTestCaseTitle(a.title || "", b.title || "");
+  });
+}
+
 function parseProjectSettings(raw: unknown): Record<string, unknown> {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;
   if (typeof raw !== "string" || !raw.trim()) return {};
@@ -132,6 +179,128 @@ function parseProjectSettings(raw: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/**
+ * +delta to one suite's own testCaseCount+recursiveTestCaseCount, and to every ANCESTOR's
+ * recursiveTestCaseCount only (testCaseCount is direct-children-only, per SuiteNode's own doc
+ * comment — an ancestor never gains a "direct" case just because a descendant did). Mirrors
+ * suiteNameMap's own visited-set cycle guard, since suites.parentId carries no write-time cycle
+ * guard either.
+ */
+function adjustSuiteCounts(allSuites: SuiteNode[], suiteId: string, delta: number): SuiteNode[] {
+  const byId = new Map(allSuites.map((s) => [s.id, s]));
+  if (!byId.has(suiteId)) return allSuites;
+  const ancestorIds = new Set<string>();
+  const visited = new Set<string>();
+  let current = byId.get(suiteId);
+  current = current?.parentId ? byId.get(current.parentId) : undefined;
+  while (current && !visited.has(current.id)) {
+    ancestorIds.add(current.id);
+    visited.add(current.id);
+    current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  return allSuites.map((s) => {
+    if (s.id === suiteId) {
+      return { ...s, testCaseCount: s.testCaseCount + delta, recursiveTestCaseCount: s.recursiveTestCaseCount + delta };
+    }
+    if (ancestorIds.has(s.id)) {
+      return { ...s, recursiveTestCaseCount: s.recursiveTestCaseCount + delta };
+    }
+    return s;
+  });
+}
+
+/** +delta (creating the bucket at `delta` if it didn't exist and delta is positive) to one named bucket. */
+function bumpBucket(
+  buckets: { name: string; count: number }[],
+  name: string,
+  delta: number
+): { name: string; count: number }[] {
+  const idx = buckets.findIndex((b) => b.name === name);
+  if (idx < 0) return delta > 0 ? [...buckets, { name, count: delta }] : buckets;
+  return buckets.map((b, i) => (i === idx ? { ...b, count: Math.max(0, b.count + delta) } : b));
+}
+
+/**
+ * The suite/repository-wide effect of one test case appearing or disappearing (delta +1/-1): the
+ * created/deleted suite's own + every ancestor's rollup count, and repoSummary's total/byStatus/
+ * bySuite buckets. bySuite groups on the suite's own bare `name` (COALESCE(s.name, 'Unassigned') on
+ * the backend) — NOT suiteNameMap's "Parent / Child" path — so a same-named bucket is matched here
+ * the identical way the backend already computes it.
+ */
+function applySingleCaseDelta(
+  currentSuites: SuiteNode[],
+  currentSummary: RepositorySummary | null,
+  status: string,
+  suiteIdForCase: string | null,
+  delta: 1 | -1
+): { suites: SuiteNode[]; repoSummary: RepositorySummary | null } {
+  const nextSuites = suiteIdForCase ? adjustSuiteCounts(currentSuites, suiteIdForCase, delta) : currentSuites;
+  if (!currentSummary) return { suites: nextSuites, repoSummary: currentSummary };
+  const suiteBucketName = suiteIdForCase ? (currentSuites.find((s) => s.id === suiteIdForCase)?.name ?? "Unassigned") : "Unassigned";
+  return {
+    suites: nextSuites,
+    repoSummary: {
+      ...currentSummary,
+      totalTestCases: Math.max(0, currentSummary.totalTestCases + delta),
+      byStatus: bumpBucket(currentSummary.byStatus, status, delta),
+      bySuite: bumpBucket(currentSummary.bySuite, suiteBucketName, delta),
+    },
+  };
+}
+
+/**
+ * A test case's status changing in place (archive/unarchive, and later edit) — moves one unit
+ * between two byStatus buckets, touching nothing else. Verified against the backend's own suite/
+ * repository-summary queries (legacy.service.ts's suite tree query and the testcases_active view,
+ * `WHERE deleted_at IS NULL` with no status filter in either): archiving/unarchiving a case changes
+ * no suite's testCaseCount/recursiveTestCaseCount and no bySuite bucket and not totalTestCases — the
+ * case never stops existing or moves suite, only its status column changes.
+ */
+function applyStatusChange(
+  currentSummary: RepositorySummary | null,
+  fromStatus: string,
+  toStatus: string
+): RepositorySummary | null {
+  if (!currentSummary || fromStatus === toStatus) return currentSummary;
+  return {
+    ...currentSummary,
+    byStatus: bumpBucket(bumpBucket(currentSummary.byStatus, fromStatus, -1), toStatus, 1),
+  };
+}
+
+/**
+ * The suite/repository-wide effect of editing one existing test case's status and/or suite.
+ * totalTestCases never changes (an edit doesn't create or destroy a case). Suite counts are safe to
+ * move regardless of status (see applyStatusChange's own comment on the backend queries this was
+ * verified against) — a suite move and a status change touch disjoint parts of repoSummary, so
+ * applying both in either order gives the same result.
+ */
+function applyTestCaseEditDelta(
+  currentSuites: SuiteNode[],
+  currentSummary: RepositorySummary | null,
+  change: { oldStatus: string; newStatus: string; oldSuiteId: string | null; newSuiteId: string | null }
+): { suites: SuiteNode[]; repoSummary: RepositorySummary | null } {
+  const { oldStatus, newStatus, oldSuiteId, newSuiteId } = change;
+  let nextSuites = currentSuites;
+  let nextSummary = currentSummary;
+
+  if (oldSuiteId !== newSuiteId) {
+    if (oldSuiteId) nextSuites = adjustSuiteCounts(nextSuites, oldSuiteId, -1);
+    if (newSuiteId) nextSuites = adjustSuiteCounts(nextSuites, newSuiteId, 1);
+    if (nextSummary) {
+      const bucketName = (id: string | null) => (id ? (currentSuites.find((s) => s.id === id)?.name ?? "Unassigned") : "Unassigned");
+      nextSummary = {
+        ...nextSummary,
+        bySuite: bumpBucket(bumpBucket(nextSummary.bySuite, bucketName(oldSuiteId), -1), bucketName(newSuiteId), 1),
+      };
+    }
+  }
+  if (oldStatus !== newStatus) {
+    nextSummary = applyStatusChange(nextSummary, oldStatus, newStatus);
+  }
+  return { suites: nextSuites, repoSummary: nextSummary };
 }
 
 function statusTone(s: string) {
@@ -196,12 +365,34 @@ export default function TestCasesPage() {
   const [suites, setSuites] = useState<SuiteNode[]>(cached?.suites ?? []);
   const [repoSummary, setRepoSummary] = useState<RepositorySummary | null>(cached?.repoSummary ?? null);
   const [suitePanelOpen, setSuitePanelOpen] = useState(true);
+  /*
+   * Holds every row matching the current suite/search/status/priority/type/automation/jira/
+   * customField filters, up to MAX_PAGE_SIZE (500) — not just the current on-screen page. Sorting
+   * and pagination are then derived from this batch entirely client-side (see sortedSuiteCases/
+   * selectedSuiteCases below), the same architecture the Test Runs table already uses for its own
+   * column sort (cycles/[cycleId]/page.tsx loads every execution once, then sorts/paginates in
+   * memory). A round trip is still unavoidable when a *filter* actually changes — the server has to
+   * tell us what matches — but sorting and flipping pages no longer do, which is the part that used
+   * to feel sluggish (a sort click used to be its own full refetch).
+   *
+   * The trade-off: a filter set with more than MAX_PAGE_SIZE matches only has its first batch
+   * available to sort/page through client-side — see suiteCasesTruncated below, surfaced to the user
+   * rather than silently dropping rows.
+   */
   const [suiteCases, setSuiteCases] = useState<TestCaseListItem[]>([]);
   const [suiteCasesTotal, setSuiteCasesTotal] = useState(0);
   const [suiteCasesLoading, setSuiteCasesLoading] = useState(false);
+  // Distinguishes the very first fetch (nothing to show yet, so the full-page "Loading test
+  // cases..." message is the only option) from every later refetch — a filter change, mainly, now
+  // that sort and pagination no longer fetch at all — where the previous rows are still valid and
+  // should stay on screen instead of being torn down and replaced by that message.
+  const [hasLoadedCasesOnce, setHasLoadedCasesOnce] = useState(false);
   const [suiteCasesError, setSuiteCasesError] = useState<string | null>(null);
   const [suiteCasesPage, setSuiteCasesPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  // ID/Test case title/Priority column sort — null keeps the server's default (creation) order,
+  // same "no sort" convention the Test Runs table's own column sort uses.
+  const [suiteCasesSort, setSuiteCasesSort] = useState<RepoTcSort>(null);
   // Only the true first visit to this project's testcases repository has no cache to seed from —
   // every later visit renders the last-known suite tree/summary immediately while the effect below
   // revalidates it in the background, instead of blocking behind the spinner on every click.
@@ -241,6 +432,13 @@ export default function TestCasesPage() {
   const [testcaseIdPrefix, setTestcaseIdPrefix] = useState(defaultTestcaseIdPrefix);
   const [panelJiraIssueKey, setPanelJiraIssueKey] = useState("");
   const [panelJiraUrl, setPanelJiraUrl] = useState("");
+  // Server-confirmed status/suite AT THE MOMENT the panel was last (re)loaded from the server —
+  // distinct from the `status`/`suiteId` form fields above, which the user can change in the form
+  // before saving. Used only to compute the edit-save patch's before/after delta; never touched by
+  // the form controls themselves. Re-set every time fillFormFromTestCase runs (i.e. every real fetch
+  // via openViewPanel), so it always reflects the latest known-persisted values.
+  const [panelOriginalStatus, setPanelOriginalStatus] = useState<string | null>(null);
+  const [panelOriginalSuiteId, setPanelOriginalSuiteId] = useState<string | null>(null);
 
   // Bugs filed against this test case (edit mode only — a case being created has none yet).
   const [panelBugs, setPanelBugs] = useState<BugItem[]>([]);
@@ -304,6 +502,26 @@ export default function TestCasesPage() {
     setRepoSummary(next.repoSummary);
     setCustomFieldDefinitions(next.customFieldDefinitions);
   }, [projectId]);
+
+  /**
+   * Same real refetch as loadData, minus listCustomFieldDefinitions — for the two remaining sites
+   * (bulk actions, suite delete) where the client can't safely compute a patch itself: a bulk
+   * selection can span records never fully loaded ("select all matching" only ever has ids), and a
+   * suite delete can move or remove an unknown number of test cases at once. Custom field
+   * *definitions* are still dropped from the refetch even here — neither operation can change them,
+   * the same reasoning already applied to every other site in this file — so this reuses whatever
+   * customFieldDefinitions is already in state for the cache write instead of re-fetching it.
+   */
+  const loadSuitesAndSummary = useCallback(async () => {
+    const [suiteList, summary] = await Promise.all([
+      listSuites(projectId),
+      getRepositorySummary(projectId).catch(() => null),
+    ]);
+    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions };
+    setPageCache(cacheKey, next);
+    setSuites(next.suites);
+    setRepoSummary(next.repoSummary);
+  }, [projectId, customFieldDefinitions, cacheKey]);
 
   useEffect(() => {
     const saved = readStoredValue("tesbo_tc_suite_panel");
@@ -385,7 +603,17 @@ export default function TestCasesPage() {
     }
     return new Map(suites.map((s) => [s.id, pathFor(s.id)]));
   }, [suites]);
-  const selectedSuiteCases = suiteCases;
+  // Sorted client-side from the whole loaded batch, then sliced to just the current page — both
+  // instant, no network round trip for either (see the `suiteCases` state comment above).
+  const sortedSuiteCases = useMemo(() => sortTestCases(suiteCases, suiteCasesSort), [suiteCases, suiteCasesSort]);
+  const selectedSuiteCases = useMemo(
+    () => sortedSuiteCases.slice((suiteCasesPage - 1) * pageSize, suiteCasesPage * pageSize),
+    [sortedSuiteCases, suiteCasesPage, pageSize]
+  );
+  // The server reports more matches than fit in one MAX_PAGE_SIZE batch — pagination can only reach
+  // what was actually loaded, so this is surfaced next to the result count rather than silently
+  // dead-ending on a page that renders nothing.
+  const suiteCasesTruncated = suiteCasesTotal > suiteCases.length;
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
   const areAllCasesSelected =
     selectedSuiteCases.length > 0 && selectedSuiteCases.every((tc) => selectedCaseIdSet.has(tc.id));
@@ -443,7 +671,10 @@ export default function TestCasesPage() {
     activeJiraIssueKey !== "",
     customFieldFilters.length > 0,
   ].filter(Boolean).length;
-  const totalPages = Math.max(1, Math.ceil(suiteCasesTotal / pageSize));
+  // Paged against what was actually loaded (suiteCases.length), not the server's raw total — when
+  // suiteCasesTruncated is true those differ, and paging against the total would offer pages past
+  // the loaded batch that can only ever render empty.
+  const totalPages = Math.max(1, Math.ceil(suiteCases.length / pageSize));
 
   const statusCount = useCallback(
     (name: string) => repoSummary?.byStatus.find((s) => s.name === name)?.count ?? 0,
@@ -519,15 +750,29 @@ export default function TestCasesPage() {
     activeJiraIssueKey,
     customFieldFilters,
     pageSize,
+    suiteCasesSort,
   ]);
 
-  const loadSelectedSuiteCases = useCallback(async (pageOverride?: number) => {
+  // Toggles the ID/Test case title/Priority column sort: the same column clicked again flips
+  // direction, a different column replaces it starting at ascending — only one active sort at a
+  // time, matching the Test Runs table's own toggleRunSort. Purely a state update: sortedSuiteCases
+  // above re-derives from it instantly, with no fetch involved at all.
+  const toggleSuiteCasesSort = useCallback((column: RepoTcSortColumn) => {
+    setSuiteCasesSort((prev) =>
+      prev?.column === column ? { column, direction: prev.direction === "asc" ? "desc" : "asc" } : { column, direction: "asc" }
+    );
+  }, []);
+
+  const loadSelectedSuiteCases = useCallback(async () => {
     setSuiteCasesLoading(true);
     setSuiteCasesError(null);
     try {
+      // Always the whole filtered batch (up to MAX_PAGE_SIZE), never just one page — sort and
+      // pagination are derived from it client-side (sortedSuiteCases/selectedSuiteCases above), so
+      // neither one needs to appear in this call or in this callback's dependencies below.
       const { list, total } = await listTestCases(projectId, {
-        limit: pageSize,
-        offset: ((pageOverride ?? suiteCasesPage) - 1) * pageSize,
+        limit: MAX_PAGE_SIZE,
+        offset: 0,
         suiteId: activeSuiteId ?? undefined,
         // A suite in this tree stands for itself and everything nested under it (see the
         // sidebar's recursiveTestCaseCount) — the list has to agree, or a parent suite with all
@@ -551,12 +796,12 @@ export default function TestCasesPage() {
       setSuiteCasesTotal(0);
     } finally {
       setSuiteCasesLoading(false);
+      setHasLoadedCasesOnce(true);
     }
   }, [
     activeSuiteId,
     debouncedSuiteSearch,
     projectId,
-    suiteCasesPage,
     suitePriorityFilter,
     suiteStatusFilter,
     suiteTypeFilter,
@@ -564,7 +809,6 @@ export default function TestCasesPage() {
     activeJiraIssueKey,
     activeLinearIssueKey,
     customFieldFilters,
-    pageSize,
   ]);
 
   useEffect(() => {
@@ -605,6 +849,8 @@ export default function TestCasesPage() {
     setSuiteId((data.suiteId as string) ?? formSuiteId ?? "");
     setPanelJiraIssueKey((data.jiraIssueKey as string) ?? "");
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
+    setPanelOriginalStatus((data.status as string) ?? "Draft");
+    setPanelOriginalSuiteId((data.suiteId as string) || null);
   }
 
   function resetForm(defaultSuiteId?: string | null) {
@@ -659,6 +905,13 @@ export default function TestCasesPage() {
     setPanelTestcaseId(testcaseId);
     setPanelMode("edit");
     setPanelTab("overview");
+    // Cleared up front, not just left over from whatever case (if any) was last successfully loaded.
+    // fillFormFromTestCase below is the only place that sets these back to real values, so if this
+    // fetch fails, panelOriginalStatus stays null instead of silently holding a PREVIOUS test case's
+    // values — handlePanelSubmit's edit branch checks for exactly that null to know its computed
+    // suites/repoSummary patch would be based on stale data, and falls back to a real refetch instead.
+    setPanelOriginalStatus(null);
+    setPanelOriginalSuiteId(null);
     setCustomFieldErrors({});
     try {
       const [data, customFields, bugs] = await Promise.all([
@@ -708,9 +961,32 @@ export default function TestCasesPage() {
     setSteps((prev) => prev.map((step, i) => (i === index ? { ...step, [field]: value } : step)));
   }
 
-  async function refreshData(pageOverride?: number) {
+  // Deliberately kept present-but-unused rather than deleted: this is the pre-patch full-reload
+  // implementation every one of the 9 mutation sites in this file used to call directly. Every call
+  // site has since been converted to a computed patch (see applyTestCasesPatch and friends above)
+  // or, for bulk actions/suite delete, to loadSuitesAndSummary(). If a patch ever turns out wrong in
+  // production, restoring correctness for that one site is a one-line swap back to `refreshData()`
+  // — a much faster and safer revert than reconstructing this function from git history under
+  // incident pressure. Safe to delete once these patches have been running correctly for a while.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async function refreshData() {
     await loadData();
-    await loadSelectedSuiteCases(pageOverride);
+    await loadSelectedSuiteCases();
+  }
+
+  /**
+   * Patches suites/repoSummary in both component state and pageDataCache in one call, so a revisit
+   * to this page later in the same SPA session doesn't render pre-mutation data — setPageCache is
+   * otherwise only ever called from inside loadData(), so a patch that updated state without also
+   * updating the cache would silently reintroduce the exact staleness the cache exists to prevent.
+   * Omit a field to leave it untouched (both in state and in what's written back to the cache).
+   */
+  function applyTestCasesPatch(patch: { suites?: SuiteNode[]; repoSummary?: RepositorySummary | null }) {
+    const nextSuites = patch.suites ?? suites;
+    const nextRepoSummary = patch.repoSummary !== undefined ? patch.repoSummary : repoSummary;
+    if (patch.suites) setSuites(nextSuites);
+    if (patch.repoSummary !== undefined) setRepoSummary(nextRepoSummary);
+    setPageCache(cacheKey, { suites: nextSuites, repoSummary: nextRepoSummary, customFieldDefinitions });
   }
 
   function toggleCaseSelection(testcaseId: string) {
@@ -825,7 +1101,12 @@ export default function TestCasesPage() {
         });
       }
       const refreshPanelTestcaseId = panelTestcaseId && selectedCaseIdSet.has(panelTestcaseId) ? panelTestcaseId : null;
-      await refreshData();
+      // Kept as a real refetch, deliberately: a bulk selection can include records never fully
+      // loaded (selectAllMatchingCases only ever accumulates ids), so their prior status/suite isn't
+      // known here and can't be safely patched — only the now-redundant customFieldDefinitions
+      // refetch is dropped (bulk actions never touch field definitions).
+      await loadSuitesAndSummary();
+      await loadSelectedSuiteCases();
       if (bulkAction === "delete" && refreshPanelTestcaseId) {
         closePanel();
       } else if (refreshPanelTestcaseId) {
@@ -874,7 +1155,12 @@ export default function TestCasesPage() {
       setNewSuiteName("");
       setNewSuiteParentId("");
       setIsAddSuiteModalOpen(false);
-      await refreshData();
+      // A new suite starts empty (testCaseCount/recursiveTestCaseCount both 0, guaranteed by the
+      // backend for a just-created row), so appending it changes no ancestor's rollup count and
+      // affects no repoSummary bucket — a full reload bought nothing here beyond this one row.
+      // The currently displayed test-case list is unaffected too (the new suite has no cases and
+      // isn't the active view), so loadSelectedSuiteCases() is correctly skipped as well.
+      applyTestCasesPatch({ suites: [...suites, created] });
     } catch (err) {
       setNewSuiteNameError(err instanceof Error ? err.message : "Failed to create suite.");
     } finally {
@@ -899,10 +1185,22 @@ export default function TestCasesPage() {
     setIsRenamingSuite(true);
     setRenameSuiteError("");
     try {
-      await updateSuite(renameSuiteId, { name: renameSuiteInputValue.trim() });
+      const trimmedName = renameSuiteInputValue.trim();
+      await updateSuite(renameSuiteId, { name: trimmedName });
       setIsRenameSuiteModalOpen(false);
       setRenameSuiteId(null);
-      await refreshData();
+      // NOT patched client-side, deliberately, unlike suite create: the backend's updateSuite writes
+      // `parent_id = $3` with no COALESCE (unlike name/position), so a rename call that omits
+      // parentId — which this one always does — silently reparents the suite to root server-side.
+      // That's a pre-existing backend bug, out of scope here, but a client-only name patch would
+      // additionally HIDE it for the rest of this SPA session (the stale local parentId keeps
+      // showing the suite nested where it was, while the server now disagrees) — a real change in
+      // what the user sees after a rename, which the "no behaviour change" bar for this phase
+      // doesn't allow. A real listSuites() refetch keeps today's actual behavior (any such
+      // reparenting is visible immediately) while still skipping the repoSummary/
+      // customFieldDefinitions/paginated-list refetch a full refreshData() would also do.
+      const freshSuites = await listSuites(projectId);
+      applyTestCasesPatch({ suites: freshSuites });
     } catch (err) {
       setRenameSuiteError(err instanceof Error ? err.message : "Failed to rename suite.");
     } finally {
@@ -919,7 +1217,12 @@ export default function TestCasesPage() {
         router.replace(`/projects/${projectId}/testcases`);
       }
       setDeleteSuiteId(null);
-      await refreshData();
+      // Kept as a real refetch, deliberately: deleting a suite can move or remove an unknown number
+      // of test cases (mode-dependent) across the whole subtree — not something this file can safely
+      // compute. Only the redundant customFieldDefinitions refetch is dropped (a suite delete never
+      // touches field definitions).
+      await loadSuitesAndSummary();
+      await loadSelectedSuiteCases();
     } finally {
       setDeleteSuiteSaving(false);
     }
@@ -932,8 +1235,19 @@ export default function TestCasesPage() {
     setPanelSaving(true);
     setPanelError(null);
     try {
+      // The last server-confirmed status/suite for this case — read from the loaded list, NOT from
+      // the edit form's status/suiteId state, which could reflect an unsaved in-progress edit made
+      // in the panel before Delete was clicked rather than what's actually stored.
+      const deletedCase = suiteCases.find((tc) => tc.id === panelTestcaseId);
       await deleteTestCase(projectId, panelTestcaseId);
-      await refreshData();
+      // If the case wasn't in the loaded list (an edge case — e.g. opened via some path outside the
+      // current page), its prior status/suite isn't known, so repoSummary/suites are left as-is
+      // rather than guessing; they're one revisit behind until the next full page load, the same
+      // bounded, self-healing drift every other patch in this file accepts.
+      if (deletedCase) {
+        applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, deletedCase.status, deletedCase.suiteId, -1));
+      }
+      await loadSelectedSuiteCases();
       closePanel();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to delete test case.";
@@ -950,8 +1264,15 @@ export default function TestCasesPage() {
     setPanelSaving(true);
     setPanelError(null);
     try {
+      // Server-confirmed prior status (not the edit form's own status state, which could reflect an
+      // unsaved dropdown change) — same reasoning as handleDeletePanelTestCase.
+      const priorStatus = suiteCases.find((tc) => tc.id === panelTestcaseId)?.status;
       await updateTestCase(projectId, panelTestcaseId, { status: "Archived" });
-      await refreshData();
+      // No suite/bySuite/total change: archiving neither removes the case (deleted_at is untouched)
+      // nor moves it to a different suite — only its status column changes (verified against the
+      // backend's suite-count and repository-summary queries; see applyStatusChange's own comment).
+      if (priorStatus) applyTestCasesPatch({ repoSummary: applyStatusChange(repoSummary, priorStatus, "Archived") });
+      await loadSelectedSuiteCases();
       await openViewPanel(panelTestcaseId);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to archive test case.";
@@ -966,8 +1287,10 @@ export default function TestCasesPage() {
     setPanelSaving(true);
     setPanelError(null);
     try {
+      const priorStatus = suiteCases.find((tc) => tc.id === panelTestcaseId)?.status;
       await updateTestCase(projectId, panelTestcaseId, { status: "Draft" });
-      await refreshData();
+      if (priorStatus) applyTestCasesPatch({ repoSummary: applyStatusChange(repoSummary, priorStatus, "Draft") });
+      await loadSelectedSuiteCases();
       await openViewPanel(panelTestcaseId);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to unarchive test case.";
@@ -1026,7 +1349,14 @@ export default function TestCasesPage() {
         setSuitePriorityFilter("all");
         setSuiteTypeFilter("all");
         setSuiteAutomationFilter("all");
-        await refreshData(1);
+        // loadData()'s customFieldDefinitions refetch is dropped — creating a testcase never changes
+        // field definitions. suites/repoSummary are patched from the exact values just submitted
+        // (not the create response, which only carries id/externalId/title/createdAt) rather than
+        // refetched. loadSelectedSuiteCases() still runs for real: the filters above just changed,
+        // so the list it fetches is genuinely different, not just "one row added" — that can't be
+        // patched client-side. setSuiteCasesPage(1) above already resets the page it's sliced to.
+        applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, status, suiteId || null, 1));
+        await loadSelectedSuiteCases();
         setPanelSuccess("Test case created successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
@@ -1055,8 +1385,34 @@ export default function TestCasesPage() {
         });
         setPanelSuccess("Test case updated successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
-        await refreshData();
+        // panelOriginalStatus/SuiteId are the values fillFormFromTestCase last set from a real fetch
+        // (i.e. what's actually persisted before this save) — status/suiteId here are the just-
+        // submitted new values. customFieldDefinitions is dropped (never changes on a testcase edit).
+        // loadSelectedSuiteCases() still runs for real: this edit can change fields the CURRENT
+        // filters key on (status, suite, priority, type, automation...), so which rows still match
+        // isn't something this patch can safely compute — only suites/repoSummary are patched here.
+        //
+        // panelOriginalStatus is null whenever this open of the panel never got a confirmed-fresh
+        // fetch for THIS testcaseId (openViewPanel resets it before every fetch, fillFormFromTestCase
+        // is the only thing that sets it back) — e.g. the load failed after switching from a
+        // different case, or raced with switching to a different case. Computing a delta from stale
+        // "original" values in that situation would silently corrupt suites/repoSummary counts with
+        // no self-correction, unlike every other unknown-prior-state case in this file — so this one
+        // real refetch (matching pre-existing behavior for exactly this edge case) is intentional.
+        if (panelOriginalStatus === null) {
+          await loadSuitesAndSummary();
+        } else {
+          applyTestCasesPatch(
+            applyTestCaseEditDelta(suites, repoSummary, {
+              oldStatus: panelOriginalStatus,
+              newStatus: status,
+              oldSuiteId: panelOriginalSuiteId,
+              newSuiteId: suiteId || null,
+            })
+          );
+        }
         const savedTab = panelTab;
+        await loadSelectedSuiteCases();
         await openViewPanel(panelTestcaseId);
         setPanelTab(savedTab);
       }
@@ -1507,7 +1863,7 @@ export default function TestCasesPage() {
                       value={suiteSearch}
                       onChange={(e) => setSuiteSearch(e.target.value)}
                       placeholder="Search by ID, title, or type"
-                      className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none placeholder:text-[var(--muted-soft)]"
+                      className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
                     />
                     {suiteSearch && (
                       <button
@@ -1709,7 +2065,7 @@ export default function TestCasesPage() {
                   <p className="flex min-h-0 flex-1 items-center justify-center p-4 text-sm text-[var(--error-foreground)]">
                     {suiteCasesError}
                   </p>
-                ) : suiteCasesLoading ? (
+                ) : suiteCasesLoading && !hasLoadedCasesOnce ? (
                   <p className="flex min-h-0 flex-1 items-center justify-center p-4 text-sm text-[var(--muted)]">
                     Loading test cases...
                   </p>
@@ -1735,7 +2091,23 @@ export default function TestCasesPage() {
                     </button>
                   </div>
                 ) : (
-                  <div className="flex min-h-0 flex-1 flex-col">
+                  <div className="relative flex min-h-0 flex-1 flex-col">
+                    {/*
+                     * Sort and pagination no longer fetch anything at all (see the `suiteCases`
+                     * state comment above) — this now only ever fires when a *filter* actually
+                     * changes and the server has to say what matches. Even then, the previous rows
+                     * stay on screen (loadSelectedSuiteCases never clears them before the request
+                     * lands) with just this small, non-blocking indicator layered over the top,
+                     * rather than tearing the table down the way the very first load above does.
+                     */}
+                    {suiteCasesLoading && (
+                      <div className="pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center">
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface-overlay)] px-2.5 py-1 text-[11px] text-[var(--muted)] shadow-[var(--shadow-elevated)]">
+                          <IconLoader2 size={12} stroke={2} className="animate-spin" />
+                          Updating…
+                        </span>
+                      </div>
+                    )}
                     <RepositoryTestCaseTable
                       key={projectId}
                       projectId={projectId}
@@ -1749,6 +2121,8 @@ export default function TestCasesPage() {
                       onOpenRow={openViewPanel}
                       suitePanelOpen={suitePanelOpen}
                       columnsSlot={columnsSlotEl}
+                      sort={suiteCasesSort}
+                      onToggleSort={toggleSuiteCasesSort}
                     />
 
                     {/* Pagination */}
@@ -1766,6 +2140,14 @@ export default function TestCasesPage() {
                             of{" "}
                             <span className="font-medium text-[var(--foreground)]">{totalPages}</span>
                           </>
+                        )}
+                        {suiteCasesTruncated && (
+                          <span
+                            className="ml-1.5 text-[var(--muted-soft)]"
+                            title="Sorting and pagination only cover the rows already loaded. Narrow your filters to bring the rest within reach."
+                          >
+                            (showing the first {suiteCases.length.toLocaleString()})
+                          </span>
                         )}
                       </span>
                       <div className="flex items-center gap-2">

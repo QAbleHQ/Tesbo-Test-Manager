@@ -431,14 +431,14 @@ test.describe("Test Run — Priority/Type/Assignee filters", () => {
 });
 
 /*
- * Feature: sorting controls on the run table's ID and Priority columns
+ * Feature: sorting controls on the run table's ID, Priority and Test Case columns
  * (app/(app)/projects/[id]/cycles/[cycleId]/page.tsx's SortableColumnHeader / runSort /
- * compareExternalId / comparePriority). Sorting is entirely client-side over the run's full,
- * already-loaded execution list — applied in the same `filteredExecutions` memo that also drives
- * pagination, so it covers the whole dataset and composes with the existing tab/filter/search, not
- * just the current page.
+ * compareExternalId / comparePriority / compareTestCaseTitle). Sorting is entirely client-side
+ * over the run's full, already-loaded execution list — applied in the same `filteredExecutions`
+ * memo that also drives pagination, so it covers the whole dataset and composes with the existing
+ * tab/filter/search, not just the current page.
  */
-test.describe("Test Run table — ID/Priority column sort", () => {
+test.describe("Test Run table — ID/Priority/Test Case column sort", () => {
   let api: APIRequestContext;
   let cycleId: string;
   let testcaseIds: string[] = [];
@@ -455,6 +455,15 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     P1: `E2E Sort Prio P1 ${stamp}`,
     P2: `E2E Sort Prio P2 ${stamp}`,
     P3: `E2E Sort Prio P3 ${stamp}`,
+  };
+  // Mixed case, chosen so a raw (case-sensitive, ASCII) sort gives a DIFFERENT order than the
+  // required case-insensitive one: every uppercase letter sorts below every lowercase letter in
+  // plain string comparison, so a naive sort would read "Mango, Zebra, apple" — only a genuinely
+  // case-insensitive comparator produces the correct alphabetical "apple, Mango, Zebra".
+  const tcTitle = {
+    a: `apple Sort TC ${stamp}`,
+    m: `Mango Sort TC ${stamp}`,
+    z: `Zebra Sort TC ${stamp}`,
   };
 
   /** Titles from `candidates` that appear in the run table, in the DOM (i.e. on-screen row) order. */
@@ -488,6 +497,10 @@ test.describe("Test Run table — ID/Priority column sort", () => {
       { title: prioTitle.P0, status: "Approved", priority: "P0" },
       { title: prioTitle.P3, status: "Approved", priority: "P3" },
       { title: prioTitle.P1, status: "Approved", priority: "P1" },
+      // Deliberately not in alphabetical (or ASCII) order either, for the same reason as above.
+      { title: tcTitle.z, status: "Approved" },
+      { title: tcTitle.a, status: "Approved" },
+      { title: tcTitle.m, status: "Approved" },
     ];
     const created: { created: { id: string; title: string }[] } = await (
       await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, { data: { testcases: rows } })
@@ -537,7 +550,20 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
   });
 
-  test("only one column sorts at a time — selecting the other column replaces it", { tag: '@tesbo.testId("TES-TC-3012")' }, async ({ page }) => {
+  test("Test Case sorts alphabetically by title, case-insensitively, and toggles direction", { tag: '@tesbo.testId("TES-TC-3014")' }, async ({ page }) => {
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    // "apple, Mango, Zebra" — not "Mango, Zebra, apple", which is what a case-sensitive/raw
+    // comparison would produce (every uppercase letter sorts below every lowercase one otherwise).
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently ascending" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Sort by Test Case, currently ascending" }).click();
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently descending" })).toBeVisible();
+  });
+
+  test("only one column sorts at a time — selecting another column replaces it", { tag: '@tesbo.testId("TES-TC-3012")' }, async ({ page }) => {
     const idSort = page.getByRole("button", { name: "Sort by ID" });
     await idSort.click();
     await expect(page.getByRole("button", { name: "Sort by ID, currently ascending" })).toBeVisible();
@@ -546,8 +572,15 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     // as un-sorted again, and the row order now reflects Priority alone.
     await page.getByRole("button", { name: "Sort by Priority" }).click();
     await expect(page.getByRole("button", { name: "Sort by ID" })).toBeVisible();
-    const ascending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
-    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    const prioAscending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
+    await expect.poll(() => orderedTitles(page, prioAscending)).toEqual(prioAscending);
+
+    // And switching from Priority to Test Case behaves the same way: Priority's control reads as
+    // un-sorted again, and the row order now reflects Test Case alone.
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await expect(page.getByRole("button", { name: "Sort by Priority" })).toBeVisible();
+    const tcAscending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, tcAscending)).toEqual(tcAscending);
   });
 
   test("the sort order is preserved after the table is narrowed by a search term", { tag: '@tesbo.testId("TES-TC-3013")' }, async ({ page }) => {
@@ -559,6 +592,17 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     // And the ID-only cases are correctly filtered out, not merely re-ordered to the bottom.
     await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
     await expect(page.getByText(titleTen, { exact: true })).toHaveCount(0);
+  });
+
+  test("Test Case sort composes with a search term the same way Priority's does", { tag: '@tesbo.testId("TES-TC-3015")' }, async ({ page }) => {
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await page.getByPlaceholder("Search test cases…").fill("Sort TC");
+
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    // The ID/Priority-only cases are filtered out, not merely re-ordered to the bottom.
+    await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(prioTitle.P0, { exact: true })).toHaveCount(0);
   });
 });
 
@@ -788,7 +832,7 @@ test.describe("Schedule Run — Run At validation", () => {
     await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
     await page.getByRole("button", { name: "Create Schedule" }).click();
 
-    await expect(page.getByText("Run At must be in the future")).toBeVisible();
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
     expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
   });
 
@@ -804,6 +848,31 @@ test.describe("Schedule Run — Run At validation", () => {
 
     // Client-side validation passes; the still-unimplemented backend is what answers, honestly.
     await expect(page.getByText("Scheduled runs are not available yet")).toBeVisible();
-    await expect(page.getByText("Run At must be in the future")).toBeHidden();
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+  });
+
+  test("a past Run At shows the inline error as soon as it's picked, before Create Schedule is clicked", { tag: '@tesbo.testId("TES-TC-2205")' }, async ({ page }) => {
+    let scheduleRequestSent = false;
+    await page.route("**/api/projects/*/cycles/schedules", async (route) => {
+      if (route.request().method() === "POST") scheduleRequestSent = true;
+      await route.continue();
+    });
+
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Inline Past Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
+
+    // No submit click here — the error must appear from the field's own onChange.
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
+    expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
+
+    // Correcting to a future value clears the inline error immediately too, still without submitting.
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const futureValue = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+    await page.locator('input[type="datetime-local"]').fill(futureValue);
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+    expect(scheduleRequestSent, "still no request from correcting the field alone").toBe(false);
   });
 });

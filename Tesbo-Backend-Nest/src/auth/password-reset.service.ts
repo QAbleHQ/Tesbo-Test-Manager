@@ -4,6 +4,7 @@ import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { EmailService } from "./email.service";
 import { PasswordService } from "./password.service";
+import { SessionCacheService } from "../cache/session-cache.service";
 
 @Injectable()
 export class PasswordResetService {
@@ -13,7 +14,8 @@ export class PasswordResetService {
     private readonly db: DatabaseService,
     private readonly config: AppConfigService,
     private readonly email: EmailService,
-    private readonly password: PasswordService
+    private readonly password: PasswordService,
+    private readonly sessionCache: SessionCacheService
   ) {}
 
   /**
@@ -52,6 +54,7 @@ export class PasswordResetService {
     // A password reset invalidates every existing session, browser or otherwise — otherwise
     // whoever (or whatever) stole the old password would keep their session alive right through it.
     await this.db.query("DELETE FROM sessions WHERE user_id = $1", [row.user_id]);
+    await this.sessionCache.invalidateAllForUser(row.user_id);
     return row.user_id;
   }
 

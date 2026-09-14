@@ -84,10 +84,43 @@ async function fetchWithNetworkErrorMessage(
   }
 }
 
+/**
+ * Collapses concurrent identical in-flight requests (e.g. two components mounting at once, each
+ * calling the same read) into one network call — every caller shares the same promise instead of
+ * each firing its own fetch. Purely an overlap-collapse, not a cache: the map entry is removed
+ * before the shared promise settles for any of its callers (the `.finally` below runs first), so a
+ * call issued after the in-flight one has already resolved always goes out fresh, never serving a
+ * stale value.
+ */
+const inFlightRequests = new Map<string, Promise<unknown>>();
+
+function dedupeInFlight<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inFlightRequests.get(key);
+  if (existing) return existing as Promise<T>;
+  const promise = run().finally(() => {
+    inFlightRequests.delete(key);
+  });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
 export async function api<T = unknown>(
   path: string,
   options: RequestInitWithBody = {}
 ): Promise<T> {
+  const method = (options.method ?? "GET").toString().toUpperCase();
+  // Scoped strictly to GET — two "identical" mutating calls are not guaranteed interchangeable, so
+  // dedup must never silently collapse a POST/PUT/PATCH/DELETE. Also skipped whenever the caller
+  // supplies its own AbortSignal (e.g. getIntegrationAuthUrl's 20s timeout): sharing one in-flight
+  // request across callers means only the FIRST caller's `options` — signal included — actually
+  // reaches fetch(), so a second caller's own cancellation/timeout would otherwise be silently
+  // dropped in favor of a different caller's. Every other GET in this file passes no signal, so this
+  // exclusion costs nothing for them.
+  if (method !== "GET" || options.signal) return apiRequest<T>(path, options);
+  return dedupeInFlight(`GET:${path}`, () => apiRequest<T>(path, options));
+}
+
+async function apiRequest<T = unknown>(path: string, options: RequestInitWithBody): Promise<T> {
   const { body, ...rest } = options;
   const headers: HeadersInit = {
     "Content-Type": "application/json",
@@ -1314,6 +1347,9 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
+    sortBy?: "id" | "title" | "priority";
+    sortDir?: "asc" | "desc";
   }
 ): Promise<{ list: TestCaseListItem[]; total: number }> {
   const sp = new URLSearchParams();
@@ -1329,19 +1365,28 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
-  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/testcases?${sp}`, { credentials: "include" });
-  const list = await res.json();
-  if (!res.ok) {
-    const err = (list as { error?: string }).error || res.statusText;
-    throw new Error(err || String(res.status));
-  }
-  const normalizedList = Array.isArray(list) ? list : [];
-  const totalHeader = res.headers.get("X-Total-Count");
-  let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
-  if (Number.isNaN(total)) {
-    total = normalizedList.length;
-  }
-  return { list: normalizedList, total };
+  if (params?.sortBy) sp.set("sortBy", params.sortBy);
+  if (params?.sortDir) sp.set("sortDir", params.sortDir);
+  const path = `/api/projects/${projectId}/testcases?${sp}`;
+  // This function hand-rolls its own fetch (X-Total-Count header, a different error shape) instead
+  // of going through api() above, so it needs its own dedupeInFlight call to get the same
+  // overlap-collapse — the single-request-heaviest read in the app (suite clicks, filter/page
+  // changes, and selectAllMatchingCases' own loop) and the one bypass worth retrofitting.
+  return dedupeInFlight(`GET:${path}`, async () => {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}${path}`, { credentials: "include" });
+    const list = await res.json();
+    if (!res.ok) {
+      const err = (list as { error?: string }).error || res.statusText;
+      throw new Error(err || String(res.status));
+    }
+    const normalizedList = Array.isArray(list) ? list : [];
+    const totalHeader = res.headers.get("X-Total-Count");
+    let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
+    if (Number.isNaN(total)) {
+      total = normalizedList.length;
+    }
+    return { list: normalizedList, total };
+  });
 }
 
 export async function getTestCase(projectId: string, testcaseId: string): Promise<Record<string, unknown>> {
