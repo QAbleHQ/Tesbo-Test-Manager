@@ -9,14 +9,27 @@ import {
   getKnowledgeDocument,
   getKnowledgeFile,
   getKnowledgeFileDownloadUrl,
+  getCustomFieldValues,
   listJiraTickets,
   type ZyraSourceRef,
   type BugItem,
   type KnowledgeDocument,
   type KnowledgeFile,
   type JiraTicket,
+  type CustomFieldValue,
 } from "@/lib/api";
 import { Drawer, PriorityBadge, SeverityBadge, StatusChip, type Priority } from "@/components/ui";
+import { formatCustomFieldValueForDisplay, isCustomFieldValueEmpty } from "@/components/customFields/customFieldTypes";
+
+// Same 5-entry map as the Knowledge Base document page's own DOC_TYPE_LABELS — kept local rather
+// than importing from that page, which doesn't export it.
+const DOC_TYPE_LABELS: Record<string, string> = {
+  general: "General",
+  api_note: "API Note",
+  release_note: "Release Note",
+  requirement_note: "Requirement",
+  test_data_note: "Test Data",
+};
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 
@@ -33,7 +46,7 @@ function parseSteps(raw: unknown): Step[] {
 type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "testcase"; data: Record<string, unknown> }
+  | { kind: "testcase"; data: Record<string, unknown>; customFields: CustomFieldValue[] }
   | { kind: "bug"; data: BugItem }
   | { kind: "knowledge_document"; data: KnowledgeDocument }
   | { kind: "knowledge_file"; data: KnowledgeFile }
@@ -43,9 +56,10 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   return <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">{children}</h4>;
 }
 
-function TestcaseDetail({ data }: { data: Record<string, unknown> }) {
+function TestcaseDetail({ data, customFields }: { data: Record<string, unknown>; customFields: CustomFieldValue[] }) {
   const steps = parseSteps(data.steps);
   const priority = String(data.priority || "P2");
+  const populatedCustomFields = customFields.filter((f) => !isCustomFieldValueEmpty(f.value));
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -90,6 +104,25 @@ function TestcaseDetail({ data }: { data: Record<string, unknown> }) {
           <p className="whitespace-pre-wrap text-sm text-[var(--foreground)]">{String(data.postconditions)}</p>
         </div>
       )}
+      {!!data.attachments && (
+        <div>
+          <SectionLabel>Notes</SectionLabel>
+          <p className="whitespace-pre-wrap text-sm text-[var(--foreground)]">{String(data.attachments)}</p>
+        </div>
+      )}
+      {populatedCustomFields.length > 0 && (
+        <div>
+          <SectionLabel>Custom fields</SectionLabel>
+          <div className="space-y-2">
+            {populatedCustomFields.map((field) => (
+              <div key={field.id} className="flex flex-wrap items-baseline gap-x-2 text-sm">
+                <span className="text-[var(--muted)]">{field.name}:</span>
+                <span className="text-[var(--foreground)]">{formatCustomFieldValueForDisplay(field, field.value)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -114,6 +147,18 @@ function BugDetail({ data }: { data: BugItem }) {
         {data.assigneeName && <span>Assigned to: <span className="text-[var(--foreground)]">{data.assigneeName}</span></span>}
         <span>Created: <span className="text-[var(--foreground)]">{new Date(data.createdAt).toLocaleDateString()}</span></span>
       </div>
+      {data.attachments.length > 0 && (
+        <div>
+          <SectionLabel>Evidence</SectionLabel>
+          <ul className="space-y-1">
+            {data.attachments.map((file) => (
+              <li key={file.id} className="text-xs text-[var(--muted)]">
+                {file.fileName} <span className="text-[var(--muted-soft)]">({Math.round(file.fileSize / 1024)} KB)</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {data.externalUrl && (
         <a href={data.externalUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs font-medium text-[var(--accent-light)] hover:underline">
           Open in tracker <IconExternalLink size={13} stroke={1.9} />
@@ -124,14 +169,28 @@ function BugDetail({ data }: { data: BugItem }) {
 }
 
 function KnowledgeDocumentDetail({ data, projectId }: { data: KnowledgeDocument; projectId: string }) {
+  const providerLabel = data.sourceProvider === "linear" ? "Linear" : "Jira";
   return (
     <div className="space-y-4">
-      <StatusChip tone="brand">{data.status}</StatusChip>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <StatusChip tone="brand">{data.status}</StatusChip>
+        <span className="text-xs text-[var(--muted)]">{DOC_TYPE_LABELS[data.documentType] || data.documentType}</span>
+      </div>
       {data.contentText ? (
         <p className="whitespace-pre-wrap text-sm text-[var(--foreground)]">{data.contentText}</p>
       ) : (
         <p className="text-sm text-[var(--muted)]">This document has no text content yet.</p>
       )}
+      <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">
+        {data.sourceProvider && (
+          <span>
+            Synced from {providerLabel}
+            {data.syncedByName ? ` by ${data.syncedByName}` : ""}
+            {data.sourceSyncedAt ? ` on ${new Date(data.sourceSyncedAt).toLocaleString()}` : ""}
+          </span>
+        )}
+        {data.reviewedAt && <span>Reviewed on <span className="text-[var(--foreground)]">{new Date(data.reviewedAt).toLocaleDateString()}</span></span>}
+      </div>
       <Link
         href={`/projects/${projectId}/knowledge-base/documents/${data.id}`}
         className="inline-flex items-center gap-1 text-xs font-medium text-[var(--accent-light)] hover:underline"
@@ -145,6 +204,9 @@ function KnowledgeDocumentDetail({ data, projectId }: { data: KnowledgeDocument;
 function KnowledgeFileDetail({ data, projectId }: { data: KnowledgeFile; projectId: string }) {
   return (
     <div className="space-y-4">
+      {data.originalFileName && data.originalFileName !== data.fileName && (
+        <p className="text-sm text-[var(--foreground)]">{data.originalFileName}</p>
+      )}
       <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">
         <span>Type: <span className="text-[var(--foreground)]">{data.mimeType || "Unknown"}</span></span>
         {data.fileSize != null && <span>Size: <span className="text-[var(--foreground)]">{Math.round(data.fileSize / 1024)} KB</span></span>}
@@ -167,6 +229,7 @@ function JiraTicketDetail({ data }: { data: JiraTicket }) {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-1.5">
         <StatusChip tone="brand">{data.status}</StatusChip>
+        {data.issueType && <span className="text-xs text-[var(--muted)]">{data.issueType}</span>}
         {data.priority && <span className="text-xs text-[var(--muted)]">{data.priority}</span>}
         <span className="font-mono text-[11px] text-[var(--muted)]">{data.jiraIssueKey}</span>
       </div>
@@ -180,6 +243,7 @@ function JiraTicketDetail({ data }: { data: JiraTicket }) {
         {data.reporter && <span>Reporter: <span className="text-[var(--foreground)]">{data.reporter}</span></span>}
         {data.assignee && <span>Assignee: <span className="text-[var(--foreground)]">{data.assignee}</span></span>}
         {data.labels && <span>Labels: <span className="text-[var(--foreground)]">{data.labels}</span></span>}
+        {data.jiraUpdatedAt && <span>Updated: <span className="text-[var(--foreground)]">{new Date(data.jiraUpdatedAt).toLocaleDateString()}</span></span>}
       </div>
       {data.jiraUrl && (
         <a href={data.jiraUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs font-medium text-[var(--accent-light)] hover:underline">
@@ -243,7 +307,10 @@ export function ZyraContextDrawer({
       try {
         if (reference.type === "testcase") {
           const data = await getTestCase(projectId, reference.id);
-          if (!cancelled) setState({ kind: "testcase", data });
+          // custom-field-values requires the row's real uuid, never the external id reference.id
+          // may carry — see getValuesForTestCase in custom-fields.service.ts.
+          const customFields = await getCustomFieldValues(projectId, String(data.id)).catch(() => []);
+          if (!cancelled) setState({ kind: "testcase", data, customFields });
         } else if (reference.type === "bug") {
           const data = await getBug(reference.id);
           if (!cancelled) setState({ kind: "bug", data });
@@ -296,7 +363,7 @@ export function ZyraContextDrawer({
       <div className="p-5">
         {state.kind === "loading" && <p className="text-sm text-[var(--muted)]">Loading…</p>}
         {state.kind === "error" && <p className="text-sm text-[var(--error-foreground)]">{state.message}</p>}
-        {state.kind === "testcase" && <TestcaseDetail data={state.data} />}
+        {state.kind === "testcase" && <TestcaseDetail data={state.data} customFields={state.customFields} />}
         {state.kind === "bug" && <BugDetail data={state.data} />}
         {state.kind === "knowledge_document" && <KnowledgeDocumentDetail data={state.data} projectId={projectId} />}
         {state.kind === "knowledge_file" && <KnowledgeFileDetail data={state.data} projectId={projectId} />}
