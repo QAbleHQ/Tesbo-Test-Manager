@@ -162,6 +162,8 @@ test.describe("test case import wizard", () => {
       description: string;
       preconditions: string;
       steps: { stepNumber: number; action: string; expectedResult: string }[];
+      automationStatus: string;
+      attachments: string | null;
     };
 
   const listSuites = async (projectId: string) =>
@@ -173,10 +175,17 @@ test.describe("test case import wizard", () => {
 
   /* ─────────────────────────── wizard drivers ─────────────────────────── */
 
-  async function openWizard(page: Page, projectId: string): Promise<void> {
-    await page.goto(`/projects/${projectId}/testcases`);
+  /** Opens the wizard from wherever the page already is — does NOT navigate. Use this whenever the
+   *  current `?suiteId=` (set by clicking into a suite, not by a fresh goto) needs to be preserved;
+   *  openWizard() below re-navigates to the bare URL and would silently drop it. */
+  async function clickImport(page: Page): Promise<void> {
     await page.getByRole("button", { name: "Import", exact: true }).click();
     await expect(page.getByText("Upload a CSV or Excel file to import test cases.")).toBeVisible();
+  }
+
+  async function openWizard(page: Page, projectId: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/testcases`);
+    await clickImport(page);
   }
 
   async function chooseFile(page: Page, name: string, buffer: Buffer, mimeType: string): Promise<void> {
@@ -279,7 +288,9 @@ test.describe("test case import wizard", () => {
 
       await page.getByRole("button", { name: "Import 2 rows" }).click();
       await expect(page.getByText("Import complete.")).toBeVisible({ timeout: 30_000 });
-      await expect(page.getByText("1 test case imported successfully")).toBeVisible();
+      // 1 of 2 rows landed, so this is the partial-import state, not the all-clear one — the banner
+      // must not say "successfully" while a row was rejected. See ImportTestCasesModal.tsx.
+      await expect(page.getByText("1 of 2 test cases imported")).toBeVisible();
 
       // The error row number must point at the line the user can find in their file — line 3 — not
       // at an index into the rows the parser kept.
@@ -338,8 +349,9 @@ test.describe("test case import wizard", () => {
       await uploadCsv(page, csv);
       await runImport(page, 3);
 
-      await expect(page.getByText("1 test case imported successfully")).toBeVisible();
-      await expect(page.getByText("Out of 3 total rows in the file.")).toBeVisible();
+      // 1 of 3 rows landed and 2 were duplicates, so this is the partial-import state.
+      await expect(page.getByText("1 of 3 test cases imported")).toBeVisible();
+      await expect(page.getByText("2 rows had errors and were skipped. See the details below.")).toBeVisible();
       await expect(
         page.getByText("Skipped duplicate title: already exists in this project"),
       ).toBeVisible();
@@ -349,6 +361,42 @@ test.describe("test case import wizard", () => {
 
       const titles = (await listCases(projectId)).map((c) => c.title).sort();
       expect(titles, "exactly one copy of each title exists").toEqual([existing, fresh].sort());
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  // Regression test for: when every row in the file was rejected, the result step still rendered the
+  // green "successfully" banner with a checkmark, reporting "0 test cases imported successfully" — see
+  // ImportTestCasesModal.tsx. The banner must switch to the failure treatment instead, and must never
+  // say "successfully" when nothing was imported.
+  test("shows a failure banner, not a success banner, when every row is rejected", async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "All Rejected");
+      const { page, projectId } = fixture;
+      const existing = `E2E All Rejected ${Date.now()}`;
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title: existing } });
+
+      // The one row in the file collides with the case already in the project, so 0 of 1 rows import.
+      await openWizard(page, projectId);
+      await uploadCsv(page, toCsv(["Title"], [[existing]]));
+      await runImport(page, 1);
+
+      await expect(page.getByText("No test cases were imported")).toBeVisible();
+      await expect(
+        page.getByText("All 1 row in the file had errors. Fix the issues below and try again."),
+      ).toBeVisible();
+      await expect(page.getByText("0 test cases imported successfully")).toBeHidden();
+      await expect(page.getByText("Skipped duplicate title: already exists in this project")).toBeVisible();
+
+      // The shortcut back to mapping works, since a wall of identical errors is often a mapping
+      // problem rather than genuinely bad data.
+      await page.getByRole("button", { name: "Edit column mapping" }).click();
+      await expect(page.getByText("Map your file columns to test case fields.")).toBeVisible();
+
+      // Only the pre-existing case is present — the rejected row did not create a duplicate.
+      expect((await listCases(projectId)).map((c) => c.title)).toEqual([existing]);
     } finally {
       await disposeProject(fixture);
     }
@@ -418,6 +466,92 @@ test.describe("test case import wizard", () => {
         { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
         { stepNumber: 2, action: "Submit empty credentials", expectedResult: "" },
       ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("builds a single step from separate Action/Expected Result columns when Steps isn't mapped", { tag: '@tesbo.testId("TES-TC-2103")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Action Expected Columns");
+      const { page, projectId } = fixture;
+      const title = `E2E Action Expected Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Action", "Expected Result"],
+          [[title, "Click the submit button", "The form is submitted"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Action"), "auto-maps by its own header, not into Steps").toHaveValue("1");
+      await expect(mappingFor(page, "Expected Result")).toHaveValue("2");
+      // Steps itself has nothing to map to — a file like this has no combined DSL column at all.
+      await expect(mappingFor(page, "Steps")).toHaveValue("");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([
+        { stepNumber: 1, action: "Click the submit button", expectedResult: "The form is submitted" },
+      ]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("a mapped Steps column wins over Action/Expected Result when both are mapped", { tag: '@tesbo.testId("TES-TC-2104")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Steps Priority");
+      const { page, projectId } = fixture;
+      const title = `E2E Steps Priority Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Steps", "Action", "Expected Result"],
+          [[title, "Open the app => It loads", "This column must be ignored", "So must this one"]],
+        ),
+      );
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.steps).toEqual([{ stepNumber: 1, action: "Open the app", expectedResult: "It loads" }]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("maps Automation Type and Notes columns and imports them", { tag: '@tesbo.testId("TES-TC-2102")' }, async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Automation Notes");
+      const { page, projectId } = fixture;
+      const title = `E2E Automation Notes Case ${Date.now()}`;
+
+      await openWizard(page, projectId);
+      await uploadCsv(
+        page,
+        toCsv(
+          ["Title", "Automation Type", "Notes"],
+          [[title, "Automated", "Captured a screenshot of the failure"]],
+        ),
+      );
+
+      await expect(mappingFor(page, "Automation Type"), "the header auto-maps by its exact field label").toHaveValue("1");
+      await expect(mappingFor(page, "Notes")).toHaveValue("2");
+      await runImport(page, 1);
+
+      const listed = (await listCases(projectId)).find((c) => c.title === title)!;
+      const imported = await getCase(projectId, listed.id);
+      expect(imported.automationStatus).toBe("Automated");
+      expect(imported.attachments).toBe("Captured a screenshot of the failure");
     } finally {
       await disposeProject(fixture);
     }

@@ -4,27 +4,31 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  authMe,
   listCycleExecutions,
   updateExecution,
-  listProjectMembers,
+  listBugs,
   type ExecutionItem,
+  type BugItem,
 } from "@/lib/api";
+import { IconBug } from "@tabler/icons-react";
 import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
+import { useLogBugDialog } from "@/components/LogBugDialog";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"];
 
 function statusToTone(status: string) {
-  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "info" | "neutral"> = {
+  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "retest" | "notRun"> = {
     Passed: "success",
     Failed: "error",
     Skipped: "skipped",
     Blocked: "blocked",
-    Retest: "info",
-    Untested: "neutral",
+    Retest: "retest",
+    Untested: "notRun",
   };
   return map[status] ?? "neutral";
 }
@@ -58,38 +62,50 @@ export default function ExecutionDetailPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const cycleId = params.cycleId as string;
+  const { currentUser } = useAppData();
+  const { projectMembers: members } = useProjectData();
   const executionId = params.executionId as string;
   const [execution, setExecution] = useState<ExecutionItem | null>(null);
   const [status, setStatus] = useState("");
   const [actualResult, setActualResult] = useState("");
-  const [defectKey, setDefectKey] = useState("");
-  const [defectUrl, setDefectUrl] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
   const [saving, setSaving] = useState(false);
+  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
+     (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
+  const [linkedBug, setLinkedBug] = useState<BugItem | null>(null);
+  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
+    projectId,
+    cycleId,
+    onLogged: () => {
+      if (execution) loadLinkedBug(execution);
+    },
+  });
+
+  function loadLinkedBug(exec: ExecutionItem) {
+    listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
+      .then((bugs) => setLinkedBug(bugs[0] ?? null))
+      .catch(() => setLinkedBug(null));
+  }
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      listCycleExecutions(cycleId)
-        .then((list) => {
-          const e = list.find((x) => x.id === executionId);
-          if (e) {
-            setExecution(e);
-            setStatus(e.status || "Untested");
-            setActualResult(e.actualResult || "");
-            setDefectKey(e.defectKey || "");
-            setDefectUrl(e.defectUrl || "");
-            setAssigneeId(e.assigneeId || "");
-          }
-        })
-        .catch(() => router.replace("/projects"));
-      listProjectMembers(projectId).then(setMembers).catch(() => {});
-    });
-  }, [cycleId, executionId, projectId, router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    listCycleExecutions(cycleId)
+      .then((list) => {
+        const e = list.find((x) => x.id === executionId);
+        if (e) {
+          setExecution(e);
+          setStatus(e.status || "Untested");
+          setActualResult(e.actualResult || "");
+          setAssigneeId(e.assigneeId || "");
+          loadLinkedBug(e);
+        }
+      })
+      .catch(() => router.replace("/projects"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cycleId, executionId, projectId, router, currentUser]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -98,8 +114,6 @@ export default function ExecutionDetailPage() {
       await updateExecution(cycleId, executionId, {
         status,
         actualResult,
-        defectKey: defectKey || undefined,
-        defectUrl: defectUrl || undefined,
         assigneeId: assigneeId || null,
       });
       router.push(`/projects/${projectId}/cycles/${cycleId}`);
@@ -245,33 +259,33 @@ export default function ExecutionDetailPage() {
           </div>
 
           {/*
-            * Basecamp 10221790207 — "Only failed test case should show defect key and Defect URL".
-            * A defect reference on a passing case is not just clutter: it flows into the CSV export
-            * and the traceability matrix, where it reads as a bug against a case that passed. The
-            * backend clears the stored values when a status other than Failed is saved, so hiding
-            * the inputs here does not leave data behind invisibly.
+            * Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
+            * rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
+            * not a free-text value typed here, so there's nothing to type into them.
             */}
           <div className="grid grid-cols-2 gap-3" hidden={status !== "Failed"}>
             <div>
               <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Defect Key
+                Bug Key
               </label>
               <Input
                 type="text"
-                value={defectKey}
-                onChange={(e) => setDefectKey(e.target.value)}
+                aria-label="Bug Key"
+                value={linkedBug?.integrationIssueKey || linkedBug?.externalId || ""}
+                readOnly
                 placeholder="e.g. PROJ-123"
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Defect URL
+                Bug Title
               </label>
               <Input
-                type="url"
-                value={defectUrl}
-                onChange={(e) => setDefectUrl(e.target.value)}
-                placeholder="https://…"
+                type="text"
+                aria-label="Bug Title"
+                value={linkedBug?.title || ""}
+                readOnly
+                placeholder="Title of the linked bug"
               />
             </div>
           </div>
@@ -291,6 +305,10 @@ export default function ExecutionDetailPage() {
             <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save"}
             </Button>
+            <Button type="button" variant="secondary" onClick={() => openBugDialogFor(execution)}>
+              <IconBug size={14} />
+              Log bug
+            </Button>
             <Link
               href={`/projects/${projectId}/cycles/${cycleId}`}
               className="rounded-lg border border-[var(--border)] py-2 px-5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
@@ -300,6 +318,7 @@ export default function ExecutionDetailPage() {
           </div>
         </form>
       </main>
+      {bugDialog}
     </div>
   );
 }

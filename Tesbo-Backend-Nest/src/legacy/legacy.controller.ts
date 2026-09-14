@@ -4,6 +4,7 @@ import {
   Controller,
   Delete,
   Get,
+  MessageEvent,
   NotFoundException,
   NotImplementedException,
   Param,
@@ -13,15 +14,19 @@ import {
   Query,
   Req,
   Res,
+  Sse,
   UploadedFiles,
   UseInterceptors
 } from "@nestjs/common";
 import { FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
 import ExcelJS from "exceljs";
+import { map, Observable, of } from "rxjs";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
+import { ZyraProgressService } from "./zyra-progress.service";
 
 const TESTCASE_EXPORT_BASE_HEADERS = [
   "externalId",
@@ -99,12 +104,85 @@ const REPORT_VIEW_SHEET_NAMES: Record<ReportExportView, string> = {
 export class LegacyController {
   constructor(
     private readonly legacy: LegacyService,
-    private readonly customFields: CustomFieldsService
+    private readonly customFields: CustomFieldsService,
+    private readonly zyraProgress: ZyraProgressService
   ) {}
+
+  // Kill switch for the whole SSE progress-narration side-channel (see zyra-progress.service.ts's
+  // file header) — flip ZYRA_PROGRESS_STREAMING_ENABLED=false to disable it without a revert, with
+  // the guarantee that a disabled feature never registers a turn, never opens a stream, and the
+  // POST route it rides alongside behaves exactly as it did before this feature existed.
+  private zyraProgressStreamingEnabled(): boolean {
+    return process.env.ZYRA_PROGRESS_STREAMING_ENABLED !== "false";
+  }
 
   private csvEscape(value: unknown): string {
     const text = String(value ?? "");
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  // Excel/Sheets treats a cell starting with =, +, -, @, tab or CR as a formula, regardless of
+  // format (CSV or XLSX). csvEscape/cellValue never guarded against that because every string they
+  // handled up to now was either static or already-validated app data. This fix is the first place
+  // a custom field's freeform NAME and its option LABELs get written into a generated file, so both
+  // now pass through here first. Prefixing with a single quote is the standard mitigation: it forces
+  // the cell to display as text in both Excel and Sheets without changing what the user typed.
+  private sanitizeFormulaCell(value: string): string {
+    return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  }
+
+  // A custom field's column, named for the file rather than the API: its display name, unless that
+  // name would collide with a fixed base column once normalized the same way the import modal's
+  // auto-mapper normalizes headers (lowercase, strip non-alphanumeric) — e.g. a field literally
+  // named "Title" or "externalId". Field creation now rejects new names like that (see
+  // CustomFieldsService), but this stays as a defensive fallback for any field named that way
+  // before the guard existed, so a generated file never has two columns that read as the same header.
+  private sampleColumnName(definition: CustomFieldDefinitionDto): string {
+    const name = this.sanitizeFormulaCell(definition.name);
+    return RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name)) ? `${name} (Custom Field)` : name;
+  }
+
+  // Builds a value that is valid for the definition's own config, so the template's worked example
+  // row can always be re-imported as-is instead of tripping the very validation it's meant to
+  // demonstrate (a maxLength, a min/max, a date-range restriction, or — for a select — simply having
+  // no active option to offer). Mirrors the parsing ImportTestCasesModal.tsx's
+  // coerceCustomFieldImportValue expects on the way back in.
+  private sampleCustomFieldValue(definition: CustomFieldDefinitionDto): string {
+    const config = definition.config || {};
+    switch (definition.fieldType) {
+      case "text":
+      case "long_text": {
+        const sample = "Sample value";
+        return this.sanitizeFormulaCell(
+          config.maxLength != null && config.maxLength < sample.length ? sample.slice(0, config.maxLength) : sample
+        );
+      }
+      case "boolean":
+        return config.displayFormat === "true_false" ? "True" : "Yes";
+      case "number": {
+        let sample = config.min ?? config.max ?? 1;
+        if (config.decimalsAllowed === false) sample = Math.round(sample);
+        return String(sample);
+      }
+      case "date":
+        // Today always satisfies any allowPastDates/allowFutureDates combination — see
+        // checkDateRange in custom-field-validation.ts, which only rejects date < today or date > today.
+        return new Date().toISOString().slice(0, 10);
+      case "single_select": {
+        const active = (config.options || []).find((o) => o.active);
+        return active ? this.sanitizeFormulaCell(active.label) : "";
+      }
+      case "multi_select": {
+        const activeOptions = (config.options || []).filter((o) => o.active);
+        const count = Math.min(Math.max(1, config.minSelected ?? 1), config.maxSelected ?? (activeOptions.length || 1));
+        return activeOptions
+          .slice(0, count)
+          .map((o) => this.sanitizeFormulaCell(o.label))
+          .join(", ");
+      }
+      default:
+        return "";
+    }
   }
 
   private rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
@@ -705,6 +783,21 @@ export class LegacyController {
     return [];
   }
 
+  // Nothing is persisted yet (see the comment above), but a one-time schedule's runAt is still
+  // validated up front: a caller bypassing the UI's own datetime-local `min` and submit-time check
+  // must not be able to submit a past or malformed instant just because the route 501s regardless —
+  // the rule has to hold at the API, not only in the form that happens to enforce it today.
+  private validateScheduleRunAt(body: Record<string, any>): void {
+    if (body?.scheduleType !== "one_time") return;
+    const raw = body?.runAt;
+    if (typeof raw !== "string" || !raw || Number.isNaN(Date.parse(raw))) {
+      throw new BadRequestException({ error: "Run At must be a valid date and time" });
+    }
+    if (Date.parse(raw) <= Date.now()) {
+      throw new BadRequestException({ error: "Date and time must be in future" });
+    }
+  }
+
   @Post("/api/projects/:projectId/cycles/schedules")
   async createSchedule(
     @Req() req: AuthenticatedRequest,
@@ -712,6 +805,7 @@ export class LegacyController {
     @Body() body: Record<string, any>
   ) {
     await this.legacy.requireProjectAccess(req.userId, projectId);
+    this.validateScheduleRunAt(body);
     throw new NotImplementedException({ error: "Scheduled runs are not available yet" });
   }
 
@@ -834,28 +928,38 @@ export class LegacyController {
     // /api/projects/:id — it was the one that answered with no session, and that served the same
     // 200 for a project id that doesn't exist.
     await this.legacy.requireProjectAccess(req.userId, projectId);
-    const rows = [
-      {
-        title: "Example login test",
-        description: "Verify a valid user can sign in.",
-        preconditions: "User account exists.",
-        postconditions: "User lands on the dashboard with an active session.",
-        // "action => expected result" per step, separated by " | " — the expected result after
-        // "=>" is optional but importing it this way carries it into each step's Expected Result.
-        steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
-        testData: "user@example.com",
-        priority: "P2",
-        severity: "Medium",
-        type: "Functional",
-        status: "Draft",
-        suite: "Authentication",
-        component: "Login",
-        // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
-        // normalizeEstimatedDuration in legacy.service.ts.
-        estimatedDuration: "10m"
-      }
-    ];
-    const headers = Object.keys(rows[0]);
+    // Every mandatory (and every other active) custom field must show up here: skipping one gives
+    // the user nothing to fill in for it, so the importer's own required-field check then rejects
+    // every row — see LegacyController.template()'s history for the incident this fixes.
+    const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
+    const row: Record<string, string> = {
+      title: "Example login test",
+      description: "Verify a valid user can sign in.",
+      preconditions: "User account exists.",
+      postconditions: "User lands on the dashboard with an active session.",
+      // "action => expected result" per step, separated by " | " — the expected result after
+      // "=>" is optional but importing it this way carries it into each step's Expected Result.
+      steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
+      testData: "user@example.com",
+      priority: "P2",
+      severity: "Medium",
+      type: "Functional",
+      status: "Draft",
+      suite: "Authentication",
+      component: "Login",
+      // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
+      // normalizeEstimatedDuration in legacy.service.ts.
+      estimatedDuration: "10m",
+      automationStatus: "Not Automated",
+      attachments: "Screenshot attached: successful-login.png"
+    };
+    const headers = Object.keys(row);
+    for (const definition of definitions) {
+      const column = this.sampleColumnName(definition);
+      row[column] = this.sampleCustomFieldValue(definition);
+      headers.push(column);
+    }
+    const rows = [row];
     if (format === "xlsx") {
       await this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
       return;
@@ -1152,14 +1256,79 @@ export class LegacyController {
     return this.legacy.zyraChatSession(projectId, req.userId, sessionId);
   }
 
-  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
-  sendZyraChatMessage(
+  @Patch("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  renameZyraChatSession(
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Param("sessionId") sessionId: string,
     @Body() body: Record<string, any>
   ) {
-    return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+    return this.legacy.renameZyraChatSession(projectId, req.userId, sessionId, body);
+  }
+
+  @Delete("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  deleteZyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("sessionId") sessionId: string) {
+    return this.legacy.deleteZyraChatSession(projectId, req.userId, sessionId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
+  async sendZyraChatMessage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: Record<string, any>
+  ) {
+    // turnId is a caller-supplied, purely optional, opaque correlation id — it exists only to let
+    // an ALREADY-open GET .../turns/:turnId/events stream narrate this same request while it runs.
+    // It changes nothing about what this route does or returns: a caller that omits it (every
+    // existing caller, every API-token/MCP integration) gets exactly today's behavior, byte for
+    // byte, because `onStage` below is then simply undefined and sendZyraChatMessage never calls it.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    if (!turnId) {
+      return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const onStage = this.zyraProgress.stageEmitter(turnId, owner);
+    try {
+      const result = await this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body, onStage);
+      this.zyraProgress.complete(turnId, result);
+      return result;
+    } catch (err) {
+      // Deliberately generic — the real error detail still reaches the client via this same
+      // request's own (unmodified) HTTP error response; the progress channel only needs to tell an
+      // open SSE stream to stop waiting, never to explain why.
+      this.zyraProgress.completeWithError(turnId, "This turn did not complete.");
+      throw err;
+    }
+  }
+
+  // Read-only, best-effort progress narration for one turn of the route above — see
+  // zyra-progress.service.ts's file header for the full design and the guarantees this route
+  // cannot violate (it can only ever narrate the POST above, never affect it). Same
+  // project/session ownership check as every other Zyra route (zyraChatSession already does both
+  // requireProjectAccess and "this session belongs to this project" in one call) — a turnId is an
+  // unguessable v4 UUID, but that is not the same as authorized, so this still runs before ever
+  // touching the in-memory turn registry.
+  @Sse("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/turns/:turnId/events")
+  async zyraTurnEvents(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Param("turnId") turnId: string
+  ): Promise<Observable<MessageEvent>> {
+    await this.legacy.zyraChatSession(projectId, req.userId, sessionId);
+    if (!this.zyraProgressStreamingEnabled()) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const subject = this.zyraProgress.subscribe(turnId, owner);
+    if (!subject) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    return subject.pipe(map((event) => ({ data: event })));
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")

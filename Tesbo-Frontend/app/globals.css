@@ -118,6 +118,10 @@
   --status-notrun-text: #0D5070;
   --status-notrun-dot: #1D7FA8;
   --status-notrun-fill: #E6F5FB;
+  /* Retest */
+  --status-retest-text: #0F6E6E;
+  --status-retest-dot: #14B8A6;
+  --status-retest-fill: #E6FFFA;
 
   /* ── Semantic utility colors ─────────────────────────────────────── */
   --success: #2D9A52;
@@ -258,6 +262,9 @@
   --status-notrun-text: #38BDF8;
   --status-notrun-dot: #1D7FA8;
   --status-notrun-fill: #102030;
+  --status-retest-text: #5EEAD4;
+  --status-retest-dot: #14B8A6;
+  --status-retest-fill: rgba(20, 184, 166, 0.18);
 
   --success: #2D9A52;
   --success-foreground: #34D399;
@@ -373,6 +380,24 @@ button[class*="bg-[var(--surface-tertiary)]"] {
 @media (min-width: 768px) {
   .tesbo-page {
     padding: 2rem 2rem 2.75rem;
+  }
+}
+
+/* Same horizontal max-width + centering + padding as .tesbo-page, so the sticky top bar's
+   content lines up with the page content beneath it on every viewport width. The header can't
+   just use .tesbo-page directly — that also carries vertical padding sized for a scrolling page,
+   not a fixed-height toolbar — and matching only the horizontal values at one breakpoint isn't
+   enough either: .tesbo-page centers its content once the viewport passes --content-max, so
+   anything wider than that needs the same margin-inline: auto, not just the same padding. */
+.tesbo-topbar-inset {
+  margin-inline: auto;
+  width: 100%;
+  max-width: var(--content-max);
+  padding-inline: 1.5rem;
+}
+@media (min-width: 768px) {
+  .tesbo-topbar-inset {
+    padding-inline: 2rem;
   }
 }
 
@@ -583,6 +608,16 @@ a.group:hover > .tesbo-card {
   color: var(--ink-400);
   padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--border-subtle);
+}
+/* `.tesbo-table th` above beats Tailwind's `.text-right`/`.text-center` on specificity alone (one
+   more element selector), so a column header using either utility was silently forced left no
+   matter what the consuming component's className said, while the cells below it aligned
+   correctly — label and content ended up on opposite sides of the column. */
+.tesbo-table th.text-right {
+  text-align: right;
+}
+.tesbo-table th.text-center {
+  text-align: center;
 }
 .tesbo-table td {
   padding: 0 1rem;

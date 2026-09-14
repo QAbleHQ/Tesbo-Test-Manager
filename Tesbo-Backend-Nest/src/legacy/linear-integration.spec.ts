@@ -12,6 +12,13 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 // A key just needs to decode to 32 bytes for aes-256-gcm; this is a throwaway test-only key
 // (crypto.util lazily loads it on first encrypt/decrypt call, so setting it at module scope
@@ -79,6 +86,10 @@ async function validState(svc: LegacyService, provider: "jira" | "linear"): Prom
 }
 
 function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyncService> = {}): LegacyService {
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   return new LegacyService(
     db,
     {} as unknown as EmailService,
@@ -90,6 +101,12 @@ function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyn
     integrationSync as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     { assertIntegrationAllowed: jest.fn().mockResolvedValue(undefined) } as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
 }
@@ -664,6 +681,64 @@ describe("LegacyService#integrationDisconnect", () => {
     expect(updateCall!.sql).toMatch(/access_token\s*=\s*''/);
     expect(updateCall!.sql).toMatch(/refresh_token\s*=\s*''/);
     expect(updateCall!.params).toEqual(["org-1", "jira"]);
+  });
+
+  // Regression: the "Jira"/"Linear" Knowledge Base folder ensureProviderFolder creates
+  // (integration-sync.service.ts) used to be left completely untouched by disconnect — fully
+  // visible and populated, as if the integration were still connected. It's now found (by
+  // source_provider, scoped to the whole organization — not just the currently-mapped project) and
+  // soft-deleted in the same transaction, tagged so restoreKnowledgeFolder can refuse to bring it
+  // back. See e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof against a
+  // real database; this pins the query shape and the never-a-DELETE guarantee at the unit level.
+  it("soft-deletes the provider's Knowledge Base folder as part of the same disconnect, tagged non-restorable", async () => {
+    const { db, calls } = makeDb([
+      workspaceRoute("owner"),
+      {
+        match: "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id",
+        rows: [{ id: "folder-1", project_id: "proj-1", name: "Jira" }]
+      }
+    ]);
+    const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
+    const res = await svc.integrationDisconnect("user-1", "jira");
+    expect(res).toEqual({ disconnected: true });
+
+    const folderLookup = calls.find((c) => c.sql.includes("SELECT id, project_id, name FROM knowledge_folders WHERE organization_id"));
+    expect(folderLookup!.params).toEqual(["org-1", "jira"]);
+    expect(folderLookup!.sql).toMatch(/AND\s+source_provider\s*=\s*\$2\s+AND\s+is_deleted\s*=\s*false/);
+
+    const folderUpdate = calls.find((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true"));
+    // the found folder must be soft-deleted, never hard-deleted
+    expect(folderUpdate).toBeDefined();
+    // folderIds is bound as a Postgres array (= ANY($1::uuid[])) so several provider folders across
+    // several projects can be cascaded in one set-based pass — see cascadeSoftDeleteFolderTree.
+    expect(folderUpdate!.params).toEqual([["folder-1"], "user-1", "integration_disconnect"]);
+    expect(calls.some((c) => c.sql.trim().toUpperCase().startsWith("DELETE"))).toBe(false);
+  });
+
+  it("cascades every affected folder across every project in one set-based pass, not one round-trip per folder", async () => {
+    const { db, calls } = makeDb([
+      workspaceRoute("owner"),
+      {
+        match: "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id",
+        rows: [
+          { id: "folder-1", project_id: "proj-1", name: "Jira" },
+          { id: "folder-2", project_id: "proj-2", name: "Jira" }
+        ]
+      }
+    ]);
+    const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
+    await svc.integrationDisconnect("user-1", "jira");
+
+    const folderUpdate = calls.find((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true"));
+    expect(folderUpdate!.params[0]).toEqual(["folder-1", "folder-2"]);
+    // Exactly one soft-delete UPDATE for the whole batch, not one per folder.
+    expect(calls.filter((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true")).length).toBe(1);
+  });
+
+  it("is a safe no-op when there is no provider folder to clean up", async () => {
+    const { db } = makeDb([workspaceRoute("owner")]);
+    const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
+    await expect(svc.integrationDisconnect("user-1", "linear")).resolves.toEqual({ disconnected: true });
   });
 });
 

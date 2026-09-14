@@ -160,6 +160,15 @@ test.describe("custom field definitions", () => {
     return scalar(`SELECT COUNT(*) FROM custom_field_definitions WHERE id = ${literal(definitionId)};`) === "1";
   }
 
+  /** Delete is a soft-delete: the row survives with deleted_at set, rather than disappearing. */
+  function isSoftDeleted(definitionId: string): boolean {
+    return scalar(`SELECT deleted_at IS NOT NULL FROM custom_field_definitions WHERE id = ${literal(definitionId)};`) === "t";
+  }
+
+  function restoreUrl(definitionId: string, projectId?: string): string {
+    return `${definitionUrl(definitionId, projectId)}/restore`;
+  }
+
   // ─── Creation ──────────────────────────────────────────────────────────────
 
   test("creates a field of every supported type, normalising each type's config", { tag: '@tesbo.testId("TES-TC-126")' }, async () => {
@@ -247,6 +256,31 @@ test.describe("custom field definitions", () => {
     const reused = await createField({ name, fieldType: "text" });
     expect(reused.id).not.toBe(first.id);
   });
+
+  test(
+    "a name reserved for a built-in test case column is rejected on create and on rename",
+    { tag: '@tesbo.testId("TES-TC-170")' },
+    async () => {
+      // Once this field started appearing as a real column in the export/import template
+      // (Tesbo-Backend-Nest/src/legacy/legacy.controller.ts's template()), a field named e.g.
+      // "Title" or "externalId" would land on the exact same normalized header as the built-in
+      // column — see RESERVED_TESTCASE_HEADERS. Blocked at the source rather than worked around
+      // downstream in every place that generates a file.
+      for (const reserved of ["Title", "EXTERNALID", "Estimated Duration"]) {
+        const res = await post(asOwner, { name: reserved, fieldType: "text" });
+        expect(res.status(), `creating a field named "${reserved}"`).toBe(400);
+        expect((await res.json()).error).toContain("reserved");
+      }
+
+      const definition = await textField();
+      const renamed = await asOwner.patch(definitionUrl(definition.id), {
+        data: { name: "Status" },
+        failOnStatusCode: false,
+      });
+      expect(renamed.status()).toBe(400);
+      expect((await renamed.json()).error).toContain("reserved");
+    },
+  );
 
   test("fieldType must be one of the seven supported types", { tag: '@tesbo.testId("TES-TC-132")' }, async () => {
     for (const fieldType of [undefined, "", "string", "TEXT", "dropdown", 7]) {
@@ -715,31 +749,126 @@ test.describe("custom field definitions", () => {
   });
 
   // ─── Deletion ──────────────────────────────────────────────────────────────
+  //
+  // Delete is a soft-delete (deleted_at/deleted_by), not a row removal: an in-use field used to be
+  // permanently un-deletable (409 FORCE_ARCHIVE), and an archived field that was also in use had no
+  // lifecycle action left at all — Edit/Deactivate/Archive hide once archived, and the old delete
+  // endpoint refused any in-use field regardless of status. Soft-delete works uniformly from any
+  // status and never destroys a recorded value.
 
-  test("an unused field can be deleted outright", { tag: '@tesbo.testId("TES-TC-159")' }, async () => {
+  test("an unused field can be deleted; the row survives soft-deleted and disappears from the list", { tag: '@tesbo.testId("TES-TC-159")' }, async () => {
     const definition = await textField();
     const res = await asOwner.delete(definitionUrl(definition.id));
     expect(res.ok(), await res.text()).toBeTruthy();
 
-    expect(definitionExists(definition.id)).toBe(false);
+    expect(definitionExists(definition.id)).toBe(true);
+    expect(isSoftDeleted(definition.id)).toBe(true);
     expect(await listFields()).toHaveLength(0);
   });
 
-  test("a field holding recorded values must be archived instead of deleted", { tag: '@tesbo.testId("TES-TC-160")' }, async () => {
+  test("a field holding recorded values can now be deleted too, and the values are kept", { tag: '@tesbo.testId("TES-TC-160")' }, async () => {
     const definition = await textField();
     recordValue(definition.id, "in use");
 
-    const res = await asOwner.delete(definitionUrl(definition.id), { failOnStatusCode: false });
-    expect(res.status()).toBe(409);
-    expect((await res.json()).code).toBe("FORCE_ARCHIVE");
-    expect(definitionExists(definition.id)).toBe(true);
-
-    // The offered alternative has to actually work, and it must not take the values with it.
-    const archived = await asOwner.patch(`${definitionUrl(definition.id)}/status`, { data: { status: "archived" } });
-    expect(archived.ok()).toBeTruthy();
+    const res = await asOwner.delete(definitionUrl(definition.id));
+    expect(res.ok(), await res.text()).toBeTruthy();
+    expect(isSoftDeleted(definition.id)).toBe(true);
     expect(
       scalar(`SELECT COUNT(*) FROM custom_field_values WHERE definition_id = ${literal(definition.id)};`),
     ).toBe("1");
+  });
+
+  test("an archived field can be deleted directly — the old dead end for an archived, in-use field is closed", { tag: '@tesbo.testId("TES-TC-3001")' }, async () => {
+    const definition = await textField();
+    recordValue(definition.id, "in use");
+    await asOwner.patch(`${definitionUrl(definition.id)}/status`, { data: { status: "archived" } });
+
+    const res = await asOwner.delete(definitionUrl(definition.id));
+    expect(res.ok(), await res.text()).toBeTruthy();
+    expect(isSoftDeleted(definition.id)).toBe(true);
+  });
+
+  test("deleting the same field twice: the second call finds nothing to delete and 404s", { tag: '@tesbo.testId("TES-TC-3002")' }, async () => {
+    const definition = await textField();
+    const first = await asOwner.delete(definitionUrl(definition.id));
+    expect(first.ok(), await first.text()).toBeTruthy();
+
+    const second = await asOwner.delete(definitionUrl(definition.id), { failOnStatusCode: false });
+    expect(second.status()).toBe(404);
+  });
+
+  test("a deleted field is unreachable through get/update/status/reorder, and its name frees up immediately", { tag: '@tesbo.testId("TES-TC-3003")' }, async () => {
+    const name = fieldName("Freed on delete");
+    const definition = await createField({ name, fieldType: "text" });
+    await asOwner.delete(definitionUrl(definition.id));
+
+    expect((await asOwner.get(definitionUrl(definition.id), { failOnStatusCode: false })).status()).toBe(404);
+    expect(
+      (await asOwner.patch(definitionUrl(definition.id), { data: { name: "x" }, failOnStatusCode: false })).status(),
+    ).toBe(404);
+    expect(
+      (
+        await asOwner.patch(`${definitionUrl(definition.id)}/status`, {
+          data: { status: "archived" },
+          failOnStatusCode: false,
+        })
+      ).status(),
+    ).toBe(404);
+    const reorder = await asOwner.post(`${definitionsUrl()}/reorder`, {
+      data: { orderedIds: [definition.id] },
+      failOnStatusCode: false,
+    });
+    expect(reorder.status()).toBe(400);
+
+    // Unlike an archived field's name (freed immediately too), a brand new field can reuse this
+    // one's exact name right away without waiting on anything.
+    const reused = await createField({ name, fieldType: "number" });
+    expect(reused.id).not.toBe(definition.id);
+  });
+
+  test("a deleted field's already-recorded value still shows read-only on the test case that has it", { tag: '@tesbo.testId("TES-TC-3004")' }, async () => {
+    const definition = await textField();
+    recordValue(definition.id, "kept for history");
+    await asOwner.delete(definitionUrl(definition.id));
+
+    const values = await asOwner.get(`/api/projects/${tenant!.mainProjectId}/testcases/${testcaseId}/custom-field-values`);
+    expect(values.ok(), await values.text()).toBeTruthy();
+    const row = (await values.json()).find((v: any) => v.id === definition.id);
+    expect(row, "deleted field's recorded value").toBeTruthy();
+    expect(row.value).toBe("kept for history");
+
+    // But it is gone from the definitions list, so nothing can newly assign this field elsewhere.
+    expect(await listFields()).toHaveLength(0);
+  });
+
+  test("restoring a deleted field undoes the delete and it reappears exactly as it was", { tag: '@tesbo.testId("TES-TC-3005")' }, async () => {
+    const definition = await createField({ name: fieldName("Restorable"), fieldType: "text", required: true });
+    await asOwner.delete(definitionUrl(definition.id));
+
+    const restored = await asOwner.post(restoreUrl(definition.id));
+    expect(restored.ok(), await restored.text()).toBeTruthy();
+    const body = await restored.json();
+    expect(body.id).toBe(definition.id);
+    expect(body.name).toBe(definition.name);
+    expect(body.required).toBe(true);
+    expect(isSoftDeleted(definition.id)).toBe(false);
+    expect((await listFields()).map((d: any) => d.id)).toContain(definition.id);
+  });
+
+  test("restore refuses a field that was never deleted, one already restored, and an unknown id", { tag: '@tesbo.testId("TES-TC-3006")' }, async () => {
+    const live = await textField();
+    expect((await asOwner.post(restoreUrl(live.id), { failOnStatusCode: false })).status()).toBe(404);
+
+    const deleted = await textField();
+    await asOwner.delete(definitionUrl(deleted.id));
+    const firstRestore = await asOwner.post(restoreUrl(deleted.id));
+    expect(firstRestore.ok()).toBeTruthy();
+    // Already restored — the same call again has nothing left to undo.
+    expect((await asOwner.post(restoreUrl(deleted.id), { failOnStatusCode: false })).status()).toBe(404);
+
+    expect(
+      (await asOwner.post(restoreUrl("00000000-0000-4000-8000-000000000000"), { failOnStatusCode: false })).status(),
+    ).toBe(404);
   });
 
   test("deleting a definition that isn't reachable from this project is a 404", { tag: '@tesbo.testId("TES-TC-161")' }, async () => {
@@ -756,6 +885,10 @@ test.describe("custom field definitions", () => {
       expect(res.status(), `DELETE definitions/${id}`).toBe(404);
     }
     expect(definitionExists(elsewhere.id)).toBe(true);
+    expect(isSoftDeleted(elsewhere.id)).toBe(false);
+
+    const restore = await asOwner.post(restoreUrl(elsewhere.id), { failOnStatusCode: false });
+    expect(restore.status(), "restore on a definition from another project").toBe(404);
   });
 
   test("a definition belonging to another project cannot be read or edited through this one", { tag: '@tesbo.testId("TES-TC-162")' }, async () => {
@@ -815,6 +948,7 @@ test.describe("custom field definitions", () => {
           }),
       ],
       ["DELETE", () => anon.delete(definitionUrl(definition.id), { failOnStatusCode: false })],
+      ["POST restore", () => anon.post(restoreUrl(definition.id), { failOnStatusCode: false })],
     ];
 
     for (const [label, call] of routes) {
@@ -842,6 +976,9 @@ test.describe("custom field definitions", () => {
     const remove = await asGuest.delete(definitionUrl(definition.id), { failOnStatusCode: false });
     expect(remove.status()).toBe(404);
     expect(definitionExists(definition.id)).toBe(true);
+
+    const restore = await asGuest.post(restoreUrl(definition.id), { failOnStatusCode: false });
+    expect(restore.status()).toBe(404);
   });
 
   test("a QA engineer may read the project's fields but not configure them", { tag: '@tesbo.testId("TES-TC-165")' }, async () => {
@@ -877,6 +1014,7 @@ test.describe("custom field definitions", () => {
           }),
       ],
       ["delete", () => asQa.delete(definitionUrl(definition.id), { failOnStatusCode: false })],
+      ["restore", () => asQa.post(restoreUrl(definition.id), { failOnStatusCode: false })],
     ];
 
     for (const [label, call] of refused) {
@@ -896,6 +1034,10 @@ test.describe("custom field definitions", () => {
     const archived = await asManager.patch(`${definitionUrl(definition.id)}/status`, { data: { status: "archived" } });
     expect(archived.ok()).toBeTruthy();
     expect(storedStatus(definition.id)).toBe("archived");
+
+    const deleted = await asManager.delete(definitionUrl(definition.id));
+    expect(deleted.ok(), await deleted.text()).toBeTruthy();
+    expect(isSoftDeleted(definition.id)).toBe(true);
   });
 
   // ─── Plan gating ───────────────────────────────────────────────────────────
@@ -945,6 +1087,7 @@ test.describe("custom field definitions", () => {
             }),
         ],
         ["delete", () => asOwner.delete(definitionUrl(definition.id), { failOnStatusCode: false })],
+        ["restore", () => asOwner.post(restoreUrl(definition.id), { failOnStatusCode: false })],
       ];
 
       for (const [label, call] of gated) {

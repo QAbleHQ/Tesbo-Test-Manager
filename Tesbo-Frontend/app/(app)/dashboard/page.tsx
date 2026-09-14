@@ -3,9 +3,10 @@
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { authMe, getWorkspaceAnalytics, getWorkspace, type WorkspaceAnalytics, type WorkspaceInfo } from "@/lib/api";
+import { getWorkspaceAnalytics, type WorkspaceAnalytics } from "@/lib/api";
 import { Card, PageLoader } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 /*
  * Basecamp 10221720616 ("[Dashboard] Execution progress bar colours are not visible").
@@ -43,6 +44,18 @@ const STATUS_COLORS: Record<string, { badge: string; text: string; fill: string;
     fill: "var(--status-notrun-dot)",
     label: "Untested",
   },
+  Skipped: {
+    badge: "bg-[var(--status-skipped-fill)]",
+    text: "text-[var(--status-skipped-text)]",
+    fill: "var(--status-skipped-dot)",
+    label: "Skipped",
+  },
+  Retest: {
+    badge: "bg-[var(--status-retest-fill)]",
+    text: "text-[var(--status-retest-text)]",
+    fill: "var(--status-retest-dot)",
+    label: "Retest",
+  },
 };
 
 function statusStyle(status: string) {
@@ -58,30 +71,23 @@ function statusStyle(status: string) {
 
 export default function DashboardPage() {
   const router = useRouter();
-  const [auth, setAuth] = useState<{ userId: string } | null>(null);
-  const [workspaceName, setWorkspaceName] = useState<string | null>(null);
+  const { currentUser, workspace } = useAppData();
   const [analytics, setAnalytics] = useState<WorkspaceAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    authMe().then((me) => {
-      setAuth(me);
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      Promise.all([getWorkspace(), getWorkspaceAnalytics()])
-        .then(([workspace, data]) => {
-          setWorkspaceName((workspace as WorkspaceInfo).name ?? "Workspace");
-          setAnalytics(data);
-        })
-        .catch((e) => setError(e instanceof Error ? e.message : "Failed to load analytics"))
-        .finally(() => setLoading(false));
-    });
-  }, [router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    getWorkspaceAnalytics()
+      .then((data) => setAnalytics(data))
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load analytics"))
+      .finally(() => setLoading(false));
+  }, [router, currentUser]);
 
-  if (!auth) {
+  if (!currentUser) {
     return <PageLoader variant="screen" />;
   }
 
@@ -110,7 +116,7 @@ export default function DashboardPage() {
           breadcrumb={(
             <Breadcrumbs
               items={[
-                { label: workspaceName || "Workspace", href: "/dashboard" },
+                { label: workspace?.name || "Workspace", href: "/dashboard" },
                 { label: "Dashboard" },
               ]}
             />

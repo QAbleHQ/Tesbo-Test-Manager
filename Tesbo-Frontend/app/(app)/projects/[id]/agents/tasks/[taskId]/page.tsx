@@ -4,12 +4,10 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  authMe,
   closeZyraTask,
   createSuite,
   deleteZyraTaskDraft,
   getJiraStatus,
-  getProject,
   getZyraTask,
   listJiraTickets,
   listSuites,
@@ -24,6 +22,8 @@ import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, 
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 type SaveMode = "existing" | "new";
 type DetailTab = "testcases" | "feedback" | "activities" | "sources";
@@ -106,6 +106,9 @@ export default function ZyraTaskDetailPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const taskId = params.taskId as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
   const [task, setTask] = useState<ZyraTask | null>(null);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
@@ -123,7 +126,6 @@ export default function ZyraTaskDetailPage() {
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
   const pollInFlightRef = useRef(false);
 
   const loadData = useCallback(async () => {
@@ -151,12 +153,9 @@ export default function ZyraTaskDetailPage() {
   }, [projectId, taskId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-  }, [loadData, router, projectId]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, projectId, currentUser]);
 
   // Lighter than loadData (skips suites/Jira) — just re-reads this task so Zyra finishing (or
   // failing) generation server-side shows up here without a manual reload.
@@ -401,7 +400,6 @@ export default function ZyraTaskDetailPage() {
             {!done && (
               <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>Close task</Button>
             )}
-            <Button variant="confidence" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>Save selected</Button>
           </div>
         </div>
       </Card>
@@ -430,7 +428,9 @@ export default function ZyraTaskDetailPage() {
                 <Button variant="secondary" onClick={allDraftsSelected ? clearDraftSelection : selectAllDrafts} disabled={done || task.drafts.length === 0}>
                   {allDraftsSelected ? "Unselect all" : "Select all"}
                 </Button>
-                <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>Clear selection</Button>
+                {!allDraftsSelected && (
+                  <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>Clear selection</Button>
+                )}
                 {task.drafts.length > 0 && (
                   <span title={selectedDrafts.length > 0 ? "Copy the selected testcases as tab-separated values, ready to paste into Excel." : "Copy every generated testcase as tab-separated values, ready to paste into Excel."}>
                     <CopyButton

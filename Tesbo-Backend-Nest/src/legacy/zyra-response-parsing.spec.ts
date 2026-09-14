@@ -10,12 +10,24 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 function makeLegacy(): LegacyService {
+  const db = { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   return new LegacyService(
-    { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService,
+    db,
     {} as unknown as EmailService,
     {} as unknown as PasswordService,
     {} as unknown as AppConfigService,
@@ -25,6 +37,12 @@ function makeLegacy(): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
 }
@@ -35,7 +53,7 @@ type Internals = {
   parseModelJson: (raw: string, salvageFields?: string[]) => Record<string, unknown> | null;
   sanitizeZyraReply: (raw: unknown, fallback: string) => string;
   reconcileZyraReply: (
-    decision: { reply: string; actionType: string; operations: { type: string }[] },
+    decision: { reply: string; actionType: string; operations: { type: string }[]; __salvaged?: boolean },
     applied: { testcases: unknown[]; activity: { title?: string; detail?: string }[] }
   ) => string;
 };
@@ -114,15 +132,17 @@ describe("Zyra model-response parsing", () => {
       expect(parsed?.reply).toContain("Generated 15 test cases");
       // salvage cannot recover the action
       expect(parsed?.action).toBeUndefined();
-      // a salvaged fragment must be distinguishable from a clean parse
-      expect((parsed as Record<string, unknown>)?.salvaged).toBe(true);
+      // a salvaged fragment must be distinguishable from a clean parse. Double-underscore prefix
+      // (matching __zyraUsage) deliberately: a bare "salvaged" key is a name a model could plausibly
+      // hallucinate into an otherwise-clean response — see the dedicated test below.
+      expect((parsed as Record<string, unknown>)?.__salvaged).toBe(true);
     });
 
     it("does not mark a cleanly parsed envelope as salvaged", () => {
       const clean = JSON.stringify({ reply: "All good.", action: "create", operations: [] });
       const parsed = internals(svc).parseModelJson(clean);
       expect(parsed?.action).toBe("create");
-      expect((parsed as Record<string, unknown>)?.salvaged).toBeUndefined();
+      expect((parsed as Record<string, unknown>)?.__salvaged).toBeUndefined();
     });
 
     it("does not mark a repaired-but-complete envelope as salvaged", () => {
@@ -130,7 +150,17 @@ describe("Zyra model-response parsing", () => {
       const repairable = '{"reply":"A "quoted" phrase","action":"create","operations":[]}';
       const parsed = internals(svc).parseModelJson(repairable);
       expect(parsed?.action).toBe("create");
-      expect((parsed as Record<string, unknown>)?.salvaged).toBeUndefined();
+      expect((parsed as Record<string, unknown>)?.__salvaged).toBeUndefined();
+    });
+
+    it("does not confuse a model-authored 'salvaged' field with the internal __salvaged marker", () => {
+      // buildZyraChatDecision's retry gate checks raw.__salvaged specifically so a model that
+      // (implausibly, but not impossibly) emits a bare "salvaged" field in an otherwise clean,
+      // fully-parseable response can never trigger a false-positive retry.
+      const clean = JSON.stringify({ reply: "All good.", action: "answer", operations: [], salvaged: true });
+      const parsed = internals(svc).parseModelJson(clean);
+      expect(parsed?.salvaged).toBe(true);
+      expect((parsed as Record<string, unknown>)?.__salvaged).toBeUndefined();
     });
   });
 
@@ -187,6 +217,10 @@ describe("Zyra model-response parsing", () => {
   describe("reconcileZyraReply", () => {
     const creates = (n: number) => Array.from({ length: n }, () => ({ type: "create" }));
     const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `tc-${i}` }));
+    // Staged (not yet saved) rows carry a "proposed-*" action, per applyZyraChatOperations' create
+    // branch — this is what proposedCount/reviewHint and the false-completion-claim guard key off,
+    // distinct from `rows()` above which stands in for something genuinely already applied.
+    const stagedRows = (n: number) => Array.from({ length: n }, (_, i) => ({ draftIndex: i, action: "proposed-create" }));
 
     it("passes the reply through when every requested operation was applied", () => {
       const out = internals(svc).reconcileZyraReply(
@@ -194,6 +228,62 @@ describe("Zyra model-response parsing", () => {
         { testcases: rows(3), activity: [] }
       );
       expect(out).toBe("Created 3 test cases.");
+    });
+
+    // The gap item 4 closes: a create/update/archive turn's own reply text was never checked for a
+    // false past-tense completion claim — only the `answer` branch was. A reply saying "Created" for
+    // rows that are still only staged (proposedCount > 0) is exactly as false here as it is on an
+    // `answer` turn, and now gets the same correction banner prepended.
+    it("corrects a create-turn reply that claims completion while its rows are still staged", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Created 3 test cases and saved them to the repository.", actionType: "create", operations: creates(3) },
+        { testcases: stagedRows(3), activity: [] }
+      );
+      expect(out).toContain("Sorry! Nothing was saved");
+      expect(out).toContain("Created 3 test cases and saved them to the repository.");
+      expect(out).toContain("staged for your review");
+    });
+
+    // The banner must not fire on rows that really were written immediately (move_to_suite), even
+    // though the reply text uses the same "saved"/"moved" language — proposedCount is 0 there because
+    // nothing about a move is staged, so the claim is true.
+    it("does not correct a reply whose completion claim is actually true", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Moved 3 test cases into the Login suite.", actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        { testcases: rows(3), activity: [] }
+      );
+      expect(out).not.toContain("Nothing was saved");
+      expect(out).toBe("Moved 3 test cases into the Login suite.");
+    });
+
+    // A reply that already honestly discloses staging (uses "drafted"/"staged" language the system
+    // prompt asks for, or explicitly says nothing is saved yet) must not be double-corrected.
+    it("does not double-correct a reply that already discloses staging honestly", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "Drafted 3 test cases for review; nothing was saved yet.", actionType: "create", operations: creates(3) },
+        { testcases: stagedRows(3), activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+    });
+
+    // The near-miss the naive fix for the case above would have caused: generateZyraChatTestcasesWithAi
+    // (the real code that authors a create turn's reply) always says "I drafted N test case(s)
+    // after reading ..." — exactly the wording the system prompt asks for when something IS staged.
+    // A completion-claim check reusing the answer branch's broad ZYRA_COMPLETION_CLAIM (which
+    // treats "drafted"/"staged"/"proposed" as false-claim verbs, correctly so when nothing at all
+    // was applied) would flag every ordinary successful generation as a false claim. Only a verb
+    // implying real persistence (created/saved/archived/updated) is false while staged.
+    it("does not flag the real generation reply's own 'I drafted N test case(s)' wording", () => {
+      const out = internals(svc).reconcileZyraReply(
+        {
+          reply: "I drafted 2 test case(s) after reading 3 knowledge-base item(s), 0 Jira ticket(s) read directly, 4 existing test case(s) to avoid duplicating coverage.\n\nThey're staged as drafts in **Zyra generated test cases** — say \"save them to <suite>\" and I'll file them where they belong.",
+          actionType: "create",
+          operations: creates(2)
+        },
+        { testcases: stagedRows(2), activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+      expect(out).toContain("staged for your review");
     });
 
     it("flags a partial application instead of repeating the model's larger number", () => {
@@ -324,6 +414,155 @@ describe("Zyra model-response parsing", () => {
         { testcases: rows(3), activity: [] }
       );
       expect(out).toBe("Created 3 test cases.");
+    });
+
+    /*
+     * The evasion this closes: a router response that failed to parse and got text-salvaged still
+     * carries the model's OWN honest-sounding words, written when it believed it was emitting a real
+     * create decision — including the exact "staged for your review" phrasing
+     * ZYRA_ALREADY_DISCLOSED exists to trust. Left unguarded, a turn that produced zero real
+     * operations reads identically to a genuinely staged batch. __salvaged: true means this reply's
+     * text cannot be trusted as a considered answer at all, so the ALREADY_DISCLOSED bypass must not
+     * apply to it — this is the mechanism the original bug report ("8 flight booking test cases
+     * drafted and staged for your review" with no table, no review panel) traced back to.
+     */
+    it("corrects a salvaged answer turn even though its own text says 'staged for your review'", () => {
+      const out = internals(svc).reconcileZyraReply(
+        {
+          reply: "Here are 8 flight booking test cases drafted and staged for your review. Once you review and save, they will be filed under 'Zyra generated test cases'.",
+          actionType: "answer",
+          operations: [],
+          __salvaged: true
+        },
+        { testcases: [], activity: [] }
+      );
+      expect(out).toContain("Sorry! Nothing was saved");
+    });
+
+    // Identical reply text to the salvaged case above — the only variable changed is __salvaged
+    // itself — must still pass through untouched. Isolates the fix to genuinely salvaged decisions
+    // rather than tightening the guard for every answer turn that happens to use staging language.
+    it("still trusts genuine (non-salvaged) staging disclosure on an answer turn", () => {
+      const out = internals(svc).reconcileZyraReply(
+        {
+          reply: "Here are 8 flight booking test cases drafted and staged for your review. Once you review and save, they will be filed under 'Zyra generated test cases'.",
+          actionType: "answer",
+          operations: []
+        },
+        { testcases: [], activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+    });
+
+    /*
+     * Second, independent loophole in the same guard, found while designing the fix above:
+     * ZYRA_COMPLETION_CLAIM only matched a mutation verb BEFORE the testcase/suite noun, or the
+     * explicit "have/has/were/was been VERB" construction. A reduced relative clause puts the noun
+     * first with neither of those — "the test cases created for this flow" — and evaded the guard on
+     * a perfectly well-formed, non-salvaged response.
+     */
+    it("catches a noun-first completion claim the original regex order missed", () => {
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "The test cases created for this login flow cover the happy path and two edge cases.", actionType: "answer", operations: [] },
+        { testcases: [], activity: [] }
+      );
+      expect(out).toContain("Sorry! Nothing was saved");
+    });
+
+    it("does not flag legitimate present-tense staging language in noun-first order", () => {
+      // "staged"/"drafted"/"proposed" deliberately stay out of the new noun-first list — this is
+      // exactly the honest disclosure wording the model is instructed to use. No other mutation verb
+      // appears anywhere in this reply, so neither the new alternation nor the old ones should fire.
+      const out = internals(svc).reconcileZyraReply(
+        { reply: "The test cases drafted here are staged for your review; nothing has been written to the repository yet.", actionType: "answer", operations: [] },
+        { testcases: [], activity: [] }
+      );
+      expect(out).not.toContain("Sorry! Nothing was saved");
+    });
+
+    /*
+     * Regression tests for a real false-positive class found by review, before this shipped: the
+     * noun-first alternation's original 80-char, any-order window had no requirement that the verb
+     * actually describe something done TO the noun — an ordinary answer that merely mentions "test
+     * cases" or "suite" and, later in the SAME sentence, an unrelated use of a mutation verb
+     * (reporting history, a precondition, a UI change) tripped it exactly like a genuine claim would.
+     * Each of these three replies is a real shape a coverage-analysis answer can take, verified to
+     * match the pre-fix regex directly (not just plausible) before the window was tightened.
+     */
+    it("does not flag an ordinary answer where a mutation verb appears in an unrelated clause", () => {
+      for (const reply of [
+        "These test cases assume the user updated their profile before login.",
+        "There are 12 login test cases already covering this flow; one suite was recently removed from the sidebar view due to a UI change.",
+        // "drafted" deliberately avoided here — it's already a trigger word in the pre-existing
+        // verb-first alternation (staged/drafted/proposed count as false claims on an answer turn,
+        // by design — see this file's own doc comment above ZYRA_COMPLETION_CLAIM), so a sentence
+        // containing "drafted ... suite" matches independently of the noun-first alternation this
+        // test targets. Isolating the noun-first case specifically needs a verb that means nothing
+        // to alternation 1 at all.
+        "These 3 test cases are documented for the checkout suite based on the ticket that was updated yesterday."
+      ]) {
+        const out = internals(svc).reconcileZyraReply(
+          { reply, actionType: "answer", operations: [] },
+          { testcases: [], activity: [] }
+        );
+        // must not warn on: ${reply}
+        expect(out).toBe(reply);
+      }
+    });
+
+    it("still catches the genuine reduced-relative-clause claim the tightened window is meant to preserve", () => {
+      for (const reply of [
+        "The test cases created for this login flow cover the happy path and two edge cases.",
+        "The suite created for onboarding now has 5 cases.",
+        "Test cases already updated to reflect the new flow."
+      ]) {
+        const out = internals(svc).reconcileZyraReply(
+          { reply, actionType: "answer", operations: [] },
+          { testcases: [], activity: [] }
+        );
+        expect(out).toContain("Sorry! Nothing was saved");
+      }
+    });
+
+    /*
+     * Regression for a SECOND review pass catching a regression in the FIRST fix above: excluding a
+     * bare "was"/"were" from the noun-first lookbehind (to kill the "suite that was removed last
+     * week" false positive) also silenced simple-past-passive claims — "3 test cases were created",
+     * "The suite was archived" — the single most idiomatic phrasing an LLM uses for exactly the
+     * reported bug. Verified directly (node -e) that these went from a real match to silently missed
+     * before this second fix; none of the other two alternations catch this phrasing (alternation 1
+     * needs the noun AFTER the verb; alternation 2 requires the literal word "been"). The lookbehind
+     * is now narrowed to only the RELATIVE-CLAUSE form ("that/which/who was/were …") instead of a
+     * bare "was"/"were" anywhere.
+     */
+    it("still catches a bare simple-past-passive claim ('X test cases were created') — the exact original bug phrasing", () => {
+      for (const reply of [
+        "3 test cases were created for the checkout flow.",
+        "The test cases were saved.",
+        "Your test cases were deleted.",
+        "The 4 test cases were updated with the new precondition.",
+        "The suite was archived."
+      ]) {
+        const out = internals(svc).reconcileZyraReply(
+          { reply, actionType: "answer", operations: [] },
+          { testcases: [], activity: [] }
+        );
+        // must warn on: ${reply}
+        expect(out).toContain("Sorry! Nothing was saved");
+      }
+    });
+
+    it("still excludes the relative-clause false positive the bare exclusion was originally trying to fix", () => {
+      for (const reply of [
+        "The suite that was removed last week is no longer visible in the sidebar.",
+        "The test cases that were archived earlier are still visible in the history tab."
+      ]) {
+        const out = internals(svc).reconcileZyraReply(
+          { reply, actionType: "answer", operations: [] },
+          { testcases: [], activity: [] }
+        );
+        expect(out).toBe(reply);
+      }
     });
   });
 });

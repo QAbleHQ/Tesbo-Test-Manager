@@ -3,12 +3,14 @@ import { DatabaseService } from "../database/database.service";
 import { EmbeddingKeyAllocation, embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
 import {
   RAG_ANN_CANDIDATES,
+  RAG_CONFIDENT_SIMILARITY,
   RAG_CONTEXT_CHAR_BUDGET,
   RAG_FTS_CANDIDATES,
   RAG_MAX_SOURCES,
+  RAG_MIN_SIMILARITY,
   RAG_RRF_K
 } from "./rag.constants";
-import { RagSourceType, RetrievedKnowledgeItem } from "./rag.types";
+import { RagRetrievalConfidence, RagSourceType, RetrievedKnowledgeItem } from "./rag.types";
 
 interface AnnRow {
   source_type: RagSourceType;
@@ -69,36 +71,53 @@ export class RagRetrievalService {
     projectId: string,
     query: string,
     opts: { maxSources?: number; charBudget?: number } = {}
-  ): Promise<{ items: RetrievedKnowledgeItem[]; semanticSearchRan: boolean; reason: string }> {
+  ): Promise<{ items: RetrievedKnowledgeItem[]; semanticSearchRan: boolean; reason: string; topScore: number | null; confidence: RagRetrievalConfidence }> {
     let reason = "";
     try {
       const text = String(query || "").trim();
-      if (!text) return { items: [], semanticSearchRan: false, reason: "Empty query." };
+      if (!text) return { items: [], semanticSearchRan: false, reason: "Empty query.", topScore: null, confidence: "none" };
 
       const resolved = await resolveEmbeddingAllocation(this.db, projectId);
       reason = resolved.reason;
       const allocation = resolved.allocation;
 
-      const [annRows, ftsDocRows, ftsFileRows] = await Promise.all([
+      const [annRowsRaw, ftsDocRows, ftsFileRows] = await Promise.all([
         allocation ? this.annSearch(projectId, allocation, text) : Promise.resolve([] as AnnRow[]),
         this.ftsSearch(projectId, "knowledge_documents", "content_text", text),
         this.ftsSearch(projectId, "knowledge_files", "extracted_text", text)
       ]);
+      // Reported honestly even when every candidate gets filtered below — "we searched and the best
+      // match scored 0.31" is a real, useful signal, distinct from "no candidates existed at all".
+      const topScore = annRowsRaw.length ? Math.max(...annRowsRaw.map((row) => row.cosine_similarity)) : null;
+      const confidence = this.confidenceFor(topScore);
+      // The relevance floor: RRF's own score is a rank position, not a magnitude (see
+      // RAG_MIN_SIMILARITY's own comment), so a weak candidate pool must be excluded here, before
+      // fusion, or it fills the context budget indistinguishably from a strong one.
+      const annRows = annRowsRaw.filter((row) => row.cosine_similarity >= RAG_MIN_SIMILARITY);
       if (!annRows.length && !ftsDocRows.length && !ftsFileRows.length) {
-        return { items: [], semanticSearchRan: Boolean(allocation), reason };
+        return { items: [], semanticSearchRan: Boolean(allocation), reason, topScore, confidence };
       }
 
       const fused = this.fuse(annRows, [...ftsDocRows, ...ftsFileRows]);
       return {
         items: this.budgetToItems(fused, opts.maxSources ?? RAG_MAX_SOURCES, opts.charBudget ?? RAG_CONTEXT_CHAR_BUDGET),
         semanticSearchRan: Boolean(allocation),
-        reason
+        reason,
+        topScore,
+        confidence
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.warn(`retrieveKnowledgeContext failed for project ${projectId}: ${message}`);
-      return { items: [], semanticSearchRan: false, reason: reason || `Retrieval failed: ${message}` };
+      return { items: [], semanticSearchRan: false, reason: reason || `Retrieval failed: ${message}`, topScore: null, confidence: "none" };
     }
+  }
+
+  private confidenceFor(topScore: number | null): RagRetrievalConfidence {
+    if (topScore === null) return "none";
+    if (topScore >= RAG_CONFIDENT_SIMILARITY) return "strong";
+    if (topScore >= RAG_MIN_SIMILARITY) return "weak";
+    return "none";
   }
 
   private async annSearch(projectId: string, allocation: EmbeddingKeyAllocation, query: string): Promise<AnnRow[]> {

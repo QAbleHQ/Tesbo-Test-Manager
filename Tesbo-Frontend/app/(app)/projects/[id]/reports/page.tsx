@@ -5,8 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconChevronDown, IconDownload } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   getExecutionReport,
   getRequirementMatrix,
   getRepositorySummary,
@@ -17,7 +15,6 @@ import {
   listPlans,
   listTestRuns,
   listSuites,
-  listProjectMembers,
   listBugs,
   type ExecutionReportRow,
   type RequirementMatrixRow,
@@ -31,6 +28,8 @@ import { computePassRate } from "@/lib/executionMetrics";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { PageLoader } from "@/components/ui";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { ReportsNav, type ReportView } from "@/components/reports/ReportsNav";
 import { OverviewTab } from "@/components/reports/OverviewTab";
 import { ExecutionReportTab } from "@/components/reports/ExecutionReportTab";
@@ -38,6 +37,29 @@ import { TraceabilityTab } from "@/components/reports/TraceabilityTab";
 import { RepositoryTab } from "@/components/reports/RepositoryTab";
 import { AIInsightsTab } from "@/components/reports/AIInsightsTab";
 import { TrendsTab } from "@/components/reports/TrendsTab";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+// Two of these four caches are eager, unconditional-on-mount fetches — what the header stat chips
+// and nav badge render every visit, regardless of which tab is open. The other (execFilters) is
+// deferred: nothing outside the Execution Report tab reads plans/suites, so a visit that never opens
+// that tab never pays for them. All are cached separately, under distinct suffixes of the same page
+// key, per the dashboard reference pattern in app/(app)/projects/[id]/dashboard/page.tsx.
+interface ReportsOverviewData {
+  overview: ReportsOverview | null;
+  insights: ReportsInsights | null;
+}
+
+/** Eager: feeds the always-visible header chips (Runs count, Open bugs) regardless of active tab. */
+interface ReportsHeaderStatsData {
+  runs: { id: string; name: string }[];
+  openBugCount: number;
+}
+
+/** Deferred: read only by the Execution Report tab's Group-by filter. */
+interface ReportsExecFiltersData {
+  plans: { id: string; name: string }[];
+  suites: SuiteNode[];
+}
 
 /*
  * Named per view because the export is per view — the file says which report it is, and the menu
@@ -63,23 +85,38 @@ export default function ReportsPage() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [auth, setAuth] = useState<{ userId: string } | null>(null);
-  const [projectName, setProjectName] = useState("");
+  const { currentUser: auth } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
   const [activeView, setActiveView] = useState<ReportView>("overview");
 
-  // Shared filter-option lists (used by Execution Report tab)
-  const [plans, setPlans] = useState<{ id: string; name: string }[]>([]);
-  const [runs, setRuns] = useState<{ id: string; name: string }[]>([]);
-  const [suites, setSuites] = useState<SuiteNode[]>([]);
-  const [members, setMembers] = useState<{ userId: string; name: string; email: string }[]>([]);
-  const [openBugCount, setOpenBugCount] = useState(0);
+  // Header-stat lists (Runs count, Open bugs) — eager, feeds the chips visible on every tab.
+  const headerStatsCacheKey = `reports:${projectId}:headerStats`;
+  const cachedHeaderStats = getPageCache<ReportsHeaderStatsData>(headerStatsCacheKey);
+  const [runs, setRuns] = useState<{ id: string; name: string }[]>(cachedHeaderStats?.runs ?? []);
+  const [openBugCount, setOpenBugCount] = useState(cachedHeaderStats?.openBugCount ?? 0);
+
+  // Execution Report's own filter-option lists — deferred to that tab's first visit (see the effect
+  // below). Seeded from a same-session cache hit if one already exists, so a user who visited
+  // Execution earlier this session and comes back doesn't wait again.
+  const execFiltersCacheKey = `reports:${projectId}:execFilters`;
+  const cachedExecFilters = getPageCache<ReportsExecFiltersData>(execFiltersCacheKey);
+  const [plans, setPlans] = useState<{ id: string; name: string }[]>(cachedExecFilters?.plans ?? []);
+  const [suites, setSuites] = useState<SuiteNode[]>(cachedExecFilters?.suites ?? []);
+  // Tracks "have we ever successfully populated plans/suites this mount" (cache-seeded counts),
+  // separately from `execFiltersLoading` ("is a fetch for them in flight right now") — the Execution
+  // tab's dropdown uses the loading flag to show a placeholder instead of vanishing while empty.
+  const [execFiltersLoaded, setExecFiltersLoaded] = useState(!!cachedExecFilters);
+  const [execFiltersLoading, setExecFiltersLoading] = useState(false);
 
   // Overview + AI Insights are cheap aggregate queries — load eagerly so the header
   // stat chips and the nav's flaky-count badge are available regardless of active tab.
-  const [overview, setOverview] = useState<ReportsOverview | null>(null);
-  const [overviewLoading, setOverviewLoading] = useState(true);
-  const [insights, setInsights] = useState<ReportsInsights | null>(null);
-  const [insightsLoading, setInsightsLoading] = useState(true);
+  const overviewCacheKey = `reports:${projectId}`;
+  const cachedOverview = getPageCache<ReportsOverviewData>(overviewCacheKey);
+  const [overview, setOverview] = useState<ReportsOverview | null>(cachedOverview?.overview ?? null);
+  const [overviewLoading, setOverviewLoading] = useState(!cachedOverview);
+  const [insights, setInsights] = useState<ReportsInsights | null>(cachedOverview?.insights ?? null);
+  const [insightsLoading, setInsightsLoading] = useState(!cachedOverview);
 
   // Execution Report state
   const [execFilterBy, setExecFilterBy] = useState("overall");
@@ -102,39 +139,82 @@ export default function ReportsPage() {
   const [trendsLoading, setTrendsLoading] = useState(false);
 
   useEffect(() => {
-    authMe().then((me) => {
-      setAuth(me);
-      if (!me) router.replace("/login");
-    });
-  }, [router]);
+    if (!auth) router.replace("/login");
+  }, [router, auth]);
 
+  // Eager, unconditional on mount: runs.length and openBugCount feed the always-visible header
+  // chips, so they load regardless of which tab is active — same timing as before this split.
   useEffect(() => {
     if (!auth) return;
-    Promise.all([
-      getProject(projectId),
-      listPlans(projectId),
-      listTestRuns(projectId),
-      listSuites(projectId),
-      listProjectMembers(projectId),
-      listBugs(projectId),
-    ])
-      .then(([project, pl, rn, su, mb, bugs]) => {
-        setProjectName(String(project.name || ""));
-        setPlans(Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : []);
-        setRuns(Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : []);
-        setSuites(su);
-        setMembers(mb);
-        setOpenBugCount(bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length);
+    const key = headerStatsCacheKey;
+    const existing = getPageCache<ReportsHeaderStatsData>(key);
+    if (existing) {
+      setRuns(existing.runs);
+      setOpenBugCount(existing.openBugCount);
+    }
+    Promise.all([listTestRuns(projectId), listBugs(projectId)])
+      .then(([rn, bugs]) => {
+        const next: ReportsHeaderStatsData = {
+          runs: Array.isArray(rn) ? rn.map((r) => ({ id: r.id, name: r.name })) : [],
+          openBugCount: bugs.filter((b) => b.status === "Open" || b.status === "Reopened").length,
+        };
+        setPageCache(key, next);
+        setRuns(next.runs);
+        setOpenBugCount(next.openBugCount);
       })
       .catch(() => {});
-  }, [auth, projectId]);
+  }, [auth, projectId, headerStatsCacheKey]);
+
+  // Deferred: plans/suites are read only by the Execution Report tab's Group-by filter, so they're
+  // fetched on that tab's first visit rather than on every Reports mount — matching the existing lazy
+  // pattern already used below for matrix/repository/trends. `execFiltersLoaded` gates against
+  // re-fetching on every subsequent switch back to this tab within the same mount (same as those
+  // three), and against re-fetching at all when a same-session cache hit already seeded the state.
+  useEffect(() => {
+    if (!auth || activeView !== "execution" || execFiltersLoaded || execFiltersLoading) return;
+    setExecFiltersLoading(true);
+    Promise.all([listPlans(projectId), listSuites(projectId)])
+      .then(([pl, su]) => {
+        const next: ReportsExecFiltersData = {
+          plans: Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : [],
+          suites: su,
+        };
+        setPageCache(execFiltersCacheKey, next);
+        setPlans(next.plans);
+        setSuites(next.suites);
+        setExecFiltersLoaded(true);
+      })
+      .catch(() => {})
+      .finally(() => setExecFiltersLoading(false));
+  }, [auth, activeView, projectId, execFiltersCacheKey, execFiltersLoaded, execFiltersLoading]);
 
   useEffect(() => {
     if (!auth) return;
-    setOverviewLoading(true);
-    getReportsOverview(projectId).then(setOverview).catch(() => setOverview(null)).finally(() => setOverviewLoading(false));
-    setInsightsLoading(true);
-    getReportsInsights(projectId).then(setInsights).catch(() => setInsights(null)).finally(() => setInsightsLoading(false));
+    const key = `reports:${projectId}`;
+    const existing = getPageCache<ReportsOverviewData>(key);
+    if (existing) {
+      setOverview(existing.overview);
+      setInsights(existing.insights);
+      setOverviewLoading(false);
+      setInsightsLoading(false);
+    } else {
+      setOverviewLoading(true);
+      setInsightsLoading(true);
+    }
+    getReportsOverview(projectId)
+      .then((res) => {
+        setOverview(res);
+        setPageCache(key, { overview: res, insights: getPageCache<ReportsOverviewData>(key)?.insights ?? null });
+      })
+      .catch(() => setOverview(null))
+      .finally(() => setOverviewLoading(false));
+    getReportsInsights(projectId)
+      .then((res) => {
+        setInsights(res);
+        setPageCache(key, { overview: getPageCache<ReportsOverviewData>(key)?.overview ?? null, insights: res });
+      })
+      .catch(() => setInsights(null))
+      .finally(() => setInsightsLoading(false));
   }, [auth, projectId]);
 
   const loadExecReport = useCallback(() => {
@@ -222,7 +302,7 @@ export default function ReportsPage() {
       : undefined;
 
   if (!auth) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (
@@ -350,6 +430,7 @@ export default function ReportsPage() {
                 runs={runs}
                 suites={suites}
                 members={members}
+                filtersLoading={execFiltersLoading}
               />
             )}
             {activeView === "matrix" && <TraceabilityTab rows={matrixRows} loading={matrixLoading} search={matrixSearch} onSearchChange={setMatrixSearch} />}

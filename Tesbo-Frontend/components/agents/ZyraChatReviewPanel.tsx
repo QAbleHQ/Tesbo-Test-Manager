@@ -5,6 +5,7 @@ import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, ge
 import { Button, CopyButton, StatusChip } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
+import { ZyraCitationsList } from "./ZyraCitations";
 
 function firstStepPreview(value: unknown): string {
   if (!value) return "—";
@@ -222,6 +223,9 @@ export function ZyraChatReviewPanel({
                     </div>
                     <p className="mt-1 text-[13px] font-medium text-[var(--foreground)]">{row.title}</p>
                     <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--muted)]">{firstStepPreview(row.stepsJson)}</p>
+                    <div className="mt-1">
+                      <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
+                    </div>
                   </div>
                   <div className="flex shrink-0 gap-1.5">
                     <Button variant="secondary" size="sm" onClick={() => setEditingIndex(editingIndex === index ? null : index)} disabled={working}>

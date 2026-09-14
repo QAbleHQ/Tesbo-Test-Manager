@@ -16,7 +16,16 @@ import { AuditService } from "../audit/audit.service";
 function makeDb(
   opts: {
     emailTaken?: boolean;
-    pendingSignup?: { id: string; email: string; name: string; password_hash: string | null; invitation_id: string | null } | null;
+    pendingSignup?: {
+      id: string;
+      email: string;
+      name: string;
+      first_name: string | null;
+      last_name: string | null;
+      mobile_number: string | null;
+      password_hash: string | null;
+      invitation_id: string | null;
+    } | null;
   } = {}
 ) {
   const txQuery = jest.fn().mockResolvedValue({ rows: [{ id: "new-user-1" }] });
@@ -84,53 +93,81 @@ describe("SignupService — invite-based registration", () => {
   describe("startInviteRegistration", () => {
     it("stores a pending signup tied to the invitation and sends an OTP (happy path)", async () => {
       const { svc, query, otp, password } = makeService({ invitation: INVITE });
-      await svc.startInviteRegistration("raw-token", "Bob Builder", "supersecret", "1.2.3.4", "ua");
+      await svc.startInviteRegistration("raw-token", "Bob", "Builder", "+14155551234", "supersecret", "1.2.3.4", "ua");
 
       expect(password.hashPassword).toHaveBeenCalledWith("supersecret");
       const insertCall = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO pending_signups"));
       expect(insertCall).toBeDefined();
-      // [email, name, passwordHash, invitationId, expiresAt]
+      // [email, name, firstName, lastName, mobileNumber, passwordHash, invitationId, expiresAt]
       expect(insertCall![1][0]).toBe("bob@example.com");
       expect(insertCall![1][1]).toBe("Bob Builder");
-      expect(insertCall![1][2]).toBe("hashed:supersecret");
-      expect(insertCall![1][3]).toBe("inv-1");
+      expect(insertCall![1][2]).toBe("Bob");
+      expect(insertCall![1][3]).toBe("Builder");
+      expect(insertCall![1][4]).toBe("+14155551234");
+      expect(insertCall![1][5]).toBe("hashed:supersecret");
+      expect(insertCall![1][6]).toBe("inv-1");
       expect(otp.requestOtp).toHaveBeenCalledWith("bob@example.com", "1.2.3.4", "ua");
+    });
+
+    it("stores a pending signup with no mobile number when none is given (optional field)", async () => {
+      const { svc, query } = makeService({ invitation: INVITE });
+      await svc.startInviteRegistration("raw-token", "Bob", "Builder", undefined, "supersecret", "1.2.3.4");
+      const insertCall = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO pending_signups"));
+      expect(insertCall![1][4]).toBeNull();
     });
 
     it("rejects when the invited email already has an account", async () => {
       const { svc } = makeService({ invitation: INVITE, dbOpts: { emailTaken: true } });
-      await expect(svc.startInviteRegistration("raw-token", "Bob", "supersecret", "1.2.3.4")).rejects.toMatchObject({
+      await expect(svc.startInviteRegistration("raw-token", "Bob", "Builder", undefined, "supersecret", "1.2.3.4")).rejects.toMatchObject({
         response: { error: "An account with this email already exists. Please sign in and accept the invite." }
       });
     });
 
-    it("rejects a missing name before ever touching the DB for the email check", async () => {
+    it("rejects a missing first name before ever touching the DB for the email check", async () => {
       const { svc, query } = makeService({ invitation: INVITE });
-      await expect(svc.startInviteRegistration("raw-token", "  ", "supersecret", "1.2.3.4")).rejects.toMatchObject({
-        response: { error: "Name is required" }
+      await expect(svc.startInviteRegistration("raw-token", "  ", "Builder", undefined, "supersecret", "1.2.3.4")).rejects.toMatchObject({
+        response: { error: "First name is required" }
       });
       expect(query.mock.calls.some((c) => String(c[0]).includes("SELECT id FROM users WHERE email"))).toBe(false);
+    });
+
+    it("rejects a malformed mobile number", async () => {
+      const { svc } = makeService({ invitation: INVITE });
+      await expect(
+        svc.startInviteRegistration("raw-token", "Bob", "Builder", "not-a-number", "supersecret", "1.2.3.4")
+      ).rejects.toMatchObject({
+        response: { error: "Mobile number must include a country code, e.g. +14155551234" }
+      });
     });
 
     it("propagates an invalid/expired invitation token from LegacyService untouched", async () => {
       const notFound = new BadRequestException({ error: "This invitation has expired. Ask the sender to resend it." });
       const { svc } = makeService({ invitation: notFound });
-      await expect(svc.startInviteRegistration("raw-token", "Bob", "supersecret", "1.2.3.4")).rejects.toBe(notFound);
+      await expect(svc.startInviteRegistration("raw-token", "Bob", "Builder", undefined, "supersecret", "1.2.3.4")).rejects.toBe(notFound);
     });
   });
 
   describe("startInviteOtpRegistration", () => {
     it("stores a pending signup with no password hash (OTP-only registration)", async () => {
       const { svc, query } = makeService({ invitation: INVITE });
-      await svc.startInviteOtpRegistration("raw-token", "Bob Builder", "1.2.3.4");
+      await svc.startInviteOtpRegistration("raw-token", "Bob", "Builder", undefined, "1.2.3.4");
       const insertCall = query.mock.calls.find((c) => String(c[0]).includes("INSERT INTO pending_signups"));
-      expect(insertCall![1][2]).toBeNull();
-      expect(insertCall![1][3]).toBe("inv-1");
+      expect(insertCall![1][5]).toBeNull();
+      expect(insertCall![1][6]).toBe("inv-1");
     });
   });
 
   describe("verifyInviteRegistration / verifyInviteOtpRegistration (completeInviteVerification)", () => {
-    const PENDING = { id: "pending-1", email: "bob@example.com", name: "Bob Builder", password_hash: "hashed:supersecret", invitation_id: "inv-1" };
+    const PENDING = {
+      id: "pending-1",
+      email: "bob@example.com",
+      name: "Bob Builder",
+      first_name: "Bob",
+      last_name: "Builder",
+      mobile_number: "+14155551234",
+      password_hash: "hashed:supersecret",
+      invitation_id: "inv-1"
+    };
 
     it("creates the user, assigns the invited role in the org and its projects, and marks the invite accepted", async () => {
       const { svc, txQuery, query, auth, audit, legacy } = makeService({ invitation: INVITE, dbOpts: { pendingSignup: PENDING } });
@@ -140,7 +177,7 @@ describe("SignupService — invite-based registration", () => {
 
       const calls = txQuery.mock.calls;
       const insertUserCall = calls.find((c) => String(c[0]).includes("INSERT INTO users"));
-      expect(insertUserCall![1]).toEqual(["bob@example.com", "Bob Builder", "hashed:supersecret"]);
+      expect(insertUserCall![1]).toEqual(["bob@example.com", "Bob Builder", "Bob", "Builder", "+14155551234", "hashed:supersecret"]);
 
       const orgMemberCall = calls.find((c) => String(c[0]).includes("INSERT INTO organization_members"));
       expect(orgMemberCall![1]).toEqual(["org-1", "new-user-1", "qa_engineer"]);

@@ -21,7 +21,7 @@ export function ChangeDiffModal({
   fields: KnowledgeChangedField[];
 }) {
   return (
-    <Modal open={open} onClose={onClose} title="View diff" className="max-w-[640px]">
+    <Modal open={open} onClose={onClose} title="Difference" className="max-w-[640px]">
       <p className="mb-3 text-[12px] text-[var(--muted)]">{title}</p>
       <div className="space-y-4">
         {fields.map((field, i) => (

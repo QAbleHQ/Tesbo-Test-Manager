@@ -183,6 +183,135 @@ test.describe("auto bug-filing on Failed", () => {
       await cleanUp(cycle.id, testcase.id);
     }
   });
+
+  /*
+   * Root-cause regression for "duplicate bug records created when saving a bug with more than 10
+   * attachments": createBug() succeeded, the attachments request that followed it failed (originally
+   * because more than ten files hit the server's per-request cap in one shot; here forced directly so
+   * the test doesn't depend on file-count timing), and the dialog stayed open with no error shown at
+   * all (handleBugSubmit had no catch block) — inviting a retry that called createBug() again and
+   * produced a duplicate. LogBugDialog.tsx now shows the failure and remembers the bug id from the
+   * failed attempt, so File Bug clicked again resumes the upload instead of filing a second bug.
+   */
+  test("a retry after a failed attachment upload does not create a duplicate bug", async ({ page }) => {
+    const title = `UI Bug Dialog Duplicate Guard ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    let attempt = 0;
+    await page.route("**/bugs/*/attachments", (route) => {
+      attempt += 1;
+      // The first attachment request fails; the retry's requests go through for real.
+      if (attempt === 1) {
+        return route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Simulated upload failure" }),
+        });
+      }
+      return route.continue();
+    });
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("combobox").first().selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.locator('input[type="file"]').setInputFiles(
+        Array.from({ length: 12 }, (_, i) => ({
+          name: `evidence-${i}.png`,
+          mimeType: "image/png",
+          buffer: Buffer.from(`file contents ${i}`),
+        })),
+      );
+
+      const submit = page.getByRole("button", { name: "File Bug" });
+      await submit.click();
+      await expect(page.getByTestId("log-bug-error")).toBeVisible();
+      // The dialog stays open with the same staged files — exactly what invited the original defect.
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await submit.click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const matches = bugs.filter((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(matches, "the retry must reuse the bug from the failed attempt, not create a second one").toHaveLength(1);
+
+        const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
+        expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(12);
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Regression: "Yes, link existing" -> search and pick a real Jira/Linear ticket used to be a
+   * dead end. The dialog echoed the picked ticket back as a chip ("PROJ-123 — summary"), but
+   * handleBugSubmit() never read it — it always sent integrationIssueKey: null, silently
+   * discarding the exact ticket the user just searched for and selected.
+   */
+  test("linking an already-logged Jira ticket carries its real key/url into the created bug", async ({ page }) => {
+    const title = `UI Bug Jira Link ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    await page.route(`**/api/projects/${ctx.projectId}/jira/status`, (route) =>
+      route.fulfill({ json: { connected: true } }),
+    );
+    await page.route(`**/api/projects/${ctx.projectId}/linear/status`, (route) =>
+      route.fulfill({ json: { connected: false } }),
+    );
+    await page.route(`**/api/projects/${ctx.projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: {
+          list: [
+            { provider: "JIRA", key: "PROJ-4242", summary: "Login button does nothing", status: "Open", url: "https://e2e.atlassian.net/browse/PROJ-4242" },
+          ],
+        },
+      }),
+    );
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      // Scoped to the row, not page.getByRole("combobox").first() — the page's own "Filter by
+      // priority" combobox sits above the table and is always first in DOM order, so an
+      // unscoped .first() silently grabs that instead of this row's status <select>.
+      await page.getByRole("row", { name: title }).getByRole("combobox").selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.getByRole("button", { name: "Yes, link existing" }).click();
+      // exact: true — "Jira ticket" is otherwise a substring match of "Search Jira tickets…" too.
+      await page.getByRole("button", { name: "Jira ticket", exact: true }).click();
+      await page.getByRole("button", { name: "Search Jira tickets…" }).click();
+
+      await expect(page.getByRole("heading", { name: "Link a ticket" })).toBeVisible();
+      const resultButton = page.getByRole("button", { name: "PROJ-4242 — Login button does nothing" });
+      await expect(resultButton).toBeVisible();
+      await resultButton.click();
+
+      await expect(page.getByText("PROJ-4242 — Login button does nothing")).toBeVisible();
+      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const filedBug = bugs.find((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(filedBug, "the bug filed against this execution").toBeTruthy();
+        expect(filedBug.integrationProvider).toBe("JIRA");
+        expect(filedBug.integrationIssueKey).toBe("PROJ-4242");
+        expect(filedBug.externalUrl).toBe("https://e2e.atlassian.net/browse/PROJ-4242");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
 });
 
 /*
@@ -258,6 +387,107 @@ test.describe("assigning a test execution", () => {
     } finally {
       await api.dispose();
       await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
+test.describe("bulk assignment (run detail)", () => {
+  async function setUpCycleWithTwoCases(prefix: string) {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = Date.now();
+    const cycle = await (
+      await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bulk Assign Cycle ${stamp}` } })
+    ).json();
+    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
+    const testcaseA = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} A ${stamp}` } })
+    ).json();
+    const testcaseB = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} B ${stamp}` } })
+    ).json();
+    await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+    await api.dispose();
+    return { cycle, testcaseA, testcaseB };
+  }
+
+  /*
+   * Before this: the run detail's bulk-selection toolbar offered only "Remove from run" — no way to
+   * assign several selected test cases to one person at once, despite the backend's bulk-assign
+   * route (executions/bulk-assign, covered at the API level in execution-ops.spec.ts EXO-A-04)
+   * already existing and working. This is the UI half: select several rows, assign them together,
+   * and the table reflects the new assignee immediately without a reload.
+   */
+  test("selecting several test cases and assigning them to a member updates all of them at once", async ({ page }) => {
+    const { cycle, testcaseA, testcaseB } = await setUpCycleWithTwoCases("UI Bulk Assign Case");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("checkbox", { name: `Select ${testcaseA.title}` }).check();
+      await page.getByRole("checkbox", { name: `Select ${testcaseB.title}` }).check();
+      await expect(page.getByText("2 selected")).toBeVisible();
+
+      await page.getByRole("button", { name: "Assign to" }).click();
+      await page.getByRole("combobox", { name: "Assign selected test cases to" }).selectOption(me.userId);
+      await page.getByRole("button", { name: "Assign 2" }).click();
+
+      // Selection clears and the modal closes on success, with no page reload in between.
+      await expect(page.getByText("2 selected")).toBeHidden();
+      // Scoped to each case's own row, not a bare page-wide text search — the run's own owner badge
+      // in the header can carry the same display name (this account both created and is assigned
+      // the run), which would otherwise make a page-wide count a false positive.
+      const displayName = me.name || me.email;
+      await expect(page.getByRole("row").filter({ hasText: testcaseA.title })).toContainText(displayName);
+      await expect(page.getByRole("row").filter({ hasText: testcaseB.title })).toContainText(displayName);
+
+      const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(executions.every((e: { assigneeId: string }) => e.assigneeId === me.userId)).toBeTruthy();
+    } finally {
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("individual assignment still works after a bulk assignment on the same run", async ({ page }) => {
+    const { cycle, testcaseA, testcaseB } = await setUpCycleWithTwoCases("UI Mixed Assign Case");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("checkbox", { name: `Select ${testcaseA.title}` }).check();
+      await page.getByRole("checkbox", { name: `Select ${testcaseB.title}` }).check();
+      await page.getByRole("button", { name: "Assign to" }).click();
+      await page.getByRole("combobox", { name: "Assign selected test cases to" }).selectOption(me.userId);
+      await page.getByRole("button", { name: "Assign 2" }).click();
+      await expect(page.getByText("2 selected")).toBeHidden();
+
+      // Unassign just one of the two rows through the existing per-row drawer. Waiting on the
+      // save request itself (not on the drawer closing/the row text hiding, which is a separate,
+      // pre-existing flake unrelated to bulk assignment) keeps this test scoped to what it's
+      // actually verifying: that per-row assignment still works the same after a bulk assignment.
+      await page.getByText(testcaseA.title).first().click();
+      await expect(page.getByRole("combobox", { name: "Assigned to" })).toHaveValue(me.userId);
+      await page.getByRole("combobox", { name: "Assigned to" }).selectOption("");
+      const [patchRes] = await Promise.all([
+        page.waitForResponse((res) => /\/executions\/[0-9a-f-]{36}$/.test(res.url()) && res.request().method() === "PATCH"),
+        page.getByRole("button", { name: "Save" }).first().click(),
+      ]);
+      expect(patchRes.ok()).toBeTruthy();
+
+      const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      const execA = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseA.id);
+      const execB = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseB.id);
+      expect(execA.assigneeId, "the bulk-then-individual case is cleared").toBeNull();
+      expect(execB.assigneeId, "the untouched bulk-assigned case keeps its assignee").toBe(me.userId);
+    } finally {
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+      await api.dispose();
     }
   });
 });
@@ -412,7 +642,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
     }
   });
 
-  test("EXE-U-31 defect fields appear only once the case is marked Failed", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
+  test("EXE-U-31 Bug Key/Bug Title fields appear only once the case is marked Failed", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
     const { cycle, testcase } = await setUpCycleWithOneCase(`UI Defect Visibility ${Date.now()}`);
     try {
       // Driven from the full-page execute screen rather than the run's side panel: the panel opens
@@ -425,16 +655,99 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
       await expect(page.getByText(testcase.title).first()).toBeVisible();
 
-      // Opens on Untested: a defect reference would be meaningless, so the fields are not offered.
-      await expect(page.getByText("Defect Key")).toBeHidden();
+      // Opens on Untested: a bug reference would be meaningless, so the fields are not offered.
+      await expect(page.getByText("Bug Key")).toBeHidden();
 
       await page.getByRole("button", { name: "Failed", exact: true }).first().click();
-      await expect(page.getByText("Defect Key")).toBeVisible();
-      await expect(page.getByText("Defect URL")).toBeVisible();
+      await expect(page.getByText("Bug Key")).toBeVisible();
+      await expect(page.getByText("Bug Title")).toBeVisible();
 
       await page.getByRole("button", { name: "Passed", exact: true }).first().click();
-      await expect(page.getByText("Defect Key")).toBeHidden();
+      await expect(page.getByText("Bug Key")).toBeHidden();
     } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Bug Key/Bug Title used to be free-text "Defect Key"/"Defect URL" inputs bound only to
+   * executions.defect_key/defect_url — typing a value there never touched an actual bug, so a bug
+   * filed via "Log bug" on this exact screen never showed up here. They now read the real
+   * bugs/bug_links relationship (the same one the Test Case Detail Bugs tab reads), and are
+   * read-only: there's nothing to type into a field that mirrors an existing bug's own data.
+   */
+  /*
+   * Test-case titles here deliberately avoid the substring "Bug Key" — the run table's row
+   * checkbox carries aria-label="Select {title}", and a title containing that phrase makes
+   * getByLabel("Bug Key") ambiguously match both the checkbox and the actual input (strict-mode
+   * violation). Read-only-ness is asserted purely via the `readonly` attribute rather than by
+   * attempting `.fill()` against the field: Playwright's fill() waits for the target to become
+   * editable, which a readonly input never does, so it hangs for the whole test timeout instead
+   * of failing fast — the attribute check already proves the point.
+   */
+  test("EXE-U-31b Bug Key and Bug Title reflect the actual linked bug, and are read-only", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Linked Bug Fields ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      await api.patch(`/api/cycles/${cycle.id}/executions/${execution.id}`, { data: { status: "Failed" } });
+      const bugTitle = `E2E Execute Linked Bug ${Date.now()}`;
+      await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: bugTitle,
+          integrationProvider: "JIRA",
+          integrationIssueKey: "PROJ-5566",
+          externalUrl: "https://example.atlassian.net/browse/PROJ-5566",
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id, executionId: execution.id }],
+        },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      // The execute page's own listBugs fetch fires after several other requests on this page
+      // (auth, executions, members, jira/linear status) resolve first, so it can genuinely take
+      // longer than the default 10s expect timeout under load — confirmed via a direct network
+      // trace (the same request returned correct data at 933ms standalone, but took over 6s and
+      // under 20s through this page under heavy local load). Longer timeout here, not everywhere.
+      await expect(bugKeyInput).toHaveValue("PROJ-5566", { timeout: 20_000 });
+      await expect(bugTitleInput).toHaveValue(bugTitle, { timeout: 20_000 });
+      await expect(bugKeyInput).toHaveAttribute("readonly", "");
+      await expect(bugTitleInput).toHaveAttribute("readonly", "");
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("EXE-U-31c the run drawer also shows Bug Key/Bug Title, read-only, from the same linked bug", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Drawer Linked Bug Fields ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      await api.patch(`/api/cycles/${cycle.id}/executions/${execution.id}`, { data: { status: "Failed" } });
+      const bugTitle = `E2E Drawer Linked Bug ${Date.now()}`;
+      await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: bugTitle,
+          integrationProvider: "LINEAR",
+          integrationIssueKey: "ENG-7788",
+          externalUrl: "https://linear.app/example/issue/ENG-7788",
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id, executionId: execution.id }],
+        },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      await expect(bugKeyInput).toHaveValue("ENG-7788");
+      await expect(bugTitleInput).toHaveValue(bugTitle);
+      await expect(bugKeyInput).toHaveAttribute("readonly", "");
+      await expect(bugTitleInput).toHaveAttribute("readonly", "");
+    } finally {
+      await api.dispose();
       await cleanUp(cycle.id, testcase.id);
     }
   });

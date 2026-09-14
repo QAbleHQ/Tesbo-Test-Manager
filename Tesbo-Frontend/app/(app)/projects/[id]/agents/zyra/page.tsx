@@ -4,15 +4,15 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconClipboardCheck, IconCopy, IconPlus, IconSettings, IconSparkles } from "@tabler/icons-react";
+import { IconClipboardCheck, IconCopy, IconPencil, IconPlus, IconSettings, IconSparkles, IconTrash } from "@tabler/icons-react";
 import {
-  authMe,
   continueZyraChatMessage,
   createZyraChatSession,
-  getProject,
+  deleteZyraChatSession,
   getZyraAgent,
   getZyraChatSession,
   listZyraChatSessions,
+  renameZyraChatSession,
   sendZyraChatMessage,
   stopZyraChatPlan,
   resumeZyraChatPlan,
@@ -22,12 +22,29 @@ import {
   type ZyraChatSession,
   type ZyraChatTestcaseRow,
 } from "@/lib/api";
-import { Button, CopyButton, PageLoader, StatusChip, Textarea, PriorityBadge, type Priority } from "@/components/ui";
+import {
+  Button,
+  ConfirmModal,
+  CopyButton,
+  Field,
+  FieldError,
+  FieldLabel,
+  Input,
+  Modal,
+  PageLoader,
+  StatusChip,
+  Textarea,
+  PriorityBadge,
+  type Priority,
+} from "@/components/ui";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
+import { ZyraCitationsList } from "@/components/agents/ZyraCitations";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
 function ZyraMark({ size = 24 }: { size?: number }) {
@@ -103,7 +120,7 @@ function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
 }
 
 // ─── TestcaseTable ────────────────────────────────────────────────────────────
-function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
+function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; projectId: string }) {
   if (!rows.length) return null;
   const tsv = toTsv(
     ["ID", "Title", "Priority", "Status", "First step", "Source"],
@@ -161,12 +178,13 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
                 <td className="max-w-[220px] px-3 py-3 text-[11px] leading-snug text-[var(--muted)]">
                   <div className="line-clamp-2">{firstStepPreview(row.stepsJson)}</div>
                 </td>
-                <td className="px-3 py-3">
-                  <div className="flex flex-col gap-0.5">
+                <td className="max-w-[220px] px-3 py-3">
+                  <div className="flex flex-col gap-1">
                     <span className={`text-[11px] font-semibold capitalize ${actionColor(row.action)}`}>
                       {row.action || "suggested"}
                     </span>
                     <span className="text-[10px] text-[var(--muted)]">AI · Zyra chat</span>
+                    <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
                   </div>
                 </td>
               </tr>
@@ -389,6 +407,23 @@ function MessageBubble({
   // save) instead of the plain read-only table, and don't count toward "View test cases" below.
   const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
   const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
+  // Defense-in-depth, independent of the backend guard: a reply that routed as a mutation but carries
+  // no rows and no review panel to show is a sign something upstream failed silently — surface that
+  // instead of leaving the bubble looking like an ordinary, uneventful answer. Never fires for a
+  // healthy turn: a genuine create/update/archive always carries either applied rows or a
+  // reviewRequestId with proposed rows.
+  //
+  // Found by review: "mixed" — reachable whenever the router's intent is create/update/archive and
+  // the model itself reports actionType "mixed" (normalizeZyraChatDecision trusts that value as-is)
+  // — was missing from this list, leaving exactly the same phantom-success shape unguarded for a
+  // mixed-operation turn (e.g. "create + archive in one request") whose operations end up filtered
+  // to nothing. "suite" is deliberately still excluded: create_suite/move_to_suite write
+  // immediately, so a suite-only turn legitimately has no testcases row to show.
+  const missingStructuredData =
+    !isUser &&
+    ["create", "update", "archive", "mixed"].includes(message.actionType || "") &&
+    testcases.length === 0 &&
+    !message.reviewRequestId;
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -414,9 +449,14 @@ function MessageBubble({
         dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
       />
 
-      <TestcaseTable rows={appliedRows} />
+      <TestcaseTable rows={appliedRows} projectId={projectId} />
       {message.reviewRequestId && proposedRows.length > 0 && (
         <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      )}
+      {missingStructuredData && (
+        <p className="mt-1 flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          ⚠️ Zyra didn&apos;t return structured data for this reply — nothing above should be treated as saved or staged. Try asking again.
+        </p>
       )}
 
       <div className="flex items-center gap-2">
@@ -477,6 +517,67 @@ function PlanProgressBubble({ plan }: { plan: { doneCount: number; totalCount: n
   );
 }
 
+// ─── RenameSessionModal ───────────────────────────────────────────────────────
+function RenameSessionModal({
+  open,
+  initialTitle,
+  saving,
+  onClose,
+  onSave,
+}: {
+  open: boolean;
+  initialTitle: string;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (title: string) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(initialTitle);
+  const [titleError, setTitleError] = useState("");
+  useEffect(() => {
+    if (open) {
+      setTitle(initialTitle);
+      setTitleError("");
+    }
+  }, [open, initialTitle]);
+
+  async function handleSaveClick() {
+    const trimmed = title.trim();
+    if (!trimmed) {
+      setTitleError("Conversation name is required");
+      return;
+    }
+    try {
+      await onSave(trimmed);
+    } catch (err) {
+      setTitleError(err instanceof Error ? err.message : "Failed to rename conversation.");
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="Rename conversation">
+      <div className="space-y-4">
+        <Field>
+          <FieldLabel>Conversation name</FieldLabel>
+          <Input
+            value={title}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              if (titleError) setTitleError("");
+            }}
+            autoFocus
+            maxLength={240}
+          />
+          {titleError && <FieldError>{titleError}</FieldError>}
+        </Field>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button type="button" disabled={!title.trim() || saving} onClick={handleSaveClick}>{saving ? "Saving…" : "Save"}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ─── NoKeyBanner ─────────────────────────────────────────────────────────────
 function NoKeyBanner({ projectId }: { projectId: string }) {
   return (
@@ -503,6 +604,9 @@ export default function ZyraChatPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // matching the full-bleed IDE-workspace pattern used by the Test Cases / Plan Details screens.
@@ -512,16 +616,21 @@ export default function ZyraChatPage() {
     return () => setTopBarFilled(false);
   }, [setTopBarFilled]);
 
-  const [projectName, setProjectName] = useState("");
   const [agent, setAgent] = useState<ZyraAgentState | null>(null);
   const [sessions, setSessions] = useState<ZyraChatSession[]>([]);
   const [activeSession, setActiveSession] = useState<ZyraChatSession | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
-  const [sending, setSending] = useState(false);
+  // Keyed by session id, not a single flag, so an in-flight send in one conversation never shows
+  // as "thinking" or disables the input in a different conversation the user has switched to.
+  const [pendingSessionIds, setPendingSessionIds] = useState<Set<string>>(new Set());
   const [stoppingPlan, setStoppingPlan] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [renameTarget, setRenameTarget] = useState<ZyraChatSession | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ZyraChatSession | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Guards the mount effect against firing loadData twice for the same mount (React 18 dev
@@ -532,6 +641,8 @@ export default function ZyraChatPage() {
   const loadStartedRef = useRef(false);
   const creatingSessionRef = useRef(false);
   const messages = useMemo(() => activeSession?.messages || [], [activeSession]);
+  // Derived, not stored: reflects only whether the CURRENTLY VIEWED session has a send in flight.
+  const sending = activeSession ? pendingSessionIds.has(activeSession.id) : false;
   // The sidebar is a history of conversations that actually happened — a session nobody ever sent
   // a message in (including one still being created) has nothing to show and shouldn't clutter or
   // duplicate in the list. `hasMessages` only comes back on list responses (see api.ts), so a
@@ -567,14 +678,50 @@ export default function ZyraChatPage() {
     }
   }, [projectId]);
 
+  async function handleRenameSave(title: string) {
+    if (!renameTarget) return;
+    const targetId = renameTarget.id;
+    setRenaming(true);
+    try {
+      const updated = await renameZyraChatSession(projectId, targetId, title);
+      setSessions((prev) => prev.map((s) => (s.id === targetId ? { ...s, title: updated.title, updatedAt: updated.updatedAt } : s)));
+      setActiveSession((prev) => (prev && prev.id === targetId ? { ...prev, title: updated.title, updatedAt: updated.updatedAt } : prev));
+      setRenameTarget(null);
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  async function handleConfirmDelete() {
+    if (!deleteTarget) return;
+    const targetId = deleteTarget.id;
+    setDeleting(true);
+    try {
+      await deleteZyraChatSession(projectId, targetId);
+      const remaining = sessions.filter((s) => s.id !== targetId);
+      setSessions(remaining);
+      setDeleteTarget(null);
+      if (activeSession?.id === targetId) {
+        // Same fallback loadData() uses when there is no session to show: fall back to the most
+        // recently used remaining conversation, or start a fresh one if none are left.
+        const nextVisible = remaining.find((s) => s.hasMessages);
+        if (nextVisible) await openSession(nextVisible.id);
+        else await createSession();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete conversation.");
+      setDeleteTarget(null);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   const loadData = useCallback(async () => {
     try {
-      const [project, agentData, sessionData] = await Promise.all([
-        getProject(projectId),
+      const [agentData, sessionData] = await Promise.all([
         getZyraAgent(projectId),
         refreshSessions(),
       ]);
-      setProjectName(String(project.name || ""));
       setAgent(agentData);
       if (sessionData[0]) await openSession(sessionData[0].id);
       else await createSession();
@@ -589,11 +736,9 @@ export default function ZyraChatPage() {
   useEffect(() => {
     if (loadStartedRef.current) return;
     loadStartedRef.current = true;
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-  }, [loadData, router]);
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, currentUser]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -618,14 +763,15 @@ export default function ZyraChatPage() {
   }, [isPlanRunning, activeSessionId, projectId]);
 
   async function submitMessage(text: string) {
-    if (!activeSession || !text.trim() || sending) return;
+    if (!activeSession || !text.trim() || pendingSessionIds.has(activeSession.id)) return;
+    const sessionId = activeSession.id;
     const trimmed = text.trim();
     setInput("");
-    setSending(true);
+    setPendingSessionIds((prev) => new Set(prev).add(sessionId));
     setError(null);
     const optimistic: ZyraChatMessage = {
       id: `local-${Date.now()}`,
-      sessionId: activeSession.id,
+      sessionId,
       projectId,
       userId: null,
       role: "user",
@@ -637,17 +783,23 @@ export default function ZyraChatPage() {
       activity: [],
       createdAt: new Date().toISOString(),
     };
-    setActiveSession((prev) => prev ? { ...prev, messages: [...(prev.messages || []), optimistic] } : prev);
+    // Guarded by session id, not just truthiness: if the user has switched to a different
+    // conversation by the time this resolves, that conversation's view must not be touched.
+    setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, messages: [...(prev.messages || []), optimistic] } : prev);
     try {
-      const result = await sendZyraChatMessage(projectId, activeSession.id, trimmed);
-      setActiveSession(result.session);
+      const result = await sendZyraChatMessage(projectId, sessionId, trimmed);
+      setActiveSession((prev) => prev && prev.id === sessionId ? result.session : prev);
       void refreshSessions();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Zyra could not answer.";
       setError(msg);
-      setActiveSession((prev) => prev ? { ...prev, messages: (prev.messages || []).filter((m) => m.id !== optimistic.id) } : prev);
+      setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, messages: (prev.messages || []).filter((m) => m.id !== optimistic.id) } : prev);
     } finally {
-      setSending(false);
+      setPendingSessionIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
       setTimeout(() => textareaRef.current?.focus(), 50);
     }
   }
@@ -801,23 +953,56 @@ export default function ZyraChatPage() {
                 {visibleSessions.map((session) => {
                   const isActive = activeSession?.id === session.id;
                   return (
-                    <button
+                    <div
                       key={session.id}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => void openSession(session.id)}
-                      className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          void openSession(session.id);
+                        }
+                      }}
+                      className={`group flex w-full cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-2.5 text-left transition-colors ${
                         isActive
                           ? "border-[var(--brand-border)] bg-[var(--surface-secondary)]"
                           : "border-transparent hover:bg-[var(--surface-secondary)]"
                       }`}
                     >
-                      <span className={`block truncate text-[12px] font-medium ${isActive ? "text-[var(--foreground)]" : "text-[var(--muted)]"}`}>
-                        {session.title}
-                      </span>
-                      <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted-soft)]">
-                        {formatTime(session.updatedAt)}
-                      </span>
-                    </button>
+                      <div className="min-w-0 flex-1">
+                        <span className={`block truncate text-[12px] font-medium ${isActive ? "text-[var(--foreground)]" : "text-[var(--muted)]"}`}>
+                          {session.title}
+                        </span>
+                        <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted-soft)]">
+                          {formatTime(session.updatedAt)}
+                        </span>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                        <button
+                          type="button"
+                          title="Rename conversation"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRenameTarget(session);
+                          }}
+                          className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--accent-light)]"
+                        >
+                          <IconPencil size={12} stroke={1.75} />
+                        </button>
+                        <button
+                          type="button"
+                          title="Delete conversation"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteTarget(session);
+                          }}
+                          className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--error-foreground)]"
+                        >
+                          <IconTrash size={12} stroke={1.75} />
+                        </button>
+                      </div>
+                    </div>
                   );
                 })}
               </div>
@@ -932,6 +1117,25 @@ export default function ZyraChatPage() {
           </div>
         )}
       </div>
+
+      <RenameSessionModal
+        open={!!renameTarget}
+        initialTitle={renameTarget?.title || ""}
+        saving={renaming}
+        onClose={() => setRenameTarget(null)}
+        onSave={handleRenameSave}
+      />
+
+      <ConfirmModal
+        open={!!deleteTarget}
+        title="Delete conversation"
+        message={`Delete "${deleteTarget?.title || "this conversation"}"? This permanently removes its message history and cannot be undone.`}
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        loading={deleting}
+        onConfirm={() => void handleConfirmDelete()}
+        onCancel={() => setDeleteTarget(null)}
+      />
 
       {/* Inline styles for markdown prose */}
       <style>{`

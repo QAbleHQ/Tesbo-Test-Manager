@@ -123,8 +123,19 @@ test.describe("account screen and password reset (UI)", () => {
     contexts.push(ctx);
     const page = await ctx.newPage();
     await page.goto("/account");
-    await expect(page.getByRole("heading", { level: 2, name: /Change password|Set a password/ })).toBeVisible();
+    // Change password now lives behind a link that opens a dialog (see openChangePasswordModal
+    // below) rather than being an always-visible card, so the loaded signal is the profile form.
+    await expect(page.locator("#account-first-name")).toBeVisible();
     return page;
+  }
+
+  /**
+   * Opens the "Change password"/"Set a password" dialog from the Password field's link. The dialog
+   * (Modal.tsx) renders its title as an <h2>, the same role/level the always-visible card used to.
+   */
+  async function openChangePasswordModal(page: Page): Promise<void> {
+    await page.getByRole("button", { name: /^Change password$|^Set a password$/ }).click();
+    await expect(page.getByRole("heading", { level: 2, name: /Change password|Set a password/ })).toBeVisible();
   }
 
   /** A fresh browser with no session, for the signed-out halves of the reset flow. */
@@ -135,10 +146,20 @@ test.describe("account screen and password reset (UI)", () => {
   }
 
   async function fillChangePassword(page: Page, current: string, next: string, confirm = next) {
-    await page.locator("#current-password").fill(current);
-    await page.locator("#new-password").fill(next);
-    await page.locator("#confirm-new-password").fill(confirm);
-    await page.getByRole("button", { name: /Change password|Set password/ }).click();
+    // Idempotent: if a previous step in the same test already left the dialog open (e.g. a refused
+    // attempt that didn't navigate away), don't try to re-open it and fail on strict-mode ambiguity.
+    if (!(await page.getByRole("heading", { level: 2, name: /Change password|Set a password/ }).isVisible())) {
+      await openChangePasswordModal(page);
+    }
+    // Scoped to the dialog's own <form>: with the dialog open, its submit button ("Change
+    // password"/"Set password") and the Password field's link that opened it ("Change
+    // password"/"Set a password") can share the exact same accessible name, so an unscoped
+    // getByRole would hit strict-mode ambiguity.
+    const dialogForm = page.locator("form", { has: page.locator("#new-password") });
+    await dialogForm.locator("#current-password").fill(current);
+    await dialogForm.locator("#new-password").fill(next);
+    await dialogForm.locator("#confirm-new-password").fill(confirm);
+    await dialogForm.getByRole("button", { name: /^Change password$|^Set password$/ }).click();
   }
 
   /** Proves a password is the live one by using it, rather than trusting a toast. */
@@ -154,9 +175,11 @@ test.describe("account screen and password reset (UI)", () => {
   test('ACU-01 the account screen is labelled "My Account"', { tag: '@tesbo.testId("TES-TC-986")' }, async ({ browser }) => {
     const page = await openAccount(browser);
 
-    // Both places the label appears: the page heading and the sidebar link that reaches it.
+    // BetterBugs 6a840253's fix was this <h1> itself. The entry point that reaches this screen
+    // used to be a sidebar link labelled "My Account" too, but that link (along with the sidebar's
+    // theme toggle and Logout button) was removed once the top-right user menu's own "Profile
+    // Settings" entry became the one way to reach this screen — see ACU-16/ACU-18 for that path.
     await expect(page.getByRole("heading", { level: 1, name: "My Account" })).toBeVisible();
-    await expect(page.locator('a[href="/account"]')).toContainText("My Account");
   });
 
   // ─── Changing a password from the account screen ───────────────────────────
@@ -349,36 +372,340 @@ test.describe("account screen and password reset (UI)", () => {
   });
   // ─── The profile card ──────────────────────────────────────────────────────
 
-  test("ACU-11 the profile shows the name captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
+  test("ACU-11 the profile shows the first name and surname captured at signup, not just the email", { tag: '@tesbo.testId("TES-TC-996")' }, async ({ browser }) => {
     /*
      * Basecamp 10212498688 — "Profile page should have user name and surname and mobile number fields
      * fetched during sign up". The Profile card rendered nothing but the email.
      *
-     * The name half was a pure display gap: /signup collects First name and Last name, sends them as
-     * one `name`, and GET /me has always returned it — the screen just never read it. Asserted against
-     * the value the API reports rather than a hard-coded string, so this stays true for any tenant.
+     * /signup collects First name and Last name separately, sends them as one `name`, and GET /me now
+     * splits that stored value back into firstName/lastName (auth.service.ts `me()`) so the screen can
+     * show the two fields signup actually collected instead of one merged string. Asserted against the
+     * value the API reports rather than a hard-coded string, so this stays true for any tenant. Both
+     * are editable inputs (see ACU-13/ACU-14 below for the PATCH round trip), so this reads `value`
+     * rather than text content.
      *
-     * The mobile number is deliberately NOT asserted: signup never collects one, there is no column
-     * and no value to fetch, so there is nothing to display. That half is a separate feature and is
-     * recorded on the card for Specification — not silently rendered as an empty row.
+     * The mobile number is asserted only for visibility, not a specific value: signup collects it as
+     * optional, so this tenant's user may legitimately have none on file.
      */
     const page = await openAccount(browser);
 
     const reported = await page.evaluate(async () => {
       const res = await fetch("/api/auth/me", { credentials: "include" });
-      return res.ok ? ((await res.json()) as { name?: string | null; email?: string | null }) : null;
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; email?: string | null })
+        : null;
     });
     expect(reported, "GET /me did not answer").not.toBeNull();
-    const expectedName = (reported!.name ?? "").trim();
-    expect(expectedName, "this tenant's user has no name stored, so the test proves nothing").not.toBe("");
+    const expectedFirstName = (reported!.firstName ?? "").trim();
+    const expectedLastName = (reported!.lastName ?? "").trim();
+    expect(expectedFirstName, "this tenant's user has no first name stored, so the test proves nothing").not.toBe("");
+    expect(expectedLastName, "this tenant's user has no last name stored, so the test proves nothing").not.toBe("");
 
-    // The name is on the screen, and labelled — not just present somewhere in the markup.
-    const nameValue = page.locator("#account-name");
-    await expect(nameValue, "the profile card shows no name field").toBeVisible();
-    await expect(nameValue).toHaveText(expectedName);
+    // First name and last name are on the screen, each labelled — not just present somewhere in the markup.
+    const firstNameValue = page.locator("#account-first-name");
+    await expect(firstNameValue, "the profile card shows no first name field").toBeVisible();
+    await expect(firstNameValue).toHaveValue(expectedFirstName);
 
-    // The email it used to show alone is still there.
-    await expect(page.locator("#account-email")).toHaveText((reported!.email ?? "").trim());
+    const lastNameValue = page.locator("#account-last-name");
+    await expect(lastNameValue, "the profile card shows no last name field").toBeVisible();
+    await expect(lastNameValue).toHaveValue(expectedLastName);
+
+    // The email it used to show alone is still there — now inside the same input-styled container
+    // as the other fields, but still read-only.
+    const emailValue = page.locator("#account-email");
+    await expect(emailValue).toHaveValue((reported!.email ?? "").trim());
+    await expect(emailValue).toHaveAttribute("readonly", "");
+
+    // Mobile number now has a real column and a field on the card — whatever this tenant's value is
+    // (signup collects it as optional, so it may legitimately be unset), the field itself must render.
+    await expect(page.locator("#account-mobile-number"), "the profile card shows no mobile number field").toBeVisible();
+  });
+
+  // ─── The Password field ─────────────────────────────────────────────────────
+
+  test("ACU-24 the profile shows a masked Password field after Email, with a link to change it", async ({ browser }) => {
+    const page = await openAccount(browser);
+
+    // Field order: First name, Last name, Mobile number, Email, then Password last — Password
+    // and Mobile number both sit after the two name fields, with Mobile number before Email/Password.
+    const labels = await page.locator("form").first().locator("label").allTextContents();
+    const lastNameIndex = labels.findIndex((label) => label.trim() === "Last name");
+    const mobileIndex = labels.findIndex((label) => label.includes("Mobile number"));
+    const emailIndex = labels.findIndex((label) => label.trim() === "Email");
+    const passwordIndex = labels.findIndex((label) => label.trim() === "Password");
+    expect(lastNameIndex, "no Last name label found").toBeGreaterThanOrEqual(0);
+    expect(mobileIndex, "no Mobile number label found").toBeGreaterThanOrEqual(0);
+    expect(emailIndex, "no Email label found").toBeGreaterThanOrEqual(0);
+    expect(passwordIndex, "no Password label found").toBeGreaterThanOrEqual(0);
+    expect(mobileIndex, "Mobile number should be placed after Last name").toBeGreaterThan(lastNameIndex);
+    expect(emailIndex, "Email should be placed after Mobile number").toBeGreaterThan(mobileIndex);
+    expect(passwordIndex, "Password should be placed after Email, last of all").toBeGreaterThan(emailIndex);
+
+    // The value is a fixed mask, never the real password (which the frontend never receives from
+    // the API in the first place — this only proves the screen doesn't render anything real).
+    const passwordField = page.locator("#account-password");
+    await expect(passwordField).toBeVisible();
+    await expect(passwordField).toBeDisabled();
+    const maskedValue = await passwordField.inputValue();
+    expect(maskedValue.length, "the field should show a mask, not sit blank").toBeGreaterThan(0);
+    expect(/^[^a-zA-Z0-9]+$/.test(maskedValue), "the mask should contain no alphanumeric characters").toBe(true);
+
+    // This tenant has a password set, so the link reads "Change password" (the "Set a password"
+    // wording is exercised for passwordless accounts elsewhere via the modal's own title binding).
+    await expect(page.getByRole("button", { name: "Change password" })).toBeVisible();
+  });
+
+  test("ACU-25 the Password field's link opens the change-password dialog, and Cancel closes it without changing anything", async ({ browser }) => {
+    const page = await openAccount(browser);
+
+    await expect(page.getByRole("heading", { level: 2, name: "Change password" })).toHaveCount(0);
+    await openChangePasswordModal(page);
+    await expect(page.getByText("You'll be signed out everywhere, including here, after changing your password.")).toBeVisible();
+
+    const dialogForm = page.locator("form", { has: page.locator("#new-password") });
+    await dialogForm.locator("#current-password").fill(FIXTURE_PASSWORD);
+    await dialogForm.locator("#new-password").fill(NEW_PASSWORD);
+    await dialogForm.locator("#confirm-new-password").fill(NEW_PASSWORD);
+
+    await dialogForm.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByRole("heading", { level: 2, name: "Change password" })).toHaveCount(0);
+
+    // Nothing was submitted, so the tab is still signed in on /account and the password unchanged.
+    expect(page.url()).toContain("/account");
+    expect(await passwordWorks(FIXTURE_PASSWORD), "cancelling must not change the stored password").toBe(true);
+    expect(await passwordWorks(NEW_PASSWORD)).toBe(false);
+
+    // Reopening starts from a clean slate — the cancelled draft isn't left sitting in the fields.
+    await openChangePasswordModal(page);
+    await expect(dialogForm.locator("#current-password")).toHaveValue("");
+    await expect(dialogForm.locator("#new-password")).toHaveValue("");
+    await expect(dialogForm.locator("#confirm-new-password")).toHaveValue("");
+
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("heading", { level: 2, name: "Change password" })).toHaveCount(0);
+  });
+
+  test("ACU-26 the locked Mobile number field's background matches the other locked profile fields", async ({ browser }) => {
+    // Regression cover: PhoneInput hard-coded bg-[var(--surface)] on its own button/input regardless
+    // of lock state, so the Mobile number row rendered a visibly different shade than the
+    // bg-[var(--surface-secondary)] every other locked field (Email, Password, and First/Last name
+    // before their pencil is clicked) uses. PhoneInput now takes a `locked` prop for this.
+    const page = await openAccount(browser);
+
+    const emailColor = await page.locator("#account-email").evaluate((el) => getComputedStyle(el).backgroundColor);
+    const passwordColor = await page.locator("#account-password").evaluate((el) => getComputedStyle(el).backgroundColor);
+    const mobileColor = await page.locator("#account-mobile-number").evaluate((el) => getComputedStyle(el).backgroundColor);
+
+    expect(passwordColor, "the Password field should share the locked-field background").toBe(emailColor);
+    expect(mobileColor, "the locked Mobile number field should share the locked-field background").toBe(emailColor);
+
+    // Unlocking it for editing restores the normal (non-locked) input background, same as First
+    // name/Last name do once their own pencil is clicked.
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+    const unlockedColor = await page.locator("#account-mobile-number").evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(unlockedColor, "editing should restore the normal, non-locked input background").not.toBe(mobileColor);
+  });
+
+  // ─── Editing the profile ────────────────────────────────────────────────────
+
+  test("ACU-21 each field's pencil unlocks only that field, independently of the others", { tag: '@tesbo.testId("TES-TC-1413")' }, async ({ browser }) => {
+    /*
+     * Regression cover: all three fields used to share one edit flag, so clicking any single
+     * pencil (e.g. Mobile number's) unlocked First name and Last name right along with it. Each
+     * field now owns its own flag — this pins that clicking one row's pencil affects only that row.
+     */
+    const page = await openAccount(browser);
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const editFirstName = page.getByRole("button", { name: "Edit first name" });
+    const editLastName = page.getByRole("button", { name: "Edit last name" });
+    const editMobile = page.getByRole("button", { name: "Edit mobile number" });
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(saveButton).toBeDisabled();
+
+    // First name's pencil unlocks only First name.
+    await editFirstName.click();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(firstNameInput).toBeFocused();
+    await expect(editFirstName).toHaveCount(0);
+    await expect(editLastName).toBeVisible();
+    await expect(editMobile).toBeVisible();
+    // Save enables the moment a field is unlocked, even before any value has actually changed.
+    await expect(saveButton).toBeEnabled();
+
+    // Last name's pencil unlocks Last name too, without relocking or affecting First name.
+    await editLastName.click();
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).toBeFocused();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(mobileInput).toBeDisabled();
+    await expect(editLastName).toHaveCount(0);
+    await expect(editMobile).toBeVisible();
+
+    // Mobile number's pencil unlocks it too, without touching the other two.
+    await editMobile.click();
+    await expect(mobileInput).toBeEnabled();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+    await expect(lastNameInput).not.toHaveAttribute("readonly", "");
+    await expect(editMobile).toHaveCount(0);
+  });
+
+  test("ACU-22 saving with a field unlocked but unchanged succeeds safely and relocks the form", { tag: '@tesbo.testId("TES-TC-1414")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const firstNameInput = page.locator("#account-first-name");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await expect(saveButton).toBeEnabled();
+
+    // No typing at all — a pure no-op resubmit of the already-valid, unchanged value must not
+    // error or hang.
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Back to locked, its pencil restored, and Save disabled again.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Edit first name" })).toBeVisible();
+    await expect(saveButton).toBeDisabled();
+  });
+
+  test("ACU-13 the first name, last name and mobile number can be edited and persist after refresh", { tag: '@tesbo.testId("TES-TC-1400")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+    const newFirstName = `E2EFirst${Date.now()}`;
+    const newLastName = `E2ELast${Date.now()}`;
+    // Typed with the formatting a real user would use — the screen strips it before sending, so the
+    // value that actually persists (asserted below) is the normalized "+14155550132".
+    const typedMobileNumber = "+1 415 555 0132";
+    const normalizedMobileNumber = "+14155550132";
+
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    // No profile picture field of any kind on this screen — that feature was removed.
+    await expect(page.getByText(/profile picture/i)).toHaveCount(0);
+
+    // Nothing changed yet, so saving is disabled — this must not be a no-op button on load.
+    await expect(saveButton).toBeDisabled();
+
+    // Each field reads read-only until its own pencil button is clicked.
+    await expect(firstNameInput).toHaveAttribute("readonly", "");
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+    await expect(firstNameInput).not.toHaveAttribute("readonly", "");
+
+    await firstNameInput.fill(newFirstName);
+    await lastNameInput.fill(newLastName);
+    await mobileInput.fill(typedMobileNumber);
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // Persisted server-side, not just in local component state — and normalized, not the raw typed
+    // formatting, since that's what the API stores and the CHECK constraint on users.mobile_number
+    // requires.
+    await page.reload();
+    await expect(page.locator("#account-first-name")).toHaveValue(newFirstName);
+    await expect(page.locator("#account-last-name")).toHaveValue(newLastName);
+    await expect(page.locator("#account-mobile-number")).toHaveValue(normalizedMobileNumber);
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
+    });
+    expect(reported?.firstName).toBe(newFirstName);
+    expect(reported?.lastName).toBe(newLastName);
+    expect(reported?.mobileNumber).toBe(normalizedMobileNumber);
+  });
+
+  test("ACU-14 an empty first/last name or an out-of-range mobile number is rejected inline", { tag: '@tesbo.testId("TES-TC-1401")' }, async ({ browser }) => {
+    const page = await openAccount(browser);
+
+    const firstNameInput = page.locator("#account-first-name");
+    const lastNameInput = page.locator("#account-last-name");
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit first name" }).click();
+    await page.getByRole("button", { name: "Edit last name" }).click();
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+
+    // Empty / whitespace-only first name.
+    await firstNameInput.fill("   ");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("First name is required")).toBeVisible();
+
+    // Empty / whitespace-only last name.
+    await firstNameInput.fill("E2E Valid First");
+    await lastNameInput.fill("   ");
+    await saveButton.click();
+    await expect(page.getByText("Last name is required")).toBeVisible();
+
+    // Too few digits to be a real number — rejected rather than silently stored.
+    await lastNameInput.fill("E2E Valid Last");
+    await mobileInput.fill("12345");
+    await saveButton.click();
+    await expect(page.getByText(/mobile number/i)).toBeVisible();
+
+    // A plausible-looking number missing its country code — the constraint requires an explicit
+    // leading '+', so this is rejected inline rather than silently normalized to one.
+    await mobileInput.fill("14155550132");
+    await saveButton.click();
+    await expect(page.getByText(/country code/i)).toBeVisible();
+
+    // None of the rejected attempts reached the server: GET /me still reports the original values.
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok
+        ? ((await res.json()) as { firstName?: string | null; lastName?: string | null; mobileNumber?: string | null })
+        : null;
+    });
+    expect(reported?.firstName).not.toBe("");
+    expect(reported?.lastName).not.toBe("");
+    expect(reported?.mobileNumber ?? "").not.toBe("14155550132");
+  });
+
+  test("ACU-15 a mobile number is optional — clearing it back to blank is allowed and persists", { tag: '@tesbo.testId("TES-TC-1407")' }, async ({ browser }) => {
+    // Existing users (and this tenant's owner before this test) have no mobile number on file —
+    // saving the profile must not force one to be entered, and an explicit clear must stick.
+    const page = await openAccount(browser);
+    const mobileInput = page.locator("#account-mobile-number");
+    const saveButton = page.getByRole("button", { name: "Save profile" });
+
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+
+    await mobileInput.fill("+1 415 555 0199");
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    // A successful save locks the fields again, same as the name fields — re-open before clearing.
+    await page.getByRole("button", { name: "Edit mobile number" }).click();
+    await mobileInput.fill("");
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+    await expect(page.getByText("Profile updated.")).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator("#account-mobile-number")).toHaveValue("");
+
+    const reported = await page.evaluate(async () => {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      return res.ok ? ((await res.json()) as { mobileNumber?: string | null }) : null;
+    });
+    expect(reported?.mobileNumber).toBeNull();
   });
 
   // ─── Cross-device session invalidation ─────────────────────────────────────
@@ -400,5 +727,112 @@ test.describe("account screen and password reset (UI)", () => {
       async () => (await fetch("/api/auth/me", { credentials: "include" })).status,
     );
     expect(status, "a different device's session should be signed out too").toBe(401);
+  });
+
+  // ─── Top bar user menu ──────────────────────────────────────────────────────
+
+  /** Same disposable owner as the rest of this suite, landed on a page other than /account. */
+  async function openProjects(browser: Browser): Promise<Page> {
+    const state = await writeStorageState(tenant!.owner, `account-ui-owner-topbar-${contexts.length}`);
+    const ctx = await browser.newContext({ storageState: state });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto("/projects");
+    return page;
+  }
+
+  const userMenuTrigger = (page: Page) => page.getByRole("button", { name: "User menu" });
+  const userMenu = (page: Page) => page.locator('[role="menu"][aria-label="User menu"]');
+
+  test("ACU-16 the user menu opens on click and contains exactly My Account and Logout", { tag: '@tesbo.testId("TES-TC-1408")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await expect(userMenu(page)).toBeHidden();
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+
+    await expect(userMenu(page).getByRole("menuitem", { name: "My Account" })).toBeVisible();
+    await expect(userMenu(page).getByRole("menuitem", { name: "Logout" })).toBeVisible();
+    // Exactly the two navigational/action items now that Theme lives in the top bar's own row
+    // (ThemeToggle in TopBar.tsx) rather than inside this menu.
+    await expect(userMenu(page).getByRole("menuitem")).toHaveCount(2);
+  });
+
+  test("ACU-23 the user menu's profile entry reads 'My Account', and Logout is styled as a destructive action", { tag: '@tesbo.testId("TES-TC-1415")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page).getByRole("menuitem", { name: "Profile Settings" })).toHaveCount(0);
+    await expect(userMenu(page).getByRole("menuitem", { name: "My Account" })).toBeVisible();
+
+    // Not asserting a specific hex — themed via --error-foreground like every other destructive
+    // label in the app — just that Logout is visually distinct from the plain-text "My Account".
+    const [logoutColor, accountColor] = await Promise.all([
+      userMenu(page).getByRole("menuitem", { name: "Logout" }).evaluate((el) => getComputedStyle(el).color),
+      userMenu(page).getByRole("menuitem", { name: "My Account" }).evaluate((el) => getComputedStyle(el).color),
+    ]);
+    expect(logoutColor).not.toBe(accountColor);
+  });
+
+  test("ACU-17 the user menu closes on outside click and on Escape", { tag: '@tesbo.testId("TES-TC-1409")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    // Deep inside the main content area — clear of both the sidebar's own links and the menu
+    // itself, so this is unambiguously an "outside" click rather than a navigation.
+    await page.mouse.click(700, 400);
+    await expect(userMenu(page)).toBeHidden();
+
+    await userMenuTrigger(page).click();
+    await expect(userMenu(page)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-18 My Account navigates to /account and closes the menu", { tag: '@tesbo.testId("TES-TC-1410")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "My Account" }).click();
+
+    await page.waitForURL(/\/account$/);
+    await expect(userMenu(page)).toBeHidden();
+  });
+
+  test("ACU-19 switching theme from the top bar applies dark mode and persists across reload", { tag: '@tesbo.testId("TES-TC-1411")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+    // ThemeToggle now lives in the top bar's own row (TopBar.tsx), not inside the user menu — see
+    // ACU-16's "exactly My Account and Logout" for the menu's own contents. It's a single switch
+    // (role="switch"), not two separate "Use light/dark theme" buttons, so it's located by role
+    // alone rather than by name — that name flips ("Switch to dark theme" <-> "Switch to light
+    // theme") depending on which theme is currently active.
+    const themeToggle = page.getByRole("switch");
+
+    await themeToggle.click();
+
+    await expect(page.locator("html")).toHaveClass(/dark/);
+    await expect(themeToggle).toHaveAttribute("aria-checked", "true");
+
+    // Persists via the app's existing mechanism (localStorage), not a new one, and survives reload.
+    const stored = await page.evaluate(() => window.localStorage.getItem("tesbo-theme"));
+    expect(stored).toBe("dark");
+    await page.reload();
+    await expect(page.locator("html")).toHaveClass(/dark/);
+
+    // Leave it back on light so this disposable context doesn't affect anything reused later.
+    await page.getByRole("switch").click();
+    await expect(page.locator("html")).not.toHaveClass(/dark/);
+  });
+
+  test("ACU-20 Logout from the user menu signs the session out and redirects to /login", { tag: '@tesbo.testId("TES-TC-1412")' }, async ({ browser }) => {
+    const page = await openProjects(browser);
+
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+
+    await page.waitForURL(/\/login/);
+    const status = await page.evaluate(async () => (await fetch("/api/auth/me", { credentials: "include" })).status);
+    expect(status, "the session should be invalidated server-side, not just redirected client-side").toBe(401);
   });
 });

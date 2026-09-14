@@ -31,6 +31,7 @@ export function ExecutionReportTab({
   runs,
   suites,
   members,
+  filtersLoading = false,
 }: {
   rows: ExecutionReportRow[];
   loading: boolean;
@@ -44,6 +45,8 @@ export function ExecutionReportTab({
   runs: { id: string; name: string }[];
   suites: SuiteNode[];
   members: { userId: string; name: string; email: string }[];
+  /** True while plans/suites (deferred, fetched on this tab's first visit) are still in flight. */
+  filtersLoading?: boolean;
 }) {
   const totals = useMemo(() => {
     const t: Record<string, number> & { total: number } = { Passed: 0, Failed: 0, Blocked: 0, Skipped: 0, Untested: 0, Retest: 0, total: 0 };
@@ -69,10 +72,21 @@ export function ExecutionReportTab({
             {FILTER_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
           </Select>
         </div>
-        {filterBy === "plan" && plans.length > 0 && (
-          <Select value={filterValue} onChange={(e) => onFilterValueChange(e.target.value)} className="min-w-[140px]">
-            <option value="">All Plans</option>
-            {plans.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        {filterBy === "plan" && (plans.length > 0 || filtersLoading) && (
+          <Select
+            value={filterValue}
+            onChange={(e) => onFilterValueChange(e.target.value)}
+            className="min-w-[140px]"
+            disabled={plans.length === 0}
+          >
+            {plans.length === 0 ? (
+              <option value="">Loading plans…</option>
+            ) : (
+              <>
+                <option value="">All Plans</option>
+                {plans.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </>
+            )}
           </Select>
         )}
         {filterBy === "run" && runs.length > 0 && (
@@ -81,10 +95,21 @@ export function ExecutionReportTab({
             {runs.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
           </Select>
         )}
-        {filterBy === "suite" && suites.length > 0 && (
-          <Select value={filterValue} onChange={(e) => onFilterValueChange(e.target.value)} className="min-w-[140px]">
-            <option value="">All Suites</option>
-            {suites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+        {filterBy === "suite" && (suites.length > 0 || filtersLoading) && (
+          <Select
+            value={filterValue}
+            onChange={(e) => onFilterValueChange(e.target.value)}
+            className="min-w-[140px]"
+            disabled={suites.length === 0}
+          >
+            {suites.length === 0 ? (
+              <option value="">Loading suites…</option>
+            ) : (
+              <>
+                <option value="">All Suites</option>
+                {suites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </>
+            )}
           </Select>
         )}
         {filterBy === "person" && members.length > 0 && (

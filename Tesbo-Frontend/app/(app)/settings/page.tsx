@@ -3,8 +3,8 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { authMe, getWorkspace } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
+import { useAppData } from "@/components/app/AppDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import { PageLoader } from "@/components/ui";
 import GeneralTab from "@/components/settings/GeneralTab";
@@ -19,6 +19,7 @@ type SettingsTab = "general" | "members" | "integrations" | "ai" | "billing" | "
 function WorkspaceSettingsContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { currentUser, workspace } = useAppData();
   const [status, setStatus] = useState<"loading" | "ready" | "denied">("loading");
   const [workspaceName, setWorkspaceName] = useState("");
   const [canManageWorkspace, setCanManageWorkspace] = useState(false);
@@ -42,31 +43,32 @@ function WorkspaceSettingsContent() {
     [canManageWorkspace, isPlatformAdmin]
   );
 
-  const load = useCallback(async () => {
-    const me = await authMe();
-    if (!me) {
+  const load = useCallback(() => {
+    if (!currentUser) {
       router.replace("/login");
       return;
     }
-    try {
-      const workspace = await getWorkspace();
-      const role = String(workspace.role || "qa_engineer").toLowerCase();
-      const canManage = role === "owner" || role === "manager";
-      const platformAdmin = Boolean(me.isPlatformAdmin);
-      if (!canManage && !platformAdmin) {
-        router.replace("/projects");
-        return;
-      }
-      setWorkspaceName(workspace.name || "");
-      setCanManageWorkspace(canManage);
-      setIsPlatformAdmin(platformAdmin);
-      setStatus("ready");
-    } catch {
+    // workspace is already resolved by AppDataProvider by the time this page mounts; a missing
+    // value here only happens if that initial fetch itself failed, matching this function's own
+    // former catch-and-redirect fallback for a rejected getWorkspace() call.
+    if (!workspace) {
       router.replace("/projects");
+      return;
     }
-  }, [router]);
+    const role = String(workspace.role || "qa_engineer").toLowerCase();
+    const canManage = role === "owner" || role === "manager";
+    const platformAdmin = Boolean(currentUser.isPlatformAdmin);
+    if (!canManage && !platformAdmin) {
+      router.replace("/projects");
+      return;
+    }
+    setWorkspaceName(workspace.name || "");
+    setCanManageWorkspace(canManage);
+    setIsPlatformAdmin(platformAdmin);
+    setStatus("ready");
+  }, [router, currentUser, workspace]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
     if (visibleTabs.length === 0) return;

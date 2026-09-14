@@ -4,8 +4,6 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
-  authMe,
-  getProject,
   listTestRuns,
   listTestRunSchedules,
   createTestRunSchedule,
@@ -14,8 +12,17 @@ import {
   type TestRunListItem,
   type TestRunSchedule,
 } from "@/lib/api";
-import { Button, Input, Card, Field, FieldLabel, Select } from "@/components/ui";
+import { Button, Input, Card, Field, FieldLabel, FieldError, Select } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { validateScheduleRunAt } from "@/lib/validation";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+
+/** The browser's own local "now", formatted for a datetime-local input's value/min attribute. */
+function toDatetimeLocalValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 
 function currentTimezone(): string {
   try {
@@ -41,18 +48,21 @@ export default function ScheduleRunsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
 
   const [runs, setRuns] = useState<TestRunListItem[]>([]);
   const [schedules, setSchedules] = useState<TestRunSchedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState("");
 
   const [name, setName] = useState("");
   const [cycleId, setCycleId] = useState("");
   const [scheduleType, setScheduleType] = useState<"one_time" | "recurring">("one_time");
   const [runAt, setRunAt] = useState("");
+  const [runAtError, setRunAtError] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(1440);
   const [timezone, setTimezone] = useState<string>(currentTimezone);
   // Computed once at mount: the option list itself doesn't change, only which one is selected.
@@ -82,20 +92,25 @@ export default function ScheduleRunsPage() {
   }, [projectId, cycleId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-      getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-    });
-  }, [router, load, projectId]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [router, load, projectId, currentUser]);
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim() || !cycleId) return;
     setError(null);
+    if (scheduleType === "one_time") {
+      const runAtErr = validateScheduleRunAt(runAt);
+      if (runAtErr) {
+        setRunAtError(runAtErr);
+        return;
+      }
+    }
+    setRunAtError("");
     setSaving(true);
     try {
       await createTestRunSchedule(projectId, {
@@ -226,9 +241,14 @@ export default function ScheduleRunsPage() {
                 <Input
                   type="datetime-local"
                   value={runAt}
-                  onChange={(e) => setRunAt(e.target.value)}
+                  min={toDatetimeLocalValue(new Date())}
+                  onChange={(e) => {
+                    setRunAt(e.target.value);
+                    setRunAtError(validateScheduleRunAt(e.target.value));
+                  }}
                   required
                 />
+                {runAtError && <FieldError>{runAtError}</FieldError>}
               </Field>
             </div>
           ) : (

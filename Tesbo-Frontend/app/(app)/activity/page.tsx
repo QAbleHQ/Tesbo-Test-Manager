@@ -4,15 +4,11 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { IconActivity, IconSearch, IconLock } from "@tabler/icons-react";
 import {
-  authMe,
-  getWorkspace,
   getWorkspaceActivitySummary,
   listWorkspaceActivity,
   listWorkspaceMembers,
-  listProjects,
   type ActivitySummary,
   type WorkspaceActivityLogItem,
-  type ProjectSummary,
 } from "@/lib/api";
 import { Button, EmptyStateBlock, PageLoader, Select } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
@@ -23,6 +19,7 @@ import {
   groupByDate,
   sinceFor,
 } from "@/components/activity/activityShared";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 const TYPE_FILTERS = [
   { value: "", label: "All types" },
@@ -48,13 +45,12 @@ const PAGE_SIZE = 30;
 
 export default function WorkspaceActivityPage() {
   const router = useRouter();
+  const { currentUser, workspace, projects } = useAppData();
 
   const [checkingAccess, setCheckingAccess] = useState(true);
   const [allowed, setAllowed] = useState(false);
-  const [workspaceName, setWorkspaceName] = useState("");
 
   const [members, setMembers] = useState<{ userId: string; name: string; email: string }[]>([]);
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [summary, setSummary] = useState<ActivitySummary | null>(null);
   const [activities, setActivities] = useState<WorkspaceActivityLogItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -102,31 +98,24 @@ export default function WorkspaceActivityPage() {
   );
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      getWorkspace()
-        .then((ws) => {
-          setWorkspaceName(ws.name ?? "Workspace");
-          const isOwner = normalizeRole(ws.role) === "owner";
-          setAllowed(isOwner);
-          if (isOwner) {
-            listWorkspaceMembers()
-              .then((list) => setMembers(list))
-              .catch(() => setMembers([]));
-            listProjects()
-              .then((list) => setProjects(list))
-              .catch(() => setProjects([]));
-            getWorkspaceActivitySummary()
-              .then((s) => setSummary(s))
-              .catch(() => setSummary(null));
-          }
-        })
-        .finally(() => setCheckingAccess(false));
-    });
-  }, [router]);
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    // workspace/projects are already resolved by AppDataProvider by the time this page mounts — only
+    // the owner-only member list and activity summary still need their own fetch here.
+    const isOwner = normalizeRole(workspace?.role) === "owner";
+    setAllowed(isOwner);
+    if (isOwner) {
+      listWorkspaceMembers()
+        .then((list) => setMembers(list))
+        .catch(() => setMembers([]));
+      getWorkspaceActivitySummary()
+        .then((s) => setSummary(s))
+        .catch(() => setSummary(null));
+    }
+    setCheckingAccess(false);
+  }, [router, currentUser, workspace]);
 
   useEffect(() => {
     if (!allowed) return;
@@ -140,7 +129,7 @@ export default function WorkspaceActivityPage() {
   const breadcrumb = (
     <Breadcrumbs
       items={[
-        { label: workspaceName || "Workspace", href: "/dashboard" },
+        { label: workspace?.name || "Workspace", href: "/dashboard" },
         { label: "Activity" },
       ]}
     />

@@ -1,6 +1,38 @@
 export type FieldType = "text" | "long_text" | "boolean" | "single_select" | "multi_select" | "number" | "date";
 export type FieldStatus = "active" | "inactive" | "archived";
 
+// Every fixed test case column, across the CSV/XLSX export, the import template, and the bulk
+// import commit — normalized the same way ImportTestCasesModal.tsx's autoMap/autoMapCustomFields
+// normalize an uploaded header (lowercase, strip non-alphanumeric). A custom field named e.g.
+// "Title" or "externalId" would otherwise land on the exact same normalized header as a base
+// column once it starts appearing as a real column in the same file. Shared by CustomFieldsService
+// (rejects the name at creation) and LegacyController (defensively renames a pre-existing offender
+// in a generated file) so the two can't drift.
+export const RESERVED_TESTCASE_HEADERS = new Set(
+  [
+    "externalId",
+    "title",
+    "description",
+    "preconditions",
+    "postconditions",
+    "steps",
+    "testData",
+    "priority",
+    "severity",
+    "type",
+    "status",
+    "suite",
+    "component",
+    "estimatedDuration",
+    "automationStatus",
+    "attachments"
+  ].map((h) => h.toLowerCase().replace(/[^a-z0-9]+/g, ""))
+);
+
+export function normalizeTestcaseHeader(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 export interface FieldOption {
   id: string;
   label: string;

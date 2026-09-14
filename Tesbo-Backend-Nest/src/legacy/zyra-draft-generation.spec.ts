@@ -10,12 +10,24 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 function makeLegacy(): LegacyService {
+  const db = { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   return new LegacyService(
-    { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService,
+    db,
     {} as unknown as EmailService,
     {} as unknown as PasswordService,
     {} as unknown as AppConfigService,
@@ -25,6 +37,12 @@ function makeLegacy(): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
 }
@@ -48,7 +66,35 @@ type Internals = {
   normalizeAiDrafts: (raw: unknown, requestedCount: number) => DraftOut[];
   generateZyraWithOpenAi: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
   generateZyraWithAnthropic: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
+  zyraDynamicTaskPrompt: (input: GenerationInput & { knowledgeConfidence?: "none" | "weak" | "strong" }) => string;
+  generateZyraChatTestcasesWithAi: (params: {
+    projectId: string;
+    userId: string | null;
+    provider: string;
+    model: string;
+    key: Body;
+    message: string;
+    knowledge: Array<{ title: string; content: string }>;
+    existingTestcases: GenerationInput["existingTestcases"];
+    jiraIssueKeys: string[];
+    requestedCount: number;
+    suites: Array<{ id: string; name: string }>;
+    jira?: Array<{ key: string; summary: string; description: string }>;
+    bugs?: unknown[];
+    knowledgeConfidence?: "none" | "weak" | "strong";
+  }) => Promise<{ reply: string }>;
 };
+
+type Body = Record<string, unknown>;
+
+type StaticInternals = {
+  zyraUngroundedNote: (count: number) => string;
+  zyraWeakGroundingNote: (count: number) => string;
+};
+
+function staticInternals(): StaticInternals {
+  return LegacyService as unknown as StaticInternals;
+}
 
 const emptyInput = (): GenerationInput => ({
   story: "As a user I want to sign in",
@@ -201,5 +247,127 @@ describe("Zyra provider call wrappers — usage survives a parse failure", () =>
 
     const result = await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: emptyInput() });
     expect(result).toMatchObject({ usage: { input: 400, output: 120, total: 520 } });
+  });
+});
+
+/*
+ * Phase 4 (RAG relevancy) coverage: "8 items" and "8 items, top score 0.31" used to be
+ * indistinguishable both to the model (zyraDynamicTaskPrompt carried no confidence signal) and to
+ * the user (the reply used identical "grounded" framing regardless of match quality). These test
+ * the two places that changed: the extra prompt instruction told to the model, and the distinct
+ * reply text (zyraWeakGroundingNote vs. zyraUngroundedNote) a viewer sees afterward.
+ */
+describe("Zyra generation prompt — knowledge confidence", () => {
+  let svc: LegacyService;
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  it("adds a hedging instruction when knowledge is only weakly related", () => {
+    const prompt = internals(svc).zyraDynamicTaskPrompt({ ...emptyInput(), knowledge: [{ title: "Loosely related doc", content: "..." }], knowledgeConfidence: "weak" });
+    expect(prompt).toMatch(/loose match|make their assumptions explicit/i);
+  });
+
+  it("tells the model to treat knowledge as ungrounded when present but below the relevance floor", () => {
+    const prompt = internals(svc).zyraDynamicTaskPrompt({ ...emptyInput(), knowledge: [{ title: "Barely related doc", content: "..." }], knowledgeConfidence: "none" });
+    expect(prompt).toMatch(/did not clear the relevance bar|general practice/i);
+  });
+
+  it("does not add either hedge when the match is confident — no unwanted noise on the regression case", () => {
+    const prompt = internals(svc).zyraDynamicTaskPrompt({ ...emptyInput(), knowledge: [{ title: "Strongly related doc", content: "..." }], knowledgeConfidence: "strong" });
+    expect(prompt).not.toMatch(/loose match|did not clear the relevance bar/i);
+  });
+
+  it("does not add either hedge when no confidence signal was ever resolved (an undefined caller, not a known-weak one)", () => {
+    const prompt = internals(svc).zyraDynamicTaskPrompt({ ...emptyInput(), knowledge: [{ title: "Some doc", content: "..." }] });
+    expect(prompt).not.toMatch(/loose match|did not clear the relevance bar/i);
+  });
+
+  it("does not add the 'ungrounded' hedge when there is simply no knowledge at all — that's zyraUngroundedNote's job, a separate reply path entirely", () => {
+    const prompt = internals(svc).zyraDynamicTaskPrompt({ ...emptyInput(), knowledge: [], knowledgeConfidence: "none" });
+    expect(prompt).not.toMatch(/did not clear the relevance bar/i);
+  });
+
+  it("zyraWeakGroundingNote is honest about a loose match, and distinct from zyraUngroundedNote's 'nothing found' wording", () => {
+    const weak = staticInternals().zyraWeakGroundingNote(3);
+    const none = staticInternals().zyraUngroundedNote(3);
+    expect(weak).toMatch(/loosely matches|not a strong enough match/i);
+    expect(weak).not.toContain("I don't have anything about this");
+    expect(none).toContain("I don't have anything about this");
+    expect(weak).not.toBe(none);
+  });
+
+  /*
+   * Regression test for a real gap found by review, before this shipped: the reply-shaping logic in
+   * generateZyraChatTestcasesWithAi originally only branched on knowledgeConfidence === "weak" — a
+   * turn with knowledgeConfidence "none" but non-empty `knowledge` (FTS-only matches with no
+   * embeddings key, or every semantic candidate below RAG_MIN_SIMILARITY — both real,
+   * RagRetrievalService-confirmed states, not hypothetical) fell through to the fully-confident
+   * groundedReply text, even though zyraDynamicTaskPrompt correctly told the MODEL to hedge for the
+   * exact same case. The model wrote cautiously; the reply the user read still claimed confident
+   * coverage. Drives the real function end to end (mocked fetch only) rather than re-deriving the
+   * condition in isolation, so a future edit to the actual branch is what this test exercises.
+   */
+  it("uses the weak-grounding reply, not the confident one, when knowledge is present but confidence is 'none'", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "Sign in works", stepsJson: "[]" }] }) } }],
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+      })
+    }) as unknown as typeof fetch;
+
+    const decision = await internals(svc).generateZyraChatTestcasesWithAi({
+      projectId: "p1",
+      userId: "u1",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      key: { api_key: "sk-test", provider: "openai" },
+      message: "generate login test cases",
+      knowledge: [{ title: "A loosely related doc found only by keyword", content: "..." }],
+      existingTestcases: [],
+      jiraIssueKeys: [],
+      requestedCount: 1,
+      suites: [],
+      jira: [],
+      bugs: [],
+      knowledgeConfidence: "none"
+    });
+
+    expect(decision.reply).toMatch(/loosely matches|not a strong enough match/i);
+    expect(decision.reply).not.toMatch(/I drafted 1 test case\(s\) after reading/);
+  });
+
+  it("regression: still uses the confident reply when knowledge is present and confidence is 'strong'", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "Sign in works", stepsJson: "[]" }] }) } }],
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+      })
+    }) as unknown as typeof fetch;
+
+    const decision = await internals(svc).generateZyraChatTestcasesWithAi({
+      projectId: "p1",
+      userId: "u1",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      key: { api_key: "sk-test", provider: "openai" },
+      message: "generate login test cases",
+      knowledge: [{ title: "A strongly related doc", content: "..." }],
+      existingTestcases: [],
+      jiraIssueKeys: [],
+      requestedCount: 1,
+      suites: [],
+      jira: [],
+      bugs: [],
+      knowledgeConfidence: "strong"
+    });
+
+    expect(decision.reply).toMatch(/I drafted 1 test case\(s\) after reading/);
+    expect(decision.reply).not.toMatch(/loosely matches|not a strong enough match/i);
   });
 });

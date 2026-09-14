@@ -5,9 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconEye, IconPencil, IconSparkles } from "@tabler/icons-react";
 import {
-  authMe,
   createZyraTask,
-  getProject,
   getZyraAgent,
   listKnowledgeDocuments,
   type KnowledgeDocument,
@@ -18,6 +16,14 @@ import { Button, Field, FieldLabel, Modal, PageLoader, Select, StatusChip, Texta
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
 import { renderMarkdown } from "@/lib/markdown";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface AgentsTasksPageData {
+  state: ZyraAgentState;
+  knowledgeItems: KnowledgeDocument[];
+}
 
 const columns = [
   { key: "todo", label: "To Do", dot: "var(--muted-soft)" },
@@ -91,8 +97,13 @@ export default function ZyraTasksPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
-  const [state, setState] = useState<ZyraAgentState | null>(null);
-  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>([]);
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
+  const cacheKey = `agents-tasks:${projectId}`;
+  const cached = getPageCache<AgentsTasksPageData>(cacheKey);
+  const [state, setState] = useState<ZyraAgentState | null>(cached?.state ?? null);
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeDocument[]>(cached?.knowledgeItems ?? []);
   const [story, setStory] = useState("");
   const [context, setContext] = useState("");
   // Context is prone to holding a large Jira/Linear-synced Markdown dump (see
@@ -101,14 +112,16 @@ export default function ZyraTasksPage() {
   const [contextEditing, setContextEditing] = useState(false);
   const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [selectedKnowledgeItemIds, setSelectedKnowledgeItemIds] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Only the true first visit to this project's task board has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [working, setWorking] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [activeView, setActiveView] = useState<TaskView>("tasks");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [quickViewTask, setQuickViewTask] = useState<ZyraTask | null>(null);
-  const [projectName, setProjectName] = useState("");
   // Guards the poll loop below against piling up requests if one tick is still in flight
   // (a slow response, or the tab waking from sleep) when the next interval fires.
   const pollInFlightRef = useRef(false);
@@ -123,8 +136,10 @@ export default function ZyraTasksPage() {
       const agentState = await getZyraAgent(projectId);
       setState(agentState);
       const kb = await listKnowledgeDocuments(projectId).catch(() => ({ list: [], total: 0 }));
-      setKnowledgeItems(kb.list || []);
+      const items = kb.list || [];
+      setKnowledgeItems(items);
       setError(null);
+      setPageCache(`agents-tasks:${projectId}`, { state: agentState, knowledgeItems: items });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load agent tasks.");
     } finally {
@@ -133,12 +148,18 @@ export default function ZyraTasksPage() {
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) router.replace("/login");
-      else void loadData();
-    });
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
-  }, [loadData, router, projectId]);
+    const key = `agents-tasks:${projectId}`;
+    const existing = getPageCache<AgentsTasksPageData>(key);
+    if (existing) {
+      setState(existing.state);
+      setKnowledgeItems(existing.knowledgeItems);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
+    if (!currentUser) router.replace("/login");
+    else void loadData();
+  }, [loadData, router, projectId, currentUser]);
 
   // Refreshes just the task list (cheaper than loadData, which also re-pulls knowledge-base
   // data). Zyra picks up and finishes tasks asynchronously server-side, so without this the board

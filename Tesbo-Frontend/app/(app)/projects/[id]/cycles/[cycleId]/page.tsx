@@ -6,6 +6,9 @@ import Link from "next/link";
 import { createPortal } from "react-dom";
 import {
   IconArrowRight,
+  IconArrowsSort,
+  IconSortAscending,
+  IconSortDescending,
   IconBug,
   IconCalendarEvent,
   IconChevronLeft,
@@ -27,49 +30,39 @@ import {
   IconShare,
   IconTag,
   IconTrash,
+  IconUserPlus,
   IconX,
 } from "@tabler/icons-react";
 import {
-  authMe,
   getTestRun,
   updateTestRun,
   listCycleExecutions,
   updateExecution,
+  bulkAssignExecutions,
   addTestCasesToRun,
   removeTestCaseFromRun,
   removeTestCasesFromRun,
   listTestCases,
   listSuites,
-  listProjectMembers,
   listPlans,
-  getProject,
   toggleTestRunShare,
-  createBug,
-  addBugLink,
   listBugs,
-  getJiraStatus,
-  getLinearStatus,
-  uploadBugAttachments,
   type TestRunDetail,
   type ExecutionItem,
   type TestCaseListItem,
   type SuiteNode,
   type BugItem,
-  type BugSeverity,
-  type BugPriority,
-  type IssueSearchResult,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer, PriorityBadge, type Priority } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
-import IssuePickerModal from "@/components/IssuePickerModal";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta, AutomationRunProvenance } from "@/components/AutomationResultMeta";
-import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
-import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
-import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { useLogBugDialog } from "@/components/LogBugDialog";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -77,28 +70,57 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 const EXEC_STATUSES = ["Untested", "Passed", "Failed", "Skipped", "Blocked", "Retest"] as const;
 const RUN_TABS = ["All", "Passed", "Failed", "Blocked", "Skipped", "Pending"] as const;
 const CANONICAL_PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
-/*
- * Basecamp 10226268634 ("The Log Bug UI should be consistent across both Test Run → Log Bug and Bug
- * Page → Log Bug"). This modal collected only a title, a description and evidence, so every bug
- * filed from a run landed on the severity column's 'Medium' default with no way to say otherwise —
- * while the same action from the Bugs page asked for severity (and now priority). Same fields, same
- * order, same wording as projects/[id]/bugs/page.tsx.
- */
-const BUG_SEVERITIES: BugSeverity[] = ["Critical", "High", "Medium", "Low"];
-const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
 type RunTab = (typeof RUN_TABS)[number];
 const PAGE_SIZE = 10;
+
+/*
+ * ID column sort: compares by the numeric portion of the external id (e.g. "PRO-TC-9" before
+ * "PRO-TC-10"), not plain string order, which would put "PRO-TC-10" before "PRO-TC-9". Falls back
+ * to a locale string compare when either id has no digits, so the sort stays total and stable
+ * instead of leaving equal-ranked rows in an arbitrary order.
+ */
+function compareExternalId(a: string, b: string): number {
+  const numOf = (id: string) => {
+    const match = id.match(/(\d+)(?!.*\d)/);
+    return match ? parseInt(match[1], 10) : NaN;
+  };
+  const na = numOf(a);
+  const nb = numOf(b);
+  if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+  return a.localeCompare(b);
+}
+
+/*
+ * Priority column sort: follows the app-wide P0 (Critical) -> P3 (Low) convention already used by
+ * the priority filter dropdown just below (CANONICAL_PRIORITIES) rather than the ticket's fallback
+ * P1->P4, since that convention already exists here. A legacy/imported priority string outside the
+ * canonical set sorts after it (alphabetically among themselves); a missing priority sorts last of
+ * all so it doesn't jump to the top under a descending sort.
+ */
+const PRIORITY_RANK: Record<string, number> = Object.fromEntries(CANONICAL_PRIORITIES.map((p, i) => [p, i]));
+function comparePriority(a: string, b: string): number {
+  const rankOf = (p: string) => (p ? (p in PRIORITY_RANK ? PRIORITY_RANK[p] : CANONICAL_PRIORITIES.length) : CANONICAL_PRIORITIES.length + 1);
+  const ra = rankOf(a);
+  const rb = rankOf(b);
+  if (ra !== rb) return ra - rb;
+  return a.localeCompare(b);
+}
+
+/* Test Case column sort: plain alphabetical by title, case-insensitive. */
+function compareTestCaseTitle(a: string, b: string): number {
+  return a.toLowerCase().localeCompare(b.toLowerCase());
+}
 import { avatarColor } from "@/lib/avatarColors";
 
 /* ───── Status tone helpers ───── */
 function statusToTone(status: string) {
-  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "info" | "neutral"> = {
+  const map: Record<string, "success" | "error" | "blocked" | "skipped" | "retest" | "notRun"> = {
     Passed: "success",
     Failed: "error",
     Skipped: "skipped",
     Blocked: "blocked",
-    Retest: "info",
-    Untested: "neutral",
+    Retest: "retest",
+    Untested: "notRun",
   };
   return map[status] ?? "neutral";
 }
@@ -142,70 +164,6 @@ const PANEL_STATUS_COLORS: Record<string, { active: string; idle: string }> = {
   Untested: { active: "bg-[var(--muted)] text-white border-[var(--muted)]", idle: "border-[var(--border)] text-[var(--muted)] hover:bg-[var(--surface-secondary)]" },
 };
 
-/* ───── Existing bug picker (for "link this failure to an already-existing Tesbo bug") ───── */
-function ExistingBugPickerModal({
-  projectId,
-  open,
-  onClose,
-  onSelect,
-}: {
-  projectId: string;
-  open: boolean;
-  onClose: () => void;
-  onSelect: (bug: BugItem) => void;
-}) {
-  const [bugs, setBugs] = useState<BugItem[]>([]);
-  const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setSearch("");
-    setLoading(true);
-    listBugs(projectId)
-      .then(setBugs)
-      .finally(() => setLoading(false));
-  }, [open, projectId]);
-
-  const filtered = useMemo(() => {
-    const term = search.trim().toLowerCase();
-    if (!term) return bugs;
-    return bugs.filter((bug) => bug.title.toLowerCase().includes(term));
-  }, [bugs, search]);
-
-  if (!open) return null;
-
-  return (
-    <Modal open={open} onClose={onClose} title="Link an existing bug" className="max-w-[520px]">
-      <div className="space-y-3">
-        <Input autoFocus value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search bugs by title…" />
-        <div className="max-h-[320px] overflow-y-auto rounded-[var(--radius-control)] border border-[var(--border)]">
-          {loading ? (
-            <p className="p-3 text-[13px] text-[var(--muted)]">Loading…</p>
-          ) : filtered.length === 0 ? (
-            <p className="p-3 text-[13px] text-[var(--muted)]">No bugs found.</p>
-          ) : (
-            filtered.map((bug) => (
-              <button
-                key={bug.id}
-                type="button"
-                onClick={() => onSelect(bug)}
-                className="flex w-full flex-col items-start gap-0.5 border-b border-[var(--border)] px-3 py-2 text-left last:border-b-0 hover:bg-[var(--surface-secondary)]"
-              >
-                <span className="text-[13px] font-medium text-[var(--foreground)]">{bug.title}</span>
-                <span className="text-[12px] text-[var(--muted)]">{bug.status}</span>
-              </button>
-            ))
-          )}
-        </div>
-        <div className="flex justify-end">
-          <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
 /* ───── Avatar helpers ───── */
 function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -237,6 +195,40 @@ function MemberAvatar({ name, seed, size = 22 }: { name: string; seed?: string |
     >
       {getInitials(name)}
     </span>
+  );
+}
+
+/* A column header for the run table's ID/Priority/Test Case sort. Un-highlighted arrows when this
+   column isn't the active sort; a direction-specific icon (and brand color) when it is. */
+function SortableColumnHeader({
+  label,
+  column,
+  runSort,
+  onToggle,
+}: {
+  label: string;
+  column: "id" | "priority" | "testCase";
+  runSort: { column: "id" | "priority" | "testCase"; direction: "asc" | "desc" } | null;
+  onToggle: (column: "id" | "priority" | "testCase") => void;
+}) {
+  const active = runSort?.column === column ? runSort.direction : null;
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(column)}
+      className={`inline-flex items-center gap-1 ${active ? "text-[var(--accent-light)]" : "hover:text-[var(--foreground)]"}`}
+      title={`Sort by ${label}`}
+      aria-label={`Sort by ${label}${active ? `, currently ${active === "asc" ? "ascending" : "descending"}` : ""}`}
+    >
+      {label}
+      {active === "asc" ? (
+        <IconSortAscending size={13} stroke={1.75} />
+      ) : active === "desc" ? (
+        <IconSortDescending size={13} stroke={1.75} />
+      ) : (
+        <IconArrowsSort size={13} stroke={1.75} className="text-[var(--muted-soft)]" />
+      )}
+    </button>
   );
 }
 
@@ -272,7 +264,7 @@ function execSelectStyle(status: string): React.CSSProperties {
     Failed: { border: "var(--error-border)", bg: "var(--error-soft)", color: "var(--error-foreground)" },
     Skipped: { border: "var(--status-skipped-dot)", bg: "var(--status-skipped-fill)", color: "var(--status-skipped-text)" },
     Blocked: { border: "var(--status-blocked-dot)", bg: "var(--status-blocked-fill)", color: "var(--status-blocked-text)" },
-    Retest: { border: "var(--info-border)", bg: "var(--info-soft)", color: "var(--info-foreground)" },
+    Retest: { border: "var(--status-retest-dot)", bg: "var(--status-retest-fill)", color: "var(--status-retest-text)" },
   };
   const s = map[status] || EXEC_STATUS_NEUTRAL;
   return { borderColor: s.border, background: s.bg, color: s.color };
@@ -394,6 +386,9 @@ export default function TestRunDetailPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
   const cycleId = params.cycleId as string;
 
   const { startEl: topBarStartEl, endEl: topBarEndEl, setFilled: setTopBarFilled } = useTopBarSlots();
@@ -409,11 +404,16 @@ export default function TestRunDetailPage() {
   const [bulkRemoveOpen, setBulkRemoveOpen] = useState(false);
   const [bulkRemoving, setBulkRemoving] = useState(false);
   const [bulkRemoveError, setBulkRemoveError] = useState<string | null>(null);
+  const [bulkAssignOpen, setBulkAssignOpen] = useState(false);
+  const [bulkAssignAssigneeId, setBulkAssignAssigneeId] = useState("");
+  const [bulkAssigning, setBulkAssigning] = useState(false);
+  const [bulkAssignError, setBulkAssignError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [memberNames, setMemberNames] = useState<Record<string, string>>({});
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
+  const memberNames = useMemo(
+    () => Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
+    [members]
+  );
   const [planNames, setPlanNames] = useState<Record<string, string>>({});
-  const [projectName, setProjectName] = useState("");
 
   /* test cases table: tab filter, search, pagination */
   const [activeTab, setActiveTab] = useState<RunTab>("All");
@@ -425,6 +425,10 @@ export default function TestRunDetailPage() {
   const [runFilterPriority, setRunFilterPriority] = useState("");
   const [runFilterType, setRunFilterType] = useState("");
   const [runFilterAssignee, setRunFilterAssignee] = useState("");
+  /* ID/Priority/Test Case column sort — null means "no sort", i.e. the existing (creation) order.
+     Only one column can be active at a time: picking another column replaces this rather than
+     combining. */
+  const [runSort, setRunSort] = useState<{ column: "id" | "priority" | "testCase"; direction: "asc" | "desc" } | null>(null);
 
   /* test case picker state */
   const [showPicker, setShowPicker] = useState(false);
@@ -451,10 +455,11 @@ export default function TestRunDetailPage() {
   const [panelExecution, setPanelExecution] = useState<ExecutionItem | null>(null);
   const [panelStatus, setPanelStatus] = useState("Untested");
   const [panelActualResult, setPanelActualResult] = useState("");
-  const [panelDefectKey, setPanelDefectKey] = useState("");
-  const [panelDefectUrl, setPanelDefectUrl] = useState("");
   const [panelAssigneeId, setPanelAssigneeId] = useState("");
   const [panelSaving, setPanelSaving] = useState(false);
+  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
+     (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
+  const [panelBug, setPanelBug] = useState<BugItem | null>(null);
 
   /* sharing state */
   const [showShare, setShowShare] = useState(false);
@@ -464,72 +469,52 @@ export default function TestRunDetailPage() {
   const [shareError, setShareError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  /* issue tracker connection status (gates the ticket-related dialog choices) */
-  const [jiraConnected, setJiraConnected] = useState(false);
-  const [linearConnected, setLinearConnected] = useState(false);
-
-  /* bug report dialog state (triggered on "Failed") */
-  const [showBugDialog, setShowBugDialog] = useState(false);
-  const [bugExecution, setBugExecution] = useState<ExecutionItem | null>(null);
-  const [bugTitle, setBugTitle] = useState("");
-  const [bugSeverity, setBugSeverity] = useState<BugSeverity>("Medium");
-  const [bugPriority, setBugPriority] = useState<BugPriority | "">("");
-  const [bugDesc, setBugDesc] = useState("");
-  const [bugAlreadyLogged, setBugAlreadyLogged] = useState(false);
-  const [bugExistingChoice, setBugExistingChoice] = useState<"JIRA" | "LINEAR" | "TESBO">("TESBO");
-  const [bugDestination, setBugDestination] = useState<TrackingDestination>("TESBO");
-  const [bugSelfSystem, setBugSelfSystem] = useState<SelfLoggedSystem>("OTHER");
-  const [bugUrl, setBugUrl] = useState("");
-  const [bugIssue, setBugIssue] = useState<IssueSearchResult | null>(null);
-  const [showBugIssuePicker, setShowBugIssuePicker] = useState(false);
-  const [selectedExistingBug, setSelectedExistingBug] = useState<BugItem | null>(null);
-  const [showExistingBugPicker, setShowExistingBugPicker] = useState(false);
-  const [bugEvidenceMode, setBugEvidenceMode] = useState<EvidenceMode>("FILES");
-  const [bugStagedFiles, setBugStagedFiles] = useState<File[]>([]);
-  const [bugBetterbugsUrl, setBugBetterbugsUrl] = useState("");
-  const [bugSaving, setBugSaving] = useState(false);
   const load = useCallback(() => {
-    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId), getProject(projectId)])
-      .then(([r, e, project]) => {
+    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId)])
+      .then(([r, e]) => {
         setRun(r);
         setExecutions(e);
         setShareEnabled(r.shareEnabled ?? false);
         setShareToken(r.shareToken ?? null);
-        setProjectName(String(project.name || ""));
       })
       .catch(() => router.replace(`/projects/${projectId}/cycles`))
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
 
-  useEffect(() => {
-    getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
-    getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
-  }, [projectId]);
-
-
-  useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
+  const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
+    projectId,
+    cycleId,
+    onLogged: () => {
       load();
-      listProjectMembers(projectId)
-        .then((members) => {
-          setMembers(members);
-          setMemberNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
-        })
-        .catch(() => {});
-      listPlans(projectId)
-        .then((plans) => setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name]))))
-        .catch(() => {});
-    });
-  }, [router, load, projectId]);
+      if (panelExecution) loadPanelBug(panelExecution);
+    },
+  });
 
-  /* reset to first page whenever the filter/search changes */
+
+  useEffect(() => {
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+    listPlans(projectId)
+      .then((plans) => setPlanNames(Object.fromEntries(plans.map((p) => [p.id, p.name]))))
+      .catch(() => {});
+  }, [router, load, projectId, currentUser]);
+
+  /* reset to first page whenever the filter/search/sort changes */
   useEffect(() => {
     setPage(1);
-  }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
+  }, [activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
+
+  /* toggle the ID/Priority/Test Case column sort: same column clicked again flips direction, the
+     other column replaces it starting at ascending — "only one active sort at a time". */
+  function toggleRunSort(column: "id" | "priority" | "testCase") {
+    setRunSort((prev) => {
+      if (prev?.column === column) return { column, direction: prev.direction === "asc" ? "desc" : "asc" };
+      return { column, direction: "asc" };
+    });
+  }
 
 
   /* ───── Load test cases for picker ───── */
@@ -559,6 +544,39 @@ export default function TestRunDetailPage() {
     [executions]
   );
 
+  /*
+   * A suite filter has to match the suite AND everything nested under it — same as the repository
+   * screen's `includeDescendants` (Tesbo-Backend-Nest/src/legacy/legacy.service.ts's listTestCases).
+   * Matching only `tc.suiteId === filterSuiteId` silently hid every case filed under a sub-suite,
+   * which is why this picker offered fewer approved cases than the repository reported for the same
+   * suite (e.g. 170 approved in the repository vs. 165 selectable here — the missing 5 lived in a
+   * child suite). `suites` is already loaded flat with `parentId`, so the subtree is walked
+   * client-side rather than adding a second network round trip.
+   */
+  const suiteSubtreeIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!filterSuiteId) return ids;
+    const childrenByParent = new Map<string, string[]>();
+    for (const s of suites) {
+      const key = s.parentId ?? "";
+      const siblings = childrenByParent.get(key);
+      if (siblings) siblings.push(s.id);
+      else childrenByParent.set(key, [s.id]);
+    }
+    const stack = [filterSuiteId];
+    ids.add(filterSuiteId);
+    while (stack.length) {
+      const current = stack.pop()!;
+      for (const childId of childrenByParent.get(current) ?? []) {
+        if (!ids.has(childId)) {
+          ids.add(childId);
+          stack.push(childId);
+        }
+      }
+    }
+    return ids;
+  }, [filterSuiteId, suites]);
+
   /* filtered available cases (not already added) */
   const filteredCases = useMemo(() => {
     return allCases.filter((tc) => {
@@ -566,11 +584,11 @@ export default function TestRunDetailPage() {
       if (filterSearch && !tc.title.toLowerCase().includes(filterSearch.toLowerCase()) && !tc.externalId.toLowerCase().includes(filterSearch.toLowerCase())) return false;
       if (filterPriority && tc.priority !== filterPriority) return false;
       if (filterType && tc.type !== filterType) return false;
-      if (filterSuiteId && tc.suiteId !== filterSuiteId) return false;
+      if (filterSuiteId && !suiteSubtreeIds.has(tc.suiteId ?? "")) return false;
       if (filterStatus && tc.status !== filterStatus) return false;
       return true;
     });
-  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, filterStatus]);
+  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds, filterStatus]);
 
   /* selectable = only Approved cases */
   const selectableCases = useMemo(
@@ -650,31 +668,6 @@ export default function TestRunDetailPage() {
     }
   }
 
-  /* ───── Prefill + open the bug dialog for a given execution ───── */
-  function prepareBugDialog(exec: ExecutionItem, titlePrefix: string) {
-    setBugExecution(exec);
-    setBugTitle(`${titlePrefix}: ${exec.title || exec.snapshotTitle || "Untitled test case"}`);
-    setBugDesc("");
-    setBugSeverity("Medium");
-    setBugPriority("");
-    setBugAlreadyLogged(false);
-    setBugExistingChoice(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "TESBO");
-    setBugDestination("TESBO");
-    setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
-    setBugUrl("");
-    setBugIssue(null);
-    setSelectedExistingBug(null);
-    setBugEvidenceMode("FILES");
-    setBugStagedFiles([]);
-    setBugBetterbugsUrl("");
-    setShowBugDialog(true);
-  }
-
-  /* ───── Quick "Log bug" row action — available regardless of status ───── */
-  function openBugDialogFor(exec: ExecutionItem) {
-    prepareBugDialog(exec, "Bug");
-  }
-
   /* ───── Inline status change ───── */
   async function handleStatusChange(executionId: string, newStatus: string) {
     setStatusSaving(executionId);
@@ -686,7 +679,7 @@ export default function TestRunDetailPage() {
 
       if (newStatus === "Failed") {
         const exec = executions.find((e) => e.id === executionId);
-        if (exec) prepareBugDialog({ ...exec, status: newStatus }, "Failed");
+        if (exec) openBugDialogFor({ ...exec, status: newStatus }, "Failed");
       }
     } finally {
       setStatusSaving(null);
@@ -694,17 +687,24 @@ export default function TestRunDetailPage() {
   }
 
   /* ───── Right-side test case detail panel ───── */
+  function loadPanelBug(exec: ExecutionItem) {
+    listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
+      .then((bugs) => setPanelBug(bugs[0] ?? null))
+      .catch(() => setPanelBug(null));
+  }
+
   function openExecutionPanel(exec: ExecutionItem) {
     setPanelExecution(exec);
     setPanelStatus(exec.status || "Untested");
     setPanelActualResult(exec.actualResult || "");
-    setPanelDefectKey(exec.defectKey || "");
-    setPanelDefectUrl(exec.defectUrl || "");
     setPanelAssigneeId(exec.assigneeId || "");
+    setPanelBug(null);
+    loadPanelBug(exec);
   }
 
   function closeExecutionPanel() {
     setPanelExecution(null);
+    setPanelBug(null);
   }
 
   async function handlePanelSave() {
@@ -714,89 +714,23 @@ export default function TestRunDetailPage() {
       await updateExecution(cycleId, panelExecution.id, {
         status: panelStatus,
         actualResult: panelActualResult,
-        defectKey: panelDefectKey || undefined,
-        defectUrl: panelDefectUrl || undefined,
         assigneeId: panelAssigneeId || null,
       });
       setExecutions((prev) =>
         prev.map((e) =>
           e.id === panelExecution.id
-            ? { ...e, status: panelStatus, actualResult: panelActualResult, defectKey: panelDefectKey, defectUrl: panelDefectUrl, assigneeId: panelAssigneeId || null }
+            ? { ...e, status: panelStatus, actualResult: panelActualResult, assigneeId: panelAssigneeId || null }
             : e
         )
       );
       const wasFailed = panelExecution.status === "Failed";
       closeExecutionPanel();
       if (panelStatus === "Failed" && !wasFailed) {
-        prepareBugDialog({ ...panelExecution, status: panelStatus }, "Failed");
+        openBugDialogFor({ ...panelExecution, status: panelStatus }, "Failed");
       }
     } finally {
       setPanelSaving(false);
     }
-  }
-
-  /* ───── Reset & close the bug dialog ───── */
-  function resetBugDialog() {
-    setShowBugDialog(false);
-    setBugExecution(null);
-    setBugTitle("");
-    setBugSeverity("Medium");
-    setBugPriority("");
-    setBugDesc("");
-    setBugAlreadyLogged(false);
-    setBugExistingChoice(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "TESBO");
-    setBugDestination("TESBO");
-    setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
-    setBugUrl("");
-    setBugIssue(null);
-    setSelectedExistingBug(null);
-    setBugEvidenceMode("FILES");
-    setBugStagedFiles([]);
-    setBugBetterbugsUrl("");
-  }
-
-  /* ───── Submit bug from dialog (new bug, optionally noting where it's tracked elsewhere) ───── */
-  async function handleBugSubmit() {
-    if (!bugExecution || !bugTitle.trim() || !bugSeverity) return;
-    const selfLogged = (jiraConnected || linearConnected) && bugDestination === "SELF";
-    setBugSaving(true);
-    try {
-      const bug = await createBug(projectId, {
-        title: bugTitle.trim(),
-        description: bugDesc.trim(),
-        severity: bugSeverity,
-        priority: bugPriority || null,
-        externalUrl: selfLogged ? bugUrl.trim() : undefined,
-        integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
-        integrationIssueKey: null,
-        betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
-        links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
-      });
-      if (bugEvidenceMode === "FILES" && bugStagedFiles.length) {
-        await uploadBugAttachments(projectId, bug.id, bugStagedFiles);
-      }
-      resetBugDialog();
-      load();
-    } finally {
-      setBugSaving(false);
-    }
-  }
-
-  /* ───── Link this failing execution to an already-existing Tesbo bug (backtrace) ───── */
-  async function handleLinkExistingBug() {
-    if (!bugExecution || !selectedExistingBug) return;
-    setBugSaving(true);
-    try {
-      await addBugLink(selectedExistingBug.id, { testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id });
-      resetBugDialog();
-      load();
-    } finally {
-      setBugSaving(false);
-    }
-  }
-
-  function handleBugSkip() {
-    resetBugDialog();
   }
 
   /* ───── Remove test case ───── */
@@ -833,6 +767,30 @@ export default function TestRunDetailPage() {
       setBulkRemoveError(err instanceof Error ? err.message : "Failed to remove the selected test cases.");
     } finally {
       setBulkRemoving(false);
+    }
+  }
+
+  /* ───── Assign selected test cases ─────
+     selectedRunCaseIds is keyed by testcaseId (same set the remove action uses); the bulk-assign
+     endpoint takes execution ids, so they're resolved through the already-loaded executions list. */
+  async function handleBulkAssign() {
+    const executionIds = executions
+      .filter((e) => selectedRunCaseIds.has(e.testcaseId))
+      .map((e) => e.id);
+    if (!executionIds.length || bulkAssigning) return;
+    setBulkAssigning(true);
+    try {
+      const assigneeId = bulkAssignAssigneeId || null;
+      await bulkAssignExecutions(cycleId, { executionIds, assigneeId });
+      const updated = new Set(executionIds);
+      setExecutions((prev) => prev.map((e) => (updated.has(e.id) ? { ...e, assigneeId } : e)));
+      setSelectedRunCaseIds(new Set());
+      setBulkAssignError(null);
+      setBulkAssignOpen(false);
+    } catch (err) {
+      setBulkAssignError(err instanceof Error ? err.message : "Failed to assign the selected test cases.");
+    } finally {
+      setBulkAssigning(false);
     }
   }
 
@@ -995,8 +953,20 @@ export default function TestRunDetailPage() {
           (e.externalId || "").toLowerCase().includes(term)
       );
     }
+    // Applied after every filter/search above (so it always covers the full filtered dataset, not
+    // just the current page) and before pagedExecutions slices it — runSort === null keeps the
+    // existing order untouched, which is also why `list` is copied rather than sorted in place:
+    // `list` can still be the original `executions` reference here when no filter matched anything.
+    if (runSort) {
+      const direction = runSort.direction === "asc" ? 1 : -1;
+      list = [...list].sort((a, b) => {
+        if (runSort.column === "id") return direction * compareExternalId(a.externalId || "", b.externalId || "");
+        if (runSort.column === "priority") return direction * comparePriority(a.priority || "", b.priority || "");
+        return direction * compareTestCaseTitle(a.title || a.snapshotTitle || "", b.title || b.snapshotTitle || "");
+      });
+    }
     return list;
-  }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee]);
+  }, [executions, activeTab, tableSearch, runFilterPriority, runFilterType, runFilterAssignee, runSort]);
 
   const pageCount = Math.max(1, Math.ceil(filteredExecutions.length / PAGE_SIZE));
   const pagedExecutions = useMemo(
@@ -1275,6 +1245,19 @@ export default function TestRunDetailPage() {
               </button>
               <button
                 type="button"
+                data-testid="run-bulk-assign"
+                onClick={() => {
+                  setBulkAssignError(null);
+                  setBulkAssignAssigneeId("");
+                  setBulkAssignOpen(true);
+                }}
+                className="flex items-center gap-1 font-medium text-[var(--brand-primary)] hover:underline"
+              >
+                <IconUserPlus size={13} />
+                Assign to
+              </button>
+              <button
+                type="button"
                 onClick={() => setSelectedRunCaseIds(new Set())}
                 className="ml-auto flex items-center gap-1 text-[var(--muted)] hover:text-[var(--foreground)]"
               >
@@ -1314,9 +1297,15 @@ export default function TestRunDetailPage() {
                         />
                       </th>
                     )}
-                    <th className="px-5 py-2.5 font-semibold">ID</th>
-                    <th className="px-5 py-2.5 font-semibold">Test Case</th>
-                    <th className="px-5 py-2.5 font-semibold">Priority</th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="ID" column="id" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="Test Case" column="testCase" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
+                    <th className="px-5 py-2.5 font-semibold">
+                      <SortableColumnHeader label="Priority" column="priority" runSort={runSort} onToggle={toggleRunSort} />
+                    </th>
                     <th className="px-5 py-2.5 font-semibold">Type</th>
                     <th className="px-5 py-2.5 font-semibold">Assigned To</th>
                     <th className="px-5 py-2.5 text-right font-semibold">Status</th>
@@ -1477,6 +1466,40 @@ export default function TestRunDetailPage() {
           </Button>
           <Button variant="danger" onClick={handleRemoveSelectedCases} disabled={bulkRemoving}>
             {bulkRemoving ? "Removing…" : `Remove ${selectedRunCaseIds.size}`}
+          </Button>
+        </div>
+      </Modal>
+
+      <Modal
+        open={bulkAssignOpen}
+        onClose={() => setBulkAssignOpen(false)}
+        title="Assign test cases"
+        className="max-w-[460px]"
+      >
+        <p className="text-[13px] text-[var(--muted)]">
+          Assign <span className="font-semibold text-[var(--foreground)]">{selectedRunCaseIds.size}</span> test case
+          {selectedRunCaseIds.size === 1 ? "" : "s"} to:
+        </p>
+        <div className="mt-3">
+          <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Assigned to</label>
+          <Select value={bulkAssignAssigneeId} onChange={(e) => setBulkAssignAssigneeId(e.target.value)} aria-label="Assign selected test cases to">
+            <option value="">Unassigned</option>
+            {members.map((m) => (
+              <option key={m.userId} value={m.userId}>
+                {m.name || m.email}
+              </option>
+            ))}
+          </Select>
+        </div>
+        {bulkAssignError && (
+          <p className="mt-3 text-[12.5px] text-[var(--error-foreground)]">{bulkAssignError}</p>
+        )}
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setBulkAssignOpen(false)} disabled={bulkAssigning}>
+            Cancel
+          </Button>
+          <Button onClick={handleBulkAssign} disabled={bulkAssigning}>
+            {bulkAssigning ? "Assigning…" : `Assign ${selectedRunCaseIds.size}`}
           </Button>
         </div>
       </Modal>
@@ -1684,267 +1707,7 @@ export default function TestRunDetailPage() {
         )}
       </Modal>
 
-      {/* ───── Bug Report Modal (triggered on Failed) ───── */}
-      <Modal
-        open={showBugDialog}
-        onClose={handleBugSkip}
-        title="Report a Bug"
-      >
-        <div className="space-y-4">
-          {/* Themed rather than the literal red-50/red-200 these carried: in dark mode that pale
-              block stayed light while its text followed the theme, which is the same mismatch the
-              danger Button variant was fixed for. */}
-          <div className="flex items-start gap-2 rounded-lg border border-[var(--error-border)] bg-[var(--error-soft)] p-3">
-            <svg className="w-5 h-5 text-[var(--status-fail-text)] mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
-            </svg>
-            <div>
-              <p className="text-sm font-medium text-[var(--status-fail-text)]">Test case marked as Failed</p>
-              <p className="text-xs text-[var(--status-fail-text)] opacity-80 mt-0.5">
-                {bugExecution?.externalId && <span className="font-mono mr-1">{bugExecution.externalId}</span>}
-                {bugExecution?.title || bugExecution?.snapshotTitle || "Untitled test case"}
-              </p>
-            </div>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-              Is this defect already logged?
-            </label>
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant={!bugAlreadyLogged ? "primary" : "secondary"}
-                onClick={() => setBugAlreadyLogged(false)}
-              >
-                No, log a new one
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={bugAlreadyLogged ? "primary" : "secondary"}
-                onClick={() => setBugAlreadyLogged(true)}
-              >
-                Yes, link existing
-              </Button>
-            </div>
-          </div>
-
-          {bugAlreadyLogged && (
-            <div className="flex flex-wrap gap-2">
-              {jiraConnected && (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={bugExistingChoice === "JIRA" ? "primary" : "secondary"}
-                  onClick={() => { setBugExistingChoice("JIRA"); setBugIssue(null); }}
-                >
-                  Jira ticket
-                </Button>
-              )}
-              {linearConnected && (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={bugExistingChoice === "LINEAR" ? "primary" : "secondary"}
-                  onClick={() => { setBugExistingChoice("LINEAR"); setBugIssue(null); }}
-                >
-                  Linear ticket
-                </Button>
-              )}
-              <Button
-                type="button"
-                size="sm"
-                variant={bugExistingChoice === "TESBO" ? "primary" : "secondary"}
-                onClick={() => setBugExistingChoice("TESBO")}
-              >
-                Existing Tesbo bug
-              </Button>
-            </div>
-          )}
-
-          {bugAlreadyLogged && bugExistingChoice === "TESBO" ? (
-            <div>
-              <label className="block text-sm font-medium text-[var(--muted)] mb-1">Bug</label>
-              {selectedExistingBug ? (
-                <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
-                  <span className="font-medium text-[var(--foreground)]">{selectedExistingBug.title}</span>
-                  <button type="button" onClick={() => setSelectedExistingBug(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
-                    ✕
-                  </button>
-                </div>
-              ) : (
-                <Button type="button" variant="secondary" size="sm" onClick={() => setShowExistingBugPicker(true)}>
-                  Choose an existing bug…
-                </Button>
-              )}
-            </div>
-          ) : (
-            <>
-              <div>
-                <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                  Bug Title <span className="text-[var(--error-foreground)]">*</span>
-                </label>
-                <Input
-                  type="text"
-                  value={bugTitle}
-                  onChange={(e) => setBugTitle(e.target.value)}
-                  placeholder="Brief summary of the bug…"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                  Description
-                </label>
-                <Textarea
-                  value={bugDesc}
-                  onChange={(e) => setBugDesc(e.target.value)}
-                  rows={3}
-                  placeholder="Steps to reproduce, expected vs actual behavior…"
-                />
-              </div>
-              {/*
-                * Severity carries dev's required marker (48363ea/10226268634 — the run's modal used
-                * to collect no severity at all, so every bug filed from a run took the column
-                * default), paired with Priority from 10226247009. Evidence keeps its own full-width
-                * row below rather than sharing the grid with Severity: three controls do not fit two
-                * columns, and the file list needs the width.
-                */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                    Severity <span className="text-[var(--error-foreground)]">*</span>
-                  </label>
-                  <Select
-                    value={bugSeverity}
-                    onChange={(e) => setBugSeverity(e.target.value as BugSeverity)}
-                    aria-label="Severity"
-                  >
-                    {BUG_SEVERITIES.map((severity) => (
-                      <option key={severity} value={severity}>
-                        {severity}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">Priority</label>
-                  <Select
-                    value={bugPriority}
-                    onChange={(e) => setBugPriority(e.target.value as BugPriority | "")}
-                    aria-label="Bug priority"
-                  >
-                    <option value="">Not set</option>
-                    {BUG_PRIORITIES.map((priority) => (
-                      <option key={priority} value={priority}>
-                        {priority}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-              </div>
-              <BugEvidenceField
-                mode={bugEvidenceMode}
-                onModeChange={setBugEvidenceMode}
-                stagedFiles={bugStagedFiles}
-                onStagedFilesChange={setBugStagedFiles}
-                betterbugsUrl={bugBetterbugsUrl}
-                onBetterbugsUrlChange={setBugBetterbugsUrl}
-              />
-              {bugAlreadyLogged ? (
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">Ticket</label>
-                  {bugIssue ? (
-                    <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
-                      <span className="font-medium text-[var(--foreground)]">{bugIssue.key} — {bugIssue.summary}</span>
-                      <button type="button" onClick={() => setBugIssue(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
-                        ✕
-                      </button>
-                    </div>
-                  ) : (
-                    <Button type="button" variant="secondary" size="sm" onClick={() => setShowBugIssuePicker(true)}>
-                      Search {bugExistingChoice === "JIRA" ? "Jira" : "Linear"} tickets…
-                    </Button>
-                  )}
-                </div>
-              ) : (
-                (jiraConnected || linearConnected) && (
-                  <>
-                    <div>
-                      <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                        Where should this be tracked?
-                      </label>
-                      <TrackingDestinationField destination={bugDestination} onChange={setBugDestination} />
-                    </div>
-                    {bugDestination === "SELF" && (
-                      <SelfLoggedTrackerField
-                        jiraConnected={jiraConnected}
-                        linearConnected={linearConnected}
-                        system={bugSelfSystem}
-                        onSystemChange={setBugSelfSystem}
-                        url={bugUrl}
-                        onUrlChange={setBugUrl}
-                      />
-                    )}
-                  </>
-                )
-              )}
-            </>
-          )}
-
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="secondary" onClick={handleBugSkip}>
-              Skip
-            </Button>
-            {bugAlreadyLogged && bugExistingChoice === "TESBO" ? (
-              <Button
-                variant="destructive"
-                onClick={handleLinkExistingBug}
-                disabled={bugSaving || !selectedExistingBug}
-              >
-                {bugSaving ? "Linking…" : "Link Bug"}
-              </Button>
-            ) : (
-              <Button
-                variant="destructive"
-                onClick={handleBugSubmit}
-                disabled={bugSaving || !bugTitle.trim() || !bugSeverity}
-              >
-                {bugSaving ? (
-                  "Filing…"
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
-                    </svg>
-                    File Bug
-                  </>
-                )}
-              </Button>
-            )}
-          </div>
-        </div>
-      </Modal>
-
-      <IssuePickerModal
-        projectId={projectId}
-        open={showBugIssuePicker}
-        onClose={() => setShowBugIssuePicker(false)}
-        onSelect={(issue) => {
-          setBugIssue(issue);
-          setShowBugIssuePicker(false);
-        }}
-      />
-
-      <ExistingBugPickerModal
-        projectId={projectId}
-        open={showExistingBugPicker}
-        onClose={() => setShowExistingBugPicker(false)}
-        onSelect={(bug) => {
-          setSelectedExistingBug(bug);
-          setShowExistingBugPicker(false);
-        }}
-      />
+      {bugDialog}
 
       {/* ───── Share Modal ───── */}
       <Modal
@@ -2181,17 +1944,17 @@ export default function TestRunDetailPage() {
                 />
               </div>
 
-              {/* Defect key/url — Failed only (Basecamp 10221790207). Same rule as the full-page
-                  execute screen: a defect reference on a passing case ends up in the export and the
-                  traceability matrix, so the backend clears it when a non-Failed status is saved. */}
+              {/* Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
+                  rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
+                  not a free-text value typed here, so there's nothing to type into them. */}
               <div className="space-y-3" hidden={panelStatus !== "Failed"}>
                 <div>
-                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Defect Key</label>
-                  <Input type="text" value={panelDefectKey} onChange={(e) => setPanelDefectKey(e.target.value)} placeholder="e.g. PROJ-123" />
+                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Key</label>
+                  <Input type="text" aria-label="Bug Key" value={panelBug?.integrationIssueKey || panelBug?.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
                 </div>
                 <div>
-                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Defect URL</label>
-                  <Input type="url" value={panelDefectUrl} onChange={(e) => setPanelDefectUrl(e.target.value)} placeholder="https://…" />
+                  <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Title</label>
+                  <Input type="text" aria-label="Bug Title" value={panelBug?.title || ""} readOnly placeholder="Title of the linked bug" />
                 </div>
               </div>
 

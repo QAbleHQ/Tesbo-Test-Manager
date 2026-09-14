@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 import {
   IconHome,
@@ -25,12 +25,8 @@ import {
   IconFolders,
   IconUserCircle,
 } from "@tabler/icons-react";
-import { logout } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
-import ThemeToggle from "@/components/ThemeToggle";
 import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
-import { removeStoredValue } from "@/lib/storage";
-import { Button, Modal } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
 
 type NavItemConfig = {
@@ -178,7 +174,6 @@ function BackToProjects({ collapsed }: { collapsed: boolean }) {
 
 function SidebarContent() {
   const pathname = usePathname();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const projectMatch = pathname?.match(/^\/projects\/([^/]+)/);
   const projectId = projectMatch?.[1] ?? null;
@@ -186,9 +181,6 @@ function SidebarContent() {
   const projectPathPrefix = projectId ? `/projects/${projectId}` : "/projects";
 
   const [isCollapsed, setIsCollapsed] = useState(false);
-  const [isLoggingOut, setIsLoggingOut] = useState(false);
-  const [logoutError, setLogoutError] = useState<string | null>(null);
-  const [isLogoutConfirmOpen, setIsLogoutConfirmOpen] = useState(false);
   const { workspace } = useAppData();
   const isWorkspaceOwner = (workspace?.role ?? "").trim().toLowerCase() === "owner";
 
@@ -207,37 +199,6 @@ function SidebarContent() {
       }
     }
     return true;
-  };
-
-  const openLogoutConfirm = () => {
-    if (isLoggingOut) return;
-    setLogoutError(null);
-    setIsLogoutConfirmOpen(true);
-  };
-
-  const closeLogoutConfirm = () => {
-    // Ignore Escape/backdrop dismissal mid-request: the session logout call is already
-    // in flight, and pulling the dialog out from under it would strand the button state.
-    if (isLoggingOut) return;
-    setIsLogoutConfirmOpen(false);
-    setLogoutError(null);
-  };
-
-  const onLogout = async () => {
-    if (isLoggingOut) return;
-    setLogoutError(null);
-    setIsLoggingOut(true);
-    try {
-      await logout();
-      if (typeof window !== "undefined") removeStoredValue("token");
-      router.replace("/login");
-      router.refresh();
-    } catch {
-      // Left open on failure, not dismissed: the user is one click away from retrying
-      // without having to re-open the confirmation from the footer button.
-      setLogoutError("Could not log out. Please try again.");
-      setIsLoggingOut(false);
-    }
   };
 
   const showProjectNav = !isInSettings && isInProject && Boolean(projectId);
@@ -369,15 +330,12 @@ function SidebarContent() {
         )}
       </nav>
 
-      {/* Footer */}
+      {/*
+       * Footer — Project/Workspace settings only. My Account, the theme toggle, and Logout used
+       * to live here too, but they're duplicates of the top-right user menu (TopBar.tsx) now that
+       * it exists, so they were removed from this second location rather than kept in both places.
+       */}
       <div className="space-y-1 border-t border-[var(--glass-border)] p-2.5">
-        <NavLink
-          href="/account"
-          label="My Account"
-          icon="account"
-          active={pathname === "/account"}
-          collapsed={isCollapsed}
-        />
         {!isInSettings && !isInProject && (
           <NavLink
             href="/settings"
@@ -395,38 +353,7 @@ function SidebarContent() {
             collapsed={isCollapsed}
           />
         )}
-        <div className={`flex items-center ${isCollapsed ? "flex-col gap-1" : "gap-2"}`}>
-          <ThemeToggle isCollapsed={isCollapsed} />
-          <button
-            type="button"
-            onClick={openLogoutConfirm}
-            disabled={isLoggingOut}
-            className={`flex items-center rounded-[6px] border border-transparent py-1.5 text-[13px] text-[var(--muted)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)] disabled:opacity-60 ${
-              isCollapsed ? "justify-center px-2" : "flex-1 gap-2 px-2"
-            }`}
-            aria-label={isLoggingOut ? "Logging out" : "Logout"}
-          >
-            <MenuIcon name="logout" className="h-[18px] w-[18px] shrink-0 text-[var(--ink-300)]" />
-            {!isCollapsed && <span>{isLoggingOut ? "Logging out..." : "Logout"}</span>}
-            {isCollapsed && <span className="sr-only">{isLoggingOut ? "Logging out..." : "Logout"}</span>}
-          </button>
-        </div>
       </div>
-
-      <Modal open={isLogoutConfirmOpen} onClose={closeLogoutConfirm} title="Logout">
-        <div className="space-y-4">
-          <p className="text-sm text-[var(--muted)]">Are you sure you want to logout?</p>
-          {logoutError && <p className="text-sm text-[var(--error-foreground)]">{logoutError}</p>}
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="secondary" onClick={closeLogoutConfirm} disabled={isLoggingOut}>
-              No
-            </Button>
-            <Button type="button" variant="primary" onClick={onLogout} disabled={isLoggingOut}>
-              {isLoggingOut ? "Logging out…" : "Yes"}
-            </Button>
-          </div>
-        </div>
-      </Modal>
     </aside>
   );
 }

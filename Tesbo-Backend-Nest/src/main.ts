@@ -26,6 +26,7 @@ import { EmailDeliveryPolicy } from "./config/email-delivery.policy";
 import { HttpExceptionFilter } from "./common/http-exception.filter";
 import { assertEncryptionKeyConfigured } from "./common/crypto.util";
 import type { AuthenticatedRequest } from "./common/request.types";
+import { RequestCacheService } from "./request-cache/request-cache.service";
 
 async function bootstrap() {
   assertEncryptionKeyConfigured();
@@ -46,9 +47,13 @@ async function bootstrap() {
   // xlsx, and image attachments), so the binary download routes keep passing bytes through untouched.
   // Nothing here sets Content-Length by hand, which is what would otherwise break under compression.
   //
-  // Safe to sit in front of every route because this API has no SSE or long-poll streaming endpoint —
-  // Zyra's chat is polled by the client, not streamed. Reintroducing a streaming route means giving it
-  // `Cache-Control: no-transform` (which this filter honours) or it will buffer.
+  // Safe to sit in front of every route, including the one SSE endpoint this API now has (Zyra
+  // chat progress narration, GET .../turns/:turnId/events — see zyra-progress.service.ts): Nest's
+  // built-in SSE response writer (@nestjs/core/router/sse-stream.js) already sends
+  // `Cache-Control: ...no-transform`, which this filter's own no-transform check (line 296 of
+  // compression/index.js) honours by skipping compression for that response — no extra
+  // configuration needed here. The turn's actual answer (the POST response) is plain JSON and
+  // compresses normally like everything else.
   app.use(compression());
 
   app.use(
@@ -63,6 +68,21 @@ async function bootstrap() {
   );
   app.use(urlencoded({ extended: true, limit: config.maxRequestBodySize }));
   app.use(cookieParser());
+
+  // Wraps the rest of the request (every downstream middleware, guard, and handler) in an
+  // AsyncLocalStorage context so RequestCacheService can memoize repeated reads (the same
+  // project/org row read 5+ times across unrelated guards/services) for exactly this request's
+  // lifetime — see request-cache/request-cache.service.ts. Must be registered before anything it's
+  // meant to cover, which is why it sits here rather than as a Nest module-level middleware: Nest's
+  // own module-registered middlewares (e.g. AuthMiddleware, via consumer.apply().forRoutes("*"))
+  // bind during app.listen()/init(), after these app.use() calls have already taken their place in
+  // the underlying Express stack — the same ordering this file already relies on for body parsing
+  // and cookies needing to run before AuthMiddleware reads them.
+  const requestCache = app.get(RequestCacheService);
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    requestCache.run(() => next());
+  });
+
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader("X-Request-Id", randomUUID());
     const forwardedProto = req.header("x-forwarded-proto");

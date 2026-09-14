@@ -3,15 +3,14 @@
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  authMe,
   listPlans,
   createPlan,
   deletePlan,
-  getProject,
-  listProjectMembers,
   type PlanListItem,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
   Button,
   Input,
@@ -24,6 +23,7 @@ import {
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { PlanCard, planStatus, type PlanStatus } from "@/components/testplans/PlanCard";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 import {
   IconArrowsSort,
   IconChevronDown,
@@ -34,6 +34,10 @@ import {
   IconSearch,
   IconX,
 } from "@tabler/icons-react";
+
+interface PlansData {
+  plans: PlanListItem[];
+}
 
 type StatusFilter = "all" | PlanStatus;
 // Exact same option set as the Projects list's sort menu (app/(app)/projects/page.tsx).
@@ -110,17 +114,31 @@ export default function PlansPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
-  const [plans, setPlans] = useState<PlanListItem[]>([]);
-  const [ownerNames, setOwnerNames] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(true);
+  const { currentUser } = useAppData();
+  const { project, projectMembers } = useProjectData();
+  const projectName = String(project.name || "");
+  const canManagePlans = useMemo(() => {
+    const myRole = typeof project.myRole === "string" ? project.myRole.toLowerCase() : "";
+    return !myRole || ["owner", "admin", "manager"].includes(myRole);
+  }, [project]);
+  const ownerNames = useMemo(
+    () => Object.fromEntries(projectMembers.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
+    [projectMembers]
+  );
+  const cacheKey = `plans:${projectId}`;
+  const cached = getPageCache<PlansData>(cacheKey);
+
+  const [plans, setPlans] = useState<PlanListItem[]>(cached?.plans ?? []);
+  // Only the true first visit to this project's plans list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newRelease, setNewRelease] = useState("");
-  const [canManagePlans, setCanManagePlans] = useState(false);
-  const [projectName, setProjectName] = useState("");
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -145,27 +163,25 @@ export default function PlansPage() {
   }, [searchParams]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      Promise.all([
-        listPlans(projectId),
-        getProject(projectId),
-        listProjectMembers(projectId).catch(() => []),
-      ])
-        .then(([plansData, projectData, members]) => {
-          setPlans(plansData);
-          const myRole = typeof projectData.myRole === "string" ? projectData.myRole.toLowerCase() : "";
-          setCanManagePlans(!myRole || ["owner", "admin", "manager"].includes(myRole));
-          setOwnerNames(Object.fromEntries(members.map((m) => [m.userId, m.name || m.email || "Unknown user"])));
-          setProjectName(String(projectData.name || ""));
-        })
-        .catch(() => router.replace("/projects"))
-        .finally(() => setLoading(false));
-    });
-  }, [projectId, router]);
+    const key = `plans:${projectId}`;
+    const existing = getPageCache<PlansData>(key);
+    if (existing) {
+      setPlans(existing.plans);
+      setLoading(false);
+    }
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    listPlans(projectId)
+      .then((plansData) => {
+        const next: PlansData = { plans: plansData };
+        setPageCache(key, next);
+        setPlans(next.plans);
+      })
+      .catch(() => router.replace("/projects"))
+      .finally(() => setLoading(false));
+  }, [projectId, router, currentUser]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -245,7 +261,7 @@ export default function PlansPage() {
   const passRate = overallPassRate(plans);
 
   if (loading) {
-    return <PageLoader variant="screen" label="Loading plans…" />;
+    return <PageLoader variant="content" label="Loading plans…" />;
   }
 
   return (
@@ -382,7 +398,7 @@ export default function PlansPage() {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search plans..."
-                className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none placeholder:text-[var(--muted-soft)]"
+                className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
               />
               {searchQuery && (
                 <button

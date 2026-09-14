@@ -1049,10 +1049,15 @@ test.describe("zyra / agents (UI)", () => {
     await page.getByRole("button", { name: "Select all" }).click();
     await expect(page.getByText("2 of 2 testcases selected")).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete selected" })).toBeEnabled();
+    // With everything selected, the toggle becomes the one "unselect all" control — the standalone
+    // "Clear selection" button (only meaningful for a partial selection) is hidden rather than
+    // duplicating it.
+    await expect(page.getByRole("button", { name: "Clear selection" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Clear selection" }).click();
+    await page.getByRole("button", { name: "Unselect all" }).click();
     await expect(page.getByText("0 of 2 testcases selected")).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete selected" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Clear selection" })).toBeDisabled();
   });
 
   test("ZYU-14 saving a draft into a new suite creates a real test case", { tag: '@tesbo.testId("TES-TC-1099")' }, async ({ browser }) => {
@@ -1845,5 +1850,110 @@ test.describe("zyra / agents (UI)", () => {
     await expect
       .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
       .toBe("in_review");
+  });
+
+  /*
+   * Frontend defense-in-depth for the reported bug ("8 flight booking test cases drafted and staged
+   * for your review" with no table, no review panel) — added alongside the backend fix
+   * (buildZyraChatDecision's router salvage-retry) so a FUTURE regression in that guard still can't
+   * look like silent success in the UI. The backend fix means this exact shape (actionType
+   * create/update/archive with zero testcases and no reviewRequestId) should no longer be reachable
+   * through the live chat route at all — which is exactly why it has to be seeded directly rather
+   * than driven through a real turn, the same rule seedChatReviewBatch()'s own header states.
+   */
+  test("ZYU-73 a mutation-routed reply with no testcases and no review batch shows the missing-data notice", async ({ browser }) => {
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'E2E missing structured data');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, action_type, testcases, activity) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        "'Here are 8 flight booking test cases drafted and staged for your review.', 'completed', 'create', '[]'::jsonb, '[]'::jsonb);",
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Here are 8 flight booking test cases drafted and staged for your review.")).toBeVisible();
+    await expect(page.getByText(/didn.t return structured data for this reply/)).toBeVisible();
+    // Neither the read-only table nor the review panel has anything to show for this message.
+    await expect(page.getByRole("checkbox", { name: /Select proposed test case/ })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "View test cases" })).toHaveCount(0);
+  });
+
+  test("ZYU-74 an ordinary answer with no testcases shows no missing-data notice", async ({ browser }) => {
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'E2E ordinary answer');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, action_type, testcases, activity) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        "'There are 12 login test cases already covering this flow.', 'completed', 'answer', '[]'::jsonb, '[]'::jsonb);",
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("There are 12 login test cases already covering this flow.")).toBeVisible();
+    await expect(page.getByText(/didn.t return structured data for this reply/)).toHaveCount(0);
+  });
+
+  /*
+   * Regression for a gap found by review, before this shipped: the missingStructuredData allow-list
+   * only checked create/update/archive — "mixed" (reachable whenever the router's intent is
+   * create/update/archive and the model itself reports actionType "mixed",
+   * normalizeZyraChatDecision trusting that value as-is) hit the identical phantom-success shape
+   * with no notice at all.
+   */
+  test("ZYU-75 a 'mixed' reply with no testcases and no review batch also shows the missing-data notice", async ({ browser }) => {
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'E2E mixed missing structured data');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, action_type, testcases, activity) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        "'Created 2 test cases and archived 1 outdated one.', 'completed', 'mixed', '[]'::jsonb, '[]'::jsonb);",
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Created 2 test cases and archived 1 outdated one.")).toBeVisible();
+    await expect(page.getByText(/didn.t return structured data for this reply/)).toBeVisible();
+  });
+
+  // "suite" stays deliberately excluded — create_suite/move_to_suite write immediately, so a
+  // suite-only turn legitimately has no testcases row to show, and must not show the notice.
+  test("ZYU-76 a 'suite' reply with no testcases does not show the missing-data notice", async ({ browser }) => {
+    exec(
+      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+        `(${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'E2E suite no notice');`,
+    );
+    const sessionId = scalar(
+      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, action_type, testcases, activity) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', ` +
+        "'Created the Smoke Tests suite.', 'completed', 'suite', '[]'::jsonb, '[]'::jsonb);",
+    );
+    exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
+
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText("Created the Smoke Tests suite.")).toBeVisible();
+    await expect(page.getByText(/didn.t return structured data for this reply/)).toHaveCount(0);
   });
 });

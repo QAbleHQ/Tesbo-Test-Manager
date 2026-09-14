@@ -1,14 +1,15 @@
 import { readStoredValue } from "./storage";
+import { EVIDENCE_MAX_FILES_PER_REQUEST } from "./validation";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
 type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
 
-type ApiErrorBody = { error?: string; detail?: string; errors?: { field?: string; message?: string }[] };
+type ApiErrorBody = { error?: string; detail?: string; message?: string; errors?: { field?: string; message?: string }[] };
 
 /**
- * A response with no `error`/`errors` body is never something the endpoint chose to say to a
- * user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * A response with no `error`/`errors`/`message` body is never something the endpoint chose to say
+ * to a user — every hand-written throw in the backend sets one (see legacy.service.ts's
  * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
  * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
  * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
@@ -28,7 +29,13 @@ function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
     return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  const msg = body.error || genericStatusMessage(status);
+  // custom-field-validation.ts (definition config checks — e.g. a multi-select's minSelected
+  // exceeding its maxSelected) throws a bare { field, message } object rather than { error }/
+  // { errors }, since it isn't wrapped by anything that reshapes it before it reaches the HTTP
+  // layer. Falling back to `message` here — instead of straight to the generic text — is what
+  // keeps that already-specific backend wording ("Minimum selections cannot be greater than
+  // maximum selections.") from being swallowed into "Something went wrong."
+  const msg = body.error || body.message || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
@@ -77,10 +84,43 @@ async function fetchWithNetworkErrorMessage(
   }
 }
 
+/**
+ * Collapses concurrent identical in-flight requests (e.g. two components mounting at once, each
+ * calling the same read) into one network call — every caller shares the same promise instead of
+ * each firing its own fetch. Purely an overlap-collapse, not a cache: the map entry is removed
+ * before the shared promise settles for any of its callers (the `.finally` below runs first), so a
+ * call issued after the in-flight one has already resolved always goes out fresh, never serving a
+ * stale value.
+ */
+const inFlightRequests = new Map<string, Promise<unknown>>();
+
+function dedupeInFlight<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inFlightRequests.get(key);
+  if (existing) return existing as Promise<T>;
+  const promise = run().finally(() => {
+    inFlightRequests.delete(key);
+  });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
 export async function api<T = unknown>(
   path: string,
   options: RequestInitWithBody = {}
 ): Promise<T> {
+  const method = (options.method ?? "GET").toString().toUpperCase();
+  // Scoped strictly to GET — two "identical" mutating calls are not guaranteed interchangeable, so
+  // dedup must never silently collapse a POST/PUT/PATCH/DELETE. Also skipped whenever the caller
+  // supplies its own AbortSignal (e.g. getIntegrationAuthUrl's 20s timeout): sharing one in-flight
+  // request across callers means only the FIRST caller's `options` — signal included — actually
+  // reaches fetch(), so a second caller's own cancellation/timeout would otherwise be silently
+  // dropped in favor of a different caller's. Every other GET in this file passes no signal, so this
+  // exclusion costs nothing for them.
+  if (method !== "GET" || options.signal) return apiRequest<T>(path, options);
+  return dedupeInFlight(`GET:${path}`, () => apiRequest<T>(path, options));
+}
+
+async function apiRequest<T = unknown>(path: string, options: RequestInitWithBody): Promise<T> {
   const { body, ...rest } = options;
   const headers: HeadersInit = {
     "Content-Type": "application/json",
@@ -106,6 +146,10 @@ export async function authMe(): Promise<{
   userId: string;
   email: string | null;
   name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
   isPlatformAdmin?: boolean;
   hasPassword?: boolean;
 } | null> {
@@ -114,12 +158,34 @@ export async function authMe(): Promise<{
       userId: string;
       email: string | null;
       name: string | null;
+      firstName: string | null;
+      lastName: string | null;
+      mobileNumber: string | null;
+      profileComplete: boolean;
       isPlatformAdmin?: boolean;
       hasPassword?: boolean;
     }>("/api/auth/me");
   } catch {
     return null;
   }
+}
+
+export async function updateProfile(data: { firstName?: string; lastName?: string; mobileNumber?: string }): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+}> {
+  return api("/api/auth/me", { method: "PATCH", body: data });
+}
+
+export async function completeProfile(data: { firstName: string; lastName: string; mobileNumber?: string }): Promise<void> {
+  await api("/api/auth/complete-profile", { method: "POST", body: data });
 }
 
 // --- Platform Admin APIs ---
@@ -202,7 +268,13 @@ export async function changePassword(currentPassword: string | null, newPassword
   });
 }
 
-export async function startSignup(data: { firstName: string; lastName: string; email: string; password: string }): Promise<void> {
+export async function startSignup(data: {
+  firstName: string;
+  lastName: string;
+  mobileNumber?: string;
+  email: string;
+  password: string;
+}): Promise<void> {
   await api("/api/auth/signup/start", { method: "POST", body: data });
 }
 
@@ -210,7 +282,10 @@ export async function verifySignup(email: string, code: string): Promise<{ ok: b
   return api("/api/auth/signup/verify", { method: "POST", body: { email, code } });
 }
 
-export async function startInviteRegistration(token: string, data: { name: string; password: string }): Promise<void> {
+export async function startInviteRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string; password: string }
+): Promise<void> {
   await api(`/api/invitations/${token}/register/start`, { method: "POST", body: data });
 }
 
@@ -221,7 +296,10 @@ export async function verifyInviteRegistration(
   return api(`/api/invitations/${token}/register/verify`, { method: "POST", body: { code } });
 }
 
-export async function startInviteOtpRegistration(token: string, data: { name: string }): Promise<void> {
+export async function startInviteOtpRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string }
+): Promise<void> {
   await api(`/api/invitations/${token}/register/otp/start`, { method: "POST", body: data });
 }
 
@@ -936,6 +1014,19 @@ export interface ZyraChatTestcaseRow {
   draftIndex?: number;
   /** The ai_generation_requests id this proposal is staged under — only set on a "proposed-*" row. */
   reviewRequestId?: string;
+  /**
+   * Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * generated case — resolved and verified server-side (see sanitizeZyraSourceRefs in
+   * legacy.service.ts), never a raw, unverified model claim. Always present, [] when the case was
+   * not grounded in any specific source.
+   */
+  sourceRefs?: ZyraSourceRef[];
+}
+
+export interface ZyraSourceRef {
+  type: "knowledge_document" | "knowledge_file" | "jira_ticket" | "testcase" | "bug";
+  id: string;
+  title: string;
 }
 
 /**
@@ -1015,6 +1106,17 @@ export async function createZyraChatSession(projectId: string, data: { title?: s
 
 export async function getZyraChatSession(projectId: string, sessionId: string): Promise<ZyraChatSession> {
   return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`);
+}
+
+export async function renameZyraChatSession(projectId: string, sessionId: string, title: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: { title },
+  });
+}
+
+export async function deleteZyraChatSession(projectId: string, sessionId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
 export async function sendZyraChatMessage(
@@ -1186,7 +1288,10 @@ export interface SuiteNode {
   name: string;
   position: number;
   createdAt: string;
+  /** Direct children of this suite only. For the tree badge / rollup math, use recursiveTestCaseCount instead. */
   testCaseCount: number;
+  /** This suite's own test cases plus every descendant suite's, at any depth. */
+  recursiveTestCaseCount: number;
 }
 
 export async function listSuites(projectId: string): Promise<SuiteNode[]> {
@@ -1231,6 +1336,8 @@ export async function listTestCases(
     limit?: number;
     offset?: number;
     suiteId?: string;
+    /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+    includeDescendants?: boolean;
     status?: string;
     priority?: string;
     type?: string;
@@ -1240,12 +1347,16 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
+    sortBy?: "id" | "title" | "priority";
+    sortDir?: "asc" | "desc";
   }
 ): Promise<{ list: TestCaseListItem[]; total: number }> {
   const sp = new URLSearchParams();
   if (params?.limit != null) sp.set("limit", String(params.limit));
   if (params?.offset != null) sp.set("offset", String(params.offset));
   if (params?.suiteId) sp.set("suiteId", params.suiteId);
+  if (params?.includeDescendants) sp.set("includeDescendants", "true");
   if (params?.status) sp.set("status", params.status);
   if (params?.priority) sp.set("priority", params.priority);
   if (params?.type) sp.set("type", params.type);
@@ -1254,19 +1365,28 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
-  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}/api/projects/${projectId}/testcases?${sp}`, { credentials: "include" });
-  const list = await res.json();
-  if (!res.ok) {
-    const err = (list as { error?: string }).error || res.statusText;
-    throw new Error(err || String(res.status));
-  }
-  const normalizedList = Array.isArray(list) ? list : [];
-  const totalHeader = res.headers.get("X-Total-Count");
-  let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
-  if (Number.isNaN(total)) {
-    total = normalizedList.length;
-  }
-  return { list: normalizedList, total };
+  if (params?.sortBy) sp.set("sortBy", params.sortBy);
+  if (params?.sortDir) sp.set("sortDir", params.sortDir);
+  const path = `/api/projects/${projectId}/testcases?${sp}`;
+  // This function hand-rolls its own fetch (X-Total-Count header, a different error shape) instead
+  // of going through api() above, so it needs its own dedupeInFlight call to get the same
+  // overlap-collapse — the single-request-heaviest read in the app (suite clicks, filter/page
+  // changes, and selectAllMatchingCases' own loop) and the one bypass worth retrofitting.
+  return dedupeInFlight(`GET:${path}`, async () => {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}${path}`, { credentials: "include" });
+    const list = await res.json();
+    if (!res.ok) {
+      const err = (list as { error?: string }).error || res.statusText;
+      throw new Error(err || String(res.status));
+    }
+    const normalizedList = Array.isArray(list) ? list : [];
+    const totalHeader = res.headers.get("X-Total-Count");
+    let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
+    if (Number.isNaN(total)) {
+      total = normalizedList.length;
+    }
+    return { list: normalizedList, total };
+  });
 }
 
 export async function getTestCase(projectId: string, testcaseId: string): Promise<Record<string, unknown>> {
@@ -1453,6 +1573,10 @@ export async function deleteCustomFieldDefinition(projectId: string, definitionI
   await api(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}`, { method: "DELETE" });
 }
 
+export async function restoreCustomFieldDefinition(projectId: string, definitionId: string): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/restore`, { method: "POST" });
+}
+
 export async function addCustomFieldOption(projectId: string, definitionId: string, label: string): Promise<CustomFieldDefinition> {
   return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/options`, {
     method: "POST",
@@ -1476,12 +1600,17 @@ export async function getCustomFieldValues(projectId: string, testcaseId: string
   return api<CustomFieldValue[]>(`/api/projects/${projectId}/testcases/${testcaseId}/custom-field-values`);
 }
 
-export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
-  return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+export interface LinkedIssueTaskStatus {
+  taskId: string;
+  status: string;
 }
 
-export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number> }> {
-  return api<{ keys: string[]; counts: Record<string, number> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
+export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+}
+
+export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
 }
 
 // Test case import/export
@@ -1521,6 +1650,8 @@ export interface ImportTestCaseRow {
   suite?: string;
   component?: string;
   estimatedDuration?: string;
+  automationStatus?: string;
+  attachments?: string;
   // definitionId -> already-coerced value. The modal resolves select labels to option ids before
   // sending, since it is the side that loaded the option lists to build the mapping UI.
   customFieldValues?: Record<string, unknown>;
@@ -2204,6 +2335,10 @@ export async function updateExecution(cycleId: string, executionId: string, data
   await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
 }
 
+export async function bulkAssignExecutions(cycleId: string, data: { executionIds: string[]; assigneeId: string | null }): Promise<{ updated: number; assigneeId: string | null }> {
+  return api(`/api/cycles/${cycleId}/executions/bulk-assign`, { method: "POST", body: data });
+}
+
 export async function getExecutionAutomationReport(cycleId: string, executionId: string): Promise<ExecutionAutomationReport> {
   return api<ExecutionAutomationReport>(`/api/cycles/${cycleId}/executions/${executionId}/automation-report`);
 }
@@ -2327,6 +2462,9 @@ export type BugPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface BugItem {
   id: string;
+  /** Per-project sequential key, e.g. "E2E-BUG-14" — always present, unlike integrationIssueKey
+   *  which is only set once the bug is linked to an external tracker (Jira/Linear). */
+  externalId: string;
   title: string;
   description: string;
   externalUrl: string;
@@ -2353,12 +2491,13 @@ export interface BugItem {
 
 export async function listBugs(
   projectId: string,
-  params?: { status?: string; cycleId?: string; assigneeId?: string }
+  params?: { status?: string; cycleId?: string; assigneeId?: string; testcaseId?: string }
 ): Promise<BugItem[]> {
   const sp = new URLSearchParams();
   if (params?.status) sp.set("status", params.status);
   if (params?.cycleId) sp.set("cycleId", params.cycleId);
   if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
+  if (params?.testcaseId) sp.set("testcaseId", params.testcaseId);
   const query = sp.toString();
   return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
 }
@@ -2413,19 +2552,39 @@ export async function removeBugLink(bugId: string, linkId: string): Promise<BugI
   return api(`/api/bugs/${bugId}/links/${linkId}`, { method: "DELETE" });
 }
 
-export async function uploadBugAttachments(projectId: string, bugId: string, files: File[]): Promise<{ list: BugAttachment[]; total: number }> {
-  const formData = new FormData();
-  for (const file of files) formData.append("files", file);
-  const res = await fetch(`${API_BASE}/api/projects/${projectId}/bugs/${bugId}/attachments`, {
-    method: "POST",
-    credentials: "include",
-    body: formData,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((err as { error?: string }).error || String(res.status));
+/**
+ * Uploads bug attachments in batches of EVIDENCE_MAX_FILES_PER_REQUEST — the server rejects a
+ * request carrying more files than that outright, so a batch larger than the limit is split into
+ * multiple sequential requests against the same bug rather than sent as one request that fails.
+ * `onBatchUploaded` fires after each batch persists, so a caller can drop those files from
+ * whatever "still needs uploading" state it retries from, instead of re-sending files that already
+ * made it to the bug if a later batch fails.
+ */
+export async function uploadBugAttachments(
+  projectId: string,
+  bugId: string,
+  files: File[],
+  onBatchUploaded?: (batch: File[]) => void
+): Promise<{ list: BugAttachment[]; total: number }> {
+  const list: BugAttachment[] = [];
+  for (let i = 0; i < files.length; i += EVIDENCE_MAX_FILES_PER_REQUEST) {
+    const batch = files.slice(i, i + EVIDENCE_MAX_FILES_PER_REQUEST);
+    const formData = new FormData();
+    for (const file of batch) formData.append("files", file);
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/bugs/${bugId}/attachments`, {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error((err as { error?: string }).error || String(res.status));
+    }
+    const batchResult = (await res.json()) as { list: BugAttachment[]; total: number };
+    list.push(...batchResult.list);
+    onBatchUploaded?.(batch);
   }
-  return res.json();
+  return { list, total: list.length };
 }
 
 export async function deleteBugAttachment(attachmentId: string): Promise<void> {

@@ -8,7 +8,7 @@ export const STATUS_COLORS: Record<string, string> = {
   Blocked: "var(--status-blocked-dot)",
   Skipped: "var(--status-skipped-dot)",
   Untested: "var(--status-notrun-dot)",
-  Retest: "var(--status-inreview-dot)",
+  Retest: "var(--status-retest-dot)",
 };
 
 export const STATUS_KEYS = ["Passed", "Failed", "Blocked", "Skipped", "Untested", "Retest"] as const;

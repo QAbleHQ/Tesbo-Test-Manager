@@ -10,6 +10,13 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -28,8 +35,13 @@ process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
  * not accept, which would have taken these tests down with it.
  */
 function makeLegacy(): LegacyService {
+  const db = { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   return new LegacyService(
-    { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService,
+    db,
     {} as unknown as EmailService,
     {} as unknown as PasswordService,
     {} as unknown as AppConfigService,
@@ -39,6 +51,12 @@ function makeLegacy(): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
 }
@@ -141,6 +159,87 @@ describe("Zyra reply guards", () => {
       });
       expect(out).toBe("Created 5 test cases in this batch.");
     });
+
+    /*
+     * Basecamp-adjacent, reported directly: "Review existing test cases and rewrite any weak or vague
+     * expected result" got the false-completion banner on a reply that was already honest — it named
+     * the candidate ids and said, in its own words, that nothing was written yet. ZYRA_COMPLETION_CLAIM
+     * matched "updated" purely by proximity to "PRO-TC-239", with no regard for "being" (present
+     * continuous, describing work not yet done) sitting directly in front of it; ZYRA_ALREADY_DISCLOSED
+     * only recognised the past-tense "nothing WAS saved", not the present-tense "nothing IS changed…
+     * until you save them" the system prompt tells the model to say for a staged batch. Together they
+     * let an honest reply get double-wrapped with the same warning it was already giving — reproduced
+     * verbatim from the reported reply below.
+     */
+    it("does not flag a present-continuous staging summary that names candidate ids", () => {
+      const reply = [
+        "Staging rewrites for the weak/vague test cases identified in the previous turn. Each update",
+        "sharpens the expected results to be specific and testable.",
+        "",
+        "**Cases being updated:** PRO-TC-239, PRO-TC-247, PRO-TC-256, PRO-TC-261, PRO-TC-276, PRO-TC-288,",
+        "PRO-TC-289, PRO-TC-299, PRO-TC-306",
+        "",
+        "All 9 updates are staged for your review — nothing is changed in the repository until you save them."
+      ].join("\n");
+      const out = internals(svc).reconcileZyraReply(answer(reply), nothingApplied);
+      expect(out).not.toContain("Nothing was saved");
+      expect(out).toBe(reply);
+    });
+
+    it("does not flag a future/modal-passive description as a completion claim", () => {
+      // "will be archived" / "should be updated" describe intent, not an already-performed mutation —
+      // the pre-fix regex had no tense check at all, so both tripped exactly like "Archived TC-5" did.
+      const willBe = "TC-5 will be archived once you confirm, and TC-9 should be updated to match.";
+      expect(internals(svc).reconcileZyraReply(answer(willBe), nothingApplied)).toBe(willBe);
+    });
+
+    it("still flags a genuine completion claim", () => {
+      // Not every reply naming a testcase near a completion verb is a staging disclosure — this one
+      // asserts the row is already archived, same false-claim shape as "TC-5 was archived". The tense
+      // fix must not swallow this just because it broadened the surrounding present-tense cases.
+      const out = internals(svc).reconcileZyraReply(answer("Already archived TC-5, so it no longer shows up."), nothingApplied);
+      expect(out).toContain("Nothing was saved");
+    });
+
+    it("does not double-wrap the present-tense staging disclosure the system prompt asks for", () => {
+      // ZYRA_ALREADY_DISCLOSED previously matched only the past-tense "nothing WAS saved/changed" —
+      // this is the present-tense phrasing §4 of the Zyra contract instructs the model to use instead.
+      const honest = "3 test cases are drafted. Nothing is saved to the repository until you save them.";
+      expect(internals(svc).reconcileZyraReply(answer(honest), nothingApplied)).toBe(honest);
+    });
+  });
+
+  /*
+   * The same tense-awareness gap existed in the narrower guard used once operations really did stage
+   * something (proposedCount > 0) — a turn correctly routed to `update` with real staged rows still
+   * got the false banner slapped in front of its own honest "staged for review" wording.
+   */
+  describe("the persisted-claim banner on a real staged update turn", () => {
+    it("does not flag a staged update batch that names the ids being changed", () => {
+      const decision = {
+        reply: [
+          "**Cases being updated:** PRO-TC-239, PRO-TC-247",
+          "",
+          "2 updates are staged for your review — nothing is changed in the repository until you save them."
+        ].join("\n"),
+        actionType: "update",
+        operations: [{ type: "update" }, { type: "update" }]
+      };
+      const applied = {
+        // Staged update previews carry the EXISTING testcase's real id (see applyZyraChatOperations'
+        // `preview = {...row, ...fields}`) — that is the bug this whole fix is about, so the test fixture
+        // deliberately mirrors it rather than using a fresh id that would never trigger the old bug.
+        testcases: [
+          { id: "11111111-1111-1111-1111-111111111111", action: "proposed-update" },
+          { id: "22222222-2222-2222-2222-222222222222", action: "proposed-update" }
+        ],
+        activity: []
+      };
+      const out = internals(svc).reconcileZyraReply(decision, applied);
+      expect(out).not.toContain("Nothing was saved");
+      expect(out).toContain("staged for your review");
+      expect(out).toContain("open the review panel");
+    });
   });
 
   /*
@@ -182,6 +281,74 @@ describe("Zyra reply guards", () => {
       ]);
       expect(out).toContain("saved nothing");
       expect(out).not.toContain("PROPOSAL");
+    });
+
+    /*
+     * The confirmation-retry bug this whole fix targets: a staged update/archive PREVIEW carries the
+     * id of the EXISTING testcase it previews changing (applyZyraChatOperations builds it from the
+     * real row + pending fields), not a fresh id from a real write. The old "does any row have an id"
+     * check read that as "this turn already saved something", so an update proposal never got the
+     * PROPOSAL annotation a "yes" needs an antecedent from — the retry in sendZyraChatMessage never
+     * fired, and the user's confirmation looped back into the same non-committal answer forever.
+     */
+    it("marks an update turn as a PROPOSAL even though its staged rows carry the target's real id", () => {
+      const out = internals(svc).zyraTranscript([
+        { role: "user", content: "review existing test cases and rewrite any weak or vague expected result" },
+        {
+          role: "assistant",
+          content: "9 updates are staged for your review — nothing is changed in the repository until you save them.",
+          action_type: "update",
+          testcases: [
+            { id: "11111111-1111-1111-1111-111111111111", action: "proposed-update" },
+            { id: "22222222-2222-2222-2222-222222222222", action: "proposed-update" }
+          ]
+        },
+        { role: "user", content: "go ahead" }
+      ]);
+      expect(out).toContain("PROPOSAL still awaiting the user's go-ahead");
+      expect(out).toContain("routed as 'update'");
+      expect(out).toContain("saved nothing");
+      expect(out).not.toContain("saved 2 testcase(s) to the repository");
+    });
+
+    it("does not mistake a real persisted row (e.g. a completed move) for a pending proposal", () => {
+      // A move_to_suite writes immediately and its rows carry action "moved", not "proposed-*" — that
+      // must still read as genuinely saved, not as something awaiting confirmation.
+      const out = internals(svc).zyraTranscript([
+        {
+          role: "assistant",
+          content: "Moved 2 test cases to the Login suite.",
+          action_type: "suite",
+          testcases: [
+            { id: "11111111-1111-1111-1111-111111111111", action: "moved" },
+            { id: "22222222-2222-2222-2222-222222222222", action: "moved" }
+          ]
+        }
+      ]);
+      expect(out).toContain("saved 2 testcase(s) to the repository");
+      expect(out).not.toContain("PROPOSAL");
+    });
+
+    /*
+     * ZYRA_OFFER_PATTERN only ever matched a "would you like me to…?" question. A turn routed `answer`
+     * (an analysis step, not yet confident enough to emit an operation) can leave something just as
+     * concrete to confirm without phrasing it as a question — the exact reply reported in the bug
+     * never asked anything, it just stated what was staged and how to save it. Without recognising
+     * this shape, "go ahead" had nothing to resolve against and the retry in sendZyraChatMessage never
+     * fired.
+     */
+    it("treats a declarative staged-for-review summary (no question mark) as an offer awaiting confirmation", () => {
+      const out = internals(svc).zyraTranscript([
+        { role: "user", content: "review existing test cases and rewrite any weak or vague expected result" },
+        {
+          role: "assistant",
+          content: "Here are the weak ones I found. 9 updates are staged for your review — nothing is changed in the repository until you save them.",
+          action_type: "answer",
+          testcases: []
+        },
+        { role: "user", content: "go ahead" }
+      ]);
+      expect(out).toContain("ended with an offer to act");
     });
   });
   /*

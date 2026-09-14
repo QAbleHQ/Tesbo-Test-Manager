@@ -430,6 +430,259 @@ test.describe("Test Run — Priority/Type/Assignee filters", () => {
   });
 });
 
+/*
+ * Feature: sorting controls on the run table's ID, Priority and Test Case columns
+ * (app/(app)/projects/[id]/cycles/[cycleId]/page.tsx's SortableColumnHeader / runSort /
+ * compareExternalId / comparePriority / compareTestCaseTitle). Sorting is entirely client-side
+ * over the run's full, already-loaded execution list — applied in the same `filteredExecutions`
+ * memo that also drives pagination, so it covers the whole dataset and composes with the existing
+ * tab/filter/search, not just the current page.
+ */
+test.describe("Test Run table — ID/Priority/Test Case column sort", () => {
+  let api: APIRequestContext;
+  let cycleId: string;
+  let testcaseIds: string[] = [];
+  const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  // The trailing digits are the numeric sort key — mirrors the ticket's own "PRO-TC-9 before
+  // PRO-TC-10" example. Embedding the stamp before "-TC-<n>" keeps those trailing digits as the
+  // LAST run of digits in the string, which is what compareExternalId keys off.
+  const idNine = `E2E${stamp}-TC-9`;
+  const idTen = `E2E${stamp}-TC-10`;
+  const titleNine = `E2E Sort ID Nine ${stamp}`;
+  const titleTen = `E2E Sort ID Ten ${stamp}`;
+  const prioTitle = {
+    P0: `E2E Sort Prio P0 ${stamp}`,
+    P1: `E2E Sort Prio P1 ${stamp}`,
+    P2: `E2E Sort Prio P2 ${stamp}`,
+    P3: `E2E Sort Prio P3 ${stamp}`,
+  };
+  // Mixed case, chosen so a raw (case-sensitive, ASCII) sort gives a DIFFERENT order than the
+  // required case-insensitive one: every uppercase letter sorts below every lowercase letter in
+  // plain string comparison, so a naive sort would read "Mango, Zebra, apple" — only a genuinely
+  // case-insensitive comparator produces the correct alphabetical "apple, Mango, Zebra".
+  const tcTitle = {
+    a: `apple Sort TC ${stamp}`,
+    m: `Mango Sort TC ${stamp}`,
+    z: `Zebra Sort TC ${stamp}`,
+  };
+
+  /** Titles from `candidates` that appear in the run table, in the DOM (i.e. on-screen row) order. */
+  async function orderedTitles(page: Page, candidates: string[]): Promise<string[]> {
+    const rows = await page.locator("tbody tr").all();
+    const order: string[] = [];
+    for (const row of rows) {
+      const text = await row.innerText();
+      const match = candidates.find((c) => text.includes(c));
+      if (match) order.push(match);
+    }
+    return order;
+  }
+
+  test.beforeAll(async () => {
+    api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const cycle = await (
+      await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Sort ${stamp}` } })
+    ).json();
+    cycleId = cycle.id;
+
+    // Bulk-create's RETURNING order is not guaranteed to match the request payload's order (see the
+    // comment on bulkCreateTestCases in legacy.service.ts), so the cycle's own item order below is
+    // built by looking each id up by its (unique) title rather than assuming array index alignment.
+    const rows = [
+      { title: titleTen, status: "Approved", externalId: idTen },
+      { title: titleNine, status: "Approved", externalId: idNine },
+      // Deliberately scrambled — not already in P0..P3 order — so a passing test can't be
+      // accidentally explained by "existing order happens to match".
+      { title: prioTitle.P2, status: "Approved", priority: "P2" },
+      { title: prioTitle.P0, status: "Approved", priority: "P0" },
+      { title: prioTitle.P3, status: "Approved", priority: "P3" },
+      { title: prioTitle.P1, status: "Approved", priority: "P1" },
+      // Deliberately not in alphabetical (or ASCII) order either, for the same reason as above.
+      { title: tcTitle.z, status: "Approved" },
+      { title: tcTitle.a, status: "Approved" },
+      { title: tcTitle.m, status: "Approved" },
+    ];
+    const created: { created: { id: string; title: string }[] } = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, { data: { testcases: rows } })
+    ).json();
+    testcaseIds = created.created.map((c) => c.id);
+    const idByTitle = new Map(created.created.map((c) => [c.title, c.id]));
+    // Added in this exact order, which is what "the existing order" (no sort selected) means below.
+    const orderedIds = rows.map((r) => idByTitle.get(r.title)!);
+    await api.post(`/api/cycles/${cycleId}/testcases`, { data: { testcaseIds: orderedIds } });
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await cleanUpRun(api, cycleId, testcaseIds);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+    await expect(page.getByRole("button", { name: "Sort by ID" })).toBeVisible();
+  });
+
+  test("no sort selected keeps the existing (item) order", async ({ page }) => {
+    // Added as TC-10 then TC-9 (see beforeAll) — a numeric ID sort would show them the other way
+    // around, so this pins that neither column is sorted by default.
+    await expect.poll(() => orderedTitles(page, [titleTen, titleNine])).toEqual([titleTen, titleNine]);
+  });
+
+  test("ID sorts by the numeric portion of the external id, not string order, and toggles direction", { tag: '@tesbo.testId("TES-TC-3010")' }, async ({ page }) => {
+    await page.getByRole("button", { name: "Sort by ID" }).click();
+    // Ascending, numeric: TC-9 before TC-10 — a plain string sort would put "TC-10" first.
+    await expect.poll(() => orderedTitles(page, [titleNine, titleTen])).toEqual([titleNine, titleTen]);
+    await expect(page.getByRole("button", { name: "Sort by ID, currently ascending" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Sort by ID, currently ascending" }).click();
+    await expect.poll(() => orderedTitles(page, [titleNine, titleTen])).toEqual([titleTen, titleNine]);
+    await expect(page.getByRole("button", { name: "Sort by ID, currently descending" })).toBeVisible();
+  });
+
+  test("Priority sorts P0 -> P3 (the app's existing convention), and toggles direction", { tag: '@tesbo.testId("TES-TC-3011")' }, async ({ page }) => {
+    const ascending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
+    await page.getByRole("button", { name: "Sort by Priority" }).click();
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+
+    await page.getByRole("button", { name: "Sort by Priority, currently ascending" }).click();
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
+  });
+
+  test("Test Case sorts alphabetically by title, case-insensitively, and toggles direction", { tag: '@tesbo.testId("TES-TC-3014")' }, async ({ page }) => {
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    // "apple, Mango, Zebra" — not "Mango, Zebra, apple", which is what a case-sensitive/raw
+    // comparison would produce (every uppercase letter sorts below every lowercase one otherwise).
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently ascending" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Sort by Test Case, currently ascending" }).click();
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently descending" })).toBeVisible();
+  });
+
+  test("only one column sorts at a time — selecting another column replaces it", { tag: '@tesbo.testId("TES-TC-3012")' }, async ({ page }) => {
+    const idSort = page.getByRole("button", { name: "Sort by ID" });
+    await idSort.click();
+    await expect(page.getByRole("button", { name: "Sort by ID, currently ascending" })).toBeVisible();
+
+    // Switching to Priority drops the ID sort rather than combining with it — ID's control reads
+    // as un-sorted again, and the row order now reflects Priority alone.
+    await page.getByRole("button", { name: "Sort by Priority" }).click();
+    await expect(page.getByRole("button", { name: "Sort by ID" })).toBeVisible();
+    const prioAscending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
+    await expect.poll(() => orderedTitles(page, prioAscending)).toEqual(prioAscending);
+
+    // And switching from Priority to Test Case behaves the same way: Priority's control reads as
+    // un-sorted again, and the row order now reflects Test Case alone.
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await expect(page.getByRole("button", { name: "Sort by Priority" })).toBeVisible();
+    const tcAscending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, tcAscending)).toEqual(tcAscending);
+  });
+
+  test("the sort order is preserved after the table is narrowed by a search term", { tag: '@tesbo.testId("TES-TC-3013")' }, async ({ page }) => {
+    await page.getByRole("button", { name: "Sort by Priority" }).click();
+    await page.getByPlaceholder("Search test cases…").fill("E2E Sort Prio");
+
+    const ascending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    // And the ID-only cases are correctly filtered out, not merely re-ordered to the bottom.
+    await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(titleTen, { exact: true })).toHaveCount(0);
+  });
+
+  test("Test Case sort composes with a search term the same way Priority's does", { tag: '@tesbo.testId("TES-TC-3015")' }, async ({ page }) => {
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await page.getByPlaceholder("Search test cases…").fill("Sort TC");
+
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    // The ID/Priority-only cases are filtered out, not merely re-ordered to the bottom.
+    await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(prioTitle.P0, { exact: true })).toHaveCount(0);
+  });
+});
+
+/*
+ * "Test Run shows fewer test cases than Test Case Repository": the repository screen treats a
+ * selected suite as itself plus every suite nested under it (includeDescendants, see
+ * loadSelectedSuiteCases in app/(app)/projects/[id]/testcases/page.tsx), but the Add Test Cases
+ * picker's own suite filter matched only `tc.suiteId === filterSuiteId` — an approved case filed
+ * under a CHILD suite of the one selected was silently excluded, so a suite the repository reported
+ * as (for example) 170 approved cases offered only 165 in the picker. Fixed by having the picker
+ * walk the already-loaded flat suite list to build the same subtree the repository's
+ * includeDescendants produces server-side.
+ */
+test.describe("Add Test Cases picker — suite filter", () => {
+  test("selecting a parent suite also offers Approved cases filed under its child suite", { tag: '@tesbo.testId("TES-TC-2013")' }, async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let parentSuiteId = "";
+    let childSuiteId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const parentSuiteName = `E2E Picker Parent ${stamp}`;
+      const parentSuite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: parentSuiteName } })
+      ).json();
+      parentSuiteId = parentSuite.id;
+      const childSuite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, {
+          data: { name: `E2E Picker Child ${stamp}`, parentId: parentSuiteId },
+        })
+      ).json();
+      childSuiteId = childSuite.id;
+
+      const parentCaseTitle = `E2E Picker Parent Case ${stamp}`;
+      const childCaseTitle = `E2E Picker Child Case ${stamp}`;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: parentCaseTitle, status: "Approved", suiteId: parentSuiteId },
+              { title: childCaseTitle, status: "Approved", suiteId: childSuiteId },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Suite Filter ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+
+      const suiteSelect = page.locator("select:has(option:text-is('All Suites'))");
+      await suiteSelect.selectOption({ label: parentSuiteName });
+
+      // The regression: filtering to the PARENT suite must also surface the approved case filed
+      // directly under its CHILD suite, not just the parent's own case.
+      await expect(page.getByText(parentCaseTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText(childCaseTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText("0 of 2 selectable selected", { exact: true })).toBeVisible();
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
+      if (childSuiteId) await api.delete(`/api/suites/${childSuiteId}`, { failOnStatusCode: false });
+      if (parentSuiteId) await api.delete(`/api/suites/${parentSuiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
+
 test.describe("Test Run filters — concurrent updates, pagination boundary, and zero-case runs", () => {
   test("an execution reassigned by a concurrent caller is reflected correctly under the Assignee filter after reload", { tag: '@tesbo.testId("TES-TC-2011")' }, async ({ page }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -522,5 +775,104 @@ test.describe("Test Run filters — concurrent updates, pagination boundary, and
       await cleanUpRun(api, cycleId, testcaseIds);
       await api.dispose();
     }
+  });
+});
+
+/*
+ * Schedule Run — "Run At" must reject a past date/time and accept a future one.
+ *
+ * Scheduled runs themselves are not implemented server-side (see execution-ops.spec.ts's
+ * EXO-A-07/08b) — the create route always answers 501 regardless of a valid body. This section is
+ * scoped to what IS real today: the "Run At" field's own validation, both client-side (the form
+ * must never even send a past instant) and server-side (LegacyController.validateScheduleRunAt,
+ * which runs before the 501 so it cannot be bypassed by a caller skipping the form).
+ */
+test.describe("Schedule Run — Run At validation", () => {
+  let cycleId: string;
+  let cycleName: string;
+
+  test.beforeAll(async () => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      cycleName = `E2E ScheduleRunAt ${Date.now()}`;
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: cycleName } })
+      ).json();
+      cycleId = cycle.id;
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test.afterAll(async () => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  /** The "Test Run" select isn't tied to its label via for/id, so this walks the DOM structure. */
+  const testRunSelect = (page: Page) =>
+    page.locator('xpath=//label[normalize-space(text())="Test Run"]/following-sibling::select');
+
+  test("a past Run At is blocked client-side with an inline error, before any request is sent", { tag: '@tesbo.testId("TES-TC-2203")' }, async ({ page }) => {
+    let scheduleRequestSent = false;
+    await page.route("**/api/projects/*/cycles/schedules", async (route) => {
+      if (route.request().method() === "POST") scheduleRequestSent = true;
+      await route.continue();
+    });
+
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Past Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    // A clearly past datetime-local value — not merely a different day, to also cover "today with
+    // an earlier time" would need the current clock; a full year in the past is unambiguous either way.
+    await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
+    await page.getByRole("button", { name: "Create Schedule" }).click();
+
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
+    expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
+  });
+
+  test("a future Run At passes client validation and reaches the server (which then 501s)", { tag: '@tesbo.testId("TES-TC-2204")' }, async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Future Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const futureValue = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+    await page.locator('input[type="datetime-local"]').fill(futureValue);
+    await page.getByRole("button", { name: "Create Schedule" }).click();
+
+    // Client-side validation passes; the still-unimplemented backend is what answers, honestly.
+    await expect(page.getByText("Scheduled runs are not available yet")).toBeVisible();
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+  });
+
+  test("a past Run At shows the inline error as soon as it's picked, before Create Schedule is clicked", { tag: '@tesbo.testId("TES-TC-2205")' }, async ({ page }) => {
+    let scheduleRequestSent = false;
+    await page.route("**/api/projects/*/cycles/schedules", async (route) => {
+      if (route.request().method() === "POST") scheduleRequestSent = true;
+      await route.continue();
+    });
+
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Inline Past Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
+
+    // No submit click here — the error must appear from the field's own onChange.
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
+    expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
+
+    // Correcting to a future value clears the inline error immediately too, still without submitting.
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const futureValue = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+    await page.locator('input[type="datetime-local"]').fill(futureValue);
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+    expect(scheduleRequestSent, "still no request from correcting the field alone").toBe(false);
   });
 });

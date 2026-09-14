@@ -17,8 +17,6 @@ import {
   IconActivity,
 } from "@tabler/icons-react";
 import {
-  authMe,
-  getProject,
   listCycles,
   listActivity,
   getProjectDashboardSummary,
@@ -28,7 +26,16 @@ import {
 } from "@/lib/api";
 import { Card, PageLoader, StatusChip, type StatusChipProps } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { OwnerAvatar } from "@/components/testplans/PlanCard";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface DashboardData {
+  summary: ProjectDashboardSummary;
+  runs: TestRunListItem[];
+  activities: ActivityLogItem[];
+}
 
 /* ───── shared small helpers ───── */
 
@@ -153,60 +160,70 @@ export default function ProjectDashboardPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
 
-  const [project, setProject] = useState<Record<string, unknown> | null>(null);
-  const [summary, setSummary] = useState<ProjectDashboardSummary | null>(null);
-  const [runs, setRuns] = useState<TestRunListItem[]>([]);
-  const [activities, setActivities] = useState<ActivityLogItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `dashboard:${projectId}`;
+  const cached = getPageCache<DashboardData>(cacheKey);
+
+  const [summary, setSummary] = useState<ProjectDashboardSummary | null>(cached?.summary ?? null);
+  const [runs, setRuns] = useState<TestRunListItem[]>(cached?.runs ?? []);
+  const [activities, setActivities] = useState<ActivityLogItem[]>(cached?.activities ?? []);
+  // Only the true first visit to this project's dashboard has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates
+  // it in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
 
   useEffect(() => {
     // Reset for the new projectId — otherwise navigating from one project's dashboard straight
     // to another's (the whole project card is a single Link) reuses this same mounted page
     // instance, and stale project/summary from the previous project would render underneath —
-    // or, if the previous project's request settles after this one starts, its .then/.catch
+    // or, if the previous project's request settles after this one starts, its state updates
     // would clobber state that belongs to the new project. `cancelled` guards against that race.
+    // Wrapped in an async IIFE (rather than setState calls direct in the effect body) so the
+    // cache-hit seeding below doesn't trip react-hooks/set-state-in-effect.
     let cancelled = false;
-    setLoading(true);
-    setProject(null);
-    setSummary(null);
-    authMe().then((me) => {
-      if (cancelled) return;
-      if (!me) {
+    (async () => {
+      const key = `dashboard:${projectId}`;
+      const existing = getPageCache<DashboardData>(key);
+      if (existing) {
+        setSummary(existing.summary);
+        setRuns(existing.runs);
+        setActivities(existing.activities);
+        setLoading(false);
+      } else {
+        setLoading(true);
+        setSummary(null);
+      }
+      if (!currentUser) {
         router.replace("/login");
         return;
       }
-      getProject(projectId)
-        .then((p) => {
-          if (cancelled) return undefined;
-          setProject(p);
-          return Promise.all([
-            getProjectDashboardSummary(projectId),
-            listCycles(projectId),
-            listActivity(projectId, { limit: 10 }),
-          ]);
-        })
-        .then((res) => {
-          if (cancelled || !res) return;
-          const [summaryRes, cyclesRes, activityRes] = res;
-          setSummary(summaryRes);
-          setRuns(cyclesRes.slice(0, 4));
-          setActivities(activityRes.list);
-        })
-        .catch(() => {
-          if (!cancelled) router.replace("/projects");
-        })
-        .finally(() => {
-          if (!cancelled) setLoading(false);
-        });
-    });
+      try {
+        const [summaryRes, cyclesRes, activityRes] = await Promise.all([
+          getProjectDashboardSummary(projectId),
+          listCycles(projectId),
+          listActivity(projectId, { limit: 10 }),
+        ]);
+        if (cancelled) return;
+        const next: DashboardData = { summary: summaryRes, runs: cyclesRes.slice(0, 4), activities: activityRes.list };
+        setPageCache(key, next);
+        setSummary(next.summary);
+        setRuns(next.runs);
+        setActivities(next.activities);
+      } catch {
+        if (!cancelled) router.replace("/projects");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [projectId, router]);
+  }, [projectId, router, currentUser]);
 
-  if (loading || !project || !summary) {
-    return <PageLoader variant="screen" label="Loading project…" />;
+  if (loading || !summary) {
+    return <PageLoader variant="content" label="Loading project…" />;
   }
 
   const name = (project.name as string) ?? "";

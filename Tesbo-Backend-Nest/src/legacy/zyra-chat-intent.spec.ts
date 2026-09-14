@@ -10,12 +10,24 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { RequestCacheService } from "../request-cache/request-cache.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
+import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
+import { SuitesCacheService } from "../cache/suites-cache.service";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
+import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import type Redis from "ioredis";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 function makeLegacy(): LegacyService {
+  const db = { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService;
+  const requestCache = new RequestCacheService({} as unknown as AppConfigService);
+  const suitesCache = new SuitesCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const testcasesListCache = new TestcasesListCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
+  const projectOverviewCache = new ProjectOverviewCacheService({} as unknown as Redis, {} as unknown as AppConfigService);
   return new LegacyService(
-    { query: jest.fn(() => Promise.resolve({ rows: [] })) } as unknown as DatabaseService,
+    db,
     {} as unknown as EmailService,
     {} as unknown as PasswordService,
     {} as unknown as AppConfigService,
@@ -25,6 +37,12 @@ function makeLegacy(): LegacyService {
     {} as unknown as IntegrationSyncService,
     {} as unknown as ApiTokenService,
     {} as unknown as PlanLimitsService,
+    requestCache,
+    new ProjectLookupService(db, requestCache),
+    {} as unknown as KbExtractionRunnerService,
+    suitesCache,
+    testcasesListCache,
+    projectOverviewCache,
     {} as unknown as CustomFieldsService
   );
 }
@@ -66,6 +84,8 @@ type Internals = {
   ) => Promise<Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>>;
   stripZyraTestcaseTables: (reply: string, hasRows: boolean) => string;
   detectZyraChatIntent: (message: string) => string;
+  zyraPendingConfirmation: (row: Record<string, unknown>) => { kind: "proposal" | "offer"; actionType?: string; content: string } | null;
+  zyraIsConfirmation: (message: string) => boolean;
   zyraDegradedDecision: (
     message: string,
     existingTestcases: Array<Record<string, unknown>>,
@@ -185,6 +205,75 @@ describe("Zyra chat AI routing", () => {
       ]);
       expect(transcript).toContain("PROPOSAL still awaiting the user's go-ahead");
       expect(transcript).not.toContain("offer to act");
+    });
+  });
+
+  // zyraPendingConfirmation is the exact predicate zyraTranscript uses to decide the PROPOSAL/offer
+  // annotation above, reused by sendZyraChatMessage's confirmation retry so the two can never drift
+  // apart (see the comment on `pending` in zyraTranscript's implementation). Covered directly here
+  // for the same reason the annotation itself is covered above: the shape it returns is what decides
+  // whether "yes" gets a retried model call at all.
+  describe("zyraPendingConfirmation", () => {
+    it("returns a proposal for a create/update/archive turn that wrote nothing", () => {
+      const pending = internals(svc).zyraPendingConfirmation({
+        role: "assistant",
+        action_type: "archive",
+        content: "I found TC-5 Login Test. Should I archive it? Reply yes to confirm.",
+        testcases: []
+      });
+      expect(pending).toEqual({ kind: "proposal", actionType: "archive", content: expect.stringContaining("TC-5") });
+    });
+
+    it("returns an offer for an answer turn that ends with an offer to act", () => {
+      const pending = internals(svc).zyraPendingConfirmation({
+        role: "assistant",
+        action_type: "answer",
+        content: "I found 3 coverage gaps around password reset. Would you like me to generate test cases for any of these gaps?",
+        testcases: []
+      });
+      expect(pending).toEqual({ kind: "offer", content: expect.stringContaining("coverage gaps") });
+    });
+
+    it("returns null once the turn actually saved something — nothing left to confirm", () => {
+      const pending = internals(svc).zyraPendingConfirmation({
+        role: "assistant",
+        action_type: "create",
+        content: "Created 2 test cases.",
+        testcases: [{ id: "11111111-1111-1111-1111-111111111111", externalId: "TC-1" }]
+      });
+      expect(pending).toBeNull();
+    });
+
+    it("returns null for a plain answer with no offer and for a user row", () => {
+      expect(internals(svc).zyraPendingConfirmation({
+        role: "assistant",
+        action_type: "answer",
+        content: "This project has 12 existing test cases covering login.",
+        testcases: []
+      })).toBeNull();
+      expect(internals(svc).zyraPendingConfirmation({ role: "user", content: "yes" })).toBeNull();
+    });
+  });
+
+  // The gate for sendZyraChatMessage's confirmation retry — deliberately anchored to the whole
+  // (trimmed) message, not a substring match, so a qualified "yes" doesn't auto-confirm something
+  // the user didn't fully agree to.
+  describe("zyraIsConfirmation", () => {
+    it.each(["yes", "Yes.", "yes please", "go ahead", "do it", " OK ", "sounds good", "please proceed"])(
+      "treats %j as a confirmation",
+      (message) => {
+        expect(internals(svc).zyraIsConfirmation(message)).toBe(true);
+      }
+    );
+
+    it.each([
+      "yes but not the archive one",
+      "no",
+      "yes, delete the login suite instead",
+      "generate test cases for the gaps",
+      ""
+    ])("does not treat %j as a confirmation", (message) => {
+      expect(internals(svc).zyraIsConfirmation(message)).toBe(false);
     });
   });
 

@@ -1,7 +1,8 @@
-import { BadRequestException, ConflictException, ForbiddenException, forwardRef, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ForbiddenException, forwardRef, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { randomBytes, randomUUID } from "crypto";
 import { DatabaseService } from "../database/database.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { isUuid, LegacyService } from "../legacy/legacy.service";
 import { buildCustomFieldFiltersSql } from "./custom-field-filters";
 import { applyDefaultIfMissing, isEmptyValue, validateAndNormalizeValue, validateConfigShape } from "./custom-field-validation";
@@ -12,7 +13,9 @@ import {
   FieldOption,
   FieldStatus,
   FieldType,
-  QueryRunner
+  normalizeTestcaseHeader,
+  QueryRunner,
+  RESERVED_TESTCASE_HEADERS
 } from "./custom-fields.types";
 
 type Body = Record<string, any>;
@@ -46,6 +49,13 @@ function requireFieldName(name: string): void {
   if (!name) throw new BadRequestException({ error: "name is required" });
   if (name.length > NAME_MAX_LENGTH) {
     throw new BadRequestException({ error: `name must be ${NAME_MAX_LENGTH} characters or fewer` });
+  }
+  // A field named e.g. "Title" or "externalId" would land on the same normalized column header as
+  // a fixed test case field the moment it starts appearing in the CSV/XLSX export or the import
+  // template/commit — see RESERVED_TESTCASE_HEADERS. Rejecting it here is the actual fix; nothing
+  // downstream can rename a field the user is actively relying on being called that.
+  if (RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name))) {
+    throw new BadRequestException({ error: "This name is reserved for a built-in test case field" });
   }
 }
 
@@ -90,6 +100,7 @@ export class CustomFieldsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly planLimits: PlanLimitsService,
+    private readonly projectLookup: ProjectLookupService,
     @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService
   ) {}
 
@@ -111,14 +122,17 @@ export class CustomFieldsService {
       values.push(statuses);
       statusFilter = ` AND d.status = ANY($${values.length})`;
     }
-    const res = await this.db.query(`${DEFINITION_SELECT} WHERE d.project_id = $1${statusFilter} ORDER BY d.display_order, d.created_at`, values);
+    const res = await this.db.query(
+      `${DEFINITION_SELECT} WHERE d.project_id = $1 AND d.deleted_at IS NULL${statusFilter} ORDER BY d.display_order, d.created_at`,
+      values
+    );
     return res.rows.map(mapDefinitionRow);
   }
 
   async getDefinition(userId: string | null | undefined, projectId: string, definitionId: string): Promise<CustomFieldDefinitionDto> {
     await this.legacy.requireProjectAccess(userId, projectId);
     requireDefinitionId(definitionId);
-    const res = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2`, [definitionId, projectId]);
+    const res = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2 AND d.deleted_at IS NULL`, [definitionId, projectId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Custom field not found" });
     return mapDefinitionRow(res.rows[0]);
   }
@@ -134,7 +148,7 @@ export class CustomFieldsService {
     const status: FieldStatus = body.active === false ? "inactive" : "active";
 
     const clash = await this.db.query(
-      "SELECT 1 FROM custom_field_definitions WHERE project_id = $1 AND lower(name) = lower($2) AND status <> 'archived'",
+      "SELECT 1 FROM custom_field_definitions WHERE project_id = $1 AND lower(name) = lower($2) AND status <> 'archived' AND deleted_at IS NULL",
       [projectId, name]
     );
     if (clash.rows[0]) throw new BadRequestException({ error: "A field with this name already exists" });
@@ -168,7 +182,10 @@ export class CustomFieldsService {
     await this.requireConfigAccess(userId, projectId);
     requireDefinitionId(definitionId);
 
-    const existingRes = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2`, [definitionId, projectId]);
+    const existingRes = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2 AND d.deleted_at IS NULL`, [
+      definitionId,
+      projectId
+    ]);
     if (!existingRes.rows[0]) throw new NotFoundException({ error: "Custom field not found" });
     const existing = mapDefinitionRow(existingRes.rows[0]);
     if (existing.status === "archived") throw new BadRequestException({ error: "Archived fields are read-only" });
@@ -182,7 +199,7 @@ export class CustomFieldsService {
       requireFieldName(name);
       if (name.toLowerCase() !== existing.name.toLowerCase()) {
         const clash = await this.db.query(
-          "SELECT 1 FROM custom_field_definitions WHERE project_id = $1 AND lower(name) = lower($2) AND status <> 'archived' AND id <> $3",
+          "SELECT 1 FROM custom_field_definitions WHERE project_id = $1 AND lower(name) = lower($2) AND status <> 'archived' AND deleted_at IS NULL AND id <> $3",
           [projectId, name, definitionId]
         );
         if (clash.rows[0]) throw new BadRequestException({ error: "A field with this name already exists" });
@@ -262,7 +279,10 @@ export class CustomFieldsService {
     if (!trimmed) throw new BadRequestException({ error: "label is required" });
 
     return this.db.transaction(async (client) => {
-      const res = await client.query(`SELECT * FROM custom_field_definitions WHERE id = $1 AND project_id = $2 FOR UPDATE`, [definitionId, projectId]);
+      const res = await client.query(`SELECT * FROM custom_field_definitions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL FOR UPDATE`, [
+        definitionId,
+        projectId
+      ]);
       const row = res.rows[0];
       if (!row) throw new NotFoundException({ error: "Custom field not found" });
       if (row.status === "archived") throw new BadRequestException({ error: "Archived fields are read-only" });
@@ -302,7 +322,10 @@ export class CustomFieldsService {
     requireDefinitionId(definitionId);
 
     return this.db.transaction(async (client) => {
-      const res = await client.query(`SELECT * FROM custom_field_definitions WHERE id = $1 AND project_id = $2 FOR UPDATE`, [definitionId, projectId]);
+      const res = await client.query(`SELECT * FROM custom_field_definitions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL FOR UPDATE`, [
+        definitionId,
+        projectId
+      ]);
       const row = res.rows[0];
       if (!row) throw new NotFoundException({ error: "Custom field not found" });
       if (row.status === "archived") throw new BadRequestException({ error: "Archived fields are read-only" });
@@ -337,7 +360,7 @@ export class CustomFieldsService {
     if (!Array.isArray(orderedIds) || !orderedIds.length) throw new BadRequestException({ error: "orderedIds is required" });
 
     const current = await this.db.query<{ id: string }>(
-      "SELECT id FROM custom_field_definitions WHERE project_id = $1 AND status <> 'archived'",
+      "SELECT id FROM custom_field_definitions WHERE project_id = $1 AND status <> 'archived' AND deleted_at IS NULL",
       [projectId]
     );
     const currentIds = new Set(current.rows.map((r) => r.id));
@@ -361,7 +384,10 @@ export class CustomFieldsService {
     requireDefinitionId(definitionId);
     if (!["active", "inactive", "archived"].includes(status)) throw new BadRequestException({ error: "Invalid status" });
 
-    const existingRes = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2`, [definitionId, projectId]);
+    const existingRes = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2 AND d.deleted_at IS NULL`, [
+      definitionId,
+      projectId
+    ]);
     if (!existingRes.rows[0]) throw new NotFoundException({ error: "Custom field not found" });
     const existing = mapDefinitionRow(existingRes.rows[0]);
     if (existing.status === "archived") throw new BadRequestException({ error: "Archived fields cannot be reactivated" });
@@ -381,18 +407,51 @@ export class CustomFieldsService {
     return dto;
   }
 
+  /**
+   * Soft-delete: sets deleted_at/deleted_by rather than removing the row, so recorded values on
+   * test cases that already hold one are never destroyed (see getValuesForTestCase's `OR v.id IS
+   * NOT NULL` carve-out) and the action works uniformly regardless of `status` or `isUsed` — the
+   * two things that used to leave an in-use, archived field with no lifecycle action left at all.
+   *
+   * Guarded by `deleted_at IS NULL` so a second delete of the same field (double-click, a second
+   * tab, a retried request) finds nothing to update and surfaces the same 404 as a truly unknown
+   * id, instead of silently double-logging the activity feed.
+   */
   async deleteDefinition(userId: string | null | undefined, projectId: string, definitionId: string): Promise<void> {
     await this.requireConfigAccess(userId, projectId);
     requireDefinitionId(definitionId);
 
-    const existingRes = await this.db.query(`${DEFINITION_SELECT} WHERE d.id = $1 AND d.project_id = $2`, [definitionId, projectId]);
-    if (!existingRes.rows[0]) throw new NotFoundException({ error: "Custom field not found" });
-    const dto = mapDefinitionRow(existingRes.rows[0]);
-    if (dto.isUsed) {
-      throw new ConflictException({ error: "Field has recorded values and cannot be deleted; archive it instead", code: "FORCE_ARCHIVE" });
-    }
-    await this.db.query("DELETE FROM custom_field_definitions WHERE id = $1 AND project_id = $2", [definitionId, projectId]);
+    const res = await this.db.query(
+      `UPDATE custom_field_definitions SET deleted_at = now(), deleted_by = $3, updated_by = $3, updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
+       RETURNING *`,
+      [definitionId, projectId, userId ?? null]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Custom field not found" });
+    const dto = mapDefinitionRow(res.rows[0]);
     await this.legacy.logProjectActivity(projectId, userId ?? null, "custom_field_deleted", "custom_field_definition", dto.id, dto.name, { before: dto });
+  }
+
+  /**
+   * Undoes a delete. Only reachable while the field is still soft-deleted — once
+   * CustomFieldDefinitionList's session-local "Undo" affordance is gone (the settings page was
+   * reloaded), nothing in the product calls this anymore, but the row itself remains restorable
+   * at the database layer indefinitely; this is the only path back.
+   */
+  async restoreDefinition(userId: string | null | undefined, projectId: string, definitionId: string): Promise<CustomFieldDefinitionDto> {
+    await this.requireConfigAccess(userId, projectId);
+    requireDefinitionId(definitionId);
+
+    const res = await this.db.query(
+      `UPDATE custom_field_definitions SET deleted_at = NULL, deleted_by = NULL, updated_by = $3, updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND deleted_at IS NOT NULL
+       RETURNING *, (SELECT EXISTS (SELECT 1 FROM custom_field_values v WHERE v.definition_id = $1)) AS is_used`,
+      [definitionId, projectId, userId ?? null]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Deleted custom field not found" });
+    const dto = mapDefinitionRow(res.rows[0]);
+    await this.legacy.logProjectActivity(projectId, userId ?? null, "custom_field_restored", "custom_field_definition", dto.id, dto.name, { after: dto });
+    return dto;
   }
 
   async getValuesForTestCase(userId: string | null | undefined, projectId: string, testcaseId: string): Promise<CustomFieldValueDto[]> {
@@ -405,7 +464,7 @@ export class CustomFieldsService {
       `SELECT d.id, d.key, d.name, d.description, d.field_type, d.status, d.required, d.config, d.display_order, v.value
        FROM custom_field_definitions d
        LEFT JOIN custom_field_values v ON v.definition_id = d.id AND v.testcase_id = $2
-       WHERE d.project_id = $1 AND (d.status <> 'archived' OR v.id IS NOT NULL)
+       WHERE d.project_id = $1 AND (d.status <> 'archived' OR v.id IS NOT NULL) AND (d.deleted_at IS NULL OR v.id IS NOT NULL)
        ORDER BY d.display_order`,
       [projectId, testcaseId]
     );
@@ -438,7 +497,8 @@ export class CustomFieldsService {
     testcaseId: string,
     values: Body,
     runner: QueryRunner = this.db,
-    mode: "enforce" | "skip-if-disabled" = "enforce"
+    mode: "enforce" | "skip-if-disabled" = "enforce",
+    options: { testCaseIsNew?: boolean } = {}
   ): Promise<void> {
     if (mode === "enforce") {
       await this.legacy.requireProjectAccess(actorId, projectId);
@@ -456,7 +516,7 @@ export class CustomFieldsService {
 
     const context = await this.loadWriteContext(projectId, runner, mode);
     if (!context) return;
-    await this.setValuesWithContext(actorId, projectId, testcaseId, values, context, runner);
+    await this.setValuesWithContext(actorId, projectId, testcaseId, values, context, runner, options);
   }
 
   /**
@@ -476,15 +536,21 @@ export class CustomFieldsService {
     mode: "enforce" | "skip-if-disabled" = "skip-if-disabled"
   ): Promise<CustomFieldWriteContext | null> {
     try {
-      const orgRes = await runner.query<{ organization_id: string }>("SELECT organization_id FROM projects WHERE id = $1", [projectId]);
-      const organizationId = orgRes.rows[0]?.organization_id;
+      // Memoized per-request by ProjectLookupService when `runner` is the default pool (the common
+      // case here); bypassed to a live read through `runner` untouched when a caller passes an
+      // explicit transaction client, so this never serves a stale value to a caller reading inside
+      // the testcase-external-id advisory lock (see ProjectLookupService's own doc comment).
+      const project = await this.projectLookup.getProjectBasics(projectId, runner === this.db ? undefined : runner);
+      const organizationId = project?.organizationId;
       if (organizationId) await this.planLimits.assertCustomFieldsEnabled(organizationId);
     } catch (err) {
       if (mode === "skip-if-disabled") return null;
       throw err;
     }
 
-    const definitionsRes = await runner.query<Body>("SELECT * FROM custom_field_definitions WHERE project_id = $1", [projectId]);
+    const definitionsRes = await runner.query<Body>("SELECT * FROM custom_field_definitions WHERE project_id = $1 AND deleted_at IS NULL", [
+      projectId
+    ]);
     const definitions = definitionsRes.rows;
     return { definitions, definitionsById: new Map(definitions.map((d) => [d.id, d])) };
   }
@@ -678,9 +744,10 @@ export class CustomFieldsService {
   async buildListFilterSql(projectId: string, rawFilters: unknown, paramIndexStart: number) {
     const filters = this.parseFilterInput(rawFilters);
     if (!filters.length) return { joinSql: "", whereSql: "", params: [] as unknown[] };
-    const res = await this.db.query<{ id: string; field_type: FieldType }>("SELECT id, field_type FROM custom_field_definitions WHERE project_id = $1", [
-      projectId
-    ]);
+    const res = await this.db.query<{ id: string; field_type: FieldType }>(
+      "SELECT id, field_type FROM custom_field_definitions WHERE project_id = $1 AND deleted_at IS NULL",
+      [projectId]
+    );
     const definitionsById = new Map(res.rows.map((r) => [r.id, { fieldType: r.field_type }]));
     return buildCustomFieldFiltersSql(filters, definitionsById, paramIndexStart);
   }

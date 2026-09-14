@@ -2,10 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconColumns } from "@tabler/icons-react";
+import { IconArrowsSort, IconColumns, IconSortAscending, IconSortDescending } from "@tabler/icons-react";
 import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+
+/** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
+export type RepoTcSortColumn = "id" | "title" | "priority";
+export type RepoTcSort = { column: RepoTcSortColumn; direction: "asc" | "desc" } | null;
+const SORTABLE_COLUMNS = new Set<RepoTcSortColumn>(["id", "title", "priority"]);
 
 export type RepoTcColumnId =
   | "select"
@@ -211,6 +216,10 @@ export type RepositoryTestCaseTableProps = {
    * filter bar, beside the other dropdowns) instead of its own strip above the table.
    */
   columnsSlot?: HTMLElement | null;
+  /** Current ID/Test case title/Priority sort, or null for the server's default (creation) order. */
+  sort?: RepoTcSort;
+  /** Toggles the given column's sort: unsorted/other column -> ascending, same column again -> flips direction. */
+  onToggleSort?: (column: RepoTcSortColumn) => void;
 };
 
 export function RepositoryTestCaseTable({
@@ -225,12 +234,13 @@ export function RepositoryTestCaseTable({
   onOpenRow,
   suitePanelOpen,
   columnsSlot,
+  sort,
+  onToggleSort,
 }: RepositoryTestCaseTableProps) {
   const [dataOrder, setDataOrder] = useState<RepoDataColumnId[]>(DEFAULT_DATA_ORDER);
   const [visible, setVisible] = useState<Record<RepoDataColumnId, boolean>>(DEFAULT_VISIBLE);
   const [widths, setWidths] = useState<Record<RepoTcColumnId, number>>(DEFAULT_WIDTHS);
   const [prefsReady, setPrefsReady] = useState(false);
-  const [dragOverId, setDragOverId] = useState<RepoDataColumnId | null>(null);
   const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
   const columnsMenuRef = useRef<HTMLDivElement>(null);
 
@@ -317,19 +327,6 @@ export function RepositoryTestCaseTable({
     [orderedColumns, widths],
   );
 
-  const moveColumn = useCallback((from: RepoDataColumnId, to: RepoDataColumnId) => {
-    if (from === to) return;
-    setDataOrder((prev) => {
-      const next = [...prev];
-      const i = next.indexOf(from);
-      const j = next.indexOf(to);
-      if (i === -1 || j === -1) return prev;
-      next.splice(i, 1);
-      next.splice(j, 0, from);
-      return next;
-    });
-  }, []);
-
   const toggleColumnVisible = useCallback((id: RepoDataColumnId) => {
     if (LOCKED_COLUMN_SET.has(id)) return;
     setVisible((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -338,72 +335,17 @@ export function RepositoryTestCaseTable({
   function renderHeaderCell(col: RepoTcColumnId) {
     const w = widths[col];
     const label = COLUMN_LABELS[col];
-    const isData = col !== "select";
     const thSizing = { width: w, minWidth: w, maxWidth: w, position: "relative" as const };
+    const sortable = onToggleSort && SORTABLE_COLUMNS.has(col as RepoTcSortColumn);
+    const activeDirection = sortable && sort?.column === col ? sort.direction : null;
 
     return (
       <th
         key={col}
         style={thSizing}
         className="align-middle"
-        draggable={isData}
-        onDragStart={
-          isData
-            ? (e) => {
-                e.dataTransfer.effectAllowed = "move";
-                e.dataTransfer.setData("text/plain", col);
-              }
-            : undefined
-        }
-        onDragOver={
-          isData
-            ? (e) => {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "move";
-              }
-            : undefined
-        }
-        onDragEnter={
-          isData
-            ? () => {
-                setDragOverId(col);
-              }
-            : undefined
-        }
-        onDragLeave={
-          isData
-            ? () => {
-                setDragOverId((cur) => (cur === col ? null : cur));
-              }
-            : undefined
-        }
-        onDrop={
-          isData
-            ? (e) => {
-                e.preventDefault();
-                const from = e.dataTransfer.getData("text/plain") as RepoDataColumnId;
-                setDragOverId(null);
-                if (from && DATA_COLUMN_IDS.includes(from)) moveColumn(from, col);
-              }
-            : undefined
-        }
-        onDragEnd={() => setDragOverId(null)}
       >
-        <div
-          className={`flex items-center gap-1.5 pr-2 ${dragOverId === col && isData ? "rounded-md bg-[var(--brand-soft)]" : ""}`}
-        >
-          {isData && (
-            <span className="cursor-grab text-[var(--muted-soft)] select-none active:cursor-grabbing" aria-hidden="true">
-              <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" className="opacity-60">
-                <circle cx="3" cy="3" r="1.25" />
-                <circle cx="7" cy="3" r="1.25" />
-                <circle cx="3" cy="7" r="1.25" />
-                <circle cx="7" cy="7" r="1.25" />
-                <circle cx="3" cy="11" r="1.25" />
-                <circle cx="7" cy="11" r="1.25" />
-              </svg>
-            </span>
-          )}
+        <div className="flex items-center gap-1.5 pr-2">
           {col === "select" ? (
             <input
               type="checkbox"
@@ -412,6 +354,25 @@ export function RepositoryTestCaseTable({
               aria-label="Select all test cases on this page"
               className="mx-auto block"
             />
+          ) : sortable ? (
+            <button
+              type="button"
+              onClick={() => onToggleSort!(col as RepoTcSortColumn)}
+              className={`inline-flex min-w-0 items-center gap-1 truncate ${
+                activeDirection ? "text-[var(--accent-light)]" : "hover:text-[var(--foreground)]"
+              }`}
+              title={`Sort by ${label}`}
+              aria-label={`Sort by ${label}${activeDirection ? `, currently ${activeDirection === "asc" ? "ascending" : "descending"}` : ""}`}
+            >
+              <span className="truncate">{label}</span>
+              {activeDirection === "asc" ? (
+                <IconSortAscending size={13} stroke={1.75} className="shrink-0" />
+              ) : activeDirection === "desc" ? (
+                <IconSortDescending size={13} stroke={1.75} className="shrink-0" />
+              ) : (
+                <IconArrowsSort size={13} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
+              )}
+            </button>
           ) : (
             <span className="truncate">{label}</span>
           )}
@@ -609,7 +570,7 @@ export function RepositoryTestCaseTable({
           })}
           <p className="mt-2 border-t border-[var(--border-subtle)] px-3 pt-2 text-[11px] text-[var(--muted)]">
             {
-              "The selection column stays first. Drag headers to reorder data fields, and drag header edges to resize columns."
+              "The selection column stays first. Drag header edges to resize columns."
             }
           </p>
         </div>

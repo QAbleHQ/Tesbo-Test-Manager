@@ -3,10 +3,10 @@ import type { Response } from "express";
 import { AuthenticatedRequest } from "../common/request.types";
 import { SignupService } from "./signup.service";
 
-type SelfServeStartBody = { firstName?: string; lastName?: string; email?: string; password?: string };
+type SelfServeStartBody = { firstName?: string; lastName?: string; mobileNumber?: string; email?: string; password?: string };
 type SelfServeVerifyBody = { email?: string; code?: string };
-type InviteRegisterStartBody = { name?: string; password?: string };
-type InviteOtpStartBody = { name?: string };
+type InviteRegisterStartBody = { firstName?: string; lastName?: string; mobileNumber?: string; password?: string };
+type InviteOtpStartBody = { firstName?: string; lastName?: string; mobileNumber?: string };
 type CodeBody = { code?: string };
 
 @Controller()
@@ -19,6 +19,7 @@ export class SignupController {
     return this.signup.startSelfServeSignup(
       body.firstName,
       body.lastName,
+      body.mobileNumber,
       body.email,
       body.password,
       this.ip(req),
@@ -34,7 +35,15 @@ export class SignupController {
   @Post("/api/invitations/:token/register/start")
   @HttpCode(204)
   startInviteRegistration(@Param("token") token: string, @Body() body: InviteRegisterStartBody, @Req() req: AuthenticatedRequest) {
-    return this.signup.startInviteRegistration(token, body.name, body.password, this.ip(req), req.get("user-agent"));
+    return this.signup.startInviteRegistration(
+      token,
+      body.firstName,
+      body.lastName,
+      body.mobileNumber,
+      body.password,
+      this.ip(req),
+      req.get("user-agent")
+    );
   }
 
   @Post("/api/invitations/:token/register/verify")
@@ -45,7 +54,14 @@ export class SignupController {
   @Post("/api/invitations/:token/register/otp/start")
   @HttpCode(204)
   startInviteOtpRegistration(@Param("token") token: string, @Body() body: InviteOtpStartBody, @Req() req: AuthenticatedRequest) {
-    return this.signup.startInviteOtpRegistration(token, body.name, this.ip(req), req.get("user-agent"));
+    return this.signup.startInviteOtpRegistration(
+      token,
+      body.firstName,
+      body.lastName,
+      body.mobileNumber,
+      this.ip(req),
+      req.get("user-agent")
+    );
   }
 
   @Post("/api/invitations/:token/register/otp/verify")

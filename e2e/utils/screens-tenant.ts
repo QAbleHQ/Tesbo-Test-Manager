@@ -290,6 +290,65 @@ export function seedJiraRequirements(
   );
 }
 
+/** The Linear mirror of seedJiraRequirements — same reasoning, same shape, a different provider. */
+export function seedLinearRequirements(
+  organizationId: string,
+  projectId: string,
+  keys: string[],
+): void {
+  exec(
+    `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+      `VALUES (${literal(organizationId)}, 'linear', 'e2e-screens', 'https://e2e-screens.invalid', 'e2e', '', now() + interval '365 days') ` +
+      `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+  );
+  const connectionId = scalar(
+    `SELECT id FROM integration_connections WHERE organization_id = ${literal(organizationId)} AND provider = 'linear';`,
+  );
+  if (!connectionId) throw new Error("Could not resolve the seeded Linear integration connection");
+
+  const values = keys
+    .map(
+      (key) =>
+        `(${literal(projectId)}, ${literal(connectionId)}, ${literal(key)}, ${literal(key)}, ` +
+        `${literal(`Requirement ${key}`)}, 'Story', 'Todo')`,
+    )
+    .join(", ");
+  exec(
+    `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status) ` +
+      `VALUES ${values} ON CONFLICT DO NOTHING;`,
+  );
+}
+
+/**
+ * Seeds a provider's Knowledge Base folder ("Jira" / "Linear" directly under the project's KB
+ * root), mirroring what IntegrationSyncService.ensureProviderFolder creates the first time a real
+ * sync actually runs. There is no API route to drive an OAuth'd sync from a test (same reason
+ * seedJiraRequirements/seedLinearRequirements go straight to Postgres), so this reproduces just
+ * the folder row a completed sync would have left behind. Returns the folder's id.
+ */
+export function seedProviderKbFolder(
+  organizationId: string,
+  projectId: string,
+  provider: "jira" | "linear",
+): string {
+  const name = provider === "jira" ? "Jira" : "Linear";
+  const rootId = scalar(
+    `SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND is_root = true;`,
+  );
+  if (!rootId) throw new Error("Could not resolve the project's Knowledge Base root folder");
+  exec(
+    `INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, description) ` +
+      `VALUES (${literal(organizationId)}, ${literal(projectId)}, ${literal(rootId)}, ${literal(name)}, ` +
+      `${literal(`Tickets synced from ${name}. Mirrored documents here are read-only.`)}) ` +
+      `ON CONFLICT (project_id, parent_folder_id, name) WHERE is_deleted = false AND parent_folder_id IS NOT NULL ` +
+      `DO UPDATE SET updated_at = now();`,
+  );
+  return scalar(
+    `SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND parent_folder_id = ${literal(rootId)} ` +
+      `AND name = ${literal(name)} AND is_deleted = false;`,
+  );
+}
+
 /** Backdates rows so the dashboard's 7-day and 14-day windows can be exercised without waiting. */
 export function backdate(
   table: "testcases" | "executions",

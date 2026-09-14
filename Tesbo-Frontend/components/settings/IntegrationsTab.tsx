@@ -1,9 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  getWorkspace,
   getBillingInfo,
   getIntegrationStatus,
   disconnectIntegration,
@@ -13,6 +12,7 @@ import {
 } from "@/lib/api";
 import { Button, Card, PageLoader } from "@/components/ui";
 import PricingModal from "@/components/PricingModal";
+import { useAppData } from "@/components/app/AppDataProvider";
 
 const PROVIDERS: {
   id: IntegrationProvider;
@@ -46,27 +46,29 @@ const PROVIDERS: {
 ];
 
 export default function IntegrationsTab() {
-  const [workspaceRole, setWorkspaceRole] = useState<string>("member");
+  const { workspace } = useAppData();
   const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [statuses, setStatuses] = useState<Record<string, IntegrationConnectionStatus>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<IntegrationProvider | null>(null);
+  // A real synchronous guard: two clicks fired before React flushes setDisconnectingProvider both
+  // read the same stale (null) state, so that alone doesn't stop a fast double-click. A ref is
+  // mutated and read back immediately, in the same tick.
+  const disconnectingRef = useRef(false);
   const [pricingOpen, setPricingOpen] = useState(false);
 
-  const canManage = workspaceRole === "owner";
+  const canManage = (workspace?.role || "member").toLowerCase() === "owner";
   const isPro = billingInfo?.plan === "pro";
 
   const loadData = useCallback(async () => {
     try {
-      const [workspace, billing, jira, linear] = await Promise.all([
-        getWorkspace(),
+      const [billing, jira, linear] = await Promise.all([
         getBillingInfo().catch(() => null),
         getIntegrationStatus("jira").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
         getIntegrationStatus("linear").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
       ]);
-      setWorkspaceRole((workspace.role || "member").toLowerCase());
       setBillingInfo(billing);
       setStatuses({ jira, linear });
       setError(null);
@@ -81,6 +83,8 @@ export default function IntegrationsTab() {
 
   async function handleDisconnect(provider: IntegrationProvider) {
     if (!canManage) return;
+    if (disconnectingRef.current) return;
+    disconnectingRef.current = true;
     setDisconnectingProvider(provider);
     setMessage(null);
     setError(null);
@@ -91,6 +95,7 @@ export default function IntegrationsTab() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to disconnect.");
     } finally {
+      disconnectingRef.current = false;
       setDisconnectingProvider(null);
     }
   }

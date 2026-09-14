@@ -1,10 +1,9 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { IconPencil, IconTrash } from "@tabler/icons-react";
 import {
-  authMe,
   listBugs,
   createBug,
   updateBug,
@@ -15,8 +14,6 @@ import {
   deleteBugAttachment,
   getBugAttachmentDownloadUrl,
   listTestRuns,
-  listProjectMembers,
-  getProject,
   type BugItem,
   type BugAttachment,
   type BugSeverity,
@@ -37,11 +34,18 @@ import {
   SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+
+interface BugsData {
+  bugs: BugItem[];
+}
 
 type ViewMode = "kanban" | "list";
 
@@ -190,9 +194,12 @@ function KanbanCard({
       className="group bg-[var(--surface)] border border-[var(--border-subtle)] rounded-lg p-3 cursor-pointer hover:border-[var(--brand-primary)]/40 hover:shadow-sm transition-all"
     >
       <div className="flex items-start justify-between gap-2 mb-2">
-        <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
-          {bug.title}
-        </h4>
+        <div className="min-w-0">
+          <p className="font-mono text-[11px] text-[var(--muted-soft)]">{bug.integrationIssueKey || bug.externalId}</p>
+          <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
+            {bug.title}
+          </h4>
+        </div>
         {/*
           * Same defect as the List view's row actions (Basecamp 10226234070 / 10218564160): a
           * 14px glyph in a ~22px box is a hairline nobody can reliably click. Matches the List
@@ -409,9 +416,18 @@ export default function BugsPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project, projectMembers: members } = useProjectData();
+  const projectName = String(project.name || "");
 
-  const [bugs, setBugs] = useState<BugItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = `bugs:${projectId}`;
+  const cached = getPageCache<BugsData>(cacheKey);
+
+  const [bugs, setBugs] = useState<BugItem[]>(cached?.bugs ?? []);
+  // Only the true first visit to this project's bugs list has no cache to seed from — every
+  // later visit renders the last-known data immediately while the effect below revalidates it
+  // in the background, instead of blocking behind the spinner on every single click.
+  const [loading, setLoading] = useState(!cached);
   const [filterStatus, setFilterStatus] = useState("");
   /*
    * Basecamp 10226242373 ("Severity filter is missing"). Severity is a first-class field — it has its
@@ -437,8 +453,6 @@ export default function BugsPage() {
      mandatory when there's actually something to pick, so reporting a bug is never blocked
      in a project that has no test runs yet */
   const [hasTestRuns, setHasTestRuns] = useState(false);
-  const [members, setMembers] = useState<{ userId: string; email: string; name: string }[]>([]);
-  const [projectName, setProjectName] = useState("");
 
   /* create modal */
   const [showCreate, setShowCreate] = useState(false);
@@ -455,6 +469,15 @@ export default function BugsPage() {
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
   const [createAssigneeId, setCreateAssigneeId] = useState("");
   const [creating, setCreating] = useState(false);
+  /*
+   * Basecamp: >10 attachments made createBug() succeed, then the (single, unbatched)
+   * uploadBugAttachments() request get rejected by the server's per-request file cap — leaving the
+   * modal open with an error and the bug already created. Retrying resubmitted the whole form,
+   * calling createBug() again and producing a duplicate bug. This ref remembers the bug created by
+   * the in-flight (or most recently failed) submit so a retry only resumes the attachment upload
+   * instead of creating a second bug; resetCreate() clears it once the submit is done or abandoned.
+   */
+  const createdBugIdRef = useRef<string | null>(null);
 
   /* edit modal */
   const [editBug, setEditBug] = useState<BugItem | null>(null);
@@ -491,26 +514,31 @@ export default function BugsPage() {
 
   const load = useCallback(() => {
     listBugs(projectId)
-      .then(setBugs)
+      .then((bugsData) => {
+        setPageCache(`bugs:${projectId}`, { bugs: bugsData });
+        setBugs(bugsData);
+      })
       .finally(() => setLoading(false));
   }, [projectId]);
 
   useEffect(() => {
-    authMe().then((me) => {
-      if (!me) {
-        router.replace("/login");
-        return;
-      }
-      load();
-    });
-  }, [router, load]);
+    const key = `bugs:${projectId}`;
+    const existing = getPageCache<BugsData>(key);
+    if (existing) {
+      setBugs(existing.bugs);
+      setLoading(false);
+    }
+    if (!currentUser) {
+      router.replace("/login");
+      return;
+    }
+    load();
+  }, [projectId, router, load, currentUser]);
 
   useEffect(() => {
     getJiraStatus(projectId).then((s) => setJiraConnected(s.connected)).catch(() => setJiraConnected(false));
     getLinearStatus(projectId).then((s) => setLinearConnected(s.connected)).catch(() => setLinearConnected(false));
     listTestRuns(projectId).then((runs) => setHasTestRuns(runs.length > 0)).catch(() => setHasTestRuns(false));
-    listProjectMembers(projectId).then(setMembers).catch(() => {});
-    getProject(projectId).then((p) => setProjectName(String(p.name || ""))).catch(() => setProjectName(""));
   }, [projectId]);
 
   /* filtered list */
@@ -590,6 +618,7 @@ export default function BugsPage() {
 
   /* reset create modal state */
   function resetCreate() {
+    createdBugIdRef.current = null;
     setShowCreate(false);
     setCreateError(null);
     setCreateTitle("");
@@ -609,28 +638,42 @@ export default function BugsPage() {
   /* create */
   async function handleCreate() {
     if (!createTitle.trim() || (hasTestRuns && !createLinks.length)) return;
+    // Belt-and-suspenders alongside the button's `disabled={creating}`: guards a re-entrant call
+    // (e.g. a key-repeat Enter) that lands before the disabled state has re-rendered.
+    if (creating) return;
     const selfLogged = (jiraConnected || linearConnected) && createDestination === "SELF";
     setCreating(true);
     setCreateError(null);
     try {
-      const bug = await createBug(projectId, {
-        title: createTitle.trim(),
-        description: createDesc.trim(),
-        severity: createSeverity,
-        priority: createPriority || null,
-        assigneeId: createAssigneeId || null,
-        externalUrl: selfLogged ? createUrl.trim() : undefined,
-        integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
-        integrationIssueKey: null,
-        betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
-        links: createLinks.map((link) => ({
-          testcaseId: link.testcaseId,
-          cycleId: link.cycleId,
-          executionId: link.executionId,
-        })),
-      });
+      // A retry after a failed attachment upload must not create a second bug: reuse the bug
+      // created by the previous attempt (if any) instead of calling createBug() again.
+      let bugId = createdBugIdRef.current;
+      if (!bugId) {
+        const bug = await createBug(projectId, {
+          title: createTitle.trim(),
+          description: createDesc.trim(),
+          severity: createSeverity,
+          priority: createPriority || null,
+          assigneeId: createAssigneeId || null,
+          externalUrl: selfLogged ? createUrl.trim() : undefined,
+          integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
+          integrationIssueKey: null,
+          betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
+          links: createLinks.map((link) => ({
+            testcaseId: link.testcaseId,
+            cycleId: link.cycleId,
+            executionId: link.executionId,
+          })),
+        });
+        bugId = bug.id;
+        createdBugIdRef.current = bugId;
+      }
       if (createEvidenceMode === "FILES" && createStagedFiles.length) {
-        await uploadBugAttachments(projectId, bug.id, createStagedFiles);
+        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
+        // only resends the files that never made it, not ones already attached to the bug.
+        await uploadBugAttachments(projectId, bugId, createStagedFiles, (batch) => {
+          setCreateStagedFiles((prev) => prev.slice(batch.length));
+        });
       }
       resetCreate();
       load();
@@ -702,7 +745,11 @@ export default function BugsPage() {
         })),
       });
       if (editEvidenceMode === "FILES" && editStagedFiles.length) {
-        await uploadBugAttachments(projectId, editBug.id, editStagedFiles);
+        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
+        // only resends the files that never made it, not ones already attached to the bug.
+        await uploadBugAttachments(projectId, editBug.id, editStagedFiles, (batch) => {
+          setEditStagedFiles((prev) => prev.slice(batch.length));
+        });
       }
       setEditBug(null);
       load();
@@ -726,7 +773,7 @@ export default function BugsPage() {
   }
 
   if (loading) {
-    return <PageLoader variant="screen" />;
+    return <PageLoader variant="content" />;
   }
 
   return (
@@ -924,6 +971,7 @@ export default function BugsPage() {
                               */}
                             <td>
                               <div className="flex flex-col gap-0.5 max-w-sm">
+                                <span className="font-mono text-[11px] text-[var(--muted-soft)]">{b.integrationIssueKey || b.externalId}</span>
                                 <span
                                   title={b.title}
                                   className="line-clamp-2 text-sm font-medium text-[var(--accent-light)] hover:underline break-words"
@@ -1074,12 +1122,17 @@ export default function BugsPage() {
       >
         {viewBug && (
           <div className="space-y-5">
-            {/* Title + Status */}
+            {/* Bug Key + Title + Status */}
             <div>
               <div className="flex items-start justify-between gap-3">
-                <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
-                  {viewBug.title}
-                </h3>
+                <div className="min-w-0">
+                  {/* Falls back to the bug's own per-project id when it has no external tracker
+                      ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
+                  <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
+                  <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
+                    {viewBug.title}
+                  </h3>
+                </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <BugSeverityBadge severity={viewBug.severity} />
                   <BugPriorityBadge priority={viewBug.priority} />
