@@ -2970,14 +2970,17 @@ export class LegacyService implements OnModuleInit {
    * The project id is not redundant with the test case id: it is what makes this answerable without
    * a second round trip, and it means a case belonging to another project is "not found" here rather
    * than readable by whoever guesses its uuid.
+   *
+   * Accepts either the row's uuid or its external id (e.g. "PRO-TC-319") — the latter is what a Zyra
+   * citation actually carries (see zyraSourceRefIndex, which keys a testcase ref by externalId, never
+   * the uuid), so a testcaseId that isn't a uuid falls back to matching external_id instead of 404ing
+   * outright. Same dual-key resolution findProjectTestcase already uses for Zyra's own operations.
    */
   async getTestCaseForUser(userId: string | null | undefined, projectId: string, testcaseId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    if (!isUuid(testcaseId)) throw new NotFoundException({ error: "Test case not found" });
-    const res = await this.db.query("SELECT * FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [
-      testcaseId,
-      projectId
-    ]);
+    const res = isUuid(testcaseId)
+      ? await this.db.query("SELECT * FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId])
+      : await this.db.query("SELECT * FROM testcases WHERE external_id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Test case not found" });
     return toCamel(res.rows[0]);
   }

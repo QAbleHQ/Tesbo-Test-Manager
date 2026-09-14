@@ -120,7 +120,7 @@ function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
 }
 
 // ─── TestcaseTable ────────────────────────────────────────────────────────────
-function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
+function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; projectId: string }) {
   if (!rows.length) return null;
   const tsv = toTsv(
     ["ID", "Title", "Priority", "Status", "First step", "Source"],
@@ -184,7 +184,7 @@ function TestcaseTable({ rows }: { rows: ZyraChatTestcaseRow[] }) {
                       {row.action || "suggested"}
                     </span>
                     <span className="text-[10px] text-[var(--muted)]">AI · Zyra chat</span>
-                    <ZyraCitationsList refs={row.sourceRefs} />
+                    <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
                   </div>
                 </td>
               </tr>
@@ -449,7 +449,7 @@ function MessageBubble({
         dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
       />
 
-      <TestcaseTable rows={appliedRows} />
+      <TestcaseTable rows={appliedRows} projectId={projectId} />
       {message.reviewRequestId && proposedRows.length > 0 && (
         <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
       )}
