@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { applyTheme, persistTheme, readStoredTheme, THEME_CHANGE_EVENT, type ThemeMode } from "@/lib/theme";
 
+// 16px, matching the size IconBell renders at next to this control in the top bar.
 function ThemeIcon({ mode }: { mode: ThemeMode }) {
   if (mode === "light") {
     return (
@@ -20,15 +21,15 @@ function ThemeIcon({ mode }: { mode: ThemeMode }) {
   );
 }
 
-export default function ThemeToggle({ isCollapsed = false }: { isCollapsed?: boolean }) {
+export default function ThemeToggle() {
   const [theme, setTheme] = useState<ThemeMode>(() => readStoredTheme());
 
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
 
-  // Two instances can be mounted at once (the sidebar footer and the top-bar user menu) — without
-  // this, switching from one leaves the other showing a stale active button until it remounts.
+  // Syncs this instance if the theme changes elsewhere (another tab, or another mounted toggle),
+  // since there's no shared context between them.
   useEffect(() => {
     function handleExternalChange(e: Event) {
       const next = (e as CustomEvent<ThemeMode>).detail;
@@ -38,36 +39,45 @@ export default function ThemeToggle({ isCollapsed = false }: { isCollapsed?: boo
     return () => window.removeEventListener(THEME_CHANGE_EVENT, handleExternalChange);
   }, []);
 
-  const setMode = (nextTheme: ThemeMode) => {
-    setTheme(nextTheme);
-    persistTheme(nextTheme);
-  };
+  const isDark = theme === "dark";
+
+  function toggle() {
+    const next: ThemeMode = isDark ? "light" : "dark";
+    setTheme(next);
+    persistTheme(next);
+  }
 
   return (
-    <div
-      className={`tesbo-glass-strong inline-flex items-center rounded-lg p-0.5 ${
-        isCollapsed ? "flex-col" : ""
-      }`}
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isDark}
+      aria-label={`Switch to ${isDark ? "light" : "dark"} theme`}
+      onClick={toggle}
+      className="tesbo-glass-strong relative inline-flex h-8 w-14 shrink-0 items-center rounded-full p-1 transition-colors"
     >
-      {(["light", "dark"] as ThemeMode[]).map((mode) => {
-        const active = theme === mode;
-        return (
-          <button
-            key={mode}
-            type="button"
-            aria-pressed={active}
-            aria-label={`Use ${mode} theme`}
-            onClick={() => setMode(mode)}
-            className={`rounded-md p-1.5 transition-colors ${
-              active
-                ? "bg-[var(--brand-surface)] text-[var(--foreground)] shadow-sm"
-                : "text-[var(--muted)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
-            }`}
-          >
-            <ThemeIcon mode={mode} />
-          </button>
-        );
-      })}
-    </div>
+      {/* Slides behind whichever icon is active; both icons stay rendered underneath so neither
+          ever disappears — only this highlight moves. */}
+      <span
+        aria-hidden
+        className={`absolute inline-flex h-6 w-6 rounded-full bg-[var(--brand-surface)] shadow-sm transition-transform ${
+          isDark ? "translate-x-6" : "translate-x-0"
+        }`}
+      />
+      <span
+        className={`relative z-10 flex h-6 w-6 items-center justify-center transition-colors ${
+          isDark ? "text-[var(--muted)]" : "text-[var(--foreground)]"
+        }`}
+      >
+        <ThemeIcon mode="light" />
+      </span>
+      <span
+        className={`relative z-10 flex h-6 w-6 items-center justify-center transition-colors ${
+          isDark ? "text-[var(--foreground)]" : "text-[var(--muted)]"
+        }`}
+      >
+        <ThemeIcon mode="dark" />
+      </span>
+    </button>
   );
 }

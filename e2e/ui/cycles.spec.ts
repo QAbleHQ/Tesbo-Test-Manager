@@ -431,14 +431,14 @@ test.describe("Test Run — Priority/Type/Assignee filters", () => {
 });
 
 /*
- * Feature: sorting controls on the run table's ID and Priority columns
+ * Feature: sorting controls on the run table's ID, Priority and Test Case columns
  * (app/(app)/projects/[id]/cycles/[cycleId]/page.tsx's SortableColumnHeader / runSort /
- * compareExternalId / comparePriority). Sorting is entirely client-side over the run's full,
- * already-loaded execution list — applied in the same `filteredExecutions` memo that also drives
- * pagination, so it covers the whole dataset and composes with the existing tab/filter/search, not
- * just the current page.
+ * compareExternalId / comparePriority / compareTestCaseTitle). Sorting is entirely client-side
+ * over the run's full, already-loaded execution list — applied in the same `filteredExecutions`
+ * memo that also drives pagination, so it covers the whole dataset and composes with the existing
+ * tab/filter/search, not just the current page.
  */
-test.describe("Test Run table — ID/Priority column sort", () => {
+test.describe("Test Run table — ID/Priority/Test Case column sort", () => {
   let api: APIRequestContext;
   let cycleId: string;
   let testcaseIds: string[] = [];
@@ -455,6 +455,15 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     P1: `E2E Sort Prio P1 ${stamp}`,
     P2: `E2E Sort Prio P2 ${stamp}`,
     P3: `E2E Sort Prio P3 ${stamp}`,
+  };
+  // Mixed case, chosen so a raw (case-sensitive, ASCII) sort gives a DIFFERENT order than the
+  // required case-insensitive one: every uppercase letter sorts below every lowercase letter in
+  // plain string comparison, so a naive sort would read "Mango, Zebra, apple" — only a genuinely
+  // case-insensitive comparator produces the correct alphabetical "apple, Mango, Zebra".
+  const tcTitle = {
+    a: `apple Sort TC ${stamp}`,
+    m: `Mango Sort TC ${stamp}`,
+    z: `Zebra Sort TC ${stamp}`,
   };
 
   /** Titles from `candidates` that appear in the run table, in the DOM (i.e. on-screen row) order. */
@@ -488,6 +497,10 @@ test.describe("Test Run table — ID/Priority column sort", () => {
       { title: prioTitle.P0, status: "Approved", priority: "P0" },
       { title: prioTitle.P3, status: "Approved", priority: "P3" },
       { title: prioTitle.P1, status: "Approved", priority: "P1" },
+      // Deliberately not in alphabetical (or ASCII) order either, for the same reason as above.
+      { title: tcTitle.z, status: "Approved" },
+      { title: tcTitle.a, status: "Approved" },
+      { title: tcTitle.m, status: "Approved" },
     ];
     const created: { created: { id: string; title: string }[] } = await (
       await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, { data: { testcases: rows } })
@@ -537,7 +550,20 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
   });
 
-  test("only one column sorts at a time — selecting the other column replaces it", { tag: '@tesbo.testId("TES-TC-3012")' }, async ({ page }) => {
+  test("Test Case sorts alphabetically by title, case-insensitively, and toggles direction", { tag: '@tesbo.testId("TES-TC-3014")' }, async ({ page }) => {
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    // "apple, Mango, Zebra" — not "Mango, Zebra, apple", which is what a case-sensitive/raw
+    // comparison would produce (every uppercase letter sorts below every lowercase one otherwise).
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently ascending" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Sort by Test Case, currently ascending" }).click();
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual([...ascending].reverse());
+    await expect(page.getByRole("button", { name: "Sort by Test Case, currently descending" })).toBeVisible();
+  });
+
+  test("only one column sorts at a time — selecting another column replaces it", { tag: '@tesbo.testId("TES-TC-3012")' }, async ({ page }) => {
     const idSort = page.getByRole("button", { name: "Sort by ID" });
     await idSort.click();
     await expect(page.getByRole("button", { name: "Sort by ID, currently ascending" })).toBeVisible();
@@ -546,8 +572,15 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     // as un-sorted again, and the row order now reflects Priority alone.
     await page.getByRole("button", { name: "Sort by Priority" }).click();
     await expect(page.getByRole("button", { name: "Sort by ID" })).toBeVisible();
-    const ascending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
-    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    const prioAscending = [prioTitle.P0, prioTitle.P1, prioTitle.P2, prioTitle.P3];
+    await expect.poll(() => orderedTitles(page, prioAscending)).toEqual(prioAscending);
+
+    // And switching from Priority to Test Case behaves the same way: Priority's control reads as
+    // un-sorted again, and the row order now reflects Test Case alone.
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await expect(page.getByRole("button", { name: "Sort by Priority" })).toBeVisible();
+    const tcAscending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, tcAscending)).toEqual(tcAscending);
   });
 
   test("the sort order is preserved after the table is narrowed by a search term", { tag: '@tesbo.testId("TES-TC-3013")' }, async ({ page }) => {
@@ -559,6 +592,17 @@ test.describe("Test Run table — ID/Priority column sort", () => {
     // And the ID-only cases are correctly filtered out, not merely re-ordered to the bottom.
     await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
     await expect(page.getByText(titleTen, { exact: true })).toHaveCount(0);
+  });
+
+  test("Test Case sort composes with a search term the same way Priority's does", { tag: '@tesbo.testId("TES-TC-3015")' }, async ({ page }) => {
+    await page.getByRole("button", { name: "Sort by Test Case" }).click();
+    await page.getByPlaceholder("Search test cases…").fill("Sort TC");
+
+    const ascending = [tcTitle.a, tcTitle.m, tcTitle.z];
+    await expect.poll(() => orderedTitles(page, ascending)).toEqual(ascending);
+    // The ID/Priority-only cases are filtered out, not merely re-ordered to the bottom.
+    await expect(page.getByText(titleNine, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(prioTitle.P0, { exact: true })).toHaveCount(0);
   });
 });
 

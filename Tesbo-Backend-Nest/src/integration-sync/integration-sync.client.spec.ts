@@ -1,5 +1,5 @@
 import { DatabaseService } from "../database/database.service";
-import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
+import { IntegrationConnectionInvalidError, IntegrationSyncClient, LinearEntityNotFoundError } from "./integration-sync.client";
 
 // Test-only key — crypto.util lazily loads it on first encrypt/decrypt call (see linear-integration.spec.ts).
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
@@ -214,6 +214,38 @@ describe("IntegrationSyncClient — auth failures from the actual data-fetch cal
 
     const connection = connectionRow({ provider: "linear", token_expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() });
     await expect(client.fetchLinearTickets(connection, "team-1", async () => undefined)).rejects.toBeInstanceOf(IntegrationConnectionInvalidError);
+  });
+
+  // Root cause of the reported "linear request failed: Entity not found: Team" run failure: a
+  // stale linear_project_mappings row (team deleted, or Linear reconnected to a different
+  // workspace without re-picking a team) sends an id the currently-connected token can't resolve.
+  // Both manual Sync Now and the nightly cron reach this exact call with the exact same mapping
+  // row, so this is not a cron-vs-manual divergence — it's this one call needing a clean error.
+  it("fetchLinearTickets surfaces a GraphQL 'Entity not found: Team' as LinearEntityNotFoundError, not a raw Error", async () => {
+    const fetchMock = jest.fn().mockResolvedValue(
+      jsonResponse({
+        errors: [
+          {
+            message: "Entity not found: Team",
+            extensions: { type: "invalid input", userPresentableMessage: "Could not find referenced Team", code: "INPUT_ERROR", statusCode: 400 }
+          }
+        ]
+      })
+    );
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { client } = makeClient(null);
+
+    const connection = connectionRow({ provider: "linear", token_expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() });
+    await expect(client.fetchLinearTickets(connection, "stale-team-id", async () => undefined)).rejects.toBeInstanceOf(LinearEntityNotFoundError);
+  });
+
+  it("fetchLinearTickets leaves an unrelated 'Entity not found: Issue' error to the generic path", async () => {
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse({ errors: [{ message: "Entity not found: Issue" }] }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { client } = makeClient(null);
+
+    const connection = connectionRow({ provider: "linear", token_expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() });
+    await expect(client.fetchLinearTickets(connection, "team-1", async () => undefined)).rejects.not.toBeInstanceOf(LinearEntityNotFoundError);
   });
 
   it("fetchJiraTickets surfaces an HTTP 401 as IntegrationConnectionInvalidError, not a raw Error", async () => {

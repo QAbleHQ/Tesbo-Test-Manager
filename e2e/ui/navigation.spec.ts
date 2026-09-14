@@ -41,6 +41,25 @@ async function activeNavLabels(page: Page): Promise<string[]> {
     .evaluateAll((links) => links.map((l) => (l.textContent ?? "").trim()));
 }
 
+/*
+ * Logout and the theme toggle used to live in the sidebar footer too, with their own Yes/No
+ * confirmation dialog. Both were removed from there once they became duplicates of the top-right
+ * user menu (TopBar.tsx) — this is the one place either control exists now, so every test below
+ * that used to drive the sidebar's copies goes through this menu instead.
+ */
+function userMenuTrigger(page: Page) {
+  return page.getByRole("button", { name: "User menu" });
+}
+
+function userMenu(page: Page) {
+  return page.locator('[role="menu"][aria-label="User menu"]');
+}
+
+async function logoutViaUserMenu(page: Page) {
+  await userMenuTrigger(page).click();
+  await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+}
+
 test.describe("side navigation — workspace mode", () => {
   test.skip(!!skipReason, skipReason ?? "");
 
@@ -445,8 +464,7 @@ test.describe("side navigation — page cache", () => {
       await page.goto(projectPath("/dashboard"));
       await expect(heading(page, /Recent test runs/)).toBeVisible();
 
-      await page.getByRole("button", { name: "Logout" }).click();
-      await page.getByRole("button", { name: "Yes" }).click();
+      await logoutViaUserMenu(page);
       await page.waitForURL("**/login", { timeout: 30_000 });
 
       await page.getByLabel("Email *", { exact: true }).fill(member.email);
@@ -524,51 +542,17 @@ test.describe("side navigation — behaviour", () => {
     await expect(sidebar(page)).toHaveCSS("width", "260px");
   });
 
-  test("NAV-B-05 the theme toggle and logout stay usable in the collapsed rail", { tag: '@tesbo.testId("TES-TC-717")' }, async ({ page }) => {
-    await page.goto("/projects");
-    await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  /*
+   * NAV-B-05/05b/05c/05d used to pin the sidebar footer's own theme toggle, Logout button, and its
+   * Yes/No confirmation dialog (collapsed-rail usability, opening the dialog, dismissing it via No,
+   * dismissing it via Escape — TES-TC-717/1345/1346/1347). All of that was removed from the sidebar
+   * once it became a duplicate of the top-right user menu (TopBar.tsx), which has no confirmation
+   * step at all — clicking Logout there logs out immediately (see ACU-20 in account.spec.ts). There
+   * is nothing left in the sidebar for those four tests to exercise, so they're gone rather than
+   * retargeted; the user menu's own open/close/keyboard behavior is covered by ACU-16/ACU-17 there.
+   */
 
-    await expect(page.getByRole("button", { name: "Use dark theme" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Use light theme" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Logout" })).toBeVisible();
-  });
-
-  test("NAV-B-05b clicking Logout opens a Yes/No confirmation instead of logging out immediately", { tag: '@tesbo.testId("TES-TC-1345")' }, async ({ page }) => {
-    await page.goto("/projects");
-    await page.getByRole("button", { name: "Logout" }).click();
-
-    // Modal.tsx renders without role="dialog" (see its own comment on this) — asserting on the
-    // title text and the Yes/No controls is the reliable signal that it's actually open.
-    await expect(page.getByRole("heading", { name: "Logout" })).toBeVisible();
-    await expect(page.getByText("Are you sure you want to logout?")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Yes" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "No" })).toBeVisible();
-    // No network call yet — confirming is a separate, deliberate step.
-    await expect(page).toHaveURL(/\/projects/);
-  });
-
-  test("NAV-B-05c No dismisses the confirmation and keeps the session", { tag: '@tesbo.testId("TES-TC-1346")' }, async ({ page }) => {
-    await page.goto("/projects");
-    await page.getByRole("button", { name: "Logout" }).click();
-    await page.getByRole("button", { name: "No" }).click();
-
-    await expect(page.getByText("Are you sure you want to logout?")).toBeHidden();
-    await expect(page).toHaveURL(/\/projects/);
-    await expect(page.getByRole("button", { name: "Logout" })).toBeVisible();
-  });
-
-  test("NAV-B-05d pressing Escape on the confirmation keeps the session, same as No", { tag: '@tesbo.testId("TES-TC-1347")' }, async ({ page }) => {
-    await page.goto("/projects");
-    await page.getByRole("button", { name: "Logout" }).click();
-    await expect(page.getByText("Are you sure you want to logout?")).toBeVisible();
-
-    await page.keyboard.press("Escape");
-
-    await expect(page.getByText("Are you sure you want to logout?")).toBeHidden();
-    await expect(page).toHaveURL(/\/projects/);
-  });
-
-  test("NAV-B-06/09 confirming with Yes ends the session and Back cannot resurrect it", async ({ browser }) => {
+  test("NAV-B-06/09 logging out via the user menu ends the session and Back cannot resurrect it", async ({ browser }) => {
     test.skip(!dbControlAvailable(), "needs psql access to seed a disposable user to log out with");
     // Its own user: logout invalidates the session server-side, and the shared screens storage
     // state would be left holding a dead cookie for every other spec in the run.
@@ -577,8 +561,7 @@ test.describe("side navigation — behaviour", () => {
     const page = await context.newPage();
     try {
     await page.goto("/projects");
-    await page.getByRole("button", { name: "Logout" }).click();
-    await page.getByRole("button", { name: "Yes" }).click();
+    await logoutViaUserMenu(page);
     // Generous: this test shares the stack with the rest of the suite, and the redirect waits on a
     // real round trip to the backend.
     await page.waitForURL("**/login", { timeout: 30_000 });
@@ -597,23 +580,23 @@ test.describe("side navigation — behaviour", () => {
     }
   });
 
-  test("NAV-B-07 a failed logout says so inside the confirmation and leaves Yes usable to retry", async ({ page }) => {
+  test("NAV-B-07 a failed logout says so in the user menu and leaves Logout usable to retry", async ({ page }) => {
     await page.goto("/projects");
     // Matched by predicate, not glob: the frontend posts to the backend origin (:1021) while the
     // page sits on :1020, and a relative glob is resolved against baseURL, so it never matches.
     await page.route((url) => url.pathname === "/api/auth/logout", (route) => route.abort("failed"));
 
-    await page.getByRole("button", { name: "Logout" }).click();
-    await page.getByRole("button", { name: "Yes" }).click();
+    await userMenuTrigger(page).click();
+    await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
 
-    // Left open on failure, not dismissed, so the user can retry without reopening the confirmation.
-    await expect(page.getByText("Could not log out. Please try again.")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Yes" })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "No" })).toBeEnabled();
+    // The menu is deliberately left open on failure, not dismissed, so the user can retry without
+    // reopening it (TopBar.tsx's Logout button only closes the menu on success, via the redirect).
+    await expect(userMenu(page).getByText("Could not log out. Please try again.")).toBeVisible();
+    await expect(userMenu(page).getByRole("menuitem", { name: "Logout" })).toBeEnabled();
     await expect(page).toHaveURL(/\/projects/);
   });
 
-  test("NAV-B-08 a double-click on Yes sends exactly one logout request", async ({ browser }) => {
+  test("NAV-B-08 a double-click on Logout sends exactly one logout request", async ({ browser }) => {
     test.skip(!dbControlAvailable(), "needs psql access to seed a disposable user to log out with");
     const member = await seedWorkspaceMember(tenant!.organizationId, "member");
     const context = await browser.newContext({ storageState: member.storageStatePath });
@@ -628,10 +611,10 @@ test.describe("side navigation — behaviour", () => {
       await route.continue();
     });
 
-    await page.getByRole("button", { name: "Logout" }).click();
-    const confirm = page.getByRole("button", { name: /^(Yes|Logging out…)$/ });
-    await confirm.click();
-    await confirm.click({ force: true }).catch(() => undefined);
+    await userMenuTrigger(page).click();
+    const logoutItem = userMenu(page).getByRole("menuitem", { name: /^(Logout|Logging out…)$/ });
+    await logoutItem.click();
+    await logoutItem.click({ force: true }).catch(() => undefined);
     await page.waitForURL("**/login");
 
     expect(logoutCalls).toBe(1);
@@ -645,7 +628,8 @@ test.describe("side navigation — behaviour", () => {
     await page.setViewportSize({ width: 1280, height: 500 });
     await page.goto(`/projects/${tenant!.projectId}/dashboard`);
 
-    await expect(page.getByRole("button", { name: "Logout" })).toBeVisible();
+    // Logout no longer lives in the sidebar footer (see the comment above NAV-B-06/09) — Project
+    // settings is the remaining footer item this test can still pin as reachable.
     await expect(navLink(page, "Project settings")).toBeVisible();
   });
 

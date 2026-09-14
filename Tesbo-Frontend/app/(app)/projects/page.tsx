@@ -336,7 +336,7 @@ function ProjectsToolbar({
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search projects"
             aria-label="Search projects by name or keyword"
-            className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none placeholder:text-[var(--muted-soft)]"
+            className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
           />
         </label>
         <SortMenu sortBy={sortBy} onSortChange={onSortChange} />
