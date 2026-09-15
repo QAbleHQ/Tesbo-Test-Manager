@@ -9083,19 +9083,17 @@ export class LegacyService implements OnModuleInit {
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
     const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
-    const uid = userId || null;
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
     // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
     // live credentials (so it can't be used even if some path forgets to check disconnected_at),
     // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
     // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
-    let filesToPurge: { storage_key: string }[] = [];
-    const affectedFolders = await this.db.transaction(async (client) => {
+    await this.db.transaction(async (client) => {
       // Serializes concurrent disconnect calls for this workspace+provider (a double-click that
       // outraces the frontend's disable-while-pending state, or two tabs/admins). The loser waits
-      // here, then its own SELECT below finds nothing left to clean up and this whole call becomes
-      // a harmless no-op — no special-cased "already disconnected" branch needed.
+      // here, then its own UPDATEs below become a harmless no-op — no special-cased "already
+      // disconnected" branch needed.
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspace.id}:${p}`]);
 
       await client.query(
@@ -9109,52 +9107,14 @@ export class LegacyService implements OnModuleInit {
          )`,
         [workspace.id, p]
       );
-
-      // The Knowledge Base folder ensureProviderFolder created is never touched by the updates
-      // above. Find it in every project under this workspace — not only the currently-mapped one,
-      // since a project's mapping can already be disabled (superseded by a different remote
-      // project/team) while its folder and documents still exist — and soft-delete it the same way
-      // a user deleting it by hand would, tagged so it can never be restored back into view.
-      // idx_knowledge_folders_source_provider (V103) backs this lookup.
-      const folders = await client.query<{ id: string; project_id: string; name: string }>(
-        "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id = $1 AND source_provider = $2 AND is_deleted = false",
-        [workspace.id, p]
-      );
-      if (!folders.rows.length) return [];
-
-      const folderIds = folders.rows.map((f) => f.id);
-      // One set-based pass across every affected folder (however many projects they span) instead
-      // of a round-trip per folder — keeps the advisory lock and the connection/mapping row locks
-      // above held for a bounded, small number of queries regardless of workspace size.
-      const purge = await client.query<{ storage_key: string }>(
-        `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-        [folderIds]
-      );
-      filesToPurge = purge.rows;
-      await this.cascadeSoftDeleteFolderTree(client, folderIds, uid, "integration_disconnect");
-
-      return folders.rows;
     });
 
-    // Storage cleanup and activity logging run after the DB commit, same convention as
-    // deleteKnowledgeFolder: the soft-delete is the source of truth, so a transient S3 failure or a
-    // logging hiccup here must never surface as a failed (or half-applied) disconnect.
-    await Promise.all(
-      filesToPurge.map((row) =>
-        this.storage
-          .delete(row.storage_key)
-          .catch((error) => this.logger.warn(`Failed to delete storage object ${row.storage_key}: ${error}`))
-      )
-    );
-    // logProjectActivity swallows its own errors and none of these depend on each other, so they
-    // run concurrently — the KB cleanup above has already committed by this point either way.
-    await Promise.all(
-      affectedFolders.map((folder) =>
-        this.logProjectActivity(folder.project_id, uid, "deleted", "knowledge_folder", folder.id, folder.name, {
-          reason: "integration_disconnected"
-        })
-      )
-    );
+    // The Knowledge Base folder ensureProviderFolder created, and every document mirrored into it,
+    // is deliberately left untouched: disconnecting is a credentials/mapping state flip, not a
+    // delete, so the imported knowledge stays visible in the Knowledge Base whether or not the
+    // integration is currently connected. Reconnecting and re-syncing finds this same folder again
+    // (ensureProviderFolder looks it up by source_provider, not by name) rather than creating a
+    // second one.
 
     return { disconnected: true };
   }
