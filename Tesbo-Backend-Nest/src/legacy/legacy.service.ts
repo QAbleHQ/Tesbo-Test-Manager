@@ -18,9 +18,10 @@ import { validatePersonName } from "../common/person-name.util";
 import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
+import { TESTCASE_UPDATE_THRESHOLD } from "../rag/rag.constants";
 import type { RagRetrievalConfidence } from "../rag/rag.types";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
-import { PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { JIRA_PAGE_SIZE, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
@@ -173,6 +174,30 @@ function parseSettings(raw: unknown): Body {
 const ZYRA_AGENT_NAME = "Zyra the Test Generator";
 const LEGACY_ZYRA_AGENT_NAME = "Zyra the Edge Hunter";
 const ZYRA_AGENT_NAMES = [ZYRA_AGENT_NAME, LEGACY_ZYRA_AGENT_NAME];
+
+// ai_generation_requests.provider value for a row staged by the archive sweep (sub-task C) rather
+// than an LLM call or the chat-staging path — same overload 'zyra_chat' already uses (see
+// V107_ai_generation_requests_system_actor.sql's own reasoning for why `provider`, not a new
+// column, is the right place for this).
+const ZYRA_ARCHIVE_SWEEP_PROVIDER = "zyra_archive_sweep";
+
+// The fixed technique vocabulary zyraSystemPrompt() instructs the model to tag every draft with
+// (ZYRA_TICKET_WORKFLOW.md §6/§8's eight named techniques, plus a fallback). Single source of
+// truth for both the prompt text (so the model is told exactly this set, not a paraphrase of it)
+// and normalizeZyraTechniques' validation — the two can never drift apart silently since both
+// read the same array.
+const ZYRA_TECHNIQUES = [
+  "equivalence_partitioning",
+  "boundary_value_analysis",
+  "decision_table",
+  "state_testing",
+  "use_case_testing",
+  "pairwise_testing",
+  "error_guessing",
+  "security_perspective",
+  "general"
+] as const;
+type ZyraTechnique = typeof ZYRA_TECHNIQUES[number];
 
 /** Frontend treats this path as "no custom logo" and renders the theme-aware lockup. */
 const DEFAULT_BRAND_LOGO_URL = "/brand/tesbo-logo-horizontal.svg";
@@ -680,6 +705,49 @@ function assertIntegrationProvider(provider: string): IntegrationProvider {
   return provider;
 }
 
+// ── Archive-sweep sub-task B: normalized live ticket-category lookup ──
+// Jira's own vocabulary (statusCategory.key: new/indeterminate/done) and Linear's (state.type:
+// backlog/unstarted/started/completed/cancelled) collapse to this one signal — the only thing an
+// archive sweep needs to decide anything. See fetchLiveTicketCategory below for the full contract.
+type NormalizedTicketDoneness = "done" | "not_done";
+
+interface TicketCategoryLookup {
+  /** True once the issue itself was resolved (found and readable) — independent of whether its
+   *  category mapped to a known bucket. False covers "no connection", "issue not found/inaccessible"
+   *  and "the live call itself failed" alike; callers that only care about a done/not-done verdict
+   *  should treat every `found: false` the same way: skip this one, don't archive on it. */
+  found: boolean;
+  /** null whenever `found` is false, OR the issue's own category/type string didn't match any of
+   *  the known values this function maps (Jira and Linear each define these as closed, fixed enums
+   *  today, so this branch is defensive rather than expected — but an unmapped category must never
+   *  silently read as "done": that is the one wrong answer with a destructive consequence). */
+  doneness: NormalizedTicketDoneness | null;
+  /** The raw statusCategory.key (Jira) or state.type (Linear) string, for logging/audit — present
+   *  whenever the issue was found, even if doneness above is null (unmapped). */
+  rawCategory: string | null;
+  reason: "ok" | "not_connected" | "not_found" | "unmapped_category" | "error";
+  /** Only set for reason "error" — a short, truncated diagnostic, never shown to an end user. */
+  detail?: string;
+}
+
+const NOT_CONNECTED_RESULT: TicketCategoryLookup = { found: false, doneness: null, rawCategory: null, reason: "not_connected" };
+const NOT_FOUND_RESULT: TicketCategoryLookup = { found: false, doneness: null, rawCategory: null, reason: "not_found" };
+
+/** Best-effort HTTP status extraction from the errors providerTokenFetch/jiraFetch already throw.
+ *  Those are BadRequestException({ error: "... failed (${status}).", detail }) — a NestJS
+ *  HttpException constructed with an object payload carries that object on `.getResponse()`, not on
+ *  `.message` (which Nest defaults to the generic "Bad Request Exception"), so this reads the same
+ *  place isReconnectError already does on these exact errors, then string-matches the status back
+ *  out of the `error` text — those helpers are shared with several other callers and deliberately
+ *  not touched here just to carry a typed status code for this one caller. Falls back to `.message`
+ *  for anything that isn't a NestJS HttpException (a plain network-failure Error, for instance). */
+function extractHttpStatus(err: unknown): number | null {
+  const response = err instanceof HttpException ? (err.getResponse() as Body) : null;
+  const message = String(response?.error || (err instanceof Error ? err.message : String(err)));
+  const match = /\((\d{3})\)/.exec(message);
+  return match ? Number(match[1]) : null;
+}
+
 const JIRA_OAUTH_SCOPE = "read:jira-work read:jira-user write:jira-work offline_access";
 const LINEAR_OAUTH_SCOPE = "read,write,issues:create,comments:create";
 
@@ -1133,6 +1201,133 @@ export class LegacyService implements OnModuleInit {
 
   private enqueueEmbedding(organizationId: string, projectId: string, sourceType: "document" | "file", sourceId: string, reason: "created" | "updated" | "transcribed"): void {
     void this.ragIngestion.enqueueEmbedding({ organizationId, projectId, sourceType, sourceId, reason }).catch(() => undefined);
+  }
+
+  // Test-case counterpart of enqueueEmbedding. Called from insertTestCaseWithClient,
+  // updateTestCaseWithClient, and patchTestCaseFromZyraWithClient — the three low-level methods
+  // createTestCase(), updateTestCase(), and patchTestCaseFromZyra() all funnel through (including
+  // the Zyra chat/task review-batch save loops, which call the WithClient variants directly).
+  // Not called from bulkCreateTestCases (import) or zyraBatchInsertTestCases (staged Zyra
+  // drafts, not yet written to testcases) — see rag-ingestion.service.ts's enqueueTestcaseEmbedding
+  // comment for why that's a deliberate scope limit, not an oversight.
+  private enqueueTestcaseEmbedding(projectId: string, testcaseId: string, reason: "created" | "updated"): void {
+    void this.ragIngestion.enqueueTestcaseEmbedding({ projectId, testcaseId, reason }).catch(() => undefined);
+  }
+
+  // Fire-and-forget wrapper around syncTestCaseActionToIntegrations, called live ({ dryRun: false })
+  // from zyraSave()'s post-commit loop — see that call site's own comment for why this runs there
+  // and not inside zyraSaveAttempt's transaction. Same "never blocks the caller" contract as
+  // enqueueTestcaseEmbedding right above: syncTestCaseActionToIntegrations already never throws (a
+  // posting failure comes back as a result entry, not a rejection — see its own comment), so this
+  // .catch is a defensive backstop, not the primary safety mechanism.
+  private enqueueTestcaseIntegrationSync(projectId: string, actorId: string, testcase: Body, action: "add" | "update" | "archive"): void {
+    void this.syncTestCaseActionToIntegrations(projectId, actorId, testcase, action, { dryRun: false }).catch(() => undefined);
+  }
+
+  // jira_sync_test_case / linear_sync_test_case (ZYRA_TICKET_WORKFLOW.md §13) — posts a comment
+  // on the linked Jira/Linear issue when a test case is added, updated, or archived. Comment-only,
+  // as scoped: no issue create/update/transition, unlike this method's name might suggest — see
+  // ZYRA_BINDING_REPORT.md §11 for why that's a real gap and not something to quietly widen here.
+  // Reuses jiraComment()/linearComment() as the actual write mechanism and jiraStatus()/
+  // linearStatus() for the connection check, rather than talking to either provider directly.
+  //
+  // NOT called from anywhere yet. This makes the capability exist and be dry-run-testable; wiring
+  // it into zyraSave's post-commit path (alongside enqueueTestcaseEmbedding, which that method
+  // already calls once per touched row) is a separate, later step.
+  //
+  // A test case with neither jiraIssueKey nor linearIssueKey set resolves to an empty array —
+  // nothing to sync to, which is not an error. A test case linked to both gets one attempt each.
+  //
+  // Defaults to dry run — pass { dryRun: false } explicitly for a real write. Dry run still runs
+  // the connection check and builds the real comment text (so the dry-run log is the actual
+  // message a real run would send, not a placeholder), it just stops short of the jiraComment/
+  // linearComment call.
+  async syncTestCaseActionToIntegrations(
+    projectId: string,
+    actorId: string | null | undefined,
+    testcase: Body,
+    action: "add" | "update" | "archive",
+    opts: { dryRun?: boolean } = {}
+  ): Promise<Body[]> {
+    const dryRun = opts.dryRun !== false;
+    const results: Body[] = [];
+    if (testcase.jiraIssueKey) results.push(await this.syncTestcaseActionToJira(projectId, actorId, testcase, action, dryRun));
+    if (testcase.linearIssueKey) results.push(await this.syncTestcaseActionToLinear(projectId, actorId, testcase, action, dryRun));
+    return results;
+  }
+
+  private zyraTestcaseKbUrl(projectId: string, testcaseId: string): string {
+    return `${this.config.frontendUrl}/projects/${projectId}/testcases/${testcaseId}`;
+  }
+
+  // Three distinct, unambiguous message shapes — one per action type — rather than one templated
+  // string with a variable verb, so each is individually greppable in a Jira/Linear issue's
+  // comment history.
+  private zyraIntegrationSyncComment(action: "add" | "update" | "archive", title: string, kbUrl: string): string {
+    if (action === "add") return `Test case added by Zyra: ${title} — ${kbUrl}`;
+    if (action === "update") return `Test case updated by Zyra: ${title} — ${kbUrl}`;
+    return `Test case archived by Zyra: ${title} — ${kbUrl}`;
+  }
+
+  private async syncTestcaseActionToJira(
+    projectId: string,
+    actorId: string | null | undefined,
+    testcase: Body,
+    action: "add" | "update" | "archive",
+    dryRun: boolean
+  ): Promise<Body> {
+    const issueKey = String(testcase.jiraIssueKey || "");
+    // §13's own guardrail: "if no integration is connected... skipped silently — not treated as a
+    // partial failure." Checked via the same jiraStatus() a caller would use to decide whether to
+    // sync at all — not a bespoke connection probe.
+    const status = await this.jiraStatus(projectId, actorId);
+    if (!status.connected) {
+      return { provider: "jira", issueKey, attempted: false, posted: false, dryRun, comment: null, reason: "Jira is not connected for this project — skipped, not an error." };
+    }
+    const comment = this.zyraIntegrationSyncComment(action, String(testcase.title || "Untitled test case"), this.zyraTestcaseKbUrl(projectId, String(testcase.id || "")));
+    if (dryRun) {
+      this.logger.log(`[dry run] Would post Jira comment on ${issueKey}: ${comment}`);
+      return { provider: "jira", issueKey, attempted: true, posted: false, dryRun: true, comment, reason: "Dry run — no API call made." };
+    }
+    try {
+      await this.jiraComment(projectId, actorId, { issueKey, comment });
+      return { provider: "jira", issueKey, attempted: true, posted: true, dryRun: false, comment, reason: "Posted." };
+    } catch (err) {
+      // A best-effort side action, never a partial failure of the underlying KB write (same
+      // principle §13 states for "no integration connected") — so a real posting error is
+      // reported back rather than thrown, leaving the caller (once this is wired in) free to
+      // decide whether that matters for a given action.
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Failed to post Zyra sync comment to Jira ${issueKey}: ${message}`);
+      return { provider: "jira", issueKey, attempted: true, posted: false, dryRun: false, comment, reason: message };
+    }
+  }
+
+  private async syncTestcaseActionToLinear(
+    projectId: string,
+    actorId: string | null | undefined,
+    testcase: Body,
+    action: "add" | "update" | "archive",
+    dryRun: boolean
+  ): Promise<Body> {
+    const issueKey = String(testcase.linearIssueKey || "");
+    const status = await this.linearStatus(projectId, actorId);
+    if (!status.connected) {
+      return { provider: "linear", issueKey, attempted: false, posted: false, dryRun, comment: null, reason: "Linear is not connected for this project — skipped, not an error." };
+    }
+    const comment = this.zyraIntegrationSyncComment(action, String(testcase.title || "Untitled test case"), this.zyraTestcaseKbUrl(projectId, String(testcase.id || "")));
+    if (dryRun) {
+      this.logger.log(`[dry run] Would post Linear comment on ${issueKey}: ${comment}`);
+      return { provider: "linear", issueKey, attempted: true, posted: false, dryRun: true, comment, reason: "Dry run — no API call made." };
+    }
+    try {
+      await this.linearComment(projectId, actorId, { issueKey, comment });
+      return { provider: "linear", issueKey, attempted: true, posted: true, dryRun: false, comment, reason: "Posted." };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Failed to post Zyra sync comment to Linear ${issueKey}: ${message}`);
+      return { provider: "linear", issueKey, attempted: true, posted: false, dryRun: false, comment, reason: message };
+    }
   }
 
   async onModuleInit(): Promise<void> {
@@ -3371,6 +3566,12 @@ export class LegacyService implements OnModuleInit {
     await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled", {
       testCaseIsNew: true
     });
+    // NOT enqueued here: this method also runs nested inside zyraSave's shared transaction
+    // (via processZyraSaveEntriesSequential/Batched), where the embedding worker — a separate
+    // connection — could query for this row before that outer transaction commits and find
+    // nothing, mismarking it 'unsupported' (terminal, per rag-embedding.processor.ts's own
+    // comment on that status). Every caller of this method enqueues itself once its own
+    // outermost transaction has actually committed: insertTestCase below, and zyraSave.
     return row;
   }
 
@@ -3379,6 +3580,7 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, "testcase_created", "testcase", created.id, `${created.external_id} - ${created.title}`, { after: toCamel(created) });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
+    this.enqueueTestcaseEmbedding(projectId, created.id, "created");
     return toCamel(created);
   }
 
@@ -4122,6 +4324,8 @@ export class LegacyService implements OnModuleInit {
     // enforcement re-checks against currently-active-required fields using existing
     // stored values — correct for "field made required after the fact".
     await this.customFields.setValuesForTestCase(uid, projectId, id, body.customFieldValues || {}, client, "skip-if-disabled");
+    // NOT enqueued here — same reasoning as insertTestCaseWithClient's comment (this method is
+    // also called nested inside zyraSave's shared transaction). Callers enqueue post-commit.
     return row;
   }
 
@@ -4139,6 +4343,10 @@ export class LegacyService implements OnModuleInit {
     });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
+    // Same "outer transaction has actually committed" reasoning as insertTestCase — see
+    // insertTestCaseWithClient's comment. updateTestCaseWithClient is also called nested inside
+    // zyraSave's shared transaction, which enqueues for its own touched rows separately below.
+    if (after?.id) this.enqueueTestcaseEmbedding(projectId, after.id, "updated");
   }
 
   // No duplicate/clone endpoint existed before this feature. Added so "custom field
@@ -9159,6 +9367,11 @@ export class LegacyService implements OnModuleInit {
    * readable, the project-to-remote-project mapping was rewritable, and jiraComment/linearComment
    * posted to the customer's real Jira or Linear using the workspace's stored OAuth token.
    */
+  // Name collision to watch for: this answers "is Jira connected for this project" (connection
+  // status), never "what state is issue X in" (issue status) — for the latter, read `status` off
+  // jiraSnapshot()'s return value instead. The audit that flagged this confusion is
+  // ZYRA_BINDING_REPORT.md §2 ("jiraStatus() is connection status, not issue status — easy to
+  // confuse by name").
   async jiraStatus(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.jiraStatusForProject(projectId);
@@ -9587,6 +9800,9 @@ export class LegacyService implements OnModuleInit {
   // Linear's API is GraphQL (not REST like Jira's) and its unit of work is a "team" rather than a
   // "project" — kept as separate methods/tables rather than forcing a shared shape onto both APIs.
 
+  // Same name collision as jiraStatus() above: this means "is Linear connected for this
+  // project", never "what state is issue X in" — for issue status, read `status` off
+  // linearSnapshot()'s return value instead.
   async linearStatus(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
@@ -10041,7 +10257,7 @@ export class LegacyService implements OnModuleInit {
         total: Number(usage.rows[0]?.total || 0)
       },
       testcasesCreated: await this.zyraCreatedTestcaseCount(projectId),
-      tasks: tasks.rows.map((row) => this.formatAiTask(row))
+      tasks: await Promise.all(tasks.rows.map((row) => this.formatAiTask(row)))
     };
   }
 
@@ -10177,7 +10393,7 @@ export class LegacyService implements OnModuleInit {
       [taskId, projectId, ZYRA_AGENT_NAMES]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Zyra task not found" });
-    return this.formatAiTask(res.rows[0]);
+    return await this.formatAiTask(res.rows[0]);
   }
 
   async updateZyraSettings(projectId: string, userId: string | null | undefined, body: Body) {
@@ -11368,7 +11584,13 @@ export class LegacyService implements OnModuleInit {
           jiraIssueKey: op.draft.jiraIssueKey || null,
           // Already resolved+verified by generateZyraChatTestcasesWithAi before this op ever
           // reached the router's operations array — never re-trusted from raw model output here.
-          sourceRefs: Array.isArray(op.draft.sourceRefs) ? op.draft.sourceRefs : []
+          sourceRefs: Array.isArray(op.draft.sourceRefs) ? op.draft.sourceRefs : [],
+          // Same reasoning as sourceRefs above: already validated by normalizeZyraTechniques at
+          // generation time. Without this, a chat-confirmed create silently lost its technique
+          // tags the moment it was staged — chatDraftRow's own allowlist was necessary but not
+          // sufficient, since this object (not the model's original draft) is what actually gets
+          // persisted into generated_payload and re-read later.
+          techniques: Array.isArray(op.draft.techniques) ? op.draft.techniques : []
         };
         // Staged only — no insert, no external-id allocation, nothing to collide on yet. The
         // draft is committed (and a real external id allocated) only by zyraSave, which is also
@@ -11755,6 +11977,28 @@ export class LegacyService implements OnModuleInit {
     const matchedSuite = this.resolveRoutedZyraSuite(params.routedSuite, params.suites)
       || this.matchZyraSuiteByName(params.message, params.suites);
     const jiraFromKnowledge = this.countZyraJiraSourcedKnowledge(params.knowledge);
+    const generationInput: ZyraGenerationInput = {
+      story: params.message,
+      context: [
+        "Generated from Zyra chat after reading project knowledge, Jira ticket details, Zyra memory, and existing testcase coverage.",
+        // The generator never sees the chat itself, so a confirmation ("yes, do it", "save
+        // those") would otherwise arrive as a story with no content. The conversation is passed
+        // whole and the model decides whether the request refers back to it.
+        params.conversation
+          ? `Conversation so far. If the user's request is a confirmation of, or a reference to, test cases already described in this conversation, generate exactly those — same titles, same order, same coverage — filling in complete steps and expected results. Otherwise treat this only as background:\n${params.conversation}`
+          : ""
+      ].filter(Boolean).join("\n\n"),
+      acceptanceCriteria: "",
+      feedback: "",
+      knowledge: params.knowledge,
+      jira,
+      linear: [],
+      existingTestcases: params.existingTestcases,
+      bugs,
+      requestedCount: params.requestedCount,
+      testcaseRange: params.testcaseRange,
+      knowledgeConfidence: params.knowledgeConfidence
+    };
     const aiResult = await this.generateZyraWithProvider({
       provider: params.provider,
       model: params.model,
@@ -11763,28 +12007,7 @@ export class LegacyService implements OnModuleInit {
       authHeaderName: params.key.auth_header_name,
       authScheme: params.key.auth_scheme,
       projectId: params.projectId,
-      input: {
-        story: params.message,
-        context: [
-          "Generated from Zyra chat after reading project knowledge, Jira ticket details, Zyra memory, and existing testcase coverage.",
-          // The generator never sees the chat itself, so a confirmation ("yes, do it", "save
-          // those") would otherwise arrive as a story with no content. The conversation is passed
-          // whole and the model decides whether the request refers back to it.
-          params.conversation
-            ? `Conversation so far. If the user's request is a confirmation of, or a reference to, test cases already described in this conversation, generate exactly those — same titles, same order, same coverage — filling in complete steps and expected results. Otherwise treat this only as background:\n${params.conversation}`
-            : ""
-        ].filter(Boolean).join("\n\n"),
-        acceptanceCriteria: "",
-        feedback: "",
-        knowledge: params.knowledge,
-        jira,
-        linear: [],
-        existingTestcases: params.existingTestcases,
-        bugs,
-        requestedCount: params.requestedCount,
-        testcaseRange: params.testcaseRange,
-        knowledgeConfidence: params.knowledgeConfidence
-      }
+      input: generationInput
     });
     // This one function backs every chat-driven "create" call: the first turn, the first batch of
     // an exhaustive plan (startZyraChatPlan), and every subsequent background batch
@@ -11803,11 +12026,71 @@ export class LegacyService implements OnModuleInit {
         usage: aiResult.usage
       });
     }
+    // Semantic-similarity pass (ZYRA_TICKET_WORKFLOW.md §10's Update signal, wired into the create
+    // path only). Two tiers, checked once against each drafted candidate's own content (nothing to
+    // compare before drafting exists):
+    //   - TESTCASE_SIMILARITY_THRESHOLD (advisory): handed to the model as `feedback` on one
+    //     bounded follow-up call (reusing the already-wired ZyraGenerationInput.feedback channel —
+    //     see zyraDynamicTaskPrompt) so the drafting decision itself decides whether to keep,
+    //     revise, or fold each flagged draft. Never a backend reclassification by itself.
+    //   - TESTCASE_UPDATE_THRESHOLD (redirect): a materially higher bar. A draft that clears it
+    //     has its operation redirected from create to update below (see `updateTargetsByIndex`
+    //     used at the operations/testcases return value) — this IS a backend decision, not left to
+    //     the model, because the review panel needs a concrete target id before the user ever sees
+    //     the row. Still fully staged and user-confirmed like any other update — see
+    //     applyZyraChatOperations' "update" branch, untouched by this change.
+    // `matchesByIndex` stays aligned with the ORIGINAL (pre-revision) drafts array — the revision
+    // call below can change a draft's CONTENT but is asked to keep each flagged draft's scenario
+    // recognizable ("revise to differentiate" or "keep if distinct"), so the same positional index
+    // in the (possibly revised) finalResult.drafts below is treated as the same candidate for
+    // update-redirect purposes. Only fires when at least one draft actually matches at the
+    // advisory tier or above; adds zero extra cost/latency otherwise.
+    let finalResult = aiResult;
+    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts);
+    if (similarityFeedback) {
+      try {
+        const revised = await this.generateZyraWithProvider({
+          provider: params.provider,
+          model: params.model,
+          apiKey: params.key.api_key,
+          baseUrl: params.key.base_url,
+          authHeaderName: params.key.auth_header_name,
+          authScheme: params.key.auth_scheme,
+          projectId: params.projectId,
+          input: { ...generationInput, feedback: similarityFeedback }
+        });
+        // Same "chat_generate" bucket as the first call — zyra_token_usage.source is a DB-level
+        // CHECK constraint (V87) and this revision pass doesn't warrant a schema change just to
+        // sub-categorize it; the Langfuse trace span below ("generate_similarity_revise") already
+        // gives per-call observability for anyone who needs to tell the two apart.
+        await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, revised.usage);
+        if (params.trace) {
+          recordGeneration(params.trace, {
+            name: "generate_similarity_revise",
+            provider: params.provider,
+            model: params.model,
+            input: { feedback: similarityFeedback, draftCount: aiResult.drafts.length },
+            output: { draftCount: revised.drafts.length, drafts: revised.drafts },
+            usage: revised.usage
+          });
+        }
+        finalResult = revised;
+      } catch (err) {
+        // Never blocks the turn — the original, unrevised drafts still ship. Same fail-open
+        // contract as RagRetrievalService itself.
+        this.logger.warn(`Similarity-revision generation call failed for project ${params.projectId}, keeping original drafts: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    // Index -> update target, for drafts whose match cleared the higher redirect bar. Bounds-checked
+    // against finalResult.drafts.length separately at the point of use, in case a revision call
+    // changed the draft count (the model isn't asked for a fixed 1:1 rewrite, just to address the
+    // feedback) — an index with no corresponding final draft simply never gets applied.
+    const updateTargetsByIndex = matchesByIndex.map((match) => (match && match.cosineSimilarity >= TESTCASE_UPDATE_THRESHOLD ? match : null));
     // Resolve each draft's model-reported sourceRefs against the exact labels offered in THIS
     // turn's prompt (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — a label the model invents, or
     // carries over from an earlier turn's transcript, is dropped rather than trusted.
     const sourceRefIndex = this.zyraSourceRefIndex({ knowledge: params.knowledge, jira, existingTestcases: params.existingTestcases, bugs });
-    for (const draft of aiResult.drafts) {
+    for (const draft of finalResult.drafts) {
       draft.sourceRefs = LegacyService.sanitizeZyraSourceRefs(draft.sourceRefs, sourceRefIndex);
     }
     await this.rememberZyraTurn({
@@ -11818,7 +12101,7 @@ export class LegacyService implements OnModuleInit {
       key: params.key,
       userMessage: params.message,
       outcome: [
-        `Generated ${aiResult.drafts.length} testcase draft(s).`,
+        `Generated ${finalResult.drafts.length} testcase draft(s).`,
         params.jiraIssueKeys.length ? `Jira keys: ${params.jiraIssueKeys.join(", ")}` : "",
         `Sources considered: ${params.knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${params.existingTestcases.length} existing testcase(s), ${bugs.length} bug(s).`
       ].filter(Boolean).join(" ")
@@ -11846,7 +12129,7 @@ export class LegacyService implements OnModuleInit {
       && (params.knowledgeConfidence === "weak" || params.knowledgeConfidence === "none");
     const stagedSuiteName = matchedSuite?.name ?? LegacyService.ZYRA_DRAFT_SUITE_NAME;
     const groundedReply = [
-        `I drafted ${aiResult.drafts.length} test case(s) after reading`,
+        `I drafted ${finalResult.drafts.length} test case(s) after reading`,
         [
           `${params.knowledge.length} knowledge-base item(s)${jiraFromKnowledge ? ` (${jiraFromKnowledge} mirrored from Jira)` : ""}`,
           `${jira.length} Jira ticket(s) read directly`,
@@ -11861,26 +12144,147 @@ export class LegacyService implements OnModuleInit {
     ].join(" ").replace(" .", ".") + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`;
     return {
       reply: ungrounded
-        ? [LegacyService.zyraUngroundedNote(aiResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
+        ? [LegacyService.zyraUngroundedNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
         : weaklyGrounded
-          ? [LegacyService.zyraWeakGroundingNote(aiResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
+          ? [LegacyService.zyraWeakGroundingNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
           : groundedReply,
-      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${aiResult.usage.input}, output ${aiResult.usage.output}.`,
+      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
       actionType: "create",
-      operations: aiResult.drafts.map((draft) => ({
-        type: "create",
-        // A suite the router named but that does not exist yet carries only a name — it is created
-        // on demand when the operation is applied (resolveOrCreateSuiteByName).
-        suiteId: matchedSuite?.id,
-        suiteName: matchedSuite?.id ? undefined : matchedSuite?.name,
-        draft: {
-          ...draft,
-          jiraIssueKey: params.jiraIssueKeys[0] || draft.jiraIssueKey || null
-        },
-        reason: "Generated by AI from Zyra chat context."
-      })),
-      testcases: aiResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
+      operations: finalResult.drafts.map((draft, index) => {
+        const updateTarget = updateTargetsByIndex[index];
+        if (updateTarget) {
+          // Redirected: this draft is a near-duplicate of an existing, real test case (see
+          // TESTCASE_UPDATE_THRESHOLD's own comment). Content field names deliberately mirror the
+          // create branch's own draftPayload mapping below (expectedSummary -> description,
+          // stepsJson kept as-is) since sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient
+          // expect the UPDATE field names, not a draft's. `status` is deliberately omitted — unlike
+          // a fresh create (which always defaults to "Draft"), forcing an existing Approved/whatever
+          // case back to "Draft" just because a similar draft arrived would be a real regression;
+          // omitted fields are left untouched by COALESCE (updateTestCaseWithClient) /
+          // "skip if undefined" (patchTestCaseFromZyraWithClient). suiteId/suiteName and
+          // jiraIssueKey are also omitted for the same reason — an update never moves the target or
+          // silently reassigns its Jira link; only its authored content changes.
+          return {
+            type: "update",
+            testcaseId: updateTarget.testcaseId,
+            fields: {
+              title: draft.title,
+              description: draft.description || draft.expectedSummary || "",
+              preconditions: draft.preconditions || "",
+              stepsJson: draft.stepsJson || draft.steps || "[]",
+              testData: draft.testData || "",
+              priority: draft.priority || "P2",
+              severity: draft.severity || null,
+              type: draft.type || "Functional",
+              component: draft.component || null
+            },
+            reason: `Generated by AI from Zyra chat context; redirected to update — closely matches an existing test case (similarity ${updateTarget.cosineSimilarity.toFixed(2)}).`
+          };
+        }
+        return {
+          type: "create",
+          // A suite the router named but that does not exist yet carries only a name — it is
+          // created on demand when the operation is applied (resolveOrCreateSuiteByName).
+          suiteId: matchedSuite?.id,
+          suiteName: matchedSuite?.id ? undefined : matchedSuite?.name,
+          draft: {
+            ...draft,
+            jiraIssueKey: params.jiraIssueKeys[0] || draft.jiraIssueKey || null
+          },
+          reason: "Generated by AI from Zyra chat context."
+        };
+      }),
+      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
     };
+  }
+
+  // Per-draft semantic similarity check for generateZyraChatTestcasesWithAi's create path only.
+  // Returns two things, aligned 1:1 (by index) with the input `drafts`:
+  //   - `feedback`: text handed back to the SAME drafting call via `feedback` (see
+  //     zyraDynamicTaskPrompt) whenever at least one draft clears TESTCASE_SIMILARITY_THRESHOLD —
+  //     the softer, advisory tier. The model decides what to do with it; this function never
+  //     reclassifies anything itself.
+  //   - `matchesByIndex`: the raw match (if any, regardless of tier) behind each draft, so the
+  //     caller can separately apply TESTCASE_UPDATE_THRESHOLD — the higher, consequential tier —
+  //     to redirect an operation from create to update. Kept out of this function on purpose: the
+  //     caller is the one deciding what to do with a high-confidence match (using either the
+  //     original or the revised draft content, see its own comment), not this one.
+  //
+  // Never throws: mirrors RagRetrievalService's own fail-open contract. A failure here (embedding
+  // call, title lookup) just means this pass is skipped for this turn — never a reason to fail the
+  // whole create request. On any failure or early exit, `matchesByIndex` is all-null (same length
+  // as `drafts`) rather than omitted, so callers can always index it positionally without a
+  // separate null-check on the whole array.
+  private async zyraSimilarityFeedbackForDrafts(
+    projectId: string,
+    drafts: Body[]
+  ): Promise<{ feedback: string | null; matchesByIndex: Array<{ testcaseId: string; cosineSimilarity: number } | null> }> {
+    const noMatches = drafts.map(() => null);
+    try {
+      // Cheap early exit: one EXISTS query (project_id is the leading column of idx_tce_unique, so
+      // this is an index probe, not a scan) versus up to ZYRA_PLAN_BATCH_SIZE/ZYRA_CHAT_MAX_OPERATIONS
+      // findSimilarTestcases() calls — each of which is itself 1-2 round trips of its own — for a
+      // project that has never embedded a single test case. That is every project today (see
+      // ZYRA_BINDING_REPORT.md's backfill findings: zero of 1,414 projects with pending embeddings
+      // currently have a capable key), so this is not a cold-path optimization, it is the common
+      // case. No cache used: nothing in this codebase already tracks "does this project have any
+      // testcase_embeddings" for a related purpose, and adding one just for this would be a second
+      // thing to keep correct (invalidate on first successful embed) for a query this cheap.
+      const embeddedRes = await this.db.query<{ exists: boolean }>("SELECT EXISTS(SELECT 1 FROM testcase_embeddings WHERE project_id = $1) AS exists", [
+        projectId
+      ]);
+      if (!embeddedRes.rows[0]?.exists) return { feedback: null, matchesByIndex: noMatches };
+
+      // Same "title + description + steps" shape buildTestcaseEmbeddingText uses for a real,
+      // already-saved test case — built inline here rather than reusing that helper because a
+      // draft's fields (expectedSummary, stepsJson as a JSON *string*) don't match a testcases
+      // row's shape (description, steps as a parsed array).
+      const texts = drafts.map((draft) =>
+        [String(draft.title || ""), String(draft.expectedSummary || draft.description || ""), String(draft.stepsJson || "")]
+          .filter(Boolean)
+          .join("\n")
+          .slice(0, 4000)
+      );
+      const results = await Promise.all(
+        texts.map((text) =>
+          text.trim()
+            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1 })
+            : Promise.resolve({ matches: [], semanticSearchRan: false, reason: "Empty draft text." })
+        )
+      );
+      const matchesByIndex = results.map((result) => (result.matches[0] ? { testcaseId: result.matches[0].testcaseId, cosineSimilarity: result.matches[0].cosineSimilarity } : null));
+
+      const hits = matchesByIndex
+        .map((match, index) => (match ? { draft: drafts[index], match } : null))
+        .filter((entry): entry is { draft: Body; match: { testcaseId: string; cosineSimilarity: number } } => Boolean(entry));
+      if (!hits.length) return { feedback: null, matchesByIndex };
+
+      const matchedIds = Array.from(new Set(hits.map((entry) => entry.match.testcaseId)));
+      const rows = await this.db.query<{ id: string; external_id: string; title: string }>(
+        "SELECT id, external_id, title FROM testcases WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [matchedIds]
+      );
+      const byId = new Map(rows.rows.map((row) => [row.id, row]));
+
+      const lines = hits
+        .map((entry) => {
+          const existing = byId.get(entry.match.testcaseId);
+          if (!existing) return null;
+          return `An existing test case appears to cover your draft "${entry.draft.title || "Untitled"}": ${existing.external_id} "${existing.title}", similarity ${entry.match.cosineSimilarity.toFixed(2)}.`;
+        })
+        .filter((line): line is string => Boolean(line));
+      const feedback = lines.length
+        ? [
+            "Semantic similarity check found possible overlap with existing test case coverage (a signal, not a rule — decide for each one):",
+            ...lines,
+            "For each flagged draft: keep it unchanged if it's a genuinely distinct scenario, revise it to clearly differentiate from the existing coverage, or fold it in with a note — your judgment. Do not drop a flagged draft silently."
+          ].join("\n")
+        : null;
+      return { feedback, matchesByIndex };
+    } catch (err) {
+      this.logger.warn(`zyraSimilarityFeedbackForDrafts failed for project ${projectId}: ${err instanceof Error ? err.message : err}`);
+      return { feedback: null, matchesByIndex: noMatches };
+    }
   }
 
   // The context Zyra reads before authoring anything: knowledge base by folder name and by semantic
@@ -12426,7 +12830,7 @@ export class LegacyService implements OnModuleInit {
     void this.processZyraTask(projectId, res.rows[0].id, { userId: uid, knowledgeItemIds }).catch(() => undefined);
     return {
       generationRequestId: res.rows[0].id,
-      task: this.formatAiTask(res.rows[0]),
+      task: await this.formatAiTask(res.rows[0]),
       provider,
       drafts: [],
       generatedCount: 0,
@@ -12775,7 +13179,7 @@ export class LegacyService implements OnModuleInit {
     }).catch(() => undefined);
     return {
       generationRequestId: taskId,
-      task: this.formatAiTask(claimRes.rows[0]),
+      task: await this.formatAiTask(claimRes.rows[0]),
       provider,
       drafts: [],
       generatedCount: 0,
@@ -12962,7 +13366,7 @@ export class LegacyService implements OnModuleInit {
       );
       return res.rows[0];
     });
-    return this.formatAiTask(result);
+    return await this.formatAiTask(result);
   }
 
   // Inline edit of one pending draft's fields — the review step's "edit" action. Task-board drafts
@@ -13011,7 +13415,7 @@ export class LegacyService implements OnModuleInit {
       );
       return res.rows[0];
     });
-    return this.formatAiTask(result);
+    return await this.formatAiTask(result);
   }
 
   async zyraCloseTask(projectId: string, userId: string | null | undefined, taskId: string) {
@@ -13022,7 +13426,7 @@ export class LegacyService implements OnModuleInit {
     if (existing.rows[0].task_status === "done") {
       // Already closed — a double-click or a second tab landing here after the first request
       // already won should be a harmless no-op, not a duplicate "Closed task" activity entry.
-      return this.formatAiTask(existing.rows[0]);
+      return await this.formatAiTask(existing.rows[0]);
     }
     const now = new Date().toISOString();
     const activity = [{
@@ -13043,9 +13447,9 @@ export class LegacyService implements OnModuleInit {
       // Lost a race to a concurrent close (two tabs, double-click before the button disabled) —
       // return the current state instead of erroring on an action that already succeeded.
       const fresh = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
-      return this.formatAiTask(fresh.rows[0]);
+      return await this.formatAiTask(fresh.rows[0]);
     }
-    return this.formatAiTask(res.rows[0]);
+    return await this.formatAiTask(res.rows[0]);
   }
 
   // The actual save, run inside one transaction so the whole selected batch commits or none of it
@@ -13149,10 +13553,11 @@ export class LegacyService implements OnModuleInit {
         existingLinked
       };
       // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
-      // implementations return the identical { created, touched } shape and must stay behaviorally
-      // interchangeable; the batched one only changes how genuinely-new testcases are written
-      // (one INSERT instead of N), never what gets written or in what order the response reflects it.
-      const { created, touched } = this.config.zyraSetBasedSaveEnabled
+      // implementations return the identical { created, touched, touchedActions } shape and must
+      // stay behaviorally interchangeable; the batched one only changes how genuinely-new
+      // testcases are written (one INSERT instead of N), never what gets written or in what order
+      // the response reflects it.
+      const { created, touched, touchedActions } = this.config.zyraSetBasedSaveEnabled
         ? await this.processZyraSaveEntriesBatched(client, selected, entryCtx)
         : await this.processZyraSaveEntriesSequential(client, selected, entryCtx);
 
@@ -13210,7 +13615,9 @@ export class LegacyService implements OnModuleInit {
           [taskId, projectId, touched.length, JSON.stringify(events), JSON.stringify(saveActivity)]
         );
       }
-      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, remaining: remainingPayload.length };
+      // touchedActions is consumed by zyraSave() (for the post-commit integration-sync loop) and
+      // deleted from the result there before it reaches the HTTP response — see its own comment.
+      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, touchedActions, remaining: remainingPayload.length };
     });
   }
 
@@ -13224,9 +13631,14 @@ export class LegacyService implements OnModuleInit {
     client: PoolClient,
     selected: Body[],
     ctx: ZyraSaveEntryContext
-  ): Promise<{ created: Body[]; touched: Body[] }> {
+  ): Promise<{ created: Body[]; touched: Body[]; touchedActions: Array<"add" | "update" | "archive"> }> {
     const created: Body[] = [];
     const touched: Body[] = [];
+    // Aligned 1:1 by index with `touched` — the sync-integration wiring in zyraSave needs to know
+    // which action each touched row represents (add/update/archive), which `touched` alone cannot
+    // say: an update and an archive push the exact same row shape (a plain toCamel'd testcases
+    // row), distinguishable only here, at the point `opType` is actually known.
+    const touchedActions: Array<"add" | "update" | "archive"> = [];
     // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
     // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
     // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
@@ -13241,6 +13653,7 @@ export class LegacyService implements OnModuleInit {
         const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
         const row = toCamel(refreshed.rows[0]);
         touched.push(row);
+        touchedActions.push(opType === "archive" ? "archive" : "update");
         await this.logProjectActivity(
           ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
           `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
@@ -13282,7 +13695,11 @@ export class LegacyService implements OnModuleInit {
       if (ctx.existingLinked.rows[linkedIndex]?.id) {
         const linkedId = ctx.existingLinked.rows[linkedIndex].id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
-        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId });
+        // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
+        // sync-integration wiring in zyraSave has something to target — this row IS what was just
+        // written to `payload.jiraIssueKey`/`payload.linearIssueKey` above, not a guess.
+        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey });
+        touchedActions.push("update");
       } else {
         const row = toCamel(await this.insertTestCaseWithClient(client, ctx.projectId, ctx.uid, payload));
         // The same audit action chat mode writes in applyZyraChatOperations. Both modes have to be
@@ -13291,9 +13708,10 @@ export class LegacyService implements OnModuleInit {
         await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entry.reason || null });
         created.push(row);
         touched.push(row);
+        touchedActions.push("add");
       }
     }
-    return { created, touched };
+    return { created, touched, touchedActions };
   }
 
   /**
@@ -13308,13 +13726,16 @@ export class LegacyService implements OnModuleInit {
     client: PoolClient,
     selected: Body[],
     ctx: ZyraSaveEntryContext
-  ): Promise<{ created: Body[]; touched: Body[] }> {
+  ): Promise<{ created: Body[]; touched: Body[]; touchedActions: Array<"add" | "update" | "archive"> }> {
     const created: Body[] = [];
     // Preserves selected's original order: a deferred create's slot is filled in AFTER the batch
     // insert runs, so the final `touched` array (which the response and the save_events/activity_log
     // history both key off) comes out in the same order as the sequential path, not "everything else,
     // then every batch-inserted row appended at the end."
     const touchedSlots: Array<Body | null> = new Array(selected.length).fill(null);
+    // Parallel to touchedSlots, same slot indexing — see processZyraSaveEntriesSequential's
+    // identical field for why this can't be derived from `touched` alone after the fact.
+    const touchedActionSlots: Array<"add" | "update" | "archive" | null> = new Array(selected.length).fill(null);
     const toInsert: Array<{ slot: number; payload: Body; draft: Body; entryReason: unknown }> = [];
     let createPosition = 0;
 
@@ -13326,6 +13747,7 @@ export class LegacyService implements OnModuleInit {
         const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
         const row = toCamel(refreshed.rows[0]);
         touchedSlots[slot] = row;
+        touchedActionSlots[slot] = opType === "archive" ? "archive" : "update";
         await this.logProjectActivity(
           ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
           `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
@@ -13366,7 +13788,11 @@ export class LegacyService implements OnModuleInit {
       if (ctx.existingLinked.rows[linkedIndex]?.id) {
         const linkedId = ctx.existingLinked.rows[linkedIndex].id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
-        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId };
+        // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
+        // sync-integration wiring in zyraSave has something to target — see the sequential path's
+        // identical comment.
+        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey };
+        touchedActionSlots[slot] = "update";
       } else {
         // Deferred — actually written once, below, as a single batch insert by
         // zyraBatchInsertTestCases. See that method's own comment for the rest of the story
@@ -13395,11 +13821,14 @@ export class LegacyService implements OnModuleInit {
         await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entryReason || null });
         created.push(row);
         touchedSlots[slot] = row;
+        touchedActionSlots[slot] = "add";
       }
     }
 
-    const touched = touchedSlots.filter((row): row is Body => row !== null);
-    return { created, touched };
+    const touchedIndexes = touchedSlots.reduce<number[]>((acc, row, index) => (row !== null ? [...acc, index] : acc), []);
+    const touched = touchedIndexes.map((index) => touchedSlots[index] as Body);
+    const touchedActions = touchedIndexes.map((index) => touchedActionSlots[index] as "add" | "update" | "archive");
+    return { created, touched, touchedActions };
   }
 
   /**
@@ -13514,6 +13943,31 @@ export class LegacyService implements OnModuleInit {
         // triggers a retry below never fires a premature invalidation for the discarded attempt.
         await this.suitesCache.invalidate(projectId);
         await this.testcasesListCache.invalidate(projectId);
+        // Same commit-boundary reasoning: insertTestCaseWithClient/updateTestCaseWithClient/
+        // patchTestCaseFromZyraWithClient run nested inside zyraSaveAttempt's own transaction and
+        // deliberately don't enqueue themselves (see insertTestCaseWithClient's comment), so every
+        // testcase this save touched — create, update, or archive — is enqueued once here, after
+        // the whole batch has actually committed. "created" vs "updated" is cosmetic (the
+        // processor branches on job name, not this reason string) but mirrors the doc/file
+        // enqueueEmbedding call sites' convention of naming what actually happened.
+        const testcases = Array.isArray((result as Body)?.testcases) ? ((result as Body).testcases as Body[]) : [];
+        // touchedActions is aligned 1:1 by index with `testcases` (see
+        // processZyraSaveEntriesSequential/Batched's own comment) — internal-only, never part of
+        // the HTTP response this function returns, so it's read here and stripped below rather
+        // than left on `result`.
+        const touchedActions = Array.isArray((result as Body)?.touchedActions) ? ((result as Body).touchedActions as Array<"add" | "update" | "archive">) : [];
+        testcases.forEach((row, index) => {
+          if (!row?.id) return;
+          this.enqueueTestcaseEmbedding(projectId, String(row.id), "updated");
+          // Same commit-boundary discipline as the embedding enqueue right above — this call is
+          // itself fire-and-forget (see its own comment) and reuses the SAME per-row loop, over the
+          // SAME already-committed rows, so it applies uniformly regardless of how each row's
+          // action was decided: an explicit user update/archive today, or feature #1's
+          // similarity-redirect create->update, both produce a row here identically.
+          const action = touchedActions[index];
+          if (action) this.enqueueTestcaseIntegrationSync(projectId, uid, row, action);
+        });
+        delete (result as Body).touchedActions;
         return result;
       } catch (error) {
         const collided =
@@ -13908,21 +14362,27 @@ export class LegacyService implements OnModuleInit {
     return knowledge.filter((item) => /^[A-Z][A-Z0-9]+-\d+\s*:/.test(String(item.title || "").trim())).length;
   }
 
-  private async jiraSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string }>> {
+  // Return shape includes `status` — already fetched and persisted to jira_tickets.status on
+  // every upsert below, this just also surfaces it to the caller instead of writing it and never
+  // reading it back (ZYRA_BINDING_REPORT.md §2: "status is captured but not returned"). Additive
+  // only — no new Jira call, no new column, no behavior change for existing callers that only
+  // read key/summary/description.
+  private async jiraSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
     const selectedKeys = Array.from(new Set(keys.map((key) => key.trim()).filter(Boolean)));
     if (!selectedKeys.length) return [];
     const res = await this.db.query(
-      `SELECT jira_issue_key, summary, description FROM jira_tickets
+      `SELECT jira_issue_key, summary, description, status FROM jira_tickets
        WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])`,
       [projectId, selectedKeys]
     ).catch(() => ({ rows: [] as any[] }));
-    const byKey = new Map<string, { key: string; summary: string; description: string }>(
+    const byKey = new Map<string, { key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.jira_issue_key),
         {
           key: String(row.jira_issue_key),
           summary: String(row.summary || ""),
-          description: String(row.description || "")
+          description: String(row.description || ""),
+          status: String(row.status || "")
         }
       ])
     );
@@ -13947,7 +14407,8 @@ export class LegacyService implements OnModuleInit {
           const fields = (issue.fields || {}) as Body;
           const summary = String(fields.summary || "");
           const description = jiraDescriptionToText(fields.description);
-          byKey.set(key, { key, summary, description });
+          const status = String(fields.status?.name || "");
+          byKey.set(key, { key, summary, description, status });
           await this.db.query(
             `INSERT INTO jira_tickets (
                project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description,
@@ -13976,7 +14437,7 @@ export class LegacyService implements OnModuleInit {
               summary,
               description,
               String(fields.issuetype?.name || ""),
-              String(fields.status?.name || ""),
+              status,
               String(fields.priority?.name || ""),
               String(fields.assignee?.displayName || ""),
               String(fields.reporter?.displayName || ""),
@@ -13995,36 +14456,384 @@ export class LegacyService implements OnModuleInit {
       summary: "Selected Jira ticket",
       description: jiraConnected
         ? "This key was not found in the local Jira cache or via the live Jira API — it may not exist, or may belong to a project this Jira connection cannot access."
-        : "Jira is not connected for this project, so this key could not be looked up. Tell the user Jira isn't connected (Project Settings → Integrations → Jira) rather than implying the ticket itself is missing."
+        : "Jira is not connected for this project, so this key could not be looked up. Tell the user Jira isn't connected (Project Settings → Integrations → Jira) rather than implying the ticket itself is missing.",
+      // Unknown, not "no status" — the key itself couldn't be resolved, so there's nothing to
+      // report a status for. Distinct from a real empty string on a resolved ticket with no
+      // status field set (rare, but not the same case).
+      status: ""
     });
   }
 
   // Only reads the linear_tickets sync cache, unlike jiraSnapshot's live-API fallback for missing
   // keys — the Requirements page only ever selects keys it just listed from that same cache, so a
   // cache miss here would mean the ticket was deleted/unsynced, not "not synced yet".
-  private async linearSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string }>> {
+  //
+  // Return shape includes `status`, same as jiraSnapshot above — already persisted to
+  // linear_tickets.status by the sync pipeline (src/integration-sync/), just not previously read
+  // back here. Additive only, no new Linear call.
+  private async linearSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
     const selectedKeys = Array.from(new Set(keys.map((key) => key.trim()).filter(Boolean)));
     if (!selectedKeys.length) return [];
     const res = await this.db.query(
-      `SELECT linear_issue_key, summary, description FROM linear_tickets
+      `SELECT linear_issue_key, summary, description, status FROM linear_tickets
        WHERE project_id = $1 AND linear_issue_key = ANY($2::text[])`,
       [projectId, selectedKeys]
     ).catch(() => ({ rows: [] as any[] }));
-    const byKey = new Map<string, { key: string; summary: string; description: string }>(
+    const byKey = new Map<string, { key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.linear_issue_key),
         {
           key: String(row.linear_issue_key),
           summary: String(row.summary || ""),
-          description: String(row.description || "")
+          description: String(row.description || ""),
+          status: String(row.status || "")
         }
       ])
     );
     return selectedKeys.map((key) => byKey.get(key) || {
       key,
       summary: "Selected Linear ticket",
-      description: "Ticket details were not available from the local cache, but the selected key was included for Zyra context."
+      description: "Ticket details were not available from the local cache, but the selected key was included for Zyra context.",
+      status: ""
     });
+  }
+
+  /**
+   * Archive-sweep sub-task B. Live (never the jira_tickets/linear_tickets nightly-sync cache) lookup
+   * of one linked issue's normalized done/not-done category, for one test case at a time.
+   *
+   * Why live, not the cache: the earlier investigation (ZYRA_IMPLEMENTATION_LOG.md) found the cache
+   * misses 36% of Jira-linked and 99% of Linear-linked test cases today — most linked test cases
+   * live in projects the nightly sync never targets (no mapping, or a disabled one). A sweep built
+   * on the cache would silently skip almost everything it exists to check.
+   *
+   * Why a single-issue shape, not a batch: this sub-task's brief is answering the question for one
+   * test case. It IS batch-friendly where that was free — see the per-provider notes below — but
+   * actually batching (grouping ~320 test cases by project, deciding page sizes, bounding concurrency
+   * across a whole sweep run) is sub-task C's job once it exists to group against; building that
+   * orchestration against no caller yet would be guessing at its shape.
+   *
+   * Jira: `fields=status` on the single-issue GET already returns `status.statusCategory.key`
+   * nested in the same response — Jira Cloud always embeds statusCategory on the status field,
+   * it isn't a separate opt-in param. So this reuses jiraFetch/getJiraConnection/jiraBaseUrlAndAuth
+   * exactly as jiraSnapshot's live-fetch fallback does, just requesting one lighter field list (no
+   * summary/description/etc — this function only ever needs to answer done-or-not).
+   * *For sub-task C*: Jira genuinely supports batching this — `jiraSearchIssues` (line ~9550) already
+   * proves the shape (`POST /rest/api/3/search/jql`, `escapeJql`-escaped `key in (...)` clause, up to
+   * JIRA_PAGE_SIZE keys per call, `fields: ["status"]`). A real sweep should very likely batch Jira
+   * lookups that way instead of calling this function 244 times — flagged, not built, here.
+   *
+   * Linear: no equivalent proven batch-by-key call exists in this codebase. `linear_tickets` is only
+   * ever populated by paging an entire team/project (fetchLinearTickets), never by a key-list query,
+   * and 75 of 76 Linear-linked test cases have no cached row to source an internal id from even if a
+   * batch-by-id call existed. The per-issue `issue(id: $id)` GraphQL query already in production use
+   * (linearComment, legacy.service.ts:~10056) is proven to accept the human-readable key directly
+   * (not just Linear's internal UUID) and to resolve to `data.issue = null` — not a thrown GraphQL
+   * error — when the key doesn't resolve (see linearComment's own `lookup?.issue?.id || issueKey`
+   * fallback, which only makes sense if a miss is a null, not an exception). Reused verbatim here.
+   */
+  async fetchLiveTicketCategory(projectId: string, provider: IntegrationProvider, issueKey: string): Promise<TicketCategoryLookup> {
+    const key = issueKey.trim();
+    if (!key) return NOT_FOUND_RESULT;
+    return provider === "jira" ? this.fetchLiveJiraTicketCategory(projectId, key) : this.fetchLiveLinearTicketCategory(projectId, key);
+  }
+
+  private mapJiraStatusCategory(categoryKey: string): NormalizedTicketDoneness | null {
+    const normalized = categoryKey.toLowerCase();
+    if (normalized === "done") return "done";
+    // Jira's statusCategory enum is exactly these three keys today ("new", "indeterminate", "done") —
+    // https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-status/ documents no
+    // others. Both non-done categories collapse to the same "not_done" verdict for this sweep's
+    // purposes; nothing downstream needs to tell "not started" apart from "in progress".
+    if (normalized === "new" || normalized === "indeterminate") return "not_done";
+    return null;
+  }
+
+  private mapLinearStateType(stateType: string): NormalizedTicketDoneness | null {
+    const normalized = stateType.toLowerCase();
+    // Linear's WorkflowStateType enum is exactly these five values today. "cancelled" counts as
+    // done for archive purposes — an abandoned ticket is exactly as much a reason to archive its
+    // test case as a completed one; the sweep isn't distinguishing "shipped" from "won't do".
+    if (normalized === "completed" || normalized === "cancelled") return "done";
+    if (normalized === "backlog" || normalized === "unstarted" || normalized === "started") return "not_done";
+    return null;
+  }
+
+  private async fetchLiveJiraTicketCategory(projectId: string, key: string): Promise<TicketCategoryLookup> {
+    let connection: Body | null;
+    try {
+      connection = await this.getJiraConnection(projectId, true);
+    } catch {
+      // requireProjectAccess isn't in play here (no userId on this path — this is a system/sweep
+      // caller, not a request handler), but getJiraConnection's own token-refresh call can still
+      // throw (a reconnect-needed BadRequestException, a network failure mid-refresh). Either way,
+      // "can't resolve a usable connection" is the same outcome as "no connection row at all" for
+      // this function's purposes.
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+
+    const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
+    let issue: Body;
+    try {
+      issue = await this.jiraFetch<Body>(`${baseUrl}/rest/api/3/issue/${encodeURIComponent(key)}?fields=status`, { headers });
+    } catch (err) {
+      const status = extractHttpStatus(err);
+      // 404 (unknown key) and 410 (Jira uses this for some deleted-issue cases) both mean "nothing
+      // to judge", the same as a cache miss — not a transient failure worth retrying or alarming on.
+      if (status === 404 || status === 410) return NOT_FOUND_RESULT;
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+
+    const categoryKey = String((issue?.fields as Body)?.status?.statusCategory?.key || "");
+    if (!categoryKey) return { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" };
+    const doneness = this.mapJiraStatusCategory(categoryKey);
+    return { found: true, doneness, rawCategory: categoryKey, reason: doneness ? "ok" : "unmapped_category" };
+  }
+
+  private async fetchLiveLinearTicketCategory(projectId: string, key: string): Promise<TicketCategoryLookup> {
+    let organizationId: string;
+    try {
+      organizationId = await this.projectOrganizationId(projectId);
+    } catch {
+      // Project deleted/inaccessible out from under a sweep mid-run (a real race across a run that
+      // can span many minutes over ~320 test cases) — same "nothing to resolve" outcome as below.
+      return NOT_CONNECTED_RESULT;
+    }
+    let connection: Body | null;
+    try {
+      connection = await this.getIntegrationConnection(organizationId, "linear", true);
+    } catch {
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+
+    const authHeader = this.linearAuthHeader(connection);
+    let data: Body;
+    try {
+      data = await this.linearGraphQL<Body>(
+        authHeader,
+        "query Issue($id: String!) { issue(id: $id) { id identifier state { type } } }",
+        { id: key }
+      );
+    } catch (err) {
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+
+    const issue = data?.issue as Body | undefined;
+    // Proven null-not-throw behavior for an unresolved key — see linearComment's identical
+    // `lookup?.issue?.id || issueKey` fallback, which only makes sense under this same assumption.
+    if (!issue) return NOT_FOUND_RESULT;
+
+    const stateType = String((issue.state as Body)?.type || "");
+    if (!stateType) return { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" };
+    const doneness = this.mapLinearStateType(stateType);
+    return { found: true, doneness, rawCategory: stateType, reason: doneness ? "ok" : "unmapped_category" };
+  }
+
+  /**
+   * Archive-sweep sub-task C's Jira path: one JQL search per up-to-JIRA_PAGE_SIZE keys instead of one
+   * REST call per key — the batch upgrade sub-task B's log flagged and deliberately didn't build.
+   * Reuses jiraSearchIssues' proven shape (POST /rest/api/3/search/jql, escapeJql-escaped `key in
+   * (...)`, `fields: ["status"]`) and mapJiraStatusCategory for the exact same category mapping
+   * fetchLiveTicketCategory's single-issue Jira path uses, so a caller gets identically-shaped
+   * TicketCategoryLookup values regardless of which path answered.
+   *
+   * A key Jira silently omits from the search response (deleted, or the searching connection can no
+   * longer see it) is reported as not_found in the returned map — Jira's `key in (...)` search does
+   * not error on an unresolvable key, it just leaves it out of `issues`, so absence is the signal.
+   */
+  async fetchLiveJiraTicketCategoriesBulk(projectId: string, issueKeys: string[]): Promise<Map<string, TicketCategoryLookup>> {
+    const keys = Array.from(new Set(issueKeys.map((key) => key.trim()).filter(Boolean)));
+    const results = new Map<string, TicketCategoryLookup>();
+    if (!keys.length) return results;
+
+    let connection: Body | null;
+    try {
+      connection = await this.getJiraConnection(projectId, true);
+    } catch {
+      connection = null;
+    }
+    if (!connection) {
+      for (const key of keys) results.set(key, NOT_CONNECTED_RESULT);
+      return results;
+    }
+    const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
+
+    for (let i = 0; i < keys.length; i += JIRA_PAGE_SIZE) {
+      const chunk = keys.slice(i, i + JIRA_PAGE_SIZE);
+      const jql = `key in (${chunk.map((key) => `"${escapeJql(key)}"`).join(", ")})`;
+      let data: Body;
+      try {
+        data = await this.jiraFetch<Body>(`${baseUrl}/rest/api/3/search/jql`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ jql, maxResults: chunk.length, fields: ["status"] })
+        });
+      } catch (err) {
+        // One chunk's search failing (network blip, rate limit) must not blank out every other
+        // chunk's already-resolved results — matches this function's own single-issue sibling's
+        // per-key isolation, just applied per-chunk instead of per-key.
+        const detail = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+        for (const key of chunk) results.set(key, { found: false, doneness: null, rawCategory: null, reason: "error", detail });
+        continue;
+      }
+      const found = new Set<string>();
+      for (const issue of normalizeJsonArray(data.issues)) {
+        const key = String(issue.key || "");
+        if (!key) continue;
+        found.add(key);
+        const categoryKey = String((issue.fields as Body)?.status?.statusCategory?.key || "");
+        if (!categoryKey) {
+          results.set(key, { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" });
+          continue;
+        }
+        const doneness = this.mapJiraStatusCategory(categoryKey);
+        results.set(key, { found: true, doneness, rawCategory: categoryKey, reason: doneness ? "ok" : "unmapped_category" });
+      }
+      for (const key of chunk) {
+        if (!found.has(key)) results.set(key, NOT_FOUND_RESULT);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Archive-sweep sub-task C: stages one archive proposal for one test case, in the exact shape
+   * applyZyraChatOperations' own archive branch already builds (legacy.service.ts:~11593 —
+   * `{ opType: "archive", testcaseId, externalId, fields: { status: "Archived" }, reason }`) so
+   * zyraSave/processZyraSaveEntries* can execute it later with no new shape to support. Unlike a
+   * chat turn, there is no live user/session here — requested_by is NULL (V107), provider is
+   * ZYRA_ARCHIVE_SWEEP_PROVIDER, chat_session_id stays unset (NULL), exactly like a task-board row.
+   *
+   * Race-safe by construction, not by a pre-check: relies entirely on
+   * idx_ai_generation_requests_sweep_archive_dedup (V108) rejecting a second unresolved proposal for
+   * the same testcaseId with a 23505, the same "try the write, recover on conflict" shape
+   * IntegrationSyncService.startRun already uses for its own nightly-cycle dedup index. The caller
+   * (ZyraArchiveSweepService) also pre-filters against already-staged ids before ever reaching here,
+   * purely to avoid spending Jira/Linear API budget on candidates it already knows are covered —
+   * that pre-filter is an optimization with its own race window (TOCTOU against a concurrent sweep),
+   * not this function's safety net; this index is.
+   */
+  async stageArchiveSweepProposal(projectId: string, testcaseId: string, reason: string): Promise<"staged" | "already_staged" | "skipped"> {
+    let row: Body;
+    try {
+      row = await this.getTestCase(testcaseId);
+    } catch {
+      // Deleted/soft-deleted since the candidate query ran, or never belonged to this project —
+      // either way there is nothing left to propose archiving.
+      return "skipped";
+    }
+    if (row.projectId !== projectId) return "skipped";
+    // Re-checked here, not just at candidate-selection time: a run can span real wall-clock time
+    // over ~320 candidates, and this test case may have been archived (by a human, or by an earlier
+    // save of an EARLIER sweep's proposal for it) since the candidate query ran.
+    if (row.status === "Archived") return "skipped";
+
+    const proposal = { opType: "archive", testcaseId: row.id, externalId: row.externalId, fields: { status: "Archived" }, reason };
+    const now = new Date().toISOString();
+    const activityLog = [{ actor: "agent", title: "Archive sweep proposal", detail: reason, createdAt: now }];
+    // A test case can genuinely carry both a Jira and a Linear key at once (no constraint anywhere
+    // rules it out) — populate whichever are actually set, rather than assuming exactly one. Lets
+    // the task-board UI's ticket badge/link (which reads these columns, not the proposal payload)
+    // work for a sweep-staged row the same way it already does for a task-board row that came with
+    // jiraIssueKeys attached at creation.
+    const jiraIssueKeys = row.jiraIssueKey ? [String(row.jiraIssueKey)] : [];
+    const linearIssueKeys = row.linearIssueKey ? [String(row.linearIssueKey)] : [];
+
+    try {
+      await this.db.query(
+        `INSERT INTO ai_generation_requests
+           (project_id, requested_by, provider, model, user_story, requested_count, generated_count,
+            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys)
+         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb)`,
+        [
+          projectId,
+          ZYRA_ARCHIVE_SWEEP_PROVIDER,
+          `Zyra archive sweep: ${row.externalId} — ${String(row.title || "").slice(0, 200)}`,
+          JSON.stringify([proposal]),
+          ZYRA_AGENT_NAME,
+          JSON.stringify(activityLog),
+          row.id,
+          JSON.stringify(jiraIssueKeys),
+          JSON.stringify(linearIssueKeys)
+        ]
+      );
+      return "staged";
+    } catch (err) {
+      const isDedupConflict =
+        (err as { code?: string })?.code === "23505" &&
+        String((err as { constraint?: string })?.constraint || "") === "idx_ai_generation_requests_sweep_archive_dedup";
+      if (isDedupConflict) return "already_staged";
+      throw err;
+    }
+  }
+
+  // ── Notifications ──
+  // Investigated first: `notifications` (V6) has never had a writer anywhere in this codebase, and
+  // GET /api/notifications / POST /api/notifications/:id/read were both hardcoded stubs ("not
+  // implemented yet... a missing feature, recorded in docs/e2e-coverage-waves.md"). The frontend
+  // bell dropdown (TopBar.tsx) already calls the real list endpoint and renders whatever it gets —
+  // it was just never getting anything real. These three methods are the first real read/write path
+  // this table has ever had, built now because the archive sweep needs a real recipient, not a stub.
+
+  /** Everyone who can actually reach this project today (same JOIN requireProjectAccess uses — no
+   *  org-role bypass exists there, so none is added here either) gets one notification row each, in
+   *  a single INSERT..SELECT so "zero members" and "project archived" both fall out naturally as
+   *  zero rows rather than needing separate guards. `dedupeKey`, when given, rides the same
+   *  ON CONFLICT DO NOTHING partial-unique-index technique V90/V108 already established in this
+   *  codebase — a retried or overlapping caller's duplicate attempt is silently absorbed per
+   *  recipient, not per whole call, so "3 of 5 members already notified today" still notifies the
+   *  other 2 rather than skipping the batch entirely. Returns how many rows were actually inserted
+   *  (0 is a normal, valid outcome — no members, or everyone already had today's dedupe key). Never
+   *  throws for "nothing to notify"; only a genuine DB failure propagates, left to the caller to
+   *  decide whether that should block anything (the archive sweep does not — see its own comment).
+   */
+  async notifyProjectMembers(
+    projectId: string,
+    opts: { type: string; title: string; body?: string; linkEntityType?: string; linkEntityId?: string; dedupeKey?: string }
+  ): Promise<number> {
+    const res = await this.db.query(
+      `INSERT INTO notifications (user_id, type, title, body, link_entity_type, link_entity_id, dedupe_key)
+       SELECT pm.user_id, $2, $3, $4, $5, $6, $7
+       FROM project_members pm
+       JOIN projects p ON p.id = pm.project_id
+       WHERE pm.project_id = $1 AND p.archived_at IS NULL
+       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [projectId, opts.type, opts.title, opts.body || null, opts.linkEntityType || null, opts.linkEntityId || null, opts.dedupeKey || null]
+    );
+    return res.rows.length;
+  }
+
+  /** Newest first, capped at 50 — this list has never had real volume to page through, and the
+   *  dropdown it feeds (TopBar.tsx) has no pagination UI to hand a cursor to. Deliberately NOT run
+   *  through toCamel: the frontend's AppNotification type already expects the raw column names
+   *  (link_entity_type/link_entity_id) — it was written against this table's real shape before this
+   *  method existed to serve it, and matching that is what lets the existing UI start working with
+   *  no frontend change. */
+  async notificationsForUser(userId: string | null | undefined): Promise<Body[]> {
+    const uid = this.requireSession(userId);
+    const res = await this.db.query(
+      `SELECT id, type, title, body, link_entity_type, link_entity_id, read_at, created_at
+       FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [uid]
+    );
+    return res.rows;
+  }
+
+  /** Scoped to the caller's own id (user_id = $2) — the gap the removed stub's own comment called
+   *  out ("mark-as-read reported success for any id to anybody"). COALESCE(read_at, now()) makes a
+   *  double-click or a second tab's repeat call a harmless no-op instead of moving the timestamp
+   *  forward on every call, the same idempotency zyraCloseTask already applies to "close". */
+  async markNotificationRead(userId: string | null | undefined, notificationId: string): Promise<void> {
+    const uid = this.requireSession(userId);
+    if (!isUuid(notificationId)) throw new NotFoundException({ error: "Notification not found" });
+    const res = await this.db.query(
+      "UPDATE notifications SET read_at = COALESCE(read_at, now()) WHERE id = $1 AND user_id = $2 RETURNING id",
+      [notificationId, uid]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Notification not found" });
   }
 
   private async generateZyraWithProvider(params: {
@@ -14047,8 +14856,17 @@ export class LegacyService implements OnModuleInit {
       "You are Zyra the Test Generator, an AI testcase generation agent.",
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
-      "Prioritize edge cases, boundary values, negative paths, permissions, data integrity, state transitions, and traceability.",
-      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"testData\":\"\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"],\"sourceRefs\":[\"\"]}]}",
+      "Apply these test design techniques wherever they genuinely fit the ticket's actual fields and flows — skip only the ones that truly don't apply, not by default:",
+      "- Equivalence Partitioning: for each meaningful input, split it into valid and invalid classes and draft one representative case per class.",
+      "- Boundary Value Analysis: for each bounded, numeric, or length-limited field, test exactly at and immediately beside each boundary (min-1, min, min+1, max-1, max, max+1).",
+      "- Decision Table Testing: when multiple conditions or business rules interact, enumerate the meaningfully distinct combinations as rows and draft one case per row.",
+      "- State Testing: for any status or lifecycle field, cover every valid transition plus at least one invalid or blocked transition attempt.",
+      "- Use Case Testing: cover the primary end-to-end flow plus at least one alternate or exception flow.",
+      "- Pairwise Testing: when several independent input dimensions exist and full combinatorial coverage is impractical, choose a representative combination set that covers every pair of dimension values at least once.",
+      "- Error Guessing: add cases for likely failure modes a formal technique above wouldn't surface — double-submit, empty/null state, malformed input, a network failure mid-action, concurrent edits.",
+      "- Security Perspective: check auth/authorization boundaries, input sanitization, and data exposure for anything OWASP-relevant the ticket's surface touches.",
+      `Return only valid JSON matching this shape: {"drafts":[{"title":"","preconditions":"","stepsJson":"[]","testData":"","expectedSummary":"","priority":"P1|P2|P3","tags":[""],"sourceRefs":[""],"techniques":[""]}]}`,
+      `For every draft, set techniques to the technique(s) from this exact set that produced it: ${ZYRA_TECHNIQUES.join(", ")}. Use "general" only when a draft genuinely doesn't map to any technique above; list more than one when several genuinely apply.`,
       "Each source below (knowledge base, Jira/Linear tickets, existing testcases, related bugs) is given a label, e.g. 'KB 2', 'HBP-14', 'AIP-TC-73', 'BUG 3'. For every draft, set sourceRefs to the exact labels of the sources that draft actually draws on — copy the label text exactly as given, do not invent or paraphrase one. Leave sourceRefs an empty array when a draft is not grounded in any specific source (general QA practice only).",
       "Do not include markdown fences, explanations, comments, or text before or after the JSON object.",
       "stepsJson must be a JSON string containing an array of step objects with stepNumber, action, and expectedResult fields.",
@@ -14177,6 +14995,33 @@ export class LegacyService implements OnModuleInit {
     ].filter(Boolean).join("\n\n");
   }
 
+  /**
+   * Validates a draft's `techniques` against ZYRA_TECHNIQUES rather than trusting the model's
+   * output blindly. Tagging is an enhancement, never a blocking requirement (standing error-
+   * handling bar) — every input shape degrades to `["general"]` instead of throwing: missing
+   * field, non-array, empty array, every entry unrecognized. An unrecognized entry is dropped and
+   * logged (visibility into model drift) rather than surfaced or failing the draft; recognized
+   * entries are deduped but otherwise all kept, since a case can genuinely combine techniques
+   * (e.g. a boundary case for a field only reachable via a specific status transition).
+   */
+  private normalizeZyraTechniques(raw: unknown): ZyraTechnique[] {
+    if (!Array.isArray(raw) || raw.length === 0) return ["general"];
+    const known = new Set<string>(ZYRA_TECHNIQUES);
+    const valid: ZyraTechnique[] = [];
+    const seen = new Set<string>();
+    for (const entry of raw) {
+      const value = String(entry ?? "").trim().toLowerCase();
+      if (!value || seen.has(value)) continue;
+      if (!known.has(value)) {
+        this.logger.warn(`Zyra draft used an unrecognized technique tag "${value.slice(0, 80)}" — dropped, not surfaced`);
+        continue;
+      }
+      seen.add(value);
+      valid.push(value as ZyraTechnique);
+    }
+    return valid.length ? valid : ["general"];
+  }
+
   private normalizeAiDrafts(raw: unknown, requestedCount: number): Body[] {
     const candidates = this.extractAiDraftCandidates(raw);
     if (!candidates.length) throw new BadRequestException({ error: "AI testcase generation returned no testcase drafts" });
@@ -14191,6 +15036,7 @@ export class LegacyService implements OnModuleInit {
         expectedSummary: String(draft.expectedSummary || draft.expected || "The workflow behaves as expected."),
         priority: String(draft.priority || (index < 2 ? "P1" : "P2")),
         tags,
+        techniques: this.normalizeZyraTechniques(draft.techniques),
         // Raw, unvalidated labels straight from the model — sanitizeZyraSourceRefs (called by
         // whichever generation path has the turn's known-label index in scope) is what turns this
         // into a trustworthy citation list. Never rendered or persisted as-is.
@@ -16055,13 +16901,30 @@ export class LegacyService implements OnModuleInit {
       values.push(column === "steps" ? JSON.stringify(this.safeSteps(fields[key])) : fields[key]);
       sets.push(`${column} = $${values.length}${column === "steps" ? "::jsonb" : ""}`);
     }
-    if (!sets.length) return;
+    if (!sets.length) return null;
     values.push(actorId);
-    await client.query(`UPDATE testcases SET ${sets.join(", ")}, updated_by = $${values.length}, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, values);
+    // RETURNING project_id only — this method has no projectId parameter of its own (it's called
+    // from inside batch loops that already have one), so this is purely for the standalone
+    // patchTestCaseFromZyra wrapper below to enqueue an embedding refresh once ITS OWN transaction
+    // commits. Not used, and not needed, by the batch-loop callers (see zyraSave's own enqueue
+    // over its returned `testcases`, keyed off the outer transaction's commit instead).
+    const res = await client.query<{ project_id: string }>(
+      `UPDATE testcases SET ${sets.join(", ")}, updated_by = $${values.length}, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING project_id`,
+      values
+    );
+    return res.rows[0]?.project_id ?? null;
   }
 
   private async patchTestCaseFromZyra(testcaseId: string, actorId: string | null, fields: Body) {
-    await this.db.transaction((client) => this.patchTestCaseFromZyraWithClient(client, testcaseId, actorId, fields));
+    // Currently unused in practice — every real Zyra update/archive write goes through
+    // zyraSave -> zyraSaveAttempt -> processZyraSaveEntries[Sequential|Batched], which call
+    // patchTestCaseFromZyraWithClient directly inside their own shared transaction. Kept correct
+    // (rather than deleted) as the one standalone entry point for this operation; if a future
+    // caller uses it directly, it still needs to enqueue post-commit like insertTestCase/
+    // updateTestCase — same nested-transaction race reasoning as insertTestCaseWithClient's
+    // comment explains.
+    const projectId = await this.db.transaction((client) => this.patchTestCaseFromZyraWithClient(client, testcaseId, actorId, fields));
+    if (projectId) this.enqueueTestcaseEmbedding(projectId, testcaseId, "updated");
   }
 
   private chatDraftRow(value: Body, action: string, reason?: string): Body {
@@ -16080,7 +16943,12 @@ export class LegacyService implements OnModuleInit {
       // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
       // raw model output. Defaults to [] for every row this function did not build from a draft
       // carrying citations (e.g. a plain move/update row), never undefined.
-      sourceRefs: Array.isArray(value.sourceRefs) ? value.sourceRefs : []
+      sourceRefs: Array.isArray(value.sourceRefs) ? value.sourceRefs : [],
+      // Already validated by normalizeZyraTechniques at generation time (never raw model output
+      // here either) — [] rather than ["general"] when absent, since a genuinely non-generation
+      // row (an update/archive preview, a "no longer exists" stub) never had a technique to begin
+      // with; ["general"] would misleadingly imply one was assigned and just didn't match.
+      techniques: Array.isArray(value.techniques) ? value.techniques : []
     };
   }
 
@@ -16099,9 +16967,26 @@ export class LegacyService implements OnModuleInit {
     }, action, reason);
   }
 
-  private formatAiTask(row: Body) {
+  /**
+   * generated_payload holds two genuinely different shapes, and always has (see zyraEditDraft's own
+   * `entry.opType || "create"` comment a few hundred lines up): task-board generation writes FLAT
+   * AiGeneratedDraft objects (`{title, priority, stepsJson, tags, ...}`, no `opType` key at all —
+   * task-board has never produced anything but a create); the chat flow (applyZyraChatOperations)
+   * writes WRAPPED `{opType: "create"|"update"|"archive", draft|...}` objects instead. The
+   * `chat_session_id IS NULL` filter every task-listing query uses was, until the archive sweep
+   * existed, an accurate proxy for "this row is flat" — a chat-staged row always carries a session
+   * id. A sweep-staged row (sub-task C) breaks that proxy: no chat session, but a WRAPPED
+   * `{opType: "archive", ...}` payload — exactly the shape this board was never built to render
+   * (see ZYRA_IMPLEMENTATION_LOG.md's investigation entry). This is the fix: detect the shape per
+   * entry and normalize a wrapped one into the same flat, display-ready row shape a create draft
+   * already has, reusing chatDraftRow/chatTestcaseRow (the chat surface's own normalization) rather
+   * than inventing a second version of it. A flat entry (task-board's create, the case every render
+   * site already gets right) is returned completely untouched — no risk of regressing it.
+   */
+  private async formatAiTask(row: Body): Promise<Body> {
     const item = toCamel(row as QueryResultRow);
-    item.drafts = normalizeJsonArray(row.generated_payload);
+    const rawDrafts = normalizeJsonArray(row.generated_payload);
+    item.drafts = await Promise.all(rawDrafts.map((entry: Body) => this.normalizeAiTaskDraftEntry(entry)));
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
     item.sources = normalizeJsonArray(row.source_summary);
@@ -16112,6 +16997,48 @@ export class LegacyService implements OnModuleInit {
       total: Number(row.token_total || 0)
     };
     return item;
+  }
+
+  /**
+   * One generated_payload array element -> one display-ready draft row. See formatAiTask's own
+   * comment for the two shapes this discriminates between.
+   *
+   * update/archive entries only ever carry `{testcaseId, externalId, fields, reason}` — never
+   * display fields (title/priority/...), the same way a live chat turn's staged proposal never
+   * does either (see applyZyraChatOperations' archive branch, legacy.service.ts:~11593). The live
+   * chat flow gets a readable card anyway because it separately snapshots a formatted preview onto
+   * the chat message itself, at staging time — this board has no such snapshot to fall back on, so
+   * it resolves the *current* test case and merges `fields` on top, exactly mirroring
+   * applyZyraChatOperations' own preview construction (`{...row, ...(fields.stepsJson !== undefined
+   * ? {steps: fields.stepsJson} : {}), ...fields}`) rather than a new formula that might drift from
+   * it — deliberately faithful to that existing logic including its one known gap: an archive/update
+   * proposal that doesn't touch stepsJson shows 0 steps in the preview (fields.stepsJson is never
+   * set, so the real test case's own steps are never carried over) exactly like the chat surface
+   * already does today. Not fixed here — reusing the existing formula, not improving on it, is what
+   * was asked.
+   */
+  private async normalizeAiTaskDraftEntry(entry: Body): Promise<Body> {
+    if (!entry || typeof entry !== "object") return entry;
+    const opType = entry.opType as string | undefined;
+    if (!opType) return entry; // task-board's own flat shape — every existing render site already handles this correctly, untouched
+    if (opType === "create") return this.chatDraftRow(entry.draft || {}, "proposed-create", entry.reason);
+    if (opType !== "update" && opType !== "archive") return entry; // an opType this function doesn't recognize — don't guess, pass through as-is
+
+    const action = opType === "archive" ? "proposed-archive" : "proposed-update";
+    let current: Body | null = null;
+    try {
+      current = await this.getTestCase(String(entry.testcaseId || ""));
+    } catch {
+      // Deleted (soft-delete, getTestCase's own filter) or never a real id — either way there is no
+      // current row to preview. Still return an identifiable row rather than a blank one: the
+      // external id and a "no longer exists" title, not a silent drop from the drafts array (which
+      // would also desync draftIndex-addressed actions like discard/edit against this entry).
+      const externalId = String(entry.externalId || "");
+      return this.chatDraftRow({ externalId, title: externalId ? `${externalId} (no longer exists)` : "Test case no longer exists" }, action, entry.reason);
+    }
+    const fields = (entry.fields || {}) as Body;
+    const preview = { ...current, ...(fields.stepsJson !== undefined ? { steps: fields.stepsJson } : {}), ...fields };
+    return this.chatTestcaseRow(preview, action, entry.reason);
   }
 
   // Not private: the MCP create_testcase tool (mcp.tools.ts) normalizes its own input through

@@ -26,11 +26,57 @@ function priorityTone(priority?: string) {
   return "neutral" as const;
 }
 
-const ACTION_LABEL: Record<string, string> = {
+// Exported so the task-board surfaces (TaskQuickViewPanel, the [taskId] detail page) can label a
+// normalized update/archive draft row the same way this panel already does, instead of each
+// defining its own copy — see formatAiTask's server-side normalization, which is what makes a
+// non-create draft carry this same `action` value outside the chat flow now too.
+export const ACTION_LABEL: Record<string, string> = {
   "proposed-create": "New",
   "proposed-update": "Update",
   "proposed-archive": "Archive",
 };
+
+// Display names for the fixed technique vocabulary (ZYRA_TECHNIQUES in legacy.service.ts,
+// ZYRA_TICKET_WORKFLOW.md §6/§8). Deliberately excludes "general" — see TechniqueBadges below.
+const TECHNIQUE_LABEL: Record<string, string> = {
+  equivalence_partitioning: "Equivalence Partitioning",
+  boundary_value_analysis: "Boundary Value Analysis",
+  decision_table: "Decision Table",
+  state_testing: "State Testing",
+  use_case_testing: "Use Case Testing",
+  pairwise_testing: "Pairwise Testing",
+  error_guessing: "Error Guessing",
+  security_perspective: "Security Perspective",
+};
+
+// Same rectangular-pill weight as JIRA_BADGE_CLASS (TaskQuickViewPanel) — a prose label instead of
+// a monospace ticket key, so no font-mono here.
+const TECHNIQUE_BADGE_CLASS =
+  "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)]";
+
+/**
+ * One badge per real technique a case was tagged with. Exported so the task-board surfaces
+ * (TaskQuickViewPanel, the [taskId] detail page) render this identically instead of each
+ * reimplementing the filter — matching how ACTION_LABEL is already shared for the same reason.
+ *
+ * `["general"]` (normalizeZyraTechniques' fallback for "no specific technique applied") is
+ * filtered out rather than shown as its own badge — a "General" pill next to real technique names
+ * would read as if it were one of them, when it actually means none matched. No techniques at all
+ * (empty array, or the field missing entirely on an older draft from before this feature existed)
+ * renders nothing — no empty row, no placeholder text, matching how ZyraCitationsList and the
+ * plain `tags` line elsewhere already render nothing rather than a hollow "no data" note.
+ */
+export function TechniqueBadges({ techniques }: { techniques?: string[] }) {
+  const real = (techniques || []).filter((t) => t !== "general");
+  if (!real.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {real.map((t) => (
+        <span key={t} className={TECHNIQUE_BADGE_CLASS}>{TECHNIQUE_LABEL[t] || t}</span>
+      ))}
+    </div>
+  );
+}
 
 /**
  * Renders a not-yet-saved batch of create/update/archive proposals from a Zyra chat message —
@@ -223,6 +269,11 @@ export function ZyraChatReviewPanel({
                     </div>
                     <p className="mt-1 text-[13px] font-medium text-[var(--foreground)]">{row.title}</p>
                     <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--muted)]">{firstStepPreview(row.stepsJson)}</p>
+                    {row.techniques?.length ? (
+                      <div className="mt-1">
+                        <TechniqueBadges techniques={row.techniques} />
+                      </div>
+                    ) : null}
                     <div className="mt-1">
                       <ZyraCitationsList refs={row.sourceRefs} />
                     </div>

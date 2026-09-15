@@ -8,9 +8,15 @@ import {
   RAG_FTS_CANDIDATES,
   RAG_MAX_SOURCES,
   RAG_MIN_SIMILARITY,
-  RAG_RRF_K
+  RAG_RRF_K,
+  TESTCASE_SIMILARITY_THRESHOLD
 } from "./rag.constants";
-import { RagRetrievalConfidence, RagSourceType, RetrievedKnowledgeItem } from "./rag.types";
+import { RagRetrievalConfidence, RagSourceType, RetrievedKnowledgeItem, SimilarTestcaseMatch } from "./rag.types";
+
+interface TestcaseAnnRow {
+  testcase_id: string;
+  cosine_similarity: number;
+}
 
 interface AnnRow {
   source_type: RagSourceType;
@@ -118,6 +124,73 @@ export class RagRetrievalService {
     if (topScore >= RAG_CONFIDENT_SIMILARITY) return "strong";
     if (topScore >= RAG_MIN_SIMILARITY) return "weak";
     return "none";
+  }
+
+  /**
+   * Test-case-to-test-case semantic similarity — the ANN half of retrieveWithDiagnostics, aimed
+   * at a second collection (testcase_embeddings) instead of knowledge_document_chunks. No FTS
+   * half and no RRF fusion: unlike KB retrieval, there is no keyword-search fallback for this
+   * (existingTestcaseSnapshot's keyword matching is a separate, pre-existing mechanism — see
+   * legacy.service.ts — not something this method fuses with), and there is exactly one
+   * candidate collection to rank, so there is nothing to fuse.
+   *
+   * NOT called anywhere yet. This exists so the capability is real and callable; wiring it into
+   * Zyra's ticket workflow Update-vs-Add classification (ZYRA_TICKET_WORKFLOW.md §10) is a
+   * separate, later step by design.
+   *
+   * Same never-throws contract as retrieveWithDiagnostics: any failure (no embedding allocation,
+   * nothing embedded yet, embeddings API error) resolves to an empty match list.
+   */
+  async findSimilarTestcases(
+    projectId: string,
+    queryText: string,
+    opts: { excludeTestcaseId?: string; limit?: number } = {}
+  ): Promise<{ matches: SimilarTestcaseMatch[]; semanticSearchRan: boolean; reason: string }> {
+    let reason = "";
+    try {
+      const text = String(queryText || "").trim();
+      if (!text) return { matches: [], semanticSearchRan: false, reason: "Empty query." };
+
+      const resolved = await resolveEmbeddingAllocation(this.db, projectId);
+      reason = resolved.reason;
+      if (!resolved.allocation) return { matches: [], semanticSearchRan: false, reason };
+
+      const rows = await this.annSearchTestcases(projectId, resolved.allocation, text, opts.excludeTestcaseId);
+      const matches = rows
+        .filter((row) => row.cosine_similarity >= TESTCASE_SIMILARITY_THRESHOLD)
+        .slice(0, opts.limit ?? RAG_ANN_CANDIDATES)
+        .map((row) => ({ testcaseId: row.testcase_id, cosineSimilarity: row.cosine_similarity }));
+      return { matches, semanticSearchRan: true, reason };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`findSimilarTestcases failed for project ${projectId}: ${message}`);
+      return { matches: [], semanticSearchRan: false, reason: reason || `Retrieval failed: ${message}` };
+    }
+  }
+
+  private async annSearchTestcases(
+    projectId: string,
+    allocation: EmbeddingKeyAllocation,
+    query: string,
+    excludeTestcaseId?: string
+  ): Promise<TestcaseAnnRow[]> {
+    const [queryVector] = await embedTexts(allocation, [query]);
+    if (!queryVector) return [];
+    const vectorLiteral = `[${queryVector.join(",")}]`;
+    // Same literal `e.project_id = $1` partition-pruning rationale as annSearch() below, and the
+    // same reason a soft-deleted test case's embedding row must be excluded via the join rather
+    // than relying on testcase_embeddings alone to stay clean (deletes are ON DELETE CASCADE only
+    // for a hard delete; soft-delete via deleted_at never touches testcase_embeddings).
+    const res = await this.db.query<TestcaseAnnRow>(
+      `SELECT e.testcase_id, 1 - (e.embedding <=> $2::vector) AS cosine_similarity
+       FROM testcase_embeddings e
+       JOIN testcases t ON t.id = e.testcase_id AND t.deleted_at IS NULL
+       WHERE e.project_id = $1 ${excludeTestcaseId ? "AND e.testcase_id != $3" : ""}
+       ORDER BY e.embedding <=> $2::vector
+       LIMIT ${RAG_ANN_CANDIDATES}`,
+      excludeTestcaseId ? [projectId, vectorLiteral, excludeTestcaseId] : [projectId, vectorLiteral]
+    );
+    return res.rows;
   }
 
   private async annSearch(projectId: string, allocation: EmbeddingKeyAllocation, query: string): Promise<AnnRow[]> {

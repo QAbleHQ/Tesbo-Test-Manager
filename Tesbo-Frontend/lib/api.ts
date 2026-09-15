@@ -851,6 +851,21 @@ export interface AiGeneratedDraft {
   expectedSummary: string;
   priority: string;
   tags: string[];
+  // The following are only ever present on a normalized update/archive entry (formatAiTask's
+  // server-side normalization of a non-create ai_generation_requests.generated_payload item — see
+  // ZYRA_IMPLEMENTATION_LOG.md). A plain task-board create draft never carries them.
+  action?: "proposed-create" | "proposed-update" | "proposed-archive" | string;
+  reason?: string;
+  externalId?: string;
+  /**
+   * The test-design technique(s) (ZYRA_TICKET_WORKFLOW.md §6/§8) that produced this case, already
+   * validated server-side against a fixed set (normalizeZyraTechniques) — never raw model output.
+   * Only ever present on a create-shaped draft (never update/archive, which don't go through
+   * generation). `["general"]` means no specific technique applied, not "uncategorized" — render
+   * accordingly (omit rather than show a meaningless badge). Absent entirely on an older draft
+   * from before this field existed.
+   */
+  techniques?: string[];
 }
 
 export interface GenerateAiTestCasesBody {
@@ -887,7 +902,10 @@ export async function generateAiTestCases(
 
 export interface AiGenerationHistoryItem {
   id: string;
-  requestedBy: string;
+  // null for a system-initiated row (e.g. a scheduled sweep) — see
+  // V107_ai_generation_requests_system_actor.sql. Not rendered anywhere today; kept honest for
+  // whatever eventually reads it.
+  requestedBy: string | null;
   provider: string;
   model: string | null;
   userStory: string;
@@ -934,7 +952,10 @@ export async function trackAiGenerationSaved(
 
 export interface ZyraTask {
   id: string;
-  provider: "openai" | "anthropic";
+  // "zyra_chat" for a chat-staged batch, "zyra_archive_sweep" for a sweep-staged one — not just
+  // "openai" | "anthropic" (real task-board generation calls), matching what the backend actually
+  // stores in ai_generation_requests.provider.
+  provider: "openai" | "anthropic" | "zyra_chat" | "zyra_archive_sweep" | string;
   model: string | null;
   userStory: string;
   acceptanceCriteria: string;
@@ -1021,6 +1042,8 @@ export interface ZyraChatTestcaseRow {
    * not grounded in any specific source.
    */
   sourceRefs?: ZyraSourceRef[];
+  /** See AiGeneratedDraft.techniques — same field, same server-side validation, same rendering rule. */
+  techniques?: string[];
 }
 
 export interface ZyraSourceRef {

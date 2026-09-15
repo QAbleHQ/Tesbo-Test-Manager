@@ -21,7 +21,7 @@ jest.mock("./rag-ai-allocation", () => ({
 
 import { RagRetrievalService } from "./rag-retrieval.service";
 import type { DatabaseService } from "../database/database.service";
-import { RAG_CONFIDENT_SIMILARITY, RAG_MIN_SIMILARITY } from "./rag.constants";
+import { RAG_CONFIDENT_SIMILARITY, RAG_MIN_SIMILARITY, TESTCASE_SIMILARITY_THRESHOLD } from "./rag.constants";
 
 type AnnRow = { source_type: string; source_id: string; heading_path: string | null; content: string; title: string; cosine_similarity: number };
 type FtsRow = { id: string; title: string; content: string; rank: number };
@@ -115,5 +115,81 @@ describe("RagRetrievalService.retrieveWithDiagnostics", () => {
     const svc = new RagRetrievalService(makeDb([]));
     const result = await svc.retrieveWithDiagnostics("project-1", "   ");
     expect(result).toEqual({ items: [], semanticSearchRan: false, reason: "Empty query.", topScore: null, confidence: "none" });
+  });
+});
+
+/*
+ * findSimilarTestcases — the ANN half aimed at testcase_embeddings instead of
+ * knowledge_document_chunks, and the threshold that gates it (TESTCASE_SIMILARITY_THRESHOLD,
+ * 0.86) — deliberately its own, higher-than-RAG_MIN_SIMILARITY constant, so a false-positive match
+ * here costs a wrongly-suppressed Add rather than a slightly-off KB citation. Wired into
+ * generateZyraChatTestcasesWithAi (legacy.service.ts) as a signal fed back into the drafting
+ * call's own `feedback`, never a deterministic Create->Update conversion — that wiring is covered
+ * separately in legacy/zyra-similarity-feedback.spec.ts. This file only tests the threshold/ANN
+ * mechanics themselves, matching this file's existing scope (RagRetrievalService's own
+ * filtering/fusion/scoring logic).
+ */
+type TestcaseAnnRow = { testcase_id: string; cosine_similarity: number };
+
+function makeTestcaseDb(rows: TestcaseAnnRow[]): DatabaseService {
+  const query = jest.fn((sql: string) => {
+    if (sql.includes("testcase_embeddings")) return Promise.resolve({ rows });
+    return Promise.resolve({ rows: [] });
+  });
+  return { query } as unknown as DatabaseService;
+}
+
+describe("RagRetrievalService.findSimilarTestcases", () => {
+  beforeEach(() => {
+    resolveEmbeddingAllocationMock.mockReset();
+    embedTextsMock.mockReset();
+    resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: FAKE_ALLOCATION, reason: "Using the project's openai key for embeddings." });
+    embedTextsMock.mockResolvedValue([[0.1, 0.2, 0.3]]);
+  });
+
+  it("returns a match whose cosine similarity is above the threshold", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-1", cosine_similarity: 0.93 }]));
+    const result = await svc.findSimilarTestcases("project-1", "user can log in with valid credentials");
+    expect(result.matches).toEqual([{ testcaseId: "tc-1", cosineSimilarity: 0.93 }]);
+    expect(result.semanticSearchRan).toBe(true);
+  });
+
+  it("returns no matches when nothing in testcase_embeddings comes back at all", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([]));
+    const result = await svc.findSimilarTestcases("project-1", "a genuinely novel scenario");
+    expect(result.matches).toEqual([]);
+  });
+
+  it("excludes a candidate scored just below the threshold", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-below", cosine_similarity: TESTCASE_SIMILARITY_THRESHOLD - 0.001 }]));
+    const result = await svc.findSimilarTestcases("project-1", "query");
+    expect(result.matches).toEqual([]);
+  });
+
+  it("includes a candidate scored exactly at the threshold (>=, not >)", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-exact", cosine_similarity: TESTCASE_SIMILARITY_THRESHOLD }]));
+    const result = await svc.findSimilarTestcases("project-1", "query");
+    expect(result.matches).toEqual([{ testcaseId: "tc-exact", cosineSimilarity: TESTCASE_SIMILARITY_THRESHOLD }]);
+  });
+
+  it("includes a candidate scored just above the threshold", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-above", cosine_similarity: TESTCASE_SIMILARITY_THRESHOLD + 0.001 }]));
+    const result = await svc.findSimilarTestcases("project-1", "query");
+    expect(result.matches.map((m) => m.testcaseId)).toEqual(["tc-above"]);
+  });
+
+  it("resolves to no matches (never throws) when there is no embeddings-capable key", async () => {
+    resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: null, reason: "No embeddings-capable key." });
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-1", cosine_similarity: 0.99 }]));
+    const result = await svc.findSimilarTestcases("project-1", "query");
+    expect(result.matches).toEqual([]);
+    expect(result.semanticSearchRan).toBe(false);
+    expect(embedTextsMock).not.toHaveBeenCalled();
+  });
+
+  it("never throws for an empty query", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([]));
+    const result = await svc.findSimilarTestcases("project-1", "   ");
+    expect(result.matches).toEqual([]);
   });
 });

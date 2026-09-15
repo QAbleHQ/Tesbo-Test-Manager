@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { IconBell, IconLogout, IconSearch, IconUserCircle, IconX } from "@tabler/icons-react";
 import type { AppNotification, ProjectSummary } from "@/lib/api";
-import { listNotifications } from "@/lib/api";
+import { listNotifications, markNotificationRead } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useLogout } from "@/lib/useLogout";
@@ -13,6 +13,26 @@ import ThemeToggle from "@/components/ThemeToggle";
 const MAX_RESULTS = 8;
 
 import { avatarColor } from "@/lib/avatarColors";
+
+/**
+ * The only shape a notification's link has ever been written with (ZyraArchiveSweepService.
+ * notifyStagedProjects, legacy.service.ts): `zyra_task_board` + a project id. One sweep run can
+ * stage several test cases' worth of candidates under a single notification (one per project per
+ * run, not one per candidate — see the archive-sweep notification work), so there is no single
+ * task to deep-link to; the project's task board list is the correct, always-valid destination —
+ * every candidate the notification is about renders there (including ones a human has since
+ * approved/rejected: the list has no status filter, so an already-actioned or since-deleted
+ * candidate still resolves to a real row instead of a dead link).
+ *
+ * An unrecognized type, or one missing its id (a malformed/older row), yields null — the caller
+ * renders that notification as plain, non-interactive text rather than a link to nowhere.
+ */
+function resolveNotificationHref(n: AppNotification): string | null {
+  if (n.link_entity_type === "zyra_task_board" && n.link_entity_id) {
+    return `/projects/${n.link_entity_id}/agents/tasks`;
+  }
+  return null;
+}
 
 function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -119,6 +139,27 @@ export default function TopBar() {
     const opening = !notifOpen;
     setNotifOpen(opening);
     if (opening) void loadNotifications();
+  }
+
+  /**
+   * Closing the panel synchronously (before the fire-and-forget read-mark or the navigation) is
+   * what keeps a rapid double click harmless: the item is unmounted on the very next render, so a
+   * second click physically cannot land on it. A second tab (or a retried request) hitting POST
+   * .../read for an already-read row is a no-op there too — markNotificationRead's UPDATE uses
+   * COALESCE(read_at, now()), so it re-affirms the same read_at rather than erroring or racing.
+   *
+   * The read-mark is deliberately fire-and-forget: a failed PATCH must not strand the user on the
+   * dropdown instead of where the notification actually pointed them, and the next time they open
+   * the panel a fresh fetch either shows it read (the call landed) or unread again (it didn't) —
+   * either is fine, neither is a broken state.
+   */
+  function handleNotificationClick(n: AppNotification, href: string) {
+    setNotifOpen(false);
+    if (!n.read_at) {
+      setNotifItems((prev) => prev.map((item) => (item.id === n.id ? { ...item, read_at: new Date().toISOString() } : item)));
+      void markNotificationRead(n.id).catch(() => {});
+    }
+    router.push(href);
   }
 
   const results = useMemo(() => {
@@ -282,12 +323,42 @@ export default function TopBar() {
               ) : notifItems.length === 0 ? (
                 <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
               ) : (
-                notifItems.map((n) => (
-                  <div key={n.id} role="menuitem" className="px-3 py-2 text-left text-[13px]">
-                    <p className="font-medium text-[var(--foreground)]">{n.title}</p>
-                    {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
-                  </div>
-                ))
+                notifItems.map((n) => {
+                  const href = resolveNotificationHref(n);
+                  const body = (
+                    <>
+                      <p className="font-medium text-[var(--foreground)]">{n.title}</p>
+                      {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
+                    </>
+                  );
+                  // No resolvable link (an unrecognized type, or an older/malformed row missing
+                  // its link id) — plain, non-interactive text, same as before this change.
+                  if (!href) {
+                    return (
+                      <div key={n.id} role="menuitem" className="px-3 py-2 text-left text-[13px]">
+                        {body}
+                      </div>
+                    );
+                  }
+                  return (
+                    <button
+                      key={n.id}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => handleNotificationClick(n, href)}
+                      className="flex w-full items-start gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-[var(--surface-secondary)]"
+                    >
+                      {!n.read_at && (
+                        <span
+                          aria-hidden="true"
+                          className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                          style={{ background: "var(--brand-primary)" }}
+                        />
+                      )}
+                      <span className="min-w-0 flex-1">{body}</span>
+                    </button>
+                  );
+                })
               )}
             </div>
           )}

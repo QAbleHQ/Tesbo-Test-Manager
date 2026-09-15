@@ -9,6 +9,8 @@
     "migrate:dev": "ts-node src/database/migrate.ts",
     "backfill:encrypt-secrets": "node dist/database/backfill-encrypt-secrets.js",
     "backfill:encrypt-secrets:dev": "ts-node src/database/backfill-encrypt-secrets.ts",
+    "backfill:testcase-embeddings": "node dist/rag/backfill-testcase-embeddings.js",
+    "backfill:testcase-embeddings:dev": "ts-node src/rag/backfill-testcase-embeddings.ts",
     "start": "node dist/main.js",
     "start:dev": "nest start --watch",
     "lint": "eslint \"src/**/*.ts\"",
