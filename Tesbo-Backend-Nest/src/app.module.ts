@@ -18,6 +18,7 @@ import { McpModule } from "./mcp/mcp.module";
 import { BillingModule } from "./billing/billing.module";
 import { CustomFieldsModule } from "./custom-fields/custom-fields.module";
 import { AutomationModule } from "./automation/automation.module";
+import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
 
 @Module({
   imports: [
@@ -39,7 +40,8 @@ import { AutomationModule } from "./automation/automation.module";
     BillingModule,
     CustomFieldsModule,
     PlanLimitsModule,
-    AutomationModule
+    AutomationModule,
+    ZyraArchiveSweepModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard
   // itself no-ops on reads and on workspaces that are within their limits.

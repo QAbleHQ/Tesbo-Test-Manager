@@ -97,7 +97,11 @@ export type RbacTenantKind =
   | "zyra-citations"
   // SSE progress narration (GET .../turns/:turnId/events). Its own tenant so a concurrent turn
   // from another spec never lands in this suite's session and confuses which stream is whose.
-  | "zyra-progress";
+  | "zyra-progress"
+  // Test-case semantic embeddings (testcase_embeddings, embedTexts, TESTCASE_SIMILARITY_THRESHOLD).
+  // Own tenant for the same reason as "kb-embeddings": these tests attach/detach workspace AI
+  // keys, and "zyra"/"ai-keys" assert on their own tenant's key set.
+  | "testcase-embeddings";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

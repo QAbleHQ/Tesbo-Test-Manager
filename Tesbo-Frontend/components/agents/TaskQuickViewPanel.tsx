@@ -8,6 +8,7 @@ import { closeZyraTask, type ZyraTask } from "@/lib/api";
 import { Button, CopyButton, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { ACTION_LABEL, TechniqueBadges } from "./ZyraChatReviewPanel";
 
 export const JIRA_BADGE_CLASS =
   "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
@@ -258,11 +259,22 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 return (
                   <div key={`${task.id}-draft-${index}`} className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
                     <div className="mb-1.5 flex items-center gap-2">
+                      {draft.action && (
+                        <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
+                          {ACTION_LABEL[draft.action] || draft.action}
+                        </StatusChip>
+                      )}
                       <PriorityBadge priority={draft.priority as Priority} />
+                      {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
                       {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
                     </div>
                     <div className="text-[13px] font-medium leading-snug text-[var(--foreground)]">{draft.title}</div>
                     {step && <div className="mt-1.5 text-[12px] text-[var(--muted)]">1 → {step}</div>}
+                    {draft.techniques?.length ? <div className="mt-1.5"><TechniqueBadges techniques={draft.techniques} /></div> : null}
+                    {/* Only an update/archive draft carries a reason (why the sweep or the chat turn
+                        flagged this) — a plain task-board create draft never has one, so this stays
+                        silent for the case that already worked before this normalization existed. */}
+                    {draft.reason && <div className="mt-1.5 text-[12px] italic text-[var(--muted)]">{draft.reason}</div>}
                   </div>
                 );
               })}

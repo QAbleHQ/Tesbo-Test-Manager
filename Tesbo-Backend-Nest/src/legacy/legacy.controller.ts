@@ -5,7 +5,6 @@ import {
   Delete,
   Get,
   MessageEvent,
-  NotFoundException,
   NotImplementedException,
   Param,
   Patch,
@@ -1879,25 +1878,18 @@ export class LegacyController {
     return this.legacy.workspaceActivitySummaryForUser(req.userId);
   }
 
-  /*
-   * Notifications are not implemented yet — there is no table behind them, so the list is empty and
-   * there is nothing to mark read. Both routes still take the caller: they previously took none at
-   * all, which meant "your notifications" was answerable without knowing who was asking, and
-   * mark-as-read reported success for any id to anybody.
-   *
-   * The empty list is a missing feature, recorded in docs/e2e-coverage-waves.md. The 404 below is the
-   * honest answer while it stays missing: no such notification exists.
-   */
+  // Real as of the archive sweep's notification work: `notifications` (V6) previously had no writer
+  // anywhere in this codebase, so both routes were honest stubs (empty list, always-404 read) rather
+  // than faking success — see LegacyService.notifyProjectMembers' own comment for the full history.
   @Get("/api/notifications")
   async notifications(@Req() req: AuthenticatedRequest) {
-    await this.legacy.requireSession(req.userId);
-    return [];
+    return this.legacy.notificationsForUser(req.userId);
   }
 
   @Post("/api/notifications/:id/read")
   async readNotification(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
-    await this.legacy.requireSession(req.userId);
-    throw new NotFoundException({ error: "Notification not found" });
+    await this.legacy.markNotificationRead(req.userId, id);
+    return { ok: true };
   }
 
   @Get("/api/admin/customers")

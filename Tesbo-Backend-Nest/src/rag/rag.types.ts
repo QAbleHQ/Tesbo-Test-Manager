@@ -8,6 +8,20 @@ export interface EmbeddingJobPayload {
   reason: "created" | "updated" | "transcribed" | "reindex";
 }
 
+// No organizationId — unlike knowledge_documents/knowledge_files, testcases has no
+// organization_id column at all (only project_id), and testcase_embeddings mirrors that.
+export interface TestcaseEmbeddingJobPayload {
+  projectId: string;
+  testcaseId: string;
+  reason: "created" | "updated" | "reindex";
+}
+
+// Returned by RagRetrievalService.findSimilarTestcases — not consumed anywhere yet.
+export interface SimilarTestcaseMatch {
+  testcaseId: string;
+  cosineSimilarity: number;
+}
+
 export interface RagChunk {
   chunkIndex: number;
   headingPath: string | null;

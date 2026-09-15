@@ -2,8 +2,8 @@ import { InjectQueue } from "@nestjs/bullmq";
 import { Injectable, Logger } from "@nestjs/common";
 import { Queue } from "bullmq";
 import { DatabaseService } from "../database/database.service";
-import { RAG_EMBEDDING_JOB_NAME, RAG_EMBEDDING_QUEUE } from "./rag.constants";
-import { EmbeddingJobPayload } from "./rag.types";
+import { RAG_EMBEDDING_JOB_NAME, RAG_EMBEDDING_QUEUE, RAG_TESTCASE_EMBEDDING_JOB_NAME } from "./rag.constants";
+import { EmbeddingJobPayload, TestcaseEmbeddingJobPayload } from "./rag.types";
 
 // Producer side of the embedding pipeline. Enqueue calls are meant to be fired
 // fire-and-forget (`void this.ragIngestion.enqueueEmbedding(...).catch(() => undefined)`)
@@ -13,7 +13,7 @@ export class RagIngestionService {
   private readonly logger = new Logger(RagIngestionService.name);
 
   constructor(
-    @InjectQueue(RAG_EMBEDDING_QUEUE) private readonly queue: Queue<EmbeddingJobPayload>,
+    @InjectQueue(RAG_EMBEDDING_QUEUE) private readonly queue: Queue<EmbeddingJobPayload | TestcaseEmbeddingJobPayload>,
     private readonly db: DatabaseService
   ) {}
 
@@ -35,6 +35,36 @@ export class RagIngestionService {
       removeOnFail: { count: 1000 }
     }).catch((err) => {
       this.logger.warn(`Failed to enqueue embedding job for ${payload.sourceType}:${payload.sourceId}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  // Test-case counterpart of enqueueEmbedding, on the same queue/worker/retry config — see
+  // RAG_TESTCASE_EMBEDDING_JOB_NAME's comment for why this doesn't get its own queue. Meant to be
+  // called fire-and-forget from LegacyService's testcase write paths (createTestCase/
+  // updateTestCase/patchTestCaseFromZyra — see legacy.service.ts's enqueueTestcaseEmbedding
+  // wrapper), the same way enqueueEmbedding already is for knowledge_documents/knowledge_files.
+  //
+  // Deliberately NOT called from bulkCreateTestCases (CSV/API import) or
+  // zyraBatchInsertTestCases (staged Zyra drafts, which write to ai_generation_requests, not
+  // testcases, until a save is confirmed) — out of scope for this pass. Those paths leave newly
+  // created rows at embedding_status='pending' (the column default) until either widened into
+  // this hook or covered by a future backfill decision.
+  async enqueueTestcaseEmbedding(payload: TestcaseEmbeddingJobPayload): Promise<void> {
+    await this.db
+      .query(`UPDATE testcases SET embedding_status = 'queued' WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`, [
+        payload.testcaseId,
+        payload.projectId
+      ])
+      .catch(() => undefined);
+
+    await this.queue.add(RAG_TESTCASE_EMBEDDING_JOB_NAME, payload, {
+      jobId: `testcase-${payload.testcaseId}`,
+      attempts: 3,
+      backoff: { type: "exponential", delay: 5000 },
+      removeOnComplete: { count: 1000 },
+      removeOnFail: { count: 1000 }
+    }).catch((err) => {
+      this.logger.warn(`Failed to enqueue testcase embedding job for testcase:${payload.testcaseId}: ${err instanceof Error ? err.message : err}`);
     });
   }
 
