@@ -275,7 +275,7 @@ export function ZyraChatReviewPanel({
                       </div>
                     ) : null}
                     <div className="mt-1">
-                      <ZyraCitationsList refs={row.sourceRefs} />
+                      <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
                     </div>
                   </div>
                   <div className="flex shrink-0 gap-1.5">

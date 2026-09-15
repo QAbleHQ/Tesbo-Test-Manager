@@ -832,7 +832,7 @@ test.describe("Schedule Run — Run At validation", () => {
     await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
     await page.getByRole("button", { name: "Create Schedule" }).click();
 
-    await expect(page.getByText("Run At must be in the future")).toBeVisible();
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
     expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
   });
 
@@ -848,6 +848,31 @@ test.describe("Schedule Run — Run At validation", () => {
 
     // Client-side validation passes; the still-unimplemented backend is what answers, honestly.
     await expect(page.getByText("Scheduled runs are not available yet")).toBeVisible();
-    await expect(page.getByText("Run At must be in the future")).toBeHidden();
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+  });
+
+  test("a past Run At shows the inline error as soon as it's picked, before Create Schedule is clicked", { tag: '@tesbo.testId("TES-TC-2205")' }, async ({ page }) => {
+    let scheduleRequestSent = false;
+    await page.route("**/api/projects/*/cycles/schedules", async (route) => {
+      if (route.request().method() === "POST") scheduleRequestSent = true;
+      await route.continue();
+    });
+
+    await page.goto(`/projects/${ctx.projectId}/cycles/schedule`);
+    await page.getByPlaceholder("Nightly Smoke").fill(`E2E Inline Past Run At ${Date.now()}`);
+    await testRunSelect(page).selectOption({ label: cycleName });
+    await page.locator('input[type="datetime-local"]').fill("2020-01-01T00:00");
+
+    // No submit click here — the error must appear from the field's own onChange.
+    await expect(page.getByText("Date and time must be in future")).toBeVisible();
+    expect(scheduleRequestSent, "a past Run At must never reach the server").toBe(false);
+
+    // Correcting to a future value clears the inline error immediately too, still without submitting.
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const futureValue = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+    await page.locator('input[type="datetime-local"]').fill(futureValue);
+    await expect(page.getByText("Date and time must be in future")).toBeHidden();
+    expect(scheduleRequestSent, "still no request from correcting the field alone").toBe(false);
   });
 });

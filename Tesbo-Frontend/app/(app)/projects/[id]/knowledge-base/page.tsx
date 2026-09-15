@@ -271,6 +271,13 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // ChangeDiffModal opens as a child of ChangeHistoryList (inside this popover's own React
+  // subtree), covering the panel in a full-viewport overlay. That overlay appearing with no actual
+  // pointer movement still makes the browser re-hit-test and fire a real `mouseleave` on the panel,
+  // and any click inside the diff modal's content lands outside triggerRef/panelRef — either one
+  // would otherwise close this popover and, since the diff modal lives inside it, take the diff
+  // modal down too before the user can read it. Pinned true for as long as a diff is showing.
+  const diffOpenRef = useRef(false);
 
   const cancelClose = useCallback(() => {
     if (closeTimer.current) {
@@ -295,8 +302,17 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
 
   const scheduleClose = useCallback(() => {
     cancelClose();
+    if (diffOpenRef.current) return;
     closeTimer.current = setTimeout(() => setOpen(false), 200);
   }, [cancelClose]);
+
+  const handleDiffOpenChange = useCallback(
+    (diffOpen: boolean) => {
+      diffOpenRef.current = diffOpen;
+      if (diffOpen) cancelClose();
+    },
+    [cancelClose]
+  );
 
   useEffect(() => cancelClose, [cancelClose]);
 
@@ -306,6 +322,7 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
       if (e.key === "Escape") setOpen(false);
     }
     function onMouseDown(e: MouseEvent) {
+      if (diffOpenRef.current) return;
       const target = e.target as Node;
       if (triggerRef.current?.contains(target) || panelRef.current?.contains(target)) return;
       setOpen(false);
@@ -391,7 +408,7 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
               style={{ position: "fixed", top: position.top, left: position.left, width: CHANGE_HISTORY_POPOVER_WIDTH }}
               className="z-50 rounded-[8px] border border-[var(--border)] bg-[var(--surface-overlay)] px-3 py-2.5 shadow-[var(--shadow-elevated)]"
             >
-              <ChangeHistoryList projectId={projectId} documentId={documentId} />
+              <ChangeHistoryList projectId={projectId} documentId={documentId} onDiffOpenChange={handleDiffOpenChange} />
             </div>,
             document.body
           )

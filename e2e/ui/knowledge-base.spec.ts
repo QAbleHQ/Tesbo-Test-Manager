@@ -230,10 +230,12 @@ test.describe("knowledge base (UI)", () => {
     eventType: "created" | "updated",
     changedSummary: string | null,
     provider: "jira" | "linear" = "jira",
+    changedFields?: Array<{ label: string; oldExcerpt: string; newExcerpt: string; oldLength: number; newLength: number; truncated: boolean }>,
   ): void {
     exec(
-      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary) VALUES (" +
-        `${literal(documentId)}, ${literal(provider)}, ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)});`,
+      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary, changed_fields) VALUES (" +
+        `${literal(documentId)}, ${literal(provider)}, ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)}, ` +
+        `${changedFields ? `${literal(JSON.stringify(changedFields))}::jsonb` : "NULL"});`,
     );
   }
 
@@ -1279,6 +1281,64 @@ test.describe("knowledge base (UI)", () => {
     await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
   });
 
+  // Regression: ChangeDiffModal is a React child of ChangeHistoryList, which lives inside this
+  // popover's own subtree. The popover auto-closes on hover-out (a 200ms timer) and on any
+  // mousedown outside trigger/panel — and the diff modal, once open, is a full-viewport overlay
+  // that (a) makes the browser refire mouseleave on the panel with no real pointer movement, and
+  // (b) puts every click inside the diff modal itself outside panelRef. Either one used to tear
+  // the popover down mid-click, taking the diff modal down with it before it could be read.
+  test("KBU-37c the diff modal opened from the info-icon popover survives the popover's own hover-out and outside-click auto-close", { tag: '@tesbo.testId("TES-TC-2053")' }, async ({ browser }) => {
+    const title = stamp("E2E-83c: Popover diff survives");
+    const documentId = seedMirrorDocument(title, "kbu-popover-diff", 2, 0);
+    seedSyncEvent(documentId, "updated", "Details, Comments updated.", "jira", [
+      {
+        label: "Details",
+        oldExcerpt: "- **Status:** To Do\n- **Priority:** Low",
+        newExcerpt: "- **Status:** To Do\n- **Priority:** Highest",
+        oldLength: 40,
+        newLength: 44,
+        truncated: false,
+      },
+      {
+        label: "Comments",
+        oldExcerpt: "_No comments on the source ticket._",
+        newExcerpt: "### reporter — 2026-09-08\n\ntest comment",
+        oldLength: 36,
+        newLength: 42,
+        truncated: false,
+      },
+    ]);
+
+    const page = await openKb(browser);
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    const diffButton = panel.getByRole("button", { name: "Check Difference" });
+    await expect(diffButton).toBeVisible();
+    await diffButton.click();
+
+    const diffModal = modal(page, "Difference");
+    await expect(diffModal).toBeVisible();
+    await expect(diffModal.getByText("Highest")).toBeVisible();
+
+    // Move away from both the trigger and the popover panel — exactly what schedules the
+    // popover's hover-out close — and wait past its 200ms timer. Before the fix this tore the
+    // diff modal down along with the popover; it must now stay put.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).hover();
+    await page.waitForTimeout(400);
+    await expect(diffModal).toBeVisible();
+
+    // Reading the diff — clicking inside its own content — must not count as an "outside click"
+    // that closes the popover (and the diff modal riding inside it) either.
+    await diffModal.getByText("Highest").click();
+    await expect(diffModal).toBeVisible();
+
+    // Escape closes only the diff modal; the popover behind it is untouched and still shows the
+    // same entry, so a second look doesn't require re-opening the whole popover from scratch.
+    await page.keyboard.press("Escape");
+    await expect(diffModal).not.toBeVisible();
+    await expect(panel.getByText("Details, Comments updated.")).toBeVisible();
+  });
+
   test("KBU-37b a failed fetch on page 2+ still leaves Previous clickable — it must not strand the user on the errored page", async ({ browser }) => {
     const title = stamp("E2E-83b: Broken page 2");
     const documentId = seedMirrorDocument(title, "kbu-added-on-4b", 3, 0);
@@ -1527,7 +1587,7 @@ test.describe("knowledge base (UI)", () => {
     await expect(dialog.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
   });
 
-  test("KBU-42 a large content change shows a compact badge with an on-demand 'View diff' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
+  test("KBU-42 a large content change shows a compact badge with an on-demand 'Check Difference' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
     browser,
   }) => {
     const title = stamp("LargeDiff");
@@ -1550,11 +1610,11 @@ test.describe("knowledge base (UI)", () => {
 
     // The row itself stays a one-line badge — the full old/new text only appears once asked for.
     await expect(dialog.getByText("short old text")).toHaveCount(0);
-    const diffButton = dialog.getByRole("button", { name: "View diff" });
+    const diffButton = dialog.getByRole("button", { name: "Check Difference" });
     await expect(diffButton).toBeVisible();
     await diffButton.click();
 
-    const diffModal = modal(page, "View diff");
+    const diffModal = modal(page, "Difference");
     await expect(diffModal).toBeVisible();
     await expect(diffModal.getByText("short old text", { exact: false })).toBeVisible();
     await expect(diffModal.getByText("New paragraph about the change.", { exact: false }).first()).toBeVisible();
@@ -1572,7 +1632,7 @@ test.describe("knowledge base (UI)", () => {
     await page.getByRole("button", { name: "View history" }).click();
     const smallDialog = modal(page, "Change history");
     await expect(smallDialog.getByText("Details updated.", { exact: false })).toBeVisible();
-    await expect(smallDialog.getByRole("button", { name: "View diff" })).toHaveCount(0);
+    await expect(smallDialog.getByRole("button", { name: "Check Difference" })).toHaveCount(0);
   });
 
   // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder

@@ -49,6 +49,7 @@ export function ChangeHistoryList({
   showHeading = true,
   onRestoreVersion,
   restoringVersionId = null,
+  onDiffOpenChange,
 }: {
   projectId: string;
   documentId: string;
@@ -61,6 +62,12 @@ export function ChangeHistoryList({
   onRestoreVersion?: (entry: KnowledgeDocumentHistoryEntry) => void;
   /** Disables every row's Restore button while one restore is in flight. */
   restoringVersionId?: string | null;
+  /** Fires the instant a "Check Difference" click opens ChangeDiffModal, and again when it closes.
+   *  ChangeDiffModal is a React child of this component, not of whatever renders it — a caller that
+   *  can auto-close itself (ChangeHistoryTrigger's hover popover) must know a diff is showing so it
+   *  doesn't tear this whole subtree down (and the diff modal with it) out from under the user; see
+   *  that component's doc comment for how the close would otherwise fire. */
+  onDiffOpenChange?: (open: boolean) => void;
 }) {
   const [page, setPage] = useState(0);
   const [state, setState] = useState<{ loading: boolean; events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean; error: boolean }>({
@@ -197,10 +204,13 @@ export function ChangeHistoryList({
                     {large && (
                       <button
                         type="button"
-                        onClick={() => setDiffEntry(event)}
+                        onClick={() => {
+                          onDiffOpenChange?.(true);
+                          setDiffEntry(event);
+                        }}
                         className="shrink-0 font-medium text-[var(--accent-light)] hover:underline"
                       >
-                        View diff.
+                        Check Difference
                       </button>
                     )}
                   </div>
@@ -234,7 +244,10 @@ export function ChangeHistoryList({
       {diffEntry && (
         <ChangeDiffModal
           open
-          onClose={() => setDiffEntry(null)}
+          onClose={() => {
+            setDiffEntry(null);
+            onDiffOpenChange?.(false);
+          }}
           title={`${diffEntry.eventType === "created" ? "Added" : "Updated"} by ${diffEntry.actorName} · ${formatEventDate(diffEntry.createdAt)} ${formatEventTime(diffEntry.createdAt)}`}
           fields={diffEntry.changedFields}
         />

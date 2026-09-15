@@ -2236,16 +2236,19 @@ export class LegacyService implements OnModuleInit {
           : "baseUrl is required for custom providers"
       });
     }
+    // Plain insert, not an upsert: the form that posts here has no "edit" mode and always
+    // defaults its Provider field to openai, so a conflicting name used to silently overwrite
+    // an existing key's provider/model/etc. back to those defaults instead of failing loudly.
     const res = await this.db.query(
       `INSERT INTO workspace_ai_keys (organization_id, name, provider, api_key, default_model, base_url, auth_header_name, auth_scheme, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (organization_id, name)
-       DO UPDATE SET provider = EXCLUDED.provider, api_key = EXCLUDED.api_key, default_model = EXCLUDED.default_model,
-                     base_url = EXCLUDED.base_url, auth_header_name = EXCLUDED.auth_header_name, auth_scheme = EXCLUDED.auth_scheme,
-                     is_active = true, updated_at = now()
+       ON CONFLICT (organization_id, name) DO NOTHING
        RETURNING id, name, provider, default_model, base_url, auth_header_name, auth_scheme, is_active AS active, api_key, created_at, updated_at`,
       [workspace.id, name, provider, apiKey, body.defaultModel || null, baseUrl, authHeaderName, authScheme, userId || null]
     );
+    if (res.rows.length === 0) {
+      throw new BadRequestException({ error: `A workspace AI key named "${name}" already exists. Remove it first, then add it again to change its provider or API key.` });
+    }
     const item = toCamel(res.rows[0]);
     item.maskedKey = maskSecret(apiKey);
     delete item.apiKey;
@@ -3203,6 +3206,39 @@ export class LegacyService implements OnModuleInit {
     }
 
     const where = filters.join(" AND ");
+    /*
+     * Repository table sort (ID/Test case title/Priority), additive to the default order above.
+     * `sortBy` is matched against a fixed allow-list rather than interpolated as a column name, so
+     * there is no injection surface here even though it lands directly in ORDER BY text.
+     *
+     * Only three columns are exposed because those are the only three the repository's header
+     * offers a sort control for:
+     *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
+     *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
+     *     sequence, matching compareExternalId() on the frontend.
+     *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
+     *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
+     *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
+     *     a missing priority sorts last of all regardless of direction.
+     *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
+     * `testcases.id` is always the final tiebreaker so paging stays stable across identical sort keys,
+     * the same reasoning as the default order's own id tiebreaker above.
+     */
+    const sortDir = String(query.sortDir ?? "").toLowerCase() === "desc" ? "DESC" : "ASC";
+    let orderBySql = "testcases.created_at DESC, testcases.id DESC";
+    if (query.sortBy === "id") {
+      orderBySql =
+        `(regexp_match(testcases.external_id, '(\\d+)$'))[1]::bigint ${sortDir} NULLS LAST, ` +
+        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`;
+    } else if (query.sortBy === "title") {
+      orderBySql = `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
+    } else if (query.sortBy === "priority") {
+      orderBySql =
+        `(CASE WHEN testcases.priority IS NULL OR testcases.priority = '' THEN 5 ` +
+        `WHEN testcases.priority IN ('P0','P1','P2','P3') THEN ` +
+        `(CASE testcases.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END) ` +
+        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`;
+    }
     values.push(limit, offset);
     // Total comes back as a window function on the same statement rather than a second
     // COUNT(*) query. This endpoint backs the repository table, the suite tree and the run
@@ -3220,7 +3256,7 @@ export class LegacyService implements OnModuleInit {
               ) AS custom_field_values,
               COUNT(*) OVER () AS total_count
        FROM testcases ${customFieldJoinSql} WHERE ${where}
-       ORDER BY testcases.created_at DESC, testcases.id DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+       ORDER BY ${orderBySql} LIMIT $${values.length - 1} OFFSET $${values.length}`,
       values
     );
     const total = Number(res.rows[0]?.total_count || 0);
@@ -3301,14 +3337,17 @@ export class LegacyService implements OnModuleInit {
    * The project id is not redundant with the test case id: it is what makes this answerable without
    * a second round trip, and it means a case belonging to another project is "not found" here rather
    * than readable by whoever guesses its uuid.
+   *
+   * Accepts either the row's uuid or its external id (e.g. "PRO-TC-319") — the latter is what a Zyra
+   * citation actually carries (see zyraSourceRefIndex, which keys a testcase ref by externalId, never
+   * the uuid), so a testcaseId that isn't a uuid falls back to matching external_id instead of 404ing
+   * outright. Same dual-key resolution findProjectTestcase already uses for Zyra's own operations.
    */
   async getTestCaseForUser(userId: string | null | undefined, projectId: string, testcaseId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    if (!isUuid(testcaseId)) throw new NotFoundException({ error: "Test case not found" });
-    const res = await this.db.query("SELECT * FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [
-      testcaseId,
-      projectId
-    ]);
+    const res = isUuid(testcaseId)
+      ? await this.db.query("SELECT * FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId])
+      : await this.db.query("SELECT * FROM testcases WHERE external_id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Test case not found" });
     return toCamel(res.rows[0]);
   }

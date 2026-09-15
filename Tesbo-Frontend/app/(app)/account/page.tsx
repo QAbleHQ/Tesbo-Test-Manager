@@ -263,7 +263,7 @@ export default function AccountPage() {
           */}
         <form onSubmit={handleProfileSubmit} className="space-y-4">
           <Field>
-            <FieldLabel htmlFor="account-first-name">First name</FieldLabel>
+            <FieldLabel htmlFor="account-first-name">First Name</FieldLabel>
             <div className="flex items-center gap-2">
               <Input
                 id="account-first-name"
@@ -299,7 +299,7 @@ export default function AccountPage() {
           </Field>
 
           <Field>
-            <FieldLabel htmlFor="account-last-name">Last name</FieldLabel>
+            <FieldLabel htmlFor="account-last-name">Last Name</FieldLabel>
             <div className="flex items-center gap-2">
               <Input
                 id="account-last-name"
@@ -336,7 +336,7 @@ export default function AccountPage() {
 
           <Field>
             <FieldLabel htmlFor="account-mobile-number">
-              Mobile number <span className="font-normal text-[var(--muted-soft)]">(Optional)</span>
+              Mobile Number <span className="font-normal text-[var(--muted-soft)]">(Optional)</span>
             </FieldLabel>
             <div className="flex items-center gap-2">
               <PhoneInput
@@ -409,7 +409,7 @@ export default function AccountPage() {
 
           <div className="flex justify-end">
             <Button type="submit" disabled={profileSaving || !anyFieldEditing}>
-              {profileSaving ? "Saving…" : "Save profile"}
+              {profileSaving ? "Saving…" : "Save Profile"}
             </Button>
           </div>
         </form>
@@ -418,7 +418,7 @@ export default function AccountPage() {
       <Modal
         open={isChangePasswordOpen}
         onClose={closeChangePassword}
-        title={hasPassword ? "Change password" : "Set a password"}
+        title={hasPassword ? "Change Password" : "Set a password"}
       >
         <p className="mb-4 text-sm text-[var(--muted)]">
           {hasPassword
