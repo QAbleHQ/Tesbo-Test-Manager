@@ -895,6 +895,37 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       expect(stored, "the API key is stored in plaintext").not.toContain("sk-e2e-not-a-real-key-000000");
     }
   });
+
+  test("ZYR-A-30b creating an AI key under a name already in use is refused, not silently applied over the original", async () => {
+    /*
+     * "Workspace AI key provider resets after production deployment" — the create route used to
+     * INSERT ... ON CONFLICT (organization_id, name) DO UPDATE, so re-submitting the "Add workspace
+     * AI key" form under an existing name (its Provider field always defaults to openai, and there
+     * is no separate edit mode) silently overwrote that key's provider/model/base_url instead of
+     * failing. Pins that a name collision is refused and the original row is left untouched.
+     */
+    const name = `E2E dup key ${Date.now()}`;
+    const original = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name, provider: "anthropic", apiKey: "sk-ant-e2e-original-000000", defaultModel: "claude-sonnet-4-6" },
+      failOnStatusCode: false,
+    });
+    expect(original.status(), `creating the original key answered ${original.status()}: ${await original.text()}`).toBe(201);
+
+    const collision = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name, provider: "openai", apiKey: "sk-e2e-should-not-apply-000000", defaultModel: "gpt-4o" },
+      failOnStatusCode: false,
+    });
+    expect(
+      collision.status(),
+      `creating a second key named "${name}" answered ${collision.status()}: ${await collision.text()}`,
+    ).toBe(400);
+    expect(JSON.stringify(await collision.json())).toContain("already exists");
+
+    const provider = scalar(
+      `SELECT provider FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name = ${literal(name)};`,
+    );
+    expect(provider, "the original key's provider was overwritten by the rejected duplicate").toBe("anthropic");
+  });
   // ─── The agent's "tests generated" counter ─────────────────────────────────
 
   test("ZYR-A-31 the agent reports every test case Zyra created, in either mode", { tag: '@tesbo.testId("TES-TC-985")' }, async () => {

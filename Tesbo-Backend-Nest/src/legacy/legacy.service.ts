@@ -2041,16 +2041,19 @@ export class LegacyService implements OnModuleInit {
           : "baseUrl is required for custom providers"
       });
     }
+    // Plain insert, not an upsert: the form that posts here has no "edit" mode and always
+    // defaults its Provider field to openai, so a conflicting name used to silently overwrite
+    // an existing key's provider/model/etc. back to those defaults instead of failing loudly.
     const res = await this.db.query(
       `INSERT INTO workspace_ai_keys (organization_id, name, provider, api_key, default_model, base_url, auth_header_name, auth_scheme, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (organization_id, name)
-       DO UPDATE SET provider = EXCLUDED.provider, api_key = EXCLUDED.api_key, default_model = EXCLUDED.default_model,
-                     base_url = EXCLUDED.base_url, auth_header_name = EXCLUDED.auth_header_name, auth_scheme = EXCLUDED.auth_scheme,
-                     is_active = true, updated_at = now()
+       ON CONFLICT (organization_id, name) DO NOTHING
        RETURNING id, name, provider, default_model, base_url, auth_header_name, auth_scheme, is_active AS active, api_key, created_at, updated_at`,
       [workspace.id, name, provider, apiKey, body.defaultModel || null, baseUrl, authHeaderName, authScheme, userId || null]
     );
+    if (res.rows.length === 0) {
+      throw new BadRequestException({ error: `A workspace AI key named "${name}" already exists. Remove it first, then add it again to change its provider or API key.` });
+    }
     const item = toCamel(res.rows[0]);
     item.maskedKey = maskSecret(apiKey);
     delete item.apiKey;
