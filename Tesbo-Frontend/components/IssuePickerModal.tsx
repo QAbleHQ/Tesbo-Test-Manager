@@ -15,11 +15,16 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onSelect: (issue: IssueSearchResult) => void;
+  /**
+   * Which tracker to search. The caller already collected this choice ("Jira ticket" vs "Linear
+   * ticket" on the Report a Bug form) — this modal must not re-ask it, or a project with both
+   * trackers connected could search Jira after the user explicitly chose Linear.
+   */
+  provider: "JIRA" | "LINEAR";
 }
 
-export default function IssuePickerModal({ projectId, open, onClose, onSelect }: Props) {
-  const [provider, setProvider] = useState<"JIRA" | "LINEAR" | null>(null);
-  const [available, setAvailable] = useState<{ jira: boolean; linear: boolean }>({ jira: false, linear: false });
+export default function IssuePickerModal({ projectId, open, onClose, onSelect, provider }: Props) {
+  const [connected, setConnected] = useState(false);
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<IssueSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -30,18 +35,11 @@ export default function IssuePickerModal({ projectId, open, onClose, onSelect }:
     setSearch("");
     setResults([]);
     setError(null);
-    (async () => {
-      const [jira, linear] = await Promise.all([
-        getJiraStatus(projectId).catch(() => ({ connected: false })),
-        getLinearStatus(projectId).catch(() => ({ connected: false })),
-      ]);
-      setAvailable({ jira: jira.connected, linear: linear.connected });
-      setProvider(jira.connected ? "JIRA" : linear.connected ? "LINEAR" : null);
-    })();
-  }, [open, projectId]);
+    const getStatus = provider === "JIRA" ? getJiraStatus : getLinearStatus;
+    getStatus(projectId).then((s) => setConnected(s.connected)).catch(() => setConnected(false));
+  }, [open, projectId, provider]);
 
   const runSearch = useCallback(async (term: string) => {
-    if (!provider) return;
     setLoading(true);
     setError(null);
     try {
@@ -57,34 +55,23 @@ export default function IssuePickerModal({ projectId, open, onClose, onSelect }:
   }, [provider, projectId]);
 
   useEffect(() => {
-    if (!open || !provider) return;
+    if (!open || !connected) return;
     const handle = setTimeout(() => runSearch(search), 300);
     return () => clearTimeout(handle);
-  }, [open, provider, search, runSearch]);
+  }, [open, connected, search, runSearch]);
 
   if (!open) return null;
 
+  const providerLabel = provider === "JIRA" ? "Jira" : "Linear";
+
   return (
-    <Modal open={open} onClose={onClose} title="Link a ticket" className="max-w-[520px]">
-      {!available.jira && !available.linear ? (
+    <Modal open={open} onClose={onClose} title={`Link a ${providerLabel} ticket`} className="max-w-[520px]">
+      {!connected ? (
         <p className="text-[14px] text-[var(--muted)]">
-          No issue tracker is connected for this project. Connect Jira or Linear in project settings to search tickets here.
+          {providerLabel} is not connected for this project. Connect it in project settings to search tickets here.
         </p>
       ) : (
         <div className="space-y-4">
-          <div className="flex gap-2">
-            {available.jira ? (
-              <Button type="button" size="sm" variant={provider === "JIRA" ? "primary" : "secondary"} onClick={() => setProvider("JIRA")}>
-                Jira
-              </Button>
-            ) : null}
-            {available.linear ? (
-              <Button type="button" size="sm" variant={provider === "LINEAR" ? "primary" : "secondary"} onClick={() => setProvider("LINEAR")}>
-                Linear
-              </Button>
-            ) : null}
-          </div>
-
           <Field>
             <FieldLabel>Search issues</FieldLabel>
             <Input autoFocus value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by key or summary…" />

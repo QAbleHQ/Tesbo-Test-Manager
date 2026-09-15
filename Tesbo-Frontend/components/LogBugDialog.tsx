@@ -368,6 +368,25 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
                 </Button>
               )}
             </div>
+          ) : bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") ? (
+            // Linking a real Jira/Linear ticket needs nothing else — the ticket itself already
+            // carries a title, description and status. Bug Title/Description/Severity/Priority/
+            // Evidence only apply to a bug being newly described here, so they stay hidden.
+            <div>
+              <label className="block text-sm font-medium text-[var(--muted)] mb-1">Ticket</label>
+              {bugIssue ? (
+                <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
+                  <span className="font-medium text-[var(--foreground)]">{bugIssue.key} — {bugIssue.summary}</span>
+                  <button type="button" onClick={() => setBugIssue(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <Button type="button" variant="secondary" size="sm" onClick={() => setShowBugIssuePicker(true)}>
+                  Search {bugExistingChoice === "JIRA" ? "Jira" : "Linear"} tickets…
+                </Button>
+              )}
+            </div>
           ) : (
             <>
               <div>
@@ -440,43 +459,25 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
                 betterbugsUrl={bugBetterbugsUrl}
                 onBetterbugsUrlChange={setBugBetterbugsUrl}
               />
-              {bugAlreadyLogged ? (
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">Ticket</label>
-                  {bugIssue ? (
-                    <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
-                      <span className="font-medium text-[var(--foreground)]">{bugIssue.key} — {bugIssue.summary}</span>
-                      <button type="button" onClick={() => setBugIssue(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
-                        ✕
-                      </button>
-                    </div>
-                  ) : (
-                    <Button type="button" variant="secondary" size="sm" onClick={() => setShowBugIssuePicker(true)}>
-                      Search {bugExistingChoice === "JIRA" ? "Jira" : "Linear"} tickets…
-                    </Button>
+              {(jiraConnected || linearConnected) && (
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--muted)] mb-1">
+                      Where should this be tracked?
+                    </label>
+                    <TrackingDestinationField destination={bugDestination} onChange={setBugDestination} />
+                  </div>
+                  {bugDestination === "SELF" && (
+                    <SelfLoggedTrackerField
+                      jiraConnected={jiraConnected}
+                      linearConnected={linearConnected}
+                      system={bugSelfSystem}
+                      onSystemChange={setBugSelfSystem}
+                      url={bugUrl}
+                      onUrlChange={setBugUrl}
+                    />
                   )}
-                </div>
-              ) : (
-                (jiraConnected || linearConnected) && (
-                  <>
-                    <div>
-                      <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                        Where should this be tracked?
-                      </label>
-                      <TrackingDestinationField destination={bugDestination} onChange={setBugDestination} />
-                    </div>
-                    {bugDestination === "SELF" && (
-                      <SelfLoggedTrackerField
-                        jiraConnected={jiraConnected}
-                        linearConnected={linearConnected}
-                        system={bugSelfSystem}
-                        onSystemChange={setBugSelfSystem}
-                        url={bugUrl}
-                        onUrlChange={setBugUrl}
-                      />
-                    )}
-                  </>
-                )
+                </>
               )}
             </>
           )}
@@ -497,7 +498,15 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
               <Button
                 variant="destructive"
                 onClick={handleBugSubmit}
-                disabled={bugSaving || !bugTitle.trim() || !bugSeverity}
+                disabled={
+                  bugSaving ||
+                  !bugTitle.trim() ||
+                  !bugSeverity ||
+                  // Linking a Jira/Linear ticket has no other field to confirm intent with — without
+                  // this, "File Bug" stayed enabled from the auto-filled title/severity defaults alone
+                  // and could file an untracked bug before a ticket was ever searched for or picked.
+                  (bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") && !bugIssue)
+                }
               >
                 {bugSaving ? (
                   "Filing…"
@@ -517,6 +526,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
 
       <IssuePickerModal
         projectId={projectId}
+        provider={bugExistingChoice === "LINEAR" ? "LINEAR" : "JIRA"}
         open={showBugIssuePicker}
         onClose={() => setShowBugIssuePicker(false)}
         onSelect={(issue) => {
