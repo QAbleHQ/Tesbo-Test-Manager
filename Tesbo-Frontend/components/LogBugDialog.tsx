@@ -33,22 +33,48 @@ const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
 
 function ExistingBugPickerModal({
   projectId,
+  testcaseId,
+  cycleId,
   open,
   onClose,
-  onSelect,
+  selectedBugs,
+  onConfirm,
 }: {
   projectId: string;
+  /** Identify the (testcase, cycle) this dialog is linking against — the same pair bug_links'
+   *  unique constraint dedupes on, so it's what decides whether a bug is "already linked here"
+   *  (not executionId, which a link row can carry as null even when it is otherwise a duplicate). */
+  testcaseId: string | null;
+  cycleId: string | null;
   open: boolean;
   onClose: () => void;
-  onSelect: (bug: BugItem) => void;
+  /** Bugs already picked in a prior open of this same "Report a Bug" dialog — seeds the checkbox
+   *  state so re-opening the picker to add one more bug doesn't lose the ones already chosen. */
+  selectedBugs: BugItem[];
+  onConfirm: (bugs: BugItem[]) => void;
 }) {
   const [bugs, setBugs] = useState<BugItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(false);
+  const [picked, setPicked] = useState<Map<string, BugItem>>(new Map());
+
+  // Seed `picked` from the parent's current selection by adjusting state during render (React's
+  // documented pattern for "reset state when a prop changes"), not in a useEffect. An effect only
+  // runs AFTER the reopened picker's first paint, so there was a render — the one the DOM actually
+  // shows first — where `picked` still held whatever it was before the transition; doing this
+  // during render instead means the very first paint after reopening already reflects the seed,
+  // with no intermediate frame for a stale/empty value to be what's on screen.
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) {
+      setPicked(new Map(selectedBugs.map((bug) => [bug.id, bug])));
+      setSearch("");
+    }
+  }
 
   useEffect(() => {
     if (!open) return;
-    setSearch("");
     setLoading(true);
     listBugs(projectId)
       .then(setBugs)
@@ -57,15 +83,38 @@ function ExistingBugPickerModal({
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
-    if (!term) return bugs;
-    return bugs.filter((bug) => bug.title.toLowerCase().includes(term));
-  }, [bugs, search]);
+    // A bug already linked to this testcase+cycle can't be linked again here (the backend link
+    // insert is a no-op for it — see bug_links' unique constraint) — hide it so the list only
+    // ever offers bugs actually pickable.
+    const pickable = bugs.filter(
+      (bug) => !testcaseId || !bug.links.some((l) => l.testcaseId === testcaseId && l.cycleId === cycleId),
+    );
+    if (!term) return pickable;
+    return pickable.filter((bug) => bug.title.toLowerCase().includes(term));
+  }, [bugs, search, testcaseId, cycleId]);
+
+  function toggle(bug: BugItem) {
+    setPicked((prev) => {
+      const next = new Map(prev);
+      if (next.has(bug.id)) next.delete(bug.id);
+      else next.set(bug.id, bug);
+      return next;
+    });
+  }
+
+  function handleConfirm() {
+    onConfirm(Array.from(picked.values()));
+    onClose();
+  }
 
   if (!open) return null;
 
   return (
-    <Modal open={open} onClose={onClose} title="Link an existing bug" className="max-w-[520px]">
-      <div className="space-y-3">
+    <Modal open={open} onClose={onClose} title="Link existing bugs" className="max-w-[520px]">
+      {/* Scoped so tests (and any future nested-modal styling) can address this picker's own rows
+          without colliding with the same bug titles rendered as chips in the Report a Bug modal
+          still open underneath it. */}
+      <div data-testid="existing-bug-picker" className="space-y-3">
         <Input autoFocus value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search bugs by title…" />
         <div className="max-h-[320px] overflow-y-auto rounded-[var(--radius-control)] border border-[var(--border)]">
           {loading ? (
@@ -73,21 +122,33 @@ function ExistingBugPickerModal({
           ) : filtered.length === 0 ? (
             <p className="p-3 text-[13px] text-[var(--muted)]">No bugs found.</p>
           ) : (
-            filtered.map((bug) => (
-              <button
-                key={bug.id}
-                type="button"
-                onClick={() => onSelect(bug)}
-                className="flex w-full flex-col items-start gap-0.5 border-b border-[var(--border)] px-3 py-2 text-left last:border-b-0 hover:bg-[var(--surface-secondary)]"
-              >
-                <span className="text-[13px] font-medium text-[var(--foreground)]">{bug.title}</span>
-                <span className="text-[12px] text-[var(--muted)]">{bug.status}</span>
-              </button>
-            ))
+            filtered.map((bug) => {
+              const checked = picked.has(bug.id);
+              return (
+                // A <label> wrapping the checkbox, not a <button> around it — a checkbox nested
+                // inside a button is invalid HTML (interactive content inside interactive content)
+                // and unreliable to click; the label lets clicking anywhere in the row toggle it.
+                <label
+                  key={bug.id}
+                  className="flex w-full items-start gap-2 border-b border-[var(--border)] px-3 py-2 text-left last:border-b-0 hover:bg-[var(--surface-secondary)] cursor-pointer"
+                >
+                  <input type="checkbox" checked={checked} onChange={() => toggle(bug)} className="mt-1" />
+                  <div className="flex flex-col items-start gap-0.5">
+                    <span className="text-[13px] font-medium text-[var(--foreground)]">{bug.title}</span>
+                    <span className="text-[12px] text-[var(--muted)]">{bug.status}</span>
+                  </div>
+                </label>
+              );
+            })
           )}
         </div>
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
           <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+          {/* Not disabled at zero: unchecking every previously-picked bug and confirming is how
+              a working selection gets cleared back down to none through this picker. */}
+          <Button type="button" onClick={handleConfirm}>
+            {picked.size > 0 ? `Add Selected (${picked.size})` : "Add Selected"}
+          </Button>
         </div>
       </div>
     </Modal>
@@ -125,9 +186,9 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
   const [bugDestination, setBugDestination] = useState<TrackingDestination>("TESBO");
   const [bugSelfSystem, setBugSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [bugUrl, setBugUrl] = useState("");
-  const [bugIssue, setBugIssue] = useState<IssueSearchResult | null>(null);
+  const [selectedIssues, setSelectedIssues] = useState<IssueSearchResult[]>([]);
   const [showBugIssuePicker, setShowBugIssuePicker] = useState(false);
-  const [selectedExistingBug, setSelectedExistingBug] = useState<BugItem | null>(null);
+  const [selectedExistingBugs, setSelectedExistingBugs] = useState<BugItem[]>([]);
   const [showExistingBugPicker, setShowExistingBugPicker] = useState(false);
   const [bugEvidenceMode, setBugEvidenceMode] = useState<EvidenceMode>("FILES");
   const [bugStagedFiles, setBugStagedFiles] = useState<File[]>([]);
@@ -160,8 +221,8 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     setBugDestination("TESBO");
     setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setBugUrl("");
-    setBugIssue(null);
-    setSelectedExistingBug(null);
+    setSelectedIssues([]);
+    setSelectedExistingBugs([]);
     setBugEvidenceMode("FILES");
     setBugStagedFiles([]);
     setBugBetterbugsUrl("");
@@ -188,24 +249,22 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     setBugDestination("TESBO");
     setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setBugUrl("");
-    setBugIssue(null);
-    setSelectedExistingBug(null);
+    setSelectedIssues([]);
+    setSelectedExistingBugs([]);
     setBugEvidenceMode("FILES");
     setBugStagedFiles([]);
     setBugBetterbugsUrl("");
   }
 
-  /* ───── Submit bug from dialog (new bug, optionally noting where it's tracked elsewhere) ───── */
+  /* ───── Submit bug from dialog ("No, log a new one" — optionally noting where it's tracked
+   * elsewhere via the self-logged fields). "Yes, link existing" never reaches this: it goes
+   * through handleLinkExisting below regardless of which tab (Tesbo/Jira/Linear) is active. ───── */
   async function handleBugSubmit() {
     if (!bugExecution || !bugTitle.trim() || !bugSeverity) return;
     // Belt-and-suspenders alongside the button's `disabled={bugSaving}`: guards a re-entrant call
     // that lands before the disabled state has re-rendered.
     if (bugSaving) return;
     const selfLogged = (jiraConnected || linearConnected) && bugDestination === "SELF";
-    // "Yes, link existing" + a searched Jira/Linear ticket carries its own real key/url/provider
-    // (IssuePickerModal -> bugIssue) — that's the actual source of truth for this bug, not the
-    // self-logged fields below, which only apply to the "No, log a new one" branch.
-    const pickedIssue = bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") ? bugIssue : null;
     setBugSaving(true);
     setBugSaveError(null);
     try {
@@ -218,9 +277,9 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
           description: bugDesc.trim(),
           severity: bugSeverity,
           priority: bugPriority || null,
-          externalUrl: pickedIssue ? pickedIssue.url : selfLogged ? bugUrl.trim() : undefined,
-          integrationProvider: pickedIssue ? pickedIssue.provider : selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
-          integrationIssueKey: pickedIssue ? pickedIssue.key : null,
+          externalUrl: selfLogged ? bugUrl.trim() : undefined,
+          integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
+          integrationIssueKey: null,
           betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
           links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
         });
@@ -246,22 +305,74 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     }
   }
 
-  /* ───── Link this failing execution to an already-existing Tesbo bug (backtrace) ───── */
-  async function handleLinkExistingBug() {
-    if (!bugExecution || !selectedExistingBug) return;
+  /* ───── Link this failing execution to everything currently selected — existing Tesbo bugs
+   * (via addBugLink) and/or Jira/Linear tickets (via createBug) — in one action, regardless of
+   * which tab (bugExistingChoice) happens to be active when "Link Bug" is clicked. The two kinds
+   * of selection live in separate arrays (selectedExistingBugs / selectedIssues) precisely so
+   * switching tabs never has to clear one to show the other.
+   *
+   * addBugLink is idempotent (INSERT ... ON CONFLICT DO NOTHING on bug_links), so a retry safely
+   * resends the whole selectedExistingBugs list. createBug is NOT idempotent — each call always
+   * inserts a new bug row — so a naive retry after a partial failure would recreate bugs for
+   * tickets that already succeeded; remainingIssues keeps only the ones that still need a bug
+   * created, so a retry (clicking the button again after an error) only re-attempts those. */
+  async function handleLinkExisting() {
+    if (!bugExecution) return;
+    if (selectedExistingBugs.length === 0 && selectedIssues.length === 0) return;
+    if (bugSaving) return;
     setBugSaving(true);
-    try {
-      await addBugLink(selectedExistingBug.id, { testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id });
+    setBugSaveError(null);
+    const link = { testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id };
+    let firstError: unknown = null;
+
+    if (selectedExistingBugs.length) {
+      try {
+        await Promise.all(selectedExistingBugs.map((bug) => addBugLink(bug.id, link)));
+      } catch (err) {
+        firstError = firstError ?? err;
+      }
+    }
+
+    const remainingIssues: IssueSearchResult[] = [];
+    for (const issue of selectedIssues) {
+      try {
+        await createBug(projectId, {
+          title: bugTitle.trim(),
+          description: bugDesc.trim(),
+          severity: bugSeverity,
+          priority: bugPriority || null,
+          externalUrl: issue.url,
+          integrationProvider: issue.provider,
+          integrationIssueKey: issue.key,
+          links: [link],
+        });
+      } catch (err) {
+        firstError = firstError ?? err;
+        remainingIssues.push(issue);
+      }
+    }
+    setSelectedIssues(remainingIssues);
+
+    if (firstError) {
+      setBugSaveError(firstError instanceof Error ? firstError.message : "Something went wrong while linking these items.");
+    } else {
       resetBugDialog();
       onLogged?.();
-    } finally {
-      setBugSaving(false);
     }
+    setBugSaving(false);
   }
 
   function handleBugSkip() {
     resetBugDialog();
   }
+
+  // Which tracker the "Yes, link existing" tabs currently have active, and how many things are
+  // in the combined working selection across all three sources — used by both the chip list and
+  // the footer's single "Link Bug" action so the count/label always reflect everything selected,
+  // not just whichever tab happens to be open right now.
+  const activeProvider: "JIRA" | "LINEAR" = bugExistingChoice === "LINEAR" ? "LINEAR" : "JIRA";
+  const activeProviderLabel = activeProvider === "JIRA" ? "Jira" : "Linear";
+  const totalSelected = selectedExistingBugs.length + selectedIssues.length;
 
   const dialog = (
     <>
@@ -326,7 +437,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
                   type="button"
                   size="sm"
                   variant={bugExistingChoice === "JIRA" ? "primary" : "secondary"}
-                  onClick={() => { setBugExistingChoice("JIRA"); setBugIssue(null); }}
+                  onClick={() => setBugExistingChoice("JIRA")}
                 >
                   Jira ticket
                 </Button>
@@ -336,7 +447,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
                   type="button"
                   size="sm"
                   variant={bugExistingChoice === "LINEAR" ? "primary" : "secondary"}
-                  onClick={() => { setBugExistingChoice("LINEAR"); setBugIssue(null); }}
+                  onClick={() => setBugExistingChoice("LINEAR")}
                 >
                   Linear ticket
                 </Button>
@@ -352,40 +463,60 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
             </div>
           )}
 
-          {bugAlreadyLogged && bugExistingChoice === "TESBO" ? (
+          {bugAlreadyLogged ? (
+            // Linking real Jira/Linear tickets or existing Tesbo bugs needs nothing else — each
+            // already carries its own title/description/status. Bug Title/Description/Severity/
+            // Priority/Evidence only apply to a bug being newly described here, so they stay
+            // hidden. The chip list below is the COMBINED working selection across all three
+            // sources (Tesbo bugs + Jira tickets + Linear tickets) so switching tabs to add from
+            // another source never hides what's already picked from this one.
             <div>
-              <label className="block text-sm font-medium text-[var(--muted)] mb-1">Bug</label>
-              {selectedExistingBug ? (
-                <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
-                  <span className="font-medium text-[var(--foreground)]">{selectedExistingBug.title}</span>
-                  <button type="button" onClick={() => setSelectedExistingBug(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
-                    ✕
-                  </button>
-                </div>
-              ) : (
-                <Button type="button" variant="secondary" size="sm" onClick={() => setShowExistingBugPicker(true)}>
-                  Choose an existing bug…
-                </Button>
-              )}
-            </div>
-          ) : bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") ? (
-            // Linking a real Jira/Linear ticket needs nothing else — the ticket itself already
-            // carries a title, description and status. Bug Title/Description/Severity/Priority/
-            // Evidence only apply to a bug being newly described here, so they stay hidden.
-            <div>
-              <label className="block text-sm font-medium text-[var(--muted)] mb-1">Ticket</label>
-              {bugIssue ? (
-                <div className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]">
-                  <span className="font-medium text-[var(--foreground)]">{bugIssue.key} — {bugIssue.summary}</span>
-                  <button type="button" onClick={() => setBugIssue(null)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">
-                    ✕
-                  </button>
-                </div>
-              ) : (
-                <Button type="button" variant="secondary" size="sm" onClick={() => setShowBugIssuePicker(true)}>
-                  Search {bugExistingChoice === "JIRA" ? "Jira" : "Linear"} tickets…
-                </Button>
-              )}
+              <label className="block text-sm font-medium text-[var(--muted)] mb-1">
+                {totalSelected > 1 ? "Selected items" : "Selected item"}
+              </label>
+              <div className="space-y-1.5">
+                {selectedExistingBugs.map((bug) => (
+                  <div
+                    key={`tesbo-${bug.id}`}
+                    className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]"
+                  >
+                    <span className="font-medium text-[var(--foreground)]">{bug.title}</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedExistingBugs((prev) => prev.filter((b) => b.id !== bug.id))}
+                      className="text-[var(--muted)] hover:text-[var(--error-foreground)]"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                {selectedIssues.map((issue) => (
+                  <div
+                    key={`${issue.provider}-${issue.key}`}
+                    className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]"
+                  >
+                    <span className="font-medium text-[var(--foreground)]">{issue.key} — {issue.summary}</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedIssues((prev) => prev.filter((i) => !(i.provider === issue.provider && i.key === issue.key)))}
+                      className="text-[var(--muted)] hover:text-[var(--error-foreground)]"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                {bugExistingChoice === "TESBO" ? (
+                  <Button type="button" variant="secondary" size="sm" onClick={() => setShowExistingBugPicker(true)}>
+                    {selectedExistingBugs.length ? "Add another bug…" : "Choose an existing bug…"}
+                  </Button>
+                ) : (
+                  <Button type="button" variant="secondary" size="sm" onClick={() => setShowBugIssuePicker(true)}>
+                    {selectedIssues.some((i) => i.provider === activeProvider)
+                      ? `Add another ${activeProviderLabel} ticket…`
+                      : `Search ${activeProviderLabel} tickets…`}
+                  </Button>
+                )}
+              </div>
             </div>
           ) : (
             <>
@@ -486,27 +617,23 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
             <Button variant="secondary" onClick={handleBugSkip}>
               Skip
             </Button>
-            {bugAlreadyLogged && bugExistingChoice === "TESBO" ? (
+            {bugAlreadyLogged ? (
               <Button
                 variant="destructive"
-                onClick={handleLinkExistingBug}
-                disabled={bugSaving || !selectedExistingBug}
+                onClick={handleLinkExisting}
+                disabled={bugSaving || totalSelected === 0}
               >
-                {bugSaving ? "Linking…" : "Link Bug"}
+                {bugSaving
+                  ? "Linking…"
+                  : totalSelected > 1
+                    ? `Link ${totalSelected} Bugs`
+                    : "Link Bug"}
               </Button>
             ) : (
               <Button
                 variant="destructive"
                 onClick={handleBugSubmit}
-                disabled={
-                  bugSaving ||
-                  !bugTitle.trim() ||
-                  !bugSeverity ||
-                  // Linking a Jira/Linear ticket has no other field to confirm intent with — without
-                  // this, "File Bug" stayed enabled from the auto-filled title/severity defaults alone
-                  // and could file an untracked bug before a ticket was ever searched for or picked.
-                  (bugAlreadyLogged && (bugExistingChoice === "JIRA" || bugExistingChoice === "LINEAR") && !bugIssue)
-                }
+                disabled={bugSaving || !bugTitle.trim() || !bugSeverity}
               >
                 {bugSaving ? (
                   "Filing…"
@@ -526,23 +653,30 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
 
       <IssuePickerModal
         projectId={projectId}
-        provider={bugExistingChoice === "LINEAR" ? "LINEAR" : "JIRA"}
+        testcaseId={bugExecution?.testcaseId ?? null}
+        cycleId={cycleId}
+        provider={activeProvider}
         open={showBugIssuePicker}
         onClose={() => setShowBugIssuePicker(false)}
-        onSelect={(issue) => {
-          setBugIssue(issue);
-          setShowBugIssuePicker(false);
-        }}
+        // Scoped to the active provider on the way in and merged back the same way on confirm —
+        // selectedIssues holds both Jira and Linear tickets together (each tagged by its own
+        // .provider), but this picker is locked to one provider and must never see or touch the
+        // other's entries, or a Linear ticket picked earlier could get swept into a Jira picker's
+        // internal selection state and rendered there by mistake.
+        selectedIssues={selectedIssues.filter((issue) => issue.provider === activeProvider)}
+        onConfirm={(issues) =>
+          setSelectedIssues((prev) => [...prev.filter((issue) => issue.provider !== activeProvider), ...issues])
+        }
       />
 
       <ExistingBugPickerModal
         projectId={projectId}
+        testcaseId={bugExecution?.testcaseId ?? null}
+        cycleId={cycleId}
         open={showExistingBugPicker}
         onClose={() => setShowExistingBugPicker(false)}
-        onSelect={(bug) => {
-          setSelectedExistingBug(bug);
-          setShowExistingBugPicker(false);
-        }}
+        selectedBugs={selectedExistingBugs}
+        onConfirm={(bugs) => setSelectedExistingBugs(bugs)}
       />
     </>
   );

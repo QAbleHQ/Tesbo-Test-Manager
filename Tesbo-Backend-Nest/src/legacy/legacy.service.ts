@@ -5241,14 +5241,16 @@ export class LegacyService implements OnModuleInit {
       values.push(query.status);
       filters.push(`b.status = $${values.length}`);
     }
+    // Sourced from bug_links, not the denormalized b.cycle_id/b.testcase_id columns — those are
+    // only a "first-link convenience" written once at creation (see V48_bug_links.sql) and go
+    // stale the moment a bug is linked to anything else afterward (addBugLink never touches
+    // them). A bug picked via "Yes, link existing" -> "Existing Tesbo bug" and originally created
+    // against a different cycle (or no cycle at all) has to still show up here, or it silently
+    // vanishes from every execution's linked-bugs display despite bug_links being correct.
     if (query.cycleId) {
       values.push(query.cycleId);
-      filters.push(`b.cycle_id = $${values.length}`);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.cycle_id = $${values.length})`);
     }
-    // Sourced from bug_links, not the denormalized b.testcase_id column — updateBug's link edits
-    // only ever touch bug_links (see replaceBugLinks), so b.testcase_id can go stale once a bug's
-    // links are edited after creation. bug_links is what the Bugs page itself already trusts to
-    // show a bug's linked test case(s), so filtering the other direction has to agree with it.
     if (query.testcaseId) {
       values.push(query.testcaseId);
       filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length})`);
