@@ -16,6 +16,8 @@ export const RESERVED_TESTCASE_HEADERS = new Set(
     "preconditions",
     "postconditions",
     "steps",
+    "action",
+    "expectedResult",
     "testData",
     "priority",
     "severity",
