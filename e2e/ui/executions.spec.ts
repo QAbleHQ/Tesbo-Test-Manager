@@ -731,15 +731,15 @@ test.describe("run detail — progress, defects and the bug modal", () => {
     }
   });
 
-  test("EXE-U-31 Bug Key/Bug Title fields appear only once the case is marked Failed", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
+  test("EXE-U-31 Bug Key/Bug Title fields appear only when the case is Failed AND a bug is actually linked", { tag: '@tesbo.testId("TES-TC-1335")' }, async ({ page }) => {
     const { cycle, testcase } = await setUpCycleWithOneCase(`UI Defect Visibility ${Date.now()}`);
+    // Driven from the full-page execute screen rather than the run's side panel: the panel opens
+    // from a row interaction this file has no established pattern for, and the same rule governs
+    // both screens. The execute screen renders its statuses as buttons.
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let bugId = "";
     try {
-      // Driven from the full-page execute screen rather than the run's side panel: the panel opens
-      // from a row interaction this file has no established pattern for, and the same rule governs
-      // both screens. The execute screen renders its statuses as buttons.
-      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
       const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
-      await api.dispose();
 
       await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
       await expect(page.getByText(testcase.title).first()).toBeVisible();
@@ -747,13 +747,40 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       // Opens on Untested: a bug reference would be meaningless, so the fields are not offered.
       await expect(page.getByText("Bug Key")).toBeHidden();
 
+      // Marking Failed changes only the execution's status. It must not, on its own, imply a bug
+      // exists — the fields stay hidden until a bug is actually logged/linked and persisted.
       await page.getByRole("button", { name: "Failed", exact: true }).first().click();
+      await expect(page.getByText("Bug Key")).toBeHidden();
+      await expect(page.getByText("Bug Title")).toBeHidden();
+
+      // Persist a real bug link — what a successful "Log bug" / "Link Bug" does server-side. Only
+      // now, with an actual bugs/bug_links row behind it, must the fields appear.
+      const bugTitle = `E2E Defect Visibility ${Date.now()}`;
+      const bug = await (
+        await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: bugTitle,
+            integrationProvider: "JIRA",
+            integrationIssueKey: "PROJ-4471",
+            externalUrl: "https://example.atlassian.net/browse/PROJ-4471",
+            links: [{ testcaseId: testcase.id, cycleId: cycle.id, executionId: execution.id }],
+          },
+        })
+      ).json();
+      bugId = bug.id;
+
+      await page.reload();
       await expect(page.getByText("Bug Key")).toBeVisible();
       await expect(page.getByText("Bug Title")).toBeVisible();
 
+      // A bug linked while the case was Failed must not keep showing once the case moves to any
+      // other status — the fields are Failed-only, not "ever had a bug" only.
       await page.getByRole("button", { name: "Passed", exact: true }).first().click();
       await expect(page.getByText("Bug Key")).toBeHidden();
+      await expect(page.getByText("Bug Title")).toBeHidden();
     } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false });
+      await api.dispose();
       await cleanUp(cycle.id, testcase.id);
     }
   });
@@ -836,6 +863,201 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(bugKeyInput).toHaveAttribute("readonly", "");
       await expect(bugTitleInput).toHaveAttribute("readonly", "");
     } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Regression: loadPanelBug() fired one fetch per panel open with no guard against out-of-order
+   * responses. Opening test case A (which has a linked bug) and then quickly switching to test
+   * case B (which has none) could let A's slower response land after B's panel was already open,
+   * overwriting panelBug with A's bug — so B's panel showed A's Bug Key/Title even though B has no
+   * bug of its own. cycles/[cycleId]/page.tsx now stamps each request with the execution id it was
+   * made for and drops any response that arrives after the panel has moved on to a different case.
+   */
+  test("EXE-U-31d the drawer never shows another test case's bug after switching before a slow bugs fetch resolves", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = Date.now();
+    let cycleId = "";
+    let bugId = "";
+    const testcaseIds: string[] = [];
+    try {
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bug Race Cycle ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+      await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
+      const testcaseA = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `UI Bug Race A ${stamp}` } })
+      ).json();
+      const testcaseB = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `UI Bug Race B ${stamp}` } })
+      ).json();
+      testcaseIds.push(testcaseA.id, testcaseB.id);
+      await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+      const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      const execA = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseA.id);
+
+      const bugTitle = `E2E Bug Race ${stamp}`;
+      const bug = await (
+        await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: bugTitle,
+            integrationProvider: "JIRA",
+            integrationIssueKey: "RACE-1",
+            externalUrl: "https://example.atlassian.net/browse/RACE-1",
+            links: [{ testcaseId: testcaseA.id, cycleId: cycle.id, executionId: execA.id }],
+          },
+        })
+      ).json();
+      bugId = bug.id;
+      // The panel gates Bug Key/Title on Failed too, so A must actually be Failed for this test to
+      // exercise the same code path a real "wrong bug leaked through" report would hit.
+      await api.patch(`/api/cycles/${cycle.id}/executions/${execA.id}`, { data: { status: "Failed" } });
+
+      // Delay only the GET fetch scoped to test case A, so its response can land after the panel
+      // has already moved on to test case B — the exact ordering that used to leak A's bug onto B.
+      await page.route(`**/api/projects/${ctx.projectId}/bugs**`, async (route) => {
+        const request = route.request();
+        const requestUrl = new URL(request.url());
+        if (request.method() === "GET" && requestUrl.searchParams.get("testcaseId") === testcaseA.id) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+        await route.continue();
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+
+      // Open A's panel — fires the (delayed) bugs fetch for A — then switch away before it lands.
+      await page.getByText(testcaseA.title).first().click();
+      await expect(page.getByRole("heading", { name: testcaseA.title })).toBeVisible();
+      await page.keyboard.press("Escape");
+      await page.getByText(testcaseB.title).first().click();
+      await expect(page.getByRole("heading", { name: testcaseB.title })).toBeVisible();
+
+      // Give A's delayed fetch time to resolve while B's panel is the one open.
+      await page.waitForTimeout(2000);
+
+      // B has no bug of its own — A's late response must not have leaked onto B's panel.
+      await expect(page.getByText("Bug Key")).toBeHidden();
+      await expect(page.getByText("Bug Title")).toBeHidden();
+    } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false });
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      for (const id of testcaseIds) {
+        await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      }
+      await api.dispose();
+    }
+  });
+
+  /*
+   * Regression: marking a case Failed via the drawer's Status buttons and clicking Save closes the
+   * drawer and auto-opens the Report a Bug dialog (handlePanelSave). The dialog's onLogged used to
+   * read this page's own `panelExecution` state, which handlePanelSave had already set to null
+   * before opening the dialog — so a bug filed or linked through that exact path never made it back
+   * onto screen: the drawer stayed closed and the user had to manually reopen the row (and even then
+   * only saw it once a possibly-slow fetch resolved). onLogged now receives the execution the dialog
+   * actually operated on and reopens the panel for it, so both "Log bug" and "Link existing bug"
+   * show the real persisted Bug Key/Title immediately, with no page reload.
+   */
+  test("EXE-U-31e the drawer's Failed+Save auto-prompt reopens the panel with the linked bug after Link Existing Bug", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Auto Prompt Link Bug ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let existingBugId = "";
+    try {
+      const existingBugTitle = `E2E Existing Bug To Link ${Date.now()}`;
+      const existingBug = await (
+        await api.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: existingBugTitle,
+            integrationProvider: "JIRA",
+            integrationIssueKey: "AUTO-99",
+            externalUrl: "https://example.atlassian.net/browse/AUTO-99",
+          },
+        })
+      ).json();
+      existingBugId = existingBug.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+
+      await page.getByRole("button", { name: "Failed", exact: true }).first().click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      // Marking Failed and saving auto-opens the bug dialog; the drawer closes behind it.
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+      await page.getByRole("button", { name: "Yes, link existing" }).click();
+      await page.getByRole("button", { name: "Existing Tesbo bug" }).click();
+      await page.getByRole("button", { name: "Choose an existing bug…" }).click();
+      await expect(page.getByRole("heading", { name: "Link an existing bug" })).toBeVisible();
+      await page.getByPlaceholder("Search bugs by title…").fill(existingBugTitle);
+      await page.getByText(existingBugTitle, { exact: true }).click();
+      await page.getByRole("button", { name: "Link Bug" }).click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      // The panel must reopen automatically, for this same test case, with the real linked bug's
+      // data — no page reload, no manual re-click on the row required.
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      await expect(bugKeyInput).toHaveValue("AUTO-99", { timeout: 20_000 });
+      await expect(bugTitleInput).toHaveValue(existingBugTitle, { timeout: 20_000 });
+    } finally {
+      if (existingBugId) await api.delete(`/api/bugs/${existingBugId}`, { failOnStatusCode: false });
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Regression: clicking the local "Failed" status button and then the "Log bug" footer button
+   * directly — without an intervening Save — used to reopen the panel showing "Untested" and no
+   * Bug Key/Title. openBugDialogFor(panelExecution) (the footer button's call) snapshots whatever
+   * panelExecution.status currently is, which is still the last-*saved* status, not the locally
+   * toggled one; onLogged then trusted that stale snapshot when reopening the panel. Since a
+   * successful "Log bug"/"Link Bug" always forces the execution to Failed server-side regardless
+   * (failLinkedExecutions), the fix reopens with status forced to "Failed" rather than trusting the
+   * snapshot, so the case doesn't visibly revert to Untested and the fields it just fetched stay
+   * visible instead of being hidden by the (now-wrong) status.
+   */
+  test("EXE-U-31f clicking Log bug without Save first still ends up Failed with the bug visible, not Untested", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Log Bug No Save ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+
+      // Toggle the local status button but never click Save, then go straight to Log bug — the
+      // natural thing to do, since the whole point of marking a case Failed is to report the bug
+      // it caused.
+      await page.getByRole("button", { name: "Failed", exact: true }).click();
+      await page.getByRole("button", { name: "Log bug" }).click();
+
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+      const bugTitle = `E2E No-Save Log Bug ${Date.now()}`;
+      await page.getByPlaceholder("Brief summary of the bug…").fill(bugTitle);
+      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      // The panel must reopen on this same test case, as Failed, with the bug it just filed —
+      // immediately, not reverted to Untested with the fields hidden.
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+      const bugKeyInput = page.getByLabel("Bug Key");
+      const bugTitleInput = page.getByLabel("Bug Title");
+      await expect(bugTitleInput).toHaveValue(bugTitle, { timeout: 20_000 });
+      await expect(bugKeyInput).toBeVisible();
+    } finally {
+      const bugsRes = await api.get(`/api/projects/${ctx.projectId}/bugs`);
+      const bugs = await bugsRes.json();
+      for (const bug of bugs) {
+        if (bug.links?.some((l: { testcaseId: string }) => l.testcaseId === testcase.id)) {
+          await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+        }
+      }
       await api.dispose();
       await cleanUp(cycle.id, testcase.id);
     }

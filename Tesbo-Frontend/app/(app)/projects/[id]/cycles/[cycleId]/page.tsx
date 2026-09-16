@@ -484,9 +484,22 @@ export default function TestRunDetailPage() {
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
     cycleId,
-    onLogged: () => {
+    // Reopen the panel for the execution the dialog actually just logged/linked a bug against,
+    // rather than trusting panelExecution — handlePanelSave's auto-prompt (mark Failed -> Save ->
+    // Report a Bug) closes the panel before opening this dialog, so panelExecution is null exactly
+    // when a bug is filed through that path, and the freshly linked Bug Key/Title would otherwise
+    // never surface until the user manually reopened the row.
+    //
+    // Force status to "Failed" rather than trusting exec.status: the backend's
+    // failLinkedExecutions unconditionally flips the linked execution to Failed on every successful
+    // "Log bug"/"Link Bug" (see legacy.service.ts), but exec is a snapshot taken when the dialog was
+    // opened. Clicking the "Log bug" footer button (or the row's bug icon) straight from an
+    // Untested/Passed/etc. panel — without first clicking the local "Failed" status button and
+    // Save — carries that stale status into the snapshot, so trusting it here would reopen the
+    // panel on "Untested" and immediately hide the very Bug Key/Title it just fetched.
+    onLogged: (exec) => {
       load();
-      if (panelExecution) loadPanelBug(panelExecution);
+      openExecutionPanel({ ...exec, status: "Failed" });
     },
   });
 
@@ -687,10 +700,21 @@ export default function TestRunDetailPage() {
   }
 
   /* ───── Right-side test case detail panel ───── */
+  // Guards against an out-of-order response: switching panels fires a new listBugs() call before
+  // the previous execution's call has resolved, and without this a slower earlier response could
+  // land after the panel has moved on, showing one test case's linked bug on another's panel.
+  const panelBugRequestIdRef = useRef<string | null>(null);
+
   function loadPanelBug(exec: ExecutionItem) {
+    panelBugRequestIdRef.current = exec.id;
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
-      .then((bugs) => setPanelBug(bugs[0] ?? null))
-      .catch(() => setPanelBug(null));
+      .then((bugs) => {
+        if (panelBugRequestIdRef.current !== exec.id) return;
+        setPanelBug(bugs[0] ?? null);
+      })
+      .catch(() => {
+        if (panelBugRequestIdRef.current === exec.id) setPanelBug(null);
+      });
   }
 
   function openExecutionPanel(exec: ExecutionItem) {
@@ -703,6 +727,7 @@ export default function TestRunDetailPage() {
   }
 
   function closeExecutionPanel() {
+    panelBugRequestIdRef.current = null;
     setPanelExecution(null);
     setPanelBug(null);
   }
@@ -1944,10 +1969,13 @@ export default function TestRunDetailPage() {
                 />
               </div>
 
-              {/* Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
-                  rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
-                  not a free-text value typed here, so there's nothing to type into them. */}
-              <div className="space-y-3" hidden={panelStatus !== "Failed"}>
+              {/* Bug Key / Bug Title — shown only for a Failed case that also has a real persisted
+                  bug association (panelBug, loaded from bug_links via listBugs). Both conditions
+                  matter: Failed alone does not imply a bug exists (only a successful "Log bug" /
+                  "Link Bug" does), and a bug linked while the case was Failed must not keep
+                  showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only: these
+                  reflect the real bug, not a free-text value typed here. */}
+              <div className="space-y-3" hidden={panelStatus !== "Failed" || !panelBug}>
                 <div>
                   <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Key</label>
                   <Input type="text" aria-label="Bug Key" value={panelBug?.integrationIssueKey || panelBug?.externalId || ""} readOnly placeholder="e.g. PROJ-123" />

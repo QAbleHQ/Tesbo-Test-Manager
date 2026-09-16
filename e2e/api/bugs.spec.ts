@@ -245,6 +245,69 @@ test.describe("bug CRUD", () => {
     },
   );
 
+  test(
+    "listBugs filters by cycleId, following bug_links rather than the denormalized column",
+    async ({ request }) => {
+      // Regression: the exact same staleness the testcaseId test above covers, but for cycleId —
+      // and this is the one the Test Case Detail panel's real query (`listBugs({testcaseId,
+      // cycleId})`) actually hit. "Link existing bug" (addBugLink) inserts a bug_links row for the
+      // new cycle but never touches bugs.cycle_id, which stays at whatever cycle the bug was first
+      // created in (or null, if it was filed with no run yet). A `b.cycle_id = $N` filter then
+      // silently excluded a bug that a real bug_links row said belonged to this cycle, so a bug
+      // that was genuinely just linked never reappeared in the panel that linked it.
+      const cycleA = await (
+        await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug Cycle Filter A ${Date.now()}` } })
+      ).json();
+      const cycleB = await (
+        await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug Cycle Filter B ${Date.now()}` } })
+      ).json();
+      const testcase = await (
+        await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Bug Cycle Filter Case ${Date.now()}` } })
+      ).json();
+      await request.post(`/api/cycles/${cycleA.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      await request.post(`/api/cycles/${cycleB.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+
+      // Filed with no link at all, so bugs.cycle_id is null from creation — the "log a bug from
+      // the Bugs page, link it to a run later" path.
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Bug Cycle Filter Target ${Date.now()}` },
+        })
+      ).json();
+
+      try {
+        const beforeLink = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcase.id, cycleId: cycleA.id } })
+        ).json();
+        expect(beforeLink.some((b: { id: string }) => b.id === created.id), "not yet linked to cycle A").toBeFalsy();
+
+        // Link it to the test case in cycle A — only bug_links is written; bugs.cycle_id (still
+        // null from creation) is left exactly as it was.
+        await request.post(`/api/bugs/${created.id}/links`, { data: { testcaseId: testcase.id, cycleId: cycleA.id } });
+
+        const listForA = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcase.id, cycleId: cycleA.id } })
+        ).json();
+        expect(
+          listForA.some((b: { id: string }) => b.id === created.id),
+          "the stale (null) bugs.cycle_id column must not hide a real bug_links row",
+        ).toBeTruthy();
+
+        // Not linked to cycle B, even though the same test case sits in both runs — a match on
+        // testcaseId in one link row must not combine with a match on cycleId from a different one.
+        const listForB = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcase.id, cycleId: cycleB.id } })
+        ).json();
+        expect(listForB.some((b: { id: string }) => b.id === created.id), "not linked to cycle B").toBeFalsy();
+      } finally {
+        await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/cycles/${cycleA.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/cycles/${cycleB.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+      }
+    },
+  );
+
   test("sending an empty string to clear a field leaves the old value in place", { tag: '@tesbo.testId("TES-TC-101")' }, async ({ request }) => {
     // KNOWN GAP (documented, not test.fail() — a data-integrity bug, not a security one):
     // updateBug (legacy.service.ts:1958) sends every field as `body.field || null`, so an

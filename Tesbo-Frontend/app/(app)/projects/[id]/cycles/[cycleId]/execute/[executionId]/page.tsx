@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   listCycleExecutions,
@@ -76,15 +76,30 @@ export default function ExecutionDetailPage() {
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
     cycleId,
-    onLogged: () => {
-      if (execution) loadLinkedBug(execution);
+    // Use the execution the dialog actually operated on rather than this page's own `execution`
+    // state — this page never nulls that state out, so both happen to agree today, but relying on
+    // the dialog's own answer keeps this correct even if that stops being true.
+    onLogged: (exec) => {
+      loadLinkedBug(exec);
     },
   });
 
+  // Guards against an out-of-order response landing after a newer listBugs() call for this same
+  // page — e.g. the initial-mount fetch resolving after a post-"Log bug" refresh — which would
+  // otherwise overwrite the fresher result with a stale one.
+  const linkedBugRequestIdRef = useRef<string | null>(null);
+
   function loadLinkedBug(exec: ExecutionItem) {
+    const requestId = `${exec.id}:${Date.now()}`;
+    linkedBugRequestIdRef.current = requestId;
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
-      .then((bugs) => setLinkedBug(bugs[0] ?? null))
-      .catch(() => setLinkedBug(null));
+      .then((bugs) => {
+        if (linkedBugRequestIdRef.current !== requestId) return;
+        setLinkedBug(bugs[0] ?? null);
+      })
+      .catch(() => {
+        if (linkedBugRequestIdRef.current === requestId) setLinkedBug(null);
+      });
   }
 
   useEffect(() => {
@@ -259,11 +274,14 @@ export default function ExecutionDetailPage() {
           </div>
 
           {/*
-            * Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
-            * rule). Read-only: these reflect the real bug filed via "Log bug" (bugs/bug_links),
-            * not a free-text value typed here, so there's nothing to type into them.
+            * Bug Key / Bug Title — shown only for a Failed case that also has a real persisted bug
+            * association (linkedBug, loaded from bug_links via listBugs). Both conditions matter:
+            * Failed alone does not imply a bug exists (only a successful "Log bug" / "Link Bug"
+            * does), and a bug linked while the case was Failed must not keep showing once the case
+            * is Untested/Passed/Skipped/Blocked/Retest. Read-only: these reflect the real bug, not
+            * a free-text value typed here.
             */}
-          <div className="grid grid-cols-2 gap-3" hidden={status !== "Failed"}>
+          <div className="grid grid-cols-2 gap-3" hidden={status !== "Failed" || !linkedBug}>
             <div>
               <label className="block text-sm font-medium text-[var(--muted)] mb-1">
                 Bug Key
