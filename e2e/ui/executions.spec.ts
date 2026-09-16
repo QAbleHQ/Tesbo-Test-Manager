@@ -286,9 +286,18 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("button", { name: "Yes, link existing" }).click();
       // exact: true — "Jira ticket" is otherwise a substring match of "Search Jira tickets…" too.
       await page.getByRole("button", { name: "Jira ticket", exact: true }).click();
+
+      // Linking a real ticket needs nothing else — the ticket already carries its own title,
+      // description and status, so the new-bug-only fields must not appear alongside it.
+      await expect(page.getByText("Bug Title", { exact: true })).toBeHidden();
+      await expect(page.getByText("Description", { exact: true })).toBeHidden();
+      await expect(page.getByLabel("Severity")).toBeHidden();
+      await expect(page.getByLabel("Bug priority")).toBeHidden();
+      await expect(page.getByText("Evidence", { exact: true })).toBeHidden();
+
       await page.getByRole("button", { name: "Search Jira tickets…" }).click();
 
-      await expect(page.getByRole("heading", { name: "Link a ticket" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Link a Jira ticket" })).toBeVisible();
       const resultButton = page.getByRole("button", { name: "PROJ-4242 — Login button does nothing" });
       await expect(resultButton).toBeVisible();
       await resultButton.click();
@@ -305,6 +314,86 @@ test.describe("auto bug-filing on Failed", () => {
         expect(filedBug.integrationProvider).toBe("JIRA");
         expect(filedBug.integrationIssueKey).toBe("PROJ-4242");
         expect(filedBug.externalUrl).toBe("https://e2e.atlassian.net/browse/PROJ-4242");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * Regression: IssuePickerModal used to own its own Jira/Linear toggle and default to whichever
+   * tracker connected first (Jira), ignoring the tracker the user had just picked on the Report a
+   * Bug form ("Jira ticket" vs "Linear ticket"). With both trackers connected, choosing "Linear
+   * ticket" and opening the search still searched — and could be switched back to — Jira. The picker
+   * must now be locked to the provider already chosen, with no toggle back to the other one, and
+   * "File Bug" must stay disabled until a ticket has actually been picked.
+   */
+  test("choosing Linear ticket only ever searches Linear, even with Jira also connected", async ({ page }) => {
+    const title = `UI Bug Linear Link ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    await page.route(`**/api/projects/${ctx.projectId}/jira/status`, (route) =>
+      route.fulfill({ json: { connected: true } }),
+    );
+    await page.route(`**/api/projects/${ctx.projectId}/linear/status`, (route) =>
+      route.fulfill({ json: { connected: true } }),
+    );
+    let jiraSearched = false;
+    await page.route(`**/api/projects/${ctx.projectId}/jira/search-issues**`, (route) => {
+      jiraSearched = true;
+      return route.fulfill({ json: { list: [] } });
+    });
+    await page.route(`**/api/projects/${ctx.projectId}/linear/search-issues**`, (route) =>
+      route.fulfill({
+        json: {
+          list: [
+            { provider: "LINEAR", key: "ENG-77", summary: "Dropdown closes on scroll", status: "Todo", url: "https://linear.app/e2e/issue/ENG-77" },
+          ],
+        },
+      }),
+    );
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("row", { name: title }).getByRole("combobox").selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.getByRole("button", { name: "Yes, link existing" }).click();
+      // exact: true — "Linear ticket" is otherwise a substring match of "Search Linear tickets…" too.
+      await page.getByRole("button", { name: "Linear ticket", exact: true }).click();
+
+      // Same new-bug-only fields must stay hidden for the Linear branch too.
+      await expect(page.getByText("Bug Title", { exact: true })).toBeHidden();
+      await expect(page.getByText("Evidence", { exact: true })).toBeHidden();
+
+      const fileBug = page.getByRole("button", { name: "File Bug" });
+      await expect(fileBug, "must not be fileable before a ticket is picked").toBeDisabled();
+
+      await page.getByRole("button", { name: "Search Linear tickets…" }).click();
+
+      await expect(page.getByRole("heading", { name: "Link a Linear ticket" })).toBeVisible();
+      // No toggle back to Jira must exist — the choice already made on the Report a Bug form is final.
+      await expect(page.getByRole("button", { name: "Jira", exact: true })).toBeHidden();
+      const resultButton = page.getByRole("button", { name: "ENG-77 — Dropdown closes on scroll" });
+      await expect(resultButton).toBeVisible();
+      await resultButton.click();
+      expect(jiraSearched, "picking Linear must never hit the Jira search endpoint").toBe(false);
+
+      await expect(page.getByText("ENG-77 — Dropdown closes on scroll")).toBeVisible();
+      await expect(fileBug).toBeEnabled();
+      await fileBug.click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const filedBug = bugs.find((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(filedBug, "the bug filed against this execution").toBeTruthy();
+        expect(filedBug.integrationProvider).toBe("LINEAR");
+        expect(filedBug.integrationIssueKey).toBe("ENG-77");
+        expect(filedBug.externalUrl).toBe("https://linear.app/e2e/issue/ENG-77");
       } finally {
         await api.dispose();
       }

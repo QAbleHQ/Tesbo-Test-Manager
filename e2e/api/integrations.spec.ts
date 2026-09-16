@@ -1283,49 +1283,48 @@ test.describe("integrations — Jira and Linear", () => {
   });
 
   // ─── Regression: the Knowledge Base folder ensureProviderFolder creates (the "Jira"/"Linear"
-  //     folder holding every mirrored ticket document) used to survive disconnect untouched,
-  //     showing a fully populated, still-connected-looking folder for an integration that was just
-  //     disconnected. Disconnect now soft-deletes it — never a hard delete — tagged so it can never
-  //     be restored back into view, distinct from an ordinary user-initiated folder delete. ───
+  //     folder holding every mirrored ticket document) used to be soft-deleted, un-restorably, the
+  //     moment its integration was disconnected — so a workspace that disconnected lost visibility
+  //     into every ticket it had ever imported. Disconnect is a credentials/mapping state flip only:
+  //     the folder and its documents must stay fully visible in the Knowledge Base whether the
+  //     integration is currently connected or not. ───
 
-  test("INT-A-43 disconnecting Jira soft-deletes its Knowledge Base folder and mirrored documents", async () => {
+  test("INT-A-43 disconnecting Jira leaves its Knowledge Base folder and mirrored documents fully visible", async () => {
     const connectionId = seedConnection("jira");
     const folderId = seedProviderFolder("jira");
-    const docId = seedMirrorDocument("jira", "kb-cleanup-1", "Removed by disconnect", tenant!.mainProjectId, folderId);
+    const docId = seedMirrorDocument("jira", "kb-cleanup-1", "Must stay visible after disconnect", tenant!.mainProjectId, folderId);
 
     const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(disconnectRes.ok(), `disconnect answered ${disconnectRes.status()}: ${await disconnectRes.text()}`).toBe(true);
 
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("t");
-    expect(scalar(`SELECT deletion_reason FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("integration_disconnect");
-    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("t");
-    // Never hard-deleted.
-    expect(scalar(`SELECT COUNT(*) FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("1");
-    expect(scalar(`SELECT COUNT(*) FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("1");
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
+    expect(scalar(`SELECT deletion_reason FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("");
+    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("f");
 
     const tree = await (await asOwner.get(url("/knowledge-base/folders/tree"))).json();
-    expect(tree.children.map((c: { id: string }) => c.id), "the disconnected folder must disappear from the tree").not.toContain(folderId);
+    expect(tree.children.map((c: { id: string }) => c.id), "the folder must still appear in the tree after disconnect").toContain(folderId);
 
     expect(scalar(`SELECT COUNT(*) FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("1");
   });
 
-  test("INT-A-44 disconnecting Linear soft-deletes its Knowledge Base folder and mirrored documents", async () => {
+  test("INT-A-44 disconnecting Linear leaves its Knowledge Base folder and mirrored documents fully visible", async () => {
     seedConnection("linear");
     const folderId = seedProviderFolder("linear");
-    const docId = seedMirrorDocument("linear", "kb-cleanup-2", "Removed by disconnect", tenant!.mainProjectId, folderId);
+    const docId = seedMirrorDocument("linear", "kb-cleanup-2", "Must stay visible after disconnect", tenant!.mainProjectId, folderId);
 
     const disconnectRes = await asOwner.delete("/api/workspace/integrations/linear/disconnect", { failOnStatusCode: false });
     expect(disconnectRes.ok(), `disconnect answered ${disconnectRes.status()}: ${await disconnectRes.text()}`).toBe(true);
 
-    expect(scalar(`SELECT is_deleted, deletion_reason FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("t,integration_disconnect");
-    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("t");
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
+    expect(scalar(`SELECT deletion_reason FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("");
+    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("f");
   });
 
-  test("INT-A-45 a project whose mapping was already superseded still has its old folder cleaned up on disconnect", async () => {
+  test("INT-A-45 a project whose mapping was already superseded still keeps its old folder visible on disconnect", async () => {
     const connectionId = seedConnection("jira");
     seedJiraMapping(connectionId, "SUPERSEDED");
-    // The mapping row above is disabled (as an unmap/remap leaves it) — the folder it fed must still
-    // be found and cleaned up: the lookup is by organization+provider, not by an enabled mapping.
+    // The mapping row above is disabled (as an unmap/remap leaves it) — the folder it fed must be
+    // left alone regardless: disconnect no longer looks up KB folders by provider at all.
     exec(
       `UPDATE jira_project_mappings SET enabled = false WHERE project_id = ${literal(tenant!.mainProjectId)} AND jira_project_key = 'SUPERSEDED';`,
     );
@@ -1334,10 +1333,10 @@ test.describe("integrations — Jira and Linear", () => {
     const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(disconnectRes.ok()).toBe(true);
 
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("t");
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
   });
 
-  test("INT-A-46 disconnect cleans up the provider folder in every project under the workspace, not only the mapped one", async () => {
+  test("INT-A-46 disconnect leaves the provider folder alone in every project under the workspace", async () => {
     seedConnection("jira");
     const mainFolderId = seedProviderFolder("jira", tenant!.mainProjectId);
     const secondFolderId = seedProviderFolder("jira", tenant!.secondProjectId);
@@ -1345,8 +1344,8 @@ test.describe("integrations — Jira and Linear", () => {
     const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(disconnectRes.ok()).toBe(true);
 
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(mainFolderId)};`)).toBe("t");
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(secondFolderId)};`)).toBe("t");
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(mainFolderId)};`)).toBe("f");
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(secondFolderId)};`)).toBe("f");
   });
 
   test("INT-A-47 disconnecting twice in a row is a safe no-op the second time", async () => {
@@ -1355,72 +1354,64 @@ test.describe("integrations — Jira and Linear", () => {
 
     const first = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(first.ok()).toBe(true);
-    const deletedAtAfterFirst = scalar(`SELECT deleted_at FROM knowledge_folders WHERE id = ${literal(folderId)};`);
 
     // Simulates the race a double-click or two tabs create: a second call after the first already
-    // committed finds nothing left to do (is_deleted = false is now false for this row) and must
-    // still answer success, not error or double-process the same folder.
+    // committed must still answer success, not error — and the folder must stay exactly as
+    // untouched as it was after the first call.
     const second = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(second.ok(), `a repeat disconnect must be a harmless no-op, not an error: ${await second.text()}`).toBe(true);
 
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("t");
-    expect(scalar(`SELECT deleted_at FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe(deletedAtAfterFirst);
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
   });
 
-  test("INT-A-48 a disconnect-deleted folder can never be restored, while a manually-deleted one still can", async () => {
+  test("INT-A-48 a folder deleted manually stays restorable exactly as before, even after its integration is later disconnected", async () => {
     seedConnection("jira");
-    const disconnectedFolderId = seedProviderFolder("jira");
-    await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
 
-    const restoreRes = await asOwner.patch(url(`/knowledge-base/folders/${disconnectedFolderId}/restore`), { failOnStatusCode: false });
-    expect(restoreRes.status(), `restoring a disconnect-deleted folder must be refused: ${await restoreRes.text()}`).toBe(400);
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(disconnectedFolderId)};`)).toBe("t");
-
-    // Regression guard: an ordinary, user-initiated folder delete must be completely unaffected by
-    // the new guard — it stays restorable exactly as before this fix.
     const manualRes = await asOwner.post(url("/knowledge-base/folders"), { data: { name: `E2E manual ${Date.now()}` } });
     expect(manualRes.ok()).toBe(true);
     const manualFolderId = (await manualRes.json()).id;
     const deleteRes = await asOwner.delete(url(`/knowledge-base/folders/${manualFolderId}`));
     expect(deleteRes.ok()).toBe(true);
-    const manualRestoreRes = await asOwner.patch(url(`/knowledge-base/folders/${manualFolderId}/restore`), { failOnStatusCode: false });
-    expect(manualRestoreRes.ok(), `a manually-deleted folder must stay restorable: ${await manualRestoreRes.text()}`).toBe(true);
-  });
+    expect(scalar(`SELECT deletion_reason FROM knowledge_folders WHERE id = ${literal(manualFolderId)};`)).toBe("manual");
 
-  test("INT-A-49 reconnecting and re-syncing can create a fresh, active folder with the same name — the old one stays soft-deleted forever", async () => {
-    seedConnection("jira");
-    const oldFolderId = seedProviderFolder("jira", tenant!.mainProjectId, "Jira");
+    // Disconnecting an integration that has nothing to do with this folder must not change its
+    // deletion_reason or restorability in either direction.
     await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
 
-    // What ensureProviderFolder's ON CONFLICT ... WHERE is_deleted = false relies on: a fresh,
-    // active row with the SAME name under the SAME parent must not collide with the old,
-    // disconnect-deleted one. Actually running a resync isn't reachable here (it calls the real
-    // Jira/Linear API — see the file-level note), so this proves the exact database mechanism the
-    // real resync depends on, the same way this suite proves other sync-only paths.
-    const newFolderId = seedProviderFolder("jira", tenant!.mainProjectId, "Jira");
-    expect(newFolderId).not.toBe(oldFolderId);
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(oldFolderId)};`)).toBe("t");
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(newFolderId)};`)).toBe("f");
+    const restoreRes = await asOwner.patch(url(`/knowledge-base/folders/${manualFolderId}/restore`), { failOnStatusCode: false });
+    expect(restoreRes.ok(), `a manually-deleted folder must stay restorable: ${await restoreRes.text()}`).toBe(true);
+  });
 
+  test("INT-A-49 disconnecting Jira keeps its Knowledge Base folder active and unique, ready for a reconnect's sync to reuse", async () => {
+    seedConnection("jira");
+    const folderId = seedProviderFolder("jira", tenant!.mainProjectId, "Jira");
+
+    const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+    expect(disconnectRes.ok()).toBe(true);
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
+
+    // ensureProviderFolder (integration-sync.service.ts) looks up an active folder by
+    // source_provider before ever inserting — with this one left active, a reconnect+resync must
+    // find and reuse it, never spawn a second "Jira" folder.
     const tree = await (await asOwner.get(url("/knowledge-base/folders/tree"))).json();
     const jiraFolders = tree.children.filter((c: { name: string }) => c.name === "Jira");
-    expect(jiraFolders.map((c: { id: string }) => c.id), "only the fresh folder should be visible").toEqual([newFolderId]);
+    expect(jiraFolders.map((c: { id: string }) => c.id), "exactly one, still the original folder").toEqual([folderId]);
   });
 
-  test("INT-A-50 a ticket key reused by a reconnected (possibly different) account never collides with its disconnected predecessor", async () => {
+  test("INT-A-50 disconnecting Jira leaves mirrored ticket documents untouched, ready for the next sync's upsert", async () => {
     seedConnection("jira");
     const folderId = seedProviderFolder("jira");
-    const oldDocId = seedMirrorDocument("jira", "REUSED-1", "Original account's ticket", tenant!.mainProjectId, folderId);
-    await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
-    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(oldDocId)};`)).toBe("t");
+    const docId = seedMirrorDocument("jira", "PERSIST-1", "Original content", tenant!.mainProjectId, folderId);
 
-    // The dedup unique index (V72) is scoped WHERE is_deleted = false, so a fresh mirror document
-    // for the same (project, provider, external id, role) — exactly what a resync against a new
-    // account that happens to reuse the same issue key would insert — must not conflict with it.
-    const newFolderId = seedProviderFolder("jira");
-    const newDocId = seedMirrorDocument("jira", "REUSED-1", "Different account, same issue key", tenant!.mainProjectId, newFolderId);
-    expect(newDocId).not.toBe(oldDocId);
-    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(newDocId)};`)).toBe("f");
+    const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+    expect(disconnectRes.ok()).toBe(true);
+
+    // integration-sync.processor.ts upserts mirror documents ON CONFLICT (project_id,
+    // source_provider, source_external_id, source_role) WHERE is_deleted = false — leaving this row
+    // active and untouched is exactly what lets the next sync update it in place rather than
+    // erroring or creating a duplicate for the same ticket.
+    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("f");
+    expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("seeded by the e2e suite");
   });
 
   test("INT-A-51 disconnecting one workspace's Jira never touches another workspace's provider folder", async () => {
@@ -1438,7 +1429,9 @@ test.describe("integrations — Jira and Linear", () => {
     const disconnectRes = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
     expect(disconnectRes.ok()).toBe(true);
 
-    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(ownFolderId)};`)).toBe("t");
+    // Neither workspace's folder is touched by disconnect any more, but the isolation itself — B's
+    // folder is never reachable from A's disconnect call — is still worth pinning.
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(ownFolderId)};`)).toBe("f");
     expect(
       scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(otherOrgFolderId)};`),
       "a different workspace's provider folder must never be touched",
