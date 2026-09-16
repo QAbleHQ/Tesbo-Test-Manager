@@ -60,7 +60,7 @@ export default function IntegrationsTab() {
   const [pricingOpen, setPricingOpen] = useState(false);
 
   const canManage = (workspace?.role || "member").toLowerCase() === "owner";
-  const isPro = billingInfo?.plan === "pro";
+  const isPro = billingInfo?.enabled === false || billingInfo?.plan === "pro";
 
   const loadData = useCallback(async () => {
     try {
