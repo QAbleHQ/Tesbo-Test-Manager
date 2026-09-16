@@ -1041,6 +1041,57 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("button", { name: "Sources (1)" })).toBeVisible();
   });
 
+  /*
+   * ZYU-77/78/79: technique badges (TechniqueBadges, shared by TaskQuickViewPanel and this same
+   * [taskId] page — see ZYRA_IMPLEMENTATION_LOG.md's "surface techniques to human reviewers"
+   * entry). generated_payload is rendered verbatim (formatAiTask), so seeding a draft's
+   * `techniques` field directly controls what a reviewer actually sees here — no live model call
+   * needed, same boundary every other test in this file draws.
+   */
+  test("ZYU-77 a single technique renders as one badge", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{ title: "Reject usernames over 64 characters", priority: "P2", preconditions: "", steps: [], techniques: ["boundary_value_analysis"] }],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByText("Boundary Value Analysis", { exact: true })).toBeVisible();
+  });
+
+  test("ZYU-78 multiple techniques on one case each render their own badge", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{
+        title: "Archive a case whose linked ticket just closed",
+        priority: "P2",
+        preconditions: "",
+        steps: [],
+        techniques: ["state_testing", "error_guessing", "security_perspective"],
+      }],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByText("State Testing", { exact: true })).toBeVisible();
+    await expect(page.getByText("Error Guessing", { exact: true })).toBeVisible();
+    await expect(page.getByText("Security Perspective", { exact: true })).toBeVisible();
+  });
+
+  test("ZYU-79 the general fallback and a missing techniques field both render no badge at all, not a meaningless 'General' pill", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [
+        { title: "Case tagged only general", priority: "P2", preconditions: "", steps: [], techniques: ["general"] },
+        { title: "Case with no techniques field", priority: "P2", preconditions: "", steps: [] }, // older-shaped draft
+      ],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByRole("cell", { name: "Case tagged only general" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "Case with no techniques field" })).toBeVisible();
+    // Every real technique label, checked absent rather than just "no visible badge row" — proves
+    // this isn't merely mis-styled but genuinely renders nothing for either case.
+    for (const label of ["Equivalence Partitioning", "Boundary Value Analysis", "Decision Table", "State Testing", "Use Case Testing", "Pairwise Testing", "Error Guessing", "Security Perspective", "General", "general"]) {
+      await expect(page.getByText(label, { exact: true })).toHaveCount(0);
+    }
+  });
+
   test("ZYU-13 selection drives the bulk actions", { tag: '@tesbo.testId("TES-TC-1098")' }, async ({ browser }) => {
     const taskId = seedTask();
     const page = await open(browser, `/agents/tasks/${taskId}`);

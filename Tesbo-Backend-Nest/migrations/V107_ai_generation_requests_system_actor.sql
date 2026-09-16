@@ -1,0 +1,35 @@
+
+-- Sub-task A of the archive-sweep feature (ZYRA_TICKET_WORKFLOW.md §13 follow-up): lets a headless,
+-- schedule-triggered job (not a human in a chat session) stage a proposal through the same
+-- ai_generation_requests table Zyra's chat/task-board flows already use, by writing requested_by =
+-- NULL for that row.
+--
+-- Investigated first rather than assumed: requested_by was `UUID NOT NULL REFERENCES users(id) ON
+-- DELETE CASCADE` since V8_ai_generation_history.sql, and every current INSERT into this table
+-- (legacy.service.ts, the chat-staging and task-board create paths) always supplies a real,
+-- authenticated user id — DROP NOT NULL below is additive and changes nothing for either of them.
+--
+-- The proven precedent for "a run with no human trigger" in this codebase is
+-- integration_sync_runs.triggered_by (V72_integration_sync_pipeline.sql), which is already `UUID
+-- REFERENCES users(id) ON DELETE SET NULL` — nullable from the start. This migration deliberately
+-- does NOT copy that FK behavior. V88_integration_sync_nightly.sql hit a real ambiguity from it:
+-- once triggered_by can go NULL via ON DELETE SET NULL, NULL stops meaning one thing — it can mean
+-- "nightly-triggered" or "a manual run whose triggering user was later deleted", and V88 had to add
+-- a whole new `trigger_source` column just to tell those apart again.
+--
+-- Here, ON DELETE CASCADE on requested_by is left untouched on purpose: a real user's rows are
+-- still deleted (not nulled) when that user is deleted, exactly as today. That means requested_by
+-- can only ever become NULL by a system actor inserting it directly — user deletion can never
+-- produce a NULL requested_by after the fact. So, unlike integration_sync_runs, NULL here has
+-- exactly one meaning for the lifetime of the row and needs no companion column to disambiguate it.
+--
+-- The "which kind of automated actor" question — the equivalent of trigger_source — is answered by
+-- a column that already exists for this: `provider`, free-text VARCHAR(32) with no CHECK constraint,
+-- already used for a non-LLM-provider discriminator today ('zyra_chat', see the chat-staging INSERT
+-- in legacy.service.ts) alongside real provider names ('anthropic', 'openai'). A future sweep job
+-- staging a NULL-actor row is expected to set its own provider value the same way, rather than this
+-- migration adding a new column duplicating what provider already does.
+--
+-- No backfill: every existing row already has a real requested_by (66 rows in the real .env DB at
+-- the time this was written) and none of them should change meaning retroactively.
+ALTER TABLE ai_generation_requests ALTER COLUMN requested_by DROP NOT NULL;

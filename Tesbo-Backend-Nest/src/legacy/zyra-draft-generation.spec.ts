@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { LegacyService } from "./legacy.service";
 import type { DatabaseService } from "../database/database.service";
 import type { EmailService } from "../auth/email.service";
@@ -47,7 +48,7 @@ function makeLegacy(): LegacyService {
   );
 }
 
-type DraftOut = { title: string; preconditions: string; stepsJson: string; expectedSummary: string; priority: string; tags: string[] };
+type DraftOut = { title: string; preconditions: string; stepsJson: string; expectedSummary: string; priority: string; tags: string[]; techniques: string[] };
 
 type GenerationInput = {
   story: string; context: string; acceptanceCriteria: string; feedback: string;
@@ -64,6 +65,8 @@ type GenerationInput = {
 // exact malformed shapes a model has been observed to emit, with no provider round trip.
 type Internals = {
   normalizeAiDrafts: (raw: unknown, requestedCount: number) => DraftOut[];
+  normalizeZyraTechniques: (raw: unknown) => string[];
+  zyraSystemPrompt: () => string;
   generateZyraWithOpenAi: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
   generateZyraWithAnthropic: (params: { provider: string; model: string; apiKey: string; projectId: string; input: GenerationInput }) => Promise<unknown>;
   zyraDynamicTaskPrompt: (input: GenerationInput & { knowledgeConfidence?: "none" | "weak" | "strong" }) => string;
@@ -369,5 +372,238 @@ describe("Zyra generation prompt — knowledge confidence", () => {
 
     expect(decision.reply).toMatch(/I drafted 1 test case\(s\) after reading/);
     expect(decision.reply).not.toMatch(/loosely matches|not a strong enough match/i);
+  });
+});
+
+/*
+ * Investigation (ZYRA_IMPLEMENTATION_LOG.md, "does the actual Zyra generation prompt implement
+ * §5–§9's test-design technique pipeline?") found the real prompt named only 2 of 8 techniques,
+ * as bare keywords with no method guidance, and that `tags` was a free-form field the model was
+ * never instructed to use for technique attribution at all. zyraSystemPrompt() now names and
+ * gives concrete guidance for all eight (ZYRA_TICKET_WORKFLOW.md §6/§8) and instructs a new
+ * `techniques` field. These tests pin that the exact guidance text reaches the real outgoing
+ * request body for BOTH providers (not just that the source string contains it) — the prompt is
+ * plumbed through generateZyraWithOpenAi's messages array and generateZyraWithAnthropic's system
+ * block differently, so asserting on zyraSystemPrompt()'s return value alone wouldn't prove either
+ * provider actually receives it.
+ */
+describe("Zyra generation prompt — test design technique guidance reaches both providers", () => {
+  let svc: LegacyService;
+  const originalFetch = global.fetch;
+  const TECHNIQUE_NAMES = [
+    "Equivalence Partitioning",
+    "Boundary Value Analysis",
+    "Decision Table Testing",
+    "State Testing",
+    "Use Case Testing",
+    "Pairwise Testing",
+    "Error Guessing",
+    "Security Perspective"
+  ];
+  const TECHNIQUE_SLUGS = [
+    "equivalence_partitioning",
+    "boundary_value_analysis",
+    "decision_table",
+    "state_testing",
+    "use_case_testing",
+    "pairwise_testing",
+    "error_guessing",
+    "security_perspective",
+    "general"
+  ];
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("zyraSystemPrompt() itself names all eight techniques with concrete, per-technique guidance, not a bare keyword list", () => {
+    const prompt = internals(svc).zyraSystemPrompt();
+    for (const name of TECHNIQUE_NAMES) {
+      if (!prompt.includes(name)) throw new Error(`missing technique name: ${name}`);
+    }
+    // "concrete guidance" — not just the name, a description of what applying it actually means.
+    expect(prompt).toMatch(/valid and invalid classes/i); // Equivalence Partitioning
+    expect(prompt).toMatch(/min-1, min, min\+1, max-1, max, max\+1/); // Boundary Value Analysis
+    expect(prompt).toMatch(/combinations as rows/i); // Decision Table Testing
+    expect(prompt).toMatch(/valid transition/i); // State Testing
+    expect(prompt).toMatch(/alternate or exception flow/i); // Use Case Testing
+    expect(prompt).toMatch(/every pair of dimension values/i); // Pairwise Testing
+    expect(prompt).toMatch(/double-submit|empty\/null state/i); // Error Guessing
+    expect(prompt).toMatch(/auth\/authorization boundaries/i); // Security Perspective
+    // The old one-sentence, two-of-eight version is fully replaced, not left alongside the new one.
+    expect(prompt).not.toContain("Prioritize edge cases, boundary values, negative paths, permissions, data integrity, state transitions, and traceability.");
+  });
+
+  it("zyraSystemPrompt() instructs the model to tag every draft's techniques from the exact fixed set", () => {
+    const prompt = internals(svc).zyraSystemPrompt();
+    expect(prompt).toContain('"techniques":[""]');
+    for (const slug of TECHNIQUE_SLUGS) {
+      if (!prompt.includes(slug)) throw new Error(`missing technique slug: ${slug}`);
+    }
+  });
+
+  it("OpenAI: the system message actually sent to the provider carries the technique guidance", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) } }],
+        usage: {}
+      })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: emptyInput() });
+
+    const fetchMock = global.fetch as jest.Mock;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const systemMessage = sentBody.messages.find((m: { role: string }) => m.role === "system").content;
+    for (const name of TECHNIQUE_NAMES) {
+      if (!systemMessage.includes(name)) throw new Error(`OpenAI system message missing: ${name}`);
+    }
+    expect(systemMessage).toContain('"techniques":[""]');
+  });
+
+  it("Anthropic: the system block actually sent to the provider carries the technique guidance", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        content: [{ type: "text", text: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) }],
+        usage: {}
+      })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: emptyInput() });
+
+    const fetchMock = global.fetch as jest.Mock;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const systemText = sentBody.system[0].text;
+    for (const name of TECHNIQUE_NAMES) {
+      if (!systemText.includes(name)) throw new Error(`Anthropic system block missing: ${name}`);
+    }
+    expect(systemText).toContain('"techniques":[""]');
+  });
+
+  it("both providers receive byte-identical technique guidance — enterprise consistency, not just the interactive path", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        choices: [{ message: { content: JSON.stringify({ drafts: [] }) } }],
+        content: [{ type: "text", text: JSON.stringify({ drafts: [] }) }],
+        usage: {}
+      })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: emptyInput() }).catch(() => undefined);
+    const openAiSystem = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).messages.find((m: { role: string }) => m.role === "system").content;
+
+    (global.fetch as jest.Mock).mockClear();
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: emptyInput() }).catch(() => undefined);
+    const anthropicSystem = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).system[0].text;
+
+    // Anthropic's system block is `${zyraSystemPrompt()}\n\n${zyraStaticSourcePrompt()}` — the
+    // technique guidance is the prefix, so it must appear byte-identical at the start of both.
+    expect(anthropicSystem.startsWith(openAiSystem)).toBe(true);
+  });
+});
+
+/*
+ * normalizeZyraTechniques is the validation layer between the model's raw `techniques` output and
+ * what a draft is actually tagged with — per the standing error-handling bar, tagging is an
+ * enhancement, never a blocking requirement, so every malformed shape here must degrade to
+ * ["general"] rather than throwing or silently corrupting the draft. Tested directly (isolated,
+ * exhaustive edge cases) and once more through normalizeAiDrafts (proves it's actually wired into
+ * the real per-draft normalization, not just callable on its own).
+ */
+describe("Zyra draft technique tagging — normalizeZyraTechniques", () => {
+  let svc: LegacyService;
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("passes through a single recognized technique", () => {
+    expect(internals(svc).normalizeZyraTechniques(["boundary_value_analysis"])).toEqual(["boundary_value_analysis"]);
+  });
+
+  it("keeps every recognized technique when a case genuinely combines several, deduped", () => {
+    const result = internals(svc).normalizeZyraTechniques(["boundary_value_analysis", "state_testing", "boundary_value_analysis"]);
+    expect(result).toEqual(["boundary_value_analysis", "state_testing"]);
+  });
+
+  it("drops an unrecognized entry but keeps the recognized ones alongside it, and logs the unrecognized one", () => {
+    const warnSpy = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const result = internals(svc).normalizeZyraTechniques(["equivalence_partitioning", "made_up_technique"]);
+    expect(result).toEqual(["equivalence_partitioning"]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("made_up_technique"));
+  });
+
+  it("falls back to general when every entry is unrecognized — never an empty array, never a throw", () => {
+    const result = internals(svc).normalizeZyraTechniques(["invented_one", "invented_two"]);
+    expect(result).toEqual(["general"]);
+  });
+
+  it("falls back to general when the field is missing entirely (undefined)", () => {
+    expect(internals(svc).normalizeZyraTechniques(undefined)).toEqual(["general"]);
+  });
+
+  it("falls back to general when the field is an empty array", () => {
+    expect(internals(svc).normalizeZyraTechniques([])).toEqual(["general"]);
+  });
+
+  it("falls back to general when the field is not an array at all (a lone string, a number, an object)", () => {
+    expect(internals(svc).normalizeZyraTechniques("boundary_value_analysis")).toEqual(["general"]);
+    expect(internals(svc).normalizeZyraTechniques(42)).toEqual(["general"]);
+    expect(internals(svc).normalizeZyraTechniques({ technique: "boundary_value_analysis" })).toEqual(["general"]);
+  });
+
+  it("accepts an explicit general tag on its own", () => {
+    expect(internals(svc).normalizeZyraTechniques(["general"])).toEqual(["general"]);
+  });
+
+  it("is case- and whitespace-tolerant, since a model is not guaranteed to echo the slug byte-exact", () => {
+    expect(internals(svc).normalizeZyraTechniques([" Boundary_Value_Analysis  "])).toEqual(["boundary_value_analysis"]);
+  });
+
+  it("is wired into normalizeAiDrafts — the real per-draft normalization the model's response actually flows through", () => {
+    const raw = JSON.stringify({
+      drafts: [
+        { title: "A boundary case", stepsJson: "[]", techniques: ["boundary_value_analysis"] },
+        { title: "An untagged case", stepsJson: "[]" },
+        { title: "A case with a bogus tag", stepsJson: "[]", techniques: ["not_a_real_technique"] }
+      ]
+    });
+    const drafts = internals(svc).normalizeAiDrafts(raw, 10);
+    expect(drafts[0].techniques).toEqual(["boundary_value_analysis"]);
+    expect(drafts[1].techniques).toEqual(["general"]);
+    expect(drafts[2].techniques).toEqual(["general"]);
+  });
+
+  // Edge case explicitly called out in the task: an older-format cached/stored draft with no
+  // techniques field at all. Confirmed by trace (not assumed) that this is actually unreachable in
+  // a live code path: normalizeAiDrafts only ever runs on a FRESH raw model response for a NEW
+  // generation call (see generateZyraWithOpenAi/generateZyraWithAnthropic) — an already-persisted
+  // ai_generation_requests.generated_payload row from before this change is never re-parsed
+  // through normalizeAiDrafts on a later read; formatAiTask reads such a row's fields directly. So
+  // there is no live path where a missing `techniques` field reaches this function via "old cached
+  // data" rather than "a fresh model response that simply omitted it" — the same fallback handles
+  // both identically regardless, which this test pins.
+  it("a draft with no techniques field at all (old-format shape) falls back to general, not a throw", () => {
+    const raw = JSON.stringify({ drafts: [{ title: "Pre-existing-shape draft", stepsJson: "[]" }] });
+    const drafts = internals(svc).normalizeAiDrafts(raw, 10);
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].techniques).toEqual(["general"]);
   });
 });

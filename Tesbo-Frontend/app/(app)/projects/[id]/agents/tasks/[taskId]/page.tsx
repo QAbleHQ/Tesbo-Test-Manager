@@ -22,6 +22,7 @@ import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, 
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { ACTION_LABEL, TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
@@ -472,8 +473,21 @@ export default function ZyraTaskDetailPage() {
                         <input type="checkbox" checked={selectedDrafts.includes(index)} onChange={() => toggleDraft(index)} disabled={done} aria-label={`Select testcase ${index + 1}`} />
                       </td>
                       <td className="max-w-[260px] px-3 py-3">
+                        {draft.action && (
+                          <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                            <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
+                              {ACTION_LABEL[draft.action] || draft.action}
+                            </StatusChip>
+                            {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
+                          </div>
+                        )}
                         <div className="font-semibold text-[var(--foreground)]">{draft.title}</div>
                         {draft.tags?.length ? <div className="mt-2 text-xs text-[var(--muted-soft)]">{draft.tags.join(", ")}</div> : null}
+                        {draft.techniques?.length ? <div className="mt-2"><TechniqueBadges techniques={draft.techniques} /></div> : null}
+                        {/* Only present on a normalized update/archive draft (formatAiTask) — why
+                            the sweep or the chat turn flagged this, shown right on the card so a
+                            reviewer doesn't have to open the Activities tab to find out. */}
+                        {draft.reason && <div className="mt-1 text-xs italic text-[var(--muted)]">{draft.reason}</div>}
                       </td>
                       <td className="px-3 py-3">
                         <span className="rounded bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">{draft.priority}</span>

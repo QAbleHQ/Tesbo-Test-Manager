@@ -5,8 +5,9 @@ import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
 import { RagChunkingService } from "./rag-chunking.service";
-import { RAG_EMBEDDING_BATCH_SIZE, RAG_EMBEDDING_DIMENSION, RAG_EMBEDDING_QUEUE } from "./rag.constants";
-import { EmbeddingJobPayload } from "./rag.types";
+import { RAG_EMBEDDING_BATCH_SIZE, RAG_EMBEDDING_DIMENSION, RAG_EMBEDDING_QUEUE, RAG_TESTCASE_EMBEDDING_JOB_NAME } from "./rag.constants";
+import { EmbeddingJobPayload, TestcaseEmbeddingJobPayload } from "./rag.types";
+import { buildTestcaseEmbeddingText } from "./testcase-embedding-text";
 
 // Consumer side of the embedding pipeline. Deliberately resolves its own AI-key allocation
 // (via rag-ai-allocation.ts) rather than importing LegacyService, to avoid a circular
@@ -23,7 +24,14 @@ export class RagEmbeddingProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<EmbeddingJobPayload>): Promise<void> {
+  async process(job: Job<EmbeddingJobPayload | TestcaseEmbeddingJobPayload>): Promise<void> {
+    if (job.name === RAG_TESTCASE_EMBEDDING_JOB_NAME) {
+      return this.processTestcase(job as Job<TestcaseEmbeddingJobPayload>);
+    }
+    return this.processKnowledgeSource(job as Job<EmbeddingJobPayload>);
+  }
+
+  private async processKnowledgeSource(job: Job<EmbeddingJobPayload>): Promise<void> {
     const { projectId, sourceType, sourceId } = job.data;
     const table = sourceType === "document" ? "knowledge_documents" : "knowledge_files";
     const contentColumn = sourceType === "document" ? "content_text" : "extracted_text";
@@ -127,12 +135,91 @@ export class RagEmbeddingProcessor extends WorkerHost {
     ]);
   }
 
+  // Test-case counterpart of processKnowledgeSource above. One vector per test case (no
+  // chunking — see V106_testcase_embeddings.sql's comment on why), written to
+  // testcase_embeddings rather than knowledge_document_chunks. Shares resolveEmbeddingAllocation/
+  // embedTexts (rag-ai-allocation.ts) with the document path — same provider, same platform
+  // vector width, no second embedding call site.
+  private async processTestcase(job: Job<TestcaseEmbeddingJobPayload>): Promise<void> {
+    const { projectId, testcaseId } = job.data;
+
+    const sourceRes = await this.db.query<{ id: string; title: string; description: string | null; steps: unknown; embedding_content_hash: string | null }>(
+      `SELECT id, title, description, steps, embedding_content_hash FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+      [testcaseId, projectId]
+    );
+    const source = sourceRes.rows[0];
+    // Not found here means hard-gone or soft-deleted (deleted_at set) since the job was queued —
+    // either way there's nothing to embed. Same "clear the status rather than leave it stuck at
+    // 'queued' forever" reasoning as the knowledge-source branch above.
+    if (!source) {
+      await this.setStatus("testcases", testcaseId, "unsupported").catch(() => undefined);
+      return;
+    }
+
+    const text = buildTestcaseEmbeddingText(source);
+    if (!text) {
+      await this.setStatus("testcases", testcaseId, "unsupported");
+      return;
+    }
+
+    const { allocation, reason } = await resolveEmbeddingAllocation(this.db, projectId);
+    if (!allocation) {
+      // 'pending', not 'unsupported' — same reasoning as the knowledge-source branch: a missing
+      // workspace key is a temporary property of the workspace, not a terminal property of this
+      // test case. Nothing currently sweeps 'pending' test cases the way
+      // resumeInterruptedEmbeddings() sweeps documents/files on boot (see rag-ingestion.service.ts
+      // for why that's deliberate), so this status will only clear on the next create/update to
+      // this test case, or once a future backfill decision adds that sweep.
+      this.logger.warn(`Cannot embed testcase:${testcaseId} — ${reason}`);
+      await this.setStatus("testcases", testcaseId, "pending");
+      return;
+    }
+
+    const contentHash = createHash("sha256").update(text).digest("hex");
+    if (contentHash === source.embedding_content_hash) return;
+
+    await this.setStatus("testcases", testcaseId, "processing");
+
+    const [vector] = await embedTexts(allocation, [text]);
+    if (!vector || vector.length !== RAG_EMBEDDING_DIMENSION) {
+      this.logger.warn(
+        `Discarding embedding for testcase:${testcaseId} — ${allocation.provider}/${allocation.model} returned ${vector?.length ?? 0} dimensions, expected ${RAG_EMBEDDING_DIMENSION}.`
+      );
+      await this.setStatus("testcases", testcaseId, "failed");
+      return;
+    }
+
+    // One row per test case, so an UPSERT rather than knowledge_document_chunks' delete+reinsert
+    // (which exists there to replace a whole chunk set atomically — no equivalent set to replace
+    // here).
+    await this.db.query(
+      `INSERT INTO testcase_embeddings (project_id, testcase_id, content_hash, embedding_model, embedding)
+       VALUES ($1, $2, $3, $4, $5::vector)
+       ON CONFLICT (project_id, testcase_id) DO UPDATE
+         SET content_hash = EXCLUDED.content_hash, embedding_model = EXCLUDED.embedding_model,
+             embedding = EXCLUDED.embedding, updated_at = now()`,
+      [projectId, testcaseId, contentHash, allocation.model, `[${vector.join(",")}]`]
+    );
+
+    await this.db.query(`UPDATE testcases SET embedding_status = 'ready', embedding_content_hash = $2, updated_at = now() WHERE id = $1`, [
+      testcaseId,
+      contentHash
+    ]);
+  }
+
   @OnWorkerEvent("failed")
-  async onFailed(job: Job<EmbeddingJobPayload> | undefined): Promise<void> {
+  async onFailed(job: Job<EmbeddingJobPayload | TestcaseEmbeddingJobPayload> | undefined): Promise<void> {
     if (!job || job.attemptsMade < (job.opts.attempts || 1)) return;
-    const table = job.data.sourceType === "document" ? "knowledge_documents" : "knowledge_files";
-    await this.setStatus(table, job.data.sourceId, "failed").catch(() => undefined);
-    this.logger.warn(`Embedding job permanently failed for ${job.data.sourceType}:${job.data.sourceId}`);
+    if (job.name === RAG_TESTCASE_EMBEDDING_JOB_NAME) {
+      const { testcaseId } = job.data as TestcaseEmbeddingJobPayload;
+      await this.setStatus("testcases", testcaseId, "failed").catch(() => undefined);
+      this.logger.warn(`Embedding job permanently failed for testcase:${testcaseId}`);
+      return;
+    }
+    const data = job.data as EmbeddingJobPayload;
+    const table = data.sourceType === "document" ? "knowledge_documents" : "knowledge_files";
+    await this.setStatus(table, data.sourceId, "failed").catch(() => undefined);
+    this.logger.warn(`Embedding job permanently failed for ${data.sourceType}:${data.sourceId}`);
   }
 
   private async setStatus(table: string, sourceId: string, status: string): Promise<void> {
