@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import { Drawer, PriorityBadge, SeverityBadge, StatusChip, type Priority } from "@/components/ui";
 import { formatCustomFieldValueForDisplay, isCustomFieldValueEmpty } from "@/components/customFields/customFieldTypes";
+import { renderMarkdown } from "@/lib/markdown";
 
 // Same 5-entry map as the Knowledge Base document page's own DOC_TYPE_LABELS — kept local rather
 // than importing from that page, which doesn't export it.
@@ -177,7 +178,10 @@ function KnowledgeDocumentDetail({ data, projectId }: { data: KnowledgeDocument;
         <span className="text-xs text-[var(--muted)]">{DOC_TYPE_LABELS[data.documentType] || data.documentType}</span>
       </div>
       {data.contentText ? (
-        <p className="whitespace-pre-wrap text-sm text-[var(--foreground)]">{data.contentText}</p>
+        <div
+          className="zyra-prose break-words text-sm text-[var(--foreground)]"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(data.contentText) }}
+        />
       ) : (
         <p className="text-sm text-[var(--muted)]">This document has no text content yet.</p>
       )}

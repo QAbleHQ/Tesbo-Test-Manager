@@ -235,6 +235,8 @@ test.describe("zyra / agents (UI)", () => {
     testcaseId?: string;
     externalId?: string;
     fields?: Record<string, unknown>;
+    /** Mirrors ZyraChatTestcaseRow.sourceRefs — what ZyraCitationsList/ZyraContextDrawer read. */
+    sourceRefs?: Array<{ type: string; id: string; title: string }>;
   }
 
   /**
@@ -293,6 +295,7 @@ test.describe("zyra / agents (UI)", () => {
       reason: "",
       draftIndex: index,
       reviewRequestId: taskId,
+      sourceRefs: entry.sourceRefs ?? [],
     }));
     exec(
       "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
@@ -1955,5 +1958,163 @@ test.describe("zyra / agents (UI)", () => {
 
     await expect(page.getByText("Created the Smoke Tests suite.")).toBeVisible();
     await expect(page.getByText(/didn.t return structured data for this reply/)).toHaveCount(0);
+  });
+
+  // ─── Citation drawer (ZyraContextDrawer): Markdown rendering ───────────────
+  //
+  // Bug report: "Zyra Context shows raw Markdown formatting for Jira and Knowledge Base content".
+  // A citation opened from ZyraCitationsList's "Context used (N)" list ("Context used" as seen in
+  // the review panel above) is always a knowledge_document lookup — Jira/Linear tickets sync into
+  // knowledge_documents as mirror rows (integration-sync.processor.ts), so there is only one
+  // component in this path, KnowledgeDocumentDetail inside ZyraContextDrawer.tsx, and it is what
+  // both the "JIRA" and "KNOWLEDGE BASE" chips in the bug screenshots open. Before the fix it
+  // rendered `contentText` as a raw `<p className="whitespace-pre-wrap">` string; it now runs the
+  // same `renderMarkdown` (lib/markdown.ts) already used for Zyra chat and the Sources tab
+  // (ZYU-34..39 above cover that renderer's use there). The seeded content below mirrors exactly
+  // what IntegrationSyncDocumentBuilder.buildMirror emits for a real Jira ticket (heading, a
+  // `- **Label:** value` meta list, an `_italic_` placeholder, and a markdown link) — so this proves
+  // both a native Knowledge Base document and a Jira-mirrored one render correctly, since they are
+  // the same row shape and the same component.
+
+  test("ZYU-77 the citation drawer renders a cited document's Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const title = stamp("Citation markdown doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText:
+        `# ${title}\n\n- **Status:** Open\n- **Priority:** High\n\n` +
+        "## Description\n\n_No description provided in the source ticket._\n\n" +
+        "## Comments\n\n_No comments on the source ticket._\n\n" +
+        "See [Open in Jira](https://example.atlassian.net/browse/KAN-9) for the source ticket.",
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E citation drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E citation drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    await expect(drawer.getByRole("heading", { name: title, level: 1 })).toBeVisible();
+    await expect(drawer.getByRole("heading", { name: "Description", level: 2 })).toBeVisible();
+    await expect(drawer.getByRole("heading", { name: "Comments", level: 2 })).toBeVisible();
+    await expect(drawer.locator("li", { hasText: "High" })).toBeVisible();
+    await expect(drawer.locator("strong", { hasText: "Status:" })).toBeVisible();
+    await expect(drawer.locator("em", { hasText: "No comments on the source ticket." })).toBeVisible();
+    // Plain text with no markdown syntax renders unchanged.
+    await expect(drawer.getByText("for the source ticket.", { exact: false })).toBeVisible();
+
+    const link = drawer.getByRole("link", { name: "Open in Jira" });
+    await expect(link).toBeVisible();
+    await expect(link).toHaveAttribute("href", "https://example.atlassian.net/browse/KAN-9");
+    await expect(link).toHaveAttribute("target", "_blank");
+
+    // The raw markdown symbols must not appear anywhere as literal text.
+    await expect(drawer.getByText(`# ${title}`, { exact: true })).toHaveCount(0);
+    await expect(drawer.getByText("**Status:**", { exact: false })).toHaveCount(0);
+    await expect(drawer.getByText("_No comments on the source ticket._", { exact: true })).toHaveCount(0);
+    await expect(drawer.getByText("[Open in Jira](https://example.atlassian.net/browse/KAN-9)", { exact: false })).toHaveCount(0);
+  });
+
+  test("ZYU-78 the citation drawer escapes HTML-like content in a cited document instead of rendering or executing it", async ({
+    browser,
+  }) => {
+    // Same safety guarantee ZYU-38 pins for the Sources tab's use of renderMarkdown — proven here
+    // too because the drawer is a second, independent dangerouslySetInnerHTML call site.
+    const marker = `xss-marker-${Date.now()}`;
+    const title = stamp("Citation injection doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText: `<img src=x onerror="window.__zyraDrawerXss='${marker}'">`,
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E injection drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E injection drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    await expect(drawer.locator("img")).toHaveCount(0);
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraDrawerXss);
+    expect(injected, "the markdown renderer escapes HTML before parsing, so this must never execute").toBeUndefined();
+    await expect(drawer.getByText("<img", { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-79 the citation drawer never lets a link's own URL text break out of its href attribute", async ({ browser }) => {
+    /*
+     * Regression: renderMarkdown's escaping (lib/markdown.ts) escaped `&`/`<`/`>` but not `"`, and
+     * its own link markup interpolates the captured URL straight into a double-quoted href
+     * attribute — so a cited document whose text contains a markdown link with a `"` inside the
+     * URL (e.g. copy-pasted from a browser address bar mid-incident) could close that attribute
+     * early and leave a bare, injected attribute (onmouseover=...) sitting on the rendered <a>
+     * element. No space before the link's closing `)`, so the regex still matches and produces a
+     * real <a href> either way — proving the fix has to be the escaping, not a malformed link.
+     * Checked at the DOM level (via the browser's own HTML parser), not just string-matching the
+     * markup, since that parser's quote-handling quirks are exactly what this vulnerability turns on.
+     */
+    const title = stamp("Citation link injection doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText: 'See [details](https://example.com"onmouseover=alert(1)) for the source ticket.',
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E link injection drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E link injection drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    const link = drawer.getByRole("link", { name: "details" });
+    await expect(link).toBeVisible();
+
+    const attrs = await link.evaluate((el) => ({
+      href: el.getAttribute("href"),
+      onmouseover: el.getAttribute("onmouseover"),
+      attributeCount: el.attributes.length,
+    }));
+    // Pre-fix, the browser's own HTML parser closed href="..." at the raw `"` and attached this as
+    // a second, genuine attribute on the element instead of leaving it inert inside href's value.
+    expect(attrs.onmouseover, "no attribute must be injected via a broken-out href").toBeNull();
+    // The whole malicious fragment lands inside href instead (decoded back through the &quot;
+    // entity the fix produces) — inert data, never parsed as markup.
+    expect(attrs.href).toContain('example.com"onmouseover=alert(1');
+    // Exactly the three attributes renderMarkdown's own link markup sets: href, target, rel.
+    expect(attrs.attributeCount).toBe(3);
   });
 });
