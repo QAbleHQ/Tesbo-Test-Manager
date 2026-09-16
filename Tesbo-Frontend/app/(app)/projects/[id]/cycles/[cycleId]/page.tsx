@@ -491,6 +491,7 @@ export default function TestRunDetailPage() {
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
     cycleId,
+    members,
     onLogged: () => {
       load();
       if (panelExecution) loadPanelBug(panelExecution);

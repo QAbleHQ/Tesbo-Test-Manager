@@ -166,9 +166,19 @@ function ExistingBugPickerModal({
  * `onLogged` fires after a bug is successfully filed or linked, so each caller can refresh whatever
  * it displays (the drawer refreshes its execution list; the full page has nothing that changes and
  * can omit it).
+ *
+ * `members` mirrors projects/[id]/bugs/page.tsx's "Assign to" selector (Basecamp: the field was
+ * missing from this dialog entirely, so a bug filed from a run could never be assigned on creation).
+ * Both callers already hold this list via useProjectData() for their own "assign the run/execution"
+ * controls, so it's passed in rather than fetched again here.
  */
-export function useLogBugDialog(params: { projectId: string; cycleId: string; onLogged?: () => void }) {
-  const { projectId, cycleId, onLogged } = params;
+export function useLogBugDialog(params: {
+  projectId: string;
+  cycleId: string;
+  members?: { userId: string; email: string; name: string }[];
+  onLogged?: () => void;
+}) {
+  const { projectId, cycleId, members = [], onLogged } = params;
 
   /* issue tracker connection status (gates the ticket-related dialog choices) */
   const [jiraConnected, setJiraConnected] = useState(false);
@@ -181,6 +191,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
   const [bugSeverity, setBugSeverity] = useState<BugSeverity>("Medium");
   const [bugPriority, setBugPriority] = useState<BugPriority | "">("");
   const [bugDesc, setBugDesc] = useState("");
+  const [bugAssigneeId, setBugAssigneeId] = useState("");
   const [bugAlreadyLogged, setBugAlreadyLogged] = useState(false);
   const [bugExistingChoice, setBugExistingChoice] = useState<"JIRA" | "LINEAR" | "TESBO">("TESBO");
   const [bugDestination, setBugDestination] = useState<TrackingDestination>("TESBO");
@@ -216,6 +227,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     setBugDesc("");
     setBugSeverity("Medium");
     setBugPriority("");
+    setBugAssigneeId("");
     setBugAlreadyLogged(false);
     setBugExistingChoice(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "TESBO");
     setBugDestination("TESBO");
@@ -244,6 +256,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
     setBugSeverity("Medium");
     setBugPriority("");
     setBugDesc("");
+    setBugAssigneeId("");
     setBugAlreadyLogged(false);
     setBugExistingChoice(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "TESBO");
     setBugDestination("TESBO");
@@ -277,6 +290,7 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
           description: bugDesc.trim(),
           severity: bugSeverity,
           priority: bugPriority || null,
+          assigneeId: bugAssigneeId || null,
           externalUrl: selfLogged ? bugUrl.trim() : undefined,
           integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
           integrationIssueKey: null,
@@ -545,11 +559,11 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
               {/*
                 * Severity carries dev's required marker (48363ea/10226268634 — the run's modal used
                 * to collect no severity at all, so every bug filed from a run took the column
-                * default), paired with Priority from 10226247009. Evidence keeps its own full-width
-                * row below rather than sharing the grid with Severity: three controls do not fit two
-                * columns, and the file list needs the width.
+                * default), paired with Priority from 10226247009 and Assign to, matching
+                * projects/[id]/bugs/page.tsx's 3-column layout. Evidence keeps its own full-width
+                * row below rather than sharing this grid — the file list needs the width.
                 */}
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="block text-sm font-medium text-[var(--muted)] mb-1">
                     Severity <span className="text-[var(--error-foreground)]">*</span>
@@ -577,6 +591,21 @@ export function useLogBugDialog(params: { projectId: string; cycleId: string; on
                     {BUG_PRIORITIES.map((priority) => (
                       <option key={priority} value={priority}>
                         {priority}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">Assign to</label>
+                  <Select
+                    value={bugAssigneeId}
+                    onChange={(e) => setBugAssigneeId(e.target.value)}
+                    aria-label="Assign to"
+                  >
+                    <option value="">Unassigned</option>
+                    {members.map((m) => (
+                      <option key={m.userId} value={m.userId}>
+                        {m.name || m.email}
                       </option>
                     ))}
                   </Select>

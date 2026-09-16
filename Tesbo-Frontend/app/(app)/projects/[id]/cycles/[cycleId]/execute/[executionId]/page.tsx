@@ -83,6 +83,7 @@ export default function ExecutionDetailPage() {
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
     cycleId,
+    members,
     onLogged: () => {
       if (execution) loadLinkedBug(execution);
     },

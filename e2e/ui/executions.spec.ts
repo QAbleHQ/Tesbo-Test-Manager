@@ -1566,6 +1566,95 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await cleanUp(cycle.id, testcase.id);
     }
   });
+
+  /*
+   * "[Test Run] Assignee field is missing while logging a bug from Test run" — the run's Log Bug
+   * modal (shared by the run drawer and the full execute page via useLogBugDialog) collected a
+   * title, description, severity and priority but had no way to assign the bug to anyone on
+   * creation, even though the standalone Bugs page (BUG-U-24 in ui/bugs.spec.ts) and the backend's
+   * assigneeId support (api/bugs.spec.ts "bug assignee") already existed. "Assign to" was simply
+   * never wired into this dialog. These three cover the field appearing (with the right default and
+   * scope), and actually persisting on the bug created from both entry points into the shared modal.
+   */
+  test("EXE-U-33 the run Log Bug modal offers Assign to, defaulting to Unassigned, only on the new-bug path", { tag: '@tesbo.testId("TES-TC-1920")' }, async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Log Bug Assignee Fields ${Date.now()}`);
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await expect(page.getByText(testcase.title).first()).toBeVisible();
+      await page.getByRole("combobox").first().selectOption("Failed");
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+      const assign = page.getByLabel("Assign to");
+      await expect(assign).toBeVisible();
+      await expect(assign).toHaveValue("");
+
+      // "Yes, link existing" links an already-described bug/ticket — it carries its own assignee
+      // already, so this dialog must not offer to set one for it.
+      await page.getByRole("button", { name: "Yes, link existing" }).click();
+      await expect(page.getByLabel("Assign to")).toBeHidden();
+
+      await page.getByRole("button", { name: "No, log a new one" }).click();
+      await expect(page.getByLabel("Assign to")).toBeVisible();
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("EXE-U-34 assigning from the run drawer's Log Bug modal persists on the created bug", { tag: '@tesbo.testId("TES-TC-1921")' }, async ({ page }) => {
+    const title = `UI Log Bug Assignee Drawer ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await expect(page.getByText(testcase.title).first()).toBeVisible();
+      await page.getByRole("combobox").first().selectOption("Failed");
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+      await page.getByLabel("Assign to").selectOption(me.userId);
+      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+      const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      const created = bugs.find((b: { links?: { testcaseId: string }[] }) =>
+        b.links?.some((l) => l.testcaseId === testcase.id),
+      );
+      expect(created, "the bug filed from this run must be findable via its link back to the testcase").toBeTruthy();
+      expect(created.assigneeId).toBe(me.userId);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("EXE-U-35 assigning from the full execute page's Log Bug modal also persists on the created bug", { tag: '@tesbo.testId("TES-TC-1922")' }, async ({ page }) => {
+    const title = `UI Log Bug Assignee Execute ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const me = await (await api.get("/api/auth/me")).json();
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+      await page.getByRole("button", { name: "Failed", exact: true }).first().click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+
+      await page.getByLabel("Assign to").selectOption(me.userId);
+      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+      const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      const created = bugs.find((b: { links?: { testcaseId: string }[] }) =>
+        b.links?.some((l) => l.testcaseId === testcase.id),
+      );
+      expect(created, "the bug filed from this run must be findable via its link back to the testcase").toBeTruthy();
+      expect(created.assigneeId).toBe(me.userId);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
 });
 
 
