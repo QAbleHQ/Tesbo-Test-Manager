@@ -84,6 +84,12 @@ export class AppConfigService {
   // above, charged instead when the buyer is detected as being in India.
   readonly stripePriceIdProMonthlyInr = this.optionalString("STRIPE_PRICE_ID_PRO_MONTHLY_INR");
   readonly stripePriceIdProAnnualInr = this.optionalString("STRIPE_PRICE_ID_PRO_ANNUAL_INR");
+  /**
+   * Billing/Stripe is optional. Empty STRIPE_SECRET_KEY → checkout/portal/webhooks stay off and
+   * plan-limit gating is skipped so the rest of the app is unaffected. Set the secret (and price
+   * IDs) in .env to turn Cloud billing back on.
+   */
+  readonly isStripeBillingEnabled = Boolean(this.stripeSecretKey?.trim());
   // Forces the detected country (e.g. "IN") for every request. Local stacks and staging see only
   // private IPs, which can't be geolocated, so without this the India price list is untestable.
   // Must stay unset in production — it would hand INR pricing to every visitor.
