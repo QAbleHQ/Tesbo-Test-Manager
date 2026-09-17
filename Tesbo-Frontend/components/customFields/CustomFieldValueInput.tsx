@@ -57,7 +57,7 @@ export default function CustomFieldValueInput({
         onChange={(e) => onChange(e.target.value === "" ? null : e.target.value === "true")}
         disabled={disabled}
       >
-        <option value="">—</option>
+        <option value="">Select…</option>
         <option value="true">{trueFalse ? "True" : "Yes"}</option>
         <option value="false">{trueFalse ? "False" : "No"}</option>
       </Select>
@@ -69,7 +69,7 @@ export default function CustomFieldValueInput({
     const selectable = options.filter((o) => o.active || o.id === value);
     return (
       <Select value={typeof value === "string" ? value : ""} onChange={(e) => onChange(e.target.value || null)} disabled={disabled}>
-        <option value="">—</option>
+        <option value="">Select…</option>
         {selectable.map((option) => (
           <option key={option.id} value={option.id}>
             {option.label}

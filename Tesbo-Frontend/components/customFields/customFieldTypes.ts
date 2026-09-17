@@ -84,7 +84,11 @@ export function validateCustomFieldValues(
 }
 
 export function formatCustomFieldValueForDisplay(field: { fieldType: CustomFieldType; config: CustomFieldConfig }, value: unknown): string {
-  if (isCustomFieldValueEmpty(value)) return "—";
+  // An inactive/archived field renders through this plain-text path instead of
+  // CustomFieldValueInput (see CustomFieldsSection.tsx) — every field type's empty state now
+  // reads "Select…" here, the same wording CustomFieldValueInput's own placeholder <option> uses
+  // for an unset dropdown, instead of the bare "—" this used to fall back to for all of them.
+  if (isCustomFieldValueEmpty(value)) return "Select…";
   switch (field.fieldType) {
     case "boolean": {
       const trueFalse = field.config.displayFormat === "true_false";
