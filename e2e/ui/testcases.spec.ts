@@ -543,3 +543,83 @@ test.describe("test case repository table — column sort", () => {
     await expect(page.getByText("Updating…")).toHaveCount(0, { timeout: 5000 });
   });
 });
+
+// Regression coverage for: Severity and Component are real testcases columns, already wired
+// through create/edit and export (see "Postconditions, Component and Severity can be set..."
+// above), but the repository list endpoint itself omitted both, so the column selector had
+// nothing to show even once a column existed for them.
+test.describe("test case repository table — Severity and Component columns", () => {
+  test("Severity and Component can be shown via the column selector, display the right value, survive a reload, and hide again", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Severity Component ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const withValues = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} with values`, severity: "Critical", component: "Checkout" },
+      });
+      created.push((await withValues.json()).id);
+      // No severity/component set — the column must render an em dash, not a blank cell.
+      const withoutValues = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without values` },
+      });
+      created.push((await withoutValues.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      const rows = () => page.locator("table.tc-repo-table tbody tr");
+      await expect(rows()).toHaveCount(2);
+
+      const headerCells = page.locator("table.tc-repo-table thead tr th");
+      // Hidden by default, same as Suite and Jira.
+      const defaultHeaderText = (await headerCells.allTextContents()).join(" | ");
+      expect(defaultHeaderText).not.toContain("Severity");
+      expect(defaultHeaderText).not.toContain("Component");
+      const defaultCount = await headerCells.count();
+
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Severity" }).locator('input[type="checkbox"]').click();
+      await page.locator("label", { hasText: "Component" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click(); // toggles the menu closed again
+
+      await expect(headerCells).toHaveCount(defaultCount + 2);
+      const headerTexts = await headerCells.allTextContents();
+      const severityIdx = headerTexts.findIndex((t) => t.includes("Severity"));
+      const componentIdx = headerTexts.findIndex((t) => t.includes("Component"));
+      expect(severityIdx, "Severity header should be present once enabled").toBeGreaterThan(-1);
+      expect(componentIdx, "Component header should be present once enabled").toBeGreaterThan(-1);
+
+      const rowWithValues = rows().filter({ hasText: `${marker} with values` });
+      const rowWithoutValues = rows().filter({ hasText: `${marker} without values` });
+      await expect(rowWithValues.locator("td").nth(severityIdx)).toHaveText("Critical");
+      await expect(rowWithValues.locator("td").nth(componentIdx)).toHaveText("Checkout");
+      await expect(rowWithoutValues.locator("td").nth(severityIdx)).toHaveText("—");
+      await expect(rowWithoutValues.locator("td").nth(componentIdx)).toHaveText("—");
+
+      // Persistence: a reload must keep both columns visible, same as any other column toggle.
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      await expect(headerCells).toHaveCount(defaultCount + 2);
+
+      // Hiding them again removes the columns and that choice persists too.
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Severity" }).locator('input[type="checkbox"]').click();
+      await page.locator("label", { hasText: "Component" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+      await expect(headerCells).toHaveCount(defaultCount);
+
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      const headerTextAfterHide = (await headerCells.allTextContents()).join(" | ");
+      expect(headerTextAfterHide).not.toContain("Severity");
+      expect(headerTextAfterHide).not.toContain("Component");
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});

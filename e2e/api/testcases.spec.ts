@@ -66,6 +66,34 @@ test.describe("test case CRUD", () => {
     expect(getAfterDeleteRes.status()).toBe(404);
   });
 
+  // Regression coverage for: severity/component are real testcases columns already returned by
+  // the single-testcase GET, but the repository list SELECT (listTestCasesUncached) omitted both,
+  // so the frontend's column selector had no data to show even once a column existed for them.
+  test("the list endpoint returns severity and component, including as null when unset", { tag: '@tesbo.testId("TES-TC-565")' }, async ({ request }) => {
+    const withValues = await createCase(request, { severity: "Critical", component: "Checkout" });
+    const withoutValues = await createCase(request);
+
+    try {
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withValues.title },
+      });
+      expect(listRes.ok()).toBeTruthy();
+      const listed = (await listRes.json()).find((tc: { id: string }) => tc.id === withValues.id);
+      expect(listed.severity).toBe("Critical");
+      expect(listed.component).toBe("Checkout");
+
+      const listResUnset = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withoutValues.title },
+      });
+      const listedUnset = (await listResUnset.json()).find((tc: { id: string }) => tc.id === withoutValues.id);
+      expect(listedUnset.severity).toBeNull();
+      expect(listedUnset.component).toBeNull();
+    } finally {
+      await deleteCase(request, withValues.id);
+      await deleteCase(request, withoutValues.id);
+    }
+  });
+
   test("defaults are applied when optional fields are omitted on create", { tag: '@tesbo.testId("TES-TC-552")' }, async ({ request }) => {
     const created = await createCase(request);
     try {

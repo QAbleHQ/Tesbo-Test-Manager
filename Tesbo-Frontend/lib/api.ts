@@ -1350,6 +1350,8 @@ export interface TestCaseListItem {
   jiraUrl?: string | null;
   linearIssueKey?: string | null;
   linearUrl?: string | null;
+  severity?: string | null;
+  component?: string | null;
   customFieldValues?: Record<string, unknown>;
 }
 
