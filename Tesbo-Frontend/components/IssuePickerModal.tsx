@@ -30,13 +30,19 @@ interface Props {
    * trackers connected could search Jira after the user explicitly chose Linear.
    */
   provider: "JIRA" | "LINEAR";
+  /**
+   * "multi" (default) is the Report-a-Bug behaviour: check any number of tickets, confirm once.
+   * "single" is for changing the one ticket a bug is already linked to (Edit Bug) — picking a
+   * ticket replaces whatever was previously picked instead of adding to it.
+   */
+  mode?: "single" | "multi";
 }
 
 function issueKey(issue: IssueSearchResult): string {
   return `${issue.provider}-${issue.key}`;
 }
 
-export default function IssuePickerModal({ projectId, testcaseId, cycleId, open, onClose, selectedIssues, onConfirm, provider }: Props) {
+export default function IssuePickerModal({ projectId, testcaseId, cycleId, open, onClose, selectedIssues, onConfirm, provider, mode = "multi" }: Props) {
   const [connected, setConnected] = useState(false);
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<IssueSearchResult[]>([]);
@@ -115,8 +121,11 @@ export default function IssuePickerModal({ projectId, testcaseId, cycleId, open,
 
   function toggle(issue: IssueSearchResult) {
     setPicked((prev) => {
-      const next = new Map(prev);
       const key = issueKey(issue);
+      // Single mode replaces the pick outright — there is only ever one ticket to hold here, so
+      // checking a new row must clear whatever was checked before rather than adding to it.
+      if (mode === "single") return prev.has(key) ? new Map() : new Map([[key, issue]]);
+      const next = new Map(prev);
       if (next.has(key)) next.delete(key);
       else next.set(key, issue);
       return next;
@@ -131,9 +140,10 @@ export default function IssuePickerModal({ projectId, testcaseId, cycleId, open,
   if (!open) return null;
 
   const providerLabel = provider === "JIRA" ? "Jira" : "Linear";
+  const title = mode === "single" ? `Select ${providerLabel} ticket` : `Link ${providerLabel} tickets`;
 
   return (
-    <Modal open={open} onClose={onClose} title={`Link ${providerLabel} tickets`} className="max-w-[520px]">
+    <Modal open={open} onClose={onClose} title={title} className="max-w-[520px]">
       {!connected ? (
         <p className="text-[14px] text-[var(--muted)]">
           {providerLabel} is not connected for this project. Connect it in project settings to search tickets here.
@@ -166,7 +176,12 @@ export default function IssuePickerModal({ projectId, testcaseId, cycleId, open,
                     key={issueKey(issue)}
                     className="flex w-full items-start gap-2 border-b border-[var(--border)] px-3 py-2 text-left last:border-b-0 hover:bg-[var(--surface-secondary)] cursor-pointer"
                   >
-                    <input type="checkbox" checked={checked} onChange={() => toggle(issue)} className="mt-1" />
+                    <input
+                      type={mode === "single" ? "radio" : "checkbox"}
+                      checked={checked}
+                      onChange={() => toggle(issue)}
+                      className="mt-1"
+                    />
                     <div className="flex flex-col items-start gap-0.5">
                       <span className="text-[13px] font-medium text-[var(--foreground)]">{issue.key} — {issue.summary}</span>
                       <span className="text-[12px] text-[var(--muted)]">{issue.status}</span>
@@ -182,7 +197,11 @@ export default function IssuePickerModal({ projectId, testcaseId, cycleId, open,
             {/* Not disabled at zero: unchecking every previously-picked ticket and confirming is
                 how a working selection gets cleared back down to none through this picker. */}
             <Button type="button" onClick={handleConfirm}>
-              {picked.size > 0 ? `Add Selected (${picked.size})` : "Add Selected"}
+              {mode === "single"
+                ? "Select"
+                : picked.size > 0
+                  ? `Add Selected (${picked.size})`
+                  : "Add Selected"}
             </Button>
           </div>
         </div>

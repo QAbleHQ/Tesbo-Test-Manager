@@ -328,6 +328,90 @@ test.describe("bug CRUD", () => {
 });
 
 /*
+ * Edit Bug's Jira/Linear field — previously a plain URL box that always sent
+ * integrationIssueKey: null on save, so an already-linked ticket could never actually be changed
+ * from the edit screen. The picker itself (Tesbo-Frontend/components/IssuePickerModal.tsx, reused
+ * from LogBugDialog's "single" mode) is covered in ui/bugs.spec.ts; this is the part it depends
+ * on — that PATCH already accepts a new integrationProvider/integrationIssueKey pair and applies
+ * it to the SAME bug row rather than requiring a new one.
+ */
+test.describe("bug integration link", () => {
+  test("changing the linked ticket updates the same bug in place, not a new one", async ({ request }) => {
+    const title = `E2E Bug Ticket Switch ${Date.now()}`;
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title,
+          integrationProvider: "JIRA",
+          integrationIssueKey: "KAN-9",
+          externalUrl: "https://e2e.atlassian.net/browse/KAN-9",
+        },
+      })
+    ).json();
+
+    try {
+      expect(created.integrationIssueKey).toBe("KAN-9");
+
+      const updated = await (
+        await request.patch(`/api/bugs/${created.id}`, {
+          data: {
+            integrationProvider: "JIRA",
+            integrationIssueKey: "KAN-10",
+            externalUrl: "https://e2e.atlassian.net/browse/KAN-10",
+          },
+        })
+      ).json();
+
+      expect(updated.id, "the same bug must be updated, not a new one").toBe(created.id);
+      expect(updated.integrationIssueKey).toBe("KAN-10");
+      expect(updated.externalUrl).toBe("https://e2e.atlassian.net/browse/KAN-10");
+
+      const fetched = await (await request.get(`/api/bugs/${created.id}`)).json();
+      expect(fetched.integrationIssueKey, "the old key must not still be current after the switch").toBe("KAN-10");
+
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      const matches = list.filter((b: { title: string }) => b.title === title);
+      expect(matches, "switching tickets must not leave a second bug behind").toHaveLength(1);
+      expect(matches[0].integrationIssueKey).toBe("KAN-10");
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("switching provider from Jira to Linear replaces both the provider and the key together", async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: `E2E Bug Provider Switch ${Date.now()}`,
+          integrationProvider: "JIRA",
+          integrationIssueKey: "KAN-9",
+          externalUrl: "https://e2e.atlassian.net/browse/KAN-9",
+        },
+      })
+    ).json();
+
+    try {
+      const updated = await (
+        await request.patch(`/api/bugs/${created.id}`, {
+          data: {
+            integrationProvider: "LINEAR",
+            integrationIssueKey: "ENG-77",
+            externalUrl: "https://linear.app/e2e/issue/ENG-77",
+          },
+        })
+      ).json();
+
+      // A stale Jira key must never survive under integrationProvider: "LINEAR" — the two fields
+      // have to change atomically, not leave a mismatched pair.
+      expect(updated.integrationProvider).toBe("LINEAR");
+      expect(updated.integrationIssueKey).toBe("ENG-77");
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
  * Bug priority — Basecamp 10226247009.
  *
  * A second axis beside severity: severity is how bad the defect is, priority is how soon it is
