@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { tracedEmbeddingCall } from "../observability/embedding-trace";
 import { EmbeddingKeyAllocation, embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
 import {
   RAG_ANN_CANDIDATES,
@@ -44,6 +45,17 @@ interface FusedSource {
   chunks: Array<{ content: string; headingPath: string | null }>;
 }
 
+// Optional Langfuse trace anchor for the query-embedding call this retrieval makes. Both fields
+// are best-effort: when neither is set (the default — most callers of this service predate
+// tracing and are unaffected), the embeddings call still happens exactly as before, just untraced.
+// See tracedEmbeddingCall (observability/embedding-trace.ts) for traceId vs traceSeed precedence.
+interface RetrievalTraceOpts {
+  traceId?: string | null;
+  traceSeed?: string | null;
+}
+
+type RetrievalOpts = { maxSources?: number; charBudget?: number } & RetrievalTraceOpts;
+
 // Hybrid retrieval for Zyra's free-text chat path: vector similarity (ANN) fused with keyword
 // full-text search. Does NOT replace knowledgeSnapshot() (that stays for the explicit-picker
 // task-generation flow — a named-document lookup, not semantic search).
@@ -60,7 +72,7 @@ export class RagRetrievalService {
 
   constructor(private readonly db: DatabaseService) {}
 
-  async retrieveKnowledgeContext(projectId: string, query: string, opts: { maxSources?: number; charBudget?: number } = {}): Promise<RetrievedKnowledgeItem[]> {
+  async retrieveKnowledgeContext(projectId: string, query: string, opts: RetrievalOpts = {}): Promise<RetrievedKnowledgeItem[]> {
     return (await this.retrieveWithDiagnostics(projectId, query, opts)).items;
   }
 
@@ -76,7 +88,7 @@ export class RagRetrievalService {
   async retrieveWithDiagnostics(
     projectId: string,
     query: string,
-    opts: { maxSources?: number; charBudget?: number } = {}
+    opts: RetrievalOpts = {}
   ): Promise<{ items: RetrievedKnowledgeItem[]; semanticSearchRan: boolean; reason: string; topScore: number | null; confidence: RagRetrievalConfidence }> {
     let reason = "";
     try {
@@ -88,7 +100,7 @@ export class RagRetrievalService {
       const allocation = resolved.allocation;
 
       const [annRowsRaw, ftsDocRows, ftsFileRows] = await Promise.all([
-        allocation ? this.annSearch(projectId, allocation, text) : Promise.resolve([] as AnnRow[]),
+        allocation ? this.annSearch(projectId, allocation, text, { traceId: opts.traceId, traceSeed: opts.traceSeed }) : Promise.resolve([] as AnnRow[]),
         this.ftsSearch(projectId, "knowledge_documents", "content_text", text),
         this.ftsSearch(projectId, "knowledge_files", "extracted_text", text)
       ]);
@@ -134,9 +146,10 @@ export class RagRetrievalService {
    * legacy.service.ts — not something this method fuses with), and there is exactly one
    * candidate collection to rank, so there is nothing to fuse.
    *
-   * NOT called anywhere yet. This exists so the capability is real and callable; wiring it into
-   * Zyra's ticket workflow Update-vs-Add classification (ZYRA_TICKET_WORKFLOW.md §10) is a
-   * separate, later step by design.
+   * Called from zyraSimilarityFeedbackForDrafts (legacy.service.ts), which feeds a match back to
+   * the drafting model as advisory context (see TESTCASE_SIMILARITY_THRESHOLD, rag.constants.ts) —
+   * not yet wired into a backend-side Update-vs-Add reclassification (ZYRA_TICKET_WORKFLOW.md §10),
+   * which stays a separate, later step by design.
    *
    * Same never-throws contract as retrieveWithDiagnostics: any failure (no embedding allocation,
    * nothing embedded yet, embeddings API error) resolves to an empty match list.
@@ -144,7 +157,7 @@ export class RagRetrievalService {
   async findSimilarTestcases(
     projectId: string,
     queryText: string,
-    opts: { excludeTestcaseId?: string; limit?: number } = {}
+    opts: { excludeTestcaseId?: string; limit?: number } & RetrievalTraceOpts = {}
   ): Promise<{ matches: SimilarTestcaseMatch[]; semanticSearchRan: boolean; reason: string }> {
     let reason = "";
     try {
@@ -155,7 +168,10 @@ export class RagRetrievalService {
       reason = resolved.reason;
       if (!resolved.allocation) return { matches: [], semanticSearchRan: false, reason };
 
-      const rows = await this.annSearchTestcases(projectId, resolved.allocation, text, opts.excludeTestcaseId);
+      const rows = await this.annSearchTestcases(projectId, resolved.allocation, text, opts.excludeTestcaseId, {
+        traceId: opts.traceId,
+        traceSeed: opts.traceSeed
+      });
       const matches = rows
         .filter((row) => row.cosine_similarity >= TESTCASE_SIMILARITY_THRESHOLD)
         .slice(0, opts.limit ?? RAG_ANN_CANDIDATES)
@@ -172,9 +188,22 @@ export class RagRetrievalService {
     projectId: string,
     allocation: EmbeddingKeyAllocation,
     query: string,
-    excludeTestcaseId?: string
+    excludeTestcaseId?: string,
+    traceOpts: RetrievalTraceOpts = {}
   ): Promise<TestcaseAnnRow[]> {
-    const [queryVector] = await embedTexts(allocation, [query]);
+    const [queryVector] = await tracedEmbeddingCall(
+      {
+        traceId: traceOpts.traceId,
+        traceSeed: traceOpts.traceSeed,
+        name: "testcase-query-embedding",
+        projectId,
+        provider: allocation.provider,
+        model: allocation.model,
+        inputCount: 1,
+        inputSample: query
+      },
+      () => embedTexts(allocation, [query])
+    );
     if (!queryVector) return [];
     const vectorLiteral = `[${queryVector.join(",")}]`;
     // Same literal `e.project_id = $1` partition-pruning rationale as annSearch() below, and the
@@ -193,8 +222,20 @@ export class RagRetrievalService {
     return res.rows;
   }
 
-  private async annSearch(projectId: string, allocation: EmbeddingKeyAllocation, query: string): Promise<AnnRow[]> {
-    const [queryVector] = await embedTexts(allocation, [query]);
+  private async annSearch(projectId: string, allocation: EmbeddingKeyAllocation, query: string, traceOpts: RetrievalTraceOpts = {}): Promise<AnnRow[]> {
+    const [queryVector] = await tracedEmbeddingCall(
+      {
+        traceId: traceOpts.traceId,
+        traceSeed: traceOpts.traceSeed,
+        name: "kb-query-embedding",
+        projectId,
+        provider: allocation.provider,
+        model: allocation.model,
+        inputCount: 1,
+        inputSample: query
+      },
+      () => embedTexts(allocation, [query])
+    );
     if (!queryVector) return [];
     const vectorLiteral = `[${queryVector.join(",")}]`;
     // The literal `c.project_id = $1` equality is what lets Postgres prune straight to one

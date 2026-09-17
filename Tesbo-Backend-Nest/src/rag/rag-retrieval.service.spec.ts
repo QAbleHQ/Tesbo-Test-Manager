@@ -19,6 +19,24 @@ jest.mock("./rag-ai-allocation", () => ({
   embedTexts: (...args: unknown[]) => embedTextsMock(...args)
 }));
 
+// Transparent by default (calls fn() and returns its result) — matches tracedEmbeddingCall's real
+// pass-through contract when tracing is off, which is always true in this unit-test environment.
+// Mocked so a handful of tests below can assert the trace context this service forwards, without
+// re-testing tracedEmbeddingCall's own behaviour (that's embedding-trace.spec.ts's job).
+interface TracedEmbeddingCtx {
+  traceId?: string | null;
+  traceSeed?: string | null;
+  name: string;
+  projectId: string;
+  provider: string;
+  model: string;
+  inputCount: number;
+}
+const tracedEmbeddingCallMock = jest.fn<Promise<number[][]>, [TracedEmbeddingCtx, () => Promise<number[][]>]>((_ctx, fn) => fn());
+jest.mock("../observability/embedding-trace", () => ({
+  tracedEmbeddingCall: (ctx: TracedEmbeddingCtx, fn: () => Promise<number[][]>) => tracedEmbeddingCallMock(ctx, fn)
+}));
+
 import { RagRetrievalService } from "./rag-retrieval.service";
 import type { DatabaseService } from "../database/database.service";
 import { RAG_CONFIDENT_SIMILARITY, RAG_MIN_SIMILARITY, TESTCASE_SIMILARITY_THRESHOLD } from "./rag.constants";
@@ -42,6 +60,8 @@ describe("RagRetrievalService.retrieveWithDiagnostics", () => {
   beforeEach(() => {
     resolveEmbeddingAllocationMock.mockReset();
     embedTextsMock.mockReset();
+    tracedEmbeddingCallMock.mockClear();
+    tracedEmbeddingCallMock.mockImplementation((_ctx, fn) => fn());
     resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: FAKE_ALLOCATION, reason: "Using the project's openai key for embeddings." });
     embedTextsMock.mockResolvedValue([[0.1, 0.2, 0.3]]);
   });
@@ -116,6 +136,23 @@ describe("RagRetrievalService.retrieveWithDiagnostics", () => {
     const result = await svc.retrieveWithDiagnostics("project-1", "   ");
     expect(result).toEqual({ items: [], semanticSearchRan: false, reason: "Empty query.", topScore: null, confidence: "none" });
   });
+
+  it("forwards a supplied traceSeed/traceId to the query-embedding call unchanged, without affecting the result", async () => {
+    const svc = new RagRetrievalService(makeDb([annRow("a", 0.9)]));
+    const result = await svc.retrieveWithDiagnostics("project-1", "query", { traceSeed: "seed-123", traceId: undefined });
+    expect(result.items.map((i) => i.citation.sourceId)).toEqual(["a"]);
+    expect(tracedEmbeddingCallMock).toHaveBeenCalledTimes(1);
+    const [ctx] = tracedEmbeddingCallMock.mock.calls[0];
+    expect(ctx).toMatchObject({ name: "kb-query-embedding", projectId: "project-1", traceSeed: "seed-123", provider: "openai", model: "text-embedding-3-small" });
+  });
+
+  it("produces an identical result whether or not a trace anchor is supplied — tracing is purely additive", async () => {
+    const svcNoTrace = new RagRetrievalService(makeDb([annRow("a", 0.9)]));
+    const withoutTrace = await svcNoTrace.retrieveWithDiagnostics("project-1", "query");
+    const svcWithTrace = new RagRetrievalService(makeDb([annRow("a", 0.9)]));
+    const withTrace = await svcWithTrace.retrieveWithDiagnostics("project-1", "query", { traceId: "turn-trace-1" });
+    expect(withTrace).toEqual(withoutTrace);
+  });
 });
 
 /*
@@ -143,6 +180,8 @@ describe("RagRetrievalService.findSimilarTestcases", () => {
   beforeEach(() => {
     resolveEmbeddingAllocationMock.mockReset();
     embedTextsMock.mockReset();
+    tracedEmbeddingCallMock.mockClear();
+    tracedEmbeddingCallMock.mockImplementation((_ctx, fn) => fn());
     resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: FAKE_ALLOCATION, reason: "Using the project's openai key for embeddings." });
     embedTextsMock.mockResolvedValue([[0.1, 0.2, 0.3]]);
   });
@@ -191,5 +230,13 @@ describe("RagRetrievalService.findSimilarTestcases", () => {
     const svc = new RagRetrievalService(makeTestcaseDb([]));
     const result = await svc.findSimilarTestcases("project-1", "   ");
     expect(result.matches).toEqual([]);
+  });
+
+  it("forwards a supplied traceId to the query-embedding call unchanged, without affecting the result", async () => {
+    const svc = new RagRetrievalService(makeTestcaseDb([{ testcase_id: "tc-1", cosine_similarity: 0.93 }]));
+    const result = await svc.findSimilarTestcases("project-1", "query", { traceId: "turn-trace-9" });
+    expect(result.matches).toEqual([{ testcaseId: "tc-1", cosineSimilarity: 0.93 }]);
+    const [ctx] = tracedEmbeddingCallMock.mock.calls[0];
+    expect(ctx).toMatchObject({ name: "testcase-query-embedding", projectId: "project-1", traceId: "turn-trace-9" });
   });
 });

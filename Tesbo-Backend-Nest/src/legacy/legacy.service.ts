@@ -11290,6 +11290,12 @@ export class LegacyService implements OnModuleInit {
     onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
     onStage?.("context");
+    // Computed here, before context-gathering, purely so the retrieval-time query-embedding call
+    // below can attach to the SAME trace startZyraTurn opens later (once gathered context exists —
+    // see that call's own comment for why the turn itself still opens down there, unchanged). Same
+    // deterministic-seed value either way; only the moment it's computed moved earlier.
+    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    const zyraTurnTraceSeed = confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId;
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
     const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
@@ -11309,7 +11315,7 @@ export class LegacyService implements OnModuleInit {
       // retrieveWithDiagnostics rather than retrieveKnowledgeContext: the plain call returns [] for
       // every failure mode, so "no embeddings key" and "nothing relevant" are indistinguishable —
       // which is how the vector half of this search stayed off in production unnoticed.
-      this.ragRetrieval.retrieveWithDiagnostics(projectId, message),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, message, { traceSeed: zyraTurnTraceSeed }),
       // Direct folder-name lookup — recency/embeddings never match on a folder's name alone
       // (e.g. "knowledge base 'EAD-11215' folder"), only on document content.
       this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys),
@@ -11347,10 +11353,11 @@ export class LegacyService implements OnModuleInit {
     // The trace id is deterministic from messageId (see startZyraTurn), so the confirmation-retry
     // call in sendZyraChatMessage — which re-invokes this method with the SAME userMessageId — needs
     // a distinct suffix here, or its span would collide with the first call's span under the same
-    // fixed spanId rather than landing as its own observation.
-    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    // fixed spanId rather than landing as its own observation. zyraTurnTraceSeed (computed above,
+    // before context-gathering) already carries that same suffix logic — reused here so the
+    // retrieval-time embedding call and this turn land under the identical trace id.
     const trace = await startZyraTurn({
-      messageId: confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId,
+      messageId: zyraTurnTraceSeed,
       sessionId,
       projectId,
       userId,
@@ -12469,7 +12476,7 @@ export class LegacyService implements OnModuleInit {
     // update-redirect purposes. Only fires when at least one draft actually matches at the
     // advisory tier or above; adds zero extra cost/latency otherwise.
     let finalResult = aiResult;
-    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts);
+    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts, params.trace?.traceId);
     if (similarityFeedback) {
       try {
         const revised = await this.generateZyraWithProvider({
@@ -12671,7 +12678,11 @@ export class LegacyService implements OnModuleInit {
   // separate null-check on the whole array.
   private async zyraSimilarityFeedbackForDrafts(
     projectId: string,
-    drafts: Body[]
+    drafts: Body[],
+    // The current turn's already-resolved Langfuse trace id, when one exists (undefined for the
+    // background batches that call this with no trace at all — same "trace optional, skip if
+    // absent" convention already used for recordGeneration elsewhere in this file).
+    traceId?: string | null
   ): Promise<{ feedback: string | null; matchesByIndex: Array<{ testcaseId: string; cosineSimilarity: number } | null> }> {
     const noMatches = drafts.map(() => null);
     try {
@@ -12702,7 +12713,7 @@ export class LegacyService implements OnModuleInit {
       const results = await Promise.all(
         texts.map((text) =>
           text.trim()
-            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1 })
+            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1, traceId })
             : Promise.resolve({ matches: [], semanticSearchRan: false, reason: "Empty draft text." })
         )
       );
