@@ -939,6 +939,14 @@ export class LegacyController {
       // "action => expected result" per step, separated by " | " — the expected result after
       // "=>" is optional but importing it this way carries it into each step's Expected Result.
       steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
+      // The Map Columns screen also offers a plain Action/Expected Result pair for a file with one
+      // step per row instead of the "=>"/"|" DSL above (see ImportTestCasesModal.tsx's handleImport).
+      // Populated here so those two fields auto-map instead of showing "-- Skip --" out of the box;
+      // mirrors the DSL's first step so both examples agree. Steps stays mapped in this same file, so
+      // on import it still wins over these two exactly as it always has — this pair only matters once
+      // Steps itself is left unmapped.
+      action: "Open login page",
+      expectedResult: "Login form is displayed",
       testData: "user@example.com",
       priority: "P2",
       severity: "Medium",

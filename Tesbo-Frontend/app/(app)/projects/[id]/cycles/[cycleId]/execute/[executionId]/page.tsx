@@ -7,11 +7,12 @@ import {
   listCycleExecutions,
   updateExecution,
   listBugs,
+  removeBugLink,
   type ExecutionItem,
   type BugItem,
 } from "@/lib/api";
 import { IconBug } from "@tabler/icons-react";
-import { Button, StatusChip, Input, PageLoader, Textarea, Select } from "@/components/ui";
+import { Button, StatusChip, Input, PageLoader, Textarea, Select, ConfirmModal } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta } from "@/components/AutomationResultMeta";
 import { useLogBugDialog } from "@/components/LogBugDialog";
@@ -70,36 +71,71 @@ export default function ExecutionDetailPage() {
   const [actualResult, setActualResult] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [saving, setSaving] = useState(false);
-  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug filed via "Log bug"
-     (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row. */
-  const [linkedBug, setLinkedBug] = useState<BugItem | null>(null);
+  /* Bug Key / Bug Title shown for a Failed execution — read from the real bug(s) filed via "Log
+     bug" (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row.
+     An execution can have more than one bug linked to it, so this is every bug linked to THIS
+     execution specifically, not just the first bug linked to its testcase+cycle. */
+  const [linkedBugs, setLinkedBugs] = useState<BugItem[]>([]);
+  /* Confirm-then-unlink for a single already-persisted bug — separate from the "Report a Bug"
+     dialog's own chip removal, which only discards an unsaved working pick and never calls this. */
+  const [bugToUnlink, setBugToUnlink] = useState<BugItem | null>(null);
+  const [unlinkingBug, setUnlinkingBug] = useState(false);
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
     cycleId,
+    members,
     // Use the execution the dialog actually operated on rather than this page's own `execution`
     // state — this page never nulls that state out, so both happen to agree today, but relying on
     // the dialog's own answer keeps this correct even if that stops being true.
     onLogged: (exec) => {
-      loadLinkedBug(exec);
+      loadLinkedBugs(exec);
     },
   });
 
   // Guards against an out-of-order response landing after a newer listBugs() call for this same
   // page — e.g. the initial-mount fetch resolving after a post-"Log bug" refresh — which would
   // otherwise overwrite the fresher result with a stale one.
-  const linkedBugRequestIdRef = useRef<string | null>(null);
+  const linkedBugsRequestIdRef = useRef<string | null>(null);
 
-  function loadLinkedBug(exec: ExecutionItem) {
+  function loadLinkedBugs(exec: ExecutionItem) {
     const requestId = `${exec.id}:${Date.now()}`;
-    linkedBugRequestIdRef.current = requestId;
+    linkedBugsRequestIdRef.current = requestId;
+    // listBugs is scoped to testcase+cycle, not to this one execution (the API has no executionId
+    // filter) — a testcase can be executed more than once in the same cycle, so this narrows to
+    // the bugs actually linked to THIS execution via each bug's own links[].
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
       .then((bugs) => {
-        if (linkedBugRequestIdRef.current !== requestId) return;
-        setLinkedBug(bugs[0] ?? null);
+        if (linkedBugsRequestIdRef.current !== requestId) return;
+        setLinkedBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id)));
       })
       .catch(() => {
-        if (linkedBugRequestIdRef.current === requestId) setLinkedBug(null);
+        if (linkedBugsRequestIdRef.current === requestId) setLinkedBugs([]);
       });
+  }
+
+  /* ───── Unlink one bug from this execution — removes only the bug_links row tying it to this
+   * testcase/cycle/execution via the existing addBugLink/removeBugLink pair; never deletes the
+   * bug (or, for a Jira/Linear-originated bug, its external ticket). Reloads from the API rather
+   * than just filtering linkedBugs locally so the list reflects the same state a refresh would. */
+  function requestUnlinkBug(bug: BugItem) {
+    setBugToUnlink(bug);
+  }
+
+  async function confirmUnlinkBug() {
+    if (!bugToUnlink || !execution) return;
+    const link = bugToUnlink.links.find((l) => l.executionId === execution.id);
+    if (!link) {
+      setBugToUnlink(null);
+      return;
+    }
+    setUnlinkingBug(true);
+    try {
+      await removeBugLink(bugToUnlink.id, link.id);
+      loadLinkedBugs(execution);
+      setBugToUnlink(null);
+    } finally {
+      setUnlinkingBug(false);
+    }
   }
 
   useEffect(() => {
@@ -115,7 +151,7 @@ export default function ExecutionDetailPage() {
           setStatus(e.status || "Untested");
           setActualResult(e.actualResult || "");
           setAssigneeId(e.assigneeId || "");
-          loadLinkedBug(e);
+          loadLinkedBugs(e);
         }
       })
       .catch(() => router.replace("/projects"));
@@ -274,39 +310,57 @@ export default function ExecutionDetailPage() {
           </div>
 
           {/*
-            * Bug Key / Bug Title — shown only for a Failed case that also has a real persisted bug
-            * association (linkedBug, loaded from bug_links via listBugs). Both conditions matter:
-            * Failed alone does not imply a bug exists (only a successful "Log bug" / "Link Bug"
-            * does), and a bug linked while the case was Failed must not keep showing once the case
-            * is Untested/Passed/Skipped/Blocked/Retest. Read-only: these reflect the real bug, not
-            * a free-text value typed here.
+            * Bug Key / Bug Title — shown only for a Failed case that also has at least one real
+            * persisted bug association (linkedBugs, loaded from bug_links via listBugs). Both
+            * conditions matter: Failed alone does not imply a bug exists (only a successful
+            * "Log bug" / "Link Bug" does), and a bug linked while the case was Failed must not
+            * keep showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only:
+            * these reflect the real bug(s), not a free-text value typed here. One execution can
+            * now have several bugs linked (multi-select existing-bug picker) — a single linked
+            * bug keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
+            * ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every row gets its own
+            * Unlink action regardless of count.
             */}
-          <div className="grid grid-cols-2 gap-3" hidden={status !== "Failed" || !linkedBug}>
-            <div>
-              <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Bug Key
-              </label>
-              <Input
-                type="text"
-                aria-label="Bug Key"
-                value={linkedBug?.integrationIssueKey || linkedBug?.externalId || ""}
-                readOnly
-                placeholder="e.g. PROJ-123"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                Bug Title
-              </label>
-              <Input
-                type="text"
-                aria-label="Bug Title"
-                value={linkedBug?.title || ""}
-                readOnly
-                placeholder="Title of the linked bug"
-              />
-            </div>
+          <div className="space-y-3" hidden={status !== "Failed" || linkedBugs.length === 0}>
+            {linkedBugs.map((bug, i) => {
+              const keyLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Key` : "Bug Key";
+              const titleLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Title` : "Bug Title";
+              return (
+                <div key={bug.id} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--muted)] mb-1">{keyLabel}</label>
+                    <Input type="text" aria-label={keyLabel} value={bug.integrationIssueKey || bug.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--muted)] mb-1">{titleLabel}</label>
+                    <Input type="text" aria-label={titleLabel} value={bug.title || ""} readOnly placeholder="Title of the linked bug" />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    aria-label={`Unlink ${bug.title}`}
+                    onClick={() => requestUnlinkBug(bug)}
+                  >
+                    Unlink
+                  </Button>
+                </div>
+              );
+            })}
           </div>
+
+          {/* Unlink-bug confirmation — unlink only, never deletes the bug or its Jira/Linear
+              ticket. Distinct from the "Report a Bug" dialog's own chip ✕, which only discards an
+              unsaved working pick and never reaches this or the removeBugLink API. */}
+          <ConfirmModal
+            open={!!bugToUnlink}
+            title="Unlink bug"
+            message={`Remove "${bugToUnlink?.title ?? ""}" from this test case? This only removes the link — the bug itself will not be deleted.`}
+            confirmLabel="Unlink"
+            loading={unlinkingBug}
+            onConfirm={confirmUnlinkBug}
+            onCancel={() => setBugToUnlink(null)}
+          />
 
           {/*
             * The same two panels the run drawer shows, so a result looks the same wherever it is

@@ -18,6 +18,7 @@ import {
   type BugAttachment,
   type BugSeverity,
   type BugPriority,
+  type IssueSearchResult,
 } from "@/lib/api";
 import {
   Button,
@@ -40,6 +41,7 @@ import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
+import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
@@ -489,6 +491,28 @@ export default function BugsPage() {
   const [editDestination, setEditDestination] = useState<TrackingDestination>("TESBO");
   const [editSelfSystem, setEditSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [editUrl, setEditUrl] = useState("");
+  // The Jira/Linear ticket currently linked to the bug being edited, so Edit Bug can offer a
+  // searchable picker (reusing IssuePickerModal) instead of a plain URL box for those systems.
+  const [editSelectedIssue, setEditSelectedIssue] = useState<IssueSearchResult | null>(null);
+  const [editIssuePickerOpen, setEditIssuePickerOpen] = useState(false);
+
+  // Switching which system (Jira/Linear/Other) is selected has to drop a previously-picked issue
+  // that belongs to a different provider — otherwise a Jira key saved while Linear is selected
+  // would be submitted under integrationProvider: "LINEAR", and the stale ticket would also leak
+  // into the Linear picker's result list (it's kept "selected" there purely by key match failing
+  // to exclude it).
+  function handleEditSystemChange(system: SelfLoggedSystem) {
+    setEditSelfSystem(system);
+    setEditSelectedIssue((prev) => {
+      if (prev && prev.provider !== system) {
+        // The URL field tracked the old provider's ticket — clear it along with the pick so a
+        // Jira browse link can't linger under integrationProvider: "LINEAR" (or "OTHER").
+        setEditUrl("");
+        return null;
+      }
+      return prev;
+    });
+  }
   const [editEvidenceMode, setEditEvidenceMode] = useState<EvidenceMode>("FILES");
   const [editStagedFiles, setEditStagedFiles] = useState<File[]>([]);
   const [editAttachments, setEditAttachments] = useState<BugAttachment[]>([]);
@@ -704,8 +728,20 @@ export default function BugsPage() {
       }))
     );
     setEditDestination(bug.externalUrl ? "SELF" : "TESBO");
-    setEditSelfSystem(bug.integrationProvider === "JIRA" || bug.integrationProvider === "LINEAR" ? bug.integrationProvider : "OTHER");
+    // updateBug/createBug store integrationProvider verbatim — unlike severity/priority, there is
+    // no backend normalization — so a value ever written as "jira"/"Jira" instead of "JIRA" (an
+    // older client, a hand-crafted API call) has to still be recognized here, or a bug with a
+    // perfectly real Jira/Linear link falls through to "Other".
+    const normalizedProvider = bug.integrationProvider?.toUpperCase();
+    const detectedProvider: SelfLoggedSystem =
+      normalizedProvider === "JIRA" || normalizedProvider === "LINEAR" ? normalizedProvider : "OTHER";
+    setEditSelfSystem(detectedProvider);
     setEditUrl(bug.externalUrl || "");
+    setEditSelectedIssue(
+      (detectedProvider === "JIRA" || detectedProvider === "LINEAR") && bug.integrationIssueKey
+        ? { provider: detectedProvider, key: bug.integrationIssueKey, summary: "", status: "", url: bug.externalUrl || "" }
+        : null
+    );
     setEditEvidenceMode(bug.betterbugsUrl ? "BETTERBUGS" : "FILES");
     setEditStagedFiles([]);
     setEditAttachments(bug.attachments);
@@ -722,7 +758,7 @@ export default function BugsPage() {
 
   /* save edit */
   async function handleEditSave() {
-    if (!editBug || !editTitle.trim() || (hasTestRuns && !editLinks.length)) return;
+    if (!editBug || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired) return;
     const selfLogged = (jiraConnected || linearConnected) && editDestination === "SELF";
     setSaving(true);
     setEditError(null);
@@ -736,7 +772,7 @@ export default function BugsPage() {
         assigneeId: editAssigneeId || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
         integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
-        integrationIssueKey: null,
+        integrationIssueKey: selfLogged && editSelfSystem !== "OTHER" ? editSelectedIssue?.key || null : null,
         betterbugsUrl: editEvidenceMode === "BETTERBUGS" ? editBetterbugsUrl.trim() : undefined,
         links: editLinks.map((link) => ({
           testcaseId: link.testcaseId,
@@ -775,6 +811,15 @@ export default function BugsPage() {
   if (loading) {
     return <PageLoader variant="content" />;
   }
+
+  // Requirement: switching Jira <-> Linear (or picking Jira/Linear for the first time) clears the
+  // previous pick and must not be saveable again until a ticket from the NEW provider is chosen —
+  // otherwise Save would silently persist integrationProvider set with integrationIssueKey null.
+  const editIssueRequired =
+    (jiraConnected || linearConnected) &&
+    editDestination === "SELF" &&
+    (editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") &&
+    !editSelectedIssue;
 
   return (
     <div className="min-h-screen bg-[var(--background)]">
@@ -1448,6 +1493,7 @@ export default function BugsPage() {
         onClose={() => {
           setEditError(null);
           setEditBug(null);
+          setEditIssuePickerOpen(false);
         }}
         title="Edit Bug"
       >
@@ -1511,9 +1557,56 @@ export default function BugsPage() {
               jiraConnected={jiraConnected}
               linearConnected={linearConnected}
               system={editSelfSystem}
-              onSystemChange={setEditSelfSystem}
+              onSystemChange={handleEditSystemChange}
               url={editUrl}
               onUrlChange={setEditUrl}
+              renderUrlField={(system, defaultField) => {
+                if (system === "OTHER") return defaultField;
+                return (
+                  <div className="mt-2 space-y-1">
+                    <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
+                      {editSelectedIssue ? (
+                        <a
+                          href={editSelectedIssue.url || editUrl || undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="truncate text-[var(--foreground)] hover:underline"
+                        >
+                          {editSelectedIssue.key}
+                          {editSelectedIssue.summary ? ` — ${editSelectedIssue.summary}` : ""}
+                        </a>
+                      ) : (
+                        <span className="text-[var(--muted)]">No issue selected.</span>
+                      )}
+                      <Button type="button" size="sm" variant="secondary" onClick={() => setEditIssuePickerOpen(true)}>
+                        {editSelectedIssue ? "Change issue" : "Select issue"}
+                      </Button>
+                    </div>
+                    {editIssueRequired && (
+                      <p className="text-[13px] text-[var(--error-foreground)]">
+                        Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
+            />
+          )}
+          {(editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") && (
+            <IssuePickerModal
+              projectId={projectId}
+              testcaseId={null}
+              cycleId={null}
+              provider={editSelfSystem}
+              open={editIssuePickerOpen}
+              onClose={() => setEditIssuePickerOpen(false)}
+              selectedIssues={editSelectedIssue ? [editSelectedIssue] : []}
+              mode="single"
+              onConfirm={(issues) => {
+                const issue = issues[0] ?? null;
+                setEditSelectedIssue(issue);
+                setEditUrl(issue?.url ?? "");
+              }}
             />
           )}
           <Field>
@@ -1583,7 +1676,7 @@ export default function BugsPage() {
             <Button
               variant="primary"
               onClick={handleEditSave}
-              disabled={saving || !editTitle.trim() || (hasTestRuns && !editLinks.length)}
+              disabled={saving || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired}
             >
               {saving ? "Saving…" : "Save Changes"}
             </Button>
