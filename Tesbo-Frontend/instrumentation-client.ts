@@ -1,4 +1,6 @@
 import * as Sentry from "@sentry/nextjs";
+import posthog from "posthog-js";
+import { getPostHogConfig } from "@/lib/posthog";
 import { getSentryRuntimeConfig, shouldSendClientEvent } from "@/lib/sentry";
 
 const config = getSentryRuntimeConfig();
@@ -32,6 +34,17 @@ if (config.enabled) {
       }
       return event;
     },
+  });
+}
+
+// PostHog: only when NEXT_PUBLIC_POSTHOG_KEY is set (typically production app.tesbo.io).
+const posthogConfig = getPostHogConfig();
+if (posthogConfig.enabled) {
+  posthog.init(posthogConfig.key, {
+    api_host: posthogConfig.host,
+    defaults: "2026-05-30",
+    capture_pageview: true,
+    capture_pageleave: true,
   });
 }
 
