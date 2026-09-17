@@ -1,13 +1,19 @@
-// Small hand-rolled Markdown → HTML renderer (headers, bold/italic, inline code, hr,
+// Small hand-rolled Markdown → HTML renderer (headers, bold/italic, links, inline code, hr,
 // bullet/numbered lists, pipe tables). Escapes HTML first so raw content can never inject
 // markup — safe to render via dangerouslySetInnerHTML. Pair with the `zyra-prose` CSS class
 // (app/globals.css) for styling, and `break-words` on the container so long unbroken tokens
 // (URLs, ids) wrap instead of overflowing a fixed-width container.
+//
+// Bold/italic run before the link replacement (same order as the backend's own inline()
+// in integration-sync-document.builder.ts, which produces content_html from the identical
+// markdown) so a link whose visible text uses **bold**/*italic*/_italic_ nests correctly.
 function mdInline(s: string): string {
   return s
     .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>");
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/_(.+?)_/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
 
 function mdTable(lines: string[]): string {
@@ -22,7 +28,11 @@ function mdTable(lines: string[]): string {
 }
 
 export function renderMarkdown(text: string): string {
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Quotes matter here, not just `<`/`>`: the link replacement above interpolates its captured URL
+  // straight into a double-quoted href attribute, so an unescaped `"` in the source text (e.g.
+  // `[x](https://a" onmouseover=alert(1) x=")`) would close that attribute early and let whatever
+  // follows land as raw, executing HTML instead of stopping at the closing `)` the regex expects.
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   const lines = esc(text).split("\n");
   const out: string[] = [];
   let i = 0;

@@ -1119,3 +1119,279 @@ test.describe("bug external id (Bug Key fallback)", () => {
     await expect(page.getByText(bug.externalId, { exact: true })).toBeVisible();
   });
 });
+
+/*
+ * Edit Bug's Jira/Linear field. Before this, the field was a plain URL text box that showed the
+ * linked ticket's URL but always saved integrationIssueKey: null on Save — the ticket could never
+ * actually be changed from here. This reuses IssuePickerModal (already exercised for Jira/Linear
+ * multi-select in ui/executions.spec.ts) in a new "single" mode: pick a ticket and it replaces the
+ * one there instead of adding to it. The api/bugs.spec.ts "bug integration link" describe covers
+ * the PATCH semantics this depends on (same bug id, provider+key change together); this covers
+ * what the picker itself shows and does.
+ */
+test.describe("bug — editing the linked Jira/Linear ticket", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-39 the current Jira ticket is preselected, and picking a different one updates the same bug", async ({ page }) => {
+    const title = `E2E Bug Jira Reselect ${uniqueSuffix()}`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: {
+          title,
+          severity: "Medium",
+          integrationProvider: "JIRA",
+          integrationIssueKey: "KAN-9",
+          externalUrl: "https://e2e.atlassian.net/browse/KAN-9",
+        },
+      })
+    ).json();
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+    await page.route(`**/api/projects/${projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: {
+          list: [
+            { provider: "JIRA", key: "KAN-9", summary: "Original ticket", status: "Open", url: "https://e2e.atlassian.net/browse/KAN-9" },
+            { provider: "JIRA", key: "KAN-10", summary: "Replacement ticket", status: "Open", url: "https://e2e.atlassian.net/browse/KAN-10" },
+          ],
+        },
+      }),
+    );
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    // The currently linked ticket is shown without having to open the picker.
+    await expect(page.getByText("KAN-9", { exact: false })).toBeVisible();
+
+    await page.getByRole("button", { name: "Change issue" }).click();
+    await expect(page.getByRole("heading", { name: "Select Jira ticket" })).toBeVisible();
+    const picker = page.getByTestId("issue-picker");
+    // Selected by default, as a single-select radio row — not the multi-select checkbox flow.
+    await expect(picker.locator('input[type="radio"]:checked')).toHaveCount(1);
+    await picker.locator("label", { hasText: "Replacement ticket" }).click();
+    await picker.getByRole("button", { name: "Select" }).click();
+
+    await expect(page.getByText("KAN-10", { exact: false })).toBeVisible();
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    const afterSave = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(afterSave.id, "the same bug must be updated, not a new one").toBe(bug.id);
+    expect(afterSave.integrationIssueKey).toBe("KAN-10");
+    expect(afterSave.externalUrl).toBe("https://e2e.atlassian.net/browse/KAN-10");
+
+    // Reopening shows the new ticket as current; the old one is gone, not just unshown.
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("KAN-10", { exact: false })).toBeVisible();
+    await expect(page.getByText("KAN-9", { exact: true })).toHaveCount(0);
+  });
+
+  test("BUG-U-40 the same picker works for Linear tickets", async ({ page }) => {
+    const title = `E2E Bug Linear Reselect ${uniqueSuffix()}`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: {
+          title,
+          severity: "Medium",
+          integrationProvider: "LINEAR",
+          integrationIssueKey: "ENG-1",
+          externalUrl: "https://linear.app/e2e/issue/ENG-1",
+        },
+      })
+    ).json();
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: false } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/search-issues**`, (route) =>
+      route.fulfill({
+        json: {
+          list: [
+            { provider: "LINEAR", key: "ENG-1", summary: "Original linear ticket", status: "Todo", url: "https://linear.app/e2e/issue/ENG-1" },
+            { provider: "LINEAR", key: "ENG-2", summary: "Replacement linear ticket", status: "Todo", url: "https://linear.app/e2e/issue/ENG-2" },
+          ],
+        },
+      }),
+    );
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Change issue" }).click();
+    await expect(page.getByRole("heading", { name: "Select Linear ticket" })).toBeVisible();
+    const picker = page.getByTestId("issue-picker");
+    await picker.locator("label", { hasText: "Replacement linear ticket" }).click();
+    await picker.getByRole("button", { name: "Select" }).click();
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    const afterSave = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(afterSave.integrationIssueKey).toBe("ENG-2");
+    expect(afterSave.integrationProvider).toBe("LINEAR");
+  });
+
+  test("BUG-U-41 a bug with no ticket linked yet can have one selected for the first time via Edit", async ({ page }) => {
+    const title = `E2E Bug Jira First Link ${uniqueSuffix()}`;
+    const bug = await (await api.post(`/api/projects/${projectId}/bugs`, { data: { title, severity: "Medium" } })).json();
+    expect(bug.integrationIssueKey).toBeNull();
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+    await page.route(`**/api/projects/${projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: { list: [{ provider: "JIRA", key: "KAN-20", summary: "Fresh pick", status: "Open", url: "https://e2e.atlassian.net/browse/KAN-20" }] },
+      }),
+    );
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+    await page.getByRole("button", { name: "Jira", exact: true }).click();
+    await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Select issue" }).click();
+    const picker = page.getByTestId("issue-picker");
+    await picker.locator("label", { hasText: "Fresh pick" }).click();
+    await picker.getByRole("button", { name: "Select" }).click();
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    const afterSave = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(afterSave.integrationProvider).toBe("JIRA");
+    expect(afterSave.integrationIssueKey).toBe("KAN-20");
+  });
+
+  /*
+   * The bug found and fixed while wiring this up: switching the system button from Jira to Linear
+   * mid-edit left the previously-picked Jira issue in state, which would have saved a Jira key
+   * under integrationProvider: "LINEAR" and let it leak into the Linear picker's result list.
+   */
+  test("BUG-U-42 switching from Jira to Linear drops the previously selected Jira ticket", async ({ page }) => {
+    const title = `E2E Bug Provider Switch UI ${uniqueSuffix()}`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: {
+          title,
+          severity: "Medium",
+          integrationProvider: "JIRA",
+          integrationIssueKey: "KAN-30",
+          externalUrl: "https://e2e.atlassian.net/browse/KAN-30",
+        },
+      })
+    ).json();
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/search-issues**`, (route) =>
+      route.fulfill({
+        json: { list: [{ provider: "LINEAR", key: "ENG-30", summary: "Linear pick", status: "Todo", url: "https://linear.app/e2e/issue/ENG-30" }] },
+      }),
+    );
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    await expect(page.getByText("KAN-30", { exact: false })).toBeVisible();
+
+    await page.getByRole("button", { name: "Linear", exact: true }).click();
+    // The stale Jira key must not still be shown as "current" under Linear.
+    await expect(page.getByText("KAN-30", { exact: false })).toHaveCount(0);
+    await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
+
+    // Requirement: switching providers "requires selecting an issue from the new provider" — Save
+    // must refuse to persist integrationProvider: "LINEAR" with no key until one is picked.
+    await expect(page.getByText("Select a Linear ticket before saving.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+
+    await page.getByRole("button", { name: "Select issue" }).click();
+    const picker = page.getByTestId("issue-picker");
+    // The Jira ticket must not leak into the Linear picker's list either.
+    await expect(picker.getByText("KAN-30", { exact: false })).toHaveCount(0);
+    await picker.locator("label", { hasText: "Linear pick" }).click();
+    await picker.getByRole("button", { name: "Select" }).click();
+
+    // Picking a ticket from the new provider clears the block.
+    await expect(page.getByText("Select a Linear ticket before saving.", { exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
+
+    const afterSave = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    expect(afterSave.integrationProvider).toBe("LINEAR");
+    expect(afterSave.integrationIssueKey).toBe("ENG-30");
+  });
+
+  /*
+   * updateBug/createBug store integrationProvider verbatim, with no case normalization (unlike
+   * severity/priority, which have dedicated case-insensitive parsers on the backend) — so a bug
+   * whose provider was ever written in a case other than "JIRA"/"LINEAR" (an older client, a
+   * hand-crafted API call) still has to be detected as that provider on Edit, not fall through to
+   * "Other".
+   */
+  test("BUG-U-43 a Jira link stored in a different case is still detected as Jira, not Other", async ({ page }) => {
+    const title = `E2E Bug Provider Case ${uniqueSuffix()}`;
+    await api.post(`/api/projects/${projectId}/bugs`, {
+      data: {
+        title,
+        severity: "Medium",
+        integrationProvider: "jira",
+        integrationIssueKey: "KAN-40",
+        externalUrl: "https://e2e.atlassian.net/browse/KAN-40",
+      },
+    });
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+
+    // "Jira" reads as the selected system (highlighted like the other "primary"-variant selected
+    // buttons elsewhere on this page), not "Other" — and the current ticket is shown.
+    const jiraButton = page.getByRole("button", { name: "Jira", exact: true });
+    const otherButton = page.getByRole("button", { name: "Other", exact: true });
+    const jiraColor = await jiraButton.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const otherColor = await otherButton.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(jiraColor, "Jira must read as the selected system, not look identical to unselected Other").not.toBe(otherColor);
+
+    await expect(page.getByText("KAN-40", { exact: false })).toBeVisible();
+    await expect(page.getByText("Change issue", { exact: true })).toBeVisible();
+    // The plain URL box (what "Other" would show instead) must not be the field in play here.
+    await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
+  });
+});

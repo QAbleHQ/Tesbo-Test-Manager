@@ -266,7 +266,7 @@ test.describe("custom field definitions", () => {
       // "Title" or "externalId" would land on the exact same normalized header as the built-in
       // column — see RESERVED_TESTCASE_HEADERS. Blocked at the source rather than worked around
       // downstream in every place that generates a file.
-      for (const reserved of ["Title", "EXTERNALID", "Estimated Duration"]) {
+      for (const reserved of ["Title", "EXTERNALID", "Estimated Duration", "Expected Result"]) {
         const res = await post(asOwner, { name: reserved, fieldType: "text" });
         expect(res.status(), `creating a field named "${reserved}"`).toBe(400);
         expect((await res.json()).error).toContain("reserved");

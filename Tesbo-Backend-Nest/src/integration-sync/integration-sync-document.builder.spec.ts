@@ -87,6 +87,24 @@ describe("IntegrationSyncDocumentBuilder#buildMirror", () => {
     expect(html).toContain("&lt;img");
   });
 
+  // Regression: escapeHtml (integration-text.util.ts) escaped `&`/`<`/`>` but not `"`. inline()'s
+  // own link markup interpolates the captured URL straight into a double-quoted href attribute, so
+  // provider content containing an unescaped `"` right after a markdown-link-shaped substring —
+  // e.g. a ticket summary someone pasted straight from a browser address bar — could close that
+  // attribute early and leave a bare, executing attribute (onmouseover=...) sitting right after it
+  // in the HTML this builder hands to dangerouslySetInnerHTML (ZyraContextDrawer.tsx /
+  // TaskQuickViewPanel.tsx). No space before the closing `)`, so the link regex still matches and
+  // produces a real <a href> either way — it's the escaping, not a malformed link, that must stop this.
+  it('never lets a raw " in provider content break out of a rendered link\'s href attribute', () => {
+    const summary = 'See [details](https://example.com"onmouseover=alert(1))';
+    const { html } = builder.buildMirror(ticket({ summary }), [], null);
+    // Pre-fix, the unescaped quote closed href="..." early, leaving this exact bare, executing
+    // attribute sitting right after it.
+    expect(html).not.toContain('"onmouseover=');
+    // The quote is still there, just neutralised as the harmless entity rather than dropped.
+    expect(html).toContain("&quot;onmouseover=");
+  });
+
   it("keeps our own bold/link markdown as real markup in the HTML", () => {
     const { html } = builder.buildMirror(ticket(), [], null);
     expect(html).toContain("<strong>Status:</strong>");
