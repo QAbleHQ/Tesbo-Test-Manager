@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
   ServiceUnavailableException,
@@ -60,6 +62,9 @@ export class AuthService {
     const result = await this.password.verifyLogin(email, password);
     if (result.outcome === "not_found") {
       throw new UnauthorizedException({ error: "No account found with that email address" });
+    }
+    if (result.outcome === "locked") {
+      throw new HttpException({ error: this.lockedMessage(result.lockedUntil) }, HttpStatus.TOO_MANY_REQUESTS);
     }
     if (result.outcome === "invalid_password") {
       throw new UnauthorizedException({ error: "invalid_email_or_password" });
@@ -271,5 +276,18 @@ export class AuthService {
 
   private ip(req: AuthenticatedRequest): string {
     return req.ip ?? "";
+  }
+
+  /** "Too many failed login attempts. Try again in 23 hours 58 minutes." — always rounds the
+   *  remainder up to whole minutes, so a caller retrying right at the boundary never sees "0
+   *  minutes" and immediately fails again. */
+  private lockedMessage(lockedUntil: Date): string {
+    const minutesLeft = Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60_000));
+    const hours = Math.floor(minutesLeft / 60);
+    const minutes = minutesLeft % 60;
+    const parts: string[] = [];
+    if (hours > 0) parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+    if (minutes > 0 || hours === 0) parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+    return `Too many failed login attempts. Try again in ${parts.join(" ")}.`;
   }
 }
