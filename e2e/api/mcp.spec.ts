@@ -162,7 +162,13 @@ test.describe("MCP create_testcase normalizes step field synonyms", () => {
       createdId = created.id;
       expect(createdId).toBeTruthy();
 
-      function assertNormalized(steps: Array<{ stepNumber: number; action: string; expectedResult: string }>) {
+      // `rawSteps` is a JSON-encoded string, not an array — the test case editor's parseSteps()
+      // (testcases/page.tsx) only accepts a string for this field, so that's the corrected
+      // contract create_testcase's storage now matches (see "MCP create_testcase stores steps in
+      // the shape the test case editor can read" below for the regression this fixes).
+      function assertNormalized(rawSteps: unknown) {
+        expect(typeof rawSteps).toBe("string");
+        const steps = JSON.parse(rawSteps as string) as Array<{ stepNumber: number; action: string; expectedResult: string }>;
         expect(steps).toHaveLength(2);
         const [first, second] = steps;
         expect(first.action).toBe("Open the login page");
@@ -181,6 +187,108 @@ test.describe("MCP create_testcase normalizes step field synonyms", () => {
       const fetched = await request.get(`/api/projects/${ctx.projectId}/testcases/${createdId}`);
       expect(fetched.ok()).toBeTruthy();
       assertNormalized((await fetched.json()).steps);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      if (createdId) await deleteCase(request, createdId);
+      await mcpApi.dispose();
+    }
+  });
+});
+
+/*
+ * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test Cases" —
+ * a Zyra/MCP-generated test case saved fine, but its steps showed as one blank Action/Expected
+ * Result pair in the Test Case Repository.
+ *
+ * Root cause: the create/edit modal pre-stringifies `steps` into a JSON string before every save
+ * (testcases/page.tsx), and the shared row writers (insertTestCaseWithClient/
+ * updateTestCaseWithClient) unconditionally JSON.stringify whatever they're given — so the modal's
+ * already-a-string input gets encoded a second time, landing in the jsonb column as a JSON string
+ * scalar, which is exactly the one shape the modal's own parseSteps() knows how to read back. MCP's
+ * create_testcase instead handed over a real array (via safeSteps()), which got encoded only once
+ * and stored as a genuine jsonb array — a shape parseSteps() silently discards, substituting one
+ * blank step regardless of how many steps actually exist. Fixed by pre-stringifying steps once in
+ * create_testcase (mcp.tools.ts), matching what the modal already sends, without changing the modal,
+ * safeSteps' synonym normalization, or anything Zyra generates.
+ */
+test.describe("MCP create_testcase stores steps in the shape the test case editor can read", () => {
+  test("multiple steps — including quotes, backslashes and unicode — persist with the right count, order and content", async ({
+    request,
+  }) => {
+    const title = `E2E MCP Steps Shape ${Date.now()}`;
+    let tokenId: string | undefined;
+    let createdId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP Steps Shape token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      // Deliberately more than one step (the observed bug always collapsed to exactly one) and
+      // content that would break a naive re-encode: an apostrophe, a quote, a literal backslash,
+      // and non-ASCII text.
+      const steps = [
+        { stepNumber: 1, action: `Enter O'Brien's "test" value`, expectedResult: `Rejects with a literal backslash: C:\\temp` },
+        { stepNumber: 2, action: "Second step", expectedResult: "Second result" },
+        { stepNumber: 3, action: "Third step with unicode: héllo 世界", expectedResult: "Renders unchanged" },
+      ];
+      const created = await callMcpTool(mcpApi, token, "create_testcase", { title, steps });
+      createdId = created.id;
+      expect(createdId).toBeTruthy();
+
+      const fetched = await request.get(`/api/projects/${ctx.projectId}/testcases/${createdId}`);
+      expect(fetched.ok()).toBeTruthy();
+      const rawSteps = (await fetched.json()).steps;
+      // The exact contract the editor's parseSteps() requires: a string, not an array.
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual(steps);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      if (createdId) await deleteCase(request, createdId);
+      await mcpApi.dispose();
+    }
+  });
+
+  test("an empty steps array persists as an empty, editor-readable list, not the one-blank-step fallback", async ({
+    request,
+  }) => {
+    const title = `E2E MCP Steps Empty ${Date.now()}`;
+    let tokenId: string | undefined;
+    let createdId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP Steps Empty token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      const created = await callMcpTool(mcpApi, token, "create_testcase", { title, steps: [] });
+      createdId = created.id;
+      expect(createdId).toBeTruthy();
+
+      const fetched = await request.get(`/api/projects/${ctx.projectId}/testcases/${createdId}`);
+      const rawSteps = (await fetched.json()).steps;
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual([]);
     } finally {
       if (tokenId) {
         await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });

@@ -125,11 +125,15 @@ test.describe("attachments", () => {
   }
 
   /** Every attachment row in this workspace, newest last. */
+  // Hard-delete remediation Phase 5: attachments are now soft-deleted (V115), so a deleted row
+  // still physically exists — every caller of this helper wants "currently live/visible", the same
+  // thing "exists at all" used to mean before the fix, hence the added deleted_at filter rather
+  // than a rewrite of every call site.
   function attachmentRows(t: RbacTenant): { id: string; fileSize: number; storagePath: string }[] {
     const raw = scalar(
       `SELECT COALESCE(string_agg(a.id || '|' || a.file_size || '|' || COALESCE(a.storage_path, ''), E'\\n' ORDER BY a.created_at), '') ` +
         `FROM attachments a JOIN projects p ON p.id = a.project_id ` +
-        `WHERE p.organization_id = ${literal(t.organizationId)};`,
+        `WHERE p.organization_id = ${literal(t.organizationId)} AND a.deleted_at IS NULL;`,
     );
     if (!raw) return [];
     return raw.split("\n").map((line) => {
@@ -206,6 +210,27 @@ test.describe("attachments", () => {
       { failOnStatusCode: false },
     );
     expect(gone.status()).toBe(404);
+  });
+
+  // Hard-delete remediation Phase 5 (Q-AT: "soft-delete the row anyway, metadata-only" — the bytes
+  // are already gone from storage by the time this runs, so this is an audit trail, not a restore
+  // path). DB-level proof, not just the API's 404 above: the row must still physically exist.
+  test("deleting an attachment soft-deletes the row — it is not physically removed", async () => {
+    const file = textFile(`soft-delete-proof-${Date.now()}.txt`, "kept as history, not recovered");
+    expect((await upload(asQa, bugUploadUrl(), [file])).ok()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+
+    expect((await asOwner.delete(`/api/bugs/attachments/${row.id}`)).ok()).toBeTruthy();
+
+    // attachmentRows() itself filters deleted_at IS NULL (see its own comment), so it correctly
+    // reports zero live rows now — the raw query below is what proves the row is soft-deleted, not
+    // gone.
+    expect(attachmentRows(tenant!)).toHaveLength(0);
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM attachments WHERE id = ${literal(row.id)};`)).toBe("t");
+    expect(scalar(`SELECT COUNT(*)::text FROM attachments WHERE id = ${literal(row.id)};`)).toBe("1");
+    // Deleting again must 404 (already gone from every read path), never a raw driver error from
+    // hitting an already-null deleted_at a second time.
+    expect((await asOwner.delete(`/api/bugs/attachments/${row.id}`, { failOnStatusCode: false })).status()).toBe(404);
   });
 
   test("several files upload in one request", { tag: '@tesbo.testId("TES-TC-1")' }, async () => {

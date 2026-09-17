@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
+import { literal, scalar } from "../utils/psql";
 
 /*
  * Automation ingest -- Basecamp 10189985971, slices 1 and 2.
@@ -1245,6 +1246,232 @@ test.describe("automation ingest - evidence", () => {
       }
     } finally {
       await cleanup(api, [run.runId], cases.map((c) => c.id));
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation, Phase 1 ("Zyra Workflow Agents/hard-delete-remediation-progress-log.md")
+ * folded automation.service.ts's requireRun and attachCases into the same phase as the ordinary
+ * cycles/executions read paths, specifically so the CI ingest path would not keep reporting
+ * against -- or silently no-op'ing into -- a run a person had just deleted through the product UI.
+ * Before migrations/V111_cycles_soft_delete.sql, deleting the underlying cycle (DELETE FROM cycles)
+ * made these routes 404 for the mechanical reason that the row was gone; now the row survives
+ * soft-deleted, so requireRun was given its own `AND deleted_at IS NULL` and attachCases' insert
+ * gained an EXISTS guard on the same predicate.
+ *
+ * Follow-up, migrations/V112_cycles_external_id_partial_index.sql: Phase 1 left createRun's
+ * externalId-reuse lookups (and idx_cycles_project_external_id itself) unfiltered on deleted_at,
+ * so a CI shard resubmitting the same externalId after the run was deleted resolved back to the
+ * dead row and got a "reused" response it could never actually attach a case to (casesAttached
+ * always 0) -- a working run for that externalId became permanently unobtainable. V112 makes the
+ * index partial on deleted_at IS NULL too, and the reuse lookups (and runSummary) now filter it,
+ * so the same resubmit opens a genuine new run instead. AUT-71 below was updated to pin this new
+ * behaviour rather than the old "still 0" one.
+ */
+test.describe("automation ingest - soft-deleted run (hard-delete remediation Phase 1)", () => {
+  test("AUT-70 get/results/close on a soft-deleted run's automation surface are all 404, not a stale success", async ({
+    request: api,
+  }) => {
+    const cases = await seedCases(api, 1, "soft-deleted");
+    const runIds: string[] = [];
+    try {
+      const run = await (
+        await createRun(api, { name: `E2E Automation SoftDel ${Date.now()}`, caseIds: [cases[0].externalId] })
+      ).json();
+      runIds.push(run.runId);
+
+      // Deleted the ordinary way -- the product's own DELETE /api/cycles/:id, not a raw SQL fixture.
+      const deleteRes = await api.delete(`/api/cycles/${run.runId}`, { failOnStatusCode: false });
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(run.runId)};`)).toBe("t");
+
+      const getRes = await api.get(`${automationBase(ctxA.projectId)}/runs/${run.runId}`, { failOnStatusCode: false });
+      expect(getRes.status(), "a soft-deleted run must not still be readable through the automation surface").toBe(404);
+
+      const postedRes = await postResult(api, run.runId, { caseId: cases[0].externalId, status: "pass" });
+      expect(postedRes.status(), "a CI shard reporting against a deleted run must be refused, not silently recorded").toBe(404);
+
+      const closeRes = await api.patch(`${automationBase(ctxA.projectId)}/runs/${run.runId}/close`, {
+        data: { status: "completed" },
+        failOnStatusCode: false,
+      });
+      expect(closeRes.status()).toBe(404);
+
+      // And nothing was written by the refused result post.
+      expect(
+        scalar(`SELECT COUNT(*) FROM executions e JOIN cycle_items ci ON ci.id = e.cycle_item_id
+                 WHERE ci.cycle_id = ${literal(run.runId)} AND e.status = 'Passed';`),
+      ).toBe("0");
+    } finally {
+      await cleanup(api, runIds, cases.map((c) => c.id));
+    }
+  });
+
+  test("AUT-71 resubmitting a soft-deleted run's externalId opens a genuine new run and attaches cases to it, leaving the dead run's history untouched", async ({
+    request: api,
+  }) => {
+    /*
+     * Used to pin the opposite: that createRun's externalId-reuse lookup resolving back to a
+     * soft-deleted row was harmless because attachCases' EXISTS guard blocked the write, leaving
+     * casesAttached stuck at 0 forever for that externalId. That was a real gap, not a safe
+     * fallback -- a CI shard had no way to ever get a *working* run for that externalId again.
+     * migrations/V112_cycles_external_id_partial_index.sql plus the matching `AND deleted_at IS
+     * NULL` on both createRun lookup sites close it: idx_cycles_project_external_id no longer
+     * counts a soft-deleted row, so a resubmit after the delete inserts a fresh cycle instead of
+     * colliding with (or resolving back to) the dead one. This test now proves the full round
+     * trip that replaces the old pin: create -> delete -> resubmit same externalId -> a genuinely
+     * new run -> attachCases succeeds against it -> the old dead run's own history is untouched.
+     */
+    const externalId = `e2e-softdel-reuse-${Date.now()}`;
+    const casesA = await seedCases(api, 1, "reuse-a");
+    const casesB = await seedCases(api, 1, "reuse-b");
+    const runIds: string[] = [];
+    try {
+      const first = await createRun(api, {
+        name: `E2E Automation Reuse A ${Date.now()}`,
+        externalId,
+        caseIds: [casesA[0].externalId],
+      });
+      expect(first.status(), await first.text()).toBe(201);
+      const runA = await first.json();
+      runIds.push(runA.runId);
+      expect(runA.casesAttached).toBe(1);
+
+      const deleteRes = await api.delete(`/api/cycles/${runA.runId}`, { failOnStatusCode: false });
+      expect(deleteRes.ok()).toBeTruthy();
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(runA.runId)};`)).toBe("t");
+
+      // A second shard reports the same externalId after the run was deleted. The reuse lookup no
+      // longer resolves back to the dead row -- it filters deleted_at itself now -- so this falls
+      // through to a fresh INSERT, which the now-partial unique index lets succeed.
+      const second = await createRun(api, {
+        name: `E2E Automation Reuse B ${Date.now()}`,
+        externalId,
+        caseIds: [casesB[0].externalId],
+      });
+      expect(second.status(), await second.text()).toBe(201);
+      const runB = await second.json();
+      runIds.push(runB.runId);
+
+      expect(runB.runId, "resubmitting a deleted run's externalId must open a new runId, not the dead one").not.toBe(
+        runA.runId,
+      );
+      expect(runB.reused, "this is a fresh create, not a reuse of an existing live run").toBe(false);
+      expect(runB.externalId).toBe(externalId);
+      expect(
+        runB.casesAttached,
+        "attachCases must succeed against the new run, not report 0 the way it did against the dead one",
+      ).toBe(1);
+
+      // The new run's case really landed in cycle_items, not just in the response body.
+      expect(
+        scalar(
+          `SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(runB.runId)} AND testcase_id = ${literal(casesB[0].id)} AND deleted_at IS NULL;`,
+        ),
+      ).toBe("1");
+
+      // The old dead run's own history is untouched: its cycle_item for casesA still exists,
+      // still carries its own cycle_id, is still soft-deleted (cascaded by the delete above, not
+      // by this resubmit), and never gained casesB's row.
+      expect(
+        scalar(
+          `SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(runA.runId)} AND testcase_id = ${literal(casesA[0].id)} AND deleted_at IS NOT NULL;`,
+        ),
+        "the original run's cycle_item survives, soft-deleted, as history",
+      ).toBe("1");
+      expect(
+        scalar(
+          `SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(runA.runId)} AND testcase_id = ${literal(casesB[0].id)};`,
+        ),
+        "the new case must not have been attached to the soft-deleted run",
+      ).toBe("0");
+    } finally {
+      await cleanup(api, runIds, [...casesA, ...casesB].map((c) => c.id));
+    }
+  });
+
+  test("AUT-72 create -> delete cycle -> resubmit externalId -> new run -> attach succeeds: full round trip, direct DB proof at every step", async ({
+    request: api,
+  }) => {
+    /*
+     * AUT-71 above already exercises this round trip through the API and pins the same outcomes.
+     * This test is the direct-DB-proof companion Yuvraj asked for as a belt-and-suspenders
+     * regression: rather than reading the round trip back through createRun's own JSON response
+     * (which is exactly the code under test), it re-derives every fact independently from
+     * `cycles`/`cycle_items`/`executions`, so a bug that happened to make the response body lie
+     * (e.g. a stale in-memory object returned instead of what was actually written) would still be
+     * caught here.
+     */
+    const externalId = `e2e-softdel-roundtrip-${Date.now()}`;
+    const casesA = await seedCases(api, 1, "roundtrip-a");
+    const casesB = await seedCases(api, 1, "roundtrip-b");
+    const runIds: string[] = [];
+    try {
+      // 1. Create run A with externalId, case A attached.
+      const created = await createRun(api, {
+        name: `E2E Automation Roundtrip A ${Date.now()}`,
+        externalId,
+        caseIds: [casesA[0].externalId],
+      });
+      expect(created.status(), await created.text()).toBe(201);
+      const runA = await created.json();
+      runIds.push(runA.runId);
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycles WHERE id = ${literal(runA.runId)} AND external_id = ${literal(externalId)} AND deleted_at IS NULL;`),
+      ).toBe("1");
+
+      // 2. Delete its cycle through the ordinary product route.
+      const deleteRes = await api.delete(`/api/cycles/${runA.runId}`, { failOnStatusCode: false });
+      expect(deleteRes.ok(), `deleting run A — ${await deleteRes.text()}`).toBeTruthy();
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(runA.runId)};`)).toBe("t");
+
+      // 3. Resubmit the same externalId.
+      const resubmitted = await createRun(api, {
+        name: `E2E Automation Roundtrip B ${Date.now()}`,
+        externalId,
+        caseIds: [casesB[0].externalId],
+      });
+      expect(resubmitted.status(), await resubmitted.text()).toBe(201);
+      const runB = await resubmitted.json();
+      runIds.push(runB.runId);
+
+      // 4. A new run really was created: a distinct row, live, sharing the externalId with the
+      // now-dead run A -- which is only possible because the unique index is partial on
+      // deleted_at IS NULL (V112). Before that migration this INSERT would have violated it.
+      expect(runB.runId).not.toBe(runA.runId);
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycles WHERE id = ${literal(runB.runId)} AND external_id = ${literal(externalId)} AND deleted_at IS NULL;`),
+      ).toBe("1");
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycles WHERE project_id = ${literal(ctxA.projectId)} AND external_id = ${literal(externalId)};`),
+        "both the dead run and the new one carry the same externalId -- exactly what the partial index now allows",
+      ).toBe("2");
+
+      // 5. attach succeeds against the new run: case B is really in cycle_items/executions under
+      // runB, live.
+      expect(
+        scalar(
+          `SELECT COUNT(*) FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
+           WHERE ci.cycle_id = ${literal(runB.runId)} AND ci.testcase_id = ${literal(casesB[0].id)}
+             AND ci.deleted_at IS NULL AND e.deleted_at IS NULL;`,
+        ),
+        "case B must be attached to the new run with a live execution opened for it",
+      ).toBe("1");
+
+      // 6. The old dead run's data is untouched: case A's cycle_item still belongs to run A only,
+      // soft-deleted alongside its parent, never moved and never joined by case B.
+      expect(
+        scalar(
+          `SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(runA.runId)} AND testcase_id = ${literal(casesA[0].id)} AND deleted_at IS NOT NULL;`,
+        ),
+      ).toBe("1");
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(runA.runId)};`),
+        "run A's cycle_items are exactly what it started with -- nothing added by the resubmit",
+      ).toBe("1");
+    } finally {
+      await cleanup(api, runIds, [...casesA, ...casesB].map((c) => c.id));
     }
   });
 });

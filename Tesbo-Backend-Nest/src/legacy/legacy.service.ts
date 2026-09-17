@@ -46,6 +46,13 @@ interface ZyraSaveEntryContext {
   linearIssueKey: string | null;
   linearUrl: string | null;
   existingLinked: { rows: Body[] };
+  // Every suite id a create-type entry in this save could target (batchSuiteId, and each draft's
+  // own per-entry suiteId), re-validated live under this same transaction — see zyraSaveAttempt's
+  // Q11 handling. A suite resolved once, at generation/staging time, can sit unsaved for hours (a
+  // chat-staged create batch, or a Task-board batch) and be soft-deleted out from under it before
+  // Save; an id absent from this set is treated as gone and the entry falls back to unassigned
+  // rather than failing the batch.
+  validSuiteIds: Set<string>;
 }
 
 /** The four buckets V67's bugs_severity_check allows, and the four the dashboard reports. */
@@ -1345,7 +1352,7 @@ export class LegacyService implements OnModuleInit {
   // self-heals instead of stalling silently.
   private async resumeInterruptedZyraChatPlans(): Promise<void> {
     const res = await this.db.query(
-      "SELECT id, project_id, user_id, active_plan FROM zyra_chat_sessions WHERE active_plan IS NOT NULL AND active_plan->>'status' = 'running'"
+      "SELECT id, project_id, user_id, active_plan FROM zyra_chat_sessions WHERE deleted_at IS NULL AND active_plan IS NOT NULL AND active_plan->>'status' = 'running'"
     ).catch(() => ({ rows: [] as Body[] }));
     for (const row of res.rows) {
       const plan = row.active_plan as Body | null;
@@ -2509,7 +2516,7 @@ export class LegacyService implements OnModuleInit {
         [ids]
       ),
       this.db.query<{ project_id: string; count: number }>(
-        `SELECT project_id, COUNT(*)::int AS count FROM suites WHERE project_id = ANY($1::uuid[]) GROUP BY project_id`,
+        `SELECT project_id, COUNT(*)::int AS count FROM suites WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL GROUP BY project_id`,
         [ids]
       ),
       this.db.query<{ project_id: string; user_id: string; name: string }>(
@@ -2534,9 +2541,9 @@ export class LegacyService implements OnModuleInit {
       }>(
         `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
            FROM cycles c
-           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
            LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-          WHERE c.project_id = ANY($1::uuid[])
+          WHERE c.project_id = ANY($1::uuid[]) AND c.deleted_at IS NULL
           GROUP BY c.id
          HAVING COUNT(e.id) FILTER (WHERE e.status NOT IN ('Untested', 'Retest')) > 0
           ORDER BY c.project_id, c.created_at DESC`,
@@ -2546,20 +2553,24 @@ export class LegacyService implements OnModuleInit {
       // query there additionally drops a testcase_* row when a zyra_* sibling exists within five
       // seconds; that sibling is itself in this union, so the presence of activity is identical and
       // only the timestamp can differ, by less than the five seconds that rule spans.
+      // cycles rows are filtered to deleted_at IS NULL here (unlike listActivity's own union, which
+      // deliberately keeps a deleted cycle's history visible) because this is a "what's currently
+      // going on" rollup, not an audit trail — a soft-deleted run's stale created_at/updated_at
+      // should not keep a project reading as "active" forever (hard-delete remediation Phase 2).
       this.db.query<{ project_id: string; last_activity_at: string }>(
         `SELECT project_id, MAX(created_at) AS last_activity_at FROM (
-           SELECT project_id, created_at FROM suites WHERE project_id = ANY($1::uuid[])
+           SELECT project_id, created_at FROM suites WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM suites
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM plans WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM plans WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM plans
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM cycles WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM cycles WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM cycles
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM bugs WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM bugs WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM bugs
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
            UNION ALL SELECT project_id, created_at FROM audit_logs WHERE project_id = ANY($1::uuid[])
          ) events GROUP BY project_id`,
         [ids]
@@ -2923,7 +2934,10 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(suiteId)) throw new NotFoundException({ error: "Suite not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM suites WHERE id = $1", [suiteId]);
+    const res = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM suites WHERE id = $1 AND deleted_at IS NULL",
+      [suiteId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Suite not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -2960,11 +2974,11 @@ export class LegacyService implements OnModuleInit {
   private async listSuitesUncached(projectId: string) {
     const res = await this.db.query(
       `WITH RECURSIVE descendants AS (
-         SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1
+         SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1 AND deleted_at IS NULL
          UNION ALL
          SELECT d.root_id, s.id, d.path || s.id
          FROM suites s JOIN descendants d ON s.parent_id = d.node_id
-         WHERE s.project_id = $1 AND NOT s.id = ANY(d.path)
+         WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(d.path)
        ),
        recursive_counts AS (
          SELECT d.root_id, COUNT(t.id)::int AS recursive_test_case_count
@@ -2980,7 +2994,7 @@ export class LegacyService implements OnModuleInit {
               )::int AS recursive_test_case_count
        FROM suites s
        LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
-       WHERE s.project_id = $1
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id
        ORDER BY s.position, s.name`,
       [projectId]
@@ -3000,13 +3014,29 @@ export class LegacyService implements OnModuleInit {
    * token is bound to one project, see McpService), the Zyra chat flow, and CSV import — all of which
    * authorized before they got here. Route traffic goes through createSuiteForUser.
    */
+  // Once suites were soft-deleted (V110) this stopped being enforced by the database: a parentId
+  // pointing at a soft-deleted (or another project's) suite used to raise a loud FK violation on
+  // insert; the row still existing now means the FK is satisfied and the write silently succeeds.
+  // listSuitesUncached only ever returns live suites, and the frontend's tree builder buckets a
+  // suite as either a root (no parentId) or a child listed under its parent (map keyed by
+  // parentId) — a suite whose parent is absent from that list is neither, and renders nowhere, for
+  // every user, permanently, with no path through the product to notice or recover it. Checked
+  // explicitly here rather than left to the FK, which can no longer catch it.
+  private async requireLiveSuiteInProject(projectId: string, suiteId: string): Promise<void> {
+    if (!isUuid(suiteId)) throw new BadRequestException({ error: "parentId is not a valid suite id" });
+    const res = await this.db.query("SELECT id FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [suiteId, projectId]);
+    if (!res.rows[0]) throw new BadRequestException({ error: "parentId does not reference a suite in this project" });
+  }
+
   async createSuite(projectId: string, body: Body) {
     const name = String(body.name || "").trim();
     if (!name) throw new BadRequestException({ error: "name is required" });
     validateBoundedField(name, "Suite name", SUITE_NAME_MAX_LENGTH);
+    const parentId = body.parentId || null;
+    if (parentId) await this.requireLiveSuiteInProject(projectId, parentId);
     const res = await this.db.query(
       "INSERT INTO suites (project_id, parent_id, name, position) VALUES ($1, $2, $3, $4) RETURNING id, parent_id, name, position, created_at",
-      [projectId, body.parentId || null, name, Number(body.position || 0)]
+      [projectId, parentId, name, Number(body.position || 0)]
     );
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
@@ -3016,19 +3046,101 @@ export class LegacyService implements OnModuleInit {
   async updateSuite(userId: string | null | undefined, suiteId: string, body: Body) {
     const projectId = await this.requireSuiteAccess(userId, suiteId);
     validateBoundedField(body.name, "Suite name", SUITE_NAME_MAX_LENGTH);
+    const parentId = body.parentId ?? null;
+    if (parentId) await this.requireLiveSuiteInProject(projectId, parentId);
     await this.db.query(
       "UPDATE suites SET name = COALESCE($2, name), parent_id = $3, position = COALESCE($4, position), updated_at = now() WHERE id = $1",
-      [suiteId, body.name ?? null, body.parentId ?? null, body.position ?? null]
+      [suiteId, body.name ?? null, parentId, body.position ?? null]
     );
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
   }
 
+  /**
+   * Soft-deletes a suite and its whole descendant subtree, instead of the hard `DELETE`s this used
+   * to issue (see migrations/V110_suites_soft_delete.sql and the Zyra context integrity progress
+   * log's Phase 3/4 inspection for the full audit). `suites.parent_id` used to be `ON DELETE
+   * CASCADE`, so the old unconditional `DELETE FROM suites WHERE id = $1` silently destroyed every
+   * descendant suite, and — via the further cascade off `testcases` — every version/execution/
+   * custom-field/etc. row belonging to a testcase anywhere in that subtree. None of that is a real
+   * `DELETE` any more: the subtree is walked explicitly (the same recursive-CTE shape already used
+   * by listSuitesUncached/listTestCasesUncached) and both halves become `UPDATE`s.
+   *
+   * Subtree-wide by design, in both modes — matching what the FK cascade actually did for free
+   * before this rewrite, not the one-line literal SQL this replaces (which only ever touched the
+   * named suite's *direct* testcases). A narrower, direct-children-only port would leave every
+   * descendant suite's testcases pointing at a suite_id that just went invisible (soft-deleted,
+   * filtered out of every list) — an active testcase with a ghost suite, unreachable from the tree
+   * and not shown as "Unassigned" either. See Q9 in the progress log.
+   *
+   * mode: "deleteTestcases" soft-deletes every testcase anywhere in the subtree via the exact
+   * `deleted_at = now()` idiom deleteTestCase/bulkDeleteTestCases already use — which is what makes
+   * this free: V63's BEFORE UPDATE trigger fires on this statement shape already, writing a
+   * `change_type='delete'` version row for every affected testcase, so none of
+   * testcase_versions/cycle_items→executions/plan_items/custom_field_values/bug_links/
+   * testcase_embeddings/automation_sessions/automation_scripts get touched at all — nothing is
+   * being DELETEd any more, so nothing cascades away.
+   * mode: "moveToDefault" unassigns every testcase anywhere in the subtree (suite_id = NULL) —
+   * they survive, just with no suite, matching what "move to default" has always meant, made
+   * subtree-wide instead of relying on the FK to do it by accident.
+   * Both modes then soft-delete every suite in the subtree, the named one and every descendant,
+   * in the same statement.
+   */
   async deleteSuite(userId: string | null | undefined, suiteId: string, mode = "moveToDefault") {
+    const uid = this.requireUser(userId);
     const projectId = await this.requireSuiteAccess(userId, suiteId);
-    if (mode === "deleteTestcases") await this.db.query("DELETE FROM testcases WHERE suite_id = $1", [suiteId]);
-    else await this.db.query("UPDATE testcases SET suite_id = NULL WHERE suite_id = $1", [suiteId]);
-    await this.db.query("DELETE FROM suites WHERE id = $1", [suiteId]);
+    await this.db.transaction(async (client) => {
+      // Per-project advisory lock, taken first, before anything is read — serializes deleteSuite
+      // against itself for a given project (two overlapping-subtree deletes simply queue instead of
+      // one reading a subtree the other is mid-mutating). Distinct key namespace from the existing
+      // `testcase-external-id:${projectId}` lock so the two never contend over unrelated work.
+      //
+      // Deliberately narrow (Q12): NOT taken by createSuite/updateSuite(reparent)/resolveImportSuites,
+      // so a suite created as a child of this subtree in the small window between this lock being
+      // acquired and the subtree being soft-deleted is a real, accepted race — the new suite's
+      // parent_id would point at a suite that is about to disappear from every list. This is bounded
+      // to the same class of "acted on stale data" race this codebase already tolerates elsewhere
+      // (nothing today stops createSuite racing a concurrent updateSuite re-parent either), and is a
+      // documented, known gap per Q12's resolution, not an oversight.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`suite-tree:${projectId}`]);
+
+      const subtree = await client.query<{ id: string }>(
+        `WITH RECURSIVE subtree AS (
+           SELECT id, ARRAY[id] AS path FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
+           UNION ALL
+           SELECT s.id, sub.path || s.id
+           FROM suites s JOIN subtree sub ON s.parent_id = sub.id
+           WHERE s.project_id = $2 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
+         )
+         SELECT id FROM subtree`,
+        [suiteId, projectId]
+      );
+      const subtreeIds = subtree.rows.map((row) => row.id);
+      // Only reachable via a race: requireSuiteAccess above already confirmed this suite was active,
+      // a moment before this transaction's advisory lock was granted. A concurrent deleteSuite on the
+      // same suite (or an ancestor) that committed in between makes this re-check under the lock come
+      // up empty — treated as "not found" for the same reason an already-soft-deleted suite is,
+      // rather than proceeding to update zero rows and reporting success.
+      if (!subtreeIds.length) throw new NotFoundException({ error: "Suite not found" });
+
+      if (mode === "deleteTestcases") {
+        await client.query(
+          `UPDATE testcases SET deleted_at = now(), deleted_by = $2, updated_by = $2, updated_at = now()
+           WHERE suite_id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+          [subtreeIds, uid]
+        );
+      } else {
+        await client.query(
+          `UPDATE testcases SET suite_id = NULL, updated_at = now()
+           WHERE suite_id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+          [subtreeIds]
+        );
+      }
+      await client.query(
+        "UPDATE suites SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [subtreeIds, uid]
+      );
+    });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
   }
@@ -3144,11 +3256,11 @@ export class LegacyService implements OnModuleInit {
     if (wantsSubtree) {
       values.push(suiteFilter);
       suiteSubtreeCteSql = `WITH RECURSIVE suite_subtree AS (
-         SELECT id, ARRAY[id] AS path FROM suites WHERE id = $${values.length} AND project_id = $1
+         SELECT id, ARRAY[id] AS path FROM suites WHERE id = $${values.length} AND project_id = $1 AND deleted_at IS NULL
          UNION ALL
          SELECT s.id, sub.path || s.id
          FROM suites s JOIN suite_subtree sub ON s.parent_id = sub.id
-         WHERE s.project_id = $1 AND NOT s.id = ANY(sub.path)
+         WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
        ) `;
       filters.push("suite_id IN (SELECT id FROM suite_subtree)");
     }
@@ -3273,7 +3385,7 @@ export class LegacyService implements OnModuleInit {
               COALESCE(t.type, '') AS type, COALESCE(t.status, '') AS status,
               COALESCE(s.name, '') AS suite, COALESCE(t.component, '') AS component
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
        -- Export keeps its documented "most recently updated first" contract (pinned by
        -- api/import-export.spec.ts "orders rows by most recently updated"); only the repository LIST
@@ -3300,8 +3412,12 @@ export class LegacyService implements OnModuleInit {
     }
 
     return res.rows.map((row) => {
-      const steps = normalizeJsonArray(row.steps)
-        .map((step) => {
+      // safeSteps(), not normalizeJsonArray(): `row.steps` can be either a genuine jsonb array or a
+      // JSON-encoded string (the shape the create/edit modal, and now Zyra/MCP, actually persist —
+      // see "[Zyra] Test Steps... Missing After Saving Generated Test Cases"), and
+      // normalizeJsonArray silently emptied the latter instead of parsing it.
+      const steps = this.safeSteps(row.steps)
+        .map((step: any) => {
           if (typeof step === "string") return step;
           return [step.action || step.step || step.description, step.expectedResult || step.expected]
             .filter(Boolean)
@@ -3801,7 +3917,7 @@ export class LegacyService implements OnModuleInit {
     if (body?.defaultSuiteId) {
       const candidate = String(body.defaultSuiteId);
       const owned = isUuid(candidate)
-        ? await this.db.query("SELECT 1 FROM suites WHERE id = $1 AND project_id = $2", [candidate, projectId])
+        ? await this.db.query("SELECT 1 FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [candidate, projectId])
         : { rows: [] };
       if (!owned.rows[0]) throw new BadRequestException({ error: "defaultSuiteId is not a suite in this project" });
       defaultSuiteId = candidate;
@@ -3819,7 +3935,7 @@ export class LegacyService implements OnModuleInit {
     const titlesInFile = new Set<string>();
 
     const suiteRows = await this.db.query<{ id: string; parent_id: string | null; name: string }>(
-      "SELECT id, parent_id, name FROM suites WHERE project_id = $1",
+      "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND deleted_at IS NULL",
       [projectId]
     );
     const suiteIdByKey = new Map(suiteRows.rows.map((row) => [importSuiteKey(row.name, row.parent_id), row.id]));
@@ -4064,8 +4180,8 @@ export class LegacyService implements OnModuleInit {
     if (missingTop.size) {
       const rescan = await client.query<{ id: string; name: string }>(
         ctx.defaultSuiteId
-          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2"
-          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL",
+          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2 AND deleted_at IS NULL"
+          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL AND deleted_at IS NULL",
         ctx.defaultSuiteId ? [ctx.projectId, ctx.defaultSuiteId] : [ctx.projectId]
       );
       for (const row of rescan.rows) {
@@ -4099,7 +4215,7 @@ export class LegacyService implements OnModuleInit {
     if (missingChild.size) {
       const parentIds = Array.from(new Set(Array.from(missingChild.values(), (v) => v.parent_id)));
       const rescan = await client.query<{ id: string; parent_id: string; name: string }>(
-        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[])",
+        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[]) AND deleted_at IS NULL",
         [ctx.projectId, parentIds]
       );
       for (const row of rescan.rows) {
@@ -4584,7 +4700,7 @@ export class LegacyService implements OnModuleInit {
   private async requirePlanAccess(userId: string | null | undefined, planId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(planId)) throw new NotFoundException({ error: "Plan not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM plans WHERE id = $1", [planId]);
+    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM plans WHERE id = $1 AND deleted_at IS NULL", [planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -4600,7 +4716,7 @@ export class LegacyService implements OnModuleInit {
   private async requirePlanItemAccess(userId: string | null | undefined, planId: string, itemId: string) {
     await this.requirePlanAccess(userId, planId);
     if (!isUuid(itemId)) throw new NotFoundException({ error: "Plan item not found" });
-    const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2", [itemId, planId]);
+    const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2 AND deleted_at IS NULL", [itemId, planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan item not found" });
   }
 
@@ -4688,6 +4804,7 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN (
          SELECT plan_id, COUNT(*)::int AS case_count
          FROM plan_items
+         WHERE deleted_at IS NULL
          GROUP BY plan_id
        ) pi ON pi.plan_id = p.id
        LEFT JOIN (
@@ -4699,12 +4816,12 @@ export class LegacyService implements OnModuleInit {
                 COUNT(e.id) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
                 MAX(COALESCE(c.started_at, c.created_at)) AS last_run_at
          FROM cycles c
-         LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+         LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
          LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-         WHERE c.plan_id IS NOT NULL
+         WHERE c.plan_id IS NOT NULL AND c.deleted_at IS NULL
          GROUP BY c.plan_id
        ) runs ON runs.plan_id = p.id
-       WHERE p.project_id = $1
+       WHERE p.project_id = $1 AND p.deleted_at IS NULL
        ORDER BY p.created_at DESC`,
       [projectId]
     );
@@ -4740,8 +4857,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async deletePlan(userId: string | null | undefined, planId: string) {
+    const uid = this.requireUser(userId);
     await this.requirePlanAccess(userId, planId);
-    await this.db.query("DELETE FROM plans WHERE id = $1", [planId]);
+    await this.db.transaction(async (client) => {
+      await client.query("UPDATE plan_items SET deleted_at = now(), deleted_by = $2 WHERE plan_id = $1 AND deleted_at IS NULL", [planId, uid]);
+      await client.query("UPDATE plans SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [planId, uid]);
+    });
   }
 
   async planItems(userId: string | null | undefined, planId: string) {
@@ -4753,7 +4874,14 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT pi.*,
               t.external_id AS tc_external_id, t.title AS tc_title, t.priority AS tc_priority,
-              s.name AS suite_name,
+              -- A plan item's suite_id is a snapshot of what the plan targeted when it was built, not
+              -- a live reference (there is no equivalent of testcases.suite_id here that gets kept in
+              -- sync) — so unlike every live-listing site, this one deliberately does NOT filter out
+              -- a soft-deleted suite. It's the same "history, not current state" category audit_logs
+              -- already is: the name is preserved, with an explicit "(deleted)" marker rather than
+              -- silently going stale or blanking to null (Q10 in the Zyra context integrity progress
+              -- log's Phase 3/4 decisions).
+              (CASE WHEN s.id IS NOT NULL AND s.deleted_at IS NOT NULL THEN s.name || ' (deleted)' ELSE s.name END) AS suite_name,
               lastex.status AS last_status
        FROM plan_items pi
        LEFT JOIN testcases t ON t.id = pi.testcase_id
@@ -4767,7 +4895,7 @@ export class LegacyService implements OnModuleInit {
          ORDER BY e.executed_at DESC NULLS LAST, e.created_at DESC
          LIMIT 1
        ) lastex ON pi.testcase_id IS NOT NULL
-       WHERE pi.plan_id = $1
+       WHERE pi.plan_id = $1 AND pi.deleted_at IS NULL
        ORDER BY pi.position, pi.created_at`,
       [planId]
     );
@@ -4784,8 +4912,9 @@ export class LegacyService implements OnModuleInit {
   }
 
   async deletePlanItem(userId: string | null | undefined, planId: string, itemId: string) {
+    const uid = this.requireUser(userId);
     await this.requirePlanItemAccess(userId, planId, itemId);
-    await this.db.query("DELETE FROM plan_items WHERE id = $1", [itemId]);
+    await this.db.query("UPDATE plan_items SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [itemId, uid]);
   }
 
   async planRuns(userId: string | null | undefined, planId: string) {
@@ -4800,9 +4929,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.*,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.plan_id = $1
+       WHERE c.plan_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at DESC`,
       [planId]
@@ -4830,9 +4959,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT COUNT(DISTINCT c.id)::int AS run_count,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.plan_id = $1`,
+       WHERE c.plan_id = $1 AND c.deleted_at IS NULL`,
       [planId]
     );
     const row = res.rows[0] ?? {
@@ -4880,7 +5009,7 @@ export class LegacyService implements OnModuleInit {
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at DESC`,
       [projectId]
@@ -4939,7 +5068,14 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(cycleId)) throw new NotFoundException({ error: "Cycle not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM cycles WHERE id = $1", [cycleId]);
+    // deleted_at IS NULL: a soft-deleted run must behave like it no longer exists for every caller
+    // that resolves it through here — getCycle, updateCycle, deleteCycle, shareCycle, the
+    // cycle_items routes and executionsForUser all funnel through this one check (hard-delete
+    // remediation Phase 1, see progress log).
+    const res = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -4947,7 +5083,7 @@ export class LegacyService implements OnModuleInit {
 
   async getCycle(cycleId: string, userId?: string | null) {
     await this.requireCycleAccess(userId, cycleId);
-    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1", [cycleId]);
+    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1 AND deleted_at IS NULL", [cycleId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     return toCamel(res.rows[0]);
   }
@@ -4955,11 +5091,14 @@ export class LegacyService implements OnModuleInit {
   async shareCycle(cycleId: string, userId: string | null | undefined, body: Body) {
     await this.requireCycleAccess(userId, cycleId);
     const enabled = body.enabled !== false;
-    const existing = await this.db.query("SELECT id, share_token FROM cycles WHERE id = $1", [cycleId]);
+    const existing = await this.db.query(
+      "SELECT id, share_token FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!existing.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     const shareToken = existing.rows[0].share_token || randomBytes(24).toString("hex");
     const res = await this.db.query(
-      "UPDATE cycles SET share_enabled = $2, share_token = $3, updated_at = now() WHERE id = $1 RETURNING share_enabled, share_token",
+      "UPDATE cycles SET share_enabled = $2, share_token = $3, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING share_enabled, share_token",
       [cycleId, enabled, shareToken]
     );
     return {
@@ -4969,7 +5108,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async publicCycle(token: string) {
-    const res = await this.db.query("SELECT * FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    // deleted_at IS NULL: a soft-deleted run's public share link must go dead, not keep resolving
+    // to a "deleted" run forever (hard-delete remediation Phase 1).
+    const res = await this.db.query(
+      "SELECT * FROM cycles WHERE share_token = $1 AND share_enabled = true AND deleted_at IS NULL",
+      [token]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
     return toCamel(res.rows[0]);
   }
@@ -4987,7 +5131,11 @@ export class LegacyService implements OnModuleInit {
    * needs has to be added here on purpose, which is the point — the previous shape leaked by default.
    */
   async publicCycleExecutions(token: string) {
-    const run = await this.db.query("SELECT id FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    // deleted_at IS NULL: same as publicCycle above — a soft-deleted run's share link must go dead.
+    const run = await this.db.query(
+      "SELECT id FROM cycles WHERE share_token = $1 AND share_enabled = true AND deleted_at IS NULL",
+      [token]
+    );
     if (!run.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
     const res = await this.db.query(
       `SELECT e.id, e.status,
@@ -4995,7 +5143,8 @@ export class LegacyService implements OnModuleInit {
               t.external_id, t.priority, t.type
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
-       WHERE ci.cycle_id = $1 AND e.deleted_at IS NULL ORDER BY ci.position, ci.created_at`,
+       WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
+       ORDER BY ci.position, ci.created_at`,
       [run.rows[0].id]
     );
     return res.rows.map(toCamel);
@@ -5047,9 +5196,40 @@ export class LegacyService implements OnModuleInit {
     );
   }
 
+  /**
+   * Soft-deletes the run and every cycle_item/execution in it, in one transaction.
+   *
+   * Used to be `DELETE FROM cycles WHERE id = $1`, which — combined with cycle_items.cycle_id and
+   * executions.cycle_item_id both being ON DELETE CASCADE (V3) — silently hard-deleted every
+   * execution in the run, bypassing executions.deleted_at (V60) entirely. See hard-delete
+   * remediation Phase 1 in the progress log.
+   *
+   * No advisory lock, unlike deleteSuite: there is no recursive-subtree read whose snapshot can go
+   * stale mid-transaction. The three UPDATEs below all filter `deleted_at IS NULL`, so a concurrent
+   * duplicate call (or a caller racing requireCycleAccess's read) just updates zero rows once the
+   * first commits — the same idempotent-no-op shape today's DELETE of zero rows already had.
+   */
   async deleteCycle(cycleId: string, userId?: string | null) {
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
-    await this.db.query("DELETE FROM cycles WHERE id = $1", [cycleId]);
+    await this.db.transaction(async (client) => {
+      const cycleRes = await client.query(
+        "UPDATE cycles SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+        [cycleId, uid]
+      );
+      // Lost a race with a concurrent delete of the same cycle between requireCycleAccess's read
+      // and this transaction's write — nothing left to cascade the soft-delete into.
+      if (!cycleRes.rowCount) return;
+      const itemsRes = await client.query<{ id: string }>(
+        "UPDATE cycle_items SET deleted_at = now(), deleted_by = $2 WHERE cycle_id = $1 AND deleted_at IS NULL RETURNING id",
+        [cycleId, uid]
+      );
+      if (!itemsRes.rows.length) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemsRes.rows.map((row) => row.id), uid]
+      );
+    });
   }
 
   /**
@@ -5093,12 +5273,22 @@ export class LegacyService implements OnModuleInit {
          -- belonging to another workspace and have this run adopt it — copying that tenant's title
          -- into snapshot_title on the way. requireCycleAccess already resolved the run's project, so
          -- scope the join to it and let a foreign id fall out with the unknown ones.
+         -- cycle_items_cycle_id_testcase_id_key is now a partial unique index (WHERE deleted_at IS
+         -- NULL, hard-delete remediation Phase 1) — a conflict target against a partial index must
+         -- repeat its predicate, or Postgres can't infer which index this ON CONFLICT means. Only
+         -- an active row can conflict, so re-adding a test case that was previously soft-removed
+         -- from this run inserts a fresh row instead of silently no-op'ing forever.
+         -- The EXISTS guard mirrors attachCases' (automation.service.ts) exactly: requireCycleAccess
+         -- above already refused a soft-deleted run with 404, but that read and this write are two
+         -- separate statements, leaving a window where a concurrent delete could land in between.
+         -- This closes that window at the point of the actual write (hard-delete remediation Phase 2).
          INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
          SELECT $1, t.id, t.title, base.pos + i.ord
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
-         ON CONFLICT (cycle_id, testcase_id) DO NOTHING
+          WHERE EXISTS (SELECT 1 FROM cycles c WHERE c.id = $1 AND c.deleted_at IS NULL)
+         ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING
          RETURNING id
        )
        INSERT INTO executions (cycle_item_id)
@@ -5111,15 +5301,44 @@ export class LegacyService implements OnModuleInit {
     return { requested, added: res.rows.length, skipped: requested - res.rows.length };
   }
 
+  /**
+   * Soft-deletes a single cycle_item and its execution, in one transaction.
+   *
+   * Used to be `DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = $2`, which cascaded
+   * into a hard `DELETE FROM executions` (V3's ON DELETE CASCADE), bypassing executions.deleted_at
+   * the same way deleteCycle did. See hard-delete remediation Phase 1 in the progress log.
+   */
   async removeCycleTestCase(cycleId: string, userId: string | null | undefined, testcaseId: string) {
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
     if (!isUuid(testcaseId)) throw new NotFoundException({ error: "Test case not found" });
-    await this.db.query("DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = $2", [cycleId, testcaseId]);
+    await this.db.transaction(async (client) => {
+      const itemRes = await client.query<{ id: string }>(
+        `UPDATE cycle_items SET deleted_at = now(), deleted_by = $3
+         WHERE cycle_id = $1 AND testcase_id = $2 AND deleted_at IS NULL
+         RETURNING id`,
+        [cycleId, testcaseId, uid]
+      );
+      // Already removed (or never in the run) — idempotent no-op, same as today's DELETE of 0 rows.
+      if (!itemRes.rows.length) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemRes.rows.map((row) => row.id), uid]
+      );
+    });
   }
 
+  /**
+   * Soft-deletes a bulk selection of cycle_items and their executions, in one transaction.
+   *
+   * Used to be a single `DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = ANY($2)`,
+   * cascading into a hard delete of every execution in the selection. See hard-delete remediation
+   * Phase 1 in the progress log.
+   */
   async removeCycleTestCases(cycleId: string, userId: string | null | undefined, body: Body) {
     // Guarded like every other /api/cycles/* route and like removeCycleTestCase above: without a
     // caller check a cycle id alone was enough to strip cases out of any workspace's run.
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
     const raw = body.testcaseIds || (body.testcaseId ? [body.testcaseId] : []);
     const requested = normalizeJsonArray(raw).length;
@@ -5127,10 +5346,25 @@ export class LegacyService implements OnModuleInit {
     // request with a driver error, so one bad id in a large selection would 500 the entire remove.
     const ids = [...new Set(normalizeJsonArray(raw).map((id) => String(id)).filter((id) => isUuid(id)))];
     if (!ids.length) return { requested, removed: 0 };
+    let removed = 0;
     // Single statement for the whole selection — the alternative users were left with was one
-    // DELETE per case (or dropping the entire run). executions cascade off cycle_items.
-    const res = await this.db.query("DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = ANY($2::uuid[])", [cycleId, ids]);
-    return { requested, removed: res.rowCount ?? 0 };
+    // UPDATE per case (or dropping the entire run). executions are soft-deleted in a second
+    // statement scoped to exactly the cycle_items this one just touched.
+    await this.db.transaction(async (client) => {
+      const itemsRes = await client.query<{ id: string }>(
+        `UPDATE cycle_items SET deleted_at = now(), deleted_by = $3
+         WHERE cycle_id = $1 AND testcase_id = ANY($2::uuid[]) AND deleted_at IS NULL
+         RETURNING id`,
+        [cycleId, ids, uid]
+      );
+      removed = itemsRes.rows.length;
+      if (!removed) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemsRes.rows.map((row) => row.id), uid]
+      );
+    });
+    return { requested, removed };
   }
 
   /** The guarded entry point for GET /api/cycles/:cycleId/executions. */
@@ -5173,9 +5407,10 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
        LEFT JOIN LATERAL (
          SELECT COUNT(*) AS count FROM attachments a
-          WHERE a.entity_type = 'execution' AND a.entity_id = e.id
+          WHERE a.entity_type = 'execution' AND a.entity_id = e.id AND a.deleted_at IS NULL
        ) ev ON true
-       WHERE ci.cycle_id = $1 AND e.deleted_at IS NULL ORDER BY ci.position, ci.created_at`,
+       WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
+       ORDER BY ci.position, ci.created_at`,
       [cycleId]
     );
     return res.rows.map(toCamel);
@@ -5272,7 +5507,15 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(cycleId)) throw new NotFoundException({ error: "Cycle not found" });
-    const cycle = await this.db.query<{ project_id: string }>("SELECT project_id FROM cycles WHERE id = $1", [cycleId]);
+    // deleted_at IS NULL: this lookup used to be the one place a soft-deleted run's data was still
+    // reachable — requireCycleAccess (used by every other /api/cycles/* route) already refuses a
+    // deleted run with 404, but this export path resolved its own project_id without that filter,
+    // so a still-authorized project member could keep downloading a "deleted" run's CSV forever
+    // (hard-delete remediation Phase 2 — an access-gate bypass, not merely a stale count).
+    const cycle = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!cycle.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     await this.requireProjectAccess(uid, cycle.rows[0].project_id);
     return this.executions(cycleId);
@@ -5399,13 +5642,17 @@ export class LegacyService implements OnModuleInit {
           'testcaseTitle', t.title,
           'testcaseExternalId', t.external_id,
           'cycleId', bl.cycle_id,
-          'cycleName', c.name,
+          -- Historical display, not a live reference: a bug's link record documents which run it
+          -- was found in, and that run can be soft-deleted long after the bug is filed. Marked
+          -- rather than dropped, matching the suites precedent exactly (Q10 in the Zyra context
+          -- integrity progress log's Phase 3/4 decisions; hard-delete remediation Phase 2).
+          'cycleName', (CASE WHEN c.id IS NOT NULL AND c.deleted_at IS NOT NULL THEN c.name || ' (deleted)' ELSE c.name END),
           'executionId', bl.execution_id
         ) ORDER BY bl.created_at) AS items
         FROM bug_links bl
         LEFT JOIN testcases t ON t.id = bl.testcase_id
         LEFT JOIN cycles c ON c.id = bl.cycle_id
-        WHERE bl.bug_id = b.id
+        WHERE bl.bug_id = b.id AND bl.deleted_at IS NULL
       ) links ON true
       LEFT JOIN LATERAL (
         SELECT json_agg(json_build_object(
@@ -5416,9 +5663,9 @@ export class LegacyService implements OnModuleInit {
           'createdAt', a.created_at
         ) ORDER BY a.created_at) AS items
         FROM attachments a
-        WHERE a.entity_type = 'bug' AND a.entity_id = b.id
+        WHERE a.entity_type = 'bug' AND a.entity_id = b.id AND a.deleted_at IS NULL
       ) atts ON true
-      WHERE ${where}`;
+      WHERE b.deleted_at IS NULL AND (${where})`;
   }
 
   /**
@@ -5431,7 +5678,7 @@ export class LegacyService implements OnModuleInit {
   private async requireBugAccess(userId: string | null | undefined, bugId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
+    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1 AND deleted_at IS NULL", [bugId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -5459,7 +5706,7 @@ export class LegacyService implements OnModuleInit {
     // show a bug's linked test case(s), so filtering the other direction has to agree with it.
     if (query.testcaseId) {
       values.push(query.testcaseId);
-      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length})`);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length} AND bl.deleted_at IS NULL)`);
     }
     // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
     // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
@@ -5550,7 +5797,7 @@ export class LegacyService implements OnModuleInit {
     };
     const [validTestcases, validCycles, validExecutions] = await Promise.all([
       resolved("SELECT id FROM testcases WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL", testcaseIds),
-      resolved("SELECT id FROM cycles WHERE id = ANY($1::uuid[]) AND project_id = $2", cycleIds),
+      resolved("SELECT id FROM cycles WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL", cycleIds),
       resolved(
         `SELECT e.id FROM executions e
            JOIN cycle_items ci ON ci.id = e.cycle_item_id
@@ -5571,13 +5818,50 @@ export class LegacyService implements OnModuleInit {
       .filter((link) => link.testcaseId || link.cycleId || link.executionId);
   }
 
-  private async replaceBugLinks(client: PoolClient, bugId: string, links: Body[]) {
-    await client.query("DELETE FROM bug_links WHERE bug_id = $1", [bugId]);
+  // A blind delete-all-then-reinsert (the pre-Phase-7 shape) can no longer be a real DELETE, and
+  // doing it as soft-delete-all-then-reinsert-everything would needlessly churn every unchanged
+  // link's id/created_at on every bug edit. Diffs instead: only rows genuinely absent from the new
+  // set are soft-deleted, only genuinely new (testcaseId, cycleId) pairs are inserted, and a pair
+  // that's already live and unchanged is left completely alone.
+  // Diff key/existence checks are done in JS with IS NOT DISTINCT FROM semantics deliberately, not
+  // by trusting ON CONFLICT alone: the partial unique index treats two NULL cycle_id rows as
+  // non-duplicates (ordinary SQL NULL-distinctness), so a bug linked only to a test case (no run)
+  // would otherwise pass every existing-row check as "new," insert a second identical row on this
+  // save, a third on the next, forever. Explicitly checking "does a live row already match this
+  // exact pair" before ever reaching INSERT closes that regardless of nullability, and as a
+  // byproduct also updates a link whose executionId changed in place instead of silently keeping
+  // the stale one (ON CONFLICT DO NOTHING would have swallowed that update for a non-null pair).
+  private async replaceBugLinks(client: PoolClient, bugId: string, uid: string | null, links: Body[]) {
+    const desired = new Map<string, Body>();
     for (const link of links) {
+      desired.set(`${link.testcaseId || ""}|${link.cycleId || ""}`, link);
+    }
+    const existing = await client.query<{ id: string; testcase_id: string | null; cycle_id: string | null; execution_id: string | null }>(
+      "SELECT id, testcase_id, cycle_id, execution_id FROM bug_links WHERE bug_id = $1 AND deleted_at IS NULL",
+      [bugId]
+    );
+    const existingByKey = new Map(existing.rows.map((row) => [`${row.testcase_id || ""}|${row.cycle_id || ""}`, row]));
+
+    const staleIds = existing.rows
+      .filter((row) => !desired.has(`${row.testcase_id || ""}|${row.cycle_id || ""}`))
+      .map((row) => row.id);
+    if (staleIds.length) {
+      await client.query("UPDATE bug_links SET deleted_at = now(), deleted_by = $2 WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL", [staleIds, uid]);
+    }
+
+    for (const [key, link] of desired) {
+      const match = existingByKey.get(key);
+      const executionId = link.executionId || null;
+      if (match) {
+        if (executionId !== match.execution_id) {
+          await client.query("UPDATE bug_links SET execution_id = $2 WHERE id = $1", [match.id, executionId]);
+        }
+        continue;
+      }
       await client.query(
         `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (bug_id, testcase_id, cycle_id) DO NOTHING`,
-        [bugId, link.testcaseId || null, link.cycleId || null, link.executionId || null]
+         ON CONFLICT (bug_id, testcase_id, cycle_id) WHERE deleted_at IS NULL DO NOTHING`,
+        [bugId, link.testcaseId || null, link.cycleId || null, executionId]
       );
     }
   }
@@ -5631,6 +5915,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async createBug(projectId: string, userId: string | null | undefined, body: Body) {
+    // Deliberately not this.requireUser(userId) — the MCP create_bug tool can call this with a null
+    // userId (an API-token caller with no owning user) and must keep working, same as before this
+    // link-diffing existed. uid is only ever consumed by replaceBugLinks' UPDATE ... deleted_by
+    // branch, which cannot run here (a brand-new bug has no existing links to soft-delete), so
+    // passing null through when there is no authenticated user costs nothing.
+    const uid = userId || null;
     // A link is required whenever the project actually has test cases/runs to link to — enforced
     // client-side (the UI only lets the field be empty when there's nothing to pick). An empty
     // array is accepted here so reporting a bug is never blocked in a project with no test runs yet.
@@ -5677,7 +5967,7 @@ export class LegacyService implements OnModuleInit {
             ]
           );
           const id = res.rows[0].id;
-          await this.replaceBugLinks(client, id, links);
+          await this.replaceBugLinks(client, id, uid, links);
           return id;
         });
         break;
@@ -5714,6 +6004,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   async updateBug(userId: string | null | undefined, bugId: string, body: Body) {
+    const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
     // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
@@ -5758,7 +6049,7 @@ export class LegacyService implements OnModuleInit {
     if (Array.isArray(body.links)) {
       const owner = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
       const sanitized = await this.sanitizeBugLinks(String(owner.rows[0]?.project_id ?? ""), normalizeJsonArray(body.links));
-      await this.db.transaction((client) => this.replaceBugLinks(client, bugId, sanitized));
+      await this.db.transaction((client) => this.replaceBugLinks(client, bugId, uid, sanitized));
     }
     return this.getBug(bugId);
   }
@@ -5766,11 +6057,29 @@ export class LegacyService implements OnModuleInit {
   async addBugLink(userId: string | null | undefined, bugId: string, body: Body) {
     await this.requireBugAccess(userId, bugId);
     if (!body.testcaseId && !body.cycleId) throw new BadRequestException({ error: "testcaseId or cycleId is required." });
-    await this.db.query(
-      `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (bug_id, testcase_id, cycle_id) DO NOTHING`,
-      [bugId, body.testcaseId || null, body.cycleId || null, body.executionId || null]
+    const testcaseId = body.testcaseId || null;
+    const cycleId = body.cycleId || null;
+    const executionId = body.executionId || null;
+    // IS NOT DISTINCT FROM, not ON CONFLICT alone: the partial unique index treats two NULL
+    // cycle_id rows as non-duplicates, so a bug already linked to this test case with no run would
+    // otherwise pass as "new" and insert a second identical row — same root cause as
+    // replaceBugLinks' own comment above.
+    const existing = await this.db.query<{ id: string; execution_id: string | null }>(
+      `SELECT id, execution_id FROM bug_links WHERE bug_id = $1 AND deleted_at IS NULL
+       AND testcase_id IS NOT DISTINCT FROM $2 AND cycle_id IS NOT DISTINCT FROM $3`,
+      [bugId, testcaseId, cycleId]
     );
+    if (existing.rows[0]) {
+      if (executionId !== existing.rows[0].execution_id) {
+        await this.db.query("UPDATE bug_links SET execution_id = $2 WHERE id = $1", [existing.rows[0].id, executionId]);
+      }
+    } else {
+      await this.db.query(
+        `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (bug_id, testcase_id, cycle_id) WHERE deleted_at IS NULL DO NOTHING`,
+        [bugId, testcaseId, cycleId, executionId]
+      );
+    }
     // requireBugAccess already resolved this bug's project; re-read it rather than trusting the
     // caller's body, which never carries a project id.
     const owner = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
@@ -5780,14 +6089,19 @@ export class LegacyService implements OnModuleInit {
   }
 
   async removeBugLink(userId: string | null | undefined, bugId: string, linkId: string) {
+    const uid = this.requireUser(userId);
     await this.requireBugAccess(userId, bugId);
-    await this.db.query("DELETE FROM bug_links WHERE id = $1 AND bug_id = $2", [linkId, bugId]);
+    await this.db.query(
+      "UPDATE bug_links SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND bug_id = $2 AND deleted_at IS NULL",
+      [linkId, bugId, uid]
+    );
     return this.getBug(bugId);
   }
 
   async deleteBug(userId: string | null | undefined, bugId: string) {
+    const uid = this.requireUser(userId);
     await this.requireBugAccess(userId, bugId);
-    await this.db.query("DELETE FROM bugs WHERE id = $1", [bugId]);
+    await this.db.query("UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [bugId, uid]);
   }
 
   // The client controls the uploaded filename completely, and it is only ever a display label —
@@ -5887,7 +6201,7 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     if (!files || files.length === 0) throw new BadRequestException({ error: "No files were uploaded" });
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2", [bugId, projectId]);
+    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
     LegacyService.assertValidEvidenceFiles(files);
     await this.planLimits.assertStorageAvailable(
@@ -5916,7 +6230,7 @@ export class LegacyService implements OnModuleInit {
   private async bugAttachment(attachmentId: string, scopeProjectId?: string): Promise<Body> {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
-      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug'
+      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug' AND deleted_at IS NULL
        AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
       [attachmentId, scopeProjectId ?? null]
     );
@@ -5939,13 +6253,15 @@ export class LegacyService implements OnModuleInit {
 
   async deleteBugAttachment(attachmentId: string, userId?: string | null) {
     // This route carries no project id, so the attachment's own project is what the caller is
-    // authorized against. It destroys the stored object as well as the row — an unauthorized
-    // caller here doesn't just read someone's evidence, they lose it for them.
+    // authorized against. It destroys the stored object — an unauthorized caller here doesn't just
+    // read someone's evidence, they lose it for them. The row itself is soft-deleted, not removed:
+    // metadata-only (who deleted what, when), since the object is already unrecoverable once
+    // storage.delete() below returns — see V115's header comment / Q-AT in the progress log.
     const uid = this.requireUser(userId);
     const file = await this.bugAttachment(attachmentId);
     await this.requireProjectAccess(uid, String(file.project_id));
     await this.storage.delete(file.storage_path);
-    await this.db.query("DELETE FROM attachments WHERE id = $1", [attachmentId]);
+    await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [attachmentId, uid]);
     return { ok: true };
   }
 
@@ -6036,7 +6352,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
       `SELECT * FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
       [attachmentId, executionId, execution.project_id]
     );
     const file = res.rows[0];
@@ -6094,7 +6410,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
       `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
       [attachmentId, executionId, execution.project_id]
     );
     const file = res.rows[0];
@@ -6122,7 +6438,7 @@ export class LegacyService implements OnModuleInit {
     const claims = verifyTraceLink(token);
     const res = await this.db.query(
       `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND deleted_at IS NULL`,
       [claims.attachmentId, claims.executionId]
     );
     const file = res.rows[0];
@@ -6146,7 +6462,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT id, project_id, entity_type, entity_id, file_name, content_type, file_size, uploaded_by,
               evidence_kind, created_at
-       FROM attachments WHERE entity_type = 'execution' AND entity_id = $1 ORDER BY created_at`,
+       FROM attachments WHERE entity_type = 'execution' AND entity_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
       [executionId]
     );
     return { list: res.rows.map(toCamel), total: res.rowCount };
@@ -6217,16 +6533,16 @@ export class LegacyService implements OnModuleInit {
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
          c.plan_id,
-         COALESCE(p.name, 'No Plan') AS plan_name,
+         COALESCE(CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END, 'No Plan') AS plan_name,
          COALESCE(u.name, u.email, 'Unassigned') AS assignee_name
        FROM cycles c
-       JOIN cycle_items ci ON ci.cycle_id = c.id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
-       WHERE c.project_id = $1
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        ORDER BY c.created_at DESC, ci.position, ci.created_at`,
       [projectId]
     );
@@ -6304,11 +6620,11 @@ export class LegacyService implements OnModuleInit {
          b.status AS bug_status,
          b.external_url AS bug_url
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
-       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
-       LEFT JOIN cycles c ON c.id = ci.cycle_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
+       LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       LEFT JOIN bugs b ON b.execution_id = e.id
+       LEFT JOIN bugs b ON b.execution_id = e.id AND b.deleted_at IS NULL
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
        ORDER BY t.external_id, c.created_at DESC NULLS LAST`,
       [projectId]
@@ -6346,15 +6662,26 @@ export class LegacyService implements OnModuleInit {
       : organizationId
         ? ` WHERE project_id IN (${orgProjectsSubquery})`
         : "";
+    // cycles and plans have no "_active" view the way testcases/suites/executions do, so both
+    // counts need their own deleted_at filter bolted onto childWhere rather than getting one for
+    // free (hard-delete remediation Phases 2 and 4).
+    const cyclesWhere = childWhere ? `${childWhere} AND deleted_at IS NULL` : " WHERE deleted_at IS NULL";
+    const plansWhere = cyclesWhere;
     const values = projectId ? [projectId] : organizationId ? [organizationId, userId] : [];
     const [projects, testcases, suites, plans, cycles, statuses] = await Promise.all([
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM projects${projectsWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM testcases_active${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${childWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites_active${childWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${plansWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${cyclesWhere}`, values),
       this.db.query<{ status: string; count: string }>(
-        `SELECT e.status, COUNT(*) AS count FROM executions_active e JOIN cycle_items ci ON ci.id = e.cycle_item_id JOIN cycles c ON c.id = ci.cycle_id${
+        // ci/c both gain deleted_at IS NULL: executions_active already excludes soft-deleted
+        // executions, but a run or a removed cycle_item surviving underneath it (hard-delete
+        // remediation Phase 1/2) must not keep inflating this breakdown just because its execution
+        // row itself is still live.
+        `SELECT e.status, COUNT(*) AS count FROM executions_active e
+           JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+           JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL${
           projectId
             ? " WHERE c.project_id = $1"
             : organizationId
@@ -6389,7 +6716,7 @@ export class LegacyService implements OnModuleInit {
     const bySuiteQuery = () =>
       this.db.query<{ name: string; count: string }>(
         `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
-       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id
+       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        WHERE t.project_id = $1 GROUP BY s.name ORDER BY s.name`,
         [projectId]
       );
@@ -6464,9 +6791,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.id, c.name, c.created_at,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at ASC`,
       [projectId]
@@ -6507,7 +6834,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
        LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.project_id = t.project_id
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
@@ -6545,12 +6872,12 @@ export class LegacyService implements OnModuleInit {
               COUNT(DISTINCT t.id)::int AS total_cases,
               COUNT(DISTINCT covered.testcase_id)::int AS covered_cases
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN LATERAL (
          SELECT ci.testcase_id
          FROM cycle_items ci
-         JOIN executions e ON e.cycle_item_id = ci.id
-         WHERE ci.testcase_id = t.id AND e.status IS NOT NULL AND e.status <> 'Untested'
+         JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+         WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL AND e.status IS NOT NULL AND e.status <> 'Untested'
          LIMIT 1
        ) covered ON true
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
@@ -6571,7 +6898,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT COUNT(*)::int AS count FROM (
          SELECT t.id
          FROM testcases t
-         LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
+         LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
          LEFT JOIN executions e ON e.cycle_item_id = ci.id
          WHERE t.project_id = $1 AND t.deleted_at IS NULL AND t.priority = 'P1'
          GROUP BY t.id
@@ -6600,8 +6927,9 @@ export class LegacyService implements OnModuleInit {
        JOIN executions e ON e.cycle_item_id = ci.id
        JOIN cycles c ON c.id = ci.cycle_id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id
-       WHERE c.project_id = $1 AND e.status IS NOT NULL AND e.status <> 'Untested'
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
+         AND e.status IS NOT NULL AND e.status <> 'Untested'
        ORDER BY ci.testcase_id, c.created_at ASC`,
       [projectId]
     );
@@ -6708,7 +7036,7 @@ export class LegacyService implements OnModuleInit {
          FROM generate_series(date_trunc('week', now() - interval '6 weeks'), date_trunc('week', now()), interval '1 week') AS d
          LEFT JOIN (
            SELECT date_trunc('week', created_at) AS week, COUNT(*) AS cnt
-           FROM bugs WHERE project_id = $1
+           FROM bugs WHERE project_id = $1 AND deleted_at IS NULL
            GROUP BY 1
          ) b ON b.week = d
          ORDER BY d`,
@@ -6731,10 +7059,13 @@ export class LegacyService implements OnModuleInit {
       this.analytics(projectId),
       this.requirementsSummary(projectId, userId),
       this.db.query<{ severity: string; count: string }>(
-        `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND status IN ('Open', 'Reopened') GROUP BY severity`,
+        `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
         [projectId]
       ),
-      this.db.query<{ count: string }>(`SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress'`, [projectId]),
+      this.db.query<{ count: string }>(
+        `SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress' AND deleted_at IS NULL`,
+        [projectId]
+      ),
       this.db.query<{ count: string }>(
         `SELECT COUNT(*)::int AS count FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '7 days'`,
         [projectId]
@@ -6750,8 +7081,8 @@ export class LegacyService implements OnModuleInit {
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS passed_prior,
            COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS settled_prior
          FROM executions e
-         JOIN cycle_items ci ON ci.id = e.cycle_item_id
-         JOIN cycles c ON c.id = ci.cycle_id
+         JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+         JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
          WHERE c.project_id = $1`,
         [projectId]
       )
@@ -6922,7 +7253,12 @@ export class LegacyService implements OnModuleInit {
           'created'::text AS action,
           'suite'::text AS entity_type,
           id::text AS entity_id,
-          name AS entity_name,
+          -- The feed calls itself a full audit log ("who did what and when") — unlike the live
+          -- listing sites, a suite's own history entries must survive it being (soft-)deleted, same
+          -- as any other audited event survives the row it describes. Marked rather than left plain,
+          -- so a reader can tell the suite is gone without the row vanishing outright (Q10 in the
+          -- Zyra context integrity progress log's Phase 3/4 decisions).
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END) AS entity_name,
           NULL::text AS diff,
           created_at
         FROM suites
@@ -6931,7 +7267,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('suite-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'suite'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'suite'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM suites
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6939,7 +7277,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           p.project_id, ('plan-created-' || p.id::text), p.owner_id, u.email, u.name,
           CASE WHEN p.owner_id IS NOT NULL THEN 'user' END,
-          'created'::text, 'plan'::text, p.id::text, p.name, NULL::text, p.created_at
+          'created'::text, 'plan'::text, p.id::text,
+          (CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END),
+          NULL::text, p.created_at
         FROM plans p
         LEFT JOIN users u ON u.id = p.owner_id
         WHERE ${projectScopeSql}
@@ -6947,7 +7287,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('plan-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'plan'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'plan'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM plans
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6955,7 +7297,12 @@ export class LegacyService implements OnModuleInit {
         SELECT
           c.project_id, ('cycle-created-' || c.id::text), c.owner_id, u.email, u.name,
           CASE WHEN c.owner_id IS NOT NULL THEN 'user' END,
-          'created'::text, 'cycle'::text, c.id::text, c.name, NULL::text, c.created_at
+          -- Same "history, not current state" treatment as suites above: a run's creation event must
+          -- survive it being soft-deleted, marked rather than left plain or dropped (hard-delete
+          -- remediation Phase 2).
+          'created'::text, 'cycle'::text, c.id::text,
+          (CASE WHEN c.deleted_at IS NOT NULL THEN c.name || ' (deleted)' ELSE c.name END),
+          NULL::text, c.created_at
         FROM cycles c
         LEFT JOIN users u ON u.id = c.owner_id
         WHERE ${projectScopeSql}
@@ -6963,7 +7310,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('cycle-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'cycle'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'cycle'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM cycles
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6971,7 +7320,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           b.project_id, ('bug-created-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
-          'created'::text, 'bug'::text, b.id::text, b.title, NULL::text, b.created_at
+          'created'::text, 'bug'::text, b.id::text,
+          (CASE WHEN b.deleted_at IS NOT NULL THEN b.title || ' (deleted)' ELSE b.title END),
+          NULL::text, b.created_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql}
@@ -6980,7 +7331,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           b.project_id, ('bug-updated-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
-          'updated'::text, 'bug'::text, b.id::text, b.title, NULL::text, b.updated_at
+          'updated'::text, 'bug'::text, b.id::text,
+          (CASE WHEN b.deleted_at IS NOT NULL THEN b.title || ' (deleted)' ELSE b.title END),
+          NULL::text, b.updated_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second'
@@ -10212,7 +10565,7 @@ export class LegacyService implements OnModuleInit {
       this.db.query<{ last_used: string | null }>(
         `SELECT MAX(s.updated_at) AS last_used
            FROM zyra_chat_sessions s
-          WHERE s.project_id = $1
+          WHERE s.project_id = $1 AND s.deleted_at IS NULL
             AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
         [projectId]
       )
@@ -10430,7 +10783,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT s.id, s.project_id, s.user_id, s.title, s.created_at, s.updated_at, s.active_plan,
               EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id) AS has_messages
        FROM zyra_chat_sessions s
-       WHERE s.project_id = $1
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        ORDER BY s.updated_at DESC
        LIMIT 50`,
       [projectId]
@@ -10442,7 +10795,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
     const session = await this.db.query(
-      "SELECT id, project_id, user_id, title, created_at, updated_at, active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      "SELECT id, project_id, user_id, title, created_at, updated_at, active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
       [sessionId, projectId]
     );
     if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
@@ -10488,7 +10841,7 @@ export class LegacyService implements OnModuleInit {
     if (!title) throw new BadRequestException({ error: "title is required" });
     const res = await this.db.query(
       `UPDATE zyra_chat_sessions SET title = $3, updated_at = now()
-       WHERE id = $1 AND project_id = $2
+       WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
        RETURNING id, project_id, user_id, title, created_at, updated_at`,
       [sessionId, projectId, title]
     );
@@ -10501,16 +10854,17 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     const existing = await this.db.query<{ active_plan: { status?: string } | null }>(
-      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
       [sessionId, projectId]
     );
     if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     if (existing.rows[0].active_plan?.status === "running") {
       throw new ConflictException({ error: "Stop the running generation plan before deleting this conversation." });
     }
-    // Messages (zyra_chat_messages.session_id) and any staged review batches
-    // (ai_generation_requests.chat_session_id) are both ON DELETE CASCADE — nothing else to clean up.
-    await this.db.query("DELETE FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    // Messages and any staged review batch are left physically in place, untouched — the FKs are
+    // ON DELETE RESTRICT now, not CASCADE (V116), and nothing reads them independently of this
+    // session's own now-gated existence, same reasoning as bug_links surviving a soft-deleted bug.
+    await this.db.query("UPDATE zyra_chat_sessions SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId, uid]);
     return { success: true };
   }
 
@@ -10520,7 +10874,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     const message = String(body.message || "").trim();
     if (!message) throw new BadRequestException({ error: "message is required" });
-    const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
 
     // Claim this session for the duration of one turn. Without this, two overlapping requests for
@@ -10808,7 +11162,7 @@ export class LegacyService implements OnModuleInit {
     // pause, if any, is decided and applied under the row lock in zyraPlanTransition below, the
     // same guard continueZyraChatPlan's own batch commits use, so a Stop click landing the same
     // moment a batch is mid-commit can't race it (see zyraPlanTransition's own comment).
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     if (plan && plan.status !== "paused") {
@@ -10848,7 +11202,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     // Fast-path check only, same reasoning as stopZyraChatPlan — the actual reactivation is decided
     // and applied under the row lock below.
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     const remainingScenarios = normalizeJsonArray(plan?.remainingScenarios).map(String);
@@ -11788,7 +12142,7 @@ export class LegacyService implements OnModuleInit {
   private async resolveOrCreateSuiteByName(projectId: string, name: string): Promise<{ id: string; name: string; created: boolean }> {
     const trimmed = String(name || "").trim();
     const existing = await this.db.query(
-      "SELECT id, name FROM suites WHERE project_id = $1 AND lower(name) = lower($2) ORDER BY position, created_at LIMIT 1",
+      "SELECT id, name FROM suites WHERE project_id = $1 AND lower(name) = lower($2) AND deleted_at IS NULL ORDER BY position, created_at LIMIT 1",
       [projectId, trimmed]
     ).catch(() => ({ rows: [] as Body[] }));
     if (existing.rows[0]) return { id: String(existing.rows[0].id), name: String(existing.rows[0].name), created: false };
@@ -11798,7 +12152,7 @@ export class LegacyService implements OnModuleInit {
 
   private async getProjectSuite(projectId: string, suiteId: string): Promise<{ id: string; name: string } | null> {
     const res = await this.db.query(
-      "SELECT id, name FROM suites WHERE project_id = $1 AND id = $2::uuid LIMIT 1",
+      "SELECT id, name FROM suites WHERE project_id = $1 AND id = $2::uuid AND deleted_at IS NULL LIMIT 1",
       [projectId, suiteId]
     ).catch(() => ({ rows: [] as Body[] }));
     return res.rows[0] ? { id: String(res.rows[0].id), name: String(res.rows[0].name) } : null;
@@ -13539,6 +13893,49 @@ export class LegacyService implements OnModuleInit {
         }
       }
 
+      // Q11 (Zyra context integrity progress log, Phase 3/4): a suite a create-type entry targets —
+      // `batchSuiteId` above, or a chat-staged draft's own `draft.suiteId` (written once, at
+      // resolveOrCreateSuiteByName / patchZyraPendingBatchSuite time, then frozen inside
+      // generated_payload until the user hits Save, potentially hours later) — can have been
+      // soft-deleted out from under it since it was resolved. Before this, that couldn't happen
+      // silently: a suite id that resolved once couldn't stop existing without a hard delete, and a
+      // hard-deleted suite would make the FK insert fail loudly. Now the row still exists (just
+      // filtered out of every list), so the FK is satisfied and the insert would otherwise succeed
+      // with a `suite_id` pointing at a suite that already looks deleted everywhere else — a
+      // create-time version of the same "ghost suite reference" this phase closes off on the read
+      // side. Re-validated live, under this same lock/transaction, rather than trusted from whenever
+      // it was first resolved.
+      // isUuid-filtered defensively so a malformed id here is just "not found" (falls back to
+      // unassigned, below) rather than a raw driver error from the `::uuid[]` cast reaching the
+      // global exception filter as an unhandled 500 — the same failure mode every other uuid-typed
+      // filter in this file already avoids by checking isUuid() first.
+      const createSuiteIdCandidates = new Set<string>();
+      if (batchSuiteId && isUuid(String(batchSuiteId))) createSuiteIdCandidates.add(String(batchSuiteId));
+      for (const entry of selected) {
+        if (entry.opType === "update" || entry.opType === "archive") continue;
+        const draft = entry.draft || entry;
+        if (draft.suiteId && isUuid(String(draft.suiteId))) createSuiteIdCandidates.add(String(draft.suiteId));
+      }
+      let validSuiteIds = new Set<string>();
+      if (createSuiteIdCandidates.size) {
+        // project_id-scoped: without it, a caller supplying another project's (or tenant's) suite
+        // id would pass this check, write testcases into THIS project pointing at that foreign
+        // suite_id, and every suite-joined report/export (repositorySummary, exportTestCases,
+        // executionReport, requirementMatrix, suiteHealth, coverageBySuite, detectFlakyTests — none
+        // of which scope their suites join by project) would then render the other project's suite
+        // name inside this project's data.
+        const foundSuites = await client.query<{ id: string }>(
+          "SELECT id FROM suites WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL",
+          [Array.from(createSuiteIdCandidates), projectId]
+        );
+        validSuiteIds = new Set(foundSuites.rows.map((row) => String(row.id)));
+      }
+      const staleSuiteIds = Array.from(createSuiteIdCandidates).filter((id) => !validSuiteIds.has(id));
+      // A stale batchSuiteId falls back the same way a stale per-draft suiteId does: unassigned,
+      // never a failed batch — see below, entries fall back individually via ctx.validSuiteIds. This
+      // only affects what `events`/the response report as the batch's own suite.
+      if (batchSuiteId && !validSuiteIds.has(String(batchSuiteId))) batchSuiteId = null;
+
       const entryCtx: ZyraSaveEntryContext = {
         projectId,
         uid,
@@ -13549,7 +13946,8 @@ export class LegacyService implements OnModuleInit {
         jiraUrl,
         linearIssueKey,
         linearUrl,
-        existingLinked
+        existingLinked,
+        validSuiteIds
       };
       // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
       // implementations return the identical { created, touched, touchedActions } shape and must
@@ -13563,6 +13961,18 @@ export class LegacyService implements OnModuleInit {
       const savedAt = new Date().toISOString();
       const events = [{ suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
       const saveActivity = [{ actor: "user", stage: "done", title: "Accepted and saved testcases", detail: `Saved ${touched.length} testcase(s).`, createdAt: savedAt }];
+      // Q11: recorded on the batch itself (not just swallowed) when a target suite turned out to be
+      // gone — this is a silent, non-blocking fallback everywhere else in this save, so the only
+      // place it's visible at all is this log entry.
+      if (staleSuiteIds.length) {
+        saveActivity.push({
+          actor: "system",
+          stage: "info",
+          title: "Target suite no longer available",
+          detail: `${staleSuiteIds.length} target suite(s) had been deleted since these drafts were staged. Affected new test case(s) were saved unassigned instead of failing the batch.`,
+          createdAt: savedAt
+        });
+      }
       // Task-board batches always resolve to 'done' on any save, partial selection or not — a single
       // generation request completes as one review, and that is unchanged here. A chat-staged batch
       // is different: a conversation naturally continues across turns, so saving only some of a
@@ -13661,7 +14071,11 @@ export class LegacyService implements OnModuleInit {
       }
       const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      // Q11: whichever suite this entry would have targeted, re-validated live (see zyraSaveAttempt)
+      // rather than trusted from whenever it was resolved — a soft-deleted suite falls back to
+      // unassigned instead of failing this entry or the batch.
+      const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const targetSuiteId = rawTargetSuiteId && ctx.validSuiteIds.has(String(rawTargetSuiteId)) ? rawTargetSuiteId : null;
       const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
       const tags = Array.from(new Set([
         ...baseTags,
@@ -13675,7 +14089,14 @@ export class LegacyService implements OnModuleInit {
         title: draft.title,
         description: draft.description || draft.expectedSummary || "",
         preconditions: draft.preconditions || "",
-        stepsJson: this.safeSteps(draft.stepsJson),
+        // Pre-stringified here, once, to match what the create/edit modal already sends
+        // (testcases/page.tsx: `steps: JSON.stringify(steps)`) before this payload reaches
+        // insertTestCaseWithClient/updateTestCaseWithClient or zyraBatchInsertTestCases — all of
+        // which apply exactly one more encode on top of whatever they're given. Handing them a
+        // bare array (the old behavior) got single-encoded into a genuine jsonb array, a shape the
+        // editor's parseSteps() silently discards as one blank step. See
+        // "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+        stepsJson: JSON.stringify(this.safeSteps(draft.stepsJson)),
         testData: draft.testData || "",
         priority: draft.priority || "P2",
         type: draft.type || "Functional",
@@ -13756,7 +14177,10 @@ export class LegacyService implements OnModuleInit {
 
       const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      // Q11: same live re-validation as processZyraSaveEntriesSequential — see that function's
+      // identical comment.
+      const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const targetSuiteId = rawTargetSuiteId && ctx.validSuiteIds.has(String(rawTargetSuiteId)) ? rawTargetSuiteId : null;
       const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
       const tags = Array.from(new Set([
         ...baseTags,
@@ -13770,7 +14194,14 @@ export class LegacyService implements OnModuleInit {
         title: draft.title,
         description: draft.description || draft.expectedSummary || "",
         preconditions: draft.preconditions || "",
-        stepsJson: this.safeSteps(draft.stepsJson),
+        // Pre-stringified here, once, to match what the create/edit modal already sends
+        // (testcases/page.tsx: `steps: JSON.stringify(steps)`) before this payload reaches
+        // insertTestCaseWithClient/updateTestCaseWithClient or zyraBatchInsertTestCases — all of
+        // which apply exactly one more encode on top of whatever they're given. Handing them a
+        // bare array (the old behavior) got single-encoded into a genuine jsonb array, a shape the
+        // editor's parseSteps() silently discards as one blank step. See
+        // "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+        stepsJson: JSON.stringify(this.safeSteps(draft.stepsJson)),
         testData: draft.testData || "",
         priority: draft.priority || "P2",
         type: draft.type || "Functional",
@@ -14199,7 +14630,7 @@ export class LegacyService implements OnModuleInit {
     const folderNames = foldersRes.rows.map((row) => row.name).join(", ");
     const [docsRes, filesRes] = await Promise.all([
       this.db.query(
-        `SELECT id, title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 12`,
+        `SELECT id, title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false AND (document_type != 'ai_memory' OR status = 'approved') ORDER BY updated_at DESC LIMIT 12`,
         [folderIds]
       ).catch(() => ({ rows: [] as Body[] })),
       this.db.query(
@@ -14240,7 +14671,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT external_id, title, description, priority, status, steps
        FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL
+       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived'
        ORDER BY ${orderBy}
        LIMIT 25`,
       values
@@ -14251,7 +14682,9 @@ export class LegacyService implements OnModuleInit {
       description: String(row.description || "").slice(0, 500),
       priority: String(row.priority || "P2"),
       status: String(row.status || "Draft"),
-      stepsSummary: JSON.stringify(normalizeJsonArray(row.steps)).slice(0, 800)
+      // safeSteps(), not normalizeJsonArray() — same reasoning as exportTestcases: `row.steps` may
+      // be a JSON-encoded string, not a genuine array.
+      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, 800)
     }));
   }
 
@@ -14299,7 +14732,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT id, title, description, status, priority
        FROM bugs
-       WHERE project_id = $1
+       WHERE project_id = $1 AND deleted_at IS NULL
          AND (lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]))
        ORDER BY CASE WHEN lower(title) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC
        LIMIT $3`,
@@ -16656,8 +17089,8 @@ export class LegacyService implements OnModuleInit {
   private async projectSuiteSummaries(projectId: string): Promise<Array<{ id: string; name: string; testCaseCount: number }>> {
     const suites = await this.db.query(
       `SELECT s.id, s.name, COUNT(t.id)::int AS test_case_count
-       FROM suites s LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
-       WHERE s.project_id = $1
+       FROM suites s LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL AND COALESCE(t.status,'') <> 'Archived'
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id, s.name
        ORDER BY s.position, s.name
        LIMIT 50`,
@@ -16702,7 +17135,7 @@ export class LegacyService implements OnModuleInit {
            COUNT(*)::int AS testcase_count,
            COUNT(*) FILTER (WHERE jira_issue_key IS NOT NULL AND COALESCE(status, '') <> 'Archived')::int AS linked_jira_testcase_count
          FROM testcases
-         WHERE project_id = $1 AND deleted_at IS NULL`,
+         WHERE project_id = $1 AND deleted_at IS NULL AND COALESCE(status,'') <> 'Archived'`,
         [projectId]
       ).catch(() => ({ rows: [{}] as Body[] })),
       this.db.query(
@@ -16897,7 +17330,11 @@ export class LegacyService implements OnModuleInit {
     const values: any[] = [testcaseId];
     for (const [key, column] of LegacyService.ZYRA_PATCH_FIELD_COLUMNS) {
       if (fields[key] === undefined) continue;
-      values.push(column === "steps" ? JSON.stringify(this.safeSteps(fields[key])) : fields[key]);
+      // Double-encoded on purpose, matching insertTestCaseWithClient/updateTestCaseWithClient's own
+      // stepsJson handling: this function doesn't funnel through either of those, so it needs its
+      // own extra JSON.stringify to land in the same jsonb string-scalar shape parseSteps() expects
+      // — see "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+      values.push(column === "steps" ? JSON.stringify(JSON.stringify(this.safeSteps(fields[key]))) : fields[key]);
       sets.push(`${column} = $${values.length}${column === "steps" ? "::jsonb" : ""}`);
     }
     if (!sets.length) return null;

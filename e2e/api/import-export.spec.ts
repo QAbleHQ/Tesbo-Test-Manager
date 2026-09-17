@@ -258,6 +258,34 @@ test.describe("import / export", () => {
     );
   });
 
+  test("still exports steps when they were stored as a JSON-encoded string, not a genuine array", async () => {
+    /*
+     * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test
+     * Cases" — the create/edit modal pre-stringifies `steps` before every save (testcases/page.tsx
+     * `steps: JSON.stringify(steps)`), and insertTestCaseWithClient encodes it a second time, so the
+     * jsonb column ends up holding a JSON string scalar rather than a genuine array. The editor's own
+     * parseSteps() expects exactly that string, but exportTestcases' `normalizeJsonArray(row.steps)`
+     * was `Array.isArray(value) ? value : []` — the mirror-image assumption — so this shape (which is
+     * what every modal-created test case, and now every Zyra/MCP-created one, actually persists)
+     * exported as a blank Steps column instead of silently failing to save.
+     */
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Steps Shape ${stamp}`);
+    const steps = [
+      { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
+      { stepNumber: 2, action: "Submit empty credentials" },
+    ];
+    const seeded = await seedCase(
+      { title: `E2E Export Steps Shape ${stamp}`, steps: JSON.stringify(steps) },
+      project,
+    );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    expect(records.find((r) => r.title === seeded.title)!.steps).toBe(
+      "Open the login page => The form is shown | Submit empty credentials",
+    );
+  });
+
   test("quotes values containing commas, quotes and newlines so they survive the round trip", { tag: '@tesbo.testId("TES-TC-199")' }, async () => {
     const stamp = Date.now();
     const project = await newProject(`E2E Export Quoting ${stamp}`);

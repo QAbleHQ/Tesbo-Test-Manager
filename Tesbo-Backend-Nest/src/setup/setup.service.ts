@@ -601,7 +601,19 @@ export class SetupService {
       });
 
     // ── Knowledge Base ──
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "HabitNest – Product Overview",
+    // Hard-delete remediation Phase 8: this used to write into the legacy, flat
+    // knowledge_base_items table (v1), which no screen in the product can display — the v2
+    // knowledge base (folders -> documents) is the only one the UI reads. insertDemoProject never
+    // called seedKnowledgeBaseDefaults either, so the demo project had no root folder at all; both
+    // are fixed together here, since a document needs a folder to belong to.
+    const rootFolder = await client.query<{ id: string }>(
+      `INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root)
+       VALUES ($1, $2, NULL, 'Knowledge base', true) RETURNING id`,
+      [organizationId, projectId]
+    );
+    const rootFolderId = rootFolder.rows[0].id;
+
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "HabitNest – Product Overview",
       `# HabitNest – Product Overview
 
 HabitNest is a habit tracking application that helps users build and maintain consistent daily routines.
@@ -624,7 +636,7 @@ Individuals who want to improve their daily routine and stay consistent with per
 HabitNest is an MVP-stage product. The recommended first release targets ten core screens: Welcome, Registration, Login, Dashboard, Create Habit, Habit List, Edit Habit, Habit Details, Weekly Report, and Profile.`
     );
 
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "HabitNest – Screen Inventory",
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "HabitNest – Screen Inventory",
       `# HabitNest – Screen Inventory
 
 A reference list of all screens in the HabitNest application and their purpose.
@@ -665,7 +677,7 @@ A reference list of all screens in the HabitNest application and their purpose.
 | Error and Validation | Inform users when something goes wrong with clear actionable messages |`
     );
 
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "Habit Entity – Rules and Validations",
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "Habit Entity – Rules and Validations",
       `# Habit Entity – Business Rules and Validations
 
 ## Required Fields
@@ -696,7 +708,7 @@ A reference list of all screens in the HabitNest application and their purpose.
 - Undo is only available on the current day and reverts the habit to pending`
     );
 
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "Authentication and Account Rules",
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "Authentication and Account Rules",
       `# Authentication and Account Rules
 
 ## Registration Validation
@@ -731,7 +743,7 @@ A reference list of all screens in the HabitNest application and their purpose.
 - Logout must end the session and redirect to the login screen`
     );
 
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "Report Behaviour Notes",
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "Report Behaviour Notes",
       `# Report Behaviour Notes
 
 ## Weekly Report
@@ -760,7 +772,7 @@ A reference list of all screens in the HabitNest application and their purpose.
 - Streaks that span across week or month boundaries`
     );
 
-    await this.insertDemoKnowledgeBaseItem(client, projectId, userId, "Empty States and Error Scenarios",
+    await this.insertDemoKnowledgeBaseItem(client, organizationId, projectId, rootFolderId, userId, "Empty States and Error Scenarios",
       `# Empty States and Error Scenarios
 
 ## Empty States
@@ -840,17 +852,25 @@ Error messages must be clear, actionable, and written in plain language. The use
     );
   }
 
+  // Writes into the v2 knowledge base (knowledge_documents), the only one the product UI reads —
+  // see the call site's comment. Mirrors createKnowledgeDocument's own shape (status 'draft',
+  // document_type 'general'): the search_vector trigger (V45) populates itself on insert, so these
+  // notes are keyword-searchable immediately. Semantic/RAG embeddings are not enqueued here (no
+  // embedding-queue dependency exists in this service) — a smaller gap than the notes being
+  // entirely invisible, and out of this fix's scope.
   private async insertDemoKnowledgeBaseItem(
     client: PoolClient,
+    organizationId: string,
     projectId: string,
+    folderId: string,
     userId: string,
     title: string,
     content: string
   ): Promise<void> {
     await client.query(
-      `INSERT INTO knowledge_base_items (project_id, item_type, title, content, created_by)
-       VALUES ($1, 'note', $2, $3, $4)`,
-      [projectId, title, content, userId]
+      `INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, document_type, status, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, 'general', 'draft', $6, $6)`,
+      [organizationId, projectId, folderId, title, content, userId]
     );
   }
 
