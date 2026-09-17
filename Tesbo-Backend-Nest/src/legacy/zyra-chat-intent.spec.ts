@@ -67,11 +67,12 @@ type Internals = {
     suites: Array<{ id: string; name: string }>
   ) => { id?: string; name: string } | null;
   reconcileZyraReply: (
-    decision: { reply: string; actionType: string; operations: Array<{ type: string }> },
+    decision: { reply: string; actionType: string; operations: Array<{ type: string }>; __salvaged?: boolean },
     applied: {
       testcases: unknown[];
       activity: unknown[];
       moveBreakdown?: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>;
+      unresolvedMoveTargetCount?: number;
     }
   ) => string;
   zyraMoveBreakdownSuffix: (
@@ -551,6 +552,28 @@ describe("Zyra chat AI routing", () => {
       expect(typeof internals(svc).detectZyraChatIntent).toBe("function");
       expect(internals(svc).detectZyraChatIntent("generate test cases")).toBe("create");
     });
+
+    // Reported bug: every degraded-mode reply already says "no test cases were generated or
+    // changed" — an honest disclosure — but reconcileZyraReply's own false-completion guard
+    // (ZYRA_ALREADY_DISCLOSED) only recognized "no test cases were created/saved/added", not
+    // "generated" or "changed". So its "Sorry! Nothing was saved... Ask me to go ahead..." banner
+    // got stacked on top of a reply that had already said exactly that, on every degraded turn —
+    // a refused create request and a served read-only listing alike.
+    it("reconcileZyraReply does not double-warn a degraded create-refusal that already discloses nothing happened", () => {
+      const decision = internals(svc).zyraDegradedDecision("generate 5 test cases for login", existing, "credit balance too low");
+      const reply = internals(svc).reconcileZyraReply(decision as any, { testcases: [], activity: [] });
+      expect(reply).not.toContain("Sorry! Nothing was saved");
+      expect(reply).toContain("AI provider is unavailable");
+    });
+
+    it("reconcileZyraReply does not double-warn the plain degraded fallback (no create/list intent matched) either", () => {
+      // detectZyraChatIntent("hello") falls through every word group to "answer" — the same
+      // `note` prefix, same testcases: [], same gap.
+      const decision = internals(svc).zyraDegradedDecision("hello", existing, "provider timeout");
+      expect(decision.testcases).toEqual([]);
+      const reply = internals(svc).reconcileZyraReply(decision as any, { testcases: [], activity: [] });
+      expect(reply).not.toContain("Sorry! Nothing was saved");
+    });
   });
 
   describe("reconcileZyraReply", () => {
@@ -644,6 +667,77 @@ describe("Zyra chat AI routing", () => {
       );
       expect(reply).toBe(suiteClaim);
       expect(reply).not.toContain("📦");
+    });
+
+    // Same bug shape as the degraded-mode fix above, different trigger: applyStorageGateToGenerated
+    // forces actionType to "answer" (so a generation reply never routes through the save-branch's
+    // narrower zyraPersistedClaimBanner, which legitimately allows "drafted"/"staged" wording). That
+    // reroutes it through zyraFalseCompletionBanner instead — the WIDER check meant for genuine
+    // answer turns, where ZYRA_COMPLETION_CLAIM's own verb list includes "drafted". The gate's own
+    // prefix ("I did not save them...") wasn't recognized by ZYRA_ALREADY_DISCLOSED, so every
+    // generation reply shown while test case storage is disabled got the false-completion banner
+    // stacked on top — with a call-to-action ("ask me to go ahead") that is actively wrong here: no
+    // amount of asking Zyra to proceed saves anything while the capability itself is off.
+    it("does not double-warn the storage-capability gate's reply, which already says it didn't save anything", () => {
+      const storageGateReply =
+        'Test case storage is disabled for Zyra in this project, so these are suggestions only — I did not save them. Enable "Test case storage operations" under Zyra → Settings → Capabilities to let me save generated testcases.\n\n' +
+        'I drafted 3 test case(s) after reading 2 knowledge-base item(s). They\'re staged as drafts in **Zyra Drafts** — say "save them to <suite>" and I\'ll file them where they belong.';
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: storageGateReply, actionType: "answer", operations: [] },
+        { testcases: [], activity: [] }
+      );
+      expect(reply).not.toContain("Sorry! Nothing was saved");
+      expect(reply).toContain("I did not save them");
+    });
+
+    // F3: the all-create_suite branch used to return decision.reply unchecked (necessary — a
+    // genuine "Created the Regression suite" would otherwise trip ZYRA_COMPLETION_CLAIM itself,
+    // since "suite" is one of its own nouns), but that meant a reply could ALSO hallucinate an
+    // unrelated, unrequested testcase claim in the same message and nothing would ever catch it.
+    it("flags a create_suite-only turn whose reply also hallucinates an unrelated testcase claim", () => {
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: "Created the Regression suite and added 5 test cases to it.", actionType: "suite", operations: [{ type: "create_suite" }] },
+        { testcases: [], activity: [] }
+      );
+      expect(reply).toContain("Sorry! Nothing was saved");
+      expect(reply).toContain("Created the Regression suite and added 5 test cases to it.");
+    });
+
+    it("still treats a genuine, unembellished create_suite success as success (no false positive from stripping 'suite' out of the narrower check)", () => {
+      const claim = "Created the **Regression** suite.";
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: claim, actionType: "suite", operations: [{ type: "create_suite" }] },
+        { testcases: [], activity: [] }
+      );
+      expect(reply).toBe(claim);
+    });
+
+    // F4: appliedCount (rows) vs. requested (operations) can never fall short for a move_to_suite
+    // whose targets only partially resolved — one operation can produce 0..N rows, so "1 operation,
+    // 2 of 5 named ids resolved" always read as full success by the old comparison alone. Wired
+    // through unresolvedMoveTargetCount instead of appliedCount/requested (which structurally can't
+    // see it) — see resolveZyraMoveTargets/applyZyraChatOperations' own comments.
+    it("warns when a move_to_suite operation only partially resolved its named targets, even though the operation itself 'succeeded'", () => {
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: "Moved TC-1, TC-2, TC-3, TC-4, and TC-5 into QA Regression.", actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        {
+          testcases: [{ id: "id-1" }, { id: "id-2" }],
+          activity: [{ title: "Some testcases could not be moved", detail: "3 of 5 requested testcase(s) could not be found in this project and were skipped when moving into \"QA Regression\"." }],
+          unresolvedMoveTargetCount: 3
+        }
+      );
+      expect(reply).toContain("could not be moved");
+      expect(reply).toContain("3 of 5 requested testcase(s) could not be found");
+      expect(reply).toContain("Moved TC-1, TC-2, TC-3, TC-4, and TC-5 into QA Regression.");
+    });
+
+    it("does not warn when every named move target resolved", () => {
+      const claim = "Moved TC-1 and TC-2 into QA Regression.";
+      const reply = internals(svc).reconcileZyraReply(
+        { reply: claim, actionType: "suite", operations: [{ type: "move_to_suite" }] },
+        { testcases: [{ id: "id-1" }, { id: "id-2" }], activity: [], unresolvedMoveTargetCount: 0 }
+      );
+      expect(reply).toBe(claim);
     });
   });
 

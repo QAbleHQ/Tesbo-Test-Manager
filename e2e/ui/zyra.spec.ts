@@ -231,7 +231,7 @@ test.describe("zyra / agents (UI)", () => {
 
   interface ChatEntry {
     opType: "create" | "update" | "archive";
-    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null };
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
     testcaseId?: string;
     externalId?: string;
     fields?: Record<string, unknown>;
@@ -1141,6 +1141,35 @@ test.describe("zyra / agents (UI)", () => {
       .toBe(1);
   });
 
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — drives the actual Save
+   * button (not the API directly, see api/zyra.spec.ts ZYR-A-71..74 for that half) to prove the
+   * browser's own save action forwards a draft's severity/component through to the real row, the
+   * same way ZYU-14 proves it for suite placement.
+   */
+  test("ZYU-80 saving a draft with severity and component persists both onto the real test case", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{ title: "Sign in with a valid password", priority: "P1", severity: "High", component: "Auth", preconditions: "", steps: [] }],
+    });
+    const suiteName = stamp("Suite");
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await page.getByRole("row", { name: /Sign in with a valid password/ }).getByRole("button", { name: "Save" }).click();
+
+    const dialog = modal(page, "Save generated testcases");
+    await dialog.getByRole("combobox").first().selectOption("new");
+    await dialog.getByRole("textbox").last().fill(suiteName);
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    await expect
+      .poll(
+        () => scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`),
+        { message: "the draft's severity must reach the saved row, not just the review table" },
+      )
+      .toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`)).toBe("Auth");
+  });
+
   test("ZYU-15 deleting a draft removes it from the task and leaves the rest", { tag: '@tesbo.testId("TES-TC-1100")' }, async ({ browser }) => {
     const taskId = seedTask();
     const page = await open(browser, `/agents/tasks/${taskId}`);
@@ -1877,6 +1906,27 @@ test.describe("zyra / agents (UI)", () => {
         { message: "the saved proposal must land in its own suite as a real test case" },
       )
       .toBe(1);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYU-81 saving a chat-staged proposal with severity and component persists both onto the real test case", async ({ browser }) => {
+    const draftTitle = stamp("Chat-saved severity case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2", severity: "Critical", component: "Billing" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+
+    await expect
+      .poll(
+        () => scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`),
+        { message: "a chat-staged proposal's severity must reach the saved row" },
+      )
+      .toBe("Critical");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("Billing");
     expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
   });
 
