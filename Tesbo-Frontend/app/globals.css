@@ -983,6 +983,8 @@ button:disabled,
 .zyra-prose li { margin: 0.15rem 0; }
 .zyra-prose strong { font-weight: 600; color: var(--foreground); }
 .zyra-prose em { font-style: italic; }
+.zyra-prose a { color: var(--accent-light); text-decoration: underline; text-underline-offset: 2px; }
+.zyra-prose a:hover { text-decoration: none; }
 .zyra-prose .inline-code {
   font-family: var(--font-mono);
   font-size: 0.8125em;

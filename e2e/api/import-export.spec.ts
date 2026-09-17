@@ -59,6 +59,12 @@ const EXPORT_HEADERS = [
  * UI) were added so the template, the import mapping and the Create Test Case form expose the same
  * field set — both already had DB columns and worked through the single-create/update routes, but
  * were silently dropped by the bulk import path (see PreparedImportRow/insertImportChunk).
+ *
+ * "action" and "expectedResult" were added because the Map Columns screen has always offered them
+ * as a plain single-step alternative to the "steps" DSL, but no template ever had headers for them
+ * to map to — they always showed "-- Skip --" on the official template. "steps" stays mapped in the
+ * same file and still wins on import (ImportTestCasesModal.tsx's handleImport), so this only adds
+ * columns; it does not change what importing the unmodified template produces.
  */
 const TEMPLATE_HEADERS = [
   "title",
@@ -66,6 +72,8 @@ const TEMPLATE_HEADERS = [
   "preconditions",
   "postconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",
@@ -477,6 +485,11 @@ test.describe("import / export", () => {
     expect(records[0].steps).toContain(" => ");
     expect(records[0].steps).toContain(" | ");
     expect(records[0].title).toBeTruthy();
+    // The Action/Expected Result pair must also carry a worked example — otherwise Map Columns still
+    // shows them as unmapped the moment a user removes the "steps" column to try the plain-column
+    // style instead.
+    expect(records[0].action).toBeTruthy();
+    expect(records[0].expectedResult).toBeTruthy();
     // A worked value for every base column, so filling the template in unmodified round-trips —
     // in particular Automation Type must be one of TESTCASE_AUTOMATION_TYPES, since the importer
     // stores whatever string it's given with no server-side enum check.

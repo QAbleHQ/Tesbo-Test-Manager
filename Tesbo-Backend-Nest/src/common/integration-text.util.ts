@@ -3,7 +3,11 @@
 // run), so anything the sync processors also need would otherwise close an import cycle.
 
 export function escapeHtml(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Quotes matter here, not just `<`/`>`: IntegrationSyncDocumentBuilder.inline() interpolates a
+  // captured URL straight into a double-quoted href attribute, so an unescaped `"` in ticket
+  // content (e.g. a title containing `[x](https://a" onmouseover=alert(1))`) would close that
+  // attribute early and let whatever follows land as raw, executing HTML.
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /**

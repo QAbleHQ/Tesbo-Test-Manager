@@ -528,6 +528,35 @@ test.describe("test case import wizard", () => {
     }
   });
 
+  test("the downloaded sample CSV template auto-maps its Action and Expected Result columns", { tag: '@tesbo.testId("TES-TC-2105")' }, async ({ browser }) => {
+    // Regression test for: the official sample template only ever had a combined "steps" column, so
+    // Action and Expected Result had no header to match and always showed "-- Skip --" in Map
+    // Columns, even though those two fields are otherwise fully supported (TES-TC-2103/2104).
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Template Automap");
+      const { page, projectId } = fixture;
+
+      const templateRes = await page.request.get(
+        `${env.apiBaseUrl}/api/projects/${projectId}/testcases/import/template?format=csv`,
+      );
+      expect(templateRes.status()).toBe(200);
+      const templateCsv = await templateRes.text();
+
+      await openWizard(page, projectId);
+      await uploadCsv(page, templateCsv);
+
+      await expect(mappingFor(page, "Steps")).not.toHaveValue("");
+      await expect(mappingFor(page, "Action"), "the template's own Action column must auto-map").not.toHaveValue("");
+      await expect(
+        mappingFor(page, "Expected Result"),
+        "the template's own Expected Result column must auto-map",
+      ).not.toHaveValue("");
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
   test("maps Automation Type and Notes columns and imports them", { tag: '@tesbo.testId("TES-TC-2102")' }, async ({ browser }) => {
     let fixture: Fixture | undefined;
     try {

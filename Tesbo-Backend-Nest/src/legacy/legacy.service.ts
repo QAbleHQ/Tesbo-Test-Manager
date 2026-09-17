@@ -5696,17 +5696,27 @@ export class LegacyService implements OnModuleInit {
       values.push(query.status);
       filters.push(`b.status = $${values.length}`);
     }
-    if (query.cycleId) {
-      values.push(query.cycleId);
-      filters.push(`b.cycle_id = $${values.length}`);
-    }
-    // Sourced from bug_links, not the denormalized b.testcase_id column — updateBug's link edits
-    // only ever touch bug_links (see replaceBugLinks), so b.testcase_id can go stale once a bug's
-    // links are edited after creation. bug_links is what the Bugs page itself already trusts to
-    // show a bug's linked test case(s), so filtering the other direction has to agree with it.
-    if (query.testcaseId) {
+    // cycleId and testcaseId are both sourced from bug_links, not the denormalized b.cycle_id/
+    // b.testcase_id columns — updateBug's and addBugLink's link edits only ever touch bug_links
+    // (see replaceBugLinks), so those columns are just the values from whenever the bug was first
+    // created and go stale the moment a link is added, changed, or the bug is linked to a further
+    // test case in a different run. Concretely: "Link existing bug" onto a test case in a cycle
+    // other than the bug's original one never updates b.cycle_id, so a b.cycle_id = $N filter alone
+    // silently excludes a bug that a real bug_links row says belongs to this cycle — which is what
+    // made a just-linked bug fail to reappear in the Test Case Detail panel. When both are given
+    // they must be satisfied by the SAME link row (this execution's actual bug), not by two
+    // different links on the same bug that happen to each match one side.
+    if (query.testcaseId && query.cycleId) {
+      values.push(query.testcaseId, query.cycleId);
+      filters.push(
+        `EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length - 1} AND bl.cycle_id = $${values.length} AND bl.deleted_at IS NULL)`
+      );
+    } else if (query.testcaseId) {
       values.push(query.testcaseId);
       filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length} AND bl.deleted_at IS NULL)`);
+    } else if (query.cycleId) {
+      values.push(query.cycleId);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.cycle_id = $${values.length} AND bl.deleted_at IS NULL)`);
     }
     // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
     // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
