@@ -506,4 +506,112 @@ test.describe("password login lockout", () => {
       await anon.dispose();
     }
   });
+
+  /*
+   * The lockout counter isn't password-specific: a wrong OTP code and a repeated OTP resend count
+   * toward the same per-email counter as a wrong password (AuthService.requestOtp/verifyOtp — see
+   * the comment there on why this lives in AuthService and not OtpService itself), and once an
+   * email is locked, every login path for it is blocked, not just whichever one tripped it.
+   */
+
+  test("LOGIN-LOCK-06 wrong OTP codes count toward the same per-email lockout, and the 6th is blocked even with the correct code", async ({
+    playwright,
+  }) => {
+    const email = lockoutEmail("otp-wrong");
+    seedOtpCode(email, "482913");
+    const anon = await anonContext(playwright);
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const res = await anon.post("/api/auth/otp/verify", { data: { email, code: "000000" }, failOnStatusCode: false });
+        expect(res.status(), `attempt ${attempt} of 5 — ${await res.text()}`).toBe(401);
+      }
+      expect(attemptCount(email)).toBe(5);
+      expect(isLocked(email), "the 5th wrong code should have locked the email").toBeTruthy();
+
+      // The 6th attempt is blocked outright — even the CORRECT code, seeded above and never used,
+      // is refused rather than signing anyone in.
+      const sixth = await anon.post("/api/auth/otp/verify", { data: { email, code: "482913" }, failOnStatusCode: false });
+      expect(sixth.status(), await sixth.text()).toBe(429);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-07 repeated OTP resend requests count toward the same lockout, and the 6th request is blocked", async ({
+    playwright,
+  }) => {
+    const email = lockoutEmail("otp-resend");
+    const anon = await anonContext(playwright);
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const res = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
+        expect(res.status(), `resend ${attempt} of 5 — ${await res.text()}`).toBe(204);
+      }
+      expect(attemptCount(email)).toBe(5);
+      expect(isLocked(email), "the 5th resend should have locked the email").toBeTruthy();
+
+      const sixth = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
+      expect(sixth.status(), await sixth.text()).toBe(429);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-08 wrong password and wrong OTP codes share one counter, and locking the email blocks every login path", async ({
+    playwright,
+  }) => {
+    const email = lockoutEmail("shared-counter");
+    const password = "CorrectHorse9!";
+    seedPasswordUser(email, password);
+    seedOtpCode(email, "371592");
+    const anon = await anonContext(playwright);
+    try {
+      // 3 wrong passwords + 2 wrong OTP codes = 5 total failures, mixing both entry points into
+      // the one counter.
+      for (let i = 0; i < 3; i++) {
+        const res = await login(anon, email, "wrong-password");
+        expect(res.status()).toBe(401);
+      }
+      for (let i = 0; i < 2; i++) {
+        const res = await anon.post("/api/auth/otp/verify", { data: { email, code: "000000" }, failOnStatusCode: false });
+        expect(res.status()).toBe(401);
+      }
+      expect(attemptCount(email)).toBe(5);
+      expect(isLocked(email)).toBeTruthy();
+
+      // Locked via the mixed count — every login path for this email is now blocked, not only the
+      // one that happened to tip it over.
+      const passwordBlocked = await login(anon, email, password);
+      expect(passwordBlocked.status()).toBe(429);
+      const otpVerifyBlocked = await anon.post("/api/auth/otp/verify", {
+        data: { email, code: "371592" },
+        failOnStatusCode: false,
+      });
+      expect(otpVerifyBlocked.status()).toBe(429);
+      const otpRequestBlocked = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
+      expect(otpRequestBlocked.status()).toBe(429);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-09 a successful OTP login resets the failed-attempt counter", async ({ playwright }) => {
+    const email = lockoutEmail("otp-reset");
+    seedOtpCode(email, "159357");
+    const anon = await anonContext(playwright);
+    try {
+      // Three wrong guesses — short of the 5 that would lock the account.
+      for (let i = 0; i < 3; i++) {
+        await anon.post("/api/auth/otp/verify", { data: { email, code: "000000" }, failOnStatusCode: false });
+      }
+      expect(attemptCount(email)).toBe(3);
+
+      const success = await anon.post("/api/auth/otp/verify", { data: { email, code: "159357" }, failOnStatusCode: false });
+      expect(success.ok(), await success.text()).toBeTruthy();
+
+      expect(attemptCount(email)).toBe(0);
+    } finally {
+      await anon.dispose();
+    }
+  });
 });

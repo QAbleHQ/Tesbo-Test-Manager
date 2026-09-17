@@ -117,11 +117,14 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * already exists is the only way to reach the task read, feedback, draft, close and save routes at
    * all. This is the suite's usual "arrange through Postgres when the API path is unavailable" rule.
    */
-  function seedTask(fields: { status?: string; drafts?: number } = {}): string {
+  function seedTask(
+    fields: { status?: string; drafts?: number; jiraIssueKey?: string; draftOverrides?: Array<Record<string, unknown>> } = {},
+  ): string {
     const drafts = Array.from({ length: fields.drafts ?? 2 }, (_, i) => ({
       title: `E2E draft ${i + 1}`,
       steps: [{ action: "open the app", expected: "it opens" }],
       priority: "P2",
+      ...(fields.draftOverrides?.[i] ?? {}),
     }));
     /*
      * Two details of this row are load-bearing and were both wrong on the first attempt.
@@ -131,14 +134,21 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
      * does not exist. And generated_payload is a bare ARRAY of drafts, not an object wrapping one:
      * zyraDeleteDraft runs normalizeJsonArray over the column directly, so `{testcases: [...]}`
      * measures as zero drafts and every index is out of range.
+     *
+     * jira_issue_keys defaults to '[]' (its own column default) whenever fields.jiraIssueKey is
+     * omitted — every existing caller keeps behaving exactly as before. Passed, it's what
+     * processZyraSaveEntriesSequential/Batched's `existingLinked` lookup matches an already-saved
+     * test case's own jira_issue_key against, to exercise the "regenerating an already-linked case"
+     * path (severity/component "only fill if blank") rather than a brand-new create.
      */
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status) VALUES (" +
+        "requested_count, generated_count, generated_payload, agent_name, task_status, jira_issue_keys) VALUES (" +
         `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
         `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ` +
         `${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', ` +
-        `${literal(fields.status ?? "awaiting_review")});`,
+        `${literal(fields.status ?? "awaiting_review")}, ` +
+        `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb);`,
     );
     return scalar(
       `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
@@ -1900,6 +1910,74 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
     expect(stored, "a race between two discards lost one of the removals").toHaveLength(2);
   });
+
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — Zyra never asked the
+   * model for these two fields, so every generated test case saved with both null regardless of
+   * what the task-board draft carried. ZYR-A-71/72 cover the plain persistence path (a draft that
+   * already has the fields, and one that doesn't); ZYR-A-73/74 cover the "regenerating an
+   * already-linked test case" path, where an automatic redirect must never silently overwrite a
+   * human-set value — see processZyraSaveEntriesSequential/Batched's "only fill if blank" comment.
+   */
+  test("ZYR-A-71 a task-board draft's severity and component are persisted on save", async () => {
+    const draftTitle = `E2E severity component ${Date.now()}`;
+    const taskId = seedTask({ drafts: 1, draftOverrides: [{ title: draftTitle, severity: "High", component: "Auth" }] });
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+    expect(res.status(), `saving the draft — ${await res.text()}`).toBe(201);
+    expect(scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("Auth");
+  });
+
+  test("ZYR-A-72 a task-board draft with no severity or component still saves — both stay null, not a failure", async () => {
+    const draftTitle = `E2E no severity component ${Date.now()}`;
+    const taskId = seedTask({ drafts: 1, draftOverrides: [{ title: draftTitle }] });
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+    expect(res.status(), `saving the draft — ${await res.text()}`).toBe(201);
+    expect(scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("");
+  });
+
+  test("ZYR-A-73 regenerating an already-linked test case never overwrites its already-set severity/component with a fresh draft guess", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E already-linked case", priority: "P2", jiraIssueKey, severity: "Critical", component: "Payments" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the already-linked case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const draftTitle = `E2E regenerated content ${Date.now()}`;
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ title: draftTitle, severity: "Low", component: "Billing" }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      // Content is genuinely regenerated (this is a real redirect-to-update, not a no-op)...
+      expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe(draftTitle);
+      // ...but severity/component were already set by a human and must survive untouched.
+      expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(testcaseId)};`), "an already-set severity must never be overwritten by a regenerated draft").toBe("Critical");
+      expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(testcaseId)};`), "an already-set component must never be overwritten by a regenerated draft").toBe("Payments");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-74 regenerating an already-linked test case with no severity/component yet fills them in from the fresh draft", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E blank severity component case", priority: "P2", jiraIssueKey },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the blank case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ severity: "Medium", component: "Search" }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Medium");
+      expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Search");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
 });
 
 /*
@@ -2536,6 +2614,168 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
     expect(routerPrompt, "the still-live bug must be cited").toContain(activeTitle);
     expect(routerPrompt, "a soft-deleted bug must not reach the model as grounding context").not.toContain(deletedTitle);
+  });
+
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the model was never asked
+   * for either field (zyraSystemPrompt) and the parser never extracted them (normalizeAiDrafts), so
+   * a chat-generated draft always saved with both null. These drive the real chat "create" turn
+   * through the fake provider — unlike ZYR-A-71..74 in the other describe block above, which seed a
+   * draft directly and only exercise the SAVE/persistence half, these exercise the PROMPT and
+   * NORMALIZATION half: what's asked for, and how a model's raw answer is sanitized before it's ever
+   * staged.
+   */
+  test("ZYR-A-71 a chat-generated test case's severity and component are asked for, returned, and persisted on save", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E severity component generation");
+
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case for checkout.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout rejects an expired card",
+        preconditions: "A cart has at least one item.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Pay with an expired card", expectedResult: "Checkout is blocked with a clear error" }]),
+        testData: "",
+        expectedSummary: "The expired card is rejected before payment is attempted.",
+        priority: "P1",
+        severity: "High",
+        component: "Checkout",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a test case for checkout rejecting an expired card." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // The model was actually asked for both fields (zyraSystemPrompt's JSON shape), not just
+    // happened to answer with them.
+    const draftingPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+    expect(draftingPrompt, "the model must be asked for severity").toContain("severity");
+    expect(draftingPrompt, "the model must be asked for component").toContain("component");
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(taskId, "the create turn must have staged a review batch").toBeTruthy();
+
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBeLessThan(300);
+    const saved = await saveRes.json();
+    expect(saved.testcases).toHaveLength(1);
+
+    expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("Checkout");
+  });
+
+  test("ZYR-A-72 a severity value outside the fixed vocabulary is dropped to null on the saved row, never stored verbatim", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E invalid severity");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Case with an invented severity label",
+        preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+        priority: "P2", severity: "Blocker", component: "Auth", tags: ["zyra"], sourceRefs: [],
+      }],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Create a test case." }, failOnStatusCode: false });
+    expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    const saved = await saveRes.json();
+    expect(
+      scalar(`SELECT severity FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`),
+      "an unrecognized severity ('Blocker' is not Critical/High/Medium/Low) must never be stored verbatim",
+    ).toBe("");
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("Auth");
+  });
+
+  test("ZYR-A-73 a blank component is stored as null and an over-long one is truncated, not rejected", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E component bounds");
+    const overlong = "x".repeat(300);
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 2, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [
+        { title: "Case with a blank component", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a", priority: "P2", severity: "Low", component: "", tags: ["zyra"], sourceRefs: [] },
+        { title: "Case with an over-long component", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a", priority: "P2", severity: "Low", component: overlong, tags: ["zyra"], sourceRefs: [] },
+      ],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Create two test cases." }, failOnStatusCode: false });
+    expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    const saved = await saveRes.json();
+    expect(saved.testcases).toHaveLength(2);
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("");
+    const stored = scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[1].id)};`);
+    expect(stored.length, `an over-long component must be truncated to the column's 255-char bound, got ${stored.length}`).toBe(255);
+    expect(stored).toBe(overlong.slice(0, 255));
+  });
+
+  test("ZYR-A-74 an existing test case's component is offered to the model as reusable grounding context, scoped to this project only", async () => {
+    await allocateFakeAiKey();
+    const componentName = `PaymentsGateway${Date.now()}`;
+    const otherProjectComponentName = `OtherProjectOnlyComponent${Date.now()}`;
+
+    const seeded = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: "Existing payments case", component: componentName },
+      failOnStatusCode: false,
+    });
+    expect(seeded.status(), `seeding the existing case — ${await seeded.text()}`).toBe(201);
+    const seededId = (await seeded.json()).id;
+
+    // Same organization, a DIFFERENT project — proves the grounding query is project-scoped, not
+    // merely "not world-readable": a component from another project this same owner can also reach
+    // must still never leak into this project's generation context.
+    const seededOther = await asOwner.post(`/api/projects/${tenant!.secondProjectId}/testcases`, {
+      data: { title: "Other project's case", component: otherProjectComponentName },
+      failOnStatusCode: false,
+    });
+    expect(seededOther.status(), `seeding the other-project case — ${await seededOther.text()}`).toBe(201);
+    const seededOtherId = (await seededOther.json()).id;
+
+    try {
+      const sessionId = await newSession("E2E component grounding");
+      ai.queueReply({
+        reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+      });
+      ai.queueReply({
+        drafts: [{
+          title: "A new payments case", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+          priority: "P2", severity: "Low", component: componentName, tags: ["zyra"], sourceRefs: [],
+        }],
+      });
+
+      const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Create a new payments test case." }, failOnStatusCode: false,
+      });
+      expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+      const draftingPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+      expect(draftingPrompt, "an existing component in THIS project must be offered as reusable grounding").toContain(componentName);
+      expect(draftingPrompt, "another project's component name must never leak into this project's grounding context").not.toContain(otherProjectComponentName);
+    } finally {
+      await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${seededId}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/projects/${tenant!.secondProjectId}/testcases/${seededOtherId}`, { failOnStatusCode: false });
+    }
   });
 });
 
