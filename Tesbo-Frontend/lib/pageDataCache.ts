@@ -21,6 +21,16 @@ export function setPageCache<T>(key: string, data: T): void {
 }
 
 /**
+ * Drops one entry so the next mount of that page can't seed its first render from data a
+ * mutation elsewhere just made stale — for a route that changed another page's data without
+ * ever holding a reference to that page's own state (e.g. the Zyra chat panel saving test cases
+ * into the repository the Test Cases page has cached under `testcases:${projectId}`).
+ */
+export function invalidatePageCache(key: string): void {
+  cache.delete(key);
+}
+
+/**
  * Logout is a client-side redirect (router.replace + router.refresh), not a full document reload,
  * so this module's state would otherwise survive it — called from useLogout so the next signed-in
  * session in this tab never renders a stale cache-hit for a page it hasn't fetched yet itself.
