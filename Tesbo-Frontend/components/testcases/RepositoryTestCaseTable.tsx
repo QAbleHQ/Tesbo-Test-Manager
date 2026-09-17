@@ -19,6 +19,8 @@ export type RepoTcColumnId =
   | "suite"
   | "jira"
   | "priority"
+  | "severity"
+  | "component"
   | "status"
   | "updated"
   | "type"
@@ -32,6 +34,8 @@ const DATA_COLUMN_IDS: RepoDataColumnId[] = [
   "suite",
   "jira",
   "priority",
+  "severity",
+  "component",
   "status",
   "updated",
   "type",
@@ -45,6 +49,8 @@ const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
   suite: "Suite",
   jira: "Jira",
   priority: "Priority",
+  severity: "Severity",
+  component: "Component",
   status: "Status",
   updated: "Updated",
   type: "Type",
@@ -57,6 +63,8 @@ const FIELD_IDS: Record<RepoDataColumnId, string> = {
   suite: "suite",
   jira: "jira",
   priority: "priority",
+  severity: "severity",
+  component: "component",
   status: "status",
   updated: "updated",
   type: "type",
@@ -69,6 +77,8 @@ const DEFAULT_DATA_ORDER: RepoDataColumnId[] = [
   "suite",
   "jira",
   "priority",
+  "severity",
+  "component",
   "type",
   "automation",
   "status",
@@ -86,6 +96,8 @@ const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
   suite: false,
   jira: false,
   priority: true,
+  severity: false,
+  component: false,
   status: true,
   updated: true,
   type: true,
@@ -99,6 +111,8 @@ const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
   suite: 160,
   jira: 112,
   priority: 88,
+  severity: 100,
+  component: 140,
   status: 112,
   updated: 108,
   type: 120,
@@ -112,6 +126,8 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
   suite: 96,
   jira: 80,
   priority: 72,
+  severity: 80,
+  component: 96,
   status: 88,
   updated: 96,
   type: 88,
@@ -510,6 +526,18 @@ export function RepositoryTestCaseTable({
         return (
           <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
             <span className={innerTruncate}>{tc.type}</span>
+          </td>
+        );
+      case "severity":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.severity || "—"}</span>
+          </td>
+        );
+      case "component":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.component || "—"}</span>
           </td>
         );
       case "automation":

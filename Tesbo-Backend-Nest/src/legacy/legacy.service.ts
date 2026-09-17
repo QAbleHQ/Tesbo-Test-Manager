@@ -3366,6 +3366,7 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
+              testcases.severity, testcases.component,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb

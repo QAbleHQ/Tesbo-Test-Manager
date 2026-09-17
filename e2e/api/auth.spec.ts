@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import { expect, test } from "@playwright/test";
 import { env } from "../utils/env";
 import { clearOtpIpRateLimit, disposableEmail, seedOtpCode } from "../utils/otp";
+import { hashPasswordForSeed } from "../utils/password";
+import { dbControlAvailable, exec, execAllowingAuditImmutability, literal, scalar } from "../utils/psql";
 
 async function anonContext(playwright: import("@playwright/test").PlaywrightWorkerArgs["playwright"]) {
   // Playwright Test's request.newContext() otherwise inherits the project's default
@@ -272,6 +275,234 @@ test.describe("otp", () => {
       expect(blockedStatus).toBe(429);
     } finally {
       clearOtpIpRateLimit();
+      await anon.dispose();
+    }
+  });
+});
+
+test.describe("password login lockout", () => {
+  /*
+   * Per-email failed-password lockout (Tesbo-Backend-Nest/src/auth/login-lockout.service.ts): 5
+   * consecutive wrong passwords for one email block that email — and only that email — from
+   * password login for 24 hours, even with the correct password. Backed by otp_rate_limit
+   * (V1_init_schema.sql), keyed `login:<email>` so it can never collide with that table's
+   * documented (currently unused) `send:`/`verify:` OTP buckets.
+   *
+   * Every account here is seeded directly into Postgres with a real password hash
+   * (utils/password.ts's hashPasswordForSeed — the same technique global-setup.ts uses for the
+   * smoke tenant) rather than going through OTP or self-serve signup: cheaper, and it keeps this
+   * file's several-failed-attempts-per-test from ever touching the shared smoke tenant
+   * (env.testEmail) or another spec's counters. NEVER run failed attempts against env.testEmail —
+   * locking it for 24 hours would fail every other spec in the suite that logs in as that account.
+   */
+  const skipReason = dbControlAvailable()
+    ? null
+    : "needs `docker compose exec postgres psql` to seed a password user and inspect/adjust the lockout row";
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  const created: string[] = [];
+
+  test.afterAll(() => {
+    if (skipReason) return;
+    for (const email of created) purgeLockoutAccount(email);
+  });
+
+  function lockoutEmail(label: string): string {
+    const email = disposableEmail(`lockout-${label}`);
+    created.push(email);
+    return email;
+  }
+
+  /** A real, password-login-capable user, seeded straight into Postgres — no OTP, no email. */
+  function seedPasswordUser(email: string, password: string): void {
+    const hash = hashPasswordForSeed(password);
+    exec(
+      `INSERT INTO users (email, name, password_hash, profile_completed_at) ` +
+        `VALUES (${literal(email.toLowerCase())}, 'E2E Lockout User', ${literal(hash)}, now());`,
+    );
+  }
+
+  function purgeLockoutAccount(email: string): void {
+    const normalized = email.toLowerCase();
+    exec(`DELETE FROM otp_rate_limit WHERE email = ${literal(`login:${normalized}`)};`);
+    exec(
+      `DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM users WHERE email = ${literal(normalized)});`,
+    );
+    execAllowingAuditImmutability(`DELETE FROM users WHERE email = ${literal(normalized)};`);
+  }
+
+  function attemptCount(email: string): number {
+    const raw = scalar(
+      `SELECT attempt_count FROM otp_rate_limit WHERE email = ${literal(`login:${email.toLowerCase()}`)};`,
+    );
+    return raw ? Number(raw) : 0;
+  }
+
+  function isLocked(email: string): boolean {
+    return (
+      scalar(
+        `SELECT (locked_until > now()) FROM otp_rate_limit WHERE email = ${literal(`login:${email.toLowerCase()}`)};`,
+      ) === "t"
+    );
+  }
+
+  /** Simulates the 24 hours having already passed, instead of waiting for it. */
+  function expireLockNow(email: string): void {
+    exec(
+      `UPDATE otp_rate_limit SET locked_until = now() - interval '1 minute' WHERE email = ${literal(`login:${email.toLowerCase()}`)};`,
+    );
+  }
+
+  /**
+   * A random, never-delivered reset token seeded straight into password_reset_tokens — the same
+   * shape PasswordResetService.resetPassword expects, without needing to read a real email.
+   */
+  function seedResetToken(email: string): string {
+    const userId = scalar(`SELECT id FROM users WHERE email = ${literal(email.toLowerCase())};`);
+    const rawToken = `e2e-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tokenHash = createHash("sha256").update(rawToken, "utf8").digest("base64url");
+    exec(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) ` +
+        `VALUES (${literal(userId)}, ${literal(tokenHash)}, now() + interval '1 hour');`,
+    );
+    return rawToken;
+  }
+
+  async function login(anon: import("@playwright/test").APIRequestContext, email: string, password: string) {
+    return anon.post("/api/auth/password/login", { data: { email, password }, failOnStatusCode: false });
+  }
+
+  test("LOGIN-LOCK-01 five wrong passwords each read as a normal failure, and the 6th is blocked even with the right password", async ({
+    playwright,
+  }) => {
+    const email = lockoutEmail("five-then-six");
+    const password = "CorrectHorse9!";
+    seedPasswordUser(email, password);
+    const anon = await anonContext(playwright);
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const res = await login(anon, email, "wrong-password");
+        expect(res.status(), `attempt ${attempt} of 5 — ${await res.text()}`).toBe(401);
+      }
+      expect(attemptCount(email)).toBe(5);
+      expect(isLocked(email), "the 5th failure should have locked the email").toBeTruthy();
+
+      // The 6th attempt is blocked outright — even with the CORRECT password, it never gets far
+      // enough to check it.
+      const sixth = await login(anon, email, password);
+      expect(sixth.status(), await sixth.text()).toBe(429);
+      const body = await sixth.json();
+      expect(body.error).toContain("Too many failed login attempts");
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-02 locking one email does not affect a different email's ability to log in", async ({ playwright }) => {
+    const lockedEmail = lockoutEmail("isolation-locked");
+    const otherEmail = lockoutEmail("isolation-other");
+    const password = "CorrectHorse9!";
+    seedPasswordUser(lockedEmail, password);
+    seedPasswordUser(otherEmail, password);
+    const anon = await anonContext(playwright);
+    try {
+      for (let i = 0; i < 5; i++) {
+        await login(anon, lockedEmail, "wrong-password");
+      }
+      expect(isLocked(lockedEmail)).toBeTruthy();
+
+      const blocked = await login(anon, lockedEmail, password);
+      expect(blocked.status()).toBe(429);
+
+      // A completely unrelated email must log in normally, unaffected by the other account's lock.
+      const otherLogin = await login(anon, otherEmail, password);
+      expect(otherLogin.ok(), await otherLogin.text()).toBeTruthy();
+      expect(isLocked(otherEmail)).toBeFalsy();
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-03 a successful login resets the failed-attempt counter", async ({ playwright }) => {
+    const email = lockoutEmail("reset-on-success");
+    const password = "CorrectHorse9!";
+    seedPasswordUser(email, password);
+    const anon = await anonContext(playwright);
+    try {
+      // Three failures — short of the 5 that would lock the account.
+      for (let i = 0; i < 3; i++) {
+        await login(anon, email, "wrong-password");
+      }
+      expect(attemptCount(email)).toBe(3);
+
+      const success = await login(anon, email, password);
+      expect(success.ok(), await success.text()).toBeTruthy();
+
+      // The counter row is cleared outright, not merely decremented — so a fresh run of failures
+      // starts the 5-attempt count from zero, not from 3.
+      expect(attemptCount(email)).toBe(0);
+      for (let i = 0; i < 4; i++) {
+        const res = await login(anon, email, "wrong-password");
+        expect(res.status()).toBe(401);
+      }
+      expect(isLocked(email), "4 fresh failures after a reset must not lock the account").toBeFalsy();
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-04 completing a password reset clears the lock, even mid-block", async ({ playwright }) => {
+    const email = lockoutEmail("reset-unlocks");
+    const oldPassword = "CorrectHorse9!";
+    const newPassword = "NewHorse9!";
+    seedPasswordUser(email, oldPassword);
+    const anon = await anonContext(playwright);
+    try {
+      for (let i = 0; i < 5; i++) {
+        await login(anon, email, "wrong-password");
+      }
+      expect(isLocked(email)).toBeTruthy();
+      const blocked = await login(anon, email, oldPassword);
+      expect(blocked.status()).toBe(429);
+
+      const token = seedResetToken(email);
+      const resetRes = await anon.post("/api/auth/password/reset", {
+        data: { token, password: newPassword },
+        failOnStatusCode: false,
+      });
+      expect(resetRes.ok(), await resetRes.text()).toBeTruthy();
+
+      // Unblocked immediately — the new password works right away, with no 24-hour wait.
+      expect(isLocked(email), "the lock must be cleared by a completed reset").toBeFalsy();
+      const afterReset = await login(anon, email, newPassword);
+      expect(afterReset.ok(), await afterReset.text()).toBeTruthy();
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("LOGIN-LOCK-05 the lock expires after 24 hours, and login works again with the correct password", async ({ playwright }) => {
+    const email = lockoutEmail("expiry");
+    const password = "CorrectHorse9!";
+    seedPasswordUser(email, password);
+    const anon = await anonContext(playwright);
+    try {
+      for (let i = 0; i < 5; i++) {
+        await login(anon, email, "wrong-password");
+      }
+      expect(isLocked(email)).toBeTruthy();
+
+      expireLockNow(email);
+      expect(isLocked(email)).toBeFalsy();
+
+      const afterExpiry = await login(anon, email, password);
+      expect(afterExpiry.ok(), await afterExpiry.text()).toBeTruthy();
+      // A successful login clears the row outright, same as any other successful login.
+      expect(attemptCount(email)).toBe(0);
+    } finally {
       await anon.dispose();
     }
   });
