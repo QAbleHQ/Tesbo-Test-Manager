@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow } from "@/lib/api";
+import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
+import { useAppData } from "@/components/app/AppDataProvider";
 import { Button, CopyButton, StatusChip } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
@@ -96,6 +98,7 @@ export function ZyraChatReviewPanel({
   reviewRequestId: string;
   initialRows: ZyraChatTestcaseRow[];
 }) {
+  const { workspace } = useAppData();
   const [status, setStatus] = useState<"checking" | "in_review" | "resolved">("checking");
   const [rows, setRows] = useState<ZyraChatTestcaseRow[]>(initialRows);
   const [selected, setSelected] = useState<number[]>(() => initialRows.map((_, index) => index));
@@ -187,6 +190,9 @@ export function ZyraChatReviewPanel({
     try {
       const savedSet = new Set(selected);
       const result = await saveZyraTask(projectId, reviewRequestId, { selectedDraftIndexes: selected });
+      // Fire-and-forget: refreshes every module whose cache holds test-case-derived data, in the
+      // background, without making this save feel slower. See lib/zyraCacheSync.ts.
+      refreshPageCachesAfterZyraSave(projectId, workspace?.id);
       // A partial selection leaves the rest staged for a later Save — only once nothing remains
       // does the batch resolve (matches the server: see zyraSaveAttempt's `remaining` handling).
       setRows((prev) => prev.filter((_, i) => !savedSet.has(i)).map((row, newIndex) => ({ ...row, draftIndex: newIndex })));

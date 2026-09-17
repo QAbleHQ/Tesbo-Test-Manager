@@ -1957,6 +1957,176 @@ test.describe("zyra / agents (UI)", () => {
   });
 
   /*
+   * Regression test for the Test Case Repository not reflecting a Zyra save until a manual reload.
+   * The Test Cases page seeds its first render from an in-memory, per-tab cache (pageDataCache,
+   * keyed `testcases:${projectId}`) rather than always fetching live first — see its own doc
+   * comment. The chat review panel used to save into the repository without ever touching that
+   * cache, so a tab that had Test Cases open earlier in the session, then saved via Zyra, then
+   * navigated back, rendered the pre-save snapshot (old suite list, old counts) until the page's
+   * own background revalidation fetch happened to finish.
+   *
+   * The fix is NOT to drop the cache entry on save (that was tried and reverted — it traded "shows
+   * stale data instantly" for "shows a blocking spinner until a live fetch finishes", which is its
+   * own regression: a real, noticeably slower Test Cases open right after every Zyra save).
+   * ZyraChatReviewPanel.tsx instead refetches suites/summary in the BACKGROUND the moment the save
+   * succeeds (refreshTestCasesPageCache) and writes the result into the same cache entry, so the
+   * correct data is already sitting there by the time the user actually clicks over.
+   *
+   * To prove both halves of that without racing the real backend's timing: first wait for the
+   * background refresh's own network call to complete (so the cache is provably updated before
+   * navigating), THEN artificially delay the Test Cases page's own mount-time fetch of the same
+   * endpoint. If the fix works, the very first paint after navigating already shows the new suite
+   * and count — sourced from the cache, not from that (still in-flight, delayed) fetch — and no
+   * loading spinner ever appears. Before this fix, that first paint would have shown the stale
+   * suite-less snapshot; with the earlier (reverted) invalidate-only approach, it would have shown
+   * a spinner instead. Either wrong prior behavior is distinguishable from the two assertions below.
+   */
+  test("ZYU-80 navigating from a Zyra save back to Test Cases shows the new suite and counts immediately, with no loading spinner", async ({
+    browser,
+  }) => {
+    // Prime the Test Cases page's cache with a pre-save snapshot — no suites, no test cases yet —
+    // the same way a real user would already have this page open earlier in the session.
+    const page = await open(browser, "/testcases");
+    await expect(page.getByText("Zyra generated test cases")).toHaveCount(0);
+    await expect(page.getByText(/0 test cases across 0 suites/)).toBeVisible();
+
+    // Leaving suiteId null means the backend files this under its default "Zyra generated test
+    // cases" suite (LegacyService.ZYRA_DRAFT_SUITE_NAME) — a suite that does not exist yet, so its
+    // very appearance after saving is itself proof the repository picked up the new data.
+    const draftTitle = stamp("Fresh from Zyra");
+    seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+
+    // Client-side navigation only, via the same sidebar/modal links a real user clicks (ZYU-02) —
+    // a page.goto() would do a full document load and reset pageDataCache's module state for free,
+    // which would prove nothing about the bug.
+    await page.getByRole("link", { name: "Agents", exact: true }).click();
+    await page.getByRole("button", { name: /Zyra the Test Generator/ }).click();
+    await page.getByRole("link", { name: /Agent workspace/ }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/agents/zyra$`));
+
+    const suitesPath = `/api/projects/${tenant!.mainProjectId}/suites`;
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    // Set up the wait before clicking — the background refresh's request can land before the next
+    // line would otherwise get a chance to start listening for it.
+    const backgroundRefresh = page.waitForResponse(
+      (res) => new URL(res.url()).pathname === suitesPath && res.request().method() === "GET",
+    );
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    await expect
+      .poll(
+        () =>
+          Number(
+            scalar(
+              `SELECT COUNT(*) FROM testcases t JOIN suites s ON s.id = t.suite_id ` +
+                `WHERE t.project_id = ${literal(tenant!.mainProjectId)} AND s.name = 'Zyra generated test cases' AND t.title = ${literal(draftTitle)};`,
+            ),
+          ),
+        { message: "the saved proposal must land in the default Zyra suite as a real test case" },
+      )
+      .toBe(1);
+    // Confirms the background cache refresh's own suites fetch has completed — the cache is
+    // provably holding fresh data now, before we ever navigate back to Test Cases.
+    await backgroundRefresh;
+
+    // Only now delay the Test Cases page's OWN mount-time fetch of the same endpoint — everything
+    // above, including the background refresh just awaited, must stay fast and unaffected.
+    await page.route(
+      (url) => url.pathname === suitesPath,
+      async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await route.continue();
+      },
+    );
+
+    await page.getByRole("link", { name: "Test cases" }).click();
+
+    // The very first paint after navigating back already has the background-refreshed cache to
+    // seed from: no loading state at all, and the new suite/count are correct immediately — sourced
+    // from that cache, not from the mount's own fetch, which is still artificially stuck mid-flight.
+    await expect(page.getByRole("status")).toHaveCount(0);
+    await expect(page.getByText("Zyra generated test cases")).toBeVisible();
+    await expect(page.getByText(/1 test case across 1 suite/)).toBeVisible();
+  });
+
+  /**
+   * Representative coverage for the same fix generalized beyond Test Cases: dashboard, reports
+   * (overview + execFilters), requirements, agents/tasks, agents/zyra/settings, and the workspace
+   * projects list all cache a test-case-derived count/summary the same way testcases/page.tsx did,
+   * and are now refreshed by the same lib/zyraCacheSync.ts helper ZYU-80 already exercises end to
+   * end. Every one of those pages goes through the identical generic patchPageCacheIfCached() —
+   * the only per-page risk is a wrong cache key or field name, which type-checking alone would not
+   * catch (a string literal typo still compiles). This pins that the dashboard's wiring — cache key
+   * `dashboard:${projectId}`, field `summary.testCases.total`, endpoint `GET .../dashboard` — is
+   * actually correct, the same way ZYU-80 pins it for testcases/page.tsx, rather than trusting the
+   * other five pages' wiring by code review alone.
+   */
+  test("ZYU-81 saving via Zyra also refreshes the dashboard's Test cases stat, not just the Test Cases page", async ({
+    browser,
+  }) => {
+    // Same locator convention as ui/project-dashboard.spec.ts's own statCard/statValue helpers:
+    // filtered on containing a <p> as well as the label, since the sidebar's own "Test cases" nav
+    // link is also an /projects/... link carrying the same words but has no <p> inside it.
+    const testCasesCard = (p: Page) =>
+      p.locator('a[href*="/projects/"]').filter({ has: p.locator("p") }).filter({ hasText: "Test cases" }).first();
+    const cardValue = (card: Locator) => card.evaluate((el) => el.querySelector("p")?.textContent?.trim() ?? "");
+
+    const page = await open(browser, "/dashboard");
+    await expect(testCasesCard(page)).toBeVisible();
+    expect(await cardValue(testCasesCard(page))).toBe("0");
+
+    const draftTitle = stamp("Fresh from Zyra for dashboard");
+    seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+
+    await page.getByRole("link", { name: "Agents", exact: true }).click();
+    await page.getByRole("button", { name: /Zyra the Test Generator/ }).click();
+    await page.getByRole("link", { name: /Agent workspace/ }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/agents/zyra$`));
+
+    const dashboardPath = `/api/projects/${tenant!.mainProjectId}/dashboard`;
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    const backgroundRefresh = page.waitForResponse(
+      (res) => new URL(res.url()).pathname === dashboardPath && res.request().method() === "GET",
+    );
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    // Confirms the background cache refresh's own dashboard-summary fetch has completed — the
+    // cache is provably holding the fresh count now, before navigating back to the dashboard.
+    await backgroundRefresh;
+
+    // Only now delay the dashboard page's OWN mount-time fetch of the same endpoint.
+    await page.route(
+      (url) => url.pathname === dashboardPath,
+      async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await route.continue();
+      },
+    );
+
+    // "Project home" is the sidebar link that reaches the dashboard — it's a client-side redirect
+    // (app/(app)/projects/[id]/page.tsx does router.replace to .../dashboard), still client-side
+    // navigation throughout, so pageDataCache's module state survives the hop.
+    await page.getByRole("link", { name: "Project home" }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/dashboard$`));
+
+    // Correct immediately, sourced from the background-refreshed cache — not from the mount's own
+    // fetch, which is still artificially stuck mid-flight.
+    expect(await cardValue(testCasesCard(page))).toBe("1");
+  });
+
+  /*
    * Frontend defense-in-depth for the reported bug ("8 flight booking test cases drafted and staged
    * for your review" with no table, no review panel) — added alongside the backend fix
    * (buildZyraChatDecision's router salvage-retry) so a FUTURE regression in that guard still can't
