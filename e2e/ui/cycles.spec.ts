@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
+import { literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 const STATE_PATH = path.join(__dirname, "../.auth/state.json");
@@ -874,5 +875,45 @@ test.describe("Schedule Run — Run At validation", () => {
     await page.locator('input[type="datetime-local"]').fill(futureValue);
     await expect(page.getByText("Date and time must be in future")).toBeHidden();
     expect(scheduleRequestSent, "still no request from correcting the field alone").toBe(false);
+  });
+});
+
+/*
+ * Hard-delete remediation, Phase 1 ("Zyra Workflow Agents/hard-delete-remediation-progress-log.md")
+ * — deleting a run through the UI drives the exact same DELETE /api/cycles/:id the API-level test
+ * in api/cycles.spec.ts exercises directly, and that behavior is unchanged by this phase (design
+ * point 7 of the phase-gate inspection: deleting a run must keep looking instant and identical to
+ * today from the UI's point of view). This is the product-surface half of that same fix: a person
+ * clicking Delete still sees the run vanish from the list, while the row underneath now survives,
+ * soft-deleted, instead of being destroyed outright.
+ */
+test.describe("deleting a run from the UI (hard-delete remediation Phase 1)", () => {
+  test("deleting a run through the runs list removes its card, and the row survives soft-deleted underneath", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const name = `E2E UI Delete Run ${Date.now()}`;
+    let cycleId = "";
+    try {
+      const cycle = await (await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name } })).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles`);
+      await expect(page.getByText(name, { exact: true })).toBeVisible();
+
+      await runCard(page, cycleId).getByTitle("Delete run").click();
+      await expect(page.getByText("Delete Test Run")).toBeVisible();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      // Gone from the list — the same observable behavior as before this fix.
+      await expect(page.getByText(name, { exact: true })).not.toBeVisible();
+
+      // Database-visible: the row survived, soft-deleted, rather than vanishing outright.
+      expect(
+        scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycleId)};`),
+        "the run must survive soft-deleted, not be hard-deleted",
+      ).toBe("t");
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
   });
 });

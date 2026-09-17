@@ -253,7 +253,13 @@ test.describe("screens sweep — the pages no other spec opens", () => {
       expect(page.url(), "a share link redirected an anonymous visitor to sign in").not.toContain("/login");
     } finally {
       await visitor.close();
-      if (cycleId) exec(`DELETE FROM cycles WHERE id = ${literal(cycleId)};`);
+      if (cycleId) {
+        // cycle_items.cycle_id / executions.cycle_item_id are ON DELETE RESTRICT now (V111) — clear
+        // children before the cycle itself.
+        exec(`DELETE FROM executions WHERE cycle_item_id IN (SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycleId)});`);
+        exec(`DELETE FROM cycle_items WHERE cycle_id = ${literal(cycleId)};`);
+        exec(`DELETE FROM cycles WHERE id = ${literal(cycleId)};`);
+      }
     }
   });
 

@@ -100,7 +100,14 @@ export function buildMcpTools(): McpTool[] {
         // (e.g. "expected" instead of "expectedResult") exactly the way Zyra's chat/task-board
         // output can. Reuse the same tolerant mapping Zyra's write paths already run through
         // rather than storing whatever shape the caller happened to send.
-        const body = Array.isArray(args.steps) ? { ...args, steps: ctx.legacy.safeSteps(args.steps) } : args;
+        // Pre-stringified to match what the create/edit modal sends (testcases/page.tsx), same as
+        // Zyra's own write paths — insertTestCaseWithClient applies exactly one more encode on top
+        // of whatever it's given, so a bare array here got single-encoded into a genuine jsonb
+        // array, a shape the editor's parseSteps() silently discards as one blank step. See
+        // "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+        const body = Array.isArray(args.steps)
+          ? { ...args, steps: JSON.stringify(ctx.legacy.safeSteps(args.steps)) }
+          : args;
         return ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, body);
       }
     },

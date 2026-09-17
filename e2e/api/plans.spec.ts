@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
-import { dbControlAvailable } from "../utils/psql";
+import { dbControlAvailable, literal, scalar } from "../utils/psql";
 import { softDeleteExecutions } from "../utils/screens-tenant";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -90,6 +90,49 @@ test.describe("test plan CRUD", () => {
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, {
         failOnStatusCode: false,
       });
+    }
+  });
+
+  // Zyra context integrity, Phase 3/4 (Q10, resolved by Yuvraj): a plan item's suite_id is a
+  // snapshot of what the plan targeted when it was built, not a live reference — there is no
+  // background job that keeps it in sync with the suite tree the way a testcase's suite_id is kept
+  // current. So unlike every LIVE suite listing (which simply stops showing a soft-deleted suite,
+  // no behavior change from before this phase), planItemRows deliberately does NOT blank the name
+  // out or drop the row: it preserves it as historical record, marked "(deleted)", the same
+  // "history, not current state" category audit_logs already is.
+  test("a plan item naming a since-deleted suite keeps the suite's name, marked as deleted, rather than blanking it", async ({
+    request,
+  }) => {
+    const plan = await (
+      await request.post(`/api/projects/${ctx.projectId}/plans`, {
+        data: { name: `E2E Plan Deleted Suite ${Date.now()}` },
+      })
+    ).json();
+    const suiteName = `E2E Plan Item Deleted Suite ${Date.now()}`;
+    const suite = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: suiteName } })
+    ).json();
+
+    try {
+      const suiteItem = await (
+        await request.post(`/api/plans/${plan.id}/items`, { data: { suiteId: suite.id } })
+      ).json();
+
+      const beforeDelete = await (await request.get(`/api/plans/${plan.id}/items`)).json();
+      expect(beforeDelete.find((i: { id: string }) => i.id === suiteItem.id).suiteName).toBe(suiteName);
+
+      const deleteRes = await request.delete(`/api/suites/${suite.id}`, { params: { mode: "moveToDefault" } });
+      expect(deleteRes.ok(), `deleting the suite — ${await deleteRes.text()}`).toBeTruthy();
+
+      // The suite itself is gone from every live listing (unchanged behavior, asserted elsewhere in
+      // suites.spec.ts) — but the plan item naming it must still resolve, with the name preserved
+      // and marked, not blanked to null/empty the way a fresh "no suite" plan item would read.
+      const afterDelete = await (await request.get(`/api/plans/${plan.id}/items`)).json();
+      const itemAfterDelete = afterDelete.find((i: { id: string }) => i.id === suiteItem.id);
+      expect(itemAfterDelete, "the plan item itself must survive the suite's deletion").toBeTruthy();
+      expect(itemAfterDelete.suiteName).toBe(`${suiteName} (deleted)`);
+    } finally {
+      await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
     }
   });
 
@@ -207,6 +250,81 @@ test.describe("test plan CRUD", () => {
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, {
         failOnStatusCode: false,
       });
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 2. V111 made `cycles`/`cycle_items` soft-deletable (Phase 1), but
+ * three of the plan screen's own read sites — planRunRows (GET /api/plans/:id/runs),
+ * planProgressRollup (GET /api/plans/:id/progress) and listPlans' run-count/last-run subquery (GET
+ * /api/projects/:id/plans) — kept joining `cycles`/`cycle_items` with no `deleted_at IS NULL` filter.
+ * A soft-deleted run therefore kept counting on every one of those three surfaces even though the
+ * run itself already 404s (requireCycleAccess, Phase 1) — the plan header, the runs list beneath it,
+ * and the plan card's "N runs" chip all going stale in the same way, which is why one test below
+ * checks all three together rather than three separate specs drifting apart later.
+ */
+test.describe("plan roll-ups exclude soft-deleted runs (hard-delete remediation Phase 2)", () => {
+  test("deleting a linked run drops it from the plan's run list, its progress roll-up, and the plan card's run/case counts", async ({
+    request,
+  }) => {
+    const plan = await (
+      await request.post(`/api/projects/${ctx.projectId}/plans`, {
+        data: { name: `E2E Plan Soft-Deleted Run ${Date.now()}` },
+      })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `E2E Plan Soft-Deleted Run Case ${Date.now()}` },
+      })
+    ).json();
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, {
+        data: { name: `E2E Plan Soft-Deleted Run Cycle ${Date.now()}`, planId: plan.id },
+      })
+    ).json();
+    const summaryFor = async () => {
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+      return list.find((p: { id: string }) => p.id === plan.id);
+    };
+
+    try {
+      await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      const executions = await (await request.get(`/api/cycles/${cycle.id}/executions`)).json();
+      await request.patch(`/api/cycles/${cycle.id}/executions/${executions[0].id}`, { data: { status: "Passed" } });
+
+      // Before the delete: the run counts everywhere, so the disappearance below is proven to be
+      // the delete's effect and not these endpoints failing to find the fixture at all.
+      const runsBefore = await (await request.get(`/api/plans/${plan.id}/runs`)).json();
+      expect(runsBefore.some((r: { id: string }) => r.id === cycle.id)).toBe(true);
+      const progressBefore = await (await request.get(`/api/plans/${plan.id}/progress`)).json();
+      expect(progressBefore).toMatchObject({ runCount: 1, totalCases: 1, passed: 1 });
+      const summaryBefore = await summaryFor();
+      expect(summaryBefore).toMatchObject({ runCount: 1, passed: 1 });
+      expect(summaryBefore.lastRunAt).toBeTruthy();
+
+      const deleteRes = await request.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+      // Confirms the row genuinely survives soft-deleted underneath, so the three assertions below
+      // are exercising the new deleted_at filters, not a run that was hard-deleted (and would
+      // disappear from every join trivially, filter or not).
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycle.id)};`)).toBe("t");
+
+      // #2 planRunRows: the run drops out of the plan's own runs list.
+      const runsAfter = await (await request.get(`/api/plans/${plan.id}/runs`)).json();
+      expect(runsAfter.some((r: { id: string }) => r.id === cycle.id), "the soft-deleted run must not appear in planRunRows").toBe(false);
+
+      // #3 planProgressRollup: the header roll-up goes back to reporting nothing to execute.
+      const progressAfter = await (await request.get(`/api/plans/${plan.id}/progress`)).json();
+      expect(progressAfter).toMatchObject({ runCount: 0, totalCases: 0, passed: 0 });
+
+      // #4 listPlans: the plan card's run_count/passed/last_run_at all fall back to their empty state.
+      const summaryAfter = await summaryFor();
+      expect(summaryAfter).toMatchObject({ runCount: 0, passed: 0 });
+      expect(summaryAfter.lastRunAt).toBeNull();
+    } finally {
+      await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
     }
   });
 });
@@ -595,4 +713,73 @@ test.describe("test plan progress roll-up", () => {
     }
   });
 
+});
+
+/*
+ * Hard-delete remediation Phase 4: `plans` and `plan_items` themselves. deletePlan/deletePlanItem
+ * issued real DELETEs, and plan_items.plan_id was ON DELETE CASCADE, so deleting a plan destroyed
+ * every item in it with no audit trail. V114 converts both to soft-delete, matching
+ * testcases/suites/cycles/bugs. These tests prove the rows genuinely survive (not just that the API
+ * stops showing them) and that listPlans' case/run counts self-correct.
+ */
+test.describe("plan and plan-item soft-delete (hard-delete remediation Phase 4)", () => {
+  test("deleting a plan soft-deletes it and every one of its items, none of it physically removed", async ({ request }) => {
+    const plan = await (
+      await request.post(`/api/projects/${ctx.projectId}/plans`, { data: { name: `E2E Plan Soft-Delete ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Plan Soft-Delete Case ${Date.now()}` } })
+    ).json();
+    try {
+      const item = await (
+        await request.post(`/api/plans/${plan.id}/items`, { data: { testcaseId: testcase.id } })
+      ).json();
+
+      const delRes = await request.delete(`/api/plans/${plan.id}`);
+      expect(delRes.ok(), `deleting the plan — ${await delRes.text()}`).toBeTruthy();
+
+      // DB-level proof, not just the API's 404 — both rows must still physically exist, soft-deleted.
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM plans WHERE id = ${literal(plan.id)};`)).toBe("t");
+      expect(scalar(`SELECT COUNT(*)::text FROM plans WHERE id = ${literal(plan.id)};`)).toBe("1");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM plan_items WHERE id = ${literal(item.id)};`)).toBe("t");
+      expect(scalar(`SELECT COUNT(*)::text FROM plan_items WHERE id = ${literal(item.id)};`)).toBe("1");
+
+      // Every read path 404s/excludes it, exactly as if it were gone.
+      expect((await request.get(`/api/plans/${plan.id}`, { failOnStatusCode: false })).status()).toBe(404);
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+      expect(list.some((p: { id: string }) => p.id === plan.id)).toBeFalsy();
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("removing a single plan item soft-deletes it and it drops out of listPlans' case count", async ({ request }) => {
+    const plan = await (
+      await request.post(`/api/projects/${ctx.projectId}/plans`, { data: { name: `E2E Plan Item Soft-Delete ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Plan Item Soft-Delete Case ${Date.now()}` } })
+    ).json();
+    try {
+      const item = await (
+        await request.post(`/api/plans/${plan.id}/items`, { data: { testcaseId: testcase.id } })
+      ).json();
+
+      const before = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+      expect(before.find((p: { id: string }) => p.id === plan.id).caseCount).toBe(1);
+
+      const delRes = await request.delete(`/api/plans/${plan.id}/items/${item.id}`);
+      expect(delRes.ok(), `removing the item — ${await delRes.text()}`).toBeTruthy();
+
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM plan_items WHERE id = ${literal(item.id)};`)).toBe("t");
+      const itemsAfter = await (await request.get(`/api/plans/${plan.id}/items`)).json();
+      expect(itemsAfter.some((i: { id: string }) => i.id === item.id)).toBeFalsy();
+
+      const after = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+      expect(after.find((p: { id: string }) => p.id === plan.id).caseCount, "the removed item must not still be counted").toBe(0);
+    } finally {
+      await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
 });

@@ -8,7 +8,7 @@ import {
   resetRbacMembership,
   type RbacTenant,
 } from "../utils/rbac-tenant";
-import { exec, literal } from "../utils/psql";
+import { exec, literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -899,6 +899,242 @@ test.describe("bug assignee", () => {
       }
     } finally {
       exec(`UPDATE users SET name = ${literal(`E2E bugs-assignee QA`)} WHERE id = ${literal(tenant!.qa.userId)}`);
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 2. Two bug-owned sites from the cycles/cycle_items read-path gap
+ * sweep: sanitizeBugLinks' cycle-id validation (a soft-deleted cycle must be refused the same way an
+ * unknown one already is, not silently accepted into a link) and bugSelect's linked-cycle name (a
+ * historical display: the link record should keep saying which run the bug was found in even after
+ * that run is gone, marked "(deleted)" rather than dropped — the suites precedent, not the filter
+ * precedent the other 15 sites got).
+ */
+test.describe("bug links and soft-deleted cycles (hard-delete remediation Phase 2)", () => {
+  test("sanitizeBugLinks refuses a soft-deleted cycle's id the same way it refuses an unknown one", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug Link Deleted Cycle ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Bug Link Deleted Cycle Case ${Date.now()}` } })
+    ).json();
+
+    try {
+      const deleteRes = await request.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycle.id)};`)).toBe("t");
+
+      // Before this fix, sanitizeBugLinks' cycle lookup had no deleted_at filter, so a soft-deleted
+      // run's id still passed validation and the link was accepted, pointing traceability at a run
+      // that every other screen already treats as gone.
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: {
+            title: `E2E Bug Against Deleted Cycle ${Date.now()}`,
+            links: [{ testcaseId: testcase.id, cycleId: cycle.id }],
+          },
+        })
+      ).json();
+
+      try {
+        expect(created.links).toHaveLength(1);
+        expect(created.links[0].testcaseId, "the testcase half of the link is still valid and kept").toBe(testcase.id);
+        expect(created.links[0].cycleId, "the soft-deleted cycle id must be dropped, same as an unknown one").toBeNull();
+      } finally {
+        await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+      }
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a bug's linked-cycle name survives the run being deleted, marked rather than blanked", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug Link Historical Cycle ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Bug Link Historical Case ${Date.now()}` } })
+    ).json();
+    await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: {
+          title: `E2E Bug With Historical Link ${Date.now()}`,
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id }],
+        },
+      })
+    ).json();
+
+    try {
+      expect(created.links[0].cycleName).toBe(cycle.name);
+
+      const deleteRes = await request.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      // The link record itself (bug_links.cycle_id) is untouched by the run's own soft-delete — no
+      // FK cascades it, no fix rewrote it — so the bug still reads as linked to that run, and the
+      // GET below is what proves the display survives, not merely the raw column.
+      const afterDelete = await (await request.get(`/api/bugs/${created.id}`)).json();
+      expect(afterDelete.links).toHaveLength(1);
+      expect(afterDelete.links[0].cycleId, "the link itself is untouched by the run's soft-delete").toBe(cycle.id);
+      expect(afterDelete.links[0].cycleName, "the name must be marked deleted, not blanked or left stale").toBe(`${cycle.name} (deleted)`);
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 3: `bugs` itself. deleteBug issued a real `DELETE FROM bugs`, and
+ * bug_links.bug_id was ON DELETE CASCADE, so deleting a bug destroyed every trace link with no audit
+ * trail. V113 converts it to a soft-delete, matching testcases/suites/cycles. These tests prove the
+ * row genuinely survives (not just that the API stops showing it), that its links survive alongside
+ * it untouched, that the evidence-upload gate now rejects a deleted bug, and that the per-project
+ * BUG-n sequence is never reissued.
+ */
+test.describe("bug soft-delete (hard-delete remediation Phase 3)", () => {
+  test("deleting a bug soft-deletes the row and leaves its links physically intact, not cascaded away", async ({ request }) => {
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Bug Soft-Delete Case ${Date.now()}` } })
+    ).json();
+    try {
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Bug Soft-Delete ${Date.now()}`, links: [{ testcaseId: testcase.id }] },
+        })
+      ).json();
+      expect(created.links).toHaveLength(1);
+
+      const delRes = await request.delete(`/api/bugs/${created.id}`);
+      expect(delRes.ok(), `deleting the bug — ${await delRes.text()}`).toBeTruthy();
+
+      // DB-level proof, not just the API's 404 — the row must still physically exist, soft-deleted,
+      // and its bug_links row must survive untouched (RESTRICT on bug_links.bug_id, no cascade fired).
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM bugs WHERE id = ${literal(created.id)};`)).toBe("t");
+      expect(scalar(`SELECT COUNT(*)::text FROM bugs WHERE id = ${literal(created.id)};`)).toBe("1");
+      expect(scalar(`SELECT COUNT(*)::text FROM bug_links WHERE bug_id = ${literal(created.id)};`)).toBe("1");
+
+      // Every read path 404s/excludes it, exactly as if it were gone.
+      const getRes = await request.get(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+      expect(getRes.status()).toBe(404);
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      expect(list.some((b: { id: string }) => b.id === created.id)).toBeFalsy();
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("uploading evidence to a soft-deleted bug is rejected, not silently accepted", async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Evidence Gate ${Date.now()}` } })
+    ).json();
+    const delRes = await request.delete(`/api/bugs/${created.id}`);
+    expect(delRes.ok(), `deleting the bug — ${await delRes.text()}`).toBeTruthy();
+
+    const uploadRes = await request.post(`/api/projects/${ctx.projectId}/bugs/${created.id}/attachments`, {
+      multipart: { files: { name: "evidence.txt", mimeType: "text/plain", buffer: Buffer.from("late evidence") } },
+      failOnStatusCode: false,
+    });
+    expect(uploadRes.status(), "a soft-deleted bug must not accept new evidence").toBe(404);
+  });
+
+  test("a deleted bug's external id is never reissued to a later bug", async ({ request }) => {
+    const first = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Seq A ${Date.now()}` } })
+    ).json();
+    const delRes = await request.delete(`/api/bugs/${first.id}`);
+    expect(delRes.ok(), `deleting the first bug — ${await delRes.text()}`).toBeTruthy();
+
+    const second = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Seq B ${Date.now()}` } })
+    ).json();
+    try {
+      expect(second.externalId, "the second bug's sequence number must not collide with the deleted first bug's").not.toBe(first.externalId);
+    } finally {
+      await request.delete(`/api/bugs/${second.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 7: bug_links itself, per Q-BL's ruling ("soft-delete it properly").
+ * removeBugLink issued a real DELETE, and replaceBugLinks did a blind delete-all-then-reinsert on
+ * every bug edit. V117 converts both to soft-delete via a diff: only rows genuinely absent from the
+ * new set are soft-deleted, only genuinely new pairs are inserted, and an unchanged link keeps its
+ * original id.
+ */
+test.describe("bug_links soft-delete (hard-delete remediation Phase 7)", () => {
+  test("removing a bug link soft-deletes the row — it is not physically removed", async ({ request }) => {
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Link Soft-Delete Case ${Date.now()}` } })
+    ).json();
+    try {
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Link Soft-Delete Bug ${Date.now()}`, links: [{ testcaseId: testcase.id }] },
+        })
+      ).json();
+      const linkId = created.links[0].id;
+
+      const delRes = await request.delete(`/api/bugs/${created.id}/links/${linkId}`);
+      expect(delRes.ok(), `removing the link — ${await delRes.text()}`).toBeTruthy();
+
+      // DB-level proof, not just the API excluding it from the response above.
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM bug_links WHERE id = ${literal(linkId)};`)).toBe("t");
+      expect(scalar(`SELECT COUNT(*)::text FROM bug_links WHERE id = ${literal(linkId)};`)).toBe("1");
+
+      // Re-linking the same bug to the same test case after removal must not silently no-op
+      // (the pre-fix plain UNIQUE constraint would have blocked this forever).
+      const relinked = await (
+        await request.post(`/api/bugs/${created.id}/links`, { data: { testcaseId: testcase.id } })
+      ).json();
+      const newLink = relinked.links.find((l: { testcaseId: string }) => l.testcaseId === testcase.id);
+      expect(newLink, "re-linking after removal must create a fresh, live link").toBeTruthy();
+      expect(newLink.id, "the re-link must be a new row, not the soft-deleted original resurrected").not.toBe(linkId);
+
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("editing a bug's links only touches what changed — an unmodified link keeps its id", async ({ request }) => {
+    const testcaseA = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Link Diff Case A ${Date.now()}` } })
+    ).json();
+    const testcaseB = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Link Diff Case B ${Date.now()}` } })
+    ).json();
+    try {
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Link Diff Bug ${Date.now()}`, links: [{ testcaseId: testcaseA.id }] },
+        })
+      ).json();
+      const originalLinkId = created.links[0].id;
+
+      // Replace the whole links array: keep A, drop nothing new, add B.
+      const updated = await (
+        await request.patch(`/api/bugs/${created.id}`, {
+          data: { links: [{ testcaseId: testcaseA.id }, { testcaseId: testcaseB.id }] },
+        })
+      ).json();
+
+      expect(updated.links).toHaveLength(2);
+      const linkA = updated.links.find((l: { testcaseId: string }) => l.testcaseId === testcaseA.id);
+      expect(linkA.id, "an unchanged link must not be recreated by a diff-based replace").toBe(originalLinkId);
+
+      // Now drop A, keep only B — A's original row must survive, soft-deleted, not resurrected.
+      await request.patch(`/api/bugs/${created.id}`, { data: { links: [{ testcaseId: testcaseB.id }] } });
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM bug_links WHERE id = ${literal(originalLinkId)};`)).toBe("t");
+
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
     }
   });
 });
