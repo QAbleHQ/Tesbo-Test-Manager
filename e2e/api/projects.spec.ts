@@ -1102,4 +1102,90 @@ test.describe("projects overview", () => {
       await deleteProjects(api, [first.id, second.id]);
     }
   });
+
+  /*
+   * Hard-delete remediation Phase 2 (#1 in the progress log's 17-site gap sweep). The overview's
+   * runCounts/currentPassRate roll-up joins `cycles`/`cycle_items` with no `deleted_at IS NULL`
+   * filter, so a soft-deleted run (hard-delete remediation Phase 1) kept driving both numbers
+   * forever even though the run itself already 404s.
+   */
+  test("PVW-A-14 a soft-deleted run stops driving the run-count roll-up and pass rate", async () => {
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, { statuses: ["Passed"] });
+
+      const before = await overviewFor(project.id);
+      expect(before.runCounts).toMatchObject({ passed: 1, total: 1 });
+      expect(before.currentPassRate).toBe(100);
+
+      const deleteRes = await api.delete(`/api/cycles/${run.cycleId}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      const after = await overviewFor(project.id);
+      expect(after.runCounts, "a soft-deleted run must no longer drive the run-count roll-up").toBeNull();
+      expect(after.currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Same site (#1), the other half of the same two statements: the lastActivityAt union selected
+   * `cycles.created_at`/`updated_at` with no deleted_at filter either, so a soft-deleted run's
+   * timestamps kept the project reading as "just active" forever. Proven as a differential against
+   * the activity feed on purpose: the feed deliberately keeps showing a deleted run's creation,
+   * marked "(deleted)" (site #17 — see activity.spec.ts's ACT-A-18), while this card's lastActivityAt
+   * must fall back to the next most recent event once the run no longer counts. The two endpoints are
+   * SUPPOSED to disagree about a deleted run, in this one specific way — an unfixed lastActivityAt
+   * would instead keep agreeing with the feed's (deleted) top entry forever.
+   *
+   * Deliberately does not execute the run's case: recording a result itself logs an
+   * "execution_updated" audit_logs row (legacy.service.ts's updateExecution), which would become the
+   * newest, unaffected-by-this-fix event and mask the very drop this test exists to prove. The run
+   * being merely created (and left Untested) is enough to make it the newest, audit-log-free event
+   * that fix #1 has to exclude.
+   */
+  test("PVW-A-15 a soft-deleted run's timestamp stops feeding lastActivityAt, though the audit feed still remembers it", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id, { title: `E2E Overview Last-Activity Run ${uniqueSuffix()}` });
+      const cycle = await (
+        await api.post(`/api/projects/${project.id}/cycles`, { data: { name: `E2E Overview Last-Activity Run Cycle ${uniqueSuffix()}` } })
+      ).json();
+
+      // Before the delete: the run's own creation is the newest event, so the card and the feed agree.
+      const feedBefore = await (await api.get(`/api/projects/${project.id}/activity`, { params: { limit: 5 } })).json();
+      expect(feedBefore.list[0].entityType, "the run's own creation must be the newest event before anything is deleted").toBe("cycle");
+      const before = await overviewFor(project.id);
+      expect(
+        Math.abs(new Date(before.lastActivityAt!).getTime() - new Date(feedBefore.list[0].createdAt).getTime()),
+        "lastActivityAt must agree with the feed's own newest entry",
+      ).toBeLessThan(5000);
+
+      const deleteRes = await api.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      // After the delete: the feed still shows the run's creation, now marked "(deleted)" — the
+      // audit trail is supposed to remember it (site #17). But it is no longer the SOURCE of
+      // lastActivityAt on this card (site #1) — that must fall back to the next event, the test
+      // case's own creation.
+      const feedAfter = await (await api.get(`/api/projects/${project.id}/activity`, { params: { limit: 5 } })).json();
+      const cycleEntryAfter = feedAfter.list.find((i: { entityType: string; action: string }) => i.entityType === "cycle" && i.action === "created");
+      expect(cycleEntryAfter?.entityName, "the feed must still remember the run, marked deleted").toBe(`${cycle.name} (deleted)`);
+      const testcaseEntryAfter = feedAfter.list.find((i: { entityType: string }) => i.entityType === "testcase");
+      expect(testcaseEntryAfter, "the test case's own creation must still be in the feed").toBeTruthy();
+
+      const after = await overviewFor(project.id);
+      expect(
+        Math.abs(new Date(after.lastActivityAt!).getTime() - new Date(testcaseEntryAfter!.createdAt).getTime()),
+        "lastActivityAt must fall back to the test case's creation once the run is excluded",
+      ).toBeLessThan(5000);
+      expect(
+        new Date(after.lastActivityAt!).getTime(),
+        "lastActivityAt must move backward once the more recent (but now-deleted) run drops out",
+      ).toBeLessThan(new Date(before.lastActivityAt!).getTime());
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
 });

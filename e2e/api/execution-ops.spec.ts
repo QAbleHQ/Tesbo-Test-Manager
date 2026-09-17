@@ -555,6 +555,39 @@ test.describe("execution bulk operations, schedules and share links", () => {
     }
   });
 
+  test("EXO-A-13b a soft-deleted run's public share link goes dead (hard-delete remediation Phase 1)", async () => {
+    /*
+     * Before migrations/V111_cycles_soft_delete.sql, deleteCycle issued `DELETE FROM cycles WHERE
+     * id = $1`, which — same row, same share_token — would ALSO have made the link stop resolving,
+     * so this is not a new behavior from the caller's point of view. What changed is what happens
+     * underneath: the run and its share_token now survive (soft-deleted), and publicCycle /
+     * publicCycleExecutions (legacy.service.ts) were extended with an explicit
+     * `AND deleted_at IS NULL` so a soft-deleted run's link does not keep quietly resolving forever.
+     * This pins that the two routes actually got that filter, not merely the row-existence check
+     * every other query happens to share.
+     */
+    const { cycleId } = await seedRun(1);
+    const token = (await (await asOwner.post(`/api/cycles/${cycleId}/share`, { data: { enabled: true } })).json())
+      .shareToken;
+    expect((await anon.get(`/api/public/shared-runs/${token}`, { failOnStatusCode: false })).status()).toBe(200);
+    expect(
+      (await anon.get(`/api/public/shared-runs/${token}/executions`, { failOnStatusCode: false })).status(),
+    ).toBe(200);
+
+    const deleteRes = await asOwner.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+    expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+    // Database-visible: the token is still on the (now soft-deleted) row — this is not "the link
+    // died because the token vanished", it is the deleted_at filter doing the work.
+    expect(scalar(`SELECT share_token FROM cycles WHERE id = ${literal(cycleId)};`)).toBe(token);
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycleId)};`)).toBe("t");
+
+    for (const suffix of ["", "/executions"]) {
+      const res = await anon.get(`/api/public/shared-runs/${token}${suffix}`, { failOnStatusCode: false });
+      expect(res.status(), `a soft-deleted run's share link still served ${suffix || "the run"}`).toBe(404);
+    }
+  });
+
   test("EXO-A-14 only someone inside the project can mint a share link for its run", { tag: '@tesbo.testId("TES-TC-188")' }, async () => {
     const { cycleId } = await seedRun(1);
 

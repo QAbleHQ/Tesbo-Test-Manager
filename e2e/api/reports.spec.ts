@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type APIRequestContext } from "@playwright/test";
 import { setGraceWindow, setProPlan } from "../utils/billing-db";
+import { literal, scalar } from "../utils/psql";
 import {
   anonymousContext,
   loginAs,
@@ -988,6 +989,118 @@ test.describe("cross-endpoint consistency", () => {
     expect(overview.flakyCount).toBe(insights.flakyTests.length);
     expect(overview.coverageGapCount).toBe(insights.coverageGaps.length);
     expect(overview.untestedP1Count).toBe(insights.untestedP1Count);
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 2. V111 made `cycles`/`cycle_items` soft-deletable (Phase 1), but
+ * five of the reports layer's own read sites — executionReport, requirementMatrix, coverageBySuite,
+ * untestedP1Count and detectFlakyTests — kept joining them with no `deleted_at IS NULL` filter, so a
+ * case removed from a run (or a run itself deleted) kept counting as executed/covered forever: a
+ * phantom row that the API surface said was gone but every report still saw. This describe block
+ * uses its own disposable project (not the shared `fixture` above, whose every count is tuned to the
+ * eleven-run history) so removing a case mid-test can't perturb any of RPT-A-01 through RPT-A-46.
+ */
+test.describe("reports exclude cases removed from a run (hard-delete remediation Phase 2)", () => {
+  test("RPT-A-65 removing a case from its only run reverts execution report, requirement matrix, coverage and the untested-P1 count", async () => {
+    await withEmptyProject(async (projectId) => {
+      const suiteId = await seedSuite(asOwner, projectId, "E2E Phantom-Row Suite");
+      const testcase = await seedTestCase(asOwner, projectId, {
+        title: "E2E Phantom-Row Case",
+        suiteId,
+        priority: "P1",
+        status: "Approved",
+      });
+      const run = await seedRun(asOwner, projectId, { name: "E2E Phantom-Row Run" });
+      await addRunCases(asOwner, run.id, [testcase.id]);
+      const executions = await listRunExecutions(asOwner, run.id);
+      const execution = executions.find((e) => e.testcaseId === testcase.id)!;
+      const patchRes = await asOwner.patch(`/api/cycles/${run.id}/executions/${execution.id}`, { data: { status: "Passed" } });
+      expect(patchRes.ok(), `recording the result — ${await patchRes.text()}`).toBeTruthy();
+
+      // Before removal: the case is live, executed, and every report the fix touches agrees on it.
+      const reportBefore = await getJson(asOwner, `/api/projects/${projectId}/reports/execution`);
+      const runRowBefore = reportBefore.rows.find((r: any) => r.groupId === run.id);
+      expect(runRowBefore, "the run must report its one Passed execution before anything is removed").toMatchObject({ Passed: 1, total: 1 });
+      const matrixBefore = await getJson(asOwner, `/api/projects/${projectId}/reports/requirement-matrix`);
+      const matrixRowBefore = matrixBefore.rows.find((r: any) => r.testcaseId === testcase.id);
+      expect(matrixRowBefore?.executionStatus).toBe("Passed");
+      const coverageBefore = await getJson(asOwner, `/api/projects/${projectId}/reports/insights`);
+      const suiteCoverageBefore = coverageBefore.coverageBySuite.find((c: any) => c.suiteName === "E2E Phantom-Row Suite");
+      expect(suiteCoverageBefore).toMatchObject({ total: 1, covered: 1 });
+      expect(coverageBefore.untestedP1Count).toBe(0);
+
+      const removeRes = await asOwner.delete(`/api/cycles/${run.id}/testcases/${testcase.id}`);
+      expect(removeRes.ok(), `removing the case — ${await removeRes.text()}`).toBeTruthy();
+
+      // DB-level proof the row is a genuine soft-delete, not a hard delete the report would trivially
+      // agree with either way — this is what makes the assertions below a proof that the JOIN filters
+      // are doing the work, not that the row is simply gone.
+      const cycleItemId = scalar(
+        `SELECT id FROM cycle_items WHERE cycle_id = ${literal(run.id)} AND testcase_id = ${literal(testcase.id)};`,
+      );
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycle_items WHERE id = ${literal(cycleItemId)};`)).toBe("t");
+      expect(
+        scalar(`SELECT COUNT(*) FROM executions WHERE cycle_item_id = ${literal(cycleItemId)} AND deleted_at IS NOT NULL;`),
+      ).toBe("1");
+
+      // #7 executionReport: the removed pair is gone from the per-run rows entirely (the run itself
+      // had exactly one case, so it drops out of the report altogether rather than showing a
+      // zero-item run).
+      const reportAfter = await getJson(asOwner, `/api/projects/${projectId}/reports/execution`);
+      const runRowAfter = reportAfter.rows.find((r: any) => r.groupId === run.id);
+      expect(runRowAfter, "a run whose only case was removed must not still report a Passed execution").toBeUndefined();
+
+      // #8 requirementMatrix: the test case itself must still be listed (RTM lists every live case
+      // regardless of run history) but with no run/execution attached any more — reverted to
+      // "never run", not simply missing.
+      const matrixAfter = await getJson(asOwner, `/api/projects/${projectId}/reports/requirement-matrix`);
+      const matrixRowsAfter = matrixAfter.rows.filter((r: any) => r.testcaseId === testcase.id);
+      expect(matrixRowsAfter, "the case must still appear exactly once, now with no run").toHaveLength(1);
+      expect(matrixRowsAfter[0].runId).toBeNull();
+      expect(matrixRowsAfter[0].executionStatus).toBeNull();
+
+      // #11 coverageBySuite / #12 untestedP1Count: both revert as if the case had never been run.
+      const insightsAfter = await getJson(asOwner, `/api/projects/${projectId}/reports/insights`);
+      const suiteCoverageAfter = insightsAfter.coverageBySuite.find((c: any) => c.suiteName === "E2E Phantom-Row Suite");
+      expect(suiteCoverageAfter, "coverage must revert to 0 of 1 once the only executed case is removed").toMatchObject({
+        total: 1,
+        covered: 0,
+      });
+      expect(insightsAfter.untestedP1Count, "the P1 case must count as untested again").toBe(1);
+    });
+  });
+
+  test("RPT-A-66 detectFlakyTests stops counting a case's history once it is removed from every run that gave it flips", async () => {
+    await withEmptyProject(async (projectId) => {
+      const testcase = await seedTestCase(asOwner, projectId, { title: "E2E Phantom-Row Flaky Case", priority: "P2", status: "Approved" });
+      const runA = await seedRun(asOwner, projectId, { name: "E2E Phantom-Row Flaky Run A" });
+      const runB = await seedRun(asOwner, projectId, { name: "E2E Phantom-Row Flaky Run B" });
+      await addRunCases(asOwner, runA.id, [testcase.id]);
+      await addRunCases(asOwner, runB.id, [testcase.id]);
+      const execA = (await listRunExecutions(asOwner, runA.id)).find((e) => e.testcaseId === testcase.id)!;
+      const execB = (await listRunExecutions(asOwner, runB.id)).find((e) => e.testcaseId === testcase.id)!;
+      await asOwner.patch(`/api/cycles/${runA.id}/executions/${execA.id}`, { data: { status: "Passed" } });
+      await asOwner.patch(`/api/cycles/${runB.id}/executions/${execB.id}`, { data: { status: "Failed" } });
+
+      const before = await getJson(asOwner, `/api/projects/${projectId}/reports/insights`);
+      expect(
+        before.flakyTests.some((f: any) => f.testcaseId === testcase.id),
+        "two runs, two different settled statuses — the case must be flagged flaky before either run is touched",
+      ).toBe(true);
+
+      // Removing the case from run B leaves only one live result, so it can no longer flip between
+      // two statuses — detectFlakyTests' JOIN filter (ci.deleted_at IS NULL) is what makes the
+      // now-soft-deleted execution stop counting, rather than a stale row keeping the flip alive.
+      const removeRes = await asOwner.delete(`/api/cycles/${runB.id}/testcases/${testcase.id}`);
+      expect(removeRes.ok(), `removing the case — ${await removeRes.text()}`).toBeTruthy();
+
+      const after = await getJson(asOwner, `/api/projects/${projectId}/reports/insights`);
+      expect(
+        after.flakyTests.some((f: any) => f.testcaseId === testcase.id),
+        "with only one live result left, the case must no longer be reported as flaky",
+      ).toBe(false);
+    });
   });
 });
 

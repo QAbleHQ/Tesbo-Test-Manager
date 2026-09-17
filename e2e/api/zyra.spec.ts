@@ -1,5 +1,5 @@
 import { expect, test, type APIRequestContext, type APIResponse } from "@playwright/test";
-import { exec, literal, scalar } from "../utils/psql";
+import { column, exec, literal, scalar } from "../utils/psql";
 import {
   anonymousContext,
   loginAs,
@@ -70,9 +70,11 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   function purge(t: RbacTenant): void {
     const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
     exec(`DELETE FROM zyra_chat_messages WHERE session_id IN (SELECT id FROM zyra_chat_sessions WHERE project_id IN (${projects}));`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116), not CASCADE — must
+    // go before zyra_chat_sessions, not after.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id IN (${projects});`);
     exec(`DELETE FROM zyra_token_usage WHERE project_id IN (${projects});`);
-    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
   }
@@ -1619,6 +1621,105 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     }
   });
 
+  /*
+   * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test
+   * Cases" — a Zyra-generated test case saved fine, but its steps showed as one blank
+   * Action/Expected Result pair in the Test Case Repository regardless of how many steps were
+   * actually generated.
+   *
+   * Root cause: the create/edit modal pre-stringifies `steps` into a JSON string before every save
+   * (testcases/page.tsx), and the shared writers (insertTestCaseWithClient/updateTestCaseWithClient,
+   * patchTestCaseFromZyraWithClient) unconditionally JSON.stringify whatever they're given — so the
+   * modal's already-a-string input gets encoded a second time, landing in the jsonb column as a JSON
+   * string scalar, which is exactly the shape the modal's own parseSteps() reads back. Zyra's save
+   * paths instead handed over a real array (via safeSteps()), which got encoded only once and stored
+   * as a genuine jsonb array — a shape parseSteps() silently discards, substituting one blank step.
+   * Fixed by pre-stringifying steps once at the point Zyra hands them to each writer, matching what
+   * the modal already sends, without changing the modal, safeSteps' synonym normalization, or
+   * anything Zyra generates or displays before save.
+   */
+  test("ZYR-A-51b saving a chat-staged create draft persists real step content the editor can read, not one blank step", async () => {
+    const draftTitle = `E2E chat steps ${Date.now()}`;
+    // More than one step (the observed bug always collapsed to exactly one), with content that
+    // would break a naive re-encode: an apostrophe, a quote, and a literal backslash.
+    const steps = [
+      { stepNumber: 1, action: "Enter a valid destination (e.g. 'Paris')", expectedResult: `Destination field accepts the input.` },
+      { stepNumber: 2, action: "Set Check-in Date to 14 days from today", expectedResult: "Check-in date is set successfully." },
+      { stepNumber: 3, action: `Click "Search Hotels"`, expectedResult: `Path separator check: C:\\temp is rejected` },
+    ];
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        {
+          opType: "create",
+          draft: {
+            suiteId: null,
+            title: draftTitle,
+            description: "",
+            preconditions: "",
+            stepsJson: JSON.stringify(steps),
+            priority: "P1",
+            type: "Functional",
+            status: "Draft",
+          },
+          reason: "",
+        },
+      ],
+    });
+
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving a chat-staged create — ${await res.text()}`).toBe(201);
+
+    const testcaseId = scalar(
+      `SELECT id FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`,
+    );
+    try {
+      const fetched = await asOwner.get(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+      expect(fetched.status(), `fetching the saved case — ${await fetched.text()}`).toBe(200);
+      const rawSteps = (await fetched.json()).steps;
+      // The editor's parseSteps() (testcases/page.tsx) only accepts a JSON-encoded string for this
+      // field — an array here is exactly the shape it silently discards.
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual(steps);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-52b saving a chat-staged update proposal replaces an existing test case's steps in the editor-readable shape", async () => {
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: `E2E update steps target ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    const testcaseId = (await created.json()).id;
+    const steps = [
+      { stepNumber: 1, action: "Updated step one", expectedResult: "Updated result one" },
+      { stepNumber: 2, action: "Updated step two", expectedResult: "Updated result two" },
+    ];
+    try {
+      const { taskId } = seedChatReviewTask({
+        entries: [
+          { opType: "update", testcaseId, externalId: "E2E-1", fields: { stepsJson: JSON.stringify(steps) }, reason: "" },
+        ],
+      });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), {
+        data: { selectedDraftIndexes: [0] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `saving a chat-staged step update — ${await res.text()}`).toBe(201);
+
+      const fetched = await asOwner.get(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+      expect(fetched.status(), `fetching the updated case — ${await fetched.text()}`).toBe(200);
+      const rawSteps = (await fetched.json()).steps;
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual(steps);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
   test("ZYR-A-53 saving a chat-staged archive proposal archives the real test case", async () => {
     const created = await asOwner.post(url("/testcases"), { data: { title: `E2E archive target ${Date.now()}` }, failOnStatusCode: false });
     const testcaseId = (await created.json()).id;
@@ -1848,12 +1949,20 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const project = literal(tenant!.mainProjectId);
     const org = literal(tenant!.organizationId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    // ZYR-A-66 creates its own suite to exercise projectSuiteSummaries/zyraChatProjectSnapshot's
+    // per-suite count — deleted after testcases above so no FK on suite_id is still live.
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
     exec(`DELETE FROM bugs WHERE project_id = ${project};`);
     exec(`DELETE FROM jira_tickets WHERE project_id = ${project};`);
     exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    // ZYR-A-65 creates a non-root folder to exercise knowledgeFolderSnapshot's quoted-name lookup;
+    // the root folder itself must survive (it cannot be recreated through the API — see
+    // knowledge-base.spec.ts's purgeKb doc comment for the same constraint).
+    exec(`DELETE FROM knowledge_folders WHERE project_id = ${project} AND is_root = false;`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
   }
@@ -2041,6 +2150,393 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
     expect(String(lastAssistant.content || "")).not.toContain("I don't have anything about this in the project's knowledge base");
   });
+
+  // knowledgeFolderSnapshot (legacy.service.ts) is the direct folder-name-lookup path — used when a
+  // message quotes a folder name literally, since neither the recency fallback nor RAG retrieval can
+  // match on a folder's name alone. Every other knowledge read site (knowledgeSnapshot, annSearch,
+  // ftsSearch, zyraChatProjectSnapshot) gates an ai_memory document behind `status = 'approved'`;
+  // this one previously did not, so an unreviewed (or rejected) AI-memory note sitting in a
+  // quote-matched folder was fed to the model as trusted context. This test drives the real "create"
+  // turn end to end and asserts on the literal prompt text the fake AI server received — the most
+  // direct proof that the excluded document's content never reached the model, independent of
+  // whatever the model does with citations afterward.
+  test("ZYR-A-65 a quoted folder-name lookup excludes an unapproved ai_memory document but still surfaces an approved one and a general document", async () => {
+    await allocateFakeAiKey();
+
+    const folderName = `E2E Folder Gate ${Date.now()}`;
+    const folderRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/folders`, {
+      data: { name: folderName },
+      failOnStatusCode: false,
+    });
+    expect(folderRes.status(), `creating the folder — ${await folderRes.text()}`).toBe(201);
+    const folderId = (await folderRes.json()).id;
+
+    async function createFolderDoc(title: string, contentText: string, documentType: string): Promise<string> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+        data: { folderId, documentType, title, contentText },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      return (await res.json()).id;
+    }
+
+    const generalMarker = "GENERAL-MARKER-VISIBLE";
+    const approvedMemoryMarker = "APPROVED-MEMORY-MARKER-VISIBLE";
+    const draftMemoryMarker = "DRAFT-MEMORY-MARKER-MUST-NOT-LEAK";
+
+    await createFolderDoc("General note", generalMarker, "general");
+    const approvedMemoryId = await createFolderDoc("Approved memory", approvedMemoryMarker, "ai_memory");
+    const approveRes = await asOwner.patch(
+      `/api/projects/${tenant!.mainProjectId}/knowledge-base/documents/${approvedMemoryId}/approve-ai-memory`,
+      { failOnStatusCode: false },
+    );
+    expect(approveRes.status(), `approving the memory doc — ${await approveRes.text()}`).toBe(200);
+    // Left in the default "draft" status deliberately — never approved (and never rejected either,
+    // to also cover the "simply not yet reviewed" case, not only the rejected one).
+    await createFolderDoc("Draft memory", draftMemoryMarker, "ai_memory");
+
+    const sessionId = await newSession("E2E folder gate");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case from the named folder.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Placeholder from folder contents",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Pull the details from the "${folderName}" knowledge base folder and create a test case for it.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // Index 1 is the generation call — see ZYR-A-63's comment on the same three-call shape
+    // (router, generation, rememberZyraTurn's summarization).
+    const generationPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+    expect(generationPrompt).toContain(generalMarker);
+    expect(generationPrompt).toContain(approvedMemoryMarker);
+    expect(generationPrompt, "an unapproved ai_memory document must not reach the model as context").not.toContain(draftMemoryMarker);
+  });
+
+  // Phase 1 of the Zyra context-integrity task (see
+  // "Zyra Workflow Agents/zyra-context-integrity-progress-log.md"): `status = 'Archived'` is a
+  // second "gone" state alongside `deleted_at` — it's what the repository screen's archive action
+  // sets, and listTestCases already hides it there. Before this fix, existingTestcaseSnapshot (the
+  // "Existing testcases" grounding/citation source), projectSuiteSummaries, and
+  // zyraChatProjectSnapshot's testcase_count all still counted/cited an archived case as live, so a
+  // user who archived something kept seeing Zyra treat it as current coverage. This drives one real
+  // create turn and asserts on the literal router-prompt text plus the final sourceRefs — the same
+  // style ZYR-A-65 uses — so the proof is against what the model was actually given, not an
+  // inference from downstream behavior.
+  test("ZYR-A-66 an archived test case is excluded from grounding context, citations, and every reported count", async () => {
+    await allocateFakeAiKey();
+
+    const suiteName = `E2E Archived Gap Suite ${Date.now()}`;
+    const suiteRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(suiteRes.status(), `creating the suite — ${await suiteRes.text()}`).toBe(201);
+    const suiteId = (await suiteRes.json()).id;
+
+    async function createTestcase(title: string, suiteIdForCase: string | null): Promise<{ id: string; externalId: string }> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+        data: { title, suiteId: suiteIdForCase },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      const body = await res.json();
+      return { id: body.id, externalId: body.externalId };
+    }
+
+    const active = await createTestcase("Archived-gap active case", suiteId);
+    // Unassigned on purpose — exercises unassignedTestCaseCount (= total - sum of suite counts)
+    // alongside the per-suite count, per the pre-phase inspection note's "count fields that will
+    // shift" edge case. Its id/externalId aren't needed below; only its existence matters.
+    await createTestcase("Archived-gap unassigned case", null);
+    const archived = await createTestcase("Archived-gap archived case", suiteId);
+    const archiveRes = await asOwner.put(`/api/projects/${tenant!.mainProjectId}/testcases/${archived.id}`, {
+      data: { status: "Archived" },
+      failOnStatusCode: false,
+    });
+    expect(archiveRes.status(), `archiving the third case — ${await archiveRes.text()}`).toBe(200);
+
+    const sessionId = await newSession("E2E archived gap");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case, citing existing coverage.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    // The model cites both the still-active case and the archived one; only the active citation can
+    // survive sanitizeZyraSourceRefs, because the archived one is no longer in this turn's
+    // zyraSourceRefIndex — same mechanism ZYR-A-63 proves for a wholly-fabricated label.
+    ai.queueReply({
+      drafts: [{
+        title: "A new case citing both the active and the archived case",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [active.externalId, archived.externalId],
+      }],
+    });
+
+    // Deliberately does not mention either external id in the raw message text — the router prompt
+    // embeds the raw user message verbatim as its own chat turn (see the `{ role: "user", content:
+    // message }` entry alongside the system `context`), so naming the archived id here would make it
+    // appear in ai.requests[0] regardless of whether existingTestcaseSnapshot excluded it, and the
+    // assertion below would no longer prove anything about the query.
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a new test case for the archived-gap scenario, reusing what already exists for it." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // Index 0 is the router call — existingTestcaseSnapshot, projectSuiteSummaries and
+    // zyraChatProjectSnapshot are all assembled into this one prompt (see buildZyraChatDecision).
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt).toContain(active.externalId);
+    expect(routerPrompt, "an archived test case must not appear in the 'Existing testcases' grounding section").not.toContain(archived.externalId);
+    expect(routerPrompt, "the suite's own count must exclude the archived case").toContain(`${suiteName} (id: ${suiteId}, 1 testcase(s))`);
+    expect(routerPrompt, "unassignedTestCaseCount must still reconcile against the reduced total").toContain("Unassigned (no suite) (1 testcase(s))");
+    expect(routerPrompt, "the project-wide total must exclude the archived case").toContain("The total test case count for this project is 2,");
+
+    const testcases = await lastAssistantTestcases(sessionId);
+    expect(testcases).toHaveLength(1);
+    const sourceRefs = testcases[0].sourceRefs as Array<{ type: string; id: string; title: string }>;
+    expect(sourceRefs, "the archived case's citation must be dropped, the still-active one kept").toEqual([
+      { type: "testcase", id: active.externalId, title: "Archived-gap active case" },
+    ]);
+  });
+
+  // Edge case named explicitly in the Phase 1 pre-inspection note: a project where every test case
+  // is archived must report zero coverage cleanly — an empty "Existing testcases" section and a
+  // zero total — not an unhandled exception from any of the three changed queries.
+  test("ZYR-A-67 a project with only archived test cases reports zero existing coverage, not a crash", async () => {
+    await allocateFakeAiKey();
+
+    const onlyCaseRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: "Archived-gap only case" },
+      failOnStatusCode: false,
+    });
+    expect(onlyCaseRes.status()).toBe(201);
+    const onlyCaseId = (await onlyCaseRes.json()).id;
+    const archiveRes = await asOwner.put(`/api/projects/${tenant!.mainProjectId}/testcases/${onlyCaseId}`, {
+      data: { status: "Archived" },
+      failOnStatusCode: false,
+    });
+    expect(archiveRes.status(), `archiving the only case — ${await archiveRes.text()}`).toBe(200);
+
+    const sessionId = await newSession("E2E all archived");
+    // A pure "answer" turn makes exactly one AI call (the router) — no generation, no
+    // rememberZyraTurn summarization — so ai.requests[0] is the only call to inspect.
+    ai.queueReply({
+      reply: "This project currently has 0 existing test cases.",
+      reasoningSummary: "Answered directly, no operations.",
+      action: "answer", actionType: "answer", operations: [], testcases: [],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many existing test cases does this project have?" },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the answer message — ${await turn.text()}`).toBeLessThan(300);
+
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt, "no suite was created in this scenario").toContain("No suites yet.");
+    expect(routerPrompt, "the only test case in the project is archived, so grounding must be empty, not a stale full list").toContain("No existing testcases.");
+    expect(routerPrompt, "the project-wide total must be zero, not the physical row count").toContain("The total test case count for this project is 0,");
+  });
+
+  // Zyra context integrity, Phase 3/4 (suites soft-delete) — Q11: a chat-staged `create` draft
+  // resolves its target suite once (matchZyraSuiteByName, here — see resolveOrCreateSuiteByName's
+  // own test below for the create_suite path) and that resolved id sits frozen inside
+  // ai_generation_requests.generated_payload until the user hits Save, potentially long after. Before
+  // suites were soft-deletable this could never go stale silently: a suite id that resolved once
+  // couldn't stop existing without a hard delete, and a hard-deleted suite would make the save's INSERT
+  // fail loudly on the FK. Now the row still exists (just filtered out of every list), so the FK is
+  // satisfied and the old code would have silently written a suite_id that looks deleted everywhere
+  // else. Per Yuvraj's resolution (Q11): fall back to unassigned rather than failing the batch, and
+  // note the fallback in the batch's own activity_log.
+  test("ZYR-A-68 a create draft's staged suite falls back to unassigned (not a failed save) if the suite is soft-deleted before Save", async () => {
+    await allocateFakeAiKey();
+    const suiteName = `E2E Suite Deleted Before Save ${Date.now()}`;
+    const suiteRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(suiteRes.status(), `creating the suite — ${await suiteRes.text()}`).toBe(201);
+    const suiteId = (await suiteRes.json()).id;
+
+    const sessionId = await newSession("E2E suite deleted before save");
+    // Router: routes to create. matchZyraSuiteByName (legacy.service.ts) matches the suite by its
+    // name appearing verbatim in the raw message, so the staged draft below gets `suiteId` set to it
+    // without needing a routedSuite field on this reply.
+    ai.queueReply({
+      reply: "", reasoningSummary: `Creating a test case for the ${suiteName} suite.`,
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Case staged against a suite that will be deleted before Save",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Create a test case for the ${suiteName} suite.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(taskId, "the create turn must have staged a review batch").toBeTruthy();
+
+    const stagedSuiteId = scalar(
+      `SELECT generated_payload->0->'draft'->>'suiteId' FROM ai_generation_requests WHERE id = ${literal(taskId)};`,
+    );
+    expect(stagedSuiteId, "the draft must have resolved the suite by name before this test deletes it").toBe(suiteId);
+
+    // The suite is deleted (soft, per this fix) BETWEEN staging and Save — the exact window Q11 is
+    // about. moveToDefault is the mode that matters here: it does not touch the testcases, only the
+    // suite itself stops resolving to anything live.
+    const deleteRes = await asOwner.delete(`/api/suites/${suiteId}`, {
+      params: { mode: "moveToDefault" },
+      failOnStatusCode: false,
+    });
+    expect(deleteRes.ok(), `deleting the suite — ${await deleteRes.text()}`).toBeTruthy();
+
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    expect(saveRes.status(), `saving despite the deleted suite — ${await saveRes.text()}`).toBeLessThan(300);
+    const saved = await saveRes.json();
+    expect(saved.savedCount, "the batch must still save, not fail outright").toBe(1);
+    expect(saved.testcases).toHaveLength(1);
+
+    // Ground truth from the database, not just the response shape.
+    const persistedSuiteId = scalar(`SELECT suite_id FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`);
+    expect(persistedSuiteId, "the new test case must land unassigned, not pointing at the deleted suite").toBe("");
+
+    const activityLog = JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{
+      title?: string;
+      detail?: string;
+    }>;
+    expect(
+      activityLog.some((entry) => /no longer available/i.test(entry.title || "")),
+      `the fallback must be noted on the batch's own activity log — got ${JSON.stringify(activityLog)}`,
+    ).toBe(true);
+  });
+
+  // Zyra context integrity, Phase 3/4 — resolveOrCreateSuiteByName (legacy.service.ts) is the
+  // create_suite / move_to_suite resolver: before this fix it matched by name with no `deleted_at`
+  // filter, so asking Zyra to (re-)create a suite whose name matches one that was just soft-deleted
+  // would silently reattach to the dead row instead of creating a fresh, listable one.
+  test("ZYR-A-69 create_suite creates a fresh suite when the same name was used by a suite that is now soft-deleted", async () => {
+    await allocateFakeAiKey();
+    const suiteName = `E2E Suite Reuse By Name ${Date.now()}`;
+
+    const session1 = await newSession("E2E suite reuse 1");
+    ai.queueReply({
+      reply: "Created the suite.", reasoningSummary: "Creating the requested suite.",
+      action: "create_suite", actionType: "suite", operations: [{ type: "create_suite", suiteName }], testcases: [],
+    });
+    const turn1 = await asOwner.post(url(`/chat/sessions/${session1}/messages`), {
+      data: { message: `Create a suite called ${suiteName}` },
+      failOnStatusCode: false,
+    });
+    expect(turn1.status(), `first create_suite turn — ${await turn1.text()}`).toBeLessThan(300);
+
+    const firstSuiteId = scalar(
+      `SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(suiteName)} AND deleted_at IS NULL;`,
+    );
+    expect(firstSuiteId, "the first turn must have created the suite").toBeTruthy();
+
+    const del = await asOwner.delete(`/api/suites/${firstSuiteId}`, { params: { mode: "moveToDefault" }, failOnStatusCode: false });
+    expect(del.ok(), `deleting the first suite — ${await del.text()}`).toBeTruthy();
+
+    // Same name, a second, independent turn — resolveOrCreateSuiteByName must not find the
+    // soft-deleted row a live match and reuse it.
+    const session2 = await newSession("E2E suite reuse 2");
+    ai.queueReply({
+      reply: "Created the suite.", reasoningSummary: "Creating the requested suite.",
+      action: "create_suite", actionType: "suite", operations: [{ type: "create_suite", suiteName }], testcases: [],
+    });
+    const turn2 = await asOwner.post(url(`/chat/sessions/${session2}/messages`), {
+      data: { message: `Create a suite called ${suiteName}` },
+      failOnStatusCode: false,
+    });
+    expect(turn2.status(), `second create_suite turn — ${await turn2.text()}`).toBeLessThan(300);
+
+    const activeMatches = column(
+      `SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(suiteName)} AND deleted_at IS NULL;`,
+    );
+    expect(activeMatches, "exactly one ACTIVE suite with this name after the second turn").toHaveLength(1);
+    expect(activeMatches[0], "must be a freshly created suite, not the soft-deleted original resurrected").not.toBe(firstSuiteId);
+
+    // Listed via the real API too, not only visible to a direct DB query — proves the soft-deleted
+    // original is genuinely gone from what the user (and Zyra) sees, not merely uncounted.
+    const suitesList = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/suites`)).json();
+    expect(suitesList.filter((s: { name: string }) => s.name === suiteName)).toHaveLength(1);
+  });
+
+  // Hard-delete remediation Phase 3: bugsSnapshot had no deleted_at filter, predicted as a live gap
+  // by the original Zyra context-integrity audit before `bugs.deleted_at` existed at all. Both bugs
+  // share a distinctive keyword so they both match zyraSearchTerms' relevance search; only the
+  // deleted one should be excluded once the fix lands.
+  test("ZYR-A-70 a soft-deleted bug is excluded from Zyra's relevance-matched bug context", async () => {
+    await allocateFakeAiKey();
+    const keyword = `quantumwidget${Date.now()}`;
+
+    async function createBug(title: string): Promise<string> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title, description: "seeded for ZYR-A-70" },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      return (await res.json()).id;
+    }
+
+    const activeTitle = `Crash in the ${keyword} checkout flow`;
+    const deletedTitle = `Timeout in the ${keyword} settings panel`;
+    await createBug(activeTitle);
+    const deletedId = await createBug(deletedTitle);
+
+    const delRes = await asOwner.delete(`/api/bugs/${deletedId}`, { failOnStatusCode: false });
+    expect(delRes.ok(), `deleting the second bug — ${await delRes.text()}`).toBeTruthy();
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM bugs WHERE id = ${literal(deletedId)};`)).toBe("t");
+
+    const sessionId = await newSession("E2E bug relevance gap");
+    ai.queueReply({
+      reply: "Let me check.", reasoningSummary: "Answering directly, no operations.",
+      action: "answer", actionType: "answer", operations: [], testcases: [],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Are there any known bugs related to ${keyword}?` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the question — ${await turn.text()}`).toBeLessThan(300);
+
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt, "the still-live bug must be cited").toContain(activeTitle);
+    expect(routerPrompt, "a soft-deleted bug must not reach the model as grounding context").not.toContain(deletedTitle);
+  });
 });
 
 /*
@@ -2084,8 +2580,9 @@ test.describe("zyra chat — progress streaming (fake provider)", () => {
     const project = literal(tenant!.mainProjectId);
     const org = literal(tenant!.organizationId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
@@ -2206,5 +2703,67 @@ test.describe("zyra chat — progress streaming (fake provider)", () => {
     expect(res.status()).toBe(200);
     const events = parseSseEvents(await res.text());
     expect(events).toEqual([{ kind: "unknown" }]);
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 6: zyra_chat_sessions itself. deleteZyraChatSession issued a real
+ * DELETE, and zyra_chat_messages.session_id / ai_generation_requests.chat_session_id were both
+ * ON DELETE CASCADE, so deleting a conversation destroyed the whole transcript (plus any staged,
+ * unsaved review batch) with no audit trail. V116 converts it to soft-delete, matching every other
+ * entity. These tests prove the session row genuinely survives (not just that the API stops showing
+ * it) and that every access-gated route treats a deleted session as gone.
+ */
+test.describe("zyra chat session soft-delete (hard-delete remediation Phase 6)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-chat");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  test("deleting a chat session soft-deletes the row — it is not physically removed", async () => {
+    const sessionId = await newSession(`E2E Session Soft-Delete ${Date.now()}`);
+
+    const delRes = await asOwner.delete(url(`/chat/sessions/${sessionId}`));
+    expect(delRes.ok(), `deleting the session — ${await delRes.text()}`).toBeTruthy();
+
+    // DB-level proof, not just the API's 404s below — the row must still physically exist.
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("t");
+    expect(scalar(`SELECT COUNT(*)::text FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("1");
+
+    // Every access-gated route treats it as gone.
+    expect((await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false })).status()).toBe(404);
+    expect((await asOwner.patch(url(`/chat/sessions/${sessionId}`), { data: { title: "renamed" }, failOnStatusCode: false })).status()).toBe(404);
+    expect(
+      (await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "hello" }, failOnStatusCode: false })).status(),
+    ).toBe(404);
+    const list = await (await asOwner.get(url("/chat/sessions"))).json();
+    expect(list.list.some((s: { id: string }) => s.id === sessionId)).toBeFalsy();
+
+    // Deleting again must 404 (already gone from every read path), never a raw driver error from
+    // hitting an already-non-null deleted_at a second time.
+    expect((await asOwner.delete(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false })).status()).toBe(404);
   });
 });

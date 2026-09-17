@@ -68,9 +68,10 @@ test.describe("zyra chat ↔ repository consistency", () => {
   function purge(): void {
     const project = literal(tenant!.mainProjectId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     // ZCC-A-06 seeds a chat-staged review batch, the only test in this file that writes here.
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM suites WHERE project_id = ${project};`);
   }
@@ -488,8 +489,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const project = literal(tenant!.mainProjectId);
     const org = literal(tenant!.organizationId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM suites WHERE project_id = ${project};`);
     // This describe block, unlike the one above, mints its own AI key per test (it needs one

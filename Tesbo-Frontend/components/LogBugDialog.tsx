@@ -163,6 +163,7 @@ function ExistingBugPickerModal({
  * (cycles/[cycleId]/execute/[executionId]/page.tsx) share one implementation instead of each having
  * their own — the two used to drift, so the drawer had "Log bug" and the full page did not.
  *
+
  * `onLogged` fires after a bug is successfully filed or linked, and receives the execution the
  * dialog was actually operating on (`bugExecution`) — not whatever execution-scoped state the
  * caller happens to hold at that moment. That distinction matters: the run drawer's auto-prompt

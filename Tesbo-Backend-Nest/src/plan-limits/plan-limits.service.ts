@@ -198,7 +198,7 @@ export class PlanLimitsService {
     const res = await this.db.query<{ total: string }>(
       `SELECT
          COALESCE((SELECT SUM(file_size) FROM knowledge_files WHERE organization_id = $1 AND is_deleted = false), 0) +
-         COALESCE((SELECT SUM(a.file_size) FROM attachments a JOIN projects p ON p.id = a.project_id WHERE p.organization_id = $1), 0)
+         COALESCE((SELECT SUM(a.file_size) FROM attachments a JOIN projects p ON p.id = a.project_id WHERE p.organization_id = $1 AND a.deleted_at IS NULL), 0)
          AS total`,
       [organizationId]
     );
