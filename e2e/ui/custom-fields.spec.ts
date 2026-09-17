@@ -651,6 +651,83 @@ test.describe("custom fields (UI)", () => {
     await expect.poll(() => storedValue(single.id, testcase.id)).toBe(`"${highId}"`);
   });
 
+  /*
+   * Regression test: an unset single_select/boolean custom field used to render its placeholder
+   * <option> with the literal text "—" (CustomFieldValueInput.tsx) — indistinguishable from a
+   * disabled text box, unlike every other field type's real placeholder (Input's `placeholder`
+   * attribute for text fields, the browser's own empty state for date/number). Fixed to read
+   * "Select…", matching the "Select …" placeholder convention already used everywhere else in the
+   * app (e.g. CustomFieldFilterPopover's own "Select an option…").
+   */
+  test("an unset dropdown custom field shows a 'Select…' placeholder, not a bare dash", async ({ browser }) => {
+    await defineField({
+      fieldType: "single_select",
+      config: { options: [{ label: "Chrome" }, { label: "Firefox" }] },
+    });
+    await defineField({ fieldType: "boolean" });
+    // Neither field is given a value — this pins the empty state, not the filled one the test
+    // above already covers.
+    const testcase = await seedTestCase({});
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+
+    const panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    // Told apart from the panel's other dropdowns by an option only each field has (same
+    // convention as the test above).
+    const singleSelect = panel.locator("select").filter({ has: page.locator("option", { hasText: "Chrome" }) });
+    const booleanSelect = panel.locator("select").filter({ has: page.locator("option", { hasText: "Yes" }) });
+
+    for (const select of [singleSelect, booleanSelect]) {
+      await expect(select).toHaveValue("");
+      // The placeholder <option>'s own visible label is what the user actually reads — not just
+      // the <select>'s resolved value, which was already "" before this fix too.
+      const selectedOptionText = await select.evaluate(
+        (el: HTMLSelectElement) => el.options[el.selectedIndex]?.textContent?.trim(),
+      );
+      expect(selectedOptionText).toBe("Select…");
+      await expect(select.locator("option", { hasText: "—" })).toHaveCount(0);
+    }
+  });
+
+  /*
+   * Same bug, its other rendering path: an inactive/archived field is shown read-only through a
+   * plain <p> (CustomFieldsSection.tsx), not through CustomFieldValueInput at all, so the fix above
+   * — which only touches the active <select>'s placeholder <option> — never reaches it.
+   * formatCustomFieldValueForDisplay (customFieldTypes.ts) had its own independent "—" fallback for
+   * an empty value, now "Select…" for every field type, not just the dropdown ones — a real report
+   * against this exact screen was a `number` field ("Execution Time", min/max/unit config) still
+   * showing "—" after the first pass only widened the dropdown types.
+   */
+  for (const fieldType of ["single_select", "number", "date", "text"] as const) {
+    test(`an inactive ${fieldType} field's read-only display also shows 'Select…', not a bare dash`, async ({
+      browser,
+    }) => {
+      const field = await defineField(
+        fieldType === "single_select"
+          ? { fieldType, config: { options: [{ label: "Chrome" }, { label: "Firefox" }] } }
+          : { fieldType },
+      );
+      await api.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "inactive" } });
+      const testcase = await seedTestCase({});
+
+      const page = await pageAs(browser, "owner");
+      await page.goto(testcasesUrl());
+      await page.getByRole("button", { name: testcase.title }).click();
+
+      const panel = page.locator("aside");
+      await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+      await expect(panel.getByText(field.name)).toBeVisible();
+      await expect(panel.getByText("Inactive", { exact: true })).toBeVisible();
+      await expect(panel.getByText("Select…", { exact: true })).toBeVisible();
+      await expect(panel.getByText("—", { exact: true })).toHaveCount(0);
+    });
+  }
+
   // ─── Filtering the list ────────────────────────────────────────────────────
 
   test("the custom field filter narrows the test case list", { tag: '@tesbo.testId("TES-TC-666")' }, async ({ browser }) => {
