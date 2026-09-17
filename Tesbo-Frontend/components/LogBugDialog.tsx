@@ -163,9 +163,13 @@ function ExistingBugPickerModal({
  * (cycles/[cycleId]/execute/[executionId]/page.tsx) share one implementation instead of each having
  * their own — the two used to drift, so the drawer had "Log bug" and the full page did not.
  *
- * `onLogged` fires after a bug is successfully filed or linked, so each caller can refresh whatever
- * it displays (the drawer refreshes its execution list; the full page has nothing that changes and
- * can omit it).
+
+ * `onLogged` fires after a bug is successfully filed or linked, and receives the execution the
+ * dialog was actually operating on (`bugExecution`) — not whatever execution-scoped state the
+ * caller happens to hold at that moment. That distinction matters: the run drawer's auto-prompt
+ * (triggered by marking a case Failed and saving) closes its own panel before opening this dialog,
+ * so a caller relying on its own "currently open execution" state would find it already null and
+ * silently skip refreshing anything. Passing the execution back removes that dependency.
  *
  * `members` mirrors projects/[id]/bugs/page.tsx's "Assign to" selector (Basecamp: the field was
  * missing from this dialog entirely, so a bug filed from a run could never be assigned on creation).
@@ -176,7 +180,7 @@ export function useLogBugDialog(params: {
   projectId: string;
   cycleId: string;
   members?: { userId: string; email: string; name: string }[];
-  onLogged?: () => void;
+  onLogged?: (exec: ExecutionItem) => void;
 }) {
   const { projectId, cycleId, members = [], onLogged } = params;
 
@@ -307,8 +311,9 @@ export function useLogBugDialog(params: {
           setBugStagedFiles((prev) => prev.slice(batch.length));
         });
       }
+      const loggedExecution = bugExecution;
       resetBugDialog();
-      onLogged?.();
+      onLogged?.(loggedExecution);
     } catch (err) {
       // The bug itself may already have been created — the evidence upload is the step that
       // failed. Keep the dialog open with the error shown rather than losing that state, matching
@@ -336,6 +341,7 @@ export function useLogBugDialog(params: {
     if (bugSaving) return;
     setBugSaving(true);
     setBugSaveError(null);
+    const loggedExecution = bugExecution;
     const link = { testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id };
     let firstError: unknown = null;
 
@@ -371,7 +377,7 @@ export function useLogBugDialog(params: {
       setBugSaveError(firstError instanceof Error ? firstError.message : "Something went wrong while linking these items.");
     } else {
       resetBugDialog();
-      onLogged?.();
+      onLogged?.(loggedExecution);
     }
     setBugSaving(false);
   }

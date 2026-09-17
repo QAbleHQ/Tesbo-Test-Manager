@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   listCycleExecutions,
@@ -84,18 +84,36 @@ export default function ExecutionDetailPage() {
     projectId,
     cycleId,
     members,
-    onLogged: () => {
-      if (execution) loadLinkedBug(execution);
+    // Use the execution the dialog actually operated on rather than this page's own `execution`
+    // state — this page never nulls that state out, so both happen to agree today, but relying on
+    // the dialog's own answer keeps this correct even if that stops being true.
+    onLogged: (exec) => {
+      loadLinkedBug(exec);
     },
   });
+
+  // Guards against an out-of-order response landing after a newer listBugs() call for this same
+  // page — e.g. the initial-mount fetch resolving after a post-"Log bug" refresh — which would
+  // otherwise overwrite the fresher result with a stale one.
+  const linkedBugRequestIdRef = useRef<string | null>(null);
 
   function loadLinkedBug(exec: ExecutionItem) {
     // listBugs is scoped to testcase+cycle, not to this one execution (the API has no executionId
     // filter) — a testcase can be executed more than once in the same cycle, so this narrows to
-    // the bugs actually linked to THIS execution via each bug's own links[].
+    // the bugs actually linked to THIS execution via each bug's own links[]. Guarded by a
+    // per-request id against an out-of-order response landing after a newer call for this same
+    // page (e.g. the initial-mount fetch resolving after a post-"Log bug" refresh) overwriting a
+    // fresher result with a stale one.
+    const requestId = `${exec.id}:${Date.now()}`;
+    linkedBugRequestIdRef.current = requestId;
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
-      .then((bugs) => setLinkedBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id))))
-      .catch(() => setLinkedBugs([]));
+      .then((bugs) => {
+        if (linkedBugRequestIdRef.current !== requestId) return;
+        setLinkedBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id)));
+      })
+      .catch(() => {
+        if (linkedBugRequestIdRef.current === requestId) setLinkedBugs([]);
+      });
   }
 
   /* ───── Unlink one bug from this execution — removes only the bug_links row tying it to this
@@ -295,57 +313,43 @@ export default function ExecutionDetailPage() {
           </div>
 
           {/*
-            * Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
-            * rule). Read-only: these reflect the real bug(s) filed via "Log bug" (bugs/bug_links),
-            * not a free-text value typed here, so there's nothing to type into them. One execution
-            * can now have several bugs linked (multi-select existing-bug picker) — a single linked
-            * bug keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
-            * ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every row gets its own
-            * Unlink action regardless of count.
+            * Bug Key / Bug Title — shown only for a Failed case that also has at least one real
+            * persisted bug association (linkedBugs, loaded from bug_links via listBugs). Both
+            * conditions matter: Failed alone does not imply a bug exists (only a successful "Log
+            * bug" / "Link Bug" does), and a bug linked while the case was Failed must not keep
+            * showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only: these
+            * reflect the real bug(s), not a free-text value typed here. One execution can have
+            * several bugs linked (multi-select existing-bug picker) — a single linked bug keeps the
+            * original "Bug Key"/"Bug Title" labels; more than one numbers them ("Bug 1 Key", "Bug 2
+            * Key", …) so none is silently dropped. Every row gets its own Unlink action regardless
+            * of count.
             */}
-          <div className="space-y-3" hidden={status !== "Failed"}>
-            {linkedBugs.length === 0 ? (
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                    Bug Key
-                  </label>
-                  <Input type="text" aria-label="Bug Key" value="" readOnly placeholder="e.g. PROJ-123" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                    Bug Title
-                  </label>
-                  <Input type="text" aria-label="Bug Title" value="" readOnly placeholder="Title of the linked bug" />
-                </div>
-              </div>
-            ) : (
-              linkedBugs.map((bug, i) => {
-                const keyLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Key` : "Bug Key";
-                const titleLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Title` : "Bug Title";
-                return (
-                  <div key={bug.id} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
-                    <div>
-                      <label className="block text-sm font-medium text-[var(--muted)] mb-1">{keyLabel}</label>
-                      <Input type="text" aria-label={keyLabel} value={bug.integrationIssueKey || bug.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-[var(--muted)] mb-1">{titleLabel}</label>
-                      <Input type="text" aria-label={titleLabel} value={bug.title || ""} readOnly placeholder="Title of the linked bug" />
-                    </div>
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      aria-label={`Unlink ${bug.title}`}
-                      onClick={() => requestUnlinkBug(bug)}
-                    >
-                      Unlink
-                    </Button>
+          <div className="space-y-3" hidden={status !== "Failed" || linkedBugs.length === 0}>
+            {linkedBugs.map((bug, i) => {
+              const keyLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Key` : "Bug Key";
+              const titleLabel = linkedBugs.length > 1 ? `Bug ${i + 1} Title` : "Bug Title";
+              return (
+                <div key={bug.id} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--muted)] mb-1">{keyLabel}</label>
+                    <Input type="text" aria-label={keyLabel} value={bug.integrationIssueKey || bug.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
                   </div>
-                );
-              })
-            )}
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--muted)] mb-1">{titleLabel}</label>
+                    <Input type="text" aria-label={titleLabel} value={bug.title || ""} readOnly placeholder="Title of the linked bug" />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    aria-label={`Unlink ${bug.title}`}
+                    onClick={() => requestUnlinkBug(bug)}
+                  >
+                    Unlink
+                  </Button>
+                </div>
+              );
+            })}
           </div>
 
           {/* Unlink-bug confirmation — unlink only, never deletes the bug or its Jira/Linear

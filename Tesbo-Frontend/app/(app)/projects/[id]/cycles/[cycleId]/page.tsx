@@ -492,9 +492,22 @@ export default function TestRunDetailPage() {
     projectId,
     cycleId,
     members,
-    onLogged: () => {
+    // Reopen the panel for the execution the dialog actually just logged/linked a bug against,
+    // rather than trusting panelExecution — handlePanelSave's auto-prompt (mark Failed -> Save ->
+    // Report a Bug) closes the panel before opening this dialog, so panelExecution is null exactly
+    // when a bug is filed through that path, and the freshly linked Bug Key/Title would otherwise
+    // never surface until the user manually reopened the row.
+    //
+    // Force status to "Failed" rather than trusting exec.status: the backend's
+    // failLinkedExecutions unconditionally flips the linked execution to Failed on every successful
+    // "Log bug"/"Link Bug" (see legacy.service.ts), but exec is a snapshot taken when the dialog was
+    // opened. Clicking the "Log bug" footer button (or the row's bug icon) straight from an
+    // Untested/Passed/etc. panel — without first clicking the local "Failed" status button and
+    // Save — carries that stale status into the snapshot, so trusting it here would reopen the
+    // panel on "Untested" and immediately hide the very Bug Key/Title it just fetched.
+    onLogged: (exec) => {
       load();
-      if (panelExecution) loadPanelBug(panelExecution);
+      openExecutionPanel({ ...exec, status: "Failed" });
     },
   });
 
@@ -695,13 +708,25 @@ export default function TestRunDetailPage() {
   }
 
   /* ───── Right-side test case detail panel ───── */
+  // Guards against an out-of-order response: switching panels fires a new listBugs() call before
+  // the previous execution's call has resolved, and without this a slower earlier response could
+  // land after the panel has moved on, showing one test case's linked bug on another's panel.
+  const panelBugRequestIdRef = useRef<string | null>(null);
+
   function loadPanelBug(exec: ExecutionItem) {
     // listBugs is scoped to testcase+cycle, not to this one execution (the API has no executionId
     // filter) — a testcase can be executed more than once in the same cycle, so this narrows to
-    // the bugs actually linked to THIS execution via each bug's own links[].
+    // the bugs actually linked to THIS execution via each bug's own links[]. Guarded against
+    // switching panels firing a new call before the previous execution's call resolves.
+    panelBugRequestIdRef.current = exec.id;
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
-      .then((bugs) => setPanelBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id))))
-      .catch(() => setPanelBugs([]));
+      .then((bugs) => {
+        if (panelBugRequestIdRef.current !== exec.id) return;
+        setPanelBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id)));
+      })
+      .catch(() => {
+        if (panelBugRequestIdRef.current === exec.id) setPanelBugs([]);
+      });
   }
 
   /* ───── Unlink one bug from this execution — removes only the bug_links row tying it to this
@@ -739,6 +764,7 @@ export default function TestRunDetailPage() {
   }
 
   function closeExecutionPanel() {
+    panelBugRequestIdRef.current = null;
     setPanelExecution(null);
     setPanelBugs([]);
   }
@@ -1993,52 +2019,42 @@ export default function TestRunDetailPage() {
                 />
               </div>
 
-              {/* Bug Key / Bug Title — Failed only (Basecamp 10221790207 kept the same visibility
-                  rule). Read-only: these reflect the real bug(s) filed via "Log bug" (bugs/bug_links),
-                  not a free-text value typed here, so there's nothing to type into them. One
-                  execution can now have several bugs linked (multi-select existing-bug picker) —
-                  a single linked bug keeps the original "Bug Key"/"Bug Title" labels; more than
-                  one numbers them ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every
-                  row gets its own Unlink action regardless of count. */}
-              <div className="space-y-3" hidden={panelStatus !== "Failed"}>
-                {panelBugs.length === 0 ? (
-                  <>
-                    <div>
-                      <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Key</label>
-                      <Input type="text" aria-label="Bug Key" value="" readOnly placeholder="e.g. PROJ-123" />
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">Bug Title</label>
-                      <Input type="text" aria-label="Bug Title" value="" readOnly placeholder="Title of the linked bug" />
-                    </div>
-                  </>
-                ) : (
-                  panelBugs.map((bug, i) => {
-                    const keyLabel = panelBugs.length > 1 ? `Bug ${i + 1} Key` : "Bug Key";
-                    const titleLabel = panelBugs.length > 1 ? `Bug ${i + 1} Title` : "Bug Title";
-                    return (
-                      <div key={bug.id} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
-                        <div>
-                          <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">{keyLabel}</label>
-                          <Input type="text" aria-label={keyLabel} value={bug.integrationIssueKey || bug.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
-                        </div>
-                        <div>
-                          <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">{titleLabel}</label>
-                          <Input type="text" aria-label={titleLabel} value={bug.title || ""} readOnly placeholder="Title of the linked bug" />
-                        </div>
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          size="sm"
-                          aria-label={`Unlink ${bug.title}`}
-                          onClick={() => requestUnlinkBug(bug)}
-                        >
-                          Unlink
-                        </Button>
+              {/* Bug Key / Bug Title — shown only for a Failed case that also has at least one real
+                  persisted bug association (panelBugs, loaded from bug_links via listBugs). Both
+                  conditions matter: Failed alone does not imply a bug exists (only a successful
+                  "Log bug" / "Link Bug" does), and a bug linked while the case was Failed must not
+                  keep showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only:
+                  these reflect the real bug(s), not a free-text value typed here. One execution can
+                  have several bugs linked (multi-select existing-bug picker) — a single linked bug
+                  keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
+                  ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every row gets its own
+                  Unlink action regardless of count. */}
+              <div className="space-y-3" hidden={panelStatus !== "Failed" || panelBugs.length === 0}>
+                {panelBugs.map((bug, i) => {
+                  const keyLabel = panelBugs.length > 1 ? `Bug ${i + 1} Key` : "Bug Key";
+                  const titleLabel = panelBugs.length > 1 ? `Bug ${i + 1} Title` : "Bug Title";
+                  return (
+                    <div key={bug.id} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                      <div>
+                        <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">{keyLabel}</label>
+                        <Input type="text" aria-label={keyLabel} value={bug.integrationIssueKey || bug.externalId || ""} readOnly placeholder="e.g. PROJ-123" />
                       </div>
-                    );
-                  })
-                )}
+                      <div>
+                        <label className="mb-1 block text-[12.5px] font-medium text-[var(--muted)]">{titleLabel}</label>
+                        <Input type="text" aria-label={titleLabel} value={bug.title || ""} readOnly placeholder="Title of the linked bug" />
+                      </div>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        aria-label={`Unlink ${bug.title}`}
+                        onClick={() => requestUnlinkBug(bug)}
+                      >
+                        Unlink
+                      </Button>
+                    </div>
+                  );
+                })}
               </div>
 
               <div className="h-px bg-[var(--border)]" />
