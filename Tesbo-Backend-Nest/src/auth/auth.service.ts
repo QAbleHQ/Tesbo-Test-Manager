@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
   ServiceUnavailableException,
@@ -13,6 +15,7 @@ import { DatabaseService } from "../database/database.service";
 import { SuperAdminService } from "../admin/super-admin.service";
 import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
+import { LoginLockoutService } from "./login-lockout.service";
 import { OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
 import { PasswordService } from "./password.service";
@@ -27,11 +30,26 @@ export class AuthService {
     private readonly passwordReset: PasswordResetService,
     private readonly email: EmailService,
     private readonly audit: AuditService,
-    private readonly superAdmin: SuperAdminService
+    private readonly superAdmin: SuperAdminService,
+    private readonly lockout: LoginLockoutService
   ) {}
 
+  /*
+   * requestOtp/verifyOtp are the login-specific callers of OtpService's requestOtp/verifyOtp — the
+   * lockout is applied here, not inside OtpService, because OtpService.requestOtp and
+   * .verifyOtpCode are shared primitives signup.service.ts also calls directly (signup and
+   * invitation-acceptance codes). Counting those against this email's *login* lockout would be
+   * wrong — someone mistyping a signup code has nothing to do with someone hammering a login.
+   */
   async requestOtp(email: string | undefined, req: AuthenticatedRequest): Promise<void> {
     if (!email) throw new BadRequestException({ error: "email required" });
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const activeLock = await this.lockout.getActiveLock(normalizedEmail);
+    if (activeLock) {
+      throw new HttpException({ error: this.lockedMessage(activeLock) }, HttpStatus.TOO_MANY_REQUESTS);
+    }
+
     let sent = false;
     try {
       sent = await this.otp.requestOtp(email, this.ip(req), req.get("user-agent"));
@@ -39,15 +57,36 @@ export class AuthService {
       throw new ServiceUnavailableException({ error: "otp_delivery_failed" });
     }
     if (!sent) throw new BadRequestException({ error: "email required" });
+
+    // Each OTP request — first send or a resend — counts toward the same per-email lockout as a
+    // wrong password or a wrong OTP code: repeated resends are exactly the kind of hammering this
+    // limit exists to catch. Only counted once the code has actually gone out, so the delivery
+    // failure above never counts against the caller.
+    await this.lockout.recordFailedAttempt(normalizedEmail);
+
     await this.audit.log(null, "otp_requested", "auth", email, "{}", this.ip(req), req.get("user-agent"));
   }
 
   async verifyOtp(email: string | undefined, code: string | undefined, req: AuthenticatedRequest, res: Response) {
     if (!email || !code) throw new BadRequestException({ error: "email and code required" });
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const activeLock = await this.lockout.getActiveLock(normalizedEmail);
+    if (activeLock) {
+      throw new HttpException({ error: this.lockedMessage(activeLock) }, HttpStatus.TOO_MANY_REQUESTS);
+    }
+
     const token = await this.otp.verifyOtp(email.trim(), code, this.ip(req), req.get("user-agent"));
-    if (!token) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    if (!token) {
+      await this.lockout.recordFailedAttempt(normalizedEmail);
+      throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    }
     const userId = await this.otp.resolveSession(token);
-    if (!userId) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    if (!userId) {
+      await this.lockout.recordFailedAttempt(normalizedEmail);
+      throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    }
+    await this.lockout.clear(normalizedEmail);
     await this.audit.log(userId, "login", "auth", email, "{}", this.ip(req), req.get("user-agent"));
     this.setSessionCookie(req, res, token, 86400 * this.config.sessionDays);
     return { ok: true, userId };
@@ -60,6 +99,9 @@ export class AuthService {
     const result = await this.password.verifyLogin(email, password);
     if (result.outcome === "not_found") {
       throw new UnauthorizedException({ error: "No account found with that email address" });
+    }
+    if (result.outcome === "locked") {
+      throw new HttpException({ error: this.lockedMessage(result.lockedUntil) }, HttpStatus.TOO_MANY_REQUESTS);
     }
     if (result.outcome === "invalid_password") {
       throw new UnauthorizedException({ error: "invalid_email_or_password" });
@@ -271,5 +313,18 @@ export class AuthService {
 
   private ip(req: AuthenticatedRequest): string {
     return req.ip ?? "";
+  }
+
+  /** "Too many failed login attempts. Try again in 23 hours 58 minutes." — always rounds the
+   *  remainder up to whole minutes, so a caller retrying right at the boundary never sees "0
+   *  minutes" and immediately fails again. */
+  private lockedMessage(lockedUntil: Date): string {
+    const minutesLeft = Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60_000));
+    const hours = Math.floor(minutesLeft / 60);
+    const minutes = minutesLeft % 60;
+    const parts: string[] = [];
+    if (hours > 0) parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+    if (minutes > 0 || hours === 0) parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+    return `Too many failed login attempts. Try again in ${parts.join(" ")}.`;
   }
 }

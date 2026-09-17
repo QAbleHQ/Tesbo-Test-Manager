@@ -714,11 +714,10 @@ export default function TestRunDetailPage() {
   const panelBugRequestIdRef = useRef<string | null>(null);
 
   function loadPanelBug(exec: ExecutionItem) {
+    panelBugRequestIdRef.current = exec.id;
     // listBugs is scoped to testcase+cycle, not to this one execution (the API has no executionId
     // filter) — a testcase can be executed more than once in the same cycle, so this narrows to
-    // the bugs actually linked to THIS execution via each bug's own links[]. Guarded against
-    // switching panels firing a new call before the previous execution's call resolves.
-    panelBugRequestIdRef.current = exec.id;
+    // the bugs actually linked to THIS execution via each bug's own links[].
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
       .then((bugs) => {
         if (panelBugRequestIdRef.current !== exec.id) return;
@@ -2025,8 +2024,8 @@ export default function TestRunDetailPage() {
                   "Log bug" / "Link Bug" does), and a bug linked while the case was Failed must not
                   keep showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only:
                   these reflect the real bug(s), not a free-text value typed here. One execution can
-                  have several bugs linked (multi-select existing-bug picker) — a single linked bug
-                  keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
+                  now have several bugs linked (multi-select existing-bug picker) — a single linked
+                  bug keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
                   ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every row gets its own
                   Unlink action regardless of count. */}
               <div className="space-y-3" hidden={panelStatus !== "Failed" || panelBugs.length === 0}>

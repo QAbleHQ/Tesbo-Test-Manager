@@ -246,7 +246,7 @@ test.describe("bug CRUD", () => {
   );
 
   test(
-    "listBugs filters by cycleId, following bug_links rather than the denormalized column",
+    "listBugs filters by testcaseId+cycleId together, matching only the SAME bug_links row",
     async ({ request }) => {
       // Regression: the exact same staleness the testcaseId test above covers, but for cycleId —
       // and this is the one the Test Case Detail panel's real query (`listBugs({testcaseId,
@@ -254,7 +254,9 @@ test.describe("bug CRUD", () => {
       // new cycle but never touches bugs.cycle_id, which stays at whatever cycle the bug was first
       // created in (or null, if it was filed with no run yet). A `b.cycle_id = $N` filter then
       // silently excluded a bug that a real bug_links row said belonged to this cycle, so a bug
-      // that was genuinely just linked never reappeared in the panel that linked it.
+      // that was genuinely just linked never reappeared in the panel that linked it. When both
+      // testcaseId and cycleId are given they must be satisfied by the SAME link row, not by two
+      // different links on the same bug that happen to each match one side.
       const cycleA = await (
         await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug Cycle Filter A ${Date.now()}` } })
       ).json();
@@ -297,6 +299,58 @@ test.describe("bug CRUD", () => {
         // testcaseId in one link row must not combine with a match on cycleId from a different one.
         const listForB = await (
           await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { testcaseId: testcase.id, cycleId: cycleB.id } })
+        ).json();
+        expect(listForB.some((b: { id: string }) => b.id === created.id), "not linked to cycle B").toBeFalsy();
+      } finally {
+        await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/cycles/${cycleA.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/cycles/${cycleB.id}`, { failOnStatusCode: false });
+        await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+      }
+    },
+  );
+
+  test(
+    "listBugs filters by cycleId alone, following bug_links rather than the denormalized column",
+    async ({ request }) => {
+      // Regression: unlike the testcaseId filter above (TES-TC-2015), the cycleId filter still
+      // matched against bugs.cycle_id -- the "first-link convenience" column set once at creation
+      // (V48_bug_links.sql) and never touched by addBugLink afterwards. A bug created with no
+      // link at all (bugs.cycle_id stays NULL) and later linked into a cycle via addBugLink --
+      // exactly what "Yes, link existing -> Existing Tesbo bug" does -- was then invisible to
+      // listBugs(cycleId) even though bug_links was correct, so a bug picked that way silently
+      // never showed up in the run drawer/execute page's Bug Key/Title fields.
+      const cycleA = await (
+        await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug CycleId Filter A ${Date.now()}` } })
+      ).json();
+      const cycleB = await (
+        await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Bug CycleId Filter B ${Date.now()}` } })
+      ).json();
+      const testcase = await (
+        await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Bug CycleId Filter Case ${Date.now()}` } })
+      ).json();
+
+      // Created with no link at all -- bugs.cycle_id stays NULL, same as a bug the picker offers
+      // that was originally filed unlinked or against a different cycle entirely.
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Bug CycleId Filter Target ${Date.now()}`, links: [] },
+        })
+      ).json();
+
+      try {
+        await request.post(`/api/bugs/${created.id}/links`, { data: { testcaseId: testcase.id, cycleId: cycleA.id } });
+
+        const listForA = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { cycleId: cycleA.id } })
+        ).json();
+        expect(
+          listForA.some((b: { id: string }) => b.id === created.id),
+          "linked via bug_links to cycle A -- must be found even though bugs.cycle_id is still NULL",
+        ).toBeTruthy();
+
+        const listForB = await (
+          await request.get(`/api/projects/${ctx.projectId}/bugs`, { params: { cycleId: cycleB.id } })
         ).json();
         expect(listForB.some((b: { id: string }) => b.id === created.id), "not linked to cycle B").toBeFalsy();
       } finally {

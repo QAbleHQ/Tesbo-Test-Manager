@@ -100,6 +100,10 @@ const TESTCASE_TYPES = [
   "API", "UI", "Performance", "Security",
 ];
 const TESTCASE_AUTOMATION_TYPES = ["Automated", "Not Automated", "Can't Automate"];
+/* Create-form-only sentinel for an unselected Suite: "" is already the real "No suite" value
+ * (see `suiteId || undefined` in handlePanelSubmit), so an unpicked suite needs a distinct value
+ * to render as an unselected "Select" placeholder rather than pre-selecting "No suite". */
+const UNSELECTED_SUITE_ID = "__unselected_suite__";
 // Same vocabulary as bugs.severity (BUG_SEVERITIES in legacy.service.ts) for consistency, though the
 // testcases.severity column has no CHECK constraint enforcing it — free text is stored either way.
 const TESTCASE_SEVERITIES = ["Critical", "High", "Medium", "Low"];
@@ -862,13 +866,13 @@ export default function TestCasesPage() {
     setTestData("");
     setEstimatedDuration("");
     setAttachments("");
-    setType("Functional");
-    setPriority("P2");
+    setType("");
+    setPriority("");
     setStatus("Draft");
-    setAutomationStatus("Not Automated");
+    setAutomationStatus("");
     setComponent("");
     setSeverity("");
-    setSuiteId(defaultSuiteId ?? formSuiteId ?? "");
+    setSuiteId(defaultSuiteId ?? formSuiteId ?? UNSELECTED_SUITE_ID);
     setTestcaseIdPrefix(defaultTestcaseIdPrefix);
     setPanelJiraIssueKey("");
     setPanelJiraUrl("");
@@ -1303,6 +1307,21 @@ export default function TestCasesPage() {
   async function handlePanelSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (panelMode !== "create" && panelMode !== "edit") return;
+
+    // Suite/Type/Priority/Automation Type start unselected on the create form (never a predefined
+    // default the user didn't choose) — so a create submitted before they're picked must be blocked
+    // here rather than silently sending an empty/placeholder value to the API.
+    if (panelMode === "create") {
+      const missingFields: string[] = [];
+      if (suiteId === UNSELECTED_SUITE_ID) missingFields.push("Suite");
+      if (!type) missingFields.push("Type");
+      if (!priority) missingFields.push("Priority");
+      if (!automationStatus) missingFields.push("Automation Type");
+      if (missingFields.length > 0) {
+        setPanelError(`Select a value for ${missingFields.join(", ")} before creating the test case.`);
+        return;
+      }
+    }
 
     // Required custom fields must be filled before the test case can be saved. Checked
     // client-side against whichever list is currently in scope — the edit-mode tab is
@@ -2324,6 +2343,7 @@ export default function TestCasesPage() {
                         <Field>
                           <FieldLabel>Suite</FieldLabel>
                           <Select value={suiteId} onChange={(e) => setSuiteId(e.target.value)}>
+                            <option value={UNSELECTED_SUITE_ID} disabled>Select</option>
                             <option value="">No suite</option>
                             {suites.map((suite) => <option key={suite.id} value={suite.id}>{suiteNameMap.get(suite.id) ?? suite.name}</option>)}
                           </Select>
@@ -2331,12 +2351,14 @@ export default function TestCasesPage() {
                         <Field>
                           <FieldLabel>Type</FieldLabel>
                           <Select value={type} onChange={(e) => setType(e.target.value)}>
+                            <option value="" disabled>Select</option>
                             {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                           </Select>
                         </Field>
                         <Field>
                           <FieldLabel>Priority</FieldLabel>
                           <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                            <option value="" disabled>Select</option>
                             {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
                           </Select>
                         </Field>
@@ -2349,6 +2371,7 @@ export default function TestCasesPage() {
                         <Field>
                           <FieldLabel>Automation Type</FieldLabel>
                           <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
+                            <option value="" disabled>Select</option>
                             {TESTCASE_AUTOMATION_TYPES.map((a) => <option key={a} value={a}>{a}</option>)}
                           </Select>
                         </Field>

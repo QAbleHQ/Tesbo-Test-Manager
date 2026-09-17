@@ -471,7 +471,11 @@ describe("McpService", () => {
         "proj-1"
       );
       expect(res.result.isError).toBe(false);
-      expect((legacy as any).updateExecution).toHaveBeenCalledWith("ex-1", "mcp-actor-1", {
+      // Attributed to the token's user (ctx.userId), NOT the mcp-actor-1 agent actor resolved by
+      // makeDb's mcpActorId — updateExecution stores this as executions.executed_by, which
+      // references users(id), and the agent actor has no organization_members row to satisfy
+      // requireProjectAccess. See mcp.tools.ts's record_execution_result handler comment.
+      expect((legacy as any).updateExecution).toHaveBeenCalledWith("ex-1", "user-1", {
         executionId: "ex-1",
         status: "Passed"
       });

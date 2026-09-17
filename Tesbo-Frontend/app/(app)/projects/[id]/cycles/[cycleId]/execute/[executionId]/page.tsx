@@ -88,31 +88,28 @@ export default function ExecutionDetailPage() {
     // state — this page never nulls that state out, so both happen to agree today, but relying on
     // the dialog's own answer keeps this correct even if that stops being true.
     onLogged: (exec) => {
-      loadLinkedBug(exec);
+      loadLinkedBugs(exec);
     },
   });
 
   // Guards against an out-of-order response landing after a newer listBugs() call for this same
   // page — e.g. the initial-mount fetch resolving after a post-"Log bug" refresh — which would
   // otherwise overwrite the fresher result with a stale one.
-  const linkedBugRequestIdRef = useRef<string | null>(null);
+  const linkedBugsRequestIdRef = useRef<string | null>(null);
 
-  function loadLinkedBug(exec: ExecutionItem) {
+  function loadLinkedBugs(exec: ExecutionItem) {
+    const requestId = `${exec.id}:${Date.now()}`;
+    linkedBugsRequestIdRef.current = requestId;
     // listBugs is scoped to testcase+cycle, not to this one execution (the API has no executionId
     // filter) — a testcase can be executed more than once in the same cycle, so this narrows to
-    // the bugs actually linked to THIS execution via each bug's own links[]. Guarded by a
-    // per-request id against an out-of-order response landing after a newer call for this same
-    // page (e.g. the initial-mount fetch resolving after a post-"Log bug" refresh) overwriting a
-    // fresher result with a stale one.
-    const requestId = `${exec.id}:${Date.now()}`;
-    linkedBugRequestIdRef.current = requestId;
+    // the bugs actually linked to THIS execution via each bug's own links[].
     listBugs(projectId, { testcaseId: exec.testcaseId, cycleId })
       .then((bugs) => {
-        if (linkedBugRequestIdRef.current !== requestId) return;
+        if (linkedBugsRequestIdRef.current !== requestId) return;
         setLinkedBugs(bugs.filter((bug) => bug.links.some((l) => l.executionId === exec.id)));
       })
       .catch(() => {
-        if (linkedBugRequestIdRef.current === requestId) setLinkedBugs([]);
+        if (linkedBugsRequestIdRef.current === requestId) setLinkedBugs([]);
       });
   }
 
@@ -134,7 +131,7 @@ export default function ExecutionDetailPage() {
     setUnlinkingBug(true);
     try {
       await removeBugLink(bugToUnlink.id, link.id);
-      loadLinkedBug(execution);
+      loadLinkedBugs(execution);
       setBugToUnlink(null);
     } finally {
       setUnlinkingBug(false);
@@ -154,7 +151,7 @@ export default function ExecutionDetailPage() {
           setStatus(e.status || "Untested");
           setActualResult(e.actualResult || "");
           setAssigneeId(e.assigneeId || "");
-          loadLinkedBug(e);
+          loadLinkedBugs(e);
         }
       })
       .catch(() => router.replace("/projects"));
@@ -315,14 +312,14 @@ export default function ExecutionDetailPage() {
           {/*
             * Bug Key / Bug Title — shown only for a Failed case that also has at least one real
             * persisted bug association (linkedBugs, loaded from bug_links via listBugs). Both
-            * conditions matter: Failed alone does not imply a bug exists (only a successful "Log
-            * bug" / "Link Bug" does), and a bug linked while the case was Failed must not keep
-            * showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only: these
-            * reflect the real bug(s), not a free-text value typed here. One execution can have
-            * several bugs linked (multi-select existing-bug picker) — a single linked bug keeps the
-            * original "Bug Key"/"Bug Title" labels; more than one numbers them ("Bug 1 Key", "Bug 2
-            * Key", …) so none is silently dropped. Every row gets its own Unlink action regardless
-            * of count.
+            * conditions matter: Failed alone does not imply a bug exists (only a successful
+            * "Log bug" / "Link Bug" does), and a bug linked while the case was Failed must not
+            * keep showing once the case is Untested/Passed/Skipped/Blocked/Retest. Read-only:
+            * these reflect the real bug(s), not a free-text value typed here. One execution can
+            * now have several bugs linked (multi-select existing-bug picker) — a single linked
+            * bug keeps the original "Bug Key"/"Bug Title" labels; more than one numbers them
+            * ("Bug 1 Key", "Bug 2 Key", …) so none is silently dropped. Every row gets its own
+            * Unlink action regardless of count.
             */}
           <div className="space-y-3" hidden={status !== "Failed" || linkedBugs.length === 0}>
             {linkedBugs.map((bug, i) => {

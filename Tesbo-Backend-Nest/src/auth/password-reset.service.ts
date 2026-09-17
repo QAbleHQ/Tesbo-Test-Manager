@@ -55,6 +55,12 @@ export class PasswordResetService {
     // whoever (or whatever) stole the old password would keep their session alive right through it.
     await this.db.query("DELETE FROM sessions WHERE user_id = $1", [row.user_id]);
     await this.sessionCache.invalidateAllForUser(row.user_id);
+
+    // Forgot Password exception: completing a reset clears this email's failed-login lockout too,
+    // so a blocked account isn't still blocked from using the very password it just set.
+    const userRow = await this.db.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [row.user_id]);
+    if (userRow.rows[0]?.email) await this.password.clearLoginLockout(userRow.rows[0].email);
+
     return row.user_id;
   }
 

@@ -494,18 +494,47 @@ describe("LegacyService#integrationCallback", () => {
 });
 
 describe("LegacyService#linkedLinearKeys — issue-linking aggregate", () => {
+  // linkedLinearKeys(projectId, userId) runs requireProjectAccess(userId, projectId) first, which
+  // needs (a) a real userId — requireUser() throws "Authentication required" on a missing one —
+  // and (b) a UUID-shaped projectId — isUuid() throws "Project not found" otherwise (see
+  // legacy.service.ts). The tests below previously called linkedLinearKeys("proj-1") with no
+  // userId at all, so every one of them failed at requireUser() before ever reaching the
+  // aggregation query this describe block is meant to test.
+  const PROJECT_ID = "11111111-1111-1111-1111-111111111111";
+  const USER_ID = "22222222-2222-2222-2222-222222222222";
+  const ORG_ID = "org-1";
+
+  /** requireProjectAccess's own two lookups: the caller's workspace, then project membership. */
+  function projectAccessRoutes(): Route[] {
+    return [
+      workspaceRoute("qa_engineer", ORG_ID),
+      { match: "JOIN project_members pm ON pm.project_id = p.id", rows: [{ id: PROJECT_ID, organization_id: ORG_ID, caller_role: "qa_engineer" }] }
+    ];
+  }
+
   it("aggregates linked Linear issue keys and their testcase counts", async () => {
-    const { db, calls } = makeDb([{ match: "FROM testcases WHERE project_id", rows: [{ linear_issue_key: "ENG-1", count: 3 }, { linear_issue_key: "ENG-2", count: 1 }] }]);
+    const { db, calls } = makeDb([
+      ...projectAccessRoutes(),
+      { match: "FROM testcases WHERE project_id", rows: [{ linear_issue_key: "ENG-1", count: 3 }, { linear_issue_key: "ENG-2", count: 1 }] }
+    ]);
     const svc = makeLegacy(db);
-    const res = await svc.linkedLinearKeys("proj-1");
-    expect(res).toEqual({ keys: ["ENG-1", "ENG-2"], counts: { "ENG-1": 3, "ENG-2": 1 } });
-    expect(calls[0].params).toEqual(["proj-1"]);
+    const res = await svc.linkedLinearKeys(PROJECT_ID, USER_ID);
+    expect(res).toEqual({ keys: ["ENG-1", "ENG-2"], counts: { "ENG-1": 3, "ENG-2": 1 }, tasks: {} });
+    const aggregateCall = calls.find((c) => c.sql.includes("FROM testcases WHERE project_id"));
+    expect(aggregateCall!.params).toEqual([PROJECT_ID]);
   });
 
   it("returns empty keys/counts when no testcase links a Linear issue", async () => {
-    const { db } = makeDb([{ match: "FROM testcases WHERE project_id", rows: [] }]);
+    const { db } = makeDb([...projectAccessRoutes(), { match: "FROM testcases WHERE project_id", rows: [] }]);
     const svc = makeLegacy(db);
-    expect(await svc.linkedLinearKeys("proj-1")).toEqual({ keys: [], counts: {} });
+    expect(await svc.linkedLinearKeys(PROJECT_ID, USER_ID)).toEqual({ keys: [], counts: {}, tasks: {} });
+  });
+
+  it("404s when the project id is not a valid UUID — never reaches the aggregation query", async () => {
+    const { db, calls } = makeDb([...projectAccessRoutes(), { match: "FROM testcases WHERE project_id", rows: [] }]);
+    const err = await rejection(makeLegacy(db).linkedLinearKeys("not-a-uuid-at-all", USER_ID));
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("FROM testcases WHERE project_id"))).toBe(false);
   });
 });
 
