@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, request as pwRequest, test, type Locator } from "@playwright/test";
+import { expect, request as pwRequest, test, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 const STATE_PATH = path.join(__dirname, "../.auth/state.json");
+
+/** The label isn't tied to its control via for/id, so this walks the DOM structure instead. */
+function fieldControl(page: Page, label: string): Locator {
+  return page.locator(
+    `xpath=//label[normalize-space(text())="${label}"]/following-sibling::*[self::input or self::select or self::textarea]`,
+  );
+}
 
 test.describe("test case creation", () => {
   test("a user can create a test case from the UI and see it in the list", { tag: '@tesbo.testId("TES-TC-836")' }, async ({ page }) => {
@@ -18,6 +25,13 @@ test.describe("test case creation", () => {
 
     const panel = page.locator("aside");
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
+    // Suite/Type/Priority/Automation Type start unselected (see the dedicated test below) and
+    // block creation until chosen — pick a value for each so this happy-path test still reaches
+    // the create call itself.
+    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
+    await fieldControl(page, "Type").selectOption("Functional");
+    await fieldControl(page, "Priority").selectOption("P2");
+    await fieldControl(page, "Automation Type").selectOption("Not Automated");
     await panel.getByRole("button", { name: "Create", exact: true }).click();
 
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
@@ -51,20 +65,18 @@ test.describe("test case creation", () => {
     const postconditions = "User is redirected to the dashboard.";
     const component = "Login";
 
-    /** The label isn't tied to its control via for/id, so this walks the DOM structure instead. */
-    const fieldControl = (label: string): Locator =>
-      page.locator(
-        `xpath=//label[normalize-space(text())="${label}"]/following-sibling::*[self::input or self::select or self::textarea]`,
-      );
-
     await page.goto(`/projects/${ctx.projectId}/testcases`);
     await page.getByRole("button", { name: "Add test case" }).first().click();
 
     const panel = page.locator("aside");
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
-    await fieldControl("Postconditions").fill(postconditions);
-    await fieldControl("Component").fill(component);
-    await fieldControl("Severity").selectOption("Medium");
+    await fieldControl(page, "Postconditions").fill(postconditions);
+    await fieldControl(page, "Component").fill(component);
+    await fieldControl(page, "Severity").selectOption("Medium");
+    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
+    await fieldControl(page, "Type").selectOption("Functional");
+    await fieldControl(page, "Priority").selectOption("P2");
+    await fieldControl(page, "Automation Type").selectOption("Not Automated");
     await panel.getByRole("button", { name: "Create", exact: true }).click();
 
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
@@ -73,9 +85,58 @@ test.describe("test case creation", () => {
     // Reopening the row loads the edit panel (View/Edit) — the three new fields must come back
     // exactly as saved, proving the round trip through the API rather than just the form state.
     await page.getByRole("button", { name: title }).click();
-    await expect(fieldControl("Postconditions")).toHaveValue(postconditions);
-    await expect(fieldControl("Component")).toHaveValue(component);
-    await expect(fieldControl("Severity")).toHaveValue("Medium");
+    await expect(fieldControl(page, "Postconditions")).toHaveValue(postconditions);
+    await expect(fieldControl(page, "Component")).toHaveValue(component);
+    await expect(fieldControl(page, "Severity")).toHaveValue("Medium");
+
+    // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const listRes = await api.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: title },
+      });
+      const list = await listRes.json();
+      const match = list.find((tc: { id: string; title: string }) => tc.title === title);
+      if (match) await api.delete(`/api/projects/${ctx.projectId}/testcases/${match.id}`);
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  // Regression coverage for: Create Test Case opened with Suite/Type/Priority/Automation Type
+  // pre-set to "No suite"/"Functional"/"P2"/"Not Automated" — real values the user never chose,
+  // silently submitted on Create. Status is unaffected by this bug and must keep defaulting to
+  // "Draft".
+  test("Create Test Case opens with Suite, Type, Priority and Automation Type unselected, and blocks creation until they're chosen", async ({ page }) => {
+    const title = `UI unselected defaults test case ${Date.now()}`;
+
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+    await page.getByRole("button", { name: "Add test case" }).first().click();
+
+    const panel = page.locator("aside");
+
+    await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Status").locator("option:checked")).toHaveText("Draft");
+
+    // Submitting before picking them is blocked with an explicit error, not a silent create.
+    await panel.getByPlaceholder("Describe what this test case validates").fill(title);
+    await panel.getByRole("button", { name: "Create", exact: true }).click();
+    await expect(
+      panel.getByText("Select a value for Suite, Type, Priority, Automation Type before creating the test case."),
+    ).toBeVisible();
+    await expect(panel.getByText("Test case created successfully.")).not.toBeVisible();
+
+    // Selecting all four — including explicitly picking "No suite" — lets the same create through.
+    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
+    await fieldControl(page, "Type").selectOption("Functional");
+    await fieldControl(page, "Priority").selectOption("P2");
+    await fieldControl(page, "Automation Type").selectOption("Not Automated");
+    await panel.getByRole("button", { name: "Create", exact: true }).click();
+    await expect(panel.getByText("Test case created successfully.")).toBeVisible();
+    await panel.getByRole("button", { name: "Close panel" }).click();
 
     // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
