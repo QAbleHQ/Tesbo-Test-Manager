@@ -10578,7 +10578,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity, approval] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
@@ -10613,6 +10613,23 @@ export class LegacyService implements OnModuleInit {
           WHERE s.project_id = $1 AND s.deleted_at IS NULL
             AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
         [projectId]
+      ),
+      // All-time, unlike `tasks` above which is capped to the 50 most recently updated rows for
+      // display — a project with a long Zyra history must not have its approval rate silently
+      // reset once older runs scroll out of that window. task_status = 'done' (not merely
+      // <> 'failed') is deliberate: a 'in_review' task has drafts generated and saved_count still
+      // 0 simply because the user hasn't finished reviewing it yet, not because they rejected
+      // anything — counting it here would drag the rate down for work that is still pending, not
+      // decided. 'done' is only ever reached via aiSave, an explicit save-or-close action (see
+      // aiSave below), which is what "approved and saved" in the ticket actually means. Excludes
+      // 'failed' the same way, since a generation error leaves nothing to approve or reject.
+      // chat_session_id IS NULL matches `tasks`: chat-created testcases don't go through this
+      // saved/generated lifecycle, so there is nothing meaningful to fold into this ratio for them.
+      this.db.query<{ saved: string; generated: string }>(
+        `SELECT COALESCE(SUM(saved_count), 0) AS saved, COALESCE(SUM(generated_count), 0) AS generated
+           FROM ai_generation_requests
+          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND chat_session_id IS NULL AND task_status = 'done'`,
+        [projectId, ZYRA_AGENT_NAMES]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
@@ -10654,6 +10671,10 @@ export class LegacyService implements OnModuleInit {
         total: Number(usage.rows[0]?.total || 0)
       },
       testcasesCreated: await this.zyraCreatedTestcaseCount(projectId),
+      approvalRate: (() => {
+        const generated = Number(approval.rows[0]?.generated || 0);
+        return generated > 0 ? Math.round((Number(approval.rows[0]?.saved || 0) / generated) * 100) : null;
+      })(),
       tasks: await Promise.all(tasks.rows.map((row) => this.formatAiTask(row)))
     };
   }
