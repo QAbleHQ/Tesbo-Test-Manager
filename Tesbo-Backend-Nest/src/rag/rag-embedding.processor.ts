@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { tracedEmbeddingCall } from "../observability/embedding-trace";
 import { embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
 import { RagChunkingService } from "./rag-chunking.service";
 import { RAG_EMBEDDING_BATCH_SIZE, RAG_EMBEDDING_DIMENSION, RAG_EMBEDDING_QUEUE, RAG_TESTCASE_EMBEDDING_JOB_NAME } from "./rag.constants";
@@ -81,10 +82,28 @@ export class RagEmbeddingProcessor extends WorkerHost {
       return;
     }
 
+    // Deterministic per-content-version trace id — recomputable from data already stored
+    // (embedding_content_hash), the same "no trace_id column, no backfill" philosophy
+    // startZyraTurn uses for chat messages. One batch = one Langfuse observation, all landing
+    // under this same trace id, so a multi-batch document shows exactly which batch failed
+    // rather than one opaque "job failed" line.
+    const traceSeed = `embed-doc:${sourceType}:${sourceId}:${contentHash}`;
     const embeddings: number[][] = [];
     for (let i = 0; i < chunks.length; i += RAG_EMBEDDING_BATCH_SIZE) {
       const batch = chunks.slice(i, i + RAG_EMBEDDING_BATCH_SIZE);
-      const vectors = await embedTexts(allocation, batch.map((c) => c.content));
+      const vectors = await tracedEmbeddingCall(
+        {
+          traceSeed,
+          name: "kb-chunk-embedding-batch",
+          projectId,
+          organizationId: source.organization_id,
+          provider: allocation.provider,
+          model: allocation.model,
+          inputCount: batch.length,
+          inputSample: batch[0]?.content
+        },
+        () => embedTexts(allocation, batch.map((c) => c.content))
+      );
       embeddings.push(...vectors);
     }
 
@@ -180,7 +199,19 @@ export class RagEmbeddingProcessor extends WorkerHost {
 
     await this.setStatus("testcases", testcaseId, "processing");
 
-    const [vector] = await embedTexts(allocation, [text]);
+    const traceSeed = `embed-testcase:${testcaseId}:${contentHash}`;
+    const [vector] = await tracedEmbeddingCall(
+      {
+        traceSeed,
+        name: "testcase-embedding",
+        projectId,
+        provider: allocation.provider,
+        model: allocation.model,
+        inputCount: 1,
+        inputSample: text
+      },
+      () => embedTexts(allocation, [text])
+    );
     if (!vector || vector.length !== RAG_EMBEDDING_DIMENSION) {
       this.logger.warn(
         `Discarding embedding for testcase:${testcaseId} — ${allocation.provider}/${allocation.model} returned ${vector?.length ?? 0} dimensions, expected ${RAG_EMBEDDING_DIMENSION}.`

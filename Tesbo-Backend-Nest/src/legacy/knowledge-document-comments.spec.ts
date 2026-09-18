@@ -68,6 +68,21 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
   }
 }
 
+// requireProjectAccess/kbDocument/isUuid-guarded methods (see legacy.service.ts) validate
+// projectId, documentId, commentId and parentCommentId as real UUIDs — these tests previously used
+// human-readable placeholder ids ("proj-1", "doc-1", "c-1", ...), which meant every affected test
+// was either rejected before reaching the behaviour it claims to test, or (worse, silently)
+// accidentally passed for the wrong reason whenever the expected exception type happened to match
+// the guard's own exception type (both are NotFoundException, for instance). Real UUID-shaped ids
+// here so each test exercises what it actually says it tests. User ids are left as-is — none of
+// these methods validate userId's shape, only truthiness.
+const PROJECT_ID = "11111111-1111-1111-1111-111111111111";
+const DOC_ID = "22222222-2222-2222-2222-222222222222";
+const COMMENT_ID = "33333333-3333-3333-3333-333333333333";
+const THREAD_ROOT_ID = "44444444-4444-4444-4444-444444444444";
+const REPLY_ID = "55555555-5555-5555-5555-555555555555";
+const NOT_A_UUID = "not-a-uuid-at-all";
+
 /**
  * requireProjectAccess resolves the caller's active workspace first, then the project membership
  * scoped to it — both need routing before any Knowledge Base query is reached.
@@ -75,7 +90,7 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
 function accessRoutes(role = "qa_engineer"): Route[] {
   return [
     { match: "FROM users u", rows: [{ id: "org-1", name: "Acme", slug: "acme", role: "owner", created_at: "2026-01-01T00:00:00.000Z" }] },
-    { match: "JOIN project_members pm", rows: [{ id: "proj-1", organization_id: "org-1", caller_role: role }] },
+    { match: "JOIN project_members pm", rows: [{ id: PROJECT_ID, organization_id: "org-1", caller_role: role }] },
     { match: "SELECT role FROM project_members", rows: [{ role }] }
   ];
 }
@@ -86,15 +101,15 @@ function baseRoutes(role = "qa_engineer", docOverrides: Record<string, unknown> 
     ...accessRoutes(role),
     {
       match: "FROM knowledge_documents WHERE id = $1 AND project_id = $2",
-      rows: [{ id: "doc-1", organization_id: "org-1", project_id: "proj-1", title: "EAD-1: Checkout", created_by: "user-1", ...docOverrides }]
+      rows: [{ id: DOC_ID, organization_id: "org-1", project_id: PROJECT_ID, title: "EAD-1: Checkout", created_by: "user-1", ...docOverrides }]
     }
   ];
 }
 
 function commentRow(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    id: "c-1",
-    document_id: "doc-1",
+    id: COMMENT_ID,
+    document_id: DOC_ID,
     parent_comment_id: null,
     author_id: "user-1",
     author_name: "Priya Shah",
@@ -126,7 +141,7 @@ describe("LegacyService#listKnowledgeDocumentComments", () => {
         ]
       }
     ]);
-    const res = await makeLegacy(db).listKnowledgeDocumentComments("proj-1", "user-1", "doc-1");
+    const res = await makeLegacy(db).listKnowledgeDocumentComments(PROJECT_ID, "user-1", DOC_ID);
 
     expect(res.total).toBe(2);
     // t-2 is resolved, so only t-1 is open.
@@ -147,18 +162,28 @@ describe("LegacyService#listKnowledgeDocumentComments", () => {
         rows: [commentRow({ id: "t-1", body: "Thread" }), commentRow({ id: "orphan", parent_comment_id: "deleted-root" })]
       }
     ]);
-    const res = await makeLegacy(db).listKnowledgeDocumentComments("proj-1", "user-1", "doc-1");
+    const res = await makeLegacy(db).listKnowledgeDocumentComments(PROJECT_ID, "user-1", DOC_ID);
     expect(res.list.map((t) => t.id)).toEqual(["t-1"]);
     expect(res.list[0].replies).toEqual([]);
   });
 
   it("404s when the document doesn't exist in this project", async () => {
+    const MISSING_DOC_ID = "66666666-6666-6666-6666-666666666666";
     const { db } = makeDb([
       ...accessRoutes("owner"),
       { match: "FROM knowledge_documents WHERE id = $1 AND project_id = $2", rows: [] }
     ]);
-    const err = await rejection(makeLegacy(db).listKnowledgeDocumentComments("proj-1", "user-1", "missing"));
+    // A UUID-shaped id that genuinely isn't found — not "missing" (which would 404 via the isUuid
+    // guard for the wrong reason, before ever reaching this query).
+    const err = await rejection(makeLegacy(db).listKnowledgeDocumentComments(PROJECT_ID, "user-1", MISSING_DOC_ID));
     expect(err).toBeInstanceOf(NotFoundException);
+  });
+
+  it("rejects a malformed (non-UUID) project id with a 404, before any document lookup", async () => {
+    const { db, calls } = makeDb([...accessRoutes("owner")]);
+    const err = await rejection(makeLegacy(db).listKnowledgeDocumentComments(NOT_A_UUID, "user-1", DOC_ID));
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("FROM knowledge_documents"))).toBe(false);
   });
 });
 
@@ -171,7 +196,7 @@ describe("LegacyService#createKnowledgeDocumentComment", () => {
       { match: "INSERT INTO knowledge_document_comments", rows: [{ id: "c-9" }] },
       { match: "FROM knowledge_document_comments c", rows: [commentRow({ id: "c-9" })] }
     ]);
-    const created = await makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", { body: "Still broken." });
+    const created = await makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, { body: "Still broken." });
     expect(created.id).toBe("c-9");
     expect(calls.some((c) => c.sql.includes("INSERT INTO knowledge_document_comments"))).toBe(true);
   });
@@ -182,7 +207,7 @@ describe("LegacyService#createKnowledgeDocumentComment", () => {
       { match: "INSERT INTO knowledge_document_comments", rows: [{ id: "c-9" }] },
       { match: "FROM knowledge_document_comments c", rows: [commentRow({ id: "c-9" })] }
     ]);
-    await makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", {
+    await makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, {
       body: "Which Safari version?",
       anchorText: "blank page after clicking Pay",
       anchorStart: 120,
@@ -195,13 +220,13 @@ describe("LegacyService#createKnowledgeDocumentComment", () => {
   it("ignores an anchor sent on a reply — a reply inherits its thread's anchor", async () => {
     const { db, calls } = makeDb([
       ...baseRoutes(),
-      { match: "SELECT id, parent_comment_id FROM knowledge_document_comments", rows: [{ id: "t-1", parent_comment_id: null }] },
+      { match: "SELECT id, parent_comment_id FROM knowledge_document_comments", rows: [{ id: THREAD_ROOT_ID, parent_comment_id: null }] },
       { match: "INSERT INTO knowledge_document_comments", rows: [{ id: "c-9" }] },
       { match: "FROM knowledge_document_comments c", rows: [commentRow({ id: "c-9" })] }
     ]);
-    await makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", {
+    await makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, {
       body: "Agreed",
-      parentCommentId: "t-1",
+      parentCommentId: THREAD_ROOT_ID,
       anchorText: "should be dropped",
       anchorStart: 5,
       anchorEnd: 10
@@ -213,33 +238,45 @@ describe("LegacyService#createKnowledgeDocumentComment", () => {
   it("rejects a reply to a reply, keeping threads one level deep", async () => {
     const { db } = makeDb([
       ...baseRoutes(),
-      { match: "SELECT id, parent_comment_id FROM knowledge_document_comments", rows: [{ id: "r-1", parent_comment_id: "t-1" }] }
+      { match: "SELECT id, parent_comment_id FROM knowledge_document_comments", rows: [{ id: REPLY_ID, parent_comment_id: THREAD_ROOT_ID }] }
     ]);
     const err = await rejection(
-      makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", { body: "nested", parentCommentId: "r-1" })
+      makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, { body: "nested", parentCommentId: REPLY_ID })
     );
     expect(err).toBeInstanceOf(BadRequestException);
   });
 
   it("rejects an empty or whitespace-only comment", async () => {
     const { db } = makeDb(baseRoutes());
-    const err = await rejection(makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", { body: "   \n  " }));
+    const err = await rejection(makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, { body: "   \n  " }));
     expect(err).toBeInstanceOf(BadRequestException);
   });
 
   it("404s when replying to a comment that no longer exists", async () => {
+    const GONE_ID = "77777777-7777-7777-7777-777777777777";
     const { db } = makeDb([...baseRoutes(), { match: "SELECT id, parent_comment_id FROM knowledge_document_comments", rows: [] }]);
+    // UUID-shaped but genuinely absent from the mocked SELECT — not "gone" (which would 404 via the
+    // isUuid guard for the wrong reason, before ever reaching this query).
     const err = await rejection(
-      makeLegacy(db).createKnowledgeDocumentComment("proj-1", "user-1", "doc-1", { body: "hi", parentCommentId: "gone" })
+      makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, { body: "hi", parentCommentId: GONE_ID })
     );
     expect(err).toBeInstanceOf(NotFoundException);
+  });
+
+  it("rejects a malformed (non-UUID) parentCommentId with a 404, before any thread lookup", async () => {
+    const { db, calls } = makeDb(baseRoutes());
+    const err = await rejection(
+      makeLegacy(db).createKnowledgeDocumentComment(PROJECT_ID, "user-1", DOC_ID, { body: "hi", parentCommentId: NOT_A_UUID })
+    );
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("SELECT id, parent_comment_id FROM knowledge_document_comments"))).toBe(false);
   });
 });
 
 describe("LegacyService#updateKnowledgeDocumentComment", () => {
   const existing = (over: Record<string, unknown> = {}): Route => ({
     match: "SELECT id, author_id, parent_comment_id, document_id FROM knowledge_document_comments",
-    rows: [{ id: "c-1", author_id: "user-1", parent_comment_id: null, document_id: "doc-1", ...over }]
+    rows: [{ id: COMMENT_ID, author_id: "user-1", parent_comment_id: null, document_id: DOC_ID, ...over }]
   });
 
   it("refuses to let anyone but the author reword a comment, even an owner", async () => {
@@ -249,7 +286,7 @@ describe("LegacyService#updateKnowledgeDocumentComment", () => {
       ...accessRoutes("owner"),
       existing({ author_id: "someone-else" })
     ]);
-    const err = await rejection(makeLegacy(db).updateKnowledgeDocumentComment("proj-1", "user-1", "c-1", { body: "edited" }));
+    const err = await rejection(makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", COMMENT_ID, { body: "edited" }));
     expect(err).toBeInstanceOf(ForbiddenException);
   });
 
@@ -259,9 +296,9 @@ describe("LegacyService#updateKnowledgeDocumentComment", () => {
       existing(),
       { match: "FROM knowledge_document_comments c", rows: [commentRow({ body: "edited" })] }
     ]);
-    const updated = await makeLegacy(db).updateKnowledgeDocumentComment("proj-1", "user-1", "c-1", { body: "edited" });
+    const updated = await makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", COMMENT_ID, { body: "edited" });
     expect(updated.body).toBe("edited");
-    expect(calls.find((c) => c.sql.includes("SET body = $2"))!.params).toEqual(["c-1", "edited"]);
+    expect(calls.find((c) => c.sql.includes("SET body = $2"))!.params).toEqual([COMMENT_ID, "edited"]);
   });
 
   it("lets an owner resolve someone else's thread and records who resolved it", async () => {
@@ -270,7 +307,7 @@ describe("LegacyService#updateKnowledgeDocumentComment", () => {
       existing({ author_id: "someone-else" }),
       { match: "FROM knowledge_document_comments c", rows: [commentRow({ is_resolved: true, resolved_by: "user-1" })] }
     ]);
-    const updated = await makeLegacy(db).updateKnowledgeDocumentComment("proj-1", "user-1", "c-1", { isResolved: true });
+    const updated = await makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", COMMENT_ID, { isResolved: true });
     expect(updated.isResolved).toBe(true);
     const resolve = calls.find((c) => c.sql.includes("SET is_resolved = $2"))!;
     expect(resolve.params[1]).toBe(true);
@@ -283,15 +320,22 @@ describe("LegacyService#updateKnowledgeDocumentComment", () => {
       existing(),
       { match: "FROM knowledge_document_comments c", rows: [commentRow()] }
     ]);
-    await makeLegacy(db).updateKnowledgeDocumentComment("proj-1", "user-1", "c-1", { isResolved: false });
+    await makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", COMMENT_ID, { isResolved: false });
     const resolve = calls.find((c) => c.sql.includes("SET is_resolved = $2"))!;
     expect(resolve.params.slice(1)).toEqual([false, null, null]);
   });
 
   it("refuses to resolve a reply — resolution is a thread-level action", async () => {
-    const { db } = makeDb([...accessRoutes("owner"), existing({ parent_comment_id: "t-1" })]);
-    const err = await rejection(makeLegacy(db).updateKnowledgeDocumentComment("proj-1", "user-1", "c-1", { isResolved: true }));
+    const { db } = makeDb([...accessRoutes("owner"), existing({ parent_comment_id: THREAD_ROOT_ID })]);
+    const err = await rejection(makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", COMMENT_ID, { isResolved: true }));
     expect(err).toBeInstanceOf(BadRequestException);
+  });
+
+  it("rejects a malformed (non-UUID) comment id with a 404, before any lookup", async () => {
+    const { db, calls } = makeDb([...accessRoutes("owner")]);
+    const err = await rejection(makeLegacy(db).updateKnowledgeDocumentComment(PROJECT_ID, "user-1", NOT_A_UUID, { body: "edited" }));
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("SELECT id, author_id, parent_comment_id, document_id"))).toBe(false);
   });
 });
 
@@ -299,20 +343,27 @@ describe("LegacyService#deleteKnowledgeDocumentComment", () => {
   it("takes the thread's replies with it so no orphans are left", async () => {
     const { db, calls } = makeDb([
       ...accessRoutes("qa_engineer"),
-      { match: "SELECT id, author_id FROM knowledge_document_comments", rows: [{ id: "t-1", author_id: "user-1" }] }
+      { match: "SELECT id, author_id FROM knowledge_document_comments", rows: [{ id: THREAD_ROOT_ID, author_id: "user-1" }] }
     ]);
-    await makeLegacy(db).deleteKnowledgeDocumentComment("proj-1", "user-1", "t-1");
+    await makeLegacy(db).deleteKnowledgeDocumentComment(PROJECT_ID, "user-1", THREAD_ROOT_ID);
     const del = calls.find((c) => c.sql.includes("SET is_deleted = true"))!;
     expect(del.sql).toContain("id = $1 OR parent_comment_id = $1");
-    expect(del.params).toEqual(["t-1"]);
+    expect(del.params).toEqual([THREAD_ROOT_ID]);
   });
 
   it("stops a non-author engineer from deleting someone else's comment", async () => {
     const { db } = makeDb([
       ...accessRoutes("qa_engineer"),
-      { match: "SELECT id, author_id FROM knowledge_document_comments", rows: [{ id: "t-1", author_id: "someone-else" }] }
+      { match: "SELECT id, author_id FROM knowledge_document_comments", rows: [{ id: THREAD_ROOT_ID, author_id: "someone-else" }] }
     ]);
-    const err = await rejection(makeLegacy(db).deleteKnowledgeDocumentComment("proj-1", "user-1", "t-1"));
+    const err = await rejection(makeLegacy(db).deleteKnowledgeDocumentComment(PROJECT_ID, "user-1", THREAD_ROOT_ID));
     expect(err).toBeInstanceOf(ForbiddenException);
+  });
+
+  it("rejects a malformed (non-UUID) comment id with a 404, before any lookup", async () => {
+    const { db, calls } = makeDb([...accessRoutes("qa_engineer")]);
+    const err = await rejection(makeLegacy(db).deleteKnowledgeDocumentComment(PROJECT_ID, "user-1", NOT_A_UUID));
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("SELECT id, author_id FROM knowledge_document_comments"))).toBe(false);
   });
 });

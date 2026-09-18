@@ -48,6 +48,10 @@ services:
         condition: service_completed_successfully
     environment:
       PORT: 7000
+      # Set by Jenkinsfile/Jenkinsfile.stage from `git rev-parse --short HEAD` before this file is
+      # invoked; "local" everywhere else. Surfaced on /health so two environments pointed at the
+      # same DATABASE_URL can be diffed in one curl instead of DB forensics.
+      GIT_SHA: ${GIT_SHA:-local}
       DATABASE_URL: ${DATABASE_URL}
       DATABASE_USER: ${DATABASE_USER}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}

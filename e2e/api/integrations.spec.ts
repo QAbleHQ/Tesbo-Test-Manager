@@ -177,6 +177,11 @@ test.describe("integrations — Jira and Linear", () => {
    * seeded directly for the same "no real Jira/Linear call" reason as the fixtures above. Used to
    * pin the nightly-sync dedup fix (V90) and the clean-reconnect-message fix on the read side
    * (sync-status/sync-history), without needing to reproduce either defect through a real sync.
+   *
+   * nightly_cycle_date is always populated for a nightly-triggered row (same +5:30 IST shift as
+   * IntegrationSyncService.nightlyCycleDate()) — chk_nightly_cycle_date (V118) now rejects a
+   * nightly row with no cycle date at the DB level, exactly the shape the stale-writer incident
+   * that migration exists for was producing, so this fixture has to stay honest about it too.
    */
   function seedSyncRun(
     provider: "jira" | "linear",
@@ -184,10 +189,12 @@ test.describe("integrations — Jira and Linear", () => {
   ): string {
     const status = fields.status ?? "failed";
     const projectId = fields.projectId ?? tenant!.mainProjectId;
+    const triggerSource = fields.triggerSource ?? "nightly";
     exec(
-      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, error, remote_project_key, started_at, finished_at) VALUES (" +
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date, error, remote_project_key, started_at, finished_at) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, ${literal(status)}, ` +
-        `${literal(status === "failed" ? "failed" : "done")}, ${literal(fields.triggerSource ?? "nightly")}, ` +
+        `${literal(status === "failed" ? "failed" : "done")}, ${literal(triggerSource)}, ` +
+        `${triggerSource === "nightly" ? "(now() + interval '5.5 hours')::date" : "NULL"}, ` +
         `${fields.error === undefined ? "NULL" : literal(fields.error)}, ${fields.remoteProjectKey ? literal(fields.remoteProjectKey) : "NULL"}, ` +
         "now(), now());",
     );
@@ -1440,5 +1447,55 @@ test.describe("integrations — Jira and Linear", () => {
     // And it's still visible through B's own session, not just in the database.
     const bTree = await (await asB.get(`/api/projects/${ctxB.projectId}/knowledge-base/folders/tree`)).json();
     expect(bTree.children.map((c: { id: string }) => c.id)).toContain(otherOrgFolderId);
+  });
+
+  // ─── Nightly cycle-date NOT-NULL guard (V118) ─────────────────────────────
+  //
+  // idx_integration_sync_runs_nightly_cycle (V90, see the "Nightly sync dedup" section above) is a
+  // unique index on (project_id, provider, nightly_cycle_date) WHERE trigger_source = 'nightly' —
+  // but a unique index never treats two NULLs as colliding, so a writer that inserts
+  // trigger_source='nightly' without also setting nightly_cycle_date evades that dedup entirely.
+  // That is exactly what happened in production: a second backend process, running code that
+  // predated nightly_cycle_date, kept executing nightly-sync jobs against this database and left a
+  // NULL-cycle-date duplicate every night — invisible for Jira, visibly failing for Linear once the
+  // duplicate hit a Linear Project mapping the stale code's hardcoded team(id:...) lookup couldn't
+  // resolve. chk_nightly_cycle_date closes the gap at the schema level: any writer on any code
+  // version now gets a loud constraint violation instead of a row that silently bypasses the index.
+  //
+  // This talks to Postgres directly rather than through HTTP, unlike the rest of this file — there
+  // is no HTTP route that produces this row shape (only a stale/buggy writer can), so the schema
+  // constraint itself is the only thing left to exercise.
+
+  test("INT-A-52 a nightly-triggered sync run cannot be inserted without a cycle date", { tag: '@tesbo.testId("TES-TC-267")' }, async () => {
+    const insertNightly = (nightlyCycleDate: string | null) =>
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date) VALUES (" +
+      `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, 'linear', 'failed', 'failed', 'nightly', ` +
+      `${nightlyCycleDate === null ? "NULL" : literal(nightlyCycleDate)});`;
+
+    let rejection: unknown = null;
+    try {
+      exec(insertNightly(null));
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection, "a nightly row with no cycle date must be rejected, not silently accepted").not.toBeNull();
+    const rejectionText = `${(rejection as { stderr?: unknown })?.stderr ?? ""}${(rejection as Error)?.message ?? ""}`;
+    expect(rejectionText).toContain("chk_nightly_cycle_date");
+
+    // The same shape with a real date is unaffected — the constraint only closes the NULL loophole,
+    // it does not touch the dedup index's actual job.
+    exec(insertNightly("2026-01-01"));
+    expect(
+      scalar(
+        `SELECT count(*) FROM integration_sync_runs WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
+          "AND provider = 'linear' AND trigger_source = 'nightly' AND nightly_cycle_date = '2026-01-01';",
+      ),
+    ).toBe("1");
+
+    // A manual trigger stays exempt either way — manual runs never carry a cycle date at all.
+    exec(
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, 'linear', 'failed', 'failed', 'manual', NULL);`,
+    );
   });
 });

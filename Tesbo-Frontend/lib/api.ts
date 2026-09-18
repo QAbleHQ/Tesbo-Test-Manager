@@ -963,7 +963,7 @@ export interface ZyraTask {
   requestedCount: number;
   generatedCount: number;
   savedCount: number;
-  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | "accepted" | "rejected" | string;
+  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | string;
   feedback: string;
   context: string;
   jiraIssueKeys: string[];
@@ -1011,6 +1011,12 @@ export interface ZyraAgentState {
    * task.generatedCount over-counts drafts that were never actually saved.
    */
   testcasesCreated: number;
+  /**
+   * All-time SUM(saved_count)/SUM(generated_count) across every task-board run for this project
+   * (chat-created testcases and failed runs excluded — see zyraAgent() on the backend), not
+   * derived from `tasks` below, which is capped to the 50 most recently updated rows.
+   */
+  approvalRate: number | null;
   tasks: ZyraTask[];
 }
 

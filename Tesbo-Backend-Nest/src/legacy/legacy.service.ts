@@ -10548,7 +10548,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity, approval] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
@@ -10583,6 +10583,23 @@ export class LegacyService implements OnModuleInit {
           WHERE s.project_id = $1 AND s.deleted_at IS NULL
             AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
         [projectId]
+      ),
+      // All-time, unlike `tasks` above which is capped to the 50 most recently updated rows for
+      // display — a project with a long Zyra history must not have its approval rate silently
+      // reset once older runs scroll out of that window. task_status = 'done' (not merely
+      // <> 'failed') is deliberate: a 'in_review' task has drafts generated and saved_count still
+      // 0 simply because the user hasn't finished reviewing it yet, not because they rejected
+      // anything — counting it here would drag the rate down for work that is still pending, not
+      // decided. 'done' is only ever reached via aiSave, an explicit save-or-close action (see
+      // aiSave below), which is what "approved and saved" in the ticket actually means. Excludes
+      // 'failed' the same way, since a generation error leaves nothing to approve or reject.
+      // chat_session_id IS NULL matches `tasks`: chat-created testcases don't go through this
+      // saved/generated lifecycle, so there is nothing meaningful to fold into this ratio for them.
+      this.db.query<{ saved: string; generated: string }>(
+        `SELECT COALESCE(SUM(saved_count), 0) AS saved, COALESCE(SUM(generated_count), 0) AS generated
+           FROM ai_generation_requests
+          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND chat_session_id IS NULL AND task_status = 'done'`,
+        [projectId, ZYRA_AGENT_NAMES]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
@@ -10624,6 +10641,10 @@ export class LegacyService implements OnModuleInit {
         total: Number(usage.rows[0]?.total || 0)
       },
       testcasesCreated: await this.zyraCreatedTestcaseCount(projectId),
+      approvalRate: (() => {
+        const generated = Number(approval.rows[0]?.generated || 0);
+        return generated > 0 ? Math.round((Number(approval.rows[0]?.saved || 0) / generated) * 100) : null;
+      })(),
       tasks: await Promise.all(tasks.rows.map((row) => this.formatAiTask(row)))
     };
   }
@@ -11290,6 +11311,12 @@ export class LegacyService implements OnModuleInit {
     onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
     onStage?.("context");
+    // Computed here, before context-gathering, purely so the retrieval-time query-embedding call
+    // below can attach to the SAME trace startZyraTurn opens later (once gathered context exists —
+    // see that call's own comment for why the turn itself still opens down there, unchanged). Same
+    // deterministic-seed value either way; only the moment it's computed moved earlier.
+    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    const zyraTurnTraceSeed = confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId;
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
     const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
@@ -11309,7 +11336,7 @@ export class LegacyService implements OnModuleInit {
       // retrieveWithDiagnostics rather than retrieveKnowledgeContext: the plain call returns [] for
       // every failure mode, so "no embeddings key" and "nothing relevant" are indistinguishable —
       // which is how the vector half of this search stayed off in production unnoticed.
-      this.ragRetrieval.retrieveWithDiagnostics(projectId, message),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, message, { traceSeed: zyraTurnTraceSeed }),
       // Direct folder-name lookup — recency/embeddings never match on a folder's name alone
       // (e.g. "knowledge base 'EAD-11215' folder"), only on document content.
       this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys),
@@ -11347,10 +11374,11 @@ export class LegacyService implements OnModuleInit {
     // The trace id is deterministic from messageId (see startZyraTurn), so the confirmation-retry
     // call in sendZyraChatMessage — which re-invokes this method with the SAME userMessageId — needs
     // a distinct suffix here, or its span would collide with the first call's span under the same
-    // fixed spanId rather than landing as its own observation.
-    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    // fixed spanId rather than landing as its own observation. zyraTurnTraceSeed (computed above,
+    // before context-gathering) already carries that same suffix logic — reused here so the
+    // retrieval-time embedding call and this turn land under the identical trace id.
     const trace = await startZyraTurn({
-      messageId: confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId,
+      messageId: zyraTurnTraceSeed,
       sessionId,
       projectId,
       userId,
@@ -12469,7 +12497,7 @@ export class LegacyService implements OnModuleInit {
     // update-redirect purposes. Only fires when at least one draft actually matches at the
     // advisory tier or above; adds zero extra cost/latency otherwise.
     let finalResult = aiResult;
-    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts);
+    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts, params.trace?.traceId);
     if (similarityFeedback) {
       try {
         const revised = await this.generateZyraWithProvider({
@@ -12671,7 +12699,11 @@ export class LegacyService implements OnModuleInit {
   // separate null-check on the whole array.
   private async zyraSimilarityFeedbackForDrafts(
     projectId: string,
-    drafts: Body[]
+    drafts: Body[],
+    // The current turn's already-resolved Langfuse trace id, when one exists (undefined for the
+    // background batches that call this with no trace at all — same "trace optional, skip if
+    // absent" convention already used for recordGeneration elsewhere in this file).
+    traceId?: string | null
   ): Promise<{ feedback: string | null; matchesByIndex: Array<{ testcaseId: string; cosineSimilarity: number } | null> }> {
     const noMatches = drafts.map(() => null);
     try {
@@ -12702,7 +12734,7 @@ export class LegacyService implements OnModuleInit {
       const results = await Promise.all(
         texts.map((text) =>
           text.trim()
-            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1 })
+            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1, traceId })
             : Promise.resolve({ matches: [], semanticSearchRan: false, reason: "Empty draft text." })
         )
       );

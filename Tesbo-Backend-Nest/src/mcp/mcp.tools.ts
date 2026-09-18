@@ -157,7 +157,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "record_execution_result",
       description:
-        "Record the result of a test execution. Required: executionId, status (e.g. Passed/Failed/Blocked/Skipped). Optional: actualResult, defectKey, defectUrl. The execution must belong to the token's project. Attributed to the Tesbo MCP agent actor.",
+        "Record the result of a test execution. Required: executionId, status (e.g. Passed/Failed/Blocked/Skipped). Optional: actualResult, defectKey, defectUrl. The execution must belong to the token's project. Attributed to the token's owning user, not the MCP agent actor — see the handler's own comment on why.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
