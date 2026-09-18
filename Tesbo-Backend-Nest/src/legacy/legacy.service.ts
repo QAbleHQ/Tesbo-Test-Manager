@@ -3421,21 +3421,40 @@ export class LegacyService implements OnModuleInit {
       // JSON-encoded string (the shape the create/edit modal, and now Zyra/MCP, actually persist —
       // see "[Zyra] Test Steps... Missing After Saving Generated Test Cases"), and
       // normalizeJsonArray silently emptied the latter instead of parsing it.
-      const steps = this.safeSteps(row.steps)
-        .map((step: any) => {
-          if (typeof step === "string") return step;
-          return [step.action || step.step || step.description, step.expectedResult || step.expected]
-            .filter(Boolean)
-            .join(" => ");
-        })
-        .filter(Boolean)
-        .join(" | ");
+      const parsedSteps = this.safeSteps(row.steps);
+      // Action/Expected Result only take a case with EXACTLY one step, and only when that step has
+      // its own action/expectedResult (not a plain legacy string) — the importer's own Action/
+      // Expected Result columns are single-step-only (ImportTestCasesModal.tsx's handleImport
+      // builds exactly one step from them, with no " | " splitting), so anything joined across
+      // several steps into these columns would come back as one garbled step on re-import instead
+      // of round-tripping. Every other case (0 steps, a plain-string step, or 2+ steps) keeps using
+      // `steps`, in the "action => expected" DSL the importer's Steps column already splits on
+      // both "|" and "=>" correctly regardless of step count.
+      let steps = "";
+      let action = "";
+      let expectedResult = "";
+      if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
+        action = parsedSteps[0].action || parsedSteps[0].step || parsedSteps[0].description || "";
+        expectedResult = parsedSteps[0].expectedResult || parsedSteps[0].expected || "";
+      } else {
+        steps = parsedSteps
+          .map((step: any) => {
+            if (typeof step === "string") return step;
+            return [step.action || step.step || step.description, step.expectedResult || step.expected]
+              .filter(Boolean)
+              .join(" => ");
+          })
+          .filter(Boolean)
+          .join(" | ");
+      }
       const exportRow: Body = {
         externalId: row.external_id || "",
         title: row.title || "",
         description: row.description || "",
         preconditions: row.preconditions || "",
         steps,
+        action,
+        expectedResult,
         testData: row.test_data || "",
         priority: row.priority || "",
         severity: row.severity || "",
