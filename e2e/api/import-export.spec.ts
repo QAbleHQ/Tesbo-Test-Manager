@@ -40,6 +40,8 @@ const EXPORT_HEADERS = [
   "description",
   "preconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",
@@ -238,18 +240,51 @@ test.describe("import / export", () => {
       status: "Approved",
       component: "Billing",
       suite: "",
+      // `kept` was seeded with no steps at all — action/expectedResult must come out as empty
+      // strings, not "undefined" text or a missing column.
+      steps: "",
+      action: "",
+      expectedResult: "",
     });
     // The suite column is the joined suite NAME, not its id — that's what makes an export
     // re-importable, since the import maps "Suite" by name.
     expect(records.find((r) => r.title === inSuite.title)!.suite).toBe(suite.name);
   });
 
-  test("serialises each step as \"action => expected result\", joined by \" | \"", { tag: '@tesbo.testId("TES-TC-198")' }, async () => {
+  test("exports a single step's Action/Expected Result into their own columns, not steps", { tag: '@tesbo.testId("TES-TC-198")' }, async () => {
+    // Action/Expected Result only take a case with EXACTLY one step: the importer's own Action/
+    // Expected Result columns (ImportTestCasesModal.tsx's handleImport) build exactly one step from
+    // them with no " | " splitting, so anything exported there for more than one step could never
+    // round-trip back through a re-import correctly. A single-step case is unambiguous either way,
+    // so it gets the plain columns instead of the "action => expected" DSL, and `steps` must not
+    // carry a duplicate copy of the same text.
     const stamp = Date.now();
     const project = await newProject(`E2E Export Steps ${stamp}`);
     const seeded = await seedCase(
       {
         title: `E2E Export Steps ${stamp}`,
+        // No expected result on the one step — must come out as "", not undefined/missing.
+        steps: [{ stepNumber: 1, action: "Open the login page" }],
+      },
+      project,
+    );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.action).toBe("Open the login page");
+    expect(row.expectedResult).toBe("");
+    expect(row.steps, "a single step must not also be duplicated into the steps column").toBe("");
+  });
+
+  test("exports 2+ steps into the steps column as \"action => expected\", joined by \" | \" — never into Action/Expected Result", async () => {
+    // The DSL column (not Action/Expected Result) is what the importer's Steps mapping already
+    // splits on both "|" and "=>" regardless of step count, so this is the only shape that survives
+    // a re-import unscathed once there's more than one step.
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Multi Steps ${stamp}`);
+    const seeded = await seedCase(
+      {
+        title: `E2E Export Multi Steps ${stamp}`,
         steps: [
           { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
           // No expected result: the separator must not be emitted for an absent half, or a
@@ -261,12 +296,31 @@ test.describe("import / export", () => {
     );
 
     const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
-    expect(records.find((r) => r.title === seeded.title)!.steps).toBe(
-      "Open the login page => The form is shown | Submit empty credentials",
-    );
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.steps).toBe("Open the login page => The form is shown | Submit empty credentials");
+    expect(row.action, "2+ steps must not land in Action/Expected Result — a re-import can't split them back apart").toBe("");
+    expect(row.expectedResult).toBe("");
   });
 
-  test("still exports steps when they were stored as a JSON-encoded string, not a genuine array", async () => {
+  test("still exports a legacy plain-string step into the steps column, not Action/Expected Result", async () => {
+    // A step can also be a bare string with no action/expectedResult of its own (older data, or a
+    // synonym-key shape safeSteps() didn't recognize) — that text belongs in `steps`, the one column
+    // built for it, and must not surface as a bogus Action or Expected Result value.
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Steps Legacy ${stamp}`);
+    const seeded = await seedCase(
+      { title: `E2E Export Steps Legacy ${stamp}`, steps: ["Open the app and sign in"] },
+      project,
+    );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.steps).toBe("Open the app and sign in");
+    expect(row.action).toBe("");
+    expect(row.expectedResult).toBe("");
+  });
+
+  test("still exports Action/Expected Result when steps were stored as a JSON-encoded string, not a genuine array", async () => {
     /*
      * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test
      * Cases" — the create/edit modal pre-stringifies `steps` before every save (testcases/page.tsx
@@ -275,23 +329,23 @@ test.describe("import / export", () => {
      * parseSteps() expects exactly that string, but exportTestcases' `normalizeJsonArray(row.steps)`
      * was `Array.isArray(value) ? value : []` — the mirror-image assumption — so this shape (which is
      * what every modal-created test case, and now every Zyra/MCP-created one, actually persists)
-     * exported as a blank Steps column instead of silently failing to save.
+     * exported as a blank Steps/Action/Expected Result column instead of silently failing to save.
+     * One step here (not several): safeSteps() has to see through the JSON-string wrapper before
+     * the single-vs-multi-step decision above it can even run.
      */
     const stamp = Date.now();
     const project = await newProject(`E2E Export Steps Shape ${stamp}`);
-    const steps = [
-      { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
-      { stepNumber: 2, action: "Submit empty credentials" },
-    ];
+    const steps = [{ stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" }];
     const seeded = await seedCase(
       { title: `E2E Export Steps Shape ${stamp}`, steps: JSON.stringify(steps) },
       project,
     );
 
     const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
-    expect(records.find((r) => r.title === seeded.title)!.steps).toBe(
-      "Open the login page => The form is shown | Submit empty credentials",
-    );
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.action).toBe("Open the login page");
+    expect(row.expectedResult).toBe("The form is shown");
+    expect(row.steps).toBe("");
   });
 
   test("quotes values containing commas, quotes and newlines so they survive the round trip", { tag: '@tesbo.testId("TES-TC-199")' }, async () => {
@@ -421,8 +475,13 @@ test.describe("import / export", () => {
       title: seeded.title,
       description: "In the workbook",
       priority: "P3",
-      steps: "Click => It clicks",
+      action: "Click",
+      expectedResult: "It clicks",
     });
+    // Action/Expected Result must not also be duplicated into `steps` — an empty `steps` cell reads
+    // back as either "" or an absent key depending on how the sheet library round-trips a blank
+    // string, so accept either rather than pinning one.
+    expect(rows[0].steps || "").toBe("");
   });
 
   test("a project with no test cases still exports a workbook carrying the header row", { tag: '@tesbo.testId("TES-TC-205")' }, async () => {

@@ -109,6 +109,37 @@ test.describe("test case CRUD", () => {
     }
   });
 
+  // Distinct from TES-TC-552 above: that test proves a field OMITTED from the body gets a
+  // default. This proves a field explicitly SENT as blank does not — the Create Test Case form
+  // always includes suite/type/priority/automationStatus/component/severity in its payload, blank
+  // or not (testcases/page.tsx), so an unselected/untouched field on that form arrives here as an
+  // explicit "", not a missing key. Before this, insertTestCaseWithClient's `body.x || <default>`
+  // treated both cases the same, so a Create submitted without picking these fields silently
+  // saved "P2"/"Functional"/"Not Automated"/"No severity" — a real value the user never chose.
+  test("explicit blank priority/type/automationStatus/severity/component on create are saved blank, not defaulted", async ({ request }) => {
+    const created = await createCase(request, {
+      suiteId: undefined,
+      priority: "",
+      type: "",
+      automationStatus: "",
+      severity: "",
+      component: "",
+    });
+    try {
+      expect(created.priority).toBe("");
+      expect(created.type).toBeNull();
+      expect(created.automationStatus).toBeNull();
+      expect(created.severity).toBeNull();
+      expect(created.component).toBeNull();
+      expect(created.suiteId).toBeNull();
+      // Status is excluded from this optional-field behavior on purpose: the Create form never
+      // leaves it blank, so it keeps defaulting to "Draft" the same as before.
+      expect(created.status).toBe("Draft");
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
   test("blank title defaults to 'Untitled test case' when omitted entirely, but an explicit empty string is honored", { tag: '@tesbo.testId("TES-TC-553")' }, async ({
     request,
   }) => {
