@@ -3695,10 +3695,19 @@ export class LegacyService implements OnModuleInit {
         body.postconditions || "",
         JSON.stringify(body.steps || body.stepsJson || []),
         body.testData || "",
-        body.priority || "P2",
+        // `priority`/`type`/`automationStatus` only fall back to their defaults when the caller
+        // never mentioned the field at all (import, Zyra and the MCP tool all either resolve a
+        // real value themselves or omit the key entirely, relying on this default). A caller that
+        // sends the key with an empty/falsy value — the Create Test Case form, whose Suite/Type/
+        // Priority/Automation Type start on an unselected placeholder — means it explicitly, and
+        // that must be honored rather than silently replaced with a value the user never chose.
+        // priority is NOT NULL (V2_test_cases_and_suites.sql), so "explicitly blank" is "" here,
+        // not null; type/automation_status are nullable and use null the same way severity/
+        // component already do below.
+        body.priority !== undefined ? body.priority || "" : "P2",
         body.severity || null,
-        body.type || "Functional",
-        body.automationStatus || "Not Automated",
+        body.type !== undefined ? body.type || null : "Functional",
+        body.automationStatus !== undefined ? body.automationStatus || null : "Not Automated",
         body.automationRepo || null,
         body.automationPath || null,
         body.automationTestName || null,

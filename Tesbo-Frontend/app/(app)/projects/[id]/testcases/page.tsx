@@ -844,13 +844,21 @@ export default function TestCasesPage() {
     setTestData((data.testData as string) ?? "");
     setEstimatedDuration((data.estimatedDuration as string) ?? "");
     setAttachments((data.attachments as string) ?? "");
-    setType((data.type as string) ?? "Functional");
-    setPriority((data.priority as string) ?? "P2");
+    // Type/Priority/Automation Type/Suite are shown and re-saved exactly as stored — a blank
+    // value (a case created before it was picked) stays blank rather than being coerced back to
+    // "Functional"/"P2"/"Not Automated" the moment the panel is reopened. Status keeps its
+    // "Draft" default: it has no unselected state on the form to begin with.
+    setType((data.type as string) ?? "");
+    setPriority((data.priority as string) ?? "");
     setStatus((data.status as string) ?? "Draft");
-    setAutomationStatus((data.automationStatus as string) ?? "Not Automated");
+    setAutomationStatus((data.automationStatus as string) ?? "");
     setComponent((data.component as string) ?? "");
     setSeverity((data.severity as string) ?? "");
-    setSuiteId((data.suiteId as string) ?? formSuiteId ?? "");
+    // `formSuiteId` (the suite the list view happens to be filtered on) belongs to the CREATE
+    // form's default, not this one — this always has a real fetched value, so an unfiled case
+    // (data.suiteId === null) must show/stay "No suite", not silently adopt whatever suite the
+    // repository view was scrolled to when Edit was opened.
+    setSuiteId((data.suiteId as string) ?? "");
     setPanelJiraIssueKey((data.jiraIssueKey as string) ?? "");
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
     setPanelOriginalStatus((data.status as string) ?? "Draft");
@@ -1308,21 +1316,6 @@ export default function TestCasesPage() {
     e.preventDefault();
     if (panelMode !== "create" && panelMode !== "edit") return;
 
-    // Suite/Type/Priority/Automation Type start unselected on the create form (never a predefined
-    // default the user didn't choose) — so a create submitted before they're picked must be blocked
-    // here rather than silently sending an empty/placeholder value to the API.
-    if (panelMode === "create") {
-      const missingFields: string[] = [];
-      if (suiteId === UNSELECTED_SUITE_ID) missingFields.push("Suite");
-      if (!type) missingFields.push("Type");
-      if (!priority) missingFields.push("Priority");
-      if (!automationStatus) missingFields.push("Automation Type");
-      if (missingFields.length > 0) {
-        setPanelError(`Select a value for ${missingFields.join(", ")} before creating the test case.`);
-        return;
-      }
-    }
-
     // Required custom fields must be filled before the test case can be saved. Checked
     // client-side against whichever list is currently in scope — the edit-mode tab is
     // unmounted (not just hidden) when inactive, so relying on native `required` inputs
@@ -1342,8 +1335,11 @@ export default function TestCasesPage() {
     setPanelSuccess(null);
     try {
       if (panelMode === "create") {
+        // An untouched Suite field is still the disabled placeholder value, not a real id —
+        // treat it the same as "No suite" rather than sending the placeholder to the API.
+        const effectiveSuiteId = suiteId && suiteId !== UNSELECTED_SUITE_ID ? suiteId : null;
         const created = await createTestCase(projectId, {
-          suiteId: suiteId || undefined,
+          suiteId: effectiveSuiteId ?? undefined,
           title,
           description,
           preconditions,
@@ -1374,12 +1370,12 @@ export default function TestCasesPage() {
         // refetched. loadSelectedSuiteCases() still runs for real: the filters above just changed,
         // so the list it fetches is genuinely different, not just "one row added" — that can't be
         // patched client-side. setSuiteCasesPage(1) above already resets the page it's sliced to.
-        applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, status, suiteId || null, 1));
+        applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, status, effectiveSuiteId, 1));
         await loadSelectedSuiteCases();
         setPanelSuccess("Test case created successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
         if (submitAction === "create-next") {
-          resetForm(suiteId || activeSuiteId);
+          resetForm(effectiveSuiteId ?? activeSuiteId);
         } else {
           await openViewPanel(created.id);
         }
@@ -2490,12 +2486,14 @@ export default function TestCasesPage() {
                             <Field>
                               <FieldLabel>Type</FieldLabel>
                               <Select value={type} onChange={(e) => setType(e.target.value)}>
+                                <option value="" disabled>Select</option>
                                 {TESTCASE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                               </Select>
                             </Field>
                             <Field>
                               <FieldLabel>Priority</FieldLabel>
                               <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                                <option value="" disabled>Select</option>
                                 {TESTCASE_PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
                               </Select>
                             </Field>
@@ -2508,6 +2506,7 @@ export default function TestCasesPage() {
                             <Field>
                               <FieldLabel>Automation Type</FieldLabel>
                               <Select value={automationStatus} onChange={(e) => setAutomationStatus(e.target.value)}>
+                                <option value="" disabled>Select</option>
                                 {TESTCASE_AUTOMATION_TYPES.map((a) => <option key={a} value={a}>{a}</option>)}
                               </Select>
                             </Field>
