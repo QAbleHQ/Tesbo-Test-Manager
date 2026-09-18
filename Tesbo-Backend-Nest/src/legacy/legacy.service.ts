@@ -5145,7 +5145,9 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT e.id, e.status,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
        WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
@@ -5287,8 +5289,20 @@ export class LegacyService implements OnModuleInit {
          -- above already refused a soft-deleted run with 404, but that read and this write are two
          -- separate statements, leaving a window where a concurrent delete could land in between.
          -- This closes that window at the point of the actual write (hard-delete remediation Phase 2).
-         INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
-         SELECT $1, t.id, t.title, base.pos + i.ord
+         --
+         -- snapshot_title is joined by every other field the run's execution list, detail panel,
+         -- CSV export and reports display (V119) — captured here at add-time so a run's history
+         -- stops depending on the live testcase row surviving a later soft-delete.
+         INSERT INTO cycle_items (
+           cycle_id, testcase_id, snapshot_title, position,
+           snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+           snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+           snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+         )
+         SELECT $1, t.id, t.title, base.pos + i.ord,
+                t.external_id, t.priority, t.type, t.suite_id,
+                t.description, t.preconditions, t.postconditions, t.steps,
+                t.test_data, t.automation_status, t.automation_tags
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
@@ -5399,14 +5413,30 @@ export class LegacyService implements OnModuleInit {
      *
      * The CSV export (exportCycleExecutions -> this method) is unaffected: it names its nine
      * headers explicitly rather than iterating the row's keys.
+     *
+     * external_id/priority/type/suite_id/description/preconditions/postconditions/steps/test_data/
+     * automation_status/automation_tags all prefer cycle_items' own snapshot_* column (V119) over
+     * the live testcases join, the same way title already preferred snapshot_title — a run is a
+     * point-in-time record, so its display must not depend on (or drift with) the live test case
+     * surviving or being edited afterwards. `t.*` only still backs the COALESCE for a row that
+     * predates V119's backfill and was never re-saved.
      */
     const res = await this.db.query(
       `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
               e.duration_ms, e.retry_count, e.error_message, e.error_stack, e.reported_by,
               ci.id AS cycle_item_id, ci.testcase_id, ci.snapshot_title,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type, t.suite_id, t.description, t.preconditions, t.postconditions,
-              t.steps, t.test_data, t.automation_status, t.automation_tags,
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type,
+              COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
+              COALESCE(ci.snapshot_description, t.description) AS description,
+              COALESCE(ci.snapshot_preconditions, t.preconditions) AS preconditions,
+              COALESCE(ci.snapshot_postconditions, t.postconditions) AS postconditions,
+              COALESCE(ci.snapshot_steps, t.steps) AS steps,
+              COALESCE(ci.snapshot_test_data, t.test_data) AS test_data,
+              COALESCE(ci.snapshot_automation_status, t.automation_status) AS automation_status,
+              COALESCE(ci.snapshot_automation_tags, t.automation_tags) AS automation_tags,
               COALESCE(ev.count, 0)::int AS evidence_count
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
@@ -6541,9 +6571,9 @@ export class LegacyService implements OnModuleInit {
          e.assignee_id,
          ci.testcase_id,
          COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
-         COALESCE(t.priority, 'Unspecified') AS priority,
-         COALESCE(t.automation_tags, '') AS automation_tags,
-         t.suite_id,
+         COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
+         COALESCE(ci.snapshot_automation_tags, t.automation_tags, '') AS automation_tags,
+         COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
          COALESCE(s.name, 'No Suite') AS suite_name,
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
@@ -6554,7 +6584,7 @@ export class LegacyService implements OnModuleInit {
        JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
@@ -6934,7 +6964,7 @@ export class LegacyService implements OnModuleInit {
       run_name: string;
       run_created_at: string;
     }>(
-      `SELECT ci.testcase_id, COALESCE(t.external_id, '') AS external_id,
+      `SELECT ci.testcase_id, COALESCE(ci.snapshot_external_id, t.external_id, '') AS external_id,
               COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS title,
               COALESCE(s.name, 'Unassigned') AS suite_name,
               e.status, c.name AS run_name, c.created_at AS run_created_at
@@ -6942,7 +6972,7 @@ export class LegacyService implements OnModuleInit {
        JOIN executions e ON e.cycle_item_id = ci.id
        JOIN cycles c ON c.id = ci.cycle_id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
          AND e.status IS NOT NULL AND e.status <> 'Untested'
        ORDER BY ci.testcase_id, c.created_at ASC`,
