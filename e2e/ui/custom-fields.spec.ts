@@ -694,39 +694,57 @@ test.describe("custom fields (UI)", () => {
   });
 
   /*
-   * Same bug, its other rendering path: an inactive/archived field is shown read-only through a
-   * plain <p> (CustomFieldsSection.tsx), not through CustomFieldValueInput at all, so the fix above
-   * — which only touches the active <select>'s placeholder <option> — never reaches it.
-   * formatCustomFieldValueForDisplay (customFieldTypes.ts) had its own independent "—" fallback for
-   * an empty value, now "Select…" for every field type, not just the dropdown ones — a real report
-   * against this exact screen was a `number` field ("Execution Time", min/max/unit config) still
-   * showing "—" after the first pass only widened the dropdown types.
+   * Deactivating or archiving a field used to leave it visible on this tab as a locked, read-only
+   * box (CustomFieldsSection.tsx's non-active branch) — which is what the earlier "Select…, not a
+   * bare dash" fix above was patching the display of. The product decision changed: a non-active
+   * field should not appear on this tab at all, active or not, so the panel always mirrors what
+   * Project Settings currently has switched on. That locked-box rendering path is now unreachable
+   * from here (getValuesForTestCase only returns `status = 'active'` rows) and is exercised, if at
+   * all, only by test data these specs don't construct — nothing here should still assert it shows.
    */
-  for (const fieldType of ["single_select", "number", "date", "text"] as const) {
-    test(`an inactive ${fieldType} field's read-only display also shows 'Select…', not a bare dash`, async ({
-      browser,
-    }) => {
-      const field = await defineField(
-        fieldType === "single_select"
-          ? { fieldType, config: { options: [{ label: "Chrome" }, { label: "Firefox" }] } }
-          : { fieldType },
-      );
-      await api.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "inactive" } });
-      const testcase = await seedTestCase({});
-
-      const page = await pageAs(browser, "owner");
-      await page.goto(testcasesUrl());
-      await page.getByRole("button", { name: testcase.title }).click();
-
-      const panel = page.locator("aside");
-      await panel.getByRole("button", { name: /^Custom Fields/ }).click();
-
-      await expect(panel.getByText(field.name)).toBeVisible();
-      await expect(panel.getByText("Inactive", { exact: true })).toBeVisible();
-      await expect(panel.getByText("Select…", { exact: true })).toBeVisible();
-      await expect(panel.getByText("—", { exact: true })).toHaveCount(0);
+  test("a deactivated field disappears from the test case panel, its value survives underneath, and it reappears once reactivated", async ({
+    browser,
+  }) => {
+    const stays = await defineField({ fieldType: "text" });
+    const toggled = await defineField({ fieldType: "text" });
+    const testcase = await seedTestCase({
+      customFieldValues: { [stays.id]: "always shown", [toggled.id]: "still recorded" },
     });
-  }
+    await api.patch(`${definitionsUrl()}/${toggled.id}/status`, { data: { status: "inactive" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+    let panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    await expect(panel.getByText(stays.name)).toBeVisible();
+    await expect(panel.getByText(toggled.name)).toHaveCount(0);
+    // Hidden from the panel, but nothing was deleted underneath.
+    expect(storedValue(toggled.id, testcase.id)).toBe('"still recorded"');
+
+    await api.patch(`${definitionsUrl()}/${toggled.id}/status`, { data: { status: "active" } });
+    await page.reload();
+    await page.getByRole("button", { name: testcase.title }).click();
+    panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+    await expect(panel.getByText(toggled.name)).toBeVisible();
+  });
+
+  test("an archived field also disappears from the test case panel, keeping its recorded value", async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+    const testcase = await seedTestCase({ customFieldValues: { [field.id]: "still there" } });
+    await api.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "archived" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+    const panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    await expect(panel.getByText(field.name)).toHaveCount(0);
+    expect(storedValue(field.id, testcase.id)).toBe('"still there"');
+  });
 
   // ─── Filtering the list ────────────────────────────────────────────────────
 
