@@ -96,12 +96,7 @@ function formatLastUsedDate(iso: string): string | null {
 function deriveZyraStats(tasks: ZyraTask[], testcasesCreated: number) {
   const testsGenerated = testcasesCreated;
   const activeTasks = tasks.filter((t) => ACTIVE_TASK_STATUSES.has(t.taskStatus)).length;
-  const decided = tasks.filter((t) => t.taskStatus === "accepted" || t.taskStatus === "rejected");
-  const approvalRate =
-    decided.length > 0
-      ? Math.round((decided.filter((t) => t.taskStatus === "accepted").length / decided.length) * 100)
-      : null;
-  return { testsGenerated, activeTasks, approvalRate };
+  return { testsGenerated, activeTasks };
 }
 
 export default function AgentsPage() {
@@ -330,9 +325,9 @@ export default function AgentsPage() {
             <div className="p-4 text-center">
               <div
                 className="font-mono text-xl font-semibold"
-                style={{ color: stats.approvalRate === null ? "var(--muted-soft)" : "var(--success)" }}
+                style={{ color: state.approvalRate === null ? "var(--muted-soft)" : "var(--success)" }}
               >
-                {stats.approvalRate === null ? "—" : `${stats.approvalRate}%`}
+                {state.approvalRate === null ? "—" : `${state.approvalRate}%`}
               </div>
               <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">Approval rate</div>
             </div>
