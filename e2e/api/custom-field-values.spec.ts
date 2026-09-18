@@ -294,6 +294,45 @@ test.describe("custom field values", () => {
     expect(valueRowCount(testcase.id)).toBe(1);
   });
 
+  // ─── Status visibility ─────────────────────────────────────────────────────
+
+  test("only active fields are returned for a test case, whatever else the project also defines", async () => {
+    const active1 = await defineField({ fieldType: "text" });
+    const inactive = await defineField({ fieldType: "text" });
+    const archived = await defineField({ fieldType: "text" });
+    const active2 = await defineField({ fieldType: "text" });
+    await asOwner.patch(`${definitionsUrl()}/${inactive.id}/status`, { data: { status: "inactive" } });
+    await asOwner.patch(`${definitionsUrl()}/${archived.id}/status`, { data: { status: "archived" } });
+
+    const testcase = await createdTestCase();
+    const fields = await readValues(testcase.id);
+    // display_order preserved among the survivors, with the hidden ones simply missing.
+    expect(fields.map((f) => f.id)).toEqual([active1.id, active2.id]);
+  });
+
+  test("deactivating a field hides it from the test case's list without touching its recorded value, and it comes back once reactivated", async () => {
+    const field = await defineField({ fieldType: "text" });
+    const testcase = await createdTestCase({ customFieldValues: { [field.id]: "kept safe" } });
+    expect(valueOf(await readValues(testcase.id), field.id)).toBe("kept safe");
+
+    await asOwner.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "inactive" } });
+    expect(valueOf(await readValues(testcase.id), field.id)).toBeUndefined();
+    // Hiding the field from the response is a read-side filter — the row underneath is untouched.
+    expect(storedValue(field.id, testcase.id)).toBe('"kept safe"');
+
+    await asOwner.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "active" } });
+    expect(valueOf(await readValues(testcase.id), field.id)).toBe("kept safe");
+  });
+
+  test("archiving a field hides it from the test case's list too, and its recorded value is preserved even though archiving cannot be undone", async () => {
+    const field = await defineField({ fieldType: "text" });
+    const testcase = await createdTestCase({ customFieldValues: { [field.id]: "still there" } });
+
+    await asOwner.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "archived" } });
+    expect(valueOf(await readValues(testcase.id), field.id)).toBeUndefined();
+    expect(storedValue(field.id, testcase.id)).toBe('"still there"');
+  });
+
   test("a value for a field this project does not have is refused", { tag: '@tesbo.testId("TES-TC-108")' }, async () => {
     const testcase = await createdTestCase();
     const foreign = await defineField({ fieldType: "text" }, tenant!.secondProjectId);
