@@ -7,16 +7,22 @@ import type { ZyraChatTestcaseRow } from "@/lib/api";
 type Step = { action: string; expectedResult: string };
 
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
+// Same vocabulary as testcases/page.tsx's TESTCASE_SEVERITIES and the backend's BUG_SEVERITIES
+// allow-list (normalizeZyraSeverity) — keeps this Select from ever offering a value the server
+// would silently drop back to null.
+const SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 // Same shape editZyraTaskDraft accepts server-side (legacy.service.ts sanitizeZyraUpdateFields) —
-// title/priority/preconditions/description/stepsJson cover a proposed draft either way (a new
-// test case, or a proposed change to an existing one).
+// title/priority/preconditions/description/stepsJson/severity/component cover a proposed draft
+// either way (a new test case, or a proposed change to an existing one).
 export type ZyraDraftEditValues = {
   title: string;
   priority: string;
   preconditions: string;
   description: string;
   stepsJson: string;
+  severity: string;
+  component: string;
 };
 
 function parseSteps(raw: unknown): Step[] {
@@ -56,6 +62,8 @@ export function ZyraDraftEditor({
   const [preconditions, setPreconditions] = useState(row.preconditions || "");
   const [description, setDescription] = useState(row.expectedSummary || "");
   const [steps, setSteps] = useState<Step[]>(parseSteps(row.stepsJson));
+  const [severity, setSeverity] = useState(row.severity || "");
+  const [component, setComponent] = useState(row.component || "");
 
   function addStep() {
     setSteps((prev) => [...prev, { action: "", expectedResult: "" }]);
@@ -74,6 +82,8 @@ export function ZyraDraftEditor({
       preconditions,
       description,
       stepsJson: JSON.stringify(steps.map((step, index) => ({ stepNumber: index + 1, action: step.action, expectedResult: step.expectedResult }))),
+      severity,
+      component: component.trim(),
     });
   }
 
@@ -90,6 +100,19 @@ export function ZyraDraftEditor({
             <option key={p} value={p}>{p}</option>
           ))}
         </Select>
+      </Field>
+      <Field>
+        <FieldLabel>Severity</FieldLabel>
+        <Select value={severity} onChange={(event) => setSeverity(event.target.value)}>
+          <option value="">No severity</option>
+          {SEVERITIES.map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </Select>
+      </Field>
+      <Field>
+        <FieldLabel>Component</FieldLabel>
+        <Input value={component} onChange={(event) => setComponent(event.target.value)} placeholder="e.g. Checkout" />
       </Field>
       <Field>
         <FieldLabel>Preconditions</FieldLabel>

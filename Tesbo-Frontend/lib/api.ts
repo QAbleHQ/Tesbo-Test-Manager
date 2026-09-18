@@ -851,6 +851,13 @@ export interface AiGeneratedDraft {
   expectedSummary: string;
   priority: string;
   tags: string[];
+  /**
+   * Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generated and
+   * persisted (normalizeAiDrafts/zyraBatchInsertTestCases) since before this field existed on this
+   * type; a draft from an older task can still lack it entirely, so treat absent the same as null.
+   */
+  severity?: string | null;
+  component?: string | null;
   // The following are only ever present on a normalized update/archive entry (formatAiTask's
   // server-side normalization of a non-create ai_generation_requests.generated_payload item — see
   // ZYRA_IMPLEMENTATION_LOG.md). A plain task-board create draft never carries them.
@@ -1030,6 +1037,9 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /** See AiGeneratedDraft.severity/component — same fields, same server-side chatDraftRow/chatTestcaseRow normalization. */
+  severity?: string | null;
+  component?: string | null;
   /**
    * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
    * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/

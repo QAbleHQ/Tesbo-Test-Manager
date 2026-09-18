@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow } from "@/lib/api";
 import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
 import { useAppData } from "@/components/app/AppDataProvider";
-import { Button, CopyButton, StatusChip } from "@/components/ui";
+import { Button, CopyButton, StatusChip, SeverityBadge, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
 import { ZyraCitationsList } from "./ZyraCitations";
@@ -26,6 +26,14 @@ function priorityTone(priority?: string) {
   if (priority === "P1") return "warning" as const;
   if (priority === "P2") return "confidenceHigh" as const;
   return "neutral" as const;
+}
+
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// A draft's severity is free-ish text end to end (normalizeZyraSeverity only guarantees the SAVED
+// row matches this set — a not-yet-saved preview can still carry an older/invalid value), so guard
+// before handing it to SeverityBadge rather than trusting the string.
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
 }
 
 // Exported so the task-board surfaces (TaskQuickViewPanel, the [taskId] detail page) can label a
@@ -166,11 +174,22 @@ export function ZyraChatReviewPanel({
         preconditions: values.preconditions,
         description: values.description,
         stepsJson: values.stepsJson,
+        severity: values.severity,
+        component: values.component,
       });
       setRows((prev) =>
         prev.map((row, i) =>
           i === index
-            ? { ...row, title: values.title, priority: values.priority, preconditions: values.preconditions, expectedSummary: values.description, stepsJson: values.stepsJson }
+            ? {
+                ...row,
+                title: values.title,
+                priority: values.priority,
+                preconditions: values.preconditions,
+                expectedSummary: values.description,
+                stepsJson: values.stepsJson,
+                severity: values.severity || null,
+                component: values.component || null,
+              }
             : row
         )
       );
@@ -223,8 +242,17 @@ export function ZyraChatReviewPanel({
   }
 
   const tsv = toTsv(
-    ["Action", "Title", "Priority", "Preconditions", "First step", "Expected result"],
-    rows.map((row) => [ACTION_LABEL[row.action || ""] || row.action || "", row.title, row.priority || "P2", row.preconditions || "", firstStepPreview(row.stepsJson), row.expectedSummary || ""])
+    ["Action", "Title", "Priority", "Severity", "Component", "Preconditions", "First step", "Expected result"],
+    rows.map((row) => [
+      ACTION_LABEL[row.action || ""] || row.action || "",
+      row.title,
+      row.priority || "P2",
+      row.severity || "",
+      row.component || "",
+      row.preconditions || "",
+      firstStepPreview(row.stepsJson),
+      row.expectedSummary || "",
+    ])
   );
 
   return (
@@ -271,6 +299,10 @@ export function ZyraChatReviewPanel({
                       <StatusChip tone={priorityTone(row.priority)} className="!rounded-[5px] !px-1.5 !py-0 !font-mono !text-[10px] !font-semibold">
                         {row.priority || "P2"}
                       </StatusChip>
+                      {knownSeverity(row.severity) && (
+                        <SeverityBadge severity={knownSeverity(row.severity)!} className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium" />
+                      )}
+                      {row.component && <span className="text-[11px] text-[var(--muted)]">{row.component}</span>}
                       {row.externalId && <span className="font-mono text-[11px] text-[var(--muted)]">{row.externalId}</span>}
                     </div>
                     <p className="mt-1 text-[13px] font-medium text-[var(--foreground)]">{row.title}</p>

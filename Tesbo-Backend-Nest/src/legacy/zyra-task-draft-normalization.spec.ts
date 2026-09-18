@@ -327,3 +327,67 @@ describe("chatDraftRow techniques allowlist — via zyraTask's wrapped-create no
     expect(task.drafts[0]).toEqual(flatDraft);
   });
 });
+
+/*
+ * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the chat/task-board
+ * DISPLAY half of the same ticket zyra.spec.ts's ZYR-A-71..74 cover the SAVE half of. Generation
+ * and persistence already carry severity/component correctly (normalizeAiDrafts,
+ * zyraBatchInsertTestCases); this is where they were silently dropped before ever reaching the
+ * chat/task-board UI — chatDraftRow/chatTestcaseRow rebuild the row field-by-field and, unlike
+ * every other generation-time field (priority, preconditions, stepsJson, techniques...), never
+ * copied these two across. Same allowlist-was-incomplete shape as the techniques fix above,
+ * exercised through the identical zyraTask() boundary.
+ */
+describe("chatDraftRow/chatTestcaseRow severity+component — via zyraTask's wrapped-entry normalization", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("a wrapped create entry's severity and component survive chatDraftRow, alongside the fields that already worked", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    const wrapped = {
+      opType: "create",
+      draft: { title: "New test", priority: "P2", stepsJson: "[]", preconditions: "", severity: "High", component: "Checkout" },
+      reason: "Suggested from chat",
+    };
+    dbQuery.mockResolvedValueOnce({ rows: [baseRow([wrapped])] });
+    mockAuth(svc);
+
+    const task = await svc.zyraTask(PROJECT_ID, "u1", TASK_ID);
+
+    expect(task.drafts[0]).toMatchObject({ title: "New test", severity: "High", component: "Checkout" });
+  });
+
+  it("a wrapped create entry with no severity/component yet comes back null, not undefined or dropped", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    const wrapped = { opType: "create", draft: { title: "New test", priority: "P2", stepsJson: "[]", preconditions: "" }, reason: "" };
+    dbQuery.mockResolvedValueOnce({ rows: [baseRow([wrapped])] });
+    mockAuth(svc);
+
+    const task = await svc.zyraTask(PROJECT_ID, "u1", TASK_ID);
+
+    expect(task.drafts[0].severity).toBeNull();
+    expect(task.drafts[0].component).toBeNull();
+  });
+
+  it("a wrapped archive/update preview shows the EXISTING test case's real severity/component, not blank", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    const updateEntry = { opType: "update", testcaseId: TESTCASE_ID, externalId: "EAD-TC-1", fields: { priority: "P0" }, reason: "Bumped priority per feedback" };
+    dbQuery.mockResolvedValueOnce({ rows: [baseRow([updateEntry])] });
+    dbQuery.mockResolvedValueOnce({ rows: [{ ...ACTIVE_TESTCASE, severity: "Medium", component: "Auth" }] });
+    mockAuth(svc);
+
+    const task = await svc.zyraTask(PROJECT_ID, "u1", TASK_ID);
+
+    expect(task.drafts[0]).toMatchObject({ severity: "Medium", component: "Auth" });
+  });
+
+  it("a flat task-board create draft (no opType key) passes severity/component through untouched, same as every other field", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    const flatDraft = { title: "Checkout flow", priority: "P1", stepsJson: "[]", expectedSummary: "", preconditions: "", tags: [], severity: "Low", component: "Billing" };
+    dbQuery.mockResolvedValueOnce({ rows: [baseRow([flatDraft])] });
+    mockAuth(svc);
+
+    const task = await svc.zyraTask(PROJECT_ID, "u1", TASK_ID);
+
+    expect(task.drafts[0]).toEqual(flatDraft);
+  });
+});

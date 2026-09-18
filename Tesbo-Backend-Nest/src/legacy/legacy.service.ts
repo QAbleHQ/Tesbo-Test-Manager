@@ -17676,6 +17676,13 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
+      // and save already carry both fields correctly; this row is what the chat/task-board UI
+      // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
+      // so an explicit "" edit (clearing a previously-set value) isn't coerced back to null here —
+      // sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient decide that, not this formatter.
+      severity: value.severity ?? null,
+      component: value.component ?? null,
       action,
       reason: reason || "",
       // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
@@ -17701,6 +17708,8 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      severity: row.severity,
+      component: row.component,
       sourceRefs: row.sourceRefs
     }, action, reason);
   }

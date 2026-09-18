@@ -18,7 +18,7 @@ import {
   type ZyraTask,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
-import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
+import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
@@ -69,6 +69,13 @@ const TASK_STATUS_LABELS: Record<string, string> = {
 function statusLabel(status: string): string {
   const normalized = normalizeStatus(status);
   return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
+}
+
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// See ZyraChatReviewPanel/TaskQuickViewPanel's identical guard — a draft's severity is only
+// guaranteed to match this set once actually saved (normalizeZyraSeverity).
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
 }
 
 function stepCount(stepsJson: string): number {
@@ -343,10 +350,12 @@ export default function ZyraTaskDetailPage() {
   const allDraftsSelected = task.drafts.length > 0 && selectedDrafts.length === task.drafts.length;
   const copyableDrafts = selectedDrafts.length > 0 ? selectedDrafts.map((i) => task.drafts[i]) : task.drafts;
   const draftsTsv = toTsv(
-    ["Title", "Priority", "Preconditions", "Steps", "Expected Result", "Tags"],
+    ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
     copyableDrafts.map((draft) => [
       draft.title,
       draft.priority,
+      draft.severity ?? "",
+      draft.component ?? "",
       draft.preconditions,
       stepsText(draft.stepsJson),
       draft.expectedSummary,
@@ -446,7 +455,7 @@ export default function ZyraTaskDetailPage() {
               </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[980px] border-collapse text-left text-sm">
+              <table className="w-full min-w-[1180px] border-collapse text-left text-sm">
                 <thead className="bg-[var(--surface-secondary)] text-xs uppercase tracking-[0.08em] text-[var(--muted-soft)]">
                   <tr>
                     <th className="w-10 px-3 py-3">
@@ -460,6 +469,8 @@ export default function ZyraTaskDetailPage() {
                     </th>
                     <th className="px-3 py-3">Testcase</th>
                     <th className="px-3 py-3">Priority</th>
+                    <th className="px-3 py-3">Severity</th>
+                    <th className="px-3 py-3">Component</th>
                     <th className="px-3 py-3">Preconditions</th>
                     <th className="px-3 py-3">Steps</th>
                     <th className="px-3 py-3">Expected Result</th>
@@ -492,6 +503,8 @@ export default function ZyraTaskDetailPage() {
                       <td className="px-3 py-3">
                         <span className="rounded bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">{draft.priority}</span>
                       </td>
+                      <td className="px-3 py-3">{knownSeverity(draft.severity) && <SeverityBadge severity={knownSeverity(draft.severity)!} />}</td>
+                      <td className="px-3 py-3 text-[var(--muted)]">{draft.component || ""}</td>
                       <td className="max-w-[220px] px-3 py-3 text-[var(--muted)]">{draft.preconditions}</td>
                       <td className="px-3 py-3 text-[var(--muted)]">{stepCount(draft.stepsJson)} step{stepCount(draft.stepsJson) === 1 ? "" : "s"}</td>
                       <td className="max-w-[260px] px-3 py-3 text-[var(--muted)]">{draft.expectedSummary}</td>
@@ -505,7 +518,7 @@ export default function ZyraTaskDetailPage() {
                   ))}
                   {task.drafts.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-3 py-10 text-center text-sm text-[var(--muted)]">No generated testcases remain for this task.</td>
+                      <td colSpan={9} className="px-3 py-10 text-center text-sm text-[var(--muted)]">No generated testcases remain for this task.</td>
                     </tr>
                   )}
                 </tbody>
