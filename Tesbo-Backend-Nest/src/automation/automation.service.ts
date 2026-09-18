@@ -387,8 +387,19 @@ export class AutomationService {
          -- still be true. cycle_items_cycle_id_testcase_id_key is now a partial unique index (WHERE
          -- deleted_at IS NULL) — the ON CONFLICT target below repeats that predicate so Postgres can
          -- infer it, and a previously-removed case gets a fresh row instead of no-op'ing forever.
-         INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
-         SELECT $1, t.id, t.title, base.pos + i.ord
+         -- snapshot_title is joined by every other field the run's execution list, detail panel,
+         -- CSV export and reports display (V119) — captured here at add-time so a run's history
+         -- stops depending on the live testcase row surviving a later soft-delete.
+         INSERT INTO cycle_items (
+           cycle_id, testcase_id, snapshot_title, position,
+           snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+           snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+           snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+         )
+         SELECT $1, t.id, t.title, base.pos + i.ord,
+                t.external_id, t.priority, t.type, t.suite_id,
+                t.description, t.preconditions, t.postconditions, t.steps,
+                t.test_data, t.automation_status, t.automation_tags
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
