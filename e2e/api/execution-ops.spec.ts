@@ -519,6 +519,31 @@ test.describe("execution bulk operations, schedules and share links", () => {
     expect((await publicExecutions.json()).length).toBe(2);
   });
 
+  test("a shared run keeps showing a deleted test case's title, external id, priority and type", async () => {
+    // publicCycleExecutions carries the same live-join-vs-snapshot gap executions() had (V119) --
+    // a soft-deleted test case must not blank out what a share link publishes any more than it
+    // blanks out the authenticated Runs page.
+    const { cycleId } = await seedRun(1);
+    const [execution] = await (await asOwner.get(`/api/cycles/${cycleId}/executions`)).json();
+
+    const delRes = await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${execution.testcaseId}`, {
+      failOnStatusCode: false,
+    });
+    expect(delRes.status(), await delRes.text()).toBeLessThan(300);
+
+    const shared = await asOwner.post(`/api/cycles/${cycleId}/share`, { data: { enabled: true } });
+    const { shareToken } = await shared.json();
+
+    const publicExecutions = await (
+      await anon.get(`/api/public/shared-runs/${shareToken}/executions`, { failOnStatusCode: false })
+    ).json();
+    expect(publicExecutions).toHaveLength(1);
+    expect(publicExecutions[0].title).toBe(execution.title);
+    expect(publicExecutions[0].externalId).toBe(execution.externalId);
+    expect(publicExecutions[0].priority).toBe(execution.priority);
+    expect(publicExecutions[0].type).toBe(execution.type);
+  });
+
   test("EXO-A-12 revoking a share link stops it serving the run", { tag: '@tesbo.testId("TES-TC-186")' }, async () => {
     const { cycleId } = await seedRun(1);
     const token = (await (await asOwner.post(`/api/cycles/${cycleId}/share`, { data: { enabled: true } })).json())

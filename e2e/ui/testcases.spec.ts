@@ -25,9 +25,8 @@ test.describe("test case creation", () => {
 
     const panel = page.locator("aside");
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
-    // Suite/Type/Priority/Automation Type start unselected (see the dedicated test below) and
-    // block creation until chosen — pick a value for each so this happy-path test still reaches
-    // the create call itself.
+    // Suite/Type/Priority/Automation Type start unselected (see the dedicated test below), but
+    // this happy-path test still exercises picking a value for each explicitly.
     await fieldControl(page, "Suite").selectOption({ label: "No suite" });
     await fieldControl(page, "Type").selectOption("Functional");
     await fieldControl(page, "Priority").selectOption("P2");
@@ -103,11 +102,16 @@ test.describe("test case creation", () => {
     }
   });
 
-  // Regression coverage for: Create Test Case opened with Suite/Type/Priority/Automation Type
-  // pre-set to "No suite"/"Functional"/"P2"/"Not Automated" — real values the user never chose,
-  // silently submitted on Create. Status is unaffected by this bug and must keep defaulting to
-  // "Draft".
-  test("Create Test Case opens with Suite, Type, Priority and Automation Type unselected, and blocks creation until they're chosen", async ({ page }) => {
+  // Suite, Type, Priority, Automation Type, Component and Severity are all optional on Create:
+  // Create Test Case must open with the dropdowns on "Select"/"No severity" and Component empty,
+  // and leaving every one of them untouched must both (a) succeed, and (b) persist them as blank/
+  // null rather than a real value the user never chose. The form always includes these fields in
+  // its payload (testcases/page.tsx), blank or not, so an untouched field reaches the API as an
+  // explicit "" — insertTestCaseWithClient in legacy.service.ts now only applies its "P2"/
+  // "Functional"/"Not Automated" fallbacks when the key is missing entirely (import/Zyra/MCP,
+  // which never send this form's payload shape), not when it's sent blank. Status is excluded:
+  // it has no "Select" placeholder and is never left blank, so it keeps defaulting to "Draft".
+  test("Create Test Case opens with Suite, Type, Priority, Automation Type and Component unselected/empty, and creating without filling them saves them blank rather than defaulted", async ({ page }) => {
     const title = `UI unselected defaults test case ${Date.now()}`;
 
     await page.goto(`/projects/${ctx.projectId}/testcases`);
@@ -119,26 +123,18 @@ test.describe("test case creation", () => {
     await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
     await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
     await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Component")).toHaveValue("");
+    await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("No severity");
     await expect(fieldControl(page, "Status").locator("option:checked")).toHaveText("Draft");
 
-    // Submitting before picking them is blocked with an explicit error, not a silent create.
+    // Submit with all of the above left untouched — no client-side error, a real create.
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
-    await panel.getByRole("button", { name: "Create", exact: true }).click();
-    await expect(
-      panel.getByText("Select a value for Suite, Type, Priority, Automation Type before creating the test case."),
-    ).toBeVisible();
-    await expect(panel.getByText("Test case created successfully.")).not.toBeVisible();
-
-    // Selecting all four — including explicitly picking "No suite" — lets the same create through.
-    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
-    await fieldControl(page, "Type").selectOption("Functional");
-    await fieldControl(page, "Priority").selectOption("P2");
-    await fieldControl(page, "Automation Type").selectOption("Not Automated");
     await panel.getByRole("button", { name: "Create", exact: true }).click();
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
     await panel.getByRole("button", { name: "Close panel" }).click();
 
-    // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
+    // Persisted state, not just the toast: the API-visible row must carry blank/null values,
+    // not the "No suite"/"Functional"/"P2"/"Not Automated" defaults this used to silently apply.
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
     try {
       const listRes = await api.get(`/api/projects/${ctx.projectId}/testcases`, {
@@ -146,8 +142,108 @@ test.describe("test case creation", () => {
       });
       const list = await listRes.json();
       const match = list.find((tc: { id: string; title: string }) => tc.title === title);
+      expect(match).toBeTruthy();
+      expect(match.suiteId).toBeNull();
+      expect(match.type).toBeNull();
+      expect(match.priority).toBe("");
+      expect(match.automationStatus).toBeNull();
+      expect(match.component).toBeFalsy();
+      expect(match.severity).toBeFalsy();
+      // Status is the one field NOT covered by this optional-field fix — it keeps its default.
+      expect(match.status).toBe("Draft");
+
       if (match) await api.delete(`/api/projects/${ctx.projectId}/testcases/${match.id}`);
     } finally {
+      await api.dispose();
+    }
+  });
+
+  // Companion to the create-time test above: fillFormFromTestCase (testcases/page.tsx) used to
+  // re-populate a reopened case's Type/Automation Type with "Functional"/"Not Automated" whenever
+  // the stored value was blank, and Suite with whatever suite the repository view happened to be
+  // filtered on — so a case saved blank by the fix above would silently gain a real value the
+  // moment it was opened and saved again, undoing the fix on the very next edit. Priority is
+  // excluded from that regression (an empty string isn't nullish, so it already round-tripped).
+  test("Edit Test Case shows a blank Type/Priority/Automation Type/Suite as Select/No suite, and saving with no changes keeps them blank", async ({ page }) => {
+    const title = `UI edit blank fields test case ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    try {
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title, priority: "", type: "", automationStatus: "", severity: "", component: "" },
+        })
+      ).json();
+      testcaseId = created.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText("No suite");
+      await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+
+      // Save without touching anything.
+      await panel.getByRole("button", { name: "Save changes" }).click();
+      await expect(panel.getByText("Test case updated successfully.")).toBeVisible();
+
+      const after = await (
+        await api.get(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`)
+      ).json();
+      expect(after.suiteId).toBeNull();
+      expect(after.type).toBeFalsy();
+      expect(after.priority).toBe("");
+      expect(after.automationStatus).toBeFalsy();
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  // A case that already has real values must not be disturbed by the fix above — reopening and
+  // saving it unchanged has to round-trip the exact values it already had.
+  test("Edit Test Case preserves existing Type/Priority/Automation Type/Suite values when saved with no changes", async ({ page }) => {
+    const title = `UI edit populated fields test case ${Date.now()}`;
+    const suiteName = `E2E Edit Preserve Suite ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    let suiteId = "";
+    try {
+      const suite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: suiteName } })
+      ).json();
+      suiteId = suite.id;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title, priority: "P1", type: "Regression", automationStatus: "Automated", suiteId },
+        })
+      ).json();
+      testcaseId = created.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText(suiteName);
+      await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Regression");
+      await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("P1");
+      await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Automated");
+
+      await panel.getByRole("button", { name: "Save changes" }).click();
+      await expect(panel.getByText("Test case updated successfully.")).toBeVisible();
+
+      const after = await (
+        await api.get(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`)
+      ).json();
+      expect(after.suiteId).toBe(suiteId);
+      expect(after.type).toBe("Regression");
+      expect(after.priority).toBe("P1");
+      expect(after.automationStatus).toBe("Automated");
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      if (suiteId) await api.delete(`/api/suites/${suiteId}`, { failOnStatusCode: false });
       await api.dispose();
     }
   });

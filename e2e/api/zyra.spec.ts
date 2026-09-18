@@ -118,8 +118,16 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * all. This is the suite's usual "arrange through Postgres when the API path is unavailable" rule.
    */
   function seedTask(
-    fields: { status?: string; drafts?: number; jiraIssueKey?: string; draftOverrides?: Array<Record<string, unknown>> } = {},
+    fields: {
+      status?: string;
+      drafts?: number;
+      jiraIssueKey?: string;
+      draftOverrides?: Array<Record<string, unknown>>;
+      savedCount?: number;
+      projectId?: string;
+    } = {},
   ): string {
+    const projectId = fields.projectId ?? tenant!.mainProjectId;
     const drafts = Array.from({ length: fields.drafts ?? 2 }, (_, i) => ({
       title: `E2E draft ${i + 1}`,
       steps: [{ action: "open the app", expected: "it opens" }],
@@ -143,15 +151,15 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
      */
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status, jira_issue_keys) VALUES (" +
-        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
-        `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ` +
+        "requested_count, generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys) VALUES (" +
+        `${literal(projectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
+        `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ${fields.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', ` +
         `${literal(fields.status ?? "awaiting_review")}, ` +
         `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb);`,
     );
     return scalar(
-      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
+      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(projectId)} ` +
         "ORDER BY created_at DESC LIMIT 1;",
     );
   }
@@ -1048,6 +1056,164 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(after.status(), `a non-uuid audit row broke the agent — ${await after.text()}`).toBe(200);
     expect(Number((await after.json()).testcasesCreated), "a non-uuid audit row changed the count").toBe(before);
   });
+
+  // ─── The agent's "Approval rate" tile ──────────────────────────────────────
+
+  /** Reads the agent payload's approvalRate field, failing loudly if the field is missing entirely. */
+  const approvalRate = async (api: APIRequestContext = asOwner, projectId?: string): Promise<number | null> => {
+    const res = await api.get(url("/agents/zyra", projectId), { failOnStatusCode: false });
+    expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(
+      Object.prototype.hasOwnProperty.call(body, "approvalRate"),
+      "the agent payload carries no approvalRate field at all",
+    ).toBe(true);
+    return body.approvalRate;
+  };
+
+  test(
+    "ZYR-A-75 the approval rate reflects drafts actually saved, not a taskStatus the backend never writes",
+    { tag: '@tesbo.testId("TES-TC-1215")' },
+    async () => {
+      /*
+       * "[Zyra] Approval Rate Is Not Updated After Saving Generated Test Cases" — the Agents screen
+       * computed this tile client-side as decided = tasks.filter(t => t.taskStatus === "accepted" ||
+       * t.taskStatus === "rejected"), then approved/decided. But zyraTask/processZyraTask/aiSave only
+       * ever write task_status as 'todo' | 'in_progress' | 'in_review' | 'failed' | 'done' — grep the
+       * whole service for `task_status = '...'` and "accepted"/"rejected" never appears. `decided` was
+       * therefore always empty and the tile always rendered "—", regardless of how many drafts were
+       * actually saved. Fails on the unfixed backend because the field is absent from the response
+       * entirely (approvalRate is asserted `.toBeDefined()`-equivalent above via the hasOwnProperty
+       * check); a frontend-only fix wired to the same never-true filter would still fail this, since
+       * the assertion below requires the *exact* saved/generated ratio, not just a defined field.
+       *
+       * approvalRate is now SUM(saved_count)/SUM(generated_count) over 'done' task-board rows.
+       */
+      seedTask({ drafts: 5, savedCount: 4, status: "done" });
+      expect(await approvalRate(), "a 4-of-5-saved done task did not read as 80%").toBe(80);
+    },
+  );
+
+  test("ZYR-A-76 no task-board runs at all reads null, not 0 or an error", { tag: '@tesbo.testId("TES-TC-1216")' }, async () => {
+    // The empty state every new project starts in, and what the screenshot in the bug report showed
+    // — this must render as the dash, not a misleading 0%.
+    expect(await approvalRate()).toBeNull();
+  });
+
+  test(
+    "ZYR-A-77 a task still awaiting review does not drag the rate down before anything is decided",
+    { tag: '@tesbo.testId("TES-TC-1217")' },
+    async () => {
+      // in_review means drafts were generated and are pending the user's decision — nothing has been
+      // approved OR rejected yet. Counting its 0 saved_count here would read as "0% approved" for work
+      // that is simply still in progress. todo/in_progress (queued/generating, no drafts yet) must be
+      // equally inert.
+      seedTask({ drafts: 5, savedCount: 0, status: "in_review" });
+      seedTask({ drafts: 0, savedCount: 0, status: "todo" });
+      seedTask({ drafts: 0, savedCount: 0, status: "in_progress" });
+      expect(await approvalRate(), "a pending task was counted as 0% approved instead of being excluded").toBeNull();
+    },
+  );
+
+  test(
+    "ZYR-A-78 a task that failed before producing anything to review is excluded, not counted as rejected",
+    { tag: '@tesbo.testId("TES-TC-1218")' },
+    async () => {
+      // Forced generated_count > 0 here even though a real failure normally leaves it at 0 (failures
+      // only happen before drafts exist) — this proves the exclusion is enforced by task_status, not
+      // just incidentally by an always-zero generated_count.
+      seedTask({ drafts: 3, savedCount: 0, status: "failed" });
+      expect(await approvalRate(), "a failed generation was treated as a rejection").toBeNull();
+
+      seedTask({ drafts: 2, savedCount: 2, status: "done" });
+      expect(
+        await approvalRate(),
+        "a failed task's drafts diluted the rate of an unrelated, fully-saved task",
+      ).toBe(100);
+    },
+  );
+
+  test(
+    "ZYR-A-79 the rate aggregates proportionally across multiple done tasks, including a non-round percentage",
+    { tag: '@tesbo.testId("TES-TC-1219")' },
+    async () => {
+      seedTask({ drafts: 3, savedCount: 1, status: "done" });
+      seedTask({ drafts: 4, savedCount: 2, status: "done" });
+      // 3 saved of 7 generated = 42.857...% — pins the rounding, not just the direction.
+      expect(await approvalRate()).toBe(43);
+    },
+  );
+
+  test(
+    "ZYR-A-80 a partial save and a close-without-saving, both through the real routes, feed the rate correctly",
+    { tag: '@tesbo.testId("TES-TC-1220")' },
+    async () => {
+      // Exercises POST .../tasks/:id/save (zyraSave/zyraSaveAttempt) and POST .../tasks/:id/close
+      // (zyraCloseTask) for real — the actual product actions behind the Save and Close buttons —
+      // rather than seeding task_status = 'done' directly. Task-board batches resolve to 'done' on
+      // ANY save (see zyraSaveAttempt's own comment), partial or not, unlike a chat-staged batch.
+      const partialTaskId = seedTask({ drafts: 3, status: "in_review" });
+      const saveRes = await asOwner.post(url(`/agents/zyra/tasks/${partialTaskId}/save`), {
+        data: { selectedDraftIndexes: [0, 1] },
+        failOnStatusCode: false,
+      });
+      expect(saveRes.status(), `partially saving the batch — ${await saveRes.text()}`).toBe(201);
+      const saveBody = await saveRes.json();
+      expect(saveBody.savedCount, "2 of 3 selected drafts should have saved").toBe(2);
+      const createdIds: string[] = (saveBody.testcases ?? []).map((t: { id: string }) => t.id);
+
+      try {
+        expect(
+          scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(partialTaskId)};`),
+          "a task-board batch must resolve to 'done' even on a partial save",
+        ).toBe("done");
+
+        const closedTaskId = seedTask({ drafts: 2, status: "in_review" });
+        const closeRes = await asOwner.post(url(`/agents/zyra/tasks/${closedTaskId}/close`), {
+          failOnStatusCode: false,
+        });
+        expect(closeRes.status(), `closing without saving — ${await closeRes.text()}`).toBe(201);
+        expect(
+          scalar(`SELECT saved_count FROM ai_generation_requests WHERE id = ${literal(closedTaskId)};`),
+        ).toBe("0");
+
+        // 2 saved of 3 (partial save) + 0 saved of 2 (closed without saving) = 2 of 5 = 40%.
+        expect(
+          await approvalRate(),
+          "a partial save and a close-without-saving did not aggregate into the expected rate",
+        ).toBe(40);
+      } finally {
+        for (const id of createdIds) {
+          await asOwner.delete(url(`/testcases/${id}`), { failOnStatusCode: false });
+        }
+      }
+    },
+  );
+
+  test(
+    "ZYR-A-81 chat-created testcases never feed the task-board approval rate",
+    { tag: '@tesbo.testId("TES-TC-1221")' },
+    async () => {
+      // A chat-staged row (chat_session_id set) must not be picked up by the task-board aggregate —
+      // chat has no comparable generated-vs-saved concept, and `tasks` elsewhere on this same payload
+      // already excludes these rows for the same reason (chat_session_id IS NULL).
+      seedChatReviewTask({ status: "done" });
+      expect(await approvalRate(), "a chat-staged batch leaked into the task-board approval rate").toBeNull();
+    },
+  );
+
+  test(
+    "ZYR-A-82 the approval rate is scoped per project — a second tenant's saves never leak in",
+    { tag: '@tesbo.testId("TES-TC-1222")' },
+    async () => {
+      // Same account, its own second project — the cheapest way to catch a dropped WHERE project_id.
+      seedTask({ drafts: 4, savedCount: 4, status: "done", projectId: tenant!.mainProjectId });
+      expect(
+        await approvalRate(asOwner, tenant!.secondProjectId),
+        "a save recorded against the main project leaked into a sibling project's approval rate",
+      ).toBeNull();
+    },
+  );
 
   // ─── The agent's "Token usage" tile ─────────────────────────────────────────
 
@@ -2659,6 +2825,17 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const draftingPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
     expect(draftingPrompt, "the model must be asked for severity").toContain("severity");
     expect(draftingPrompt, "the model must be asked for component").toContain("component");
+
+    // The display/preview gap this ticket was actually about: the chat UI (ZyraChatReviewPanel)
+    // renders straight from this turn's response body, BEFORE anything is saved — chatDraftRow
+    // used to rebuild this row and silently drop severity/component even though generation and
+    // save both had them all along. Asserting only the post-save DB row (below) would have passed
+    // throughout the whole time this bug was live.
+    const turnBody = await turn.json();
+    const proposedRow = (turnBody.message?.testcases ?? []).find((tc: { action?: string }) => tc.action === "proposed-create");
+    expect(proposedRow, "the create turn must stage a proposed-create row on the assistant message").toBeTruthy();
+    expect(proposedRow.severity, "severity must reach the chat preview, not just the saved row").toBe("High");
+    expect(proposedRow.component, "component must reach the chat preview, not just the saved row").toBe("Checkout");
 
     const taskId = scalar(
       `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,

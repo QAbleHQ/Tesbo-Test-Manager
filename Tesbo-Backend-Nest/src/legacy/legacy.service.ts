@@ -3421,21 +3421,40 @@ export class LegacyService implements OnModuleInit {
       // JSON-encoded string (the shape the create/edit modal, and now Zyra/MCP, actually persist —
       // see "[Zyra] Test Steps... Missing After Saving Generated Test Cases"), and
       // normalizeJsonArray silently emptied the latter instead of parsing it.
-      const steps = this.safeSteps(row.steps)
-        .map((step: any) => {
-          if (typeof step === "string") return step;
-          return [step.action || step.step || step.description, step.expectedResult || step.expected]
-            .filter(Boolean)
-            .join(" => ");
-        })
-        .filter(Boolean)
-        .join(" | ");
+      const parsedSteps = this.safeSteps(row.steps);
+      // Action/Expected Result only take a case with EXACTLY one step, and only when that step has
+      // its own action/expectedResult (not a plain legacy string) — the importer's own Action/
+      // Expected Result columns are single-step-only (ImportTestCasesModal.tsx's handleImport
+      // builds exactly one step from them, with no " | " splitting), so anything joined across
+      // several steps into these columns would come back as one garbled step on re-import instead
+      // of round-tripping. Every other case (0 steps, a plain-string step, or 2+ steps) keeps using
+      // `steps`, in the "action => expected" DSL the importer's Steps column already splits on
+      // both "|" and "=>" correctly regardless of step count.
+      let steps = "";
+      let action = "";
+      let expectedResult = "";
+      if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
+        action = parsedSteps[0].action || parsedSteps[0].step || parsedSteps[0].description || "";
+        expectedResult = parsedSteps[0].expectedResult || parsedSteps[0].expected || "";
+      } else {
+        steps = parsedSteps
+          .map((step: any) => {
+            if (typeof step === "string") return step;
+            return [step.action || step.step || step.description, step.expectedResult || step.expected]
+              .filter(Boolean)
+              .join(" => ");
+          })
+          .filter(Boolean)
+          .join(" | ");
+      }
       const exportRow: Body = {
         externalId: row.external_id || "",
         title: row.title || "",
         description: row.description || "",
         preconditions: row.preconditions || "",
         steps,
+        action,
+        expectedResult,
         testData: row.test_data || "",
         priority: row.priority || "",
         severity: row.severity || "",
@@ -3695,10 +3714,19 @@ export class LegacyService implements OnModuleInit {
         body.postconditions || "",
         JSON.stringify(body.steps || body.stepsJson || []),
         body.testData || "",
-        body.priority || "P2",
+        // `priority`/`type`/`automationStatus` only fall back to their defaults when the caller
+        // never mentioned the field at all (import, Zyra and the MCP tool all either resolve a
+        // real value themselves or omit the key entirely, relying on this default). A caller that
+        // sends the key with an empty/falsy value — the Create Test Case form, whose Suite/Type/
+        // Priority/Automation Type start on an unselected placeholder — means it explicitly, and
+        // that must be honored rather than silently replaced with a value the user never chose.
+        // priority is NOT NULL (V2_test_cases_and_suites.sql), so "explicitly blank" is "" here,
+        // not null; type/automation_status are nullable and use null the same way severity/
+        // component already do below.
+        body.priority !== undefined ? body.priority || "" : "P2",
         body.severity || null,
-        body.type || "Functional",
-        body.automationStatus || "Not Automated",
+        body.type !== undefined ? body.type || null : "Functional",
+        body.automationStatus !== undefined ? body.automationStatus || null : "Not Automated",
         body.automationRepo || null,
         body.automationPath || null,
         body.automationTestName || null,
@@ -5145,7 +5173,9 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT e.id, e.status,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
        WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
@@ -5287,8 +5317,20 @@ export class LegacyService implements OnModuleInit {
          -- above already refused a soft-deleted run with 404, but that read and this write are two
          -- separate statements, leaving a window where a concurrent delete could land in between.
          -- This closes that window at the point of the actual write (hard-delete remediation Phase 2).
-         INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
-         SELECT $1, t.id, t.title, base.pos + i.ord
+         --
+         -- snapshot_title is joined by every other field the run's execution list, detail panel,
+         -- CSV export and reports display (V119) — captured here at add-time so a run's history
+         -- stops depending on the live testcase row surviving a later soft-delete.
+         INSERT INTO cycle_items (
+           cycle_id, testcase_id, snapshot_title, position,
+           snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+           snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+           snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+         )
+         SELECT $1, t.id, t.title, base.pos + i.ord,
+                t.external_id, t.priority, t.type, t.suite_id,
+                t.description, t.preconditions, t.postconditions, t.steps,
+                t.test_data, t.automation_status, t.automation_tags
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
@@ -5399,14 +5441,30 @@ export class LegacyService implements OnModuleInit {
      *
      * The CSV export (exportCycleExecutions -> this method) is unaffected: it names its nine
      * headers explicitly rather than iterating the row's keys.
+     *
+     * external_id/priority/type/suite_id/description/preconditions/postconditions/steps/test_data/
+     * automation_status/automation_tags all prefer cycle_items' own snapshot_* column (V119) over
+     * the live testcases join, the same way title already preferred snapshot_title — a run is a
+     * point-in-time record, so its display must not depend on (or drift with) the live test case
+     * surviving or being edited afterwards. `t.*` only still backs the COALESCE for a row that
+     * predates V119's backfill and was never re-saved.
      */
     const res = await this.db.query(
       `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
               e.duration_ms, e.retry_count, e.error_message, e.error_stack, e.reported_by,
               ci.id AS cycle_item_id, ci.testcase_id, ci.snapshot_title,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type, t.suite_id, t.description, t.preconditions, t.postconditions,
-              t.steps, t.test_data, t.automation_status, t.automation_tags,
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type,
+              COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
+              COALESCE(ci.snapshot_description, t.description) AS description,
+              COALESCE(ci.snapshot_preconditions, t.preconditions) AS preconditions,
+              COALESCE(ci.snapshot_postconditions, t.postconditions) AS postconditions,
+              COALESCE(ci.snapshot_steps, t.steps) AS steps,
+              COALESCE(ci.snapshot_test_data, t.test_data) AS test_data,
+              COALESCE(ci.snapshot_automation_status, t.automation_status) AS automation_status,
+              COALESCE(ci.snapshot_automation_tags, t.automation_tags) AS automation_tags,
               COALESCE(ev.count, 0)::int AS evidence_count
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
@@ -6541,9 +6599,9 @@ export class LegacyService implements OnModuleInit {
          e.assignee_id,
          ci.testcase_id,
          COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
-         COALESCE(t.priority, 'Unspecified') AS priority,
-         COALESCE(t.automation_tags, '') AS automation_tags,
-         t.suite_id,
+         COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
+         COALESCE(ci.snapshot_automation_tags, t.automation_tags, '') AS automation_tags,
+         COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
          COALESCE(s.name, 'No Suite') AS suite_name,
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
@@ -6554,7 +6612,7 @@ export class LegacyService implements OnModuleInit {
        JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
@@ -6934,7 +6992,7 @@ export class LegacyService implements OnModuleInit {
       run_name: string;
       run_created_at: string;
     }>(
-      `SELECT ci.testcase_id, COALESCE(t.external_id, '') AS external_id,
+      `SELECT ci.testcase_id, COALESCE(ci.snapshot_external_id, t.external_id, '') AS external_id,
               COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS title,
               COALESCE(s.name, 'Unassigned') AS suite_name,
               e.status, c.name AS run_name, c.created_at AS run_created_at
@@ -6942,7 +7000,7 @@ export class LegacyService implements OnModuleInit {
        JOIN executions e ON e.cycle_item_id = ci.id
        JOIN cycles c ON c.id = ci.cycle_id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
          AND e.status IS NOT NULL AND e.status <> 'Untested'
        ORDER BY ci.testcase_id, c.created_at ASC`,
@@ -10548,7 +10606,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity, approval] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
@@ -10583,6 +10641,23 @@ export class LegacyService implements OnModuleInit {
           WHERE s.project_id = $1 AND s.deleted_at IS NULL
             AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
         [projectId]
+      ),
+      // All-time, unlike `tasks` above which is capped to the 50 most recently updated rows for
+      // display — a project with a long Zyra history must not have its approval rate silently
+      // reset once older runs scroll out of that window. task_status = 'done' (not merely
+      // <> 'failed') is deliberate: a 'in_review' task has drafts generated and saved_count still
+      // 0 simply because the user hasn't finished reviewing it yet, not because they rejected
+      // anything — counting it here would drag the rate down for work that is still pending, not
+      // decided. 'done' is only ever reached via aiSave, an explicit save-or-close action (see
+      // aiSave below), which is what "approved and saved" in the ticket actually means. Excludes
+      // 'failed' the same way, since a generation error leaves nothing to approve or reject.
+      // chat_session_id IS NULL matches `tasks`: chat-created testcases don't go through this
+      // saved/generated lifecycle, so there is nothing meaningful to fold into this ratio for them.
+      this.db.query<{ saved: string; generated: string }>(
+        `SELECT COALESCE(SUM(saved_count), 0) AS saved, COALESCE(SUM(generated_count), 0) AS generated
+           FROM ai_generation_requests
+          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND chat_session_id IS NULL AND task_status = 'done'`,
+        [projectId, ZYRA_AGENT_NAMES]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
@@ -10624,6 +10699,10 @@ export class LegacyService implements OnModuleInit {
         total: Number(usage.rows[0]?.total || 0)
       },
       testcasesCreated: await this.zyraCreatedTestcaseCount(projectId),
+      approvalRate: (() => {
+        const generated = Number(approval.rows[0]?.generated || 0);
+        return generated > 0 ? Math.round((Number(approval.rows[0]?.saved || 0) / generated) * 100) : null;
+      })(),
       tasks: await Promise.all(tasks.rows.map((row) => this.formatAiTask(row)))
     };
   }
@@ -17597,6 +17676,13 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
+      // and save already carry both fields correctly; this row is what the chat/task-board UI
+      // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
+      // so an explicit "" edit (clearing a previously-set value) isn't coerced back to null here —
+      // sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient decide that, not this formatter.
+      severity: value.severity ?? null,
+      component: value.component ?? null,
       action,
       reason: reason || "",
       // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
@@ -17622,6 +17708,8 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      severity: row.severity,
+      component: row.component,
       sourceRefs: row.sourceRefs
     }, action, reason);
   }

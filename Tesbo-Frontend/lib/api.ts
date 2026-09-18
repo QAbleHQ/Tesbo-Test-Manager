@@ -851,6 +851,13 @@ export interface AiGeneratedDraft {
   expectedSummary: string;
   priority: string;
   tags: string[];
+  /**
+   * Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generated and
+   * persisted (normalizeAiDrafts/zyraBatchInsertTestCases) since before this field existed on this
+   * type; a draft from an older task can still lack it entirely, so treat absent the same as null.
+   */
+  severity?: string | null;
+  component?: string | null;
   // The following are only ever present on a normalized update/archive entry (formatAiTask's
   // server-side normalization of a non-create ai_generation_requests.generated_payload item — see
   // ZYRA_IMPLEMENTATION_LOG.md). A plain task-board create draft never carries them.
@@ -963,7 +970,7 @@ export interface ZyraTask {
   requestedCount: number;
   generatedCount: number;
   savedCount: number;
-  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | "accepted" | "rejected" | string;
+  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | string;
   feedback: string;
   context: string;
   jiraIssueKeys: string[];
@@ -1011,6 +1018,12 @@ export interface ZyraAgentState {
    * task.generatedCount over-counts drafts that were never actually saved.
    */
   testcasesCreated: number;
+  /**
+   * All-time SUM(saved_count)/SUM(generated_count) across every task-board run for this project
+   * (chat-created testcases and failed runs excluded — see zyraAgent() on the backend), not
+   * derived from `tasks` below, which is capped to the 50 most recently updated rows.
+   */
+  approvalRate: number | null;
   tasks: ZyraTask[];
 }
 
@@ -1024,6 +1037,9 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /** See AiGeneratedDraft.severity/component — same fields, same server-side chatDraftRow/chatTestcaseRow normalization. */
+  severity?: string | null;
+  component?: string | null;
   /**
    * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
    * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/
