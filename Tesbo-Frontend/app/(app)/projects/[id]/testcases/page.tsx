@@ -825,6 +825,12 @@ export default function TestCasesPage() {
   }, [selectedSuiteCases]);
 
   function parseSteps(raw: unknown): Step[] {
+    // `steps` reaches here as a genuine array for rows written by import (which never
+    // double-encodes it — see ImportTestCasesModal/insertImportChunk), and as a JSON-encoded
+    // string for rows written by this page's own create/edit save and by Zyra (which do
+    // double-encode, to land in the shape this function used to require exclusively). Both are
+    // the same data; only the wrapping differs.
+    if (Array.isArray(raw)) return raw.length > 0 ? (raw as Step[]) : [{ ...EMPTY_STEP }];
     if (typeof raw !== "string") return [{ ...EMPTY_STEP }];
     try {
       const parsed = JSON.parse(raw) as Step[];
