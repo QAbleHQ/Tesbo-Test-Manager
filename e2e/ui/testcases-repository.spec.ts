@@ -767,4 +767,30 @@ test.describe("test case repository (UI)", () => {
     const xlsxHref = await page.getByRole("link", { name: "Export as Excel" }).getAttribute("href");
     expect(xlsxHref).toContain(`suiteId=${suiteId}`);
   });
+
+  /*
+   * Basecamp-style report: "[Test Cases] Exported Test Cases Lose Their Original Sequence" —
+   * export always sorted by most-recently-updated regardless of the repository table's own order,
+   * so editing an old case moved it to the top of the export without moving it on screen. Fixed by
+   * having export share the table's own order-by logic (LegacyService.buildTestcaseOrderBySql) and
+   * having the frontend's Export links carry the table's active column sort
+   * (currentTestCaseExportFilters in testcases/page.tsx), the same way TCR-18 covers the suite
+   * filter. Whether a sorted export's ROWS actually come back in that order is covered at the API
+   * level in e2e/api/import-export.spec.ts; this proves the link the UI builds carries the sort.
+   */
+  test("TCR-19 the Export menu links carry the repository table's active column sort", async ({ browser }) => {
+    await seedCase(stamp("SortLink"));
+    const page = await openRepository(browser);
+
+    await page.getByRole("button", { name: "Sort by Test case title" }).click();
+
+    await page.getByRole("button", { name: "Export" }).click();
+    const csvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(csvHref, "the export link must carry the table's active sort column").toContain("sortBy=title");
+    expect(csvHref, "…and its direction").toContain("sortDir=asc");
+
+    const xlsxHref = await page.getByRole("link", { name: "Export as Excel" }).getAttribute("href");
+    expect(xlsxHref).toContain("sortBy=title");
+    expect(xlsxHref).toContain("sortDir=asc");
+  });
 });

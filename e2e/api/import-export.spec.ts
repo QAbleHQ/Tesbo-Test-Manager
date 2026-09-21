@@ -364,18 +364,70 @@ test.describe("import / export", () => {
     expect(body).toContain('"E2E Export ""quoted"", comma');
   });
 
-  test("orders rows by most recently updated", { tag: '@tesbo.testId("TES-TC-200")' }, async () => {
-    const stamp = Date.now();
-    const project = await newProject(`E2E Export Order ${stamp}`);
-    const first = await seedCase({ title: `E2E Export Order A ${stamp}` }, project);
-    const second = await seedCase({ title: `E2E Export Order B ${stamp}` }, project);
-    await asOwner.put(`/api/projects/${project}/testcases/${first.id}`, {
-      data: { description: "touched last" },
-    });
+  test(
+    "orders rows the same way the repository shows them by default (newest first, ID sequence), not by last-updated",
+    { tag: '@tesbo.testId("TES-TC-200")' },
+    async () => {
+      /*
+       * Was: "orders rows by most recently updated" — export deliberately used `updated_at DESC`
+       * while the repository list used `created_at DESC` (ID sequence), on the theory that the two
+       * were allowed to diverge (see the removed comment in LegacyService.exportTestCases). That is
+       * exactly what "[Test Cases] Exported Test Cases Lose Their Original Sequence" reported:
+       * editing an old case silently moved it to the top of every future export while its position on
+       * screen never changed. Export's default now matches the repository's own default order, via
+       * the shared LegacyService.buildTestcaseOrderBySql.
+       */
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Order ${stamp}`);
+      const first = await seedCase({ title: `E2E Export Order A ${stamp}` }, project);
+      const second = await seedCase({ title: `E2E Export Order B ${stamp}` }, project);
+      // Editing the OLDER case must NOT move it in the export — that was the exact reported defect.
+      await asOwner.put(`/api/projects/${project}/testcases/${first.id}`, {
+        data: { description: "touched last" },
+      });
 
-    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
-    expect(records.map((r) => r.title)).toEqual([first.title, second.title]);
-  });
+      const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+      // Newest-created first, same as the repository's own default (unsorted) view — unaffected by
+      // which one was edited more recently.
+      expect(records.map((r) => r.title)).toEqual([second.title, first.title]);
+    },
+  );
+
+  test(
+    "an export can be sorted by the same ID/title/priority columns the repository table offers",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Sort ${stamp}`);
+      const alpha = await seedCase({ title: `E2E Export Sort Alpha ${stamp}`, priority: "P0" }, project);
+      const zebra = await seedCase({ title: `E2E Export Sort Zebra ${stamp}`, priority: "P3" }, project);
+
+      const byTitleAsc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "title", sortDir: "asc" },
+      });
+      expect(parseCsvRecords(await byTitleAsc.text()).records.map((r) => r.title)).toEqual([
+        alpha.title,
+        zebra.title,
+      ]);
+
+      const byTitleDesc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "title", sortDir: "desc" },
+      });
+      expect(parseCsvRecords(await byTitleDesc.text()).records.map((r) => r.title)).toEqual([
+        zebra.title,
+        alpha.title,
+      ]);
+
+      const byPriorityAsc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "priority", sortDir: "asc" },
+      });
+      // P0 (Critical) ranks ahead of P3 (Low) ascending — the same ranking the priority filter and
+      // the on-screen sort use, not alphabetical.
+      expect(parseCsvRecords(await byPriorityAsc.text()).records.map((r) => r.title)).toEqual([
+        alpha.title,
+        zebra.title,
+      ]);
+    },
+  );
 
   test("a project with no test cases exports the header row and nothing else", { tag: '@tesbo.testId("TES-TC-201")' }, async () => {
     const project = await newProject(`E2E Export Empty ${Date.now()}`);

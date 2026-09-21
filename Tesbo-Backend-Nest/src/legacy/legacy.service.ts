@@ -3341,42 +3341,60 @@ export class LegacyService implements OnModuleInit {
     return { filters, values, suiteSubtreeCteSql, customFieldJoinSql };
   }
 
-  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
-    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
-    const where = filters.join(" AND ");
-    /*
-     * Repository table sort (ID/Test case title/Priority), additive to the default order above.
-     * `sortBy` is matched against a fixed allow-list rather than interpolated as a column name, so
-     * there is no injection surface here even though it lands directly in ORDER BY text.
-     *
-     * Only three columns are exposed because those are the only three the repository's header
-     * offers a sort control for:
-     *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
-     *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
-     *     sequence, matching compareExternalId() on the frontend.
-     *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
-     *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
-     *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
-     *     a missing priority sorts last of all regardless of direction.
-     *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
-     * `testcases.id` is always the final tiebreaker so paging stays stable across identical sort keys,
-     * the same reasoning as the default order's own id tiebreaker above.
-     */
+  /**
+   * Repository table sort (ID/Test case title/Priority) — shared by the on-screen list and export
+   * (see exportTestCases) so a sorted export always matches the order the repository is currently
+   * showing, the same "export matches the screen" contract the suite/status/etc. filters already
+   * follow (buildTestcaseFilterFragments above). `sortBy` is matched against a fixed allow-list
+   * rather than interpolated as a column name, so there is no injection surface here even though it
+   * lands directly in ORDER BY text.
+   *
+   * Only three columns are exposed because those are the only three the repository's header offers a
+   * sort control for:
+   *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
+   *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
+   *     sequence, matching compareExternalId() on the frontend.
+   *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
+   *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
+   *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
+   *     a missing priority sorts last of all regardless of direction.
+   *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
+   * `testcases.id` is always the final tiebreaker so paging (and re-exporting the same data) stays
+   * stable across identical sort keys.
+   *
+   * With no `sortBy` at all, this is also the repository's own default view — `created_at DESC` is
+   * the ID sequence (external_id is assigned sequentially at creation), newest case first. Export
+   * used to hard-code its own, different default (`updated_at DESC` — "most recently updated first"),
+   * so editing an old case moved it to the top of every future export while its position on screen
+   * never changed ("[Test Cases] Exported Test Cases Lose Their Original Sequence"). Export now
+   * shares this same default, so an unsorted export always matches the unsorted repository view.
+   */
+  private buildTestcaseOrderBySql(query: Body): string {
     const sortDir = String(query.sortDir ?? "").toLowerCase() === "desc" ? "DESC" : "ASC";
-    let orderBySql = "testcases.created_at DESC, testcases.id DESC";
     if (query.sortBy === "id") {
-      orderBySql =
+      return (
         `(regexp_match(testcases.external_id, '(\\d+)$'))[1]::bigint ${sortDir} NULLS LAST, ` +
-        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "title") {
-      orderBySql = `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "priority") {
-      orderBySql =
+        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`
+      );
+    }
+    if (query.sortBy === "title") {
+      return `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
+    }
+    if (query.sortBy === "priority") {
+      return (
         `(CASE WHEN testcases.priority IS NULL OR testcases.priority = '' THEN 5 ` +
         `WHEN testcases.priority IN ('P0','P1','P2','P3') THEN ` +
         `(CASE testcases.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END) ` +
-        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`;
+        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`
+      );
     }
+    return "testcases.created_at DESC, testcases.id DESC";
+  }
+
+  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     values.push(limit, offset);
     // Total comes back as a window function on the same statement rather than a second
     // COUNT(*) query. This endpoint backs the repository table, the suite tree and the run
@@ -3414,6 +3432,11 @@ export class LegacyService implements OnModuleInit {
   async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = [], query: Body = {}): Promise<Body[]> {
     const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
     const where = filters.join(" AND ");
+    // Same order the repository table is currently showing — its default (created_at DESC, the ID
+    // sequence) with no sortBy, or its ID/title/priority column sort when one is active. See
+    // buildTestcaseOrderBySql for why: export used to hard-code `updated_at DESC` regardless of what
+    // was on screen ("[Test Cases] Exported Test Cases Lose Their Original Sequence").
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     const res = await this.db.query(
       `${suiteSubtreeCteSql}SELECT testcases.id, testcases.external_id, testcases.title, COALESCE(testcases.description, '') AS description,
               COALESCE(testcases.preconditions, '') AS preconditions,
@@ -3425,12 +3448,7 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN suites s ON s.id = testcases.suite_id AND s.deleted_at IS NULL
        ${customFieldJoinSql}
        WHERE ${where}
-       -- Export keeps its documented "most recently updated first" contract (pinned by
-       -- api/import-export.spec.ts "orders rows by most recently updated"); only the repository LIST
-       -- moved to ID sequence, which is what card 10212941059 asked for. The id tiebreaker is the part
-       -- that mattered here: a bulk update ties every touched row on one updated_at, and without it the
-       -- export's row order was arbitrary between two exports of the same data.
-       ORDER BY testcases.updated_at DESC, testcases.id DESC`,
+       ORDER BY ${orderBySql}`,
       values
     );
 

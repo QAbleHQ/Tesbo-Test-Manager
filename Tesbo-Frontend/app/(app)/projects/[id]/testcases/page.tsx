@@ -815,10 +815,12 @@ export default function TestCasesPage() {
     customFieldFilters,
   ]);
 
-  // Same suite/status/priority/type/automation/jira/linear/search/custom-field filters
-  // loadSelectedSuiteCases sends the list endpoint, reused for the "Export" menu so the
-  // downloaded file matches whatever suite/filters are currently active on screen instead of
-  // always exporting the whole project.
+  // Same suite/status/priority/type/automation/jira/linear/search/custom-field filters AND column
+  // sort loadSelectedSuiteCases/sortedSuiteCases apply on screen, reused for the "Export" menu so
+  // the downloaded file matches whatever the repository is currently showing — both which rows
+  // (suite/filters) and their order (sort) — instead of always exporting the whole project in an
+  // unrelated order ("[Test Cases] Exported Test Cases Lose Their Original Sequence": export used to
+  // always sort by most-recently-updated regardless of what the table displayed).
   const currentTestCaseExportFilters = useMemo(
     () => ({
       suiteId: activeSuiteId ?? undefined,
@@ -831,6 +833,8 @@ export default function TestCasesPage() {
       linearIssueKey: activeLinearIssueKey || undefined,
       search: debouncedSuiteSearch || undefined,
       customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
+      sortBy: suiteCasesSort?.column,
+      sortDir: suiteCasesSort?.direction,
     }),
     [
       activeSuiteId,
@@ -842,6 +846,7 @@ export default function TestCasesPage() {
       activeLinearIssueKey,
       debouncedSuiteSearch,
       customFieldFilters,
+      suiteCasesSort,
     ]
   );
 

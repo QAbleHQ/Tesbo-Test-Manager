@@ -1668,12 +1668,15 @@ export interface TestCaseExportFilters {
   search?: string;
   /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
   customFieldFilters?: string;
+  /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
+  sortBy?: "id" | "title" | "priority";
+  sortDir?: "asc" | "desc";
 }
 
-// Mirrors the repository screen's own filters (see loadSelectedSuiteCases' listTestCases call) so
-// "Export" produces exactly what's currently selected/filtered on screen, not the whole project —
-// an unfiltered export (no suite selected, no filters active) is still the default when `filters`
-// is omitted.
+// Mirrors the repository screen's own filters AND its current column sort (see loadSelectedSuiteCases'
+// listTestCases call and suiteCasesSort) so "Export" produces exactly what's currently
+// selected/filtered/sorted on screen, not the whole project in an unrelated order — an unfiltered,
+// unsorted export is still the default when `filters` is omitted.
 export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
   const sp = new URLSearchParams();
   if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
@@ -1686,6 +1689,8 @@ export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?
   if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
   if (filters?.search) sp.set("search", filters.search);
   if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+  if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
+  if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
   const qs = sp.toString();
   return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}${qs ? `?${qs}` : ""}`;
 }
