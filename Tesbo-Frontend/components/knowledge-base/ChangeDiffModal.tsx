@@ -6,16 +6,16 @@ import { renderMarkdown } from "@/lib/markdown";
 import { formatEventDate, formatEventTime } from "./ChangeHistory";
 
 /**
- * The "View diff" popup for a Change History entry — old vs new text per changed field. Kept out
- * of ChangeHistoryList's own row so a 500-char description edit never grows the compact timeline
- * itself; the row stays a one-line badge and this is opened on demand.
+ * The "View Details" popup for an Update History entry — old vs new text per changed field. Kept
+ * out of ChangeHistoryList's own row so a 500-char description edit never grows the compact
+ * timeline itself; the row stays a one-line badge and this is opened on demand.
  */
 
 // A field's label is usually a plain heading word ("Title", "Description", "Comments") — but for a
 // Zyra AI Memory log entry, groupSections (text-diff.util.ts) uses the section's own `## <ISO
 // timestamp>` heading as the label verbatim, so it reaches here as a raw
 // "2026-09-11T15:31:09.877Z" string. Reformat only that shape, into the same DD/MM/YYYY, hh:mm:ss
-// AM/PM the Change History list next to this modal already uses — every other label (not matching
+// AM/PM the Update History list next to this modal already uses — every other label (not matching
 // the pattern) is left exactly as the backend sent it.
 const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
@@ -37,7 +37,7 @@ export function ChangeDiffModal({
   fields: KnowledgeChangedField[];
 }) {
   return (
-    <Modal open={open} onClose={onClose} title="Difference" className="max-w-[640px]">
+    <Modal open={open} onClose={onClose} title="Update History" className="max-w-[640px]">
       <p className="mb-3 text-[12px] text-[var(--muted)]">{title}</p>
       <div className="space-y-6">
         {fields.map((field, i) => (

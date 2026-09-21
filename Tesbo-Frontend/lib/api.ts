@@ -3480,7 +3480,7 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
-// The Change History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// The Update History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
 // timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
 // are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
 export interface KnowledgeChangedField {
