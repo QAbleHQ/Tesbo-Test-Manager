@@ -96,9 +96,28 @@ describe("summarizeTextChange", () => {
     const description = fields.find((f) => f.label === "Description")!;
     expect(description.truncated).toBe(true);
     expect(description.newExcerpt).toHaveLength(4000);
-    // The section's full text includes its own "## Description" heading, not just the body — so
-    // this is slightly more than the raw description length, not exactly equal to it.
-    expect(description.newLength).toBeGreaterThanOrEqual(long.length);
+    // The section's stored text is just the body, not "## Description\n\n" + the body — the
+    // heading line is stripped once it's captured as the field's own `label`.
+    expect(description.newLength).toBe(long.length);
+  });
+
+  // Pins the exact reported bug: a heading glued directly onto its body with a single `\n` (as
+  // Zyra's AI Memory log entries are — `## <timestamp>\n<note>`, see rememberZyraMemory in
+  // legacy.service.ts) used to leave the heading line inside the section's own text, so the
+  // Change History "Difference" modal showed the same timestamp twice: once as the field's label,
+  // and again as a literal "## <timestamp>" line at the top of the diff excerpt underneath it.
+  it("does not repeat a heading glued directly onto its body inside that section's own excerpt", () => {
+    const before = "## 2026-09-11T13:40:28.172Z\nFirst note.";
+    const after = "## 2026-09-11T13:40:28.172Z\nFirst note, edited.";
+
+    const { fields } = summarizeTextChange(before, after);
+
+    expect(fields).toHaveLength(1);
+    expect(fields[0].label).toBe("2026-09-11T13:40:28.172Z");
+    expect(fields[0].oldExcerpt).toBe("First note.");
+    expect(fields[0].newExcerpt).toBe("First note, edited.");
+    expect(fields[0].newExcerpt).not.toContain("##");
+    expect(fields[0].newExcerpt).not.toContain("2026-09-11T13:40:28.172Z");
   });
 });
 

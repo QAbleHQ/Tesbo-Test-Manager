@@ -945,6 +945,36 @@ test.describe("integrations — Jira and Linear", () => {
     expect(updated.changedFields[0].newExcerpt).toContain("Edited body, now different.");
   });
 
+  test("INT-A-30b2 a heading glued directly onto its body, like Zyra's AI Memory log entries, is not repeated inside its own diff excerpt", async () => {
+    // Mirrors the exact shape rememberZyraMemory (legacy.service.ts) writes for a scratchpad
+    // entry: `## <ISO timestamp>\n<note>` — heading and body on the same block, joined by a
+    // single `\n`, unlike a synced ticket's heading and body (always separate `\n\n` blocks).
+    const heading = "## 2026-09-11T13:40:28.172Z";
+    const created = await asOwner.post(url("/knowledge-base/documents"), {
+      data: { title: "Glued heading document", folderId: rootFolderId, documentType: "general", contentText: `${heading}\nFirst note.` },
+      failOnStatusCode: false,
+    });
+    const docId = (await created.json()).id;
+
+    exec(
+      "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_html, content_text, created_by) VALUES (" +
+        `${literal(docId)}, 1, 'Glued heading document', '<p>${heading}\\nFirst note.</p>', ${literal(`${heading}\nFirst note.`)}, ${literal(tenant!.owner.userId)});`,
+    );
+    await asOwner.patch(url(`/knowledge-base/documents/${docId}`), { data: { contentText: `${heading}\nFirst note, edited.` } });
+
+    const res = await asOwner.get(url(`/knowledge-base/documents/${docId}/history`), { failOnStatusCode: false });
+    const body = await res.json();
+    const updated = body.events[0];
+    expect(Array.isArray(updated.changedFields)).toBe(true);
+    expect(updated.changedFields).toHaveLength(1);
+    // The heading's timestamp becomes the field's own label...
+    expect(updated.changedFields[0].label).toBe("2026-09-11T13:40:28.172Z");
+    // ...so it must not also appear a second time inside the excerpt underneath it.
+    expect(updated.changedFields[0].oldExcerpt).toBe("First note.");
+    expect(updated.changedFields[0].newExcerpt).toBe("First note, edited.");
+    expect(updated.changedFields[0].newExcerpt).not.toContain("##");
+  });
+
   test("INT-A-30c an AI memory's approve/reject is folded into its own history as a distinct entry", { tag: '@tesbo.testId("TES-TC-2054")' }, async () => {
     const created = await asOwner.post(url("/knowledge-base/documents"), {
       data: { title: "Memory doc", folderId: rootFolderId, documentType: "ai_memory", contentText: "Remembered fact." },
