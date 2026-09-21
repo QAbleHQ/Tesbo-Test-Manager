@@ -2,12 +2,27 @@
 
 import Modal from "@/components/ui/Modal";
 import type { KnowledgeChangedField } from "@/lib/api";
+import { formatEventDate, formatEventTime } from "./ChangeHistory";
 
 /**
  * The "View diff" popup for a Change History entry — old vs new text per changed field. Kept out
  * of ChangeHistoryList's own row so a 500-char description edit never grows the compact timeline
  * itself; the row stays a one-line badge and this is opened on demand.
  */
+
+// A field's label is usually a plain heading word ("Title", "Description", "Comments") — but for a
+// Zyra AI Memory log entry, groupSections (text-diff.util.ts) uses the section's own `## <ISO
+// timestamp>` heading as the label verbatim, so it reaches here as a raw
+// "2026-09-11T15:31:09.877Z" string. Reformat only that shape, into the same DD/MM/YYYY, hh:mm:ss
+// AM/PM the Change History list next to this modal already uses — every other label (not matching
+// the pattern) is left exactly as the backend sent it.
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function formatFieldLabel(label: string): string {
+  if (!ISO_TIMESTAMP_RE.test(label)) return label;
+  return `${formatEventDate(label)}, ${formatEventTime(label)}`;
+}
+
 export function ChangeDiffModal({
   open,
   onClose,
@@ -23,10 +38,10 @@ export function ChangeDiffModal({
   return (
     <Modal open={open} onClose={onClose} title="Difference" className="max-w-[640px]">
       <p className="mb-3 text-[12px] text-[var(--muted)]">{title}</p>
-      <div className="space-y-4">
+      <div className="space-y-6">
         {fields.map((field, i) => (
-          <div key={`${field.label}-${i}`}>
-            <div className="mb-1 text-[12px] font-semibold text-[var(--foreground)]">{field.label}</div>
+          <div key={`${field.label}-${i}`} className={i > 0 ? "border-t border-[var(--border)] pt-6" : undefined}>
+            <div className="mb-1 text-[12px] font-semibold text-[var(--foreground)]">{formatFieldLabel(field.label)}</div>
             <div className="space-y-1.5">
               {field.oldExcerpt && (
                 <div className="whitespace-pre-wrap rounded-[6px] border border-[var(--error)]/25 bg-[var(--error-soft)] px-2.5 py-1.5 text-[12px] text-[var(--error-foreground)]">

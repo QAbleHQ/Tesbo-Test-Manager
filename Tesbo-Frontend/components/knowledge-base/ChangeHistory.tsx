@@ -20,14 +20,16 @@ export const CHANGE_HISTORY_PAGE_SIZE = 5;
 const LARGE_CHANGE_THRESHOLD = 160;
 
 // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — a fixed format, deliberately not locale-dependent.
-function formatEventDate(value: string): string {
+// Exported for ChangeDiffModal, which formats the same way wherever a diff's own field label is
+// a raw timestamp (a Zyra AI Memory entry's heading — see formatFieldLabel there).
+export function formatEventDate(value: string): string {
   const date = new Date(value);
   const dd = String(date.getDate()).padStart(2, "0");
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   return `${dd}/${mm}/${date.getFullYear()}`;
 }
 
-function formatEventTime(value: string): string {
+export function formatEventTime(value: string): string {
   const date = new Date(value);
   const hours24 = date.getHours();
   const period = hours24 >= 12 ? "PM" : "AM";

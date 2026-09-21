@@ -1635,6 +1635,83 @@ test.describe("knowledge base (UI)", () => {
     await expect(smallDialog.getByRole("button", { name: "Check Difference" })).toHaveCount(0);
   });
 
+  /*
+   * Regression: a Zyra AI Memory scratchpad entry is stored as `## <ISO timestamp>\n<note>`
+   * (rememberZyraMemory, legacy.service.ts) — groupSections (text-diff.util.ts) uses that heading
+   * as the changed field's own `label`, so it used to reach this modal as a raw
+   * "2026-09-11T15:31:09.877Z" string: the T, the milliseconds and the Z all still there, unlike
+   * every other date shown anywhere else in the product. ChangeDiffModal now reformats a label in
+   * exactly that shape into the same DD/MM/YYYY, hh:mm:ss AM/PM the Change History list next to it
+   * already uses — computed here the same way the component does (local Date fields), so this
+   * assertion holds regardless of which timezone it runs in.
+   */
+  test("KBU-44 a Zyra-memory-style timestamp heading is formatted as DD/MM/YYYY, hh:mm:ss AM/PM in the Difference modal, not left as a raw ISO string", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso1 = "2026-09-10T11:41:15.253Z";
+    const iso2 = "2026-09-11T15:31:09.877Z";
+    const oldNote1 = "User triggered test case generation for the login page, producing 8 draft test cases.";
+    const newNote1 = `${oldNote1} Edited so this section alone clears the large-change threshold for its own diff button.`;
+    const oldNote2 = "User triggered test case generation targeting coverage gaps, producing 10 draft test cases.";
+    const newNote2 = `${oldNote2} Edited so this section too clears the threshold.`;
+
+    const title = stamp("ZyraMemoryHeading");
+    const created = await api.post(kbUrl("/documents"), {
+      data: {
+        title,
+        folderId: rootFolderId,
+        documentType: "general",
+        contentText: `## ${iso1}\n${newNote1}\n\n## ${iso2}\n${newNote2}`,
+      },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso1}\n${oldNote1}\n\n## ${iso2}\n${oldNote2}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Change history");
+    await dialog.getByRole("button", { name: "Check Difference" }).click();
+
+    const diffModal = modal(page, "Difference");
+    await expect(diffModal).toBeVisible();
+
+    // Both headings are formatted, consistently, and neither raw ISO string leaks through anywhere
+    // in the modal (as a label, or duplicated into the excerpt body underneath it).
+    await expect(diffModal.getByText(expectedLabel(iso1), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(expectedLabel(iso2), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(iso1, { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(iso2, { exact: false })).toHaveCount(0);
+
+    // The diff content itself is untouched by the label formatting. newNoteN extends oldNoteN, so
+    // scope each check to its own rendered "− "/"+ " box (ChangeDiffModal.tsx) rather than a bare
+    // substring match, which would ambiguously hit both.
+    await expect(diffModal.getByText(`− ${oldNote1}`, { exact: false })).toBeVisible();
+    await expect(diffModal.getByText(`+ ${newNote1}`, { exact: false })).toBeVisible();
+    await expect(diffModal.getByText(`− ${oldNote2}`, { exact: false })).toBeVisible();
+    await expect(diffModal.getByText(`+ ${newNote2}`, { exact: false })).toBeVisible();
+
+    // The two sections are visually separated, not run together — a divider between them, distinct
+    // from the space-y-1.5 gap between one section's own old/new boxes.
+    await expect(diffModal.locator(".border-t")).toHaveCount(1);
+  });
+
   // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder
   //     created fully visible in this exact screen, looking exactly like a still-connected
   //     integration. See e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof
