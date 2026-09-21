@@ -1700,16 +1700,114 @@ test.describe("knowledge base (UI)", () => {
     await expect(diffModal.getByText(iso2, { exact: false })).toHaveCount(0);
 
     // The diff content itself is untouched by the label formatting. newNoteN extends oldNoteN, so
-    // scope each check to its own rendered "− "/"+ " box (ChangeDiffModal.tsx) rather than a bare
-    // substring match, which would ambiguously hit both.
-    await expect(diffModal.getByText(`− ${oldNote1}`, { exact: false })).toBeVisible();
-    await expect(diffModal.getByText(`+ ${newNote1}`, { exact: false })).toBeVisible();
-    await expect(diffModal.getByText(`− ${oldNote2}`, { exact: false })).toBeVisible();
-    await expect(diffModal.getByText(`+ ${newNote2}`, { exact: false })).toBeVisible();
+    // scope each check to its own colored old/new box (ChangeDiffModal.tsx renders the excerpt as
+    // markdown now, so the "−"/"+" marker is a separate element from the note text rather than one
+    // concatenated string — the class-based scoping below, not a shared text node, is what tells
+    // an old box from a new one).
+    const oldBoxes = diffModal.locator('[class*="error-foreground"]');
+    const newBoxes = diffModal.locator('[class*="success-foreground"]');
+    await expect(oldBoxes.filter({ hasText: oldNote1 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote1 })).toHaveCount(1);
+    await expect(oldBoxes.filter({ hasText: oldNote2 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote2 })).toHaveCount(1);
 
     // The two sections are visually separated, not run together — a divider between them, distinct
     // from the space-y-1.5 gap between one section's own old/new boxes.
     await expect(diffModal.locator(".border-t")).toHaveCount(1);
+  });
+
+  /*
+   * Regression: the Difference modal used to render an excerpt as raw text (ChangeDiffModal.tsx),
+   * so a Zyra AI Memory note's own markdown — the "- " bullets Zyra writes its multi-point notes
+   * with — showed up as literal "- " characters instead of an actual bulleted list. Fixed by
+   * rendering the excerpt through the same renderMarkdown()/zyra-prose pairing
+   * ZyraContextDrawer.tsx already uses for this exact content elsewhere in the product.
+   */
+  test("KBU-45 a note's own markdown (bullets, a heading) renders as real elements in the Difference modal, not literal '- '/'## ' text", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-12T09:46:29.466Z";
+    const oldNote = `## Recap\n- First point about the run.\n- Second point about the run.`;
+    const newNote = `## Recap\n- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.`;
+
+    const title = stamp("ZyraMemoryMarkdown");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Change history");
+    await dialog.getByRole("button", { name: "Check Difference" }).click();
+
+    const diffModal = modal(page, "Difference");
+    await expect(diffModal).toBeVisible();
+
+    // The note's own "## Recap" heading and "- " bullets render as real elements...
+    await expect(diffModal.getByRole("heading", { name: "Recap", level: 2 })).toHaveCount(2); // one per old/new box
+    await expect(diffModal.locator("li", { hasText: "First point about the run." })).toHaveCount(2); // unchanged line, in both boxes
+    await expect(diffModal.locator("li", { hasText: "Third point added to clear the threshold." })).toHaveCount(1);
+
+    // ...so the raw markdown syntax itself is never visible as literal text anywhere in the modal.
+    await expect(diffModal.getByText("## Recap", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(/^- /)).toHaveCount(0);
+  });
+
+  /*
+   * Regression: rendering the excerpt as markdown (KBU-45) fixed the raw "- " text, but the box's
+   * own −/+ old-vs-new marker was still glued directly in front of a bulleted note's first list
+   * item — first inline beside it, then (briefly) as a caption line above it — so a list still
+   * read as "− • User requested…" or "− REMOVED" sitting redundantly next to the colour-coded box
+   * that already says the same thing. Settled on: no marker or caption at all — the box's own
+   * red/green colour is the only old-vs-new signal, so nothing but the bullets themselves shows.
+   */
+  test("KBU-46 a bulleted note renders with no −/+ marker or caption, just its own clean bullets", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-13T08:00:00.000Z";
+    const oldNote = "- First point about the run.\n- Second point about the run.";
+    const newNote = "- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.";
+
+    const title = stamp("ZyraMemoryMarkerSpacing");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Change history");
+    await dialog.getByRole("button", { name: "Check Difference" }).click();
+
+    const diffModal = modal(page, "Difference");
+    await expect(diffModal).toBeVisible();
+
+    // Each bullet's own text is clean — no stray leading "-" or marker character in front of it.
+    const firstPointItem = diffModal.locator("li", { hasText: "First point about the run." }).first();
+    await expect(firstPointItem).toHaveText("First point about the run.");
+    await expect(diffModal.locator("li", { hasText: "−" })).toHaveCount(0);
+
+    // No "− Removed"/"+ Added" caption (or any other marker) sits above the list either — the
+    // colour-coded box alone is the old-vs-new signal now.
+    await expect(diffModal.getByText("Removed", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText("Added", { exact: false })).toHaveCount(0);
+    const oldBox = diffModal.locator('[class*="error-foreground"]').filter({ hasText: "First point about the run." });
+    const newBox = diffModal.locator('[class*="success-foreground"]').filter({ hasText: "Third point added" });
+    await expect(oldBox.locator(":scope > *")).toHaveCount(1); // only the rendered list, nothing else
+    await expect(newBox.locator(":scope > *")).toHaveCount(1);
   });
 
   // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder

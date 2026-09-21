@@ -2,6 +2,7 @@
 
 import Modal from "@/components/ui/Modal";
 import type { KnowledgeChangedField } from "@/lib/api";
+import { renderMarkdown } from "@/lib/markdown";
 import { formatEventDate, formatEventTime } from "./ChangeHistory";
 
 /**
@@ -43,14 +44,25 @@ export function ChangeDiffModal({
           <div key={`${field.label}-${i}`} className={i > 0 ? "border-t border-[var(--border)] pt-6" : undefined}>
             <div className="mb-1 text-[12px] font-semibold text-[var(--foreground)]">{formatFieldLabel(field.label)}</div>
             <div className="space-y-1.5">
+              {/* The excerpt is markdown (the same Zyra AI Memory notes ZyraContextDrawer.tsx renders
+                  with this same renderMarkdown/zyra-prose pairing) — rendered here rather than shown
+                  as raw text so a note's own "## "/"- " syntax reads as headings and bullets. No
+                  −/+ marker or caption is shown at all: the box's own red/green colour is the only
+                  old-vs-new signal, so nothing sits in front of a bulleted note's own "•". */}
               {field.oldExcerpt && (
-                <div className="whitespace-pre-wrap rounded-[6px] border border-[var(--error)]/25 bg-[var(--error-soft)] px-2.5 py-1.5 text-[12px] text-[var(--error-foreground)]">
-                  − {field.oldExcerpt}
+                <div className="rounded-[6px] border border-[var(--error)]/25 bg-[var(--error-soft)] px-2.5 py-1.5 text-[12px] text-[var(--error-foreground)]">
+                  <div
+                    className="zyra-prose zyra-prose-compact break-words"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(field.oldExcerpt) }}
+                  />
                 </div>
               )}
               {field.newExcerpt && (
-                <div className="whitespace-pre-wrap rounded-[6px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-2.5 py-1.5 text-[12px] text-[var(--success-foreground)]">
-                  + {field.newExcerpt}
+                <div className="rounded-[6px] border border-[var(--success)]/25 bg-[var(--success-soft)] px-2.5 py-1.5 text-[12px] text-[var(--success-foreground)]">
+                  <div
+                    className="zyra-prose zyra-prose-compact break-words"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(field.newExcerpt) }}
+                  />
                 </div>
               )}
               {!field.oldExcerpt && !field.newExcerpt && (
