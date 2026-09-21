@@ -1655,8 +1655,39 @@ export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: s
 }
 
 // Test case import/export
-export function getExportUrl(projectId: string, format: "csv" | "xlsx"): string {
-  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}`;
+export interface TestCaseExportFilters {
+  suiteId?: string;
+  /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+  includeDescendants?: boolean;
+  status?: string;
+  priority?: string;
+  type?: string;
+  automationStatus?: string;
+  jiraIssueKey?: string;
+  linearIssueKey?: string;
+  search?: string;
+  /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
+  customFieldFilters?: string;
+}
+
+// Mirrors the repository screen's own filters (see loadSelectedSuiteCases' listTestCases call) so
+// "Export" produces exactly what's currently selected/filtered on screen, not the whole project —
+// an unfiltered export (no suite selected, no filters active) is still the default when `filters`
+// is omitted.
+export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
+  const sp = new URLSearchParams();
+  if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
+  if (filters?.includeDescendants) sp.set("includeDescendants", "true");
+  if (filters?.status) sp.set("status", filters.status);
+  if (filters?.priority) sp.set("priority", filters.priority);
+  if (filters?.type) sp.set("type", filters.type);
+  if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
+  if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
+  if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+  if (filters?.search) sp.set("search", filters.search);
+  if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+  const qs = sp.toString();
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}${qs ? `?${qs}` : ""}`;
 }
 
 export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {

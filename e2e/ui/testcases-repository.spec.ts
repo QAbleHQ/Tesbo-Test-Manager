@@ -724,4 +724,47 @@ test.describe("test case repository (UI)", () => {
       "the Suite column truncated to one level, dropping the root",
     ).toContainText(`${rootName} / ${childName} / ${grandchildName}`);
   });
+
+  // ─── Export scopes to the selected suite ────────────────────────────────────
+  /*
+   * Basecamp-style report: "Exporting a specific suite exports all test cases" — selecting a suite in
+   * this tree and clicking Export downloaded the whole project regardless. testcases/page.tsx's
+   * "Export as CSV"/"Export as Excel" links were built from getExportUrl(projectId, format) alone,
+   * with no suiteId (or any other active filter) in the URL at all, so the backend had nothing to
+   * filter by even once it gained the ability to. Fixed by threading the same suite/filter state the
+   * on-screen table already fetches with into the export link. The actual file contents (does the
+   * backend really honor the query param) are covered at the API level in
+   * e2e/api/import-export.spec.ts; this proves the UI link itself carries the selected suite, which
+   * is the half of the regression that lived entirely in the frontend.
+   */
+  test("TCR-18 the Export menu links carry the selected suite, not just the project", async ({ browser }) => {
+    const suiteName = stamp("ExportSuite");
+    const suiteId = await seedSuite(suiteName);
+    const inSuite = stamp("ExportInSuite");
+    await seedCase(inSuite, { suiteId });
+    const outsideSuite = stamp("ExportOutside");
+    await seedCase(outsideSuite);
+
+    const page = await openRepository(browser);
+
+    // Before selecting a suite, the export links carry no suiteId — the "All test cases" export is
+    // unchanged.
+    await page.getByRole("button", { name: "Export" }).click();
+    const unfilteredCsvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(unfilteredCsvHref, "the whole-project export must not carry a suiteId").not.toContain("suiteId=");
+    await page.keyboard.press("Escape");
+
+    await page.getByRole("button", { name: new RegExp(suiteName) }).click();
+    await expect(row(page, inSuite)).toBeVisible();
+
+    await page.getByRole("button", { name: "Export" }).click();
+    const csvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(
+      csvHref,
+      "the export link must carry the selected suite, not silently export the whole project",
+    ).toContain(`suiteId=${suiteId}`);
+
+    const xlsxHref = await page.getByRole("link", { name: "Export as Excel" }).getAttribute("href");
+    expect(xlsxHref).toContain(`suiteId=${suiteId}`);
+  });
 });

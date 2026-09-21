@@ -3209,8 +3209,21 @@ export class LegacyService implements OnModuleInit {
     );
   }
 
-  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
-    const filters: string[] = ["project_id = $1", "deleted_at IS NULL"];
+  /**
+   * The WHERE/CTE/join fragments shared by every "which test cases match the current repository
+   * filters" caller — the on-screen list (`listTestCasesUncached`) and the CSV/XLSX export
+   * (`exportTestCases`), which used to run its own unfiltered query and therefore ignored the suite
+   * (and every other) filter a user had selected on screen (Basecamp: "Exporting a specific suite
+   * exports all test cases"). Keeping the two in one place means a filter added to one can't quietly
+   * stop applying to the other again.
+   *
+   * All column references are qualified with `testcases.` rather than left bare: `exportTestCases`
+   * joins `suites`, which also has `project_id` and `deleted_at` columns, and an unqualified
+   * reference to either would be ambiguous. `testcases` itself is always the bare table name (never
+   * aliased) in both callers, so `testcases.column` resolves correctly in each.
+   */
+  private async buildTestcaseFilterFragments(projectId: string, query: Body) {
+    const filters: string[] = ["testcases.project_id = $1", "testcases.deleted_at IS NULL"];
     const values: any[] = [projectId];
     /*
      * `suiteId=none` asks for the cases that belong to no suite.
@@ -3226,7 +3239,7 @@ export class LegacyService implements OnModuleInit {
      */
     const suiteFilter = String(query.suiteId ?? "");
     const wantsUnfiled = suiteFilter.toLowerCase() === UNASSIGNED_SUITE_ID;
-    if (wantsUnfiled) filters.push("suite_id IS NULL");
+    if (wantsUnfiled) filters.push("testcases.suite_id IS NULL");
     /*
      * Anything else in `suiteId` has to be a uuid before it reaches the column. `suite_id` is uuid,
      * so a malformed value (a stale id pasted from a URL, a truncated copy/paste) came back as
@@ -3266,7 +3279,7 @@ export class LegacyService implements OnModuleInit {
          FROM suites s JOIN suite_subtree sub ON s.parent_id = sub.id
          WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
        ) `;
-      filters.push("suite_id IN (SELECT id FROM suite_subtree)");
+      filters.push("testcases.suite_id IN (SELECT id FROM suite_subtree)");
     }
     /*
      * Archived cases are out of the working list unless they are asked for.
@@ -3283,7 +3296,7 @@ export class LegacyService implements OnModuleInit {
     const statusFilter = String(query.status ?? "").trim();
     const includeArchived =
       statusFilter.toLowerCase() === "archived" || String(query.includeArchived ?? "").toLowerCase() === "true";
-    if (!includeArchived) filters.push("status IS DISTINCT FROM 'Archived'");
+    if (!includeArchived) filters.push("testcases.status IS DISTINCT FROM 'Archived'");
     for (const [param, column] of [
       ["suiteId", "suite_id"],
       ["status", "status"],
@@ -3300,14 +3313,18 @@ export class LegacyService implements OnModuleInit {
         // whose source file used "REGRESSION" instead of the app's canonical "Regression") —
         // match case-insensitively so filtering by type still finds it instead of silently
         // returning zero rows.
-        filters.push(param === "type" ? `lower(${column}) = lower($${values.length})` : `${column} = $${values.length}`);
+        filters.push(
+          param === "type"
+            ? `lower(testcases.${column}) = lower($${values.length})`
+            : `testcases.${column} = $${values.length}`
+        );
       }
     }
     if (query.search) {
       values.push(`%${String(query.search).toLowerCase()}%`);
       const p = values.length;
       filters.push(
-        `(lower(title) LIKE $${p} OR lower(coalesce(description, '')) LIKE $${p} OR lower(coalesce(external_id, '')) LIKE $${p} OR lower(coalesce(type, '')) LIKE $${p})`
+        `(lower(testcases.title) LIKE $${p} OR lower(coalesce(testcases.description, '')) LIKE $${p} OR lower(coalesce(testcases.external_id, '')) LIKE $${p} OR lower(coalesce(testcases.type, '')) LIKE $${p})`
       );
     }
 
@@ -3321,6 +3338,11 @@ export class LegacyService implements OnModuleInit {
       values.push(...cf.params);
     }
 
+    return { filters, values, suiteSubtreeCteSql, customFieldJoinSql };
+  }
+
+  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
     const where = filters.join(" AND ");
     /*
      * Repository table sort (ID/Test case title/Priority), additive to the default order above.
@@ -3381,24 +3403,35 @@ export class LegacyService implements OnModuleInit {
     return { rows: res.rows.map(({ total_count, ...row }) => toCamel(row)), total };
   }
 
-  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = []): Promise<Body[]> {
+  /**
+   * `query` carries the same suite/status/priority/type/automationStatus/jira/linear/search/
+   * customFieldFilters shape as `listTestCasesForUser` — the repository screen's "Export" button
+   * sends whatever suite and filters are currently active on screen, so an export of a selected
+   * suite (or a filtered view) matches what the user was looking at instead of silently returning
+   * the whole project (Basecamp: "Exporting a specific suite exports all test cases"). An empty/
+   * absent query exports the whole project, same as before.
+   */
+  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = [], query: Body = {}): Promise<Body[]> {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
     const res = await this.db.query(
-      `SELECT t.id, t.external_id, t.title, COALESCE(t.description, '') AS description,
-              COALESCE(t.preconditions, '') AS preconditions,
-              t.steps, COALESCE(t.test_data, '') AS test_data,
-              COALESCE(t.priority, '') AS priority, COALESCE(t.severity, '') AS severity,
-              COALESCE(t.type, '') AS type, COALESCE(t.status, '') AS status,
-              COALESCE(s.name, '') AS suite, COALESCE(t.component, '') AS component
-       FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
+      `${suiteSubtreeCteSql}SELECT testcases.id, testcases.external_id, testcases.title, COALESCE(testcases.description, '') AS description,
+              COALESCE(testcases.preconditions, '') AS preconditions,
+              testcases.steps, COALESCE(testcases.test_data, '') AS test_data,
+              COALESCE(testcases.priority, '') AS priority, COALESCE(testcases.severity, '') AS severity,
+              COALESCE(testcases.type, '') AS type, COALESCE(testcases.status, '') AS status,
+              COALESCE(s.name, '') AS suite, COALESCE(testcases.component, '') AS component
+       FROM testcases
+       LEFT JOIN suites s ON s.id = testcases.suite_id AND s.deleted_at IS NULL
+       ${customFieldJoinSql}
+       WHERE ${where}
        -- Export keeps its documented "most recently updated first" contract (pinned by
        -- api/import-export.spec.ts "orders rows by most recently updated"); only the repository LIST
        -- moved to ID sequence, which is what card 10212941059 asked for. The id tiebreaker is the part
        -- that mattered here: a bulk update ties every touched row on one updated_at, and without it the
        -- export's row order was arbitrary between two exports of the same data.
-       ORDER BY t.updated_at DESC, t.id DESC`,
-      [projectId]
+       ORDER BY testcases.updated_at DESC, testcases.id DESC`,
+      values
     );
 
     const valuesByTestcase = new Map<string, Map<string, unknown>>();
@@ -3434,8 +3467,9 @@ export class LegacyService implements OnModuleInit {
       let action = "";
       let expectedResult = "";
       if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
-        action = parsedSteps[0].action || parsedSteps[0].step || parsedSteps[0].description || "";
-        expectedResult = parsedSteps[0].expectedResult || parsedSteps[0].expected || "";
+        const step0 = parsedSteps[0] as Record<string, string | undefined>;
+        action = step0.action || step0.step || step0.description || "";
+        expectedResult = step0.expectedResult || step0.expected || "";
       } else {
         steps = parsedSteps
           .map((step: any) => {
