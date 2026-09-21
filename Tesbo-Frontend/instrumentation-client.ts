@@ -38,6 +38,7 @@ if (config.enabled) {
 }
 
 // PostHog: only when NEXT_PUBLIC_POSTHOG_KEY is set (typically production app.tesbo.io).
+// Email is NOT masked — identify() attaches the real Tesbo login email so Persons show who used the app.
 const posthogConfig = getPostHogConfig();
 if (posthogConfig.enabled) {
   posthog.init(posthogConfig.key, {
@@ -45,6 +46,12 @@ if (posthogConfig.enabled) {
     defaults: "2026-05-30",
     capture_pageview: true,
     capture_pageleave: true,
+    person_profiles: "identified_only",
+    session_recording: {
+      // Keep password fields private; do not blanket-mask text so emails stay readable in replays.
+      maskAllInputs: false,
+      maskInputOptions: { password: true },
+    },
   });
 }
 

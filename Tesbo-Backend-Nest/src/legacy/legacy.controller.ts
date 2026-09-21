@@ -33,6 +33,8 @@ const TESTCASE_EXPORT_BASE_HEADERS = [
   "description",
   "preconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",

@@ -2826,6 +2826,17 @@ test.describe("zyra chat — citations (fake provider)", () => {
     expect(draftingPrompt, "the model must be asked for severity").toContain("severity");
     expect(draftingPrompt, "the model must be asked for component").toContain("component");
 
+    // The display/preview gap this ticket was actually about: the chat UI (ZyraChatReviewPanel)
+    // renders straight from this turn's response body, BEFORE anything is saved — chatDraftRow
+    // used to rebuild this row and silently drop severity/component even though generation and
+    // save both had them all along. Asserting only the post-save DB row (below) would have passed
+    // throughout the whole time this bug was live.
+    const turnBody = await turn.json();
+    const proposedRow = (turnBody.message?.testcases ?? []).find((tc: { action?: string }) => tc.action === "proposed-create");
+    expect(proposedRow, "the create turn must stage a proposed-create row on the assistant message").toBeTruthy();
+    expect(proposedRow.severity, "severity must reach the chat preview, not just the saved row").toBe("High");
+    expect(proposedRow.component, "component must reach the chat preview, not just the saved row").toBe("Checkout");
+
     const taskId = scalar(
       `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
     );

@@ -3421,21 +3421,42 @@ export class LegacyService implements OnModuleInit {
       // JSON-encoded string (the shape the create/edit modal, and now Zyra/MCP, actually persist —
       // see "[Zyra] Test Steps... Missing After Saving Generated Test Cases"), and
       // normalizeJsonArray silently emptied the latter instead of parsing it.
-      const steps = this.safeSteps(row.steps)
-        .map((step: any) => {
-          if (typeof step === "string") return step;
-          return [step.action || step.step || step.description, step.expectedResult || step.expected]
-            .filter(Boolean)
-            .join(" => ");
-        })
-        .filter(Boolean)
-        .join(" | ");
+      const parsedSteps = this.safeSteps(row.steps);
+      // Action/Expected Result only take a case with EXACTLY one step, and only when that step has
+      // its own action/expectedResult (not a plain legacy string) — the importer's own Action/
+      // Expected Result columns are single-step-only (ImportTestCasesModal.tsx's handleImport
+      // builds exactly one step from them, with no " | " splitting), so anything joined across
+      // several steps into these columns would come back as one garbled step on re-import instead
+      // of round-tripping. Every other case (0 steps, a plain-string step, or 2+ steps) keeps using
+      // `steps`, in the "action => expected" DSL the importer's Steps column already splits on
+      // both "|" and "=>" correctly regardless of step count.
+      let steps = "";
+      let action = "";
+      let expectedResult = "";
+      if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
+        // safeSteps() returns unknown[]; cast like the multi-step branch below (step: any).
+        const step: any = parsedSteps[0];
+        action = step.action || step.step || step.description || "";
+        expectedResult = step.expectedResult || step.expected || "";
+      } else {
+        steps = parsedSteps
+          .map((step: any) => {
+            if (typeof step === "string") return step;
+            return [step.action || step.step || step.description, step.expectedResult || step.expected]
+              .filter(Boolean)
+              .join(" => ");
+          })
+          .filter(Boolean)
+          .join(" | ");
+      }
       const exportRow: Body = {
         externalId: row.external_id || "",
         title: row.title || "",
         description: row.description || "",
         preconditions: row.preconditions || "",
         steps,
+        action,
+        expectedResult,
         testData: row.test_data || "",
         priority: row.priority || "",
         severity: row.severity || "",
@@ -3695,10 +3716,19 @@ export class LegacyService implements OnModuleInit {
         body.postconditions || "",
         JSON.stringify(body.steps || body.stepsJson || []),
         body.testData || "",
-        body.priority || "P2",
+        // `priority`/`type`/`automationStatus` only fall back to their defaults when the caller
+        // never mentioned the field at all (import, Zyra and the MCP tool all either resolve a
+        // real value themselves or omit the key entirely, relying on this default). A caller that
+        // sends the key with an empty/falsy value — the Create Test Case form, whose Suite/Type/
+        // Priority/Automation Type start on an unselected placeholder — means it explicitly, and
+        // that must be honored rather than silently replaced with a value the user never chose.
+        // priority is NOT NULL (V2_test_cases_and_suites.sql), so "explicitly blank" is "" here,
+        // not null; type/automation_status are nullable and use null the same way severity/
+        // component already do below.
+        body.priority !== undefined ? body.priority || "" : "P2",
         body.severity || null,
-        body.type || "Functional",
-        body.automationStatus || "Not Automated",
+        body.type !== undefined ? body.type || null : "Functional",
+        body.automationStatus !== undefined ? body.automationStatus || null : "Not Automated",
         body.automationRepo || null,
         body.automationPath || null,
         body.automationTestName || null,
@@ -17648,6 +17678,13 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
+      // and save already carry both fields correctly; this row is what the chat/task-board UI
+      // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
+      // so an explicit "" edit (clearing a previously-set value) isn't coerced back to null here —
+      // sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient decide that, not this formatter.
+      severity: value.severity ?? null,
+      component: value.component ?? null,
       action,
       reason: reason || "",
       // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
@@ -17673,6 +17710,8 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      severity: row.severity,
+      component: row.component,
       sourceRefs: row.sourceRefs
     }, action, reason);
   }

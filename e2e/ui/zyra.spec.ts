@@ -291,6 +291,10 @@ test.describe("zyra / agents (UI)", () => {
       preconditions: entry.draft?.preconditions ?? "",
       expectedSummary: entry.draft?.description ?? "",
       stepsJson: entry.draft?.stepsJson ?? "[]",
+      // Mirrors chatDraftRow's own severity/component handling (legacy.service.ts) — this row is
+      // seeded directly rather than produced by the live endpoint, so it must match that shape.
+      severity: entry.draft?.severity ?? entry.fields?.severity ?? null,
+      component: entry.draft?.component ?? entry.fields?.component ?? null,
       action: entry.opType === "create" ? "proposed-create" : entry.opType === "archive" ? "proposed-archive" : "proposed-update",
       reason: "",
       draftIndex: index,
@@ -1154,7 +1158,14 @@ test.describe("zyra / agents (UI)", () => {
     const suiteName = stamp("Suite");
     const page = await open(browser, `/agents/tasks/${taskId}`);
 
-    await page.getByRole("row", { name: /Sign in with a valid password/ }).getByRole("button", { name: "Save" }).click();
+    // The actual display bug this ticket was about: severity/component must be visible on the
+    // review table BEFORE saving, not just present in the row that eventually gets persisted —
+    // this is what a reviewer is deciding whether to approve.
+    const draftRow = page.getByRole("row", { name: /Sign in with a valid password/ });
+    await expect(draftRow.getByText("High")).toBeVisible();
+    await expect(draftRow.getByText("Auth")).toBeVisible();
+
+    await draftRow.getByRole("button", { name: "Save" }).click();
 
     const dialog = modal(page, "Save generated testcases");
     await dialog.getByRole("combobox").first().selectOption("new");
@@ -1876,6 +1887,38 @@ test.describe("zyra / agents (UI)", () => {
       .toContain("Sign in with a wrong password — edited");
   });
 
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the edit form
+   * (ZyraDraftEditor) never exposed these two fields at all, even though the backend's
+   * sanitizeZyraUpdateFields allowlist already accepted them. Mirrors ZYU-66's edit/persist
+   * pattern exactly, for the two fields that were actually missing.
+   */
+  test("ZYU-82 editing a proposed row's severity and component updates what's displayed and what's stored", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
+    await row.getByRole("button", { name: "Edit" }).click();
+    // Field order in ZyraDraftEditor: Title (textbox 0), Priority (combobox 0), Severity
+    // (combobox 1), Component (textbox 1), Preconditions/Expected result/Steps after that.
+    await row.getByRole("combobox").nth(1).selectOption("Medium");
+    await row.getByRole("textbox").nth(1).fill("Search");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(row.getByText("Medium")).toBeVisible();
+    await expect(row.getByText("Search")).toBeVisible();
+
+    const readDraft = (field: "severity" | "component") =>
+      scalar(
+        `SELECT d->'draft'->>'${field}' FROM ai_generation_requests r, jsonb_array_elements(r.generated_payload) d ` +
+          `WHERE r.id = ${literal(taskId)} AND d->'draft'->>'title' = 'Sign in with a wrong password';`,
+      );
+    await expect
+      .poll(() => readDraft("severity"), { message: "the severity edit must persist, not just render client-side" })
+      .toBe("Medium");
+    expect(readDraft("component")).toBe("Search");
+  });
+
   test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {
     const suiteName = stamp("Chat review suite");
     const createdSuite = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
@@ -1916,7 +1959,12 @@ test.describe("zyra / agents (UI)", () => {
     });
     const page = await open(browser, "/agents/zyra");
 
-    await expect(page.getByText(draftTitle)).toBeVisible();
+    // Same display bug, chat surface: severity/component must be visible in the review card
+    // BEFORE saving (this is chatDraftRow's own output — the exact place the fields were dropped).
+    const draftRow = page.getByRole("listitem").filter({ hasText: draftTitle });
+    await expect(draftRow.getByText("Critical")).toBeVisible();
+    await expect(draftRow.getByText("Billing")).toBeVisible();
+
     await page.getByRole("button", { name: /Save 1 to repository/ }).click();
     await expect(page.getByText(/saved to the repository/)).toBeVisible();
 
