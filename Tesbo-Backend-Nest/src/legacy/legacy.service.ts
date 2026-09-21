@@ -3467,9 +3467,10 @@ export class LegacyService implements OnModuleInit {
       let action = "";
       let expectedResult = "";
       if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
-        const step0 = parsedSteps[0] as Record<string, string | undefined>;
-        action = step0.action || step0.step || step0.description || "";
-        expectedResult = step0.expectedResult || step0.expected || "";
+        // safeSteps() returns unknown[]; cast like the multi-step branch below (step: any).
+        const step: any = parsedSteps[0];
+        action = step.action || step.step || step.description || "";
+        expectedResult = step.expectedResult || step.expected || "";
       } else {
         steps = parsedSteps
           .map((step: any) => {
