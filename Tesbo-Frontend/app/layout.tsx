@@ -3,6 +3,7 @@ import localFont from "next/font/local";
 import "./globals.css";
 import { THEME_STORAGE_KEY } from "@/lib/theme";
 import BetterBugsWidget from "@/components/BetterBugsWidget";
+import PostHogIdentify from "@/components/PostHogIdentify";
 
 const inter = localFont({
   src: "../public/fonts/inter-variable.woff2",
@@ -62,6 +63,7 @@ export default function RootLayout({
       <body className="antialiased">
         {children}
         <BetterBugsWidget />
+        <PostHogIdentify />
       </body>
     </html>
   );
