@@ -1164,14 +1164,21 @@ export async function deleteZyraChatSession(projectId: string, sessionId: string
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
+/**
+ * `opts.turnId`, if supplied, lets an already-open (or about-to-open) `GET .../turns/:turnId/events`
+ * SSE stream narrate this same request while it runs — see openZyraTurnProgress. Purely additive:
+ * the backend route has accepted this since the SSE service was built, this is just the first
+ * caller to actually send one. Omitting it reproduces today's behavior exactly.
+ */
 export async function sendZyraChatMessage(
   projectId: string,
   sessionId: string,
-  message: string
+  message: string,
+  opts: { turnId?: string } = {}
 ): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
-    body: { message },
+    body: { message, turnId: opts.turnId },
   });
 }
 

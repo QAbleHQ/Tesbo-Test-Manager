@@ -78,7 +78,9 @@ export class ZyraProgressService implements OnModuleDestroy {
       return { status: "ok", subject: existing.subject };
     }
     // Bounded replay buffer: generous enough for every stage this turn will ever emit (single
-    // digits today), small enough that a turn nobody ever reads back costs nothing meaningful.
+    // digits — up to ~9 named stages per chat turn as of the progress-backlog work, plus one
+    // terminal complete/error), small enough that a turn nobody ever reads back costs nothing
+    // meaningful.
     const subject = new ReplaySubject<ZyraProgressEvent>(50);
     this.turns.set(turnId, { subject, owner, createdAt: Date.now() });
     return { status: "ok", subject };

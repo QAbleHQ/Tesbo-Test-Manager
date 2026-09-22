@@ -11111,7 +11111,11 @@ export class LegacyService implements OnModuleInit {
           const hint = pending.kind === "proposal"
             ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
             : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
+          // No onStage here (unlike the first call above): this is a full second pass through
+          // context-gathering/routing/generating on the SAME turnId — re-narrating it would render
+          // as confusing duplicate backlog rows for a rare retry path that already discloses itself
+          // in its own reply wording via the [confirmation-retry:...] marker.
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
           const fired = retried.operations.length > 0;
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
           decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
@@ -11122,7 +11126,7 @@ export class LegacyService implements OnModuleInit {
           if (fired) traceMessageId = `${userMessageId}:confirm-retry`;
         }
       }
-      onStage?.("staging");
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11136,7 +11140,10 @@ export class LegacyService implements OnModuleInit {
       // `{testcaseIds: [], totalCount: 0}` on every create turn, silently erasing the
       // pendingReviewRequestIds recordZyraPendingReviewRequest had just set moments earlier in the
       // SAME call. See the changelog entry this was fixed alongside.
-      onStage?.("finalizing");
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
       const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId });
       const title = this.compactTitle(message);
       await this.db.query(
@@ -11338,6 +11345,9 @@ export class LegacyService implements OnModuleInit {
             routedCount: checkpoint.routedCount ?? {}
           }, undefined, onStage)
         : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, onStage);
+      // Same two stages sendZyraChatMessage narrates, mirrored here so a resumed turn's backlog has
+      // the identical shape as a fresh one — see the "unify both flows" design.
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11351,6 +11361,10 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
       // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
       // row; a genuine completion resets it to 0 — see insertZyraAssistantMessage's resumeAttempt
       // param and the "cap is per-chain" note on continueZyraChatMessage.
@@ -11474,6 +11488,44 @@ export class LegacyService implements OnModuleInit {
     return this.zyraChatSession(projectId, userId, sessionId);
   }
 
+  /**
+   * The accuracy-critical branch for the live progress backlog: a capability-gated step (knowledge
+   * base, bugs) must never report `items`/`count` when the capability is OFF, even though the raw
+   * data was already fetched — reporting what was gathered regardless of the gate is exactly the
+   * "claims don't match what was actually used" failure this feature exists to prevent. Pulled out
+   * as its own pure function specifically so this branch has direct unit coverage, independent of
+   * buildZyraChatDecision's much larger surface.
+   */
+  private static zyraGatedBacklogMeta(enabled: boolean, items: Array<Record<string, unknown>>, disabledReason: string): Record<string, unknown> {
+    return enabled ? { items, count: items.length } : { skipped: true, reason: disabledReason };
+  }
+
+  /** Counts by `type` for the live progress backlog's "staging" step — e.g. `{ create: 5 }`. */
+  private static tallyZyraOperationTypes(operations: Array<{ type: string }>): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const op of operations) counts[op.type] = (counts[op.type] || 0) + 1;
+    return counts;
+  }
+
+  /**
+   * The `knowledge` array can carry the same document twice — once from an explicit folder-name
+   * match, once from RAG/recency (`[...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge :
+   * knowledgeFallback)]`, no dedup) — so the live progress backlog's "Knowledge Base" step would
+   * otherwise list one document twice. Keyed on the citation's real source id when present
+   * (title alone is not guaranteed unique — two docs can share a name), falling back to title.
+   */
+  private static dedupeZyraKnowledgeItems<T extends { title: string; citation?: { sourceId?: string } }>(items: T[]): T[] {
+    const seen = new Set<string>();
+    const out: T[] = [];
+    for (const item of items) {
+      const key = item.citation?.sourceId || item.title;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
   // One AI call understands the request, then the system executes it. There is deliberately no
   // keyword router in front of the model: a regex table cannot tell "start generating" from
   // "generate", or know that "save it" means create-these when the cases were never written and
@@ -11503,7 +11555,9 @@ export class LegacyService implements OnModuleInit {
     // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
     onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
-    onStage?.("context");
+    // No onStage call here — the old single "context" announcement fired before any gathering even
+    // started, and provably said nothing about what was actually found. See the granular
+    // context:knowledge/jira/testcases/bugs calls below, once capabilities are known.
     // Computed here, before context-gathering, purely so the retrieval-time query-embedding call
     // below can attach to the SAME trace startZyraTurn opens later (once gathered context exists —
     // see that call's own comment for why the turn itself still opens down there, unchanged). Same
@@ -11624,6 +11678,23 @@ export class LegacyService implements OnModuleInit {
     // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
     // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
     const bugsForChat = capabilities.knowledgeBase ? bugs : [];
+    // Progress narration for the live chat backlog — deliberately placed HERE, after `capabilities`
+    // is known, not up where gathering started (this used to be a single onStage?.("context") fired
+    // before any of knowledge/jira/testcases/bugs were even fetched). Reporting what was gathered
+    // before knowing whether the knowledge-base capability is even on would show a project with it
+    // OFF a backlog claiming Zyra read documents it never actually showed the model — the exact
+    // trust failure this feature exists to prevent. A capability that's off still gets its own
+    // step, marked `skipped`, rather than silently vanishing — showing Zyra correctly respected the
+    // setting is itself trust-building, not just showing what it read.
+    const knowledgeBacklogItems = LegacyService.dedupeZyraKnowledgeItems(knowledgeForChat);
+    onStage?.("context:knowledge", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, knowledgeBacklogItems.map((k) => ({ title: k.title })), "Knowledge base access is off for this project"
+    ));
+    onStage?.("context:jira", { items: mentionedJira.map((j) => ({ key: j.key, summary: j.summary })), count: mentionedJira.length });
+    onStage?.("context:testcases", { items: existingTestcases.map((tc) => ({ externalId: tc.externalId, title: tc.title })), count: existingTestcases.length });
+    onStage?.("context:bugs", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, bugsForChat.map((b) => ({ id: b.id, title: b.title })), "Knowledge base access is off for this project"
+    ));
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -11738,7 +11809,9 @@ export class LegacyService implements OnModuleInit {
       });
     }
 
-    onStage?.("routing");
+    onStage?.("routing", {
+      totalContextItems: knowledgeBacklogItems.length + mentionedJira.length + existingTestcases.length + bugsForChat.length
+    });
     try {
       const callRouter = () =>
         providerWire(provider) === "anthropic"
@@ -11916,7 +11989,7 @@ export class LegacyService implements OnModuleInit {
       conversation, routedSuite, routedCount, mentionedJira, capabilities, bugsForChat, onStage, trace,
       knowledgeConfidence
     } = params;
-    onStage?.("generating");
+    onStage?.("generating", { requestedCount: routedCount?.requestedCount ?? null, suiteName: routedSuite?.name ?? null });
     try {
       const decision = await this.generateZyraChatCreateDecision({
         projectId, userId, sessionId, provider, model, key, message,

@@ -94,6 +94,9 @@ type StaticInternals = {
   zyraUngroundedNote: (count: number) => string;
   zyraWeakGroundingNote: (count: number) => string;
   zyraGenerateTimeoutMs: (requestedCount: number) => number;
+  zyraGatedBacklogMeta: (enabled: boolean, items: Array<Record<string, unknown>>, disabledReason: string) => Record<string, unknown>;
+  dedupeZyraKnowledgeItems: <T extends { title: string; citation?: { sourceId?: string } }>(items: T[]) => T[];
+  tallyZyraOperationTypes: (operations: Array<{ type: string }>) => Record<string, number>;
 };
 
 function staticInternals(): StaticInternals {
@@ -674,5 +677,63 @@ describe("Zyra generation timeout scales with how much was requested", () => {
     timeoutSpy.mockClear();
     await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 10 } });
     expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+  });
+});
+
+/*
+ * The live progress backlog: a capability-gated step must never report what was fetched when the
+ * capability is off, even though the raw data already exists in memory — this is the accuracy
+ * guarantee the whole feature is built around (Basecamp: "the data should be accurate"), pulled
+ * out into its own pure function specifically so it has direct coverage independent of
+ * buildZyraChatDecision's much larger surface.
+ */
+describe("Zyra chat progress backlog — accuracy-critical meta building", () => {
+  it("reports items and a real count when the capability is on", () => {
+    const meta = staticInternals().zyraGatedBacklogMeta(true, [{ title: "Login flow" }, { title: "Checkout API" }], "unused");
+    expect(meta).toEqual({ items: [{ title: "Login flow" }, { title: "Checkout API" }], count: 2 });
+  });
+
+  it("never reports items or a count when the capability is off, regardless of what was fetched", () => {
+    // The items array here stands in for real, already-fetched data (buildZyraChatDecision fetches
+    // knowledge/bugs unconditionally, before capabilities are even known) — this must still be
+    // fully suppressed, not just emptied, so the backlog step reads as "skipped", not "checked, 0
+    // found".
+    const meta = staticInternals().zyraGatedBacklogMeta(false, [{ title: "Login flow" }], "Knowledge base access is off for this project");
+    expect(meta).toEqual({ skipped: true, reason: "Knowledge base access is off for this project" });
+    expect(meta).not.toHaveProperty("items");
+    expect(meta).not.toHaveProperty("count");
+  });
+
+  it("reports zero found, not skipped, when the capability is on but nothing matched", () => {
+    const meta = staticInternals().zyraGatedBacklogMeta(true, [], "unused");
+    expect(meta).toEqual({ items: [], count: 0 });
+  });
+
+  it("dedupes a knowledge item that reached both the folder match and RAG/recency fallback", () => {
+    const items = [
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+      { title: "Checkout API", citation: { sourceId: "doc-2" } },
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+    ];
+    expect(staticInternals().dedupeZyraKnowledgeItems(items)).toEqual([
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+      { title: "Checkout API", citation: { sourceId: "doc-2" } },
+    ]);
+  });
+
+  it("falls back to title for dedup when a source id is missing (e.g. a recency-fallback doc)", () => {
+    const items = [{ title: "Untitled note" }, { title: "Untitled note" }, { title: "Other note" }];
+    expect(staticInternals().dedupeZyraKnowledgeItems(items)).toEqual([{ title: "Untitled note" }, { title: "Other note" }]);
+  });
+
+  it("tallies staged operations by type for the 'staging' step", () => {
+    const counts = staticInternals().tallyZyraOperationTypes([
+      { type: "create" }, { type: "create" }, { type: "move_to_suite" }, { type: "create" },
+    ]);
+    expect(counts).toEqual({ create: 3, move_to_suite: 1 });
+  });
+
+  it("tallies an empty operations array to an empty object, not a throw", () => {
+    expect(staticInternals().tallyZyraOperationTypes([])).toEqual({});
   });
 });
