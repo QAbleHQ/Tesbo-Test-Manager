@@ -243,7 +243,7 @@ type ZyraGenerationInput = {
   // behaving unchanged if it never learns about bugs.
   bugs?: Array<{ id: string; title: string; description: string; status: string; priority: string }>;
   requestedCount: number;
-  testcaseRange?: string; // "minimum" | "1-10" | "10-30" | "all"
+  testcaseRange?: string; // "1-10" | "10-30" | "30-50" | "all"
   // How relevant `knowledge` actually is (see RagRetrievalService / RAG_MIN_SIMILARITY /
   // RAG_CONFIDENT_SIMILARITY) — undefined for a caller that never resolved one. Told to the model
   // explicitly in zyraDynamicTaskPrompt so a weak match is written up hedged rather than confidently,
@@ -10739,7 +10739,7 @@ export class LegacyService implements OnModuleInit {
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5),
-        testcaseRange: String(settings.testcaseRange || "1-10"),
+        testcaseRange: String(settings.testcaseRange || "30-50"),
         capabilities: this.normalizeZyraCapabilities(settings.capabilities)
       },
       aiKey: key
@@ -10906,10 +10906,10 @@ export class LegacyService implements OnModuleInit {
     const project = await this.getProject(projectId);
     const settings = this.parseProjectSettings(project.settings);
     const current = (settings.zyraAgent || {}) as Body;
-    const validRanges = ["minimum", "1-10", "10-30", "all"];
+    const validRanges = ["1-10", "10-30", "30-50", "all"];
     const testcaseRange = validRanges.includes(String(body.testcaseRange))
       ? String(body.testcaseRange)
-      : String(current.testcaseRange || "1-10");
+      : String(current.testcaseRange || "30-50");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     // Capabilities: merge the incoming partial over current, then normalize to strict booleans.
     const capabilities = this.normalizeZyraCapabilities({
@@ -11543,7 +11543,7 @@ export class LegacyService implements OnModuleInit {
     const model = normalizeProviderModel(provider, key.default_model);
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
     const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
-    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "1-10");
+    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     const knowledgeForChat = capabilities.knowledgeBase ? knowledge : [];
     // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
     // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
@@ -11855,8 +11855,14 @@ export class LegacyService implements OnModuleInit {
       return this.applyStorageGateToGenerated(decision, capabilities);
     } catch (err) {
       if (this.isZyraTimeoutError(err)) {
-        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
-        return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount });
+        // Recomputed rather than threaded through the call above — chatTestcasePlan is pure and
+        // this must resolve to exactly the requestedCount generateZyraChatCreateDecision just used,
+        // so the reported budget matches the one the failed call actually ran under.
+        const generateTimeoutMs = LegacyService.zyraGenerateTimeoutMs(
+          this.chatTestcasePlan(message, projectTestcaseRange, routedCount).requestedCount
+        );
+        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: generateTimeoutMs });
+        return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount }, generateTimeoutMs);
       }
       // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
       // after the router already succeeded.
@@ -11916,11 +11922,12 @@ export class LegacyService implements OnModuleInit {
         };
       } catch (retryErr) {
         if (this.isZyraTimeoutError(retryErr)) {
-          await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
+          const retryTimeoutMs = LegacyService.zyraGenerateTimeoutMs(LegacyService.ZYRA_RETRY_BATCH);
+          await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: retryTimeoutMs });
           return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, {
             routedSuite,
             routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false }
-          });
+          }, retryTimeoutMs);
         }
         const retryDetail = this.extractAiErrorMessage(retryErr);
         const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
@@ -11968,14 +11975,19 @@ export class LegacyService implements OnModuleInit {
     message: string,
     userMessageId: string | undefined,
     existingCount: number,
-    resumeState?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } }
+    resumeState?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } },
+    // The actual budget that call ran under — the generate stage's is now sized to how many
+    // testcases were requested (see zyraGenerateTimeoutMs), so it's no longer a single constant
+    // this function can look up by stage name alone. Defaults to the router's fixed budget, the
+    // only stage that still has just one.
+    timeoutMs: number = LegacyService.ZYRA_ROUTER_TIMEOUT_MS
   ): ZyraChatDecision {
     return {
       reply: [
         "⏱️ I didn't hear back from the AI provider in time — nothing was created or changed, and nothing was lost.",
         "Click **Continue** below and I'll pick up right where this left off, rather than starting over."
       ].join(" "),
-      reasoningSummary: `Provider call timed out at stage '${stage}' after ${stage === "router" ? LegacyService.ZYRA_ROUTER_TIMEOUT_MS : LegacyService.ZYRA_GENERATE_TIMEOUT_MS}ms. ${this.defaultReasoningSummary(existingCount)}`,
+      reasoningSummary: `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -13384,7 +13396,7 @@ export class LegacyService implements OnModuleInit {
     if (!this.normalizeZyraCapabilities((settings as Body).capabilities).generation) {
       throw new BadRequestException({ error: "Test case generation is disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities.", code: "zyra_capability_disabled" });
     }
-    const testcaseRange = String((settings as Body).testcaseRange || "1-10");
+    const testcaseRange = String((settings as Body).testcaseRange || "30-50");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     const story = String(body.userStory || body.story || "").trim();
     const context = String(body.context || body.prompt || "").trim();
@@ -13520,7 +13532,7 @@ export class LegacyService implements OnModuleInit {
       const jiraIssueKeys = normalizeJsonArray(task.jira_issue_keys).map(String);
       const linearIssueKeys = normalizeJsonArray(task.linear_issue_keys).map(String);
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
-      const testcaseRange = String((projectSettings as Body).testcaseRange || "1-10");
+      const testcaseRange = String((projectSettings as Body).testcaseRange || "30-50");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
       provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
       model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
@@ -13751,7 +13763,7 @@ export class LegacyService implements OnModuleInit {
     // otherwise this falls back to the generic "generate exactly N" phrasing, which reads very
     // differently to the model than "all possible cases".
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
-    const testcaseRange = String(zyraAgentSettings.testcaseRange || "1-10");
+    const testcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
     const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
@@ -15666,14 +15678,15 @@ export class LegacyService implements OnModuleInit {
 
   private testcaseRangeConfig(range: string): { requestedCount: number; instruction: string } {
     switch (range) {
-      case "minimum":
-        return { requestedCount: 4, instruction: "Generate only the minimum testcases needed — aim for 1 to 3 highly targeted scenarios covering the most critical paths. Never generate more than 5 testcases." };
+      case "1-10":
+        return { requestedCount: 10, instruction: "Generate between 1 and 10 testcases. Prioritise quality and relevance; include edge cases only where genuinely important." };
       case "10-30":
         return { requestedCount: 25, instruction: "Generate between 10 and 25 testcases. Cover the main flows, key edge cases, negative scenarios, and important variations. Aim for at least 10 distinct testcases." };
       case "all":
         return { requestedCount: 50, instruction: "Generate as many testcases as possible — cover every applicable flow, edge case, boundary value, negative path, and variation. Be exhaustive and do not cap yourself." };
-      default: // "1-10"
-        return { requestedCount: 10, instruction: "Generate between 1 and 10 testcases. Prioritise quality and relevance; include edge cases only where genuinely important." };
+      case "30-50":
+      default: // unset or unrecognized values resolve to the product default (30-50)
+        return { requestedCount: 40, instruction: "Generate between 30 and 50 testcases. Cover primary flows, edge cases, negative scenarios, boundary values, and meaningful variations for thorough coverage. Aim for at least 30 distinct testcases and do not exceed 50." };
     }
   }
 
@@ -16114,7 +16127,7 @@ export class LegacyService implements OnModuleInit {
       method: "POST",
       headers,
       body: JSON.stringify(openAiBody),
-      signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
+      signal: LegacyService.zyraProviderSignal(LegacyService.zyraGenerateTimeoutMs(params.input.requestedCount))
     });
     const body = await response.json().catch(() => ({} as Body)) as Body;
     if (!response.ok) {
@@ -16191,7 +16204,7 @@ export class LegacyService implements OnModuleInit {
             }
           ]
         }),
-        signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
+        signal: LegacyService.zyraProviderSignal(LegacyService.zyraGenerateTimeoutMs(params.input.requestedCount))
       });
       const body = await response.json().catch(() => ({} as Body)) as Body;
       if (!response.ok) {
@@ -16922,7 +16935,27 @@ export class LegacyService implements OnModuleInit {
    * again.
    */
   private static readonly ZYRA_ROUTER_TIMEOUT_MS = 60_000;
+  // Base budget for a small batch (<=10 testcases — the old, and still smallest, tier). Kept as its
+  // own constant because zyraGenerateTimeoutMs(10) === this is exactly the pre-existing behaviour
+  // for the "1-10" tier and the generation_retry batch, and several call sites still reason about it
+  // by name.
   private static readonly ZYRA_GENERATE_TIMEOUT_MS = 180_000;
+  private static readonly ZYRA_GENERATE_TIMEOUT_MAX_MS = 360_000;
+
+  /*
+   * The generate-stage budget scales with how much was actually asked for. This used to be the flat
+   * ZYRA_GENERATE_TIMEOUT_MS (180s) for every tier, including "all" (up to 50 testcases, the same
+   * max_tokens=16000 ceiling as everything else) — a large batch takes meaningfully longer to
+   * produce because it actually fills that token budget instead of finishing well under it, so the
+   * fixed 180s was already tight for "all" and became the common case once the default range moved
+   * from "1-10" (this function's floor) to "30-50" (Basecamp: 30-50 default generation now times
+   * out at the old 180s ceiling). Linear between the 180s floor at 10 and the 360s ceiling at 50,
+   * i.e. roughly matching max_tokens's own growth over that same range.
+   */
+  private static zyraGenerateTimeoutMs(requestedCount: number): number {
+    const extra = Math.max(0, requestedCount - 10) * 4_500;
+    return Math.min(LegacyService.ZYRA_GENERATE_TIMEOUT_MAX_MS, LegacyService.ZYRA_GENERATE_TIMEOUT_MS + extra);
+  }
 
   /** A fresh per-attempt budget — a model-candidate fallback loop must not have an earlier candidate's stall eat into the next one's time. */
   private static zyraProviderSignal(ms: number): AbortSignal {
@@ -17354,9 +17387,9 @@ export class LegacyService implements OnModuleInit {
     // reported nothing.
     if (routed?.exhaustive) return { testcaseRange: "all", requestedCount: this.testcaseRangeConfig("all").requestedCount };
     const routedCount = Number(routed?.requestedCount);
-    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(25, Math.floor(routedCount)) };
+    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(50, Math.floor(routedCount)) };
     const explicit = message.match(/\b(\d{1,2})\s+(?:testcases|test cases|tests|cases)\b/i);
-    if (explicit) return { requestedCount: Math.max(1, Math.min(25, Number(explicit[1]))) };
+    if (explicit) return { requestedCount: Math.max(1, Math.min(50, Number(explicit[1]))) };
     const lower = message.toLowerCase();
     const wantsExhaustive = /\ball( the)? possible\b|as many as possible|\bexhaustive\b|every (scenario|edge case|flow|case)|full coverage|\ball types?\b/.test(lower);
     const range = wantsExhaustive ? "all" : projectTestcaseRange;

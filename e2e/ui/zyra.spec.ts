@@ -737,6 +737,64 @@ test.describe("zyra / agents (UI)", () => {
     expect(state.settings.testcaseRange, "the choice is persisted, not just rendered").toBe("10-30");
   });
 
+  test("ZYU-07b the test-cases-per-task options render in the new order with no Minimum tier", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    const page = await open(browser, "/agents/zyra/settings");
+
+    // aria-pressed is unique to the four range cards (Toggle switches use role="switch", every
+    // other on-page button has no aria-pressed at all), so this locator is exactly the range row
+    // in DOM order — which is also render order, so this doubles as the ordering assertion.
+    const rangeButtons = page.locator("button[aria-pressed]");
+    await expect(rangeButtons).toHaveCount(4);
+    await expect(rangeButtons.nth(0)).toContainText("1–10");
+    await expect(rangeButtons.nth(1)).toContainText("10–30");
+    await expect(rangeButtons.nth(2)).toContainText("30–50");
+    await expect(rangeButtons.nth(3)).toContainText("All");
+
+    // "Removed entirely" means the card, the label and the value are all gone, not just hidden.
+    await expect(page.getByRole("button", { name: /Minimum/ })).toHaveCount(0);
+    await expect(page.getByText("1–3", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-07c a project that has never saved this setting defaults to 30–50 Extensive", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    // purgeZyra() strips the zyraAgent settings key after every test in this file (see the
+    // afterEach above), so this project genuinely has no saved testcaseRange at this point.
+    const page = await open(browser, "/agents/zyra/settings");
+
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /1–10 Focused/ })).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: /All Exhaustive/ })).toHaveAttribute("aria-pressed", "false");
+
+    const state = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra`)).json();
+    expect(state.settings.testcaseRange, "a project that never saved this setting defaults to 30-50").toBe("30-50");
+  });
+
+  test("ZYU-07d selecting 30-50 persists across a reload, and Reset to defaults returns to 30-50", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    const page = await open(browser, "/agents/zyra/settings");
+
+    // Move off the default first, so the save below is a real, observable change.
+    await page.getByRole("button", { name: /10–30 Broad/ }).click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+    await page.reload();
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "true");
+
+    await page.getByRole("button", { name: /30–50 Extensive/ }).click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+    await page.reload();
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "false");
+
+    const state = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra`)).json();
+    expect(state.settings.testcaseRange, "the choice is persisted, not just rendered").toBe("30-50");
+
+    // Reset to defaults is a local (unsaved) selection change — pick a different card first so the
+    // click is a real, observable move back to the default rather than a no-op.
+    await page.getByRole("button", { name: /10–30 Broad/ }).click();
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "true");
+    await page.getByRole("button", { name: "Reset to defaults" }).click();
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+  });
+
   test("ZYU-08 reset to defaults puts every capability back on", { tag: '@tesbo.testId("TES-TC-1093")' }, async ({ browser }) => {
     const page = await open(browser, "/agents/zyra/settings");
 

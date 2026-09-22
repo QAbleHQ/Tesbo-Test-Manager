@@ -311,17 +311,32 @@ describe("Zyra chat AI routing", () => {
     });
 
     it("clamps a router count to the per-message ceiling", () => {
-      expect(internals(svc).chatTestcasePlan("lots", "1-10", { requestedCount: 500 })).toEqual({ requestedCount: 25 });
+      // Ceiling is 50, not 25: the "all" tier's own configured requestedCount is 50, and the
+      // 30-50 tier's upper bound is also 50 — a lower clamp here would silently truncate both.
+      expect(internals(svc).chatTestcasePlan("lots", "1-10", { requestedCount: 500 })).toEqual({ requestedCount: 50 });
     });
 
     it("falls back to the message and project range when the router reported nothing", () => {
       expect(internals(svc).chatTestcasePlan("generate 7 test cases", "1-10")).toEqual({ requestedCount: 7 });
       expect(internals(svc).chatTestcasePlan("generate some cases", "10-30").testcaseRange).toBe("10-30");
+      expect(internals(svc).chatTestcasePlan("generate some cases", "30-50").testcaseRange).toBe("30-50");
     });
 
     it("ignores a nonsense router count", () => {
       expect(internals(svc).chatTestcasePlan("generate cases", "1-10", { requestedCount: "many" }).testcaseRange).toBe("1-10");
       expect(internals(svc).chatTestcasePlan("generate cases", "1-10", { requestedCount: 0 }).testcaseRange).toBe("1-10");
+    });
+
+    it("resolves the project's 30-50 range to a requestedCount of 40 when nothing else is specified", () => {
+      expect(internals(svc).chatTestcasePlan("generate cases", "30-50")).toEqual({ testcaseRange: "30-50", requestedCount: 40 });
+    });
+
+    it("no longer truncates an explicit 30-50 chat request down to the old 25 ceiling", () => {
+      // Regression test: this used to clamp to 25 regardless of what the user or the project's
+      // configured range asked for, making the "up to 50" promise of both "all" and "30-50" false
+      // for anything requested via chat instead of the settings page.
+      expect(internals(svc).chatTestcasePlan("generate 45 test cases", "1-10")).toEqual({ requestedCount: 45 });
+      expect(internals(svc).chatTestcasePlan("generate cases", "1-10", { requestedCount: 45 })).toEqual({ requestedCount: 45 });
     });
   });
 

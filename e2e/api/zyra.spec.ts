@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext, type APIResponse } from "@playwright/test";
 import { column, exec, literal, scalar } from "../utils/psql";
+import { purgeProject } from "../utils/seed";
 import {
   anonymousContext,
   loginAs,
@@ -454,9 +455,26 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(JSON.stringify(agent)).toContain("10-30");
   });
 
+  test("ZYR-A-09b the 30-50 tier round-trips the same way as every other range", { tag: '@tesbo.testId("TES-TC-603")' }, async () => {
+    const res = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "30-50" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `updating settings — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(body.testcaseRange).toBe("30-50");
+    expect(body.testcaseCount).toBe(40);
+
+    const agent = await (await asOwner.get(url("/agents/zyra"))).json();
+    expect(agent.settings.testcaseRange).toBe("30-50");
+    expect(agent.settings.testcaseCount).toBe(40);
+  });
+
   test("ZYR-A-10 an unknown testcaseRange falls back instead of being stored", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
-    // The valid set is minimum / 1-10 / 10-30 / all. A value outside it must not reach the settings
-    // JSON, or the generation step later reads a range it cannot interpret.
+    // The valid set is 1-10 / 10-30 / 30-50 / all. A value outside it must not reach the settings
+    // JSON, or the generation step later reads a range it cannot interpret. The removed "minimum"
+    // tier is exercised here too — it is now just another unrecognized string, the same as any
+    // other invalid value, and must not be stored or silently reinterpreted.
     await asOwner.patch(url("/agents/zyra/settings"), { data: { testcaseRange: "all" }, failOnStatusCode: false });
     const res = await asOwner.patch(url("/agents/zyra/settings"), {
       data: { testcaseRange: "everything-please" },
@@ -468,6 +486,37 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
     );
     expect(stored, "an invalid range was written to the project settings").not.toContain("everything-please");
+
+    const minimumRes = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "minimum" },
+      failOnStatusCode: false,
+    });
+    expect(minimumRes.status()).toBeLessThan(500);
+    const minimumBody = await minimumRes.json();
+    expect(minimumBody.testcaseRange, "the removed 'minimum' tier must not be accepted").not.toBe("minimum");
+
+    const storedAfterMinimum = scalar(
+      `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
+    );
+    expect(storedAfterMinimum, "the removed 'minimum' tier reached the stored settings").not.toContain('"minimum"');
+  });
+
+  test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
+    // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
+    // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
+    const created = await asOwner.post("/api/projects", {
+      data: { name: `E2E Zyra Default Range ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), await created.text()).toBe(201);
+    const project = await created.json();
+    try {
+      const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
+      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
+      expect(agent.settings.testcaseCount).toBe(40);
+    } finally {
+      purgeProject(project.id);
+    }
   });
 
   // ─── Chat sessions ────────────────────────────────────────────────────────
