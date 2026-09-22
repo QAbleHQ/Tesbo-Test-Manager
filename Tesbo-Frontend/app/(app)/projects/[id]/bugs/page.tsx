@@ -1596,6 +1596,71 @@ export default function BugsPage() {
               rows={3}
             />
           </Field>
+          {/* Status is edit-only (Create Bug always starts "Open"), so it has no equivalent slot in
+              that form's Severity/Priority/Assign-to row. Kept as its own field right before them
+              rather than disrupting that row's order. */}
+          <Field>
+            <FieldLabel>Status</FieldLabel>
+            <Select
+              value={editStatus}
+              onChange={(e) => setEditStatus(e.target.value)}
+            >
+              <option value="Open">Open</option>
+              <option value="In Progress">In Progress</option>
+              <option value="Closed">Closed</option>
+              <option value="Reopened">Reopened</option>
+            </Select>
+          </Field>
+          <div className="grid grid-cols-3 gap-3">
+            <Field>
+              <FieldLabel>Severity</FieldLabel>
+              <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
+                {BUG_SEVERITIES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Priority</FieldLabel>
+              <Select
+                value={editPriority}
+                onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
+                aria-label="Bug priority"
+              >
+                <option value="">Not set</option>
+                {BUG_PRIORITIES.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Assign to</FieldLabel>
+              <Select
+                value={editAssigneeId}
+                onChange={(e) => setEditAssigneeId(e.target.value)}
+                aria-label="Assign to"
+              >
+                <option value="">Unassigned</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>
+                    {m.name || m.email}
+                  </option>
+                ))}
+                {/* Current assignee not among this project's members — an AI agent or a stale row.
+                    Kept visible as a disabled option so Save doesn't silently clear a real
+                    assignment nobody touched. */}
+                {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
+                  <option value={editAssigneeId} disabled>
+                    {editBug?.assigneeName || "Unknown assignee"} (not a project member)
+                  </option>
+                )}
+              </Select>
+            </Field>
+          </div>
           <BugEvidenceField
             mode={editEvidenceMode}
             onModeChange={setEditEvidenceMode}
@@ -1681,66 +1746,6 @@ export default function BugsPage() {
               }}
             />
           )}
-          <Field>
-            <FieldLabel>Status</FieldLabel>
-            <Select
-              value={editStatus}
-              onChange={(e) => setEditStatus(e.target.value)}
-            >
-              <option value="Open">Open</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Closed">Closed</option>
-              <option value="Reopened">Reopened</option>
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Severity</FieldLabel>
-            <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
-              {BUG_SEVERITIES.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Priority</FieldLabel>
-            <Select
-              value={editPriority}
-              onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
-              aria-label="Bug priority"
-            >
-              <option value="">Not set</option>
-              {BUG_PRIORITIES.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Assign to</FieldLabel>
-            <Select
-              value={editAssigneeId}
-              onChange={(e) => setEditAssigneeId(e.target.value)}
-              aria-label="Assign to"
-            >
-              <option value="">Unassigned</option>
-              {members.map((m) => (
-                <option key={m.userId} value={m.userId}>
-                  {m.name || m.email}
-                </option>
-              ))}
-              {/* Current assignee not among this project's members — an AI agent or a stale row.
-                  Kept visible as a disabled option so Save doesn't silently clear a real
-                  assignment nobody touched. */}
-              {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
-                <option value={editAssigneeId} disabled>
-                  {editBug?.assigneeName || "Unknown assignee"} (not a project member)
-                </option>
-              )}
-            </Select>
-          </Field>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="secondary" onClick={() => setEditBug(null)}>
               Cancel
