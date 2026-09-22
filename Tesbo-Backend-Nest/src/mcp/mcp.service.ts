@@ -6,6 +6,7 @@ import { buildMcpTools } from "./mcp.tools";
 import {
   MCP_AGENT_SLUG,
   MCP_PROTOCOL_VERSION,
+  MCP_SERVER_INSTRUCTIONS,
   MCP_SERVER_NAME,
   MCP_SERVER_VERSION,
   McpError,
@@ -108,7 +109,8 @@ export class McpService {
         return {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }
+          serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+          instructions: MCP_SERVER_INSTRUCTIONS
         };
 
       case "ping":

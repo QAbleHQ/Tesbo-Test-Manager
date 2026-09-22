@@ -1351,13 +1351,29 @@ export class LegacyController {
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")
-  continueZyraChatMessage(
+  async continueZyraChatMessage(
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Param("sessionId") sessionId: string,
-    @Param("messageId") messageId: string
+    @Param("messageId") messageId: string,
+    @Body() body: Record<string, any>
   ) {
-    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId);
+    // Same optional, purely-additive turnId contract as sendZyraChatMessage above — a caller that
+    // omits it gets exactly today's fire-and-forget behavior with no progress narration. The one
+    // difference from sendZyraChatMessage: this route no longer awaits the underlying work before
+    // responding (see continueZyraChatMessage's own doc comment for why), so complete()/
+    // completeWithError() can't be called here after an await — they're wired in as onSettled and
+    // fired from inside the background resume itself once it actually finishes.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    const onStage = turnId ? this.zyraProgress.stageEmitter(turnId, { projectId, sessionId, userId: req.userId || "" }) : undefined;
+    const onSettled = turnId
+      ? (result: { ok: true; payload: unknown } | { ok: false; message: string }) =>
+          result.ok ? this.zyraProgress.complete(turnId, result.payload) : this.zyraProgress.completeWithError(turnId, result.message)
+      : undefined;
+    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId, onStage, onSettled, Boolean(body?.narrow));
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/stop-plan")

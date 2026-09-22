@@ -1074,6 +1074,10 @@ export interface ZyraSourceRef {
  * degrades to "no Continue button" rather than a type error.
  */
 export const ZYRA_MESSAGE_TIMED_OUT = "timed_out";
+/** Set while a Continue resume is running in the background — see continueZyraChatMessage. */
+export const ZYRA_MESSAGE_RESUMING = "resuming";
+/** How many consecutive timeouts a resume chain tolerates before Continue requires `narrow: true`. */
+export const ZYRA_RESUME_ATTEMPT_CAP = 2;
 
 export interface ZyraChatMessage {
   id: string;
@@ -1090,6 +1094,8 @@ export interface ZyraChatMessage {
   createdAt: string;
   /** Set when this message proposed create/update/archive operations awaiting review/Save. */
   reviewRequestId?: string | null;
+  /** How many consecutive resume attempts this message's chain has already burned through. */
+  resumeAttempt: number;
 }
 
 export interface ZyraChatActivePlan {
@@ -1158,14 +1164,21 @@ export async function deleteZyraChatSession(projectId: string, sessionId: string
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
+/**
+ * `opts.turnId`, if supplied, lets an already-open (or about-to-open) `GET .../turns/:turnId/events`
+ * SSE stream narrate this same request while it runs — see openZyraTurnProgress. Purely additive:
+ * the backend route has accepted this since the SSE service was built, this is just the first
+ * caller to actually send one. Omitting it reproduces today's behavior exactly.
+ */
 export async function sendZyraChatMessage(
   projectId: string,
   sessionId: string,
-  message: string
+  message: string,
+  opts: { turnId?: string } = {}
 ): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
-    body: { message },
+    body: { message, turnId: opts.turnId },
   });
 }
 
@@ -1173,17 +1186,51 @@ export async function sendZyraChatMessage(
  * Resumes a turn whose provider call timed out (message.status === ZYRA_MESSAGE_TIMED_OUT) — picks
  * the SAME turn back up server-side (skipping the routing call if it had already resolved a
  * suite/count before generation stalled) rather than re-sending the user's message from scratch.
- * `message` in the response is null when the checkpoint was already claimed by a concurrent call
- * (a double-click, another tab) — that is not an error, the caller should just re-render `session`.
+ *
+ * Fire-and-forget: this resolves quickly with `accepted` telling the caller whether ITS click is
+ * the one driving the resume (`true`) or someone else already claimed it (`false`, e.g. a
+ * double-click or another tab) — either way `session` already reflects current reality (the
+ * target message's `status` is `resuming`/`resumed`/`expired`), so the caller should render from
+ * that rather than from any local "did I click it" state. The actual resume can take minutes;
+ * poll `getZyraChatSession` (or watch `opts.turnId`'s SSE progress stream, if provided) for the
+ * eventual `completed`/`timed_out` outcome instead of awaiting it here.
+ *
+ * `opts.narrow: true` resumes at a smaller batch (`ZYRA_RETRY_BATCH`, 5) instead of the turn's
+ * original size — required once `resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP`, otherwise the request
+ * is rejected with `code: "zyra_resume_cap_exceeded"`.
  */
 export async function continueZyraChatMessage(
   projectId: string,
   sessionId: string,
-  messageId: string
-): Promise<{ message: ZyraChatMessage | null; session: ZyraChatSession }> {
+  messageId: string,
+  opts: { turnId?: string; narrow?: boolean } = {}
+): Promise<{ session: ZyraChatSession; accepted: boolean }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`, {
     method: "POST",
+    body: { turnId: opts.turnId, narrow: opts.narrow },
   });
+}
+
+export type ZyraTurnProgressEvent =
+  | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  | { kind: "complete"; payload: unknown }
+  | { kind: "error"; message: string }
+  | { kind: "unknown" };
+
+/**
+ * Best-effort live narration for one turn ("routing…", "generating…") — a pure enhancement over
+ * an already-running request (send or continue) that supplied this same `turnId`. Never the source
+ * of truth: the caller must still poll/re-fetch the session for the actual result, since this
+ * stream can legitimately say nothing (feature flag off, the turn already finished, a network
+ * blip) without that meaning anything went wrong. `withCredentials` is required — this is a
+ * cross-origin request to API_BASE, and a plain EventSource does not send the session cookie
+ * cross-origin without it.
+ */
+export function openZyraTurnProgress(projectId: string, sessionId: string, turnId: string): EventSource {
+  return new EventSource(
+    `${API_BASE}/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/turns/${turnId}/events`,
+    { withCredentials: true }
+  );
 }
 
 export async function stopZyraChatPlan(projectId: string, sessionId: string): Promise<ZyraChatSession> {

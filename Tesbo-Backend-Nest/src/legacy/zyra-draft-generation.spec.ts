@@ -93,6 +93,10 @@ type Body = Record<string, unknown>;
 type StaticInternals = {
   zyraUngroundedNote: (count: number) => string;
   zyraWeakGroundingNote: (count: number) => string;
+  zyraGenerateTimeoutMs: (requestedCount: number) => number;
+  zyraGatedBacklogMeta: (enabled: boolean, items: Array<Record<string, unknown>>, disabledReason: string) => Record<string, unknown>;
+  dedupeZyraKnowledgeItems: <T extends { title: string; citation?: { sourceId?: string } }>(items: T[]) => T[];
+  tallyZyraOperationTypes: (operations: Array<{ type: string }>) => Record<string, number>;
 };
 
 function staticInternals(): StaticInternals {
@@ -605,5 +609,131 @@ describe("Zyra draft technique tagging — normalizeZyraTechniques", () => {
     const drafts = internals(svc).normalizeAiDrafts(raw, 10);
     expect(drafts).toHaveLength(1);
     expect(drafts[0].techniques).toEqual(["general"]);
+  });
+});
+
+/*
+ * Basecamp: with the Zyra settings default changed from "1-10" to "30-50", generation started
+ * timing out at the "generate" stage — the provider budget (zyraGenerateTimeoutMs, née the flat
+ * ZYRA_GENERATE_TIMEOUT_MS constant) never scaled with how much was actually requested, so a
+ * 40-testcase batch got the same 180s a 5-testcase batch did, even though it has to fill much
+ * closer to the same max_tokens=16000 ceiling and so genuinely takes longer to finish.
+ */
+describe("Zyra generation timeout scales with how much was requested", () => {
+  let svc: LegacyService;
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("matches the old fixed 180s budget for a batch at or under the old default (10)", () => {
+    expect(staticInternals().zyraGenerateTimeoutMs(1)).toBe(180_000);
+    expect(staticInternals().zyraGenerateTimeoutMs(5)).toBe(180_000);
+    expect(staticInternals().zyraGenerateTimeoutMs(10)).toBe(180_000);
+  });
+
+  it("grows for a larger batch and caps at 360s", () => {
+    // 40 = the new "30-50" tier's requestedCount.
+    expect(staticInternals().zyraGenerateTimeoutMs(40)).toBe(315_000);
+    // 50 = the "all" tier's requestedCount — the point the new formula caps at.
+    expect(staticInternals().zyraGenerateTimeoutMs(50)).toBe(360_000);
+    // A malformed/oversized requestedCount must never demand an unbounded wait.
+    expect(staticInternals().zyraGenerateTimeoutMs(999)).toBe(360_000);
+  });
+
+  it("OpenAI: a 40-testcase request gets a longer provider timeout than a 10-testcase one", async () => {
+    const timeoutSpy = jest.spyOn(AbortSignal, "timeout");
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) } }], usage: {} })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 40 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(315_000);
+
+    timeoutSpy.mockClear();
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 10 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+  });
+
+  it("Anthropic: a 40-testcase request gets a longer provider timeout than a 10-testcase one", async () => {
+    const timeoutSpy = jest.spyOn(AbortSignal, "timeout");
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({ content: [{ type: "text", text: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) }], usage: {} })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 40 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(315_000);
+
+    timeoutSpy.mockClear();
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 10 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+  });
+});
+
+/*
+ * The live progress backlog: a capability-gated step must never report what was fetched when the
+ * capability is off, even though the raw data already exists in memory — this is the accuracy
+ * guarantee the whole feature is built around (Basecamp: "the data should be accurate"), pulled
+ * out into its own pure function specifically so it has direct coverage independent of
+ * buildZyraChatDecision's much larger surface.
+ */
+describe("Zyra chat progress backlog — accuracy-critical meta building", () => {
+  it("reports items and a real count when the capability is on", () => {
+    const meta = staticInternals().zyraGatedBacklogMeta(true, [{ title: "Login flow" }, { title: "Checkout API" }], "unused");
+    expect(meta).toEqual({ items: [{ title: "Login flow" }, { title: "Checkout API" }], count: 2 });
+  });
+
+  it("never reports items or a count when the capability is off, regardless of what was fetched", () => {
+    // The items array here stands in for real, already-fetched data (buildZyraChatDecision fetches
+    // knowledge/bugs unconditionally, before capabilities are even known) — this must still be
+    // fully suppressed, not just emptied, so the backlog step reads as "skipped", not "checked, 0
+    // found".
+    const meta = staticInternals().zyraGatedBacklogMeta(false, [{ title: "Login flow" }], "Knowledge base access is off for this project");
+    expect(meta).toEqual({ skipped: true, reason: "Knowledge base access is off for this project" });
+    expect(meta).not.toHaveProperty("items");
+    expect(meta).not.toHaveProperty("count");
+  });
+
+  it("reports zero found, not skipped, when the capability is on but nothing matched", () => {
+    const meta = staticInternals().zyraGatedBacklogMeta(true, [], "unused");
+    expect(meta).toEqual({ items: [], count: 0 });
+  });
+
+  it("dedupes a knowledge item that reached both the folder match and RAG/recency fallback", () => {
+    const items = [
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+      { title: "Checkout API", citation: { sourceId: "doc-2" } },
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+    ];
+    expect(staticInternals().dedupeZyraKnowledgeItems(items)).toEqual([
+      { title: "Login flow", citation: { sourceId: "doc-1" } },
+      { title: "Checkout API", citation: { sourceId: "doc-2" } },
+    ]);
+  });
+
+  it("falls back to title for dedup when a source id is missing (e.g. a recency-fallback doc)", () => {
+    const items = [{ title: "Untitled note" }, { title: "Untitled note" }, { title: "Other note" }];
+    expect(staticInternals().dedupeZyraKnowledgeItems(items)).toEqual([{ title: "Untitled note" }, { title: "Other note" }]);
+  });
+
+  it("tallies staged operations by type for the 'staging' step", () => {
+    const counts = staticInternals().tallyZyraOperationTypes([
+      { type: "create" }, { type: "create" }, { type: "move_to_suite" }, { type: "create" },
+    ]);
+    expect(counts).toEqual({ create: 3, move_to_suite: 1 });
+  });
+
+  it("tallies an empty operations array to an empty object, not a throw", () => {
+    expect(staticInternals().tallyZyraOperationTypes([])).toEqual({});
   });
 });

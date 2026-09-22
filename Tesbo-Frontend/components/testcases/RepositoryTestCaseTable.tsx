@@ -33,13 +33,13 @@ const DATA_COLUMN_IDS: RepoDataColumnId[] = [
   "title",
   "suite",
   "jira",
+  "component",
   "priority",
   "severity",
-  "component",
-  "status",
-  "updated",
   "type",
   "automation",
+  "status",
+  "updated",
 ];
 
 const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
@@ -71,14 +71,20 @@ const FIELD_IDS: Record<RepoDataColumnId, string> = {
   automation: "automationStatus",
 };
 
-const DEFAULT_DATA_ORDER: RepoDataColumnId[] = [
+// Column order is fixed, not user-customizable — drag-to-reorder was removed (only the per-column
+// resize handle remains), so unlike `visible`/`widths` below this is never read from or written to
+// storage. It used to be, under the name DEFAULT_DATA_ORDER: a stored order from before a column
+// was added (or from before drag-reorder existed at all) would freeze that stale order forever,
+// since loadPrefs kept whatever was stored and only appended new columns at the end — reported as
+// Severity/Component always trailing after Updated regardless of where the code default put them.
+const DATA_ORDER: RepoDataColumnId[] = [
   "id",
   "title",
   "suite",
   "jira",
+  "component",
   "priority",
   "severity",
-  "component",
   "type",
   "automation",
   "status",
@@ -151,31 +157,12 @@ function repoAutomationTone(automationStatus: string) {
 }
 
 type TablePrefs = {
-  dataOrder: RepoDataColumnId[];
   visible: Record<RepoDataColumnId, boolean>;
   widths: Partial<Record<RepoTcColumnId, number>>;
 };
 
 function storageKey(projectId: string) {
   return `tesbo-repo-tc-table:v1:${projectId}`;
-}
-
-function normalizeDataOrder(raw: unknown): RepoDataColumnId[] {
-  const set = new Set(DATA_COLUMN_IDS);
-  const seen = new Set<string>();
-  const out: RepoDataColumnId[] = [];
-  if (Array.isArray(raw)) {
-    for (const id of raw) {
-      if (typeof id === "string" && set.has(id as RepoDataColumnId) && !seen.has(id)) {
-        seen.add(id);
-        out.push(id as RepoDataColumnId);
-      }
-    }
-  }
-  for (const id of DEFAULT_DATA_ORDER) {
-    if (!seen.has(id)) out.push(id);
-  }
-  return out;
 }
 
 function normalizeVisible(raw: unknown): Record<RepoDataColumnId, boolean> {
@@ -193,13 +180,11 @@ function normalizeVisible(raw: unknown): Record<RepoDataColumnId, boolean> {
 
 function loadPrefs(projectId: string): Omit<TablePrefs, "widths"> & { widths: Record<RepoTcColumnId, number> } {
   const widths: Record<RepoTcColumnId, number> = { ...DEFAULT_WIDTHS };
-  let dataOrder = DEFAULT_DATA_ORDER;
   let visible = DEFAULT_VISIBLE;
   try {
     const raw = readStoredValue(storageKey(projectId));
-    if (!raw) return { dataOrder, visible, widths };
+    if (!raw) return { visible, widths };
     const parsed = JSON.parse(raw) as Partial<TablePrefs>;
-    dataOrder = normalizeDataOrder(parsed.dataOrder);
     visible = normalizeVisible(parsed.visible);
     if (parsed.widths && typeof parsed.widths === "object") {
       for (const id of Object.keys(DEFAULT_WIDTHS) as RepoTcColumnId[]) {
@@ -212,7 +197,7 @@ function loadPrefs(projectId: string): Omit<TablePrefs, "widths"> & { widths: Re
   } catch {
     /* ignore */
   }
-  return { dataOrder, visible, widths };
+  return { visible, widths };
 }
 
 export type RepositoryTestCaseTableProps = {
@@ -253,7 +238,6 @@ export function RepositoryTestCaseTable({
   sort,
   onToggleSort,
 }: RepositoryTestCaseTableProps) {
-  const [dataOrder, setDataOrder] = useState<RepoDataColumnId[]>(DEFAULT_DATA_ORDER);
   const [visible, setVisible] = useState<Record<RepoDataColumnId, boolean>>(DEFAULT_VISIBLE);
   const [widths, setWidths] = useState<Record<RepoTcColumnId, number>>(DEFAULT_WIDTHS);
   const [prefsReady, setPrefsReady] = useState(false);
@@ -267,7 +251,6 @@ export function RepositoryTestCaseTable({
     const t = window.setTimeout(() => {
       if (cancelled) return;
       const p = loadPrefs(projectId);
-      setDataOrder(p.dataOrder);
       setVisible(p.visible);
       setWidths(p.widths);
       setPrefsReady(true);
@@ -281,12 +264,12 @@ export function RepositoryTestCaseTable({
   useEffect(() => {
     if (!prefsReady) return;
     try {
-      const payload: TablePrefs = { dataOrder, visible, widths };
+      const payload: TablePrefs = { visible, widths };
       writeStoredValue(storageKey(projectId), JSON.stringify(payload));
     } catch {
       /* ignore */
     }
-  }, [prefsReady, projectId, dataOrder, visible, widths]);
+  }, [prefsReady, projectId, visible, widths]);
 
   useEffect(() => {
     if (!columnsMenuOpen) return;
@@ -329,8 +312,8 @@ export function RepositoryTestCaseTable({
   }, [widths]);
 
   const visibleDataColumns = useMemo(
-    () => dataOrder.filter((id) => (id === "suite" ? !suitePanelOpen || visible.suite : visible[id])),
-    [dataOrder, visible, suitePanelOpen],
+    () => DATA_ORDER.filter((id) => (id === "suite" ? !suitePanelOpen || visible.suite : visible[id])),
+    [visible, suitePanelOpen],
   );
 
   const orderedColumns: RepoTcColumnId[] = useMemo(

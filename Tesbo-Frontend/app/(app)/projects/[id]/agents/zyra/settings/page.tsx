@@ -22,7 +22,7 @@ import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 type ConnectionResult = { ok: boolean; provider: string; model: string; error?: string; latencyMs: number } | null;
 
-type TestcaseRange = "minimum" | "1-10" | "10-30" | "all";
+type TestcaseRange = "1-10" | "10-30" | "30-50" | "all";
 
 interface ZyraSettingsData {
   state: ZyraAgentState;
@@ -31,13 +31,13 @@ interface ZyraSettingsData {
 }
 
 const RANGE_OPTIONS: { value: TestcaseRange; num: string; label: string; description: string }[] = [
-  { value: "minimum", num: "1–3",   label: "Minimum",    description: "Critical path scenarios only" },
   { value: "1-10",    num: "1–10",  label: "Focused",    description: "High-quality coverage" },
   { value: "10-30",   num: "10–30", label: "Broad",      description: "Coverage with edge cases" },
+  { value: "30-50",   num: "30–50", label: "Extensive",  description: "Deep coverage across scenarios" },
   { value: "all",     num: "All",   label: "Exhaustive", description: "Every scenario Zyra can find" },
 ];
 
-const DEFAULT_TESTCASE_RANGE: TestcaseRange = "1-10";
+const DEFAULT_TESTCASE_RANGE: TestcaseRange = "30-50";
 const DEFAULT_CAPABILITIES: ZyraCapabilities = { generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true };
 
 const CAPABILITY_FIELDS: { key: keyof ZyraCapabilities; label: string; description: string }[] = [

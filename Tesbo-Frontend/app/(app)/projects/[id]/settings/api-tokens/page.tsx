@@ -39,6 +39,97 @@ function scopeLabel(scopes: string[]): string {
   return "Read only";
 }
 
+/**
+ * Grouped, one-line-per-tool reference for a human skimming this page. This is presentational
+ * only — it has no bearing on how an MCP client (Claude Code, Claude Desktop, …) discovers or
+ * chooses tools, which always comes from a live `tools/list` call against the running server
+ * (mcp.tools.ts), not from anything rendered here. Keep names and grouping in sync with that file
+ * when a tool is added, renamed, or removed.
+ */
+const MCP_TOOL_GROUPS: Array<{ category: string; tools: Array<{ name: string; blurb: string }> }> = [
+  {
+    category: "Projects",
+    tools: [{ name: "list_projects", blurb: "The single project this token is scoped to." }],
+  },
+  {
+    category: "Test cases",
+    tools: [
+      { name: "list_testcases", blurb: "Filter/search/paginate test cases." },
+      { name: "get_testcase", blurb: "Full detail for one test case." },
+      { name: "create_testcase", blurb: "Create a test case." },
+      { name: "update_testcase", blurb: "Update a test case (only the fields you pass)." },
+      { name: "archive_testcase", blurb: "Archive a test case (non-destructive)." },
+      { name: "restore_testcase", blurb: "Restore an archived test case." },
+      { name: "duplicate_testcase", blurb: "Copy a test case within its suite." },
+      { name: "bulk_create_testcases", blurb: "Create many test cases in one call." },
+      { name: "bulk_update_testcases", blurb: "Apply the same field changes to many test cases." },
+      { name: "bulk_archive_testcases", blurb: "Archive many test cases in one call." },
+      { name: "get_testcase_bugs", blurb: "Bugs linked to one test case." },
+      { name: "get_testcase_executions", blurb: "A test case's run history across every cycle." },
+      { name: "link_requirement_to_testcase", blurb: "Attach a Jira/Linear ticket to a test case." },
+      { name: "unlink_requirement_from_testcase", blurb: "Remove a test case's Jira/Linear link." },
+    ],
+  },
+  {
+    category: "Suites",
+    tools: [
+      { name: "list_suites", blurb: "Every suite (folder) in the project, flat." },
+      { name: "get_suite", blurb: "One suite by id." },
+      { name: "create_suite", blurb: "Create a suite." },
+      { name: "update_suite", blurb: "Rename, move, or reposition a suite." },
+      { name: "clone_test_suite", blurb: "Deep-copy a suite, its sub-suites, and their test cases." },
+    ],
+  },
+  {
+    category: "Test cycles & executions",
+    tools: [
+      { name: "list_test_cycles", blurb: "Every test cycle (test run) in the project." },
+      { name: "get_test_cycle", blurb: "One test cycle, with its linked plan if any." },
+      { name: "create_cycle_from_plan", blurb: "Create a test run, optionally seeded from a plan." },
+      { name: "create_cycle_from_testcases", blurb: "Create a test run and add test cases to it." },
+      { name: "list_executions", blurb: "Every execution in a test cycle, in run order." },
+      { name: "get_execution", blurb: "One execution's result and test-case snapshot." },
+      { name: "record_execution_result", blurb: "Record a Pass/Fail/etc. result." },
+      { name: "update_execution_result", blurb: "Update an execution's result fields." },
+      { name: "bulk_record_execution_results", blurb: "Record results for many executions in one call." },
+      { name: "get_test_execution_summary", blurb: "Live Pass/Fail/Blocked/… counts, project- or cycle-wide." },
+    ],
+  },
+  {
+    category: "Bugs",
+    tools: [
+      { name: "list_bugs", blurb: "Bugs in the project, newest first." },
+      { name: "get_bug", blurb: "One bug, with its links and attachments." },
+      { name: "create_bug", blurb: "File a bug." },
+      { name: "update_bug", blurb: "Update a bug's fields." },
+      { name: "link_testcase_to_bug", blurb: "Link a test case (and optionally a run) to a bug." },
+      { name: "unlink_testcase_from_bug", blurb: "Remove a test case/bug link." },
+    ],
+  },
+  {
+    category: "Requirements",
+    tools: [{ name: "get_requirement_matrix", blurb: "Full traceability matrix: cases, runs, latest status, bugs." }],
+  },
+  {
+    category: "Knowledge Base",
+    tools: [
+      { name: "search_knowledge_base", blurb: "Keyword search across folders, documents, and files." },
+      { name: "list_knowledge_documents", blurb: "Recently updated documents, project-wide." },
+      { name: "get_knowledge_document", blurb: "One document's full content and location." },
+      { name: "create_knowledge_document", blurb: "Create a document in a folder." },
+      { name: "update_knowledge_document", blurb: "Update a document's title or content." },
+      { name: "move_knowledge_document", blurb: "Move a document to a different folder." },
+      { name: "archive_knowledge_document", blurb: "Archive (soft-delete) a document." },
+      { name: "restore_knowledge_document", blurb: "Restore an archived document." },
+      { name: "list_knowledge_folders", blurb: "The whole folder tree, rooted at the project." },
+      { name: "get_knowledge_folder", blurb: "One folder, with its breadcrumb." },
+      { name: "create_knowledge_folder", blurb: "Create a folder." },
+      { name: "update_knowledge_folder", blurb: "Rename or re-describe a folder." },
+      { name: "move_knowledge_folder", blurb: "Move a folder under a different parent." },
+    ],
+  },
+];
+
 export default function ApiTokensPage() {
   const params = useParams();
   const router = useRouter();
@@ -166,6 +257,16 @@ export default function ApiTokensPage() {
   -H 'Authorization: Bearer ${tokenForSnippets}' \\
   -H 'Content-Type: application/json' \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'`;
+
+  /*
+   * Windows PowerShell aliases `curl` to Invoke-WebRequest, which doesn't understand -X/-H/-d or
+   * backslash line continuation — pasting the curl snippet above into PowerShell fails with
+   * "A parameter cannot be found that matches parameter name 'X'." This is PowerShell-native
+   * instead, so a Windows user has something that actually runs as pasted.
+   */
+  const powershellSnippet = `$headers = @{ Authorization = "Bearer ${tokenForSnippets}" }
+$body = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+Invoke-RestMethod -Uri "${mcpUrl}" -Method Post -Headers $headers -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 10`;
 
   const reporterInstall = `npm install --save-dev @tesbox/playwright-reporter
 npx @tesbox/playwright-reporter init`;
@@ -332,6 +433,13 @@ export default defineConfig({
           </button>
         </div>
 
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          Registering a new MCP server doesn&apos;t reach a session that&apos;s already running — it&apos;s only
+          picked up on startup. Start a new Claude Code session (or, in the VS Code / JetBrains extension, run{" "}
+          <strong>Developer: Reload Window</strong>) before the new tools show up in{" "}
+          <code className="font-mono">/mcp</code>.
+        </div>
+
         {connectTab === "claudeCode" && (
           <div className="space-y-3">
             <p className="text-sm text-[var(--muted)]">Run this once from your terminal:</p>
@@ -364,13 +472,40 @@ export default defineConfig({
             <p className="text-sm text-[var(--muted)]">
               Any MCP-compatible client can call the JSON-RPC 2.0 endpoint directly:
             </p>
-            <div className="relative">
-              <pre className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 pr-12 font-mono text-xs text-[var(--foreground)] overflow-x-auto whitespace-pre">{curlSnippet}</pre>
-              <CopyButton value={curlSnippet} iconOnly className="absolute right-2 top-2" />
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-[var(--muted-soft)]">macOS / Linux (curl)</p>
+              <div className="relative">
+                <pre className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 pr-12 font-mono text-xs text-[var(--foreground)] overflow-x-auto whitespace-pre">{curlSnippet}</pre>
+                <CopyButton value={curlSnippet} iconOnly className="absolute right-2 top-2" />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-[var(--muted-soft)]">
+                Windows (PowerShell) — <code className="font-mono">curl</code> here is aliased to Invoke-WebRequest and rejects curl-style flags, so use this instead
+              </p>
+              <div className="relative">
+                <pre className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3 pr-12 font-mono text-xs text-[var(--foreground)] overflow-x-auto whitespace-pre">{powershellSnippet}</pre>
+                <CopyButton value={powershellSnippet} iconOnly className="absolute right-2 top-2" />
+              </div>
             </div>
             <p className="text-xs text-[var(--muted-soft)]">
-              Protocol methods: <code className="font-mono">initialize</code>, <code className="font-mono">ping</code>, <code className="font-mono">tools/list</code>, <code className="font-mono">tools/call</code>. Available tools: list_projects, list_testcases, create_testcase, create_suite, create_cycle_from_plan, record_execution_result, create_bug, get_requirement_matrix.
+              Protocol methods: <code className="font-mono">initialize</code>, <code className="font-mono">ping</code>, <code className="font-mono">tools/list</code>, <code className="font-mono">tools/call</code>. An MCP client (Claude Code, Claude Desktop, …) discovers every tool and its full schema live via <code className="font-mono">tools/list</code> — the groups below are just a quick human reference for what&apos;s available.
             </p>
+            <div className="space-y-3">
+              {MCP_TOOL_GROUPS.map((group) => (
+                <div key={group.category}>
+                  <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">{group.category}</p>
+                  <ul className="mt-1 divide-y divide-[var(--border)] rounded-lg border border-[var(--border)]">
+                    {group.tools.map((tool) => (
+                      <li key={tool.name} className="flex flex-wrap items-baseline gap-x-2 px-3 py-1.5 text-xs">
+                        <code className="font-mono text-[var(--foreground)]">{tool.name}</code>
+                        <span className="text-[var(--muted)]">{tool.blurb}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </Card>
