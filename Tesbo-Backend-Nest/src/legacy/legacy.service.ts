@@ -4510,6 +4510,19 @@ export class LegacyService implements OnModuleInit {
   // review-batch save run several updates atomically with each other (and with any creates in the
   // same batch) against one shared client, instead of one transaction per row.
   private async updateTestCaseWithClient(client: PoolClient, projectId: string, id: string, uid: string, body: Body) {
+    /*
+     * jiraIssueKey/jiraUrl and linearIssueKey/linearUrl were COALESCE-only, like every other field
+     * here — but unlike the rest, there was genuinely no way to ever clear them: `body.jiraIssueKey
+     * ?? null` collapses "omitted" and "explicitly null" onto the same bound parameter, so an
+     * explicit null was silently indistinguishable from not sending the field at all. No existing
+     * caller (REST PUT, Zyra's write paths, CSV import) ever sends an explicit null for these — they
+     * either send a real string or omit the key — so redefining explicit null/"" to mean "clear"
+     * changes behavior for no caller that exists today. Added for unlink_requirement_from_testcase
+     * (MCP), which needs to actually remove a requirement link, not just leave it alone. Same
+     * explicit-clear convention updateBug already uses for priority/assigneeId.
+     */
+    const clearsJira = body.jiraIssueKey === null || body.jiraIssueKey === "";
+    const clearsLinear = body.linearIssueKey === null || body.linearIssueKey === "";
     const res = await client.query(
       `UPDATE testcases SET
        suite_id=$2, title=COALESCE($3,title), description=COALESCE($4,description),
@@ -4519,8 +4532,11 @@ export class LegacyService implements OnModuleInit {
        automation_repo=COALESCE($13,automation_repo), automation_path=COALESCE($14,automation_path),
        automation_test_name=COALESCE($15,automation_test_name), automation_framework=COALESCE($16,automation_framework),
        automation_tags=COALESCE($17,automation_tags), owner_id=$18, component=COALESCE($19,component),
-       status=COALESCE($20,status), jira_issue_key=COALESCE($21,jira_issue_key), jira_url=COALESCE($22,jira_url),
-       linear_issue_key=COALESCE($23,linear_issue_key), linear_url=COALESCE($24,linear_url),
+       status=COALESCE($20,status),
+       jira_issue_key=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($21,jira_issue_key) END,
+       jira_url=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($22,jira_url) END,
+       linear_issue_key=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($23,linear_issue_key) END,
+       linear_url=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($24,linear_url) END,
        attachments=COALESCE($25,attachments), updated_by=$26,
        estimated_duration=COALESCE($27,estimated_duration),
        source_refs=COALESCE($28::jsonb,source_refs), updated_at=now()
@@ -4557,7 +4573,9 @@ export class LegacyService implements OnModuleInit {
         // Every plain UI/API edit omits this, so COALESCE keeps whatever citations already existed
         // on the row — an update never silently clears them. Only a Zyra save that explicitly
         // resolved new citations (zyraSaveAttempt) passes a real array here.
-        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null
+        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null,
+        clearsJira,
+        clearsLinear
       ]
     );
     const row = res.rows[0];
@@ -5528,6 +5546,29 @@ export class LegacyService implements OnModuleInit {
        WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
        ORDER BY ci.position, ci.created_at`,
       [cycleId]
+    );
+    return res.rows.map(toCamel);
+  }
+
+  /**
+   * Every execution of one test case, across every cycle (test run) in the project — the opposite
+   * cut from executions(cycleId) above, which is one cycle's every execution. No REST or frontend
+   * caller needs this yet (the testcase detail route is a redirect stub with no run-history view),
+   * so this exists for the MCP get_testcase_executions tool. Kept project-scoped via a trusted
+   * caller-supplied projectId, same as listBugs/listCycles/createSuite — the MCP tool has already
+   * confirmed the test case belongs to this project before calling in.
+   */
+  async testcaseExecutions(projectId: string, testcaseId: string) {
+    const res = await this.db.query(
+      `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
+              e.duration_ms, e.retry_count, e.error_message, e.reported_by,
+              ci.id AS cycle_item_id, ci.testcase_id, c.id AS cycle_id, c.name AS cycle_name, c.status AS cycle_status
+       FROM cycle_items ci
+       JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
+       JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+       WHERE ci.testcase_id = $1 AND ci.deleted_at IS NULL AND c.project_id = $2
+       ORDER BY e.executed_at DESC NULLS LAST, e.id`,
+      [testcaseId, projectId]
     );
     return res.rows.map(toCamel);
   }
