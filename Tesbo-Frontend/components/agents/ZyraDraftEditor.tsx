@@ -104,7 +104,7 @@ export function ZyraDraftEditor({
       <Field>
         <FieldLabel>Severity</FieldLabel>
         <Select value={severity} onChange={(event) => setSeverity(event.target.value)}>
-          <option value="">No severity</option>
+          <option value="">Select</option>
           {SEVERITIES.map((s) => (
             <option key={s} value={s}>{s}</option>
           ))}
