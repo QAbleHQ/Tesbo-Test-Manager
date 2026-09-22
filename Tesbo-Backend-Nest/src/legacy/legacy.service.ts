@@ -3209,8 +3209,21 @@ export class LegacyService implements OnModuleInit {
     );
   }
 
-  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
-    const filters: string[] = ["project_id = $1", "deleted_at IS NULL"];
+  /**
+   * The WHERE/CTE/join fragments shared by every "which test cases match the current repository
+   * filters" caller — the on-screen list (`listTestCasesUncached`) and the CSV/XLSX export
+   * (`exportTestCases`), which used to run its own unfiltered query and therefore ignored the suite
+   * (and every other) filter a user had selected on screen (Basecamp: "Exporting a specific suite
+   * exports all test cases"). Keeping the two in one place means a filter added to one can't quietly
+   * stop applying to the other again.
+   *
+   * All column references are qualified with `testcases.` rather than left bare: `exportTestCases`
+   * joins `suites`, which also has `project_id` and `deleted_at` columns, and an unqualified
+   * reference to either would be ambiguous. `testcases` itself is always the bare table name (never
+   * aliased) in both callers, so `testcases.column` resolves correctly in each.
+   */
+  private async buildTestcaseFilterFragments(projectId: string, query: Body) {
+    const filters: string[] = ["testcases.project_id = $1", "testcases.deleted_at IS NULL"];
     const values: any[] = [projectId];
     /*
      * `suiteId=none` asks for the cases that belong to no suite.
@@ -3226,7 +3239,7 @@ export class LegacyService implements OnModuleInit {
      */
     const suiteFilter = String(query.suiteId ?? "");
     const wantsUnfiled = suiteFilter.toLowerCase() === UNASSIGNED_SUITE_ID;
-    if (wantsUnfiled) filters.push("suite_id IS NULL");
+    if (wantsUnfiled) filters.push("testcases.suite_id IS NULL");
     /*
      * Anything else in `suiteId` has to be a uuid before it reaches the column. `suite_id` is uuid,
      * so a malformed value (a stale id pasted from a URL, a truncated copy/paste) came back as
@@ -3266,7 +3279,7 @@ export class LegacyService implements OnModuleInit {
          FROM suites s JOIN suite_subtree sub ON s.parent_id = sub.id
          WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
        ) `;
-      filters.push("suite_id IN (SELECT id FROM suite_subtree)");
+      filters.push("testcases.suite_id IN (SELECT id FROM suite_subtree)");
     }
     /*
      * Archived cases are out of the working list unless they are asked for.
@@ -3283,7 +3296,7 @@ export class LegacyService implements OnModuleInit {
     const statusFilter = String(query.status ?? "").trim();
     const includeArchived =
       statusFilter.toLowerCase() === "archived" || String(query.includeArchived ?? "").toLowerCase() === "true";
-    if (!includeArchived) filters.push("status IS DISTINCT FROM 'Archived'");
+    if (!includeArchived) filters.push("testcases.status IS DISTINCT FROM 'Archived'");
     for (const [param, column] of [
       ["suiteId", "suite_id"],
       ["status", "status"],
@@ -3300,14 +3313,18 @@ export class LegacyService implements OnModuleInit {
         // whose source file used "REGRESSION" instead of the app's canonical "Regression") —
         // match case-insensitively so filtering by type still finds it instead of silently
         // returning zero rows.
-        filters.push(param === "type" ? `lower(${column}) = lower($${values.length})` : `${column} = $${values.length}`);
+        filters.push(
+          param === "type"
+            ? `lower(testcases.${column}) = lower($${values.length})`
+            : `testcases.${column} = $${values.length}`
+        );
       }
     }
     if (query.search) {
       values.push(`%${String(query.search).toLowerCase()}%`);
       const p = values.length;
       filters.push(
-        `(lower(title) LIKE $${p} OR lower(coalesce(description, '')) LIKE $${p} OR lower(coalesce(external_id, '')) LIKE $${p} OR lower(coalesce(type, '')) LIKE $${p})`
+        `(lower(testcases.title) LIKE $${p} OR lower(coalesce(testcases.description, '')) LIKE $${p} OR lower(coalesce(testcases.external_id, '')) LIKE $${p} OR lower(coalesce(testcases.type, '')) LIKE $${p})`
       );
     }
 
@@ -3321,40 +3338,63 @@ export class LegacyService implements OnModuleInit {
       values.push(...cf.params);
     }
 
-    const where = filters.join(" AND ");
-    /*
-     * Repository table sort (ID/Test case title/Priority), additive to the default order above.
-     * `sortBy` is matched against a fixed allow-list rather than interpolated as a column name, so
-     * there is no injection surface here even though it lands directly in ORDER BY text.
-     *
-     * Only three columns are exposed because those are the only three the repository's header
-     * offers a sort control for:
-     *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
-     *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
-     *     sequence, matching compareExternalId() on the frontend.
-     *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
-     *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
-     *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
-     *     a missing priority sorts last of all regardless of direction.
-     *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
-     * `testcases.id` is always the final tiebreaker so paging stays stable across identical sort keys,
-     * the same reasoning as the default order's own id tiebreaker above.
-     */
+    return { filters, values, suiteSubtreeCteSql, customFieldJoinSql };
+  }
+
+  /**
+   * Repository table sort (ID/Test case title/Priority) — shared by the on-screen list and export
+   * (see exportTestCases) so a sorted export always matches the order the repository is currently
+   * showing, the same "export matches the screen" contract the suite/status/etc. filters already
+   * follow (buildTestcaseFilterFragments above). `sortBy` is matched against a fixed allow-list
+   * rather than interpolated as a column name, so there is no injection surface here even though it
+   * lands directly in ORDER BY text.
+   *
+   * Only three columns are exposed because those are the only three the repository's header offers a
+   * sort control for:
+   *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
+   *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
+   *     sequence, matching compareExternalId() on the frontend.
+   *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
+   *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
+   *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
+   *     a missing priority sorts last of all regardless of direction.
+   *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
+   * `testcases.id` is always the final tiebreaker so paging (and re-exporting the same data) stays
+   * stable across identical sort keys.
+   *
+   * With no `sortBy` at all, this is also the repository's own default view — `created_at DESC` is
+   * the ID sequence (external_id is assigned sequentially at creation), newest case first. Export
+   * used to hard-code its own, different default (`updated_at DESC` — "most recently updated first"),
+   * so editing an old case moved it to the top of every future export while its position on screen
+   * never changed ("[Test Cases] Exported Test Cases Lose Their Original Sequence"). Export now
+   * shares this same default, so an unsorted export always matches the unsorted repository view.
+   */
+  private buildTestcaseOrderBySql(query: Body): string {
     const sortDir = String(query.sortDir ?? "").toLowerCase() === "desc" ? "DESC" : "ASC";
-    let orderBySql = "testcases.created_at DESC, testcases.id DESC";
     if (query.sortBy === "id") {
-      orderBySql =
+      return (
         `(regexp_match(testcases.external_id, '(\\d+)$'))[1]::bigint ${sortDir} NULLS LAST, ` +
-        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "title") {
-      orderBySql = `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "priority") {
-      orderBySql =
+        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`
+      );
+    }
+    if (query.sortBy === "title") {
+      return `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
+    }
+    if (query.sortBy === "priority") {
+      return (
         `(CASE WHEN testcases.priority IS NULL OR testcases.priority = '' THEN 5 ` +
         `WHEN testcases.priority IN ('P0','P1','P2','P3') THEN ` +
         `(CASE testcases.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END) ` +
-        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`;
+        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`
+      );
     }
+    return "testcases.created_at DESC, testcases.id DESC";
+  }
+
+  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     values.push(limit, offset);
     // Total comes back as a window function on the same statement rather than a second
     // COUNT(*) query. This endpoint backs the repository table, the suite tree and the run
@@ -3381,24 +3421,35 @@ export class LegacyService implements OnModuleInit {
     return { rows: res.rows.map(({ total_count, ...row }) => toCamel(row)), total };
   }
 
-  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = []): Promise<Body[]> {
+  /**
+   * `query` carries the same suite/status/priority/type/automationStatus/jira/linear/search/
+   * customFieldFilters shape as `listTestCasesForUser` — the repository screen's "Export" button
+   * sends whatever suite and filters are currently active on screen, so an export of a selected
+   * suite (or a filtered view) matches what the user was looking at instead of silently returning
+   * the whole project (Basecamp: "Exporting a specific suite exports all test cases"). An empty/
+   * absent query exports the whole project, same as before.
+   */
+  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = [], query: Body = {}): Promise<Body[]> {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
+    // Same order the repository table is currently showing — its default (created_at DESC, the ID
+    // sequence) with no sortBy, or its ID/title/priority column sort when one is active. See
+    // buildTestcaseOrderBySql for why: export used to hard-code `updated_at DESC` regardless of what
+    // was on screen ("[Test Cases] Exported Test Cases Lose Their Original Sequence").
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     const res = await this.db.query(
-      `SELECT t.id, t.external_id, t.title, COALESCE(t.description, '') AS description,
-              COALESCE(t.preconditions, '') AS preconditions,
-              t.steps, COALESCE(t.test_data, '') AS test_data,
-              COALESCE(t.priority, '') AS priority, COALESCE(t.severity, '') AS severity,
-              COALESCE(t.type, '') AS type, COALESCE(t.status, '') AS status,
-              COALESCE(s.name, '') AS suite, COALESCE(t.component, '') AS component
-       FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
-       -- Export keeps its documented "most recently updated first" contract (pinned by
-       -- api/import-export.spec.ts "orders rows by most recently updated"); only the repository LIST
-       -- moved to ID sequence, which is what card 10212941059 asked for. The id tiebreaker is the part
-       -- that mattered here: a bulk update ties every touched row on one updated_at, and without it the
-       -- export's row order was arbitrary between two exports of the same data.
-       ORDER BY t.updated_at DESC, t.id DESC`,
-      [projectId]
+      `${suiteSubtreeCteSql}SELECT testcases.id, testcases.external_id, testcases.title, COALESCE(testcases.description, '') AS description,
+              COALESCE(testcases.preconditions, '') AS preconditions,
+              testcases.steps, COALESCE(testcases.test_data, '') AS test_data,
+              COALESCE(testcases.priority, '') AS priority, COALESCE(testcases.severity, '') AS severity,
+              COALESCE(testcases.type, '') AS type, COALESCE(testcases.status, '') AS status,
+              COALESCE(s.name, '') AS suite, COALESCE(testcases.component, '') AS component
+       FROM testcases
+       LEFT JOIN suites s ON s.id = testcases.suite_id AND s.deleted_at IS NULL
+       ${customFieldJoinSql}
+       WHERE ${where}
+       ORDER BY ${orderBySql}`,
+      values
     );
 
     const valuesByTestcase = new Map<string, Map<string, unknown>>();

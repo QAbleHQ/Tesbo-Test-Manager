@@ -1655,8 +1655,44 @@ export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: s
 }
 
 // Test case import/export
-export function getExportUrl(projectId: string, format: "csv" | "xlsx"): string {
-  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}`;
+export interface TestCaseExportFilters {
+  suiteId?: string;
+  /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+  includeDescendants?: boolean;
+  status?: string;
+  priority?: string;
+  type?: string;
+  automationStatus?: string;
+  jiraIssueKey?: string;
+  linearIssueKey?: string;
+  search?: string;
+  /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
+  customFieldFilters?: string;
+  /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
+  sortBy?: "id" | "title" | "priority";
+  sortDir?: "asc" | "desc";
+}
+
+// Mirrors the repository screen's own filters AND its current column sort (see loadSelectedSuiteCases'
+// listTestCases call and suiteCasesSort) so "Export" produces exactly what's currently
+// selected/filtered/sorted on screen, not the whole project in an unrelated order — an unfiltered,
+// unsorted export is still the default when `filters` is omitted.
+export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
+  const sp = new URLSearchParams();
+  if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
+  if (filters?.includeDescendants) sp.set("includeDescendants", "true");
+  if (filters?.status) sp.set("status", filters.status);
+  if (filters?.priority) sp.set("priority", filters.priority);
+  if (filters?.type) sp.set("type", filters.type);
+  if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
+  if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
+  if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+  if (filters?.search) sp.set("search", filters.search);
+  if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+  if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
+  if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
+  const qs = sp.toString();
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}${qs ? `?${qs}` : ""}`;
 }
 
 export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {
@@ -3444,7 +3480,7 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
-// The Change History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// The Update History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
 // timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
 // are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
 export interface KnowledgeChangedField {

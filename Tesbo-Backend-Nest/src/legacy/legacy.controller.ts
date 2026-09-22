@@ -900,9 +900,14 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/testcases/export/csv")
-  async exportCsv(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Res() res: Response) {
+  async exportCsv(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
-    const rows = await this.legacy.exportTestCases(projectId, definitions);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", 'attachment; filename="testcases.csv"');
@@ -910,9 +915,14 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/testcases/export/xlsx")
-  async exportXlsx(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Res() res: Response) {
+  async exportXlsx(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
-    const rows = await this.legacy.exportTestCases(projectId, definitions);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
     await this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
   }

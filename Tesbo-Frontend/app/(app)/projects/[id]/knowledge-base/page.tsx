@@ -381,8 +381,8 @@ function ChangeHistoryTrigger({ projectId, documentId }: { projectId: string; do
       <button
         ref={triggerRef}
         type="button"
-        title="Change history"
-        aria-label="Change history"
+        title="Update History"
+        aria-label="Update History"
         onMouseEnter={openNow}
         onMouseLeave={scheduleClose}
         onFocus={openNow}

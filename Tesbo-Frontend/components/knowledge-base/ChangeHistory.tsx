@@ -6,7 +6,7 @@ import { getKnowledgeDocumentHistory, type KnowledgeDocumentHistoryEntry } from 
 import { ChangeDiffModal } from "./ChangeDiffModal";
 
 /**
- * The Change History timeline for one Knowledge Base document — shared between the knowledge-base
+ * The Update History timeline for one Knowledge Base document — shared between the knowledge-base
  * list's info-icon popover (ChangeHistoryTrigger, knowledge-base/page.tsx) and the document detail
  * page's "History" modal (documents/[documentId]/page.tsx). Renders the same shape for a synced
  * Jira/Linear mirror (the sync pipeline's own log) and a manually-created document (synthesized
@@ -20,14 +20,16 @@ export const CHANGE_HISTORY_PAGE_SIZE = 5;
 const LARGE_CHANGE_THRESHOLD = 160;
 
 // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — a fixed format, deliberately not locale-dependent.
-function formatEventDate(value: string): string {
+// Exported for ChangeDiffModal, which formats the same way wherever a diff's own field label is
+// a raw timestamp (a Zyra AI Memory entry's heading — see formatFieldLabel there).
+export function formatEventDate(value: string): string {
   const date = new Date(value);
   const dd = String(date.getDate()).padStart(2, "0");
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   return `${dd}/${mm}/${date.getFullYear()}`;
 }
 
-function formatEventTime(value: string): string {
+export function formatEventTime(value: string): string {
   const date = new Date(value);
   const hours24 = date.getHours();
   const period = hours24 >= 12 ? "PM" : "AM";
@@ -54,7 +56,7 @@ export function ChangeHistoryList({
   projectId: string;
   documentId: string;
   /** The popover has no surrounding chrome of its own and needs its own heading; a Modal usage
-   *  already renders "Change history" in its title bar, so that caller passes false. */
+   *  already renders "Update History" in its title bar, so that caller passes false. */
   showHeading?: boolean;
   /** Only a manual document's version-diff entries carry a versionId to restore — the button never
    *  renders on any other row, so it's safe to always pass this (as the detail page's History
@@ -62,7 +64,7 @@ export function ChangeHistoryList({
   onRestoreVersion?: (entry: KnowledgeDocumentHistoryEntry) => void;
   /** Disables every row's Restore button while one restore is in flight. */
   restoringVersionId?: string | null;
-  /** Fires the instant a "Check Difference" click opens ChangeDiffModal, and again when it closes.
+  /** Fires the instant a "View Details" click opens ChangeDiffModal, and again when it closes.
    *  ChangeDiffModal is a React child of this component, not of whatever renders it — a caller that
    *  can auto-close itself (ChangeHistoryTrigger's hover popover) must know a diff is showing so it
    *  doesn't tear this whole subtree down (and the diff modal with it) out from under the user; see
@@ -154,15 +156,15 @@ export function ChangeHistoryList({
   return (
     <div>
       {showHeading && (
-        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Change history</div>
+        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Update History</div>
       )}
       {state.loading ? (
         <div className="py-2 text-[12px] text-[var(--muted)]">Loading…</div>
       ) : state.error ? (
-        <div className="py-2 text-[12px] text-[var(--error-foreground)]">Couldn&apos;t load change history.</div>
+        <div className="py-2 text-[12px] text-[var(--error-foreground)]">Couldn&apos;t load update history.</div>
       ) : state.events.length === 0 ? (
         <div className="py-2 text-[12px] text-[var(--muted)]">
-          {page === 0 ? "No change history recorded yet." : "No more changes."}
+          {page === 0 ? "No update history recorded yet." : "No more changes."}
         </div>
       ) : (
         <ul className="max-h-80 space-y-2 overflow-y-auto">
@@ -210,7 +212,7 @@ export function ChangeHistoryList({
                         }}
                         className="shrink-0 font-medium text-[var(--accent-light)] hover:underline"
                       >
-                        Check Difference
+                        View Details
                       </button>
                     )}
                   </div>

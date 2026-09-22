@@ -815,6 +815,41 @@ export default function TestCasesPage() {
     customFieldFilters,
   ]);
 
+  // Same suite/status/priority/type/automation/jira/linear/search/custom-field filters AND column
+  // sort loadSelectedSuiteCases/sortedSuiteCases apply on screen, reused for the "Export" menu so
+  // the downloaded file matches whatever the repository is currently showing — both which rows
+  // (suite/filters) and their order (sort) — instead of always exporting the whole project in an
+  // unrelated order ("[Test Cases] Exported Test Cases Lose Their Original Sequence": export used to
+  // always sort by most-recently-updated regardless of what the table displayed).
+  const currentTestCaseExportFilters = useMemo(
+    () => ({
+      suiteId: activeSuiteId ?? undefined,
+      includeDescendants: activeSuiteId ? true : undefined,
+      status: suiteStatusFilter === "all" ? undefined : suiteStatusFilter,
+      priority: suitePriorityFilter === "all" ? undefined : suitePriorityFilter,
+      type: suiteTypeFilter === "all" ? undefined : suiteTypeFilter,
+      automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
+      jiraIssueKey: activeJiraIssueKey || undefined,
+      linearIssueKey: activeLinearIssueKey || undefined,
+      search: debouncedSuiteSearch || undefined,
+      customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
+      sortBy: suiteCasesSort?.column,
+      sortDir: suiteCasesSort?.direction,
+    }),
+    [
+      activeSuiteId,
+      suiteStatusFilter,
+      suitePriorityFilter,
+      suiteTypeFilter,
+      suiteAutomationFilter,
+      activeJiraIssueKey,
+      activeLinearIssueKey,
+      debouncedSuiteSearch,
+      customFieldFilters,
+      suiteCasesSort,
+    ]
+  );
+
   useEffect(() => {
     void loadSelectedSuiteCases();
   }, [loadSelectedSuiteCases]);
@@ -1488,7 +1523,7 @@ export default function TestCasesPage() {
                 {isImportExportMenuOpen && (
                   <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
                     <a
-                      href={getExportUrl(projectId, "csv")}
+                      href={getExportUrl(projectId, "csv", currentTestCaseExportFilters)}
                       target="_blank"
                       rel="noreferrer"
                       onClick={() => setIsImportExportMenuOpen(false)}
@@ -1498,7 +1533,7 @@ export default function TestCasesPage() {
                       Export as CSV
                     </a>
                     <a
-                      href={getExportUrl(projectId, "xlsx")}
+                      href={getExportUrl(projectId, "xlsx", currentTestCaseExportFilters)}
                       target="_blank"
                       rel="noreferrer"
                       onClick={() => setIsImportExportMenuOpen(false)}
