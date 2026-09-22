@@ -103,7 +103,7 @@ test.describe("test case creation", () => {
   });
 
   // Suite, Type, Priority, Automation Type, Component and Severity are all optional on Create:
-  // Create Test Case must open with the dropdowns on "Select"/"No severity" and Component empty,
+  // Create Test Case must open with the dropdowns on "Select"/"No suite" and Component empty,
   // and leaving every one of them untouched must both (a) succeed, and (b) persist them as blank/
   // null rather than a real value the user never chose. The form always includes these fields in
   // its payload (testcases/page.tsx), blank or not, so an untouched field reaches the API as an
@@ -124,7 +124,7 @@ test.describe("test case creation", () => {
     await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
     await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
     await expect(fieldControl(page, "Component")).toHaveValue("");
-    await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("No severity");
+    await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("Select");
     await expect(fieldControl(page, "Status").locator("option:checked")).toHaveText("Draft");
 
     // Submit with all of the above left untouched — no client-side error, a real create.
@@ -164,7 +164,7 @@ test.describe("test case creation", () => {
   // filtered on — so a case saved blank by the fix above would silently gain a real value the
   // moment it was opened and saved again, undoing the fix on the very next edit. Priority is
   // excluded from that regression (an empty string isn't nullish, so it already round-tripped).
-  test("Edit Test Case shows a blank Type/Priority/Automation Type/Suite as Select/No suite, and saving with no changes keeps them blank", async ({ page }) => {
+  test("Edit Test Case shows a blank Type/Priority/Automation Type/Suite/Severity as Select/No suite, and saving with no changes keeps them blank", async ({ page }) => {
     const title = `UI edit blank fields test case ${Date.now()}`;
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
     let testcaseId = "";
@@ -184,6 +184,7 @@ test.describe("test case creation", () => {
       await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
       await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
       await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("Select");
 
       // Save without touching anything.
       await panel.getByRole("button", { name: "Save changes" }).click();
@@ -196,6 +197,7 @@ test.describe("test case creation", () => {
       expect(after.type).toBeFalsy();
       expect(after.priority).toBe("");
       expect(after.automationStatus).toBeFalsy();
+      expect(after.severity).toBeFalsy();
     } finally {
       if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
       await api.dispose();

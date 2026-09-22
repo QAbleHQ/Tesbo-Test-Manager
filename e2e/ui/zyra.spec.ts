@@ -2024,6 +2024,8 @@ test.describe("zyra / agents (UI)", () => {
     await row.getByRole("button", { name: "Edit" }).click();
     // Field order in ZyraDraftEditor: Title (textbox 0), Priority (combobox 0), Severity
     // (combobox 1), Component (textbox 1), Preconditions/Expected result/Steps after that.
+    // The seeded draft has no severity, so the placeholder option must read "Select", not "No severity".
+    await expect(row.getByRole("combobox").nth(1).locator("option:checked")).toHaveText("Select");
     await row.getByRole("combobox").nth(1).selectOption("Medium");
     await row.getByRole("textbox").nth(1).fill("Search");
     await row.getByRole("button", { name: "Save edit" }).click();

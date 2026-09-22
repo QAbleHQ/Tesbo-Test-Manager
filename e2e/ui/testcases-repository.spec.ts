@@ -337,6 +337,58 @@ test.describe("test case repository (UI)", () => {
     const headers = page.getByRole("columnheader");
     expect(await headers.count(), "at least one data column must survive").toBeGreaterThan(1);
   });
+
+  /*
+   * Regression: column order used to be a stored preference (RepositoryTestCaseTable's old
+   * `dataOrder`), left over from when headers could be dragged to reorder — a preference saved
+   * before Severity/Component existed (or from before drag-reorder was removed entirely) kept its
+   * stale order forever, with any newly-added column silently appended at the very end regardless
+   * of where the code's own default put it. That's why Severity/Component always trailed after
+   * Updated on an existing browser even after the code's default order changed. Order is now fixed
+   * in code (DATA_ORDER) and never read from or written to storage, so it can't drift like that.
+   */
+  test("TCR-20 data columns render in a fixed order regardless of a stale stored preference", async ({ browser }) => {
+    await seedCase(stamp("ColumnOrder"));
+    const page = await openRepository(browser);
+
+    // A preference saved before Severity/Component existed — exactly the shape that used to freeze
+    // the old, incomplete order forever. `dataOrder` is intentionally absent from TablePrefs now,
+    // so this stale value must simply be ignored rather than read back.
+    await page.evaluate((pid) => {
+      window.localStorage.setItem(
+        `tesbo-repo-tc-table:v1:${pid}`,
+        JSON.stringify({ dataOrder: ["id", "title", "priority", "type", "automation", "status", "updated"] }),
+      );
+    }, tenant!.mainProjectId);
+    await page.reload();
+
+    await page.getByRole("button", { name: "Columns", exact: true }).click();
+    for (const label of ["Jira", "Component", "Severity"]) {
+      const checkbox = page.getByRole("checkbox").and(page.locator(`xpath=//label[.//span[text()=${JSON.stringify(label)}]]//input`));
+      if (!(await checkbox.isChecked())) await checkbox.check();
+    }
+    await page.keyboard.press("Escape");
+
+    const headers = page.locator("table.tc-repo-table thead tr th");
+    // Bulk-select is index 0; Suite stays hidden (only shows with the suite panel collapsed).
+    const expectedOrder = [
+      "ID",
+      "Test case title",
+      "Jira",
+      "Component",
+      "Priority",
+      "Severity",
+      "Type",
+      "Automation Type",
+      "Status",
+      "Updated",
+    ];
+    await expect(headers).toHaveCount(expectedOrder.length + 1);
+    for (const [i, label] of expectedOrder.entries()) {
+      await expect(headers.nth(i + 1), `header ${i + 1} should be "${label}"`).toContainText(label);
+    }
+  });
+
   // ─── Cases that belong to no suite ─────────────────────────────────────────
 
   /*

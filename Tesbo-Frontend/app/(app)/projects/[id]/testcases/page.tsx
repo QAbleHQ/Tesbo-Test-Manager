@@ -2423,7 +2423,7 @@ export default function TestCasesPage() {
                         <Field>
                           <FieldLabel>Severity</FieldLabel>
                           <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
-                            <option value="">No severity</option>
+                            <option value="">Select</option>
                             {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
                           </Select>
                         </Field>
@@ -2562,7 +2562,7 @@ export default function TestCasesPage() {
                             <Field>
                               <FieldLabel>Severity</FieldLabel>
                               <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
-                                <option value="">No severity</option>
+                                <option value="">Select</option>
                                 {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
                               </Select>
                             </Field>
