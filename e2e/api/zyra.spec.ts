@@ -173,7 +173,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * expect once a row carries chat_session_id (legacy.service.ts applyZyraChatOperations) — NOT
    * the flat AiGeneratedDraft shape seedTask()'s Task-board rows use.
    */
-  function seedChatReviewTask(options: { status?: string; entries?: Array<Record<string, unknown>> } = {}): {
+  function seedChatReviewTask(
+    options: { status?: string; entries?: Array<Record<string, unknown>>; savedCount?: number } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
@@ -203,9 +205,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     ];
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        "requested_count, generated_count, saved_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
         `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', ` +
-        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ` +
+        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ${options.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(entries))}::jsonb, 'Zyra the Test Generator', ` +
         `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
     );
@@ -1191,16 +1193,66 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   );
 
   test(
-    "ZYR-A-81 chat-created testcases never feed the task-board approval rate",
+    "ZYR-A-81 a chat-approved batch counts toward the approval rate exactly like a task-board save",
     { tag: '@tesbo.testId("TES-TC-1221")' },
     async () => {
-      // A chat-staged row (chat_session_id set) must not be picked up by the task-board aggregate —
-      // chat has no comparable generated-vs-saved concept, and `tasks` elsewhere on this same payload
-      // already excludes these rows for the same reason (chat_session_id IS NULL).
-      seedChatReviewTask({ status: "done" });
-      expect(await approvalRate(), "a chat-staged batch leaked into the task-board approval rate").toBeNull();
+      /*
+       * "[Zyra] Approval Rate does not update after approving additional test cases" — reproduced
+       * against the ZYR-A-75 fix itself: that fix scoped the aggregate to `chat_session_id IS NULL`
+       * on the theory that chat "has no comparable generated-vs-saved concept". It does: chat
+       * proposals are inserted into this same table with a real generated_count
+       * (applyZyraChatOperations), and approving them in the Agent workspace calls the exact same
+       * aiSave route the task board uses (ZyraChatReviewPanel -> saveZyraTask), which increments
+       * saved_count and sets task_status = 'done' with no branch on chat_session_id at all. So a
+       * chat-approved batch is byte-for-byte the same shape as a task-board one once saved, and
+       * excluding it is what left the tile frozen for anyone whose whole workflow is the chat panel.
+       */
+      seedChatReviewTask({ status: "done", savedCount: 1 });
+      expect(await approvalRate(), "an approved chat batch did not count toward the rate").toBe(100);
     },
   );
+
+  test("ZYR-A-83 the rate aggregates chat and task-board saves together, not just one or the other", async () => {
+    seedTask({ drafts: 2, savedCount: 1, status: "done" });
+    seedChatReviewTask({
+      status: "done",
+      savedCount: 1,
+      entries: [
+        { opType: "create", draft: { title: "E2E chat draft A" }, reason: "" },
+        { opType: "create", draft: { title: "E2E chat draft B" }, reason: "" },
+      ],
+    });
+    // 1 saved of 2 (task board) + 1 saved of 2 (chat) = 2 of 4 = 50%.
+    expect(await approvalRate(), "chat and task-board saves did not aggregate into one rate").toBe(50);
+  });
+
+  test(
+    "ZYR-A-84 closing a chat batch without saving, through the real route, still counts its drafts as unapproved",
+    async () => {
+      // Mirrors ZYR-A-80's task-board close, but through a chat-staged row — zyraCloseTask branches
+      // on nothing chat-specific, so this must resolve to 'done' with saved_count 0 exactly the same.
+      const { taskId } = seedChatReviewTask({ status: "in_review" });
+      const closeRes = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/close`), { failOnStatusCode: false });
+      expect(closeRes.status(), `closing a chat batch without saving — ${await closeRes.text()}`).toBe(201);
+      expect(
+        scalar(`SELECT task_status, saved_count FROM ai_generation_requests WHERE id = ${literal(taskId)};`),
+      ).toBe("done");
+
+      seedTask({ drafts: 1, savedCount: 1, status: "done" });
+      // 1 saved of 1 (task board) + 0 saved of 1 (closed chat batch) = 1 of 2 = 50%.
+      expect(
+        await approvalRate(),
+        "a closed-without-saving chat batch was not counted as generated-but-unapproved",
+      ).toBe(50);
+    },
+  );
+
+  test("ZYR-A-85 a chat batch still awaiting review does not drag the rate down before anything is decided", async () => {
+    // Same reasoning as ZYR-A-77's task-board case, now for the origin that used to be exempt from
+    // this aggregate entirely — an undecided chat batch must be excluded, not counted as 0% approved.
+    seedChatReviewTask({ status: "in_review" });
+    expect(await approvalRate(), "a pending chat batch was counted as 0% approved instead of being excluded").toBeNull();
+  });
 
   test(
     "ZYR-A-82 the approval rate is scoped per project — a second tenant's saves never leak in",

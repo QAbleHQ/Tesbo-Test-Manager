@@ -10701,15 +10701,21 @@ export class LegacyService implements OnModuleInit {
       // <> 'failed') is deliberate: a 'in_review' task has drafts generated and saved_count still
       // 0 simply because the user hasn't finished reviewing it yet, not because they rejected
       // anything — counting it here would drag the rate down for work that is still pending, not
-      // decided. 'done' is only ever reached via aiSave, an explicit save-or-close action (see
-      // aiSave below), which is what "approved and saved" in the ticket actually means. Excludes
-      // 'failed' the same way, since a generation error leaves nothing to approve or reject.
-      // chat_session_id IS NULL matches `tasks`: chat-created testcases don't go through this
-      // saved/generated lifecycle, so there is nothing meaningful to fold into this ratio for them.
+      // decided. 'done' is only ever reached via aiSave or zyraCloseTask, an explicit save-or-close
+      // action, which is what "approved and saved" in the ticket actually means. Excludes 'failed'
+      // the same way, since a generation error leaves nothing to approve or reject.
+      //
+      // Deliberately NOT filtered on chat_session_id, unlike `tasks` above: a chat-staged batch is
+      // not display-list material (it has no task-board card to show), but it is saved through the
+      // exact same aiSave route as a task-board batch once approved from the Agent workspace, so it
+      // ends up with the same valid saved_count/generated_count pair at task_status = 'done'.
+      // Scoping this aggregate to task-board rows only left the tile permanently frozen for any
+      // workflow that approves test cases through chat instead — see "[Zyra] Approval Rate does not
+      // update after approving additional test cases".
       this.db.query<{ saved: string; generated: string }>(
         `SELECT COALESCE(SUM(saved_count), 0) AS saved, COALESCE(SUM(generated_count), 0) AS generated
            FROM ai_generation_requests
-          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND chat_session_id IS NULL AND task_status = 'done'`,
+          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND task_status = 'done'`,
         [projectId, ZYRA_AGENT_NAMES]
       )
     ]);
