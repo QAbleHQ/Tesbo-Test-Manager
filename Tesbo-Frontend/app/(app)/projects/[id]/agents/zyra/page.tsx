@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconClipboardCheck, IconCopy, IconPencil, IconPlus, IconSettings, IconSparkles, IconTrash } from "@tabler/icons-react";
+import { IconArrowDown, IconClipboardCheck, IconCopy, IconPencil, IconPlus, IconSettings, IconSparkles, IconTrash } from "@tabler/icons-react";
 import {
   continueZyraChatMessage,
   createZyraChatSession,
@@ -593,6 +593,15 @@ function zyraFormatDuration(ms: number): string {
   return m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
 }
 
+// How close to the bottom (px) still counts as "at bottom" for auto-follow purposes — a little
+// slack so sub-pixel rounding and momentum scrolling don't flicker the catch-up button.
+const ZYRA_SCROLL_BOTTOM_THRESHOLD = 120;
+
+function zyraPrefersReducedMotion(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 /**
  * 8 once this turn is known to route to `create` (a step named `generating` has actually fired),
  * 7 otherwise. Deliberately NOT hardcoded to 8: an answer/list/archive turn never reaches
@@ -920,6 +929,16 @@ export default function ZyraChatPage() {
   const [deleteTarget, setDeleteTarget] = useState<ZyraChatSession | null>(null);
   const [deleting, setDeleting] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  // Whether the user is currently scrolled to (near) the bottom of the chat. Read inside the
+  // auto-scroll effect below, not stored as state, so a scroll tick never forces a re-render —
+  // only crossing the threshold (which does flip catchUpVisible) does.
+  const isAtBottomRef = useRef(true);
+  const prevSessionIdRef = useRef<string | undefined>(undefined);
+  // True once the user has scrolled away from the bottom far enough that new content arriving
+  // below the fold would go unseen. Scrolling up is never blocked; this only gates whether new
+  // content auto-follows or waits for the user to hit "catch up".
+  const [catchUpVisible, setCatchUpVisible] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Guards the mount effect against firing loadData twice for the same mount (React 18 dev
   // double-invoke, or the effect re-running before the first pass resolves) — without it, two
@@ -1028,9 +1047,48 @@ export default function ZyraChatPage() {
     else void loadData();
   }, [loadData, router, currentUser]);
 
+  // Total step count across every in-flight backlog (the live send plus any resuming turn) —
+  // a cheap proxy for "did the transcript just grow" that fires on every SSE step, not just when
+  // a whole message lands. Session-switch handling below.
+  const backlogStepTotal = useMemo(
+    () => Object.values(turnBacklogs).reduce((sum, steps) => sum + steps.length, 0),
+    [turnBacklogs],
+  );
+
+  function scrollToLatest(behavior: ScrollBehavior) {
+    endRef.current?.scrollIntoView({ behavior, block: "end" });
+  }
+
+  function handleMessagesScroll() {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom < ZYRA_SCROLL_BOTTOM_THRESHOLD;
+    isAtBottomRef.current = atBottom;
+    setCatchUpVisible((prev) => (prev === !atBottom ? prev : !atBottom));
+  }
+
+  function handleCatchUp() {
+    isAtBottomRef.current = true;
+    setCatchUpVisible(false);
+    scrollToLatest(zyraPrefersReducedMotion() ? "auto" : "smooth");
+  }
+
+  // Auto-follow: scroll to the latest content only while the user is already at the bottom.
+  // Scrolling up is never blocked — that just suspends auto-follow until the user scrolls back
+  // down themselves or hits "catch up" (handleCatchUp above), which re-arms it.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, sending]);
+    const sessionChanged = prevSessionIdRef.current !== activeSession?.id;
+    prevSessionIdRef.current = activeSession?.id;
+    if (sessionChanged) {
+      // A different conversation's scroll position is irrelevant here — always land at the
+      // bottom of the one just opened, instantly rather than animating through its history.
+      isAtBottomRef.current = true;
+      setCatchUpVisible(false);
+    }
+    if (!isAtBottomRef.current) return;
+    scrollToLatest(sessionChanged || zyraPrefersReducedMotion() ? "auto" : "smooth");
+  }, [messages.length, sending, backlogStepTotal, activeSession?.activePlan?.doneCount, activeSession?.id]);
 
   // While Zyra is actively working through a batched "all possible cases" plan, poll for
   // the new chat messages it posts as each batch finishes — they arrive without the user
@@ -1428,54 +1486,68 @@ export default function ZyraChatPage() {
                 </p>
               </div>
 
-              {/* Messages — scrollable */}
-              <div className="flex-1 overflow-y-auto px-5 py-5 space-y-5">
-                {!messages.length && (
-                  <div className="flex h-full flex-col items-center justify-center gap-6 py-8">
-                    {!agent?.agent.active ? (
-                      <NoKeyBanner projectId={projectId} />
-                    ) : (
-                      <>
-                        <div className="text-center max-w-md">
-                          <div className="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-xl font-bold text-white">Z</div>
-                          <h3 className="text-base font-semibold text-[var(--foreground)]">How can I help?</h3>
-                          <p className="mt-1 text-sm text-[var(--muted)]">
-                            Generate test cases, find coverage gaps, update existing tests, or review your test suite — all through conversation.
-                          </p>
-                        </div>
-                        <div className="w-full max-w-2xl">
-                          <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">Quick actions</p>
-                          <div className="flex flex-wrap gap-2">
-                            {QUICK_ACTIONS.map((action) => (
-                              <button
-                                key={action.label}
-                                type="button"
-                                onClick={() => onQuickAction(action.prompt)}
-                                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-all hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
-                              >
-                                {action.label}
-                              </button>
-                            ))}
+              {/* Messages — scrollable, with an absolutely-positioned catch-up affordance that
+                  floats over it rather than scrolling with it */}
+              <div className="relative min-h-0 flex-1">
+                <div ref={messagesContainerRef} onScroll={handleMessagesScroll} className="h-full overflow-y-auto px-5 py-5 space-y-5">
+                  {!messages.length && (
+                    <div className="flex h-full flex-col items-center justify-center gap-6 py-8">
+                      {!agent?.agent.active ? (
+                        <NoKeyBanner projectId={projectId} />
+                      ) : (
+                        <>
+                          <div className="text-center max-w-md">
+                            <div className="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-xl font-bold text-white">Z</div>
+                            <h3 className="text-base font-semibold text-[var(--foreground)]">How can I help?</h3>
+                            <p className="mt-1 text-sm text-[var(--muted)]">
+                              Generate test cases, find coverage gaps, update existing tests, or review your test suite — all through conversation.
+                            </p>
                           </div>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )}
+                          <div className="w-full max-w-2xl">
+                            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">Quick actions</p>
+                            <div className="flex flex-wrap gap-2">
+                              {QUICK_ACTIONS.map((action) => (
+                                <button
+                                  key={action.label}
+                                  type="button"
+                                  onClick={() => onQuickAction(action.prompt)}
+                                  className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-all hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
+                                >
+                                  {action.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
 
-                {messages.map((msg) => (
-                  <MessageBubble
-                    key={msg.id}
-                    message={msg}
-                    projectId={projectId}
-                    backlogSteps={resumeTurnIds[msg.id] ? turnBacklogs[resumeTurnIds[msg.id]] : undefined}
-                    finishedBacklog={messageBacklogs[msg.id]}
-                    onContinue={handleContinue}
-                  />
-                ))}
-                {sending && <ZyraBacklog steps={(sendingTurnId && turnBacklogs[sendingTurnId]) || []} />}
-                {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
-                <div ref={endRef} />
+                  {messages.map((msg) => (
+                    <MessageBubble
+                      key={msg.id}
+                      message={msg}
+                      projectId={projectId}
+                      backlogSteps={resumeTurnIds[msg.id] ? turnBacklogs[resumeTurnIds[msg.id]] : undefined}
+                      finishedBacklog={messageBacklogs[msg.id]}
+                      onContinue={handleContinue}
+                    />
+                  ))}
+                  {sending && <ZyraBacklog steps={(sendingTurnId && turnBacklogs[sendingTurnId]) || []} />}
+                  {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
+                  <div ref={endRef} />
+                </div>
+                {catchUpVisible && (
+                  <button
+                    type="button"
+                    onClick={handleCatchUp}
+                    className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--foreground)] shadow-md transition-all hover:border-[var(--brand-primary)] hover:text-[var(--brand-primary)]"
+                  >
+                    {sending && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--brand-primary)]" />}
+                    catch up
+                    <IconArrowDown size={12} stroke={2} />
+                  </button>
+                )}
               </div>
 
               {/* Input — fixed at bottom */}
