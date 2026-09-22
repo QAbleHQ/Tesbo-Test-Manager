@@ -1497,3 +1497,108 @@ test.describe("bug — selecting a Jira/Linear ticket when reporting a new bug",
     expect(created.externalUrl).toBe("https://example.com/browse/OTHER-9");
   });
 });
+
+/*
+ * Field order — Report a Bug vs Edit Bug.
+ *
+ * "Fix field sequence inconsistency between Log New Bug and Edit Bug": Edit Bug used to render
+ * Status/Severity/Priority/Assign-to as a trailing block after the Jira/Linear section, while
+ * Report a Bug put Severity/Priority/Assign-to right after Description — so editing an existing
+ * bug and reporting a new one showed the same fields in a different order. Both forms must now
+ * read Title -> Description -> Severity -> Priority -> Assign to -> Evidence -> Linked Test
+ * Case(s) & Run(s) -> Where should this be tracked? -> Which system?, with Edit Bug's extra
+ * Status field (there is no "not yet saved" status to edit on create) placed without disturbing
+ * that shared sequence.
+ */
+test.describe("bug — field order matches between Report a Bug and Edit Bug", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** Every <label> inside the open modal's body, in DOM order, whitespace-normalized. */
+  async function modalFieldLabels(page: Page, modalTitle: string): Promise<string[]> {
+    const heading = page.getByRole("heading", { name: modalTitle, exact: true });
+    const body = heading.locator("xpath=following-sibling::div[1]");
+    const raw = await body.locator("label").allTextContents();
+    return raw.map((t) => t.replace(/\s+/g, " ").trim());
+  }
+
+  /** Asserts each expected substring is found, in order, among the given labels. */
+  function assertAscending(labels: string[], expected: string[]) {
+    let last = -1;
+    for (const needle of expected) {
+      const idx = labels.findIndex((label, i) => i > last && label.includes(needle));
+      expect(idx, `expected "${needle}" after index ${last} in [${labels.join(" | ")}]`).toBeGreaterThan(last);
+      last = idx;
+    }
+  }
+
+  const COMMON_ORDER = [
+    "Bug Title",
+    "Description",
+    "Severity",
+    "Priority",
+    "Assign to",
+    "Evidence",
+    "Linked Test Case",
+    "Where should this be tracked?",
+    "Which system?",
+  ];
+
+  test("BUG-U-46 Report a Bug lists fields in the common order", async ({ page }) => {
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+
+    await openReportModal(page, projectId);
+    // Reveals "Which system?" too, so the full common order can be checked in one pass.
+    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+
+    const labels = await modalFieldLabels(page, "Report a Bug");
+    assertAscending(labels, COMMON_ORDER);
+  });
+
+  test("BUG-U-47 Edit Bug lists fields in the same order, with Status added ahead of Severity without disturbing it", async ({ page }) => {
+    const title = `E2E Bug Field Order ${uniqueSuffix()}`;
+    await createBug(api, projectId, { title });
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit bug" }).click();
+    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+
+    const labels = await modalFieldLabels(page, "Edit Bug");
+    assertAscending(labels, COMMON_ORDER);
+
+    // Status has no create-mode equivalent, so it isn't part of COMMON_ORDER — but it still must
+    // sit right after Description and ahead of Severity, not trailing the Jira/Linear section the
+    // way it used to.
+    const statusIdx = labels.findIndex((l) => l === "Status");
+    const descIdx = labels.findIndex((l) => l === "Description");
+    const severityIdx = labels.findIndex((l) => l.includes("Severity"));
+    expect(statusIdx, "Status must be present in Edit Bug").toBeGreaterThan(-1);
+    expect(statusIdx).toBeGreaterThan(descIdx);
+    expect(statusIdx).toBeLessThan(severityIdx);
+  });
+});
