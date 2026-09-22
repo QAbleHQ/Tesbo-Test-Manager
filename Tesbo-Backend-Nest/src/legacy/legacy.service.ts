@@ -10954,7 +10954,7 @@ export class LegacyService implements OnModuleInit {
     if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const messages = await this.db.query(
       `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
-              status, testcases, activity, created_at, review_request_id
+              status, testcases, activity, created_at, review_request_id, resume_attempt
        FROM zyra_chat_messages
        WHERE session_id = $1 AND project_id = $2
        ORDER BY created_at ASC`,
@@ -11169,8 +11169,13 @@ export class LegacyService implements OnModuleInit {
     // no live trace (tracing off, or a path that genuinely has none) simply skip recordReconciliation
     // below rather than needing a dummy value.
     traceMessageId?: string;
+    // How many consecutive resume attempts this message's chain has already burned through — 0 for
+    // every ordinary sendZyraChatMessage insert (a fresh turn), or priorAttempts+1/0 from
+    // processZyraChatResume depending on whether this attempt itself timed out again. See
+    // continueZyraChatMessage's ZYRA_RESUME_ATTEMPT_CAP check.
+    resumeAttempt?: number;
   }): Promise<Body> {
-    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId } = params;
+    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId, resumeAttempt } = params;
     const status = decision.timedOut ? "timed_out" : "completed";
     const resumeCheckpoint = decision.timedOut && decision.resumeCheckpoint ? JSON.stringify(decision.resumeCheckpoint) : null;
     const finalReply = this.finalizeZyraChatReply(decision, applied, testcases);
@@ -11201,9 +11206,9 @@ export class LegacyService implements OnModuleInit {
     }
     const assistant = await this.db.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb)
-       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id`,
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint, resume_attempt)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12)
+       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id, resume_attempt`,
       [
         sessionId,
         projectId,
@@ -11215,7 +11220,8 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(testcases),
         JSON.stringify(activity),
         applied.reviewRequestId || null,
-        resumeCheckpoint
+        resumeCheckpoint,
+        resumeAttempt || 0
       ]
     );
     const item = toCamel(assistant.rows[0]);
@@ -11224,10 +11230,21 @@ export class LegacyService implements OnModuleInit {
     return item;
   }
 
+  /** How many consecutive timeouts/failures a single resume chain tolerates before Continue stops
+   *  offering the identical-size retry and requires an explicit narrowed batch instead. */
+  private static readonly ZYRA_RESUME_ATTEMPT_CAP = 2;
+
   /*
    * Picks a timed-out turn back up. Basecamp-reported symptom: the provider stalled, the request
    * held open with no reply and no error, indistinguishable from "Zyra doesn't respond" (see
-   * ZYRA_ROUTER_TIMEOUT_MS/ZYRA_GENERATE_TIMEOUT_MS). This is what the chat's Continue button calls.
+   * ZYRA_ROUTER_TIMEOUT_MS/zyraGenerateTimeoutMs). This is what the chat's Continue button calls.
+   *
+   * Fire-and-forget, NOT synchronous: a resume can legitimately run for minutes (the same budget
+   * the original attempt had), and holding this HTTP request open for that long is exactly what
+   * made the "Resuming…" button look hung with zero feedback (Basecamp: misleading UX, not a
+   * bug in the generation itself). This claims the row, kicks off the real work in the
+   * background via processZyraChatResume, and returns immediately — the frontend polls
+   * getZyraChatSession (and optionally watches the turnId's SSE progress stream) for the result.
    *
    * Race safety: the UPDATE ... WHERE status = 'timed_out' below is the only thing that decides who
    * gets to resume a given checkpoint. It is a single atomic statement, so a double-click or two
@@ -11237,10 +11254,34 @@ export class LegacyService implements OnModuleInit {
    * the user sends a new message, so Continue can never resolve to a turn the conversation has since
    * moved past.
    */
-  async continueZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, messageId: string) {
+  async continueZyraChatMessage(
+    projectId: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void,
+    narrow?: boolean
+  ): Promise<{ session: Body; accepted: boolean }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId) || !isUuid(messageId)) throw new NotFoundException({ error: "Zyra chat message not found" });
+
+    const current = await this.db.query<{ resume_attempt: number }>(
+      "SELECT resume_attempt FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3",
+      [messageId, sessionId, projectId]
+    );
+    if (!current.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
+    const priorAttempts = Number(current.rows[0].resume_attempt) || 0;
+    // Defensive server-side re-check: the frontend hides the plain Continue button once the cap is
+    // hit, but a stale tab or a direct API call must not be able to bypass it — same "never trust
+    // the client alone" stance as the testcaseRange allow-list.
+    if (priorAttempts >= LegacyService.ZYRA_RESUME_ATTEMPT_CAP && !narrow) {
+      throw new BadRequestException({
+        error: "This turn has timed out repeatedly — try a smaller batch instead of the same size again.",
+        code: "zyra_resume_cap_exceeded"
+      });
+    }
 
     const claim = await this.db.query(
       `UPDATE zyra_chat_messages SET status = 'resuming'
@@ -11252,27 +11293,51 @@ export class LegacyService implements OnModuleInit {
       // Not (or no longer) claimable: already resumed by an earlier click, currently being resumed by
       // a concurrent one, expired by a newer message, or never existed. None of these are errors the
       // user caused right now — hand back the current session so the UI just reflects reality.
-      const existing = await this.db.query("SELECT 1 FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3", [messageId, sessionId, projectId]);
-      if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
-      return { message: null, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: false };
     }
 
     const checkpoint = (claim.rows[0].resume_checkpoint || {}) as Partial<ZyraResumeCheckpoint>;
     const resumeMessage = String(checkpoint.message || "");
-    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     if (!resumeMessage) {
       // A checkpoint with no message text is unusable — revert rather than strand it in 'resuming'.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
       throw new BadRequestException({ error: "This turn has no context to resume from — send a new message instead." });
     }
+    if (narrow) {
+      checkpoint.routedCount = { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false };
+    }
 
+    void this.processZyraChatResume(projectId, uid, userId, sessionId, messageId, checkpoint, priorAttempts, onStage, onSettled)
+      .catch(() => undefined);
+    return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: true };
+  }
+
+  /**
+   * The actual resume work, detached from continueZyraChatMessage's HTTP request — see that
+   * method's doc comment for why. Identical logic to what continueZyraChatMessage used to run
+   * inline, plus threading onStage through for SSE narration and tracking resume_attempt so
+   * repeated failures can eventually be capped.
+   */
+  private async processZyraChatResume(
+    projectId: string,
+    uid: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    checkpoint: Partial<ZyraResumeCheckpoint>,
+    priorAttempts: number,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<void> {
+    const resumeMessage = String(checkpoint.message || "");
+    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     try {
       const decision = checkpoint.stage === "generate"
         ? await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, {
             routedSuite: checkpoint.routedSuite ?? null,
             routedCount: checkpoint.routedCount ?? {}
-          })
-        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId);
+          }, undefined, onStage)
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, onStage);
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11286,18 +11351,29 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
-      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId: checkpointUserMessageId });
+      // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
+      // row; a genuine completion resets it to 0 — see insertZyraAssistantMessage's resumeAttempt
+      // param and the "cap is per-chain" note on continueZyraChatMessage.
+      const nextResumeAttempt = decision.timedOut ? priorAttempts + 1 : 0;
+      const item = await this.insertZyraAssistantMessage({
+        sessionId, projectId, uid, decision, applied, testcases, activity,
+        traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt
+      });
       // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
       // again. A fresh timeout (decision.timedOut again) instead lands on the NEW message's own
       // resume_checkpoint, so Continue keeps working across repeated timeouts.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      onSettled?.({ ok: true, payload: { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) } });
     } catch (err) {
       // Anything that throws here (not a timeout — those are caught inside buildZyraChatDecision and
       // returned as another timed-out decision, not thrown) leaves this checkpoint resumable again
-      // rather than stranding it in 'resuming' forever.
-      await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      throw err;
+      // rather than stranding it in 'resuming' forever. Still counts toward the cap: the user's
+      // experience (clicked Continue, still failed, offered Continue again) is the same either way.
+      await this.db.query(
+        "UPDATE zyra_chat_messages SET status = 'timed_out', resume_attempt = $2 WHERE id = $1 AND status = 'resuming'",
+        [messageId, priorAttempts + 1]
+      );
+      onSettled?.({ ok: false, message: "This turn did not complete." });
     }
   }
 

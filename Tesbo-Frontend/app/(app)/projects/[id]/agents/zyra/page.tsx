@@ -12,15 +12,19 @@ import {
   getZyraAgent,
   getZyraChatSession,
   listZyraChatSessions,
+  openZyraTurnProgress,
   renameZyraChatSession,
   sendZyraChatMessage,
   stopZyraChatPlan,
   resumeZyraChatPlan,
   ZYRA_MESSAGE_TIMED_OUT,
+  ZYRA_MESSAGE_RESUMING,
+  ZYRA_RESUME_ATTEMPT_CAP,
   type ZyraAgentState,
   type ZyraChatMessage,
   type ZyraChatSession,
   type ZyraChatTestcaseRow,
+  type ZyraTurnProgressEvent,
 } from "@/lib/api";
 import {
   Button,
@@ -359,17 +363,25 @@ function resolveContent(message: ZyraChatMessage): { text: string; testcases: Zy
 function MessageBubble({
   message,
   projectId,
+  stageText,
   onContinue,
 }: {
   message: ZyraChatMessage;
   projectId: string;
-  // Only ever invoked from the Continue button below, which only renders for a timed-out turn — the
-  // happy path (a message that answered normally) never touches this prop at all.
-  onContinue: (messageId: string) => Promise<void>;
+  // Latest SSE-narrated stage for THIS message's in-flight resume, if any is known — undefined
+  // whenever this message isn't currently resuming, or no stage event has arrived yet.
+  stageText?: string | null;
+  // Only ever invoked from the Continue affordance below, which only renders for a timed-out turn —
+  // the happy path (a message that answered normally) never touches this prop at all.
+  onContinue: (messageId: string, opts?: { narrow?: boolean }) => Promise<void>;
 }) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
-  const [resuming, setResuming] = useState(false);
+  // Guards only the click-to-ack round trip (fast — the backend responds before the actual resume
+  // finishes) against a double-click; the potentially-minutes-long wait itself is shown by
+  // ResumingBubble below, driven by message.status === ZYRA_MESSAGE_RESUMING from the server, not
+  // by local state — so a second tab watching the same message sees the identical experience.
+  const [clicking, setClicking] = useState(false);
   const { text, testcases, reasoning } = isUser ? { text: message.content, testcases: [], reasoning: null } : resolveContent(message);
 
   function handleCopy() {
@@ -379,13 +391,13 @@ function MessageBubble({
     });
   }
 
-  async function handleContinueClick() {
-    if (resuming) return;
-    setResuming(true);
+  async function handleContinueClick(opts?: { narrow?: boolean }) {
+    if (clicking) return;
+    setClicking(true);
     try {
-      await onContinue(message.id);
+      await onContinue(message.id, opts);
     } finally {
-      setResuming(false);
+      setClicking(false);
     }
   }
 
@@ -400,6 +412,13 @@ function MessageBubble({
         </div>
       </article>
     );
+  }
+
+  // A resume is actually running server-side — no reply content to show yet (the message row still
+  // carries the OLD "I didn't hear back in time" text until the resume lands), so this replaces the
+  // normal bubble entirely rather than sitting alongside stale content and a now-hidden button.
+  if (message.status === ZYRA_MESSAGE_RESUMING) {
+    return <ResumingBubble stageText={stageText} />;
   }
 
   const metaLabel = summarizeTestcaseActions(testcases);
@@ -478,14 +497,73 @@ function MessageBubble({
           {copied ? "Copied" : "Copy"}
         </button>
         {/* Only ever shown for a turn the provider never answered in time — never on a normal reply. */}
-        {message.status === ZYRA_MESSAGE_TIMED_OUT && (
-          <Button type="button" size="sm" variant="ai" onClick={handleContinueClick} disabled={resuming}>
-            {resuming ? "Resuming…" : "Continue"}
+        {message.status === ZYRA_MESSAGE_TIMED_OUT && message.resumeAttempt < ZYRA_RESUME_ATTEMPT_CAP && (
+          <Button type="button" size="sm" variant="ai" onClick={() => void handleContinueClick()} disabled={clicking}>
+            Continue
           </Button>
         )}
         <time className="ml-auto font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt)}</time>
       </div>
+
+      {/* This turn has failed to resume at its original size repeatedly — offering the identical
+          Continue again would just repeat the same multi-minute wait for the same result. A
+          narrowed retry (same size the existing generation-failure retry already uses) is offered
+          instead, with an explicit, deliberate escape hatch back to the original size rather than a
+          hard dead end. */}
+      {message.status === ZYRA_MESSAGE_TIMED_OUT && message.resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP && (
+        <div className="flex flex-col items-start gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-400">
+          <span>
+            This has timed out {message.resumeAttempt + 1} times in a row — the batch may be too large for the provider to finish in time.
+          </span>
+          <div className="flex items-center gap-3">
+            <Button type="button" size="sm" variant="ai" onClick={() => void handleContinueClick({ narrow: true })} disabled={clicking}>
+              Continue with a smaller batch (5 cases)
+            </Button>
+            <button
+              type="button"
+              onClick={() => void handleContinueClick()}
+              disabled={clicking}
+              className="text-[11px] font-medium text-amber-700 underline decoration-dotted hover:text-amber-800 disabled:opacity-50 dark:text-amber-400 dark:hover:text-amber-300"
+            >
+              Try the original size again anyway
+            </button>
+          </div>
+        </div>
+      )}
     </article>
+  );
+}
+
+// ─── ResumingBubble ───────────────────────────────────────────────────────────
+const ZYRA_STAGE_LABELS: Record<string, string> = {
+  received: "Received your request",
+  context: "Gathering project context",
+  routing: "Deciding what to do",
+  generating: "Generating your test cases",
+  staging: "Preparing results",
+  finalizing: "Finishing up",
+};
+
+function ResumingBubble({ stageText }: { stageText?: string | null }) {
+  // Client-observed elapsed time, anchored to when THIS bubble first rendered — not a true
+  // server-side "resume started at" timestamp (no such column exists). Honest for the common case
+  // (the user is watching it live) and still reasonable after a reload mid-resume: it reads as
+  // "this page has been watching it work for Xs", which is true, even if the server-side resume
+  // itself started earlier.
+  const [elapsedSec, setElapsedSec] = useState(0);
+  useEffect(() => {
+    const start = Date.now();
+    const timer = setInterval(() => setElapsedSec(Math.round((Date.now() - start) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return (
+    <div className="flex items-start gap-2">
+      <ZyraMark size={24} />
+      <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 text-xs text-[var(--muted)]">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand-primary)] animate-pulse" />
+        {stageText || "Zyra is working on this…"} — {elapsedSec}s elapsed. A large batch can take a few minutes.
+      </div>
+    </div>
   );
 }
 
@@ -619,6 +697,11 @@ export default function ZyraChatPage() {
   const [agent, setAgent] = useState<ZyraAgentState | null>(null);
   const [sessions, setSessions] = useState<ZyraChatSession[]>([]);
   const [activeSession, setActiveSession] = useState<ZyraChatSession | null>(null);
+  // Latest SSE-narrated stage per in-flight-resume message id. Purely a display enhancement — a
+  // message never stuck showing a stale label once its resume settles, since ResumingBubble itself
+  // stops rendering the moment message.status leaves "resuming" (driven by the poller below), at
+  // which point this entry is simply never read again.
+  const [resumeStages, setResumeStages] = useState<Record<string, string>>({});
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
   // Keyed by session id, not a single flag, so an in-flight send in one conversation never shows
@@ -762,6 +845,26 @@ export default function ZyraChatPage() {
     return () => clearInterval(interval);
   }, [isPlanRunning, activeSessionId, projectId]);
 
+  // Durable fallback for a Continue resume running in the background (see continueZyraChatMessage)
+  // — SSE (openZyraTurnProgress) is a pure enhancement that can legitimately say nothing (feature
+  // flag off, a reload lost the turnId, a network blip); this poll is what actually detects
+  // completion regardless, the same "watch a detached background job" shape the task-board page
+  // uses (5s, paused while the tab is hidden, in-flight-guarded so overlapping ticks never stack).
+  const hasResumingMessage = (activeSession?.messages || []).some((m) => m.status === ZYRA_MESSAGE_RESUMING);
+  const resumePollInFlightRef = useRef(false);
+  useEffect(() => {
+    if (!hasResumingMessage || !activeSessionId) return;
+    const interval = setInterval(() => {
+      if (resumePollInFlightRef.current || document.hidden) return;
+      resumePollInFlightRef.current = true;
+      getZyraChatSession(projectId, activeSessionId)
+        .then((fresh) => setActiveSession((prev) => (prev && prev.id === activeSessionId ? fresh : prev)))
+        .catch(() => undefined)
+        .finally(() => { resumePollInFlightRef.current = false; });
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [hasResumingMessage, activeSessionId, projectId]);
+
   async function submitMessage(text: string) {
     if (!activeSession || !text.trim() || pendingSessionIds.has(activeSession.id)) return;
     const sessionId = activeSession.id;
@@ -782,6 +885,7 @@ export default function ZyraChatPage() {
       testcases: [],
       activity: [],
       createdAt: new Date().toISOString(),
+      resumeAttempt: 0,
     };
     // Guarded by session id, not just truthiness: if the user has switched to a different
     // conversation by the time this resolves, that conversation's view must not be touched.
@@ -806,18 +910,62 @@ export default function ZyraChatPage() {
 
   // Resumes a turn the provider never answered in time (message.status === ZYRA_MESSAGE_TIMED_OUT).
   // Deliberately does not touch `sending`/ThinkingBubble — those drive the normal send/response cycle,
-  // and this is a distinct, per-message action (MessageBubble tracks its own "Resuming…" state) so a
+  // and this is a distinct, per-message action (MessageBubble tracks its own click-guard state) so a
   // Continue click can never look like or interfere with an ordinary in-flight send.
-  async function handleContinue(messageId: string) {
+  //
+  // Fire-and-forget on the backend: this call itself returns fast (`accepted` tells us whether OUR
+  // click is the one driving the resume), and the actual multi-minute work is watched afterward via
+  // the resume-poller above plus, when accepted, a best-effort SSE progress stream — never awaited
+  // here, since the whole point is to never hold this promise open for minutes again.
+  async function handleContinue(messageId: string, opts?: { narrow?: boolean }) {
     if (!activeSession) return;
     setError(null);
+    const sessionId = activeSession.id;
+    const turnId = crypto.randomUUID();
     try {
-      const result = await continueZyraChatMessage(projectId, activeSession.id, messageId);
-      setActiveSession(result.session);
+      const result = await continueZyraChatMessage(projectId, sessionId, messageId, { turnId, narrow: opts?.narrow });
+      setActiveSession((prev) => (prev && prev.id === sessionId ? result.session : prev));
       void refreshSessions();
+      if (result.accepted) watchZyraTurnProgress(sessionId, messageId, turnId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not resume that turn — try again.");
     }
+  }
+
+  // Opens the SSE stream for one Continue's turnId and mirrors its stage narration into
+  // resumeStages, keyed by messageId. Order matters here (see zyra-progress.service.ts's own doc
+  // comment): the POST above has already been awaited by the time this runs, so the progress
+  // entry is guaranteed to exist before this subscribes — never the reverse. Closes itself on any
+  // terminal event so the browser's default EventSource auto-reconnect never keeps hammering a
+  // turn that has already finished.
+  function watchZyraTurnProgress(sessionId: string, messageId: string, turnId: string) {
+    const source = openZyraTurnProgress(projectId, sessionId, turnId);
+    const stop = () => {
+      source.close();
+      setResumeStages((prev) => {
+        if (!(messageId in prev)) return prev;
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+    };
+    source.onmessage = (evt) => {
+      let event: ZyraTurnProgressEvent;
+      try {
+        event = JSON.parse(evt.data) as ZyraTurnProgressEvent;
+      } catch {
+        return;
+      }
+      if (event.kind === "stage") {
+        setResumeStages((prev) => ({ ...prev, [messageId]: ZYRA_STAGE_LABELS[event.stage] || event.stage }));
+        return;
+      }
+      // complete / error / unknown are all terminal for this stream — the poller (or the fresh
+      // session this "complete" event's own payload implies) is what actually renders the
+      // outcome, this side channel's only job past this point is to stop cleanly.
+      stop();
+    };
+    source.onerror = stop;
   }
 
   function onSubmit(event: FormEvent) {
@@ -1061,7 +1209,9 @@ export default function ZyraChatPage() {
                   </div>
                 )}
 
-                {messages.map((msg) => <MessageBubble key={msg.id} message={msg} projectId={projectId} onContinue={handleContinue} />)}
+                {messages.map((msg) => (
+                  <MessageBubble key={msg.id} message={msg} projectId={projectId} stageText={resumeStages[msg.id]} onContinue={handleContinue} />
+                ))}
                 {sending && <ThinkingBubble />}
                 {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
                 <div ref={endRef} />
