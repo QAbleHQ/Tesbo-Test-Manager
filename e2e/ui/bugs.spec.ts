@@ -1395,3 +1395,105 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
   });
 });
+
+/*
+ * The New Bug / Report a Bug flow's own Jira/Linear selection — the same plain-URL-box gap Edit
+ * Bug had (see "bug — editing the linked Jira/Linear ticket" above), but on the create side:
+ * "Where should this be tracked?" -> "I'll log it in my task management system myself" ->
+ * Jira/Linear used to be a manual URL field with no search, and handleCreate() always sent
+ * integrationIssueKey: null. This reuses the identical IssuePickerModal "single" mode fix.
+ */
+test.describe("bug — selecting a Jira/Linear ticket when reporting a new bug", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-44 reporting a new bug can select a Jira ticket via the searchable picker, and requires one before saving", async ({ page }) => {
+    const title = `E2E Bug Create Jira Pick ${uniqueSuffix()}`;
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: { list: [{ provider: "JIRA", key: "NEW-1", summary: "Newly filed ticket", status: "Open", url: "https://e2e.atlassian.net/browse/NEW-1" }] },
+      }),
+    );
+
+    await openReportModal(page, projectId);
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+
+    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+    await page.getByRole("button", { name: "Jira", exact: true }).click();
+
+    // A searchable picker, not the plain URL box — and both Jira and Linear are offered.
+    await expect(page.getByRole("button", { name: "Linear", exact: true })).toBeVisible();
+    await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
+    await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
+
+    const submit = page.getByRole("button", { name: "Report Bug" }).last();
+    await expect(submit).toBeDisabled();
+    await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Select issue" }).click();
+    await expect(page.getByRole("heading", { name: "Select Jira ticket" })).toBeVisible();
+    const picker = page.getByTestId("issue-picker");
+    await picker.locator("label", { hasText: "Newly filed ticket" }).click();
+    await picker.getByRole("button", { name: "Select" }).click();
+
+    await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toHaveCount(0);
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created, "the newly reported bug").toBeTruthy();
+    expect(created.integrationProvider).toBe("JIRA");
+    expect(created.integrationIssueKey).toBe("NEW-1");
+    expect(created.externalUrl).toBe("https://e2e.atlassian.net/browse/NEW-1");
+  });
+
+  test("BUG-U-45 Other keeps the plain URL box on the create form, unaffected by the Jira/Linear picker", async ({ page }) => {
+    const title = `E2E Bug Create Other Url ${uniqueSuffix()}`;
+
+    await page.route(`**/api/projects/${projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+
+    await openReportModal(page, projectId);
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+
+    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+    await page.getByRole("button", { name: "Other", exact: true }).click();
+
+    const urlBox = page.getByPlaceholder("https://example.com/browse/BUG-123");
+    await expect(urlBox).toBeVisible();
+    await urlBox.fill("https://example.com/browse/OTHER-9");
+
+    const submit = page.getByRole("button", { name: "Report Bug" }).last();
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    const created = bugs.find((b: { title: string }) => b.title === title);
+    expect(created.integrationProvider).toBeNull();
+    expect(created.externalUrl).toBe("https://example.com/browse/OTHER-9");
+  });
+});

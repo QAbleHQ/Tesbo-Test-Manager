@@ -93,6 +93,7 @@ type Body = Record<string, unknown>;
 type StaticInternals = {
   zyraUngroundedNote: (count: number) => string;
   zyraWeakGroundingNote: (count: number) => string;
+  zyraGenerateTimeoutMs: (requestedCount: number) => number;
 };
 
 function staticInternals(): StaticInternals {
@@ -605,5 +606,73 @@ describe("Zyra draft technique tagging — normalizeZyraTechniques", () => {
     const drafts = internals(svc).normalizeAiDrafts(raw, 10);
     expect(drafts).toHaveLength(1);
     expect(drafts[0].techniques).toEqual(["general"]);
+  });
+});
+
+/*
+ * Basecamp: with the Zyra settings default changed from "1-10" to "30-50", generation started
+ * timing out at the "generate" stage — the provider budget (zyraGenerateTimeoutMs, née the flat
+ * ZYRA_GENERATE_TIMEOUT_MS constant) never scaled with how much was actually requested, so a
+ * 40-testcase batch got the same 180s a 5-testcase batch did, even though it has to fill much
+ * closer to the same max_tokens=16000 ceiling and so genuinely takes longer to finish.
+ */
+describe("Zyra generation timeout scales with how much was requested", () => {
+  let svc: LegacyService;
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    svc = makeLegacy();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("matches the old fixed 180s budget for a batch at or under the old default (10)", () => {
+    expect(staticInternals().zyraGenerateTimeoutMs(1)).toBe(180_000);
+    expect(staticInternals().zyraGenerateTimeoutMs(5)).toBe(180_000);
+    expect(staticInternals().zyraGenerateTimeoutMs(10)).toBe(180_000);
+  });
+
+  it("grows for a larger batch and caps at 360s", () => {
+    // 40 = the new "30-50" tier's requestedCount.
+    expect(staticInternals().zyraGenerateTimeoutMs(40)).toBe(315_000);
+    // 50 = the "all" tier's requestedCount — the point the new formula caps at.
+    expect(staticInternals().zyraGenerateTimeoutMs(50)).toBe(360_000);
+    // A malformed/oversized requestedCount must never demand an unbounded wait.
+    expect(staticInternals().zyraGenerateTimeoutMs(999)).toBe(360_000);
+  });
+
+  it("OpenAI: a 40-testcase request gets a longer provider timeout than a 10-testcase one", async () => {
+    const timeoutSpy = jest.spyOn(AbortSignal, "timeout");
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) } }], usage: {} })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 40 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(315_000);
+
+    timeoutSpy.mockClear();
+    await internals(svc).generateZyraWithOpenAi({ provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 10 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+  });
+
+  it("Anthropic: a 40-testcase request gets a longer provider timeout than a 10-testcase one", async () => {
+    const timeoutSpy = jest.spyOn(AbortSignal, "timeout");
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => null },
+      json: () => Promise.resolve({ content: [{ type: "text", text: JSON.stringify({ drafts: [{ title: "x", stepsJson: "[]" }] }) }], usage: {} })
+    }) as unknown as typeof fetch;
+
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 40 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(315_000);
+
+    timeoutSpy.mockClear();
+    await internals(svc).generateZyraWithAnthropic({ provider: "anthropic", model: "claude-sonnet", apiKey: "sk-test", projectId: "p1", input: { ...emptyInput(), requestedCount: 10 } });
+    expect(timeoutSpy).toHaveBeenCalledWith(180_000);
   });
 });

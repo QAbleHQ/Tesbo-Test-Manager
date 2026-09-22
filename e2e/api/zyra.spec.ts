@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext, type APIResponse } from "@playwright/test";
 import { column, exec, literal, scalar } from "../utils/psql";
+import { purgeProject } from "../utils/seed";
 import {
   anonymousContext,
   loginAs,
@@ -173,7 +174,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * expect once a row carries chat_session_id (legacy.service.ts applyZyraChatOperations) — NOT
    * the flat AiGeneratedDraft shape seedTask()'s Task-board rows use.
    */
-  function seedChatReviewTask(options: { status?: string; entries?: Array<Record<string, unknown>> } = {}): {
+  function seedChatReviewTask(
+    options: { status?: string; entries?: Array<Record<string, unknown>>; savedCount?: number } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
@@ -203,9 +206,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     ];
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        "requested_count, generated_count, saved_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
         `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', ` +
-        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ` +
+        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ${options.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(entries))}::jsonb, 'Zyra the Test Generator', ` +
         `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
     );
@@ -452,9 +455,26 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(JSON.stringify(agent)).toContain("10-30");
   });
 
+  test("ZYR-A-09b the 30-50 tier round-trips the same way as every other range", { tag: '@tesbo.testId("TES-TC-603")' }, async () => {
+    const res = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "30-50" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `updating settings — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(body.testcaseRange).toBe("30-50");
+    expect(body.testcaseCount).toBe(40);
+
+    const agent = await (await asOwner.get(url("/agents/zyra"))).json();
+    expect(agent.settings.testcaseRange).toBe("30-50");
+    expect(agent.settings.testcaseCount).toBe(40);
+  });
+
   test("ZYR-A-10 an unknown testcaseRange falls back instead of being stored", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
-    // The valid set is minimum / 1-10 / 10-30 / all. A value outside it must not reach the settings
-    // JSON, or the generation step later reads a range it cannot interpret.
+    // The valid set is 1-10 / 10-30 / 30-50 / all. A value outside it must not reach the settings
+    // JSON, or the generation step later reads a range it cannot interpret. The removed "minimum"
+    // tier is exercised here too — it is now just another unrecognized string, the same as any
+    // other invalid value, and must not be stored or silently reinterpreted.
     await asOwner.patch(url("/agents/zyra/settings"), { data: { testcaseRange: "all" }, failOnStatusCode: false });
     const res = await asOwner.patch(url("/agents/zyra/settings"), {
       data: { testcaseRange: "everything-please" },
@@ -466,6 +486,37 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
     );
     expect(stored, "an invalid range was written to the project settings").not.toContain("everything-please");
+
+    const minimumRes = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "minimum" },
+      failOnStatusCode: false,
+    });
+    expect(minimumRes.status()).toBeLessThan(500);
+    const minimumBody = await minimumRes.json();
+    expect(minimumBody.testcaseRange, "the removed 'minimum' tier must not be accepted").not.toBe("minimum");
+
+    const storedAfterMinimum = scalar(
+      `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
+    );
+    expect(storedAfterMinimum, "the removed 'minimum' tier reached the stored settings").not.toContain('"minimum"');
+  });
+
+  test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
+    // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
+    // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
+    const created = await asOwner.post("/api/projects", {
+      data: { name: `E2E Zyra Default Range ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), await created.text()).toBe(201);
+    const project = await created.json();
+    try {
+      const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
+      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
+      expect(agent.settings.testcaseCount).toBe(40);
+    } finally {
+      purgeProject(project.id);
+    }
   });
 
   // ─── Chat sessions ────────────────────────────────────────────────────────
@@ -1191,16 +1242,66 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   );
 
   test(
-    "ZYR-A-81 chat-created testcases never feed the task-board approval rate",
+    "ZYR-A-81 a chat-approved batch counts toward the approval rate exactly like a task-board save",
     { tag: '@tesbo.testId("TES-TC-1221")' },
     async () => {
-      // A chat-staged row (chat_session_id set) must not be picked up by the task-board aggregate —
-      // chat has no comparable generated-vs-saved concept, and `tasks` elsewhere on this same payload
-      // already excludes these rows for the same reason (chat_session_id IS NULL).
-      seedChatReviewTask({ status: "done" });
-      expect(await approvalRate(), "a chat-staged batch leaked into the task-board approval rate").toBeNull();
+      /*
+       * "[Zyra] Approval Rate does not update after approving additional test cases" — reproduced
+       * against the ZYR-A-75 fix itself: that fix scoped the aggregate to `chat_session_id IS NULL`
+       * on the theory that chat "has no comparable generated-vs-saved concept". It does: chat
+       * proposals are inserted into this same table with a real generated_count
+       * (applyZyraChatOperations), and approving them in the Agent workspace calls the exact same
+       * aiSave route the task board uses (ZyraChatReviewPanel -> saveZyraTask), which increments
+       * saved_count and sets task_status = 'done' with no branch on chat_session_id at all. So a
+       * chat-approved batch is byte-for-byte the same shape as a task-board one once saved, and
+       * excluding it is what left the tile frozen for anyone whose whole workflow is the chat panel.
+       */
+      seedChatReviewTask({ status: "done", savedCount: 1 });
+      expect(await approvalRate(), "an approved chat batch did not count toward the rate").toBe(100);
     },
   );
+
+  test("ZYR-A-83 the rate aggregates chat and task-board saves together, not just one or the other", async () => {
+    seedTask({ drafts: 2, savedCount: 1, status: "done" });
+    seedChatReviewTask({
+      status: "done",
+      savedCount: 1,
+      entries: [
+        { opType: "create", draft: { title: "E2E chat draft A" }, reason: "" },
+        { opType: "create", draft: { title: "E2E chat draft B" }, reason: "" },
+      ],
+    });
+    // 1 saved of 2 (task board) + 1 saved of 2 (chat) = 2 of 4 = 50%.
+    expect(await approvalRate(), "chat and task-board saves did not aggregate into one rate").toBe(50);
+  });
+
+  test(
+    "ZYR-A-84 closing a chat batch without saving, through the real route, still counts its drafts as unapproved",
+    async () => {
+      // Mirrors ZYR-A-80's task-board close, but through a chat-staged row — zyraCloseTask branches
+      // on nothing chat-specific, so this must resolve to 'done' with saved_count 0 exactly the same.
+      const { taskId } = seedChatReviewTask({ status: "in_review" });
+      const closeRes = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/close`), { failOnStatusCode: false });
+      expect(closeRes.status(), `closing a chat batch without saving — ${await closeRes.text()}`).toBe(201);
+      expect(
+        scalar(`SELECT task_status, saved_count FROM ai_generation_requests WHERE id = ${literal(taskId)};`),
+      ).toBe("done");
+
+      seedTask({ drafts: 1, savedCount: 1, status: "done" });
+      // 1 saved of 1 (task board) + 0 saved of 1 (closed chat batch) = 1 of 2 = 50%.
+      expect(
+        await approvalRate(),
+        "a closed-without-saving chat batch was not counted as generated-but-unapproved",
+      ).toBe(50);
+    },
+  );
+
+  test("ZYR-A-85 a chat batch still awaiting review does not drag the rate down before anything is decided", async () => {
+    // Same reasoning as ZYR-A-77's task-board case, now for the origin that used to be exempt from
+    // this aggregate entirely — an undecided chat batch must be excluded, not counted as 0% approved.
+    seedChatReviewTask({ status: "in_review" });
+    expect(await approvalRate(), "a pending chat batch was counted as 0% approved instead of being excluded").toBeNull();
+  });
 
   test(
     "ZYR-A-82 the approval rate is scoped per project — a second tenant's saves never leak in",

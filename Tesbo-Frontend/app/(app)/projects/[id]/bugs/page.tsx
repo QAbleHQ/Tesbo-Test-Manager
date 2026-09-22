@@ -466,6 +466,22 @@ export default function BugsPage() {
   const [createDestination, setCreateDestination] = useState<TrackingDestination>("TESBO");
   const [createSelfSystem, setCreateSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [createUrl, setCreateUrl] = useState("");
+  // Same searchable-picker treatment as Edit Bug's editSelectedIssue/editIssuePickerOpen (see
+  // handleEditSystemChange) — kept as its own state rather than shared, since Create and Edit
+  // reset independently and must not bleed into each other.
+  const [createSelectedIssue, setCreateSelectedIssue] = useState<IssueSearchResult | null>(null);
+  const [createIssuePickerOpen, setCreateIssuePickerOpen] = useState(false);
+
+  function handleCreateSystemChange(system: SelfLoggedSystem) {
+    setCreateSelfSystem(system);
+    setCreateSelectedIssue((prev) => {
+      if (prev && prev.provider !== system) {
+        setCreateUrl("");
+        return null;
+      }
+      return prev;
+    });
+  }
   const [createEvidenceMode, setCreateEvidenceMode] = useState<EvidenceMode>("FILES");
   const [createStagedFiles, setCreateStagedFiles] = useState<File[]>([]);
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
@@ -653,6 +669,8 @@ export default function BugsPage() {
     setCreateDestination("TESBO");
     setCreateSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setCreateUrl("");
+    setCreateSelectedIssue(null);
+    setCreateIssuePickerOpen(false);
     setCreateEvidenceMode("FILES");
     setCreateStagedFiles([]);
     setCreateBetterbugsUrl("");
@@ -661,7 +679,7 @@ export default function BugsPage() {
 
   /* create */
   async function handleCreate() {
-    if (!createTitle.trim() || (hasTestRuns && !createLinks.length)) return;
+    if (!createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired) return;
     // Belt-and-suspenders alongside the button's `disabled={creating}`: guards a re-entrant call
     // (e.g. a key-repeat Enter) that lands before the disabled state has re-rendered.
     if (creating) return;
@@ -681,7 +699,7 @@ export default function BugsPage() {
           assigneeId: createAssigneeId || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
           integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
-          integrationIssueKey: null,
+          integrationIssueKey: selfLogged && createSelfSystem !== "OTHER" ? createSelectedIssue?.key || null : null,
           betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
           links: createLinks.map((link) => ({
             testcaseId: link.testcaseId,
@@ -820,6 +838,13 @@ export default function BugsPage() {
     editDestination === "SELF" &&
     (editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") &&
     !editSelectedIssue;
+  // Same rule for Create: picking Jira/Linear as the system requires an actual ticket before
+  // Report Bug is enabled, so a fresh bug can't be saved with a provider set and no key.
+  const createIssueRequired =
+    (jiraConnected || linearConnected) &&
+    createDestination === "SELF" &&
+    (createSelfSystem === "JIRA" || createSelfSystem === "LINEAR") &&
+    !createSelectedIssue;
 
   return (
     <div className="min-h-screen bg-[var(--background)]">
@@ -1467,9 +1492,56 @@ export default function BugsPage() {
               jiraConnected={jiraConnected}
               linearConnected={linearConnected}
               system={createSelfSystem}
-              onSystemChange={setCreateSelfSystem}
+              onSystemChange={handleCreateSystemChange}
               url={createUrl}
               onUrlChange={setCreateUrl}
+              renderUrlField={(system, defaultField) => {
+                if (system === "OTHER") return defaultField;
+                return (
+                  <div className="mt-2 space-y-1">
+                    <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
+                      {createSelectedIssue ? (
+                        <a
+                          href={createSelectedIssue.url || createUrl || undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="truncate text-[var(--foreground)] hover:underline"
+                        >
+                          {createSelectedIssue.key}
+                          {createSelectedIssue.summary ? ` — ${createSelectedIssue.summary}` : ""}
+                        </a>
+                      ) : (
+                        <span className="text-[var(--muted)]">No issue selected.</span>
+                      )}
+                      <Button type="button" size="sm" variant="secondary" onClick={() => setCreateIssuePickerOpen(true)}>
+                        {createSelectedIssue ? "Change issue" : "Select issue"}
+                      </Button>
+                    </div>
+                    {createIssueRequired && (
+                      <p className="text-[13px] text-[var(--error-foreground)]">
+                        Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
+            />
+          )}
+          {(createSelfSystem === "JIRA" || createSelfSystem === "LINEAR") && (
+            <IssuePickerModal
+              projectId={projectId}
+              testcaseId={null}
+              cycleId={null}
+              provider={createSelfSystem}
+              open={createIssuePickerOpen}
+              onClose={() => setCreateIssuePickerOpen(false)}
+              selectedIssues={createSelectedIssue ? [createSelectedIssue] : []}
+              mode="single"
+              onConfirm={(issues) => {
+                const issue = issues[0] ?? null;
+                setCreateSelectedIssue(issue);
+                setCreateUrl(issue?.url ?? "");
+              }}
             />
           )}
           <div className="flex justify-end gap-2 pt-2">
@@ -1479,7 +1551,7 @@ export default function BugsPage() {
             <Button
               variant="primary"
               onClick={handleCreate}
-              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length)}
+              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired}
             >
               {creating ? "Creating…" : "Report Bug"}
             </Button>

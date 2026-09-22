@@ -325,6 +325,69 @@ test.describe("auto bug-filing on Failed", () => {
   });
 
   /*
+   * The OTHER path into Jira/Linear from this same dialog: "No, log a new one" -> "I'll log it in
+   * my task management system myself" -> Jira/Linear used to be a plain URL text box with no
+   * search, and handleBugSubmit() always sent integrationIssueKey: null regardless of what was
+   * typed there. This applies the same searchable-picker fix already covered for Edit/Create Bug
+   * (e2e/ui/bugs.spec.ts) to the run drawer's Log Bug modal's self-logged fields.
+   */
+  test("the self-logged Jira system in Log Bug offers a searchable picker, and requires a pick before saving", async ({ page }) => {
+    const title = `UI Log Bug Self Jira ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    await page.route(`**/api/projects/${ctx.projectId}/jira/status`, (route) => route.fulfill({ json: { connected: true } }));
+    await page.route(`**/api/projects/${ctx.projectId}/linear/status`, (route) => route.fulfill({ json: { connected: false } }));
+    await page.route(`**/api/projects/${ctx.projectId}/jira/search-issues**`, (route) =>
+      route.fulfill({
+        json: { list: [{ provider: "JIRA", key: "SELF-1", summary: "Self logged pick", status: "Open", url: "https://e2e.atlassian.net/browse/SELF-1" }] },
+      }),
+    );
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByRole("row", { name: title }).getByRole("combobox").selectOption("Failed");
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
+
+      await page.getByRole("button", { name: "No, log a new one" }).click();
+      await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
+
+      // Jira is already the active system (connected, Linear isn't) — the field must be the
+      // picker, not the plain URL box.
+      await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
+      await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
+
+      const submit = page.getByRole("button", { name: "File Bug" });
+      await expect(submit).toBeDisabled();
+      await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toBeVisible();
+
+      await page.getByRole("button", { name: "Select issue" }).click();
+      await expect(page.getByRole("heading", { name: "Select Jira ticket" })).toBeVisible();
+      const picker = page.getByTestId("issue-picker");
+      await picker.locator("label", { hasText: "Self logged pick" }).click();
+      await picker.getByRole("button", { name: "Select" }).click();
+
+      await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toHaveCount(0);
+      await expect(submit).toBeEnabled();
+      await submit.click();
+      await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+        const filedBug = bugs.find((b: { title: string }) => b.title === `Failed: ${title}`);
+        expect(filedBug, "the bug filed against this execution").toBeTruthy();
+        expect(filedBug.integrationProvider).toBe("JIRA");
+        expect(filedBug.integrationIssueKey).toBe("SELF-1");
+        expect(filedBug.externalUrl).toBe("https://e2e.atlassian.net/browse/SELF-1");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
    * Regression: IssuePickerModal used to own its own Jira/Linear toggle and default to whichever
    * tracker connected first (Jira), ignoring the tracker the user had just picked on the Report a
    * Bug form ("Jira ticket" vs "Linear ticket"). With both trackers connected, choosing "Linear

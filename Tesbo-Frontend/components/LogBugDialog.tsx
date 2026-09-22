@@ -201,6 +201,12 @@ export function useLogBugDialog(params: {
   const [bugDestination, setBugDestination] = useState<TrackingDestination>("TESBO");
   const [bugSelfSystem, setBugSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [bugUrl, setBugUrl] = useState("");
+  // The searchable picker for the "No, log a new one" self-logged flow — separate from
+  // selectedIssues/showBugIssuePicker above, which belong to the "Yes, link existing" tabs and are
+  // multi-select. This is single-select, same shape as Edit/Create Bug's own pickers in
+  // projects/[id]/bugs/page.tsx.
+  const [bugSelfSelectedIssue, setBugSelfSelectedIssue] = useState<IssueSearchResult | null>(null);
+  const [bugSelfIssuePickerOpen, setBugSelfIssuePickerOpen] = useState(false);
   const [selectedIssues, setSelectedIssues] = useState<IssueSearchResult[]>([]);
   const [showBugIssuePicker, setShowBugIssuePicker] = useState(false);
   const [selectedExistingBugs, setSelectedExistingBugs] = useState<BugItem[]>([]);
@@ -237,6 +243,8 @@ export function useLogBugDialog(params: {
     setBugDestination("TESBO");
     setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setBugUrl("");
+    setBugSelfSelectedIssue(null);
+    setBugSelfIssuePickerOpen(false);
     setSelectedIssues([]);
     setSelectedExistingBugs([]);
     setBugEvidenceMode("FILES");
@@ -266,6 +274,8 @@ export function useLogBugDialog(params: {
     setBugDestination("TESBO");
     setBugSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setBugUrl("");
+    setBugSelfSelectedIssue(null);
+    setBugSelfIssuePickerOpen(false);
     setSelectedIssues([]);
     setSelectedExistingBugs([]);
     setBugEvidenceMode("FILES");
@@ -273,11 +283,25 @@ export function useLogBugDialog(params: {
     setBugBetterbugsUrl("");
   }
 
+  // Switching Jira <-> Linear (or Other) in the self-logged fields has to drop a previously-picked
+  // issue that belongs to a different provider — same rule as Edit/Create Bug's handler — or a
+  // Jira key could get submitted under integrationProvider: "LINEAR".
+  function handleBugSelfSystemChange(system: SelfLoggedSystem) {
+    setBugSelfSystem(system);
+    setBugSelfSelectedIssue((prev) => {
+      if (prev && prev.provider !== system) {
+        setBugUrl("");
+        return null;
+      }
+      return prev;
+    });
+  }
+
   /* ───── Submit bug from dialog ("No, log a new one" — optionally noting where it's tracked
    * elsewhere via the self-logged fields). "Yes, link existing" never reaches this: it goes
    * through handleLinkExisting below regardless of which tab (Tesbo/Jira/Linear) is active. ───── */
   async function handleBugSubmit() {
-    if (!bugExecution || !bugTitle.trim() || !bugSeverity) return;
+    if (!bugExecution || !bugTitle.trim() || !bugSeverity || bugSelfIssueRequired) return;
     // Belt-and-suspenders alongside the button's `disabled={bugSaving}`: guards a re-entrant call
     // that lands before the disabled state has re-rendered.
     if (bugSaving) return;
@@ -297,7 +321,7 @@ export function useLogBugDialog(params: {
           assigneeId: bugAssigneeId || null,
           externalUrl: selfLogged ? bugUrl.trim() : undefined,
           integrationProvider: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSystem : null,
-          integrationIssueKey: null,
+          integrationIssueKey: selfLogged && bugSelfSystem !== "OTHER" ? bugSelfSelectedIssue?.key || null : null,
           betterbugsUrl: bugEvidenceMode === "BETTERBUGS" ? bugBetterbugsUrl.trim() : undefined,
           links: [{ testcaseId: bugExecution.testcaseId, cycleId, executionId: bugExecution.id }],
         });
@@ -393,6 +417,13 @@ export function useLogBugDialog(params: {
   const activeProvider: "JIRA" | "LINEAR" = bugExistingChoice === "LINEAR" ? "LINEAR" : "JIRA";
   const activeProviderLabel = activeProvider === "JIRA" ? "Jira" : "Linear";
   const totalSelected = selectedExistingBugs.length + selectedIssues.length;
+  // Same rule as Edit/Create Bug: picking Jira/Linear as the self-logged system requires an actual
+  // ticket before File Bug is enabled, so a fresh bug can't be saved with a provider and no key.
+  const bugSelfIssueRequired =
+    (jiraConnected || linearConnected) &&
+    bugDestination === "SELF" &&
+    (bugSelfSystem === "JIRA" || bugSelfSystem === "LINEAR") &&
+    !bugSelfSelectedIssue;
 
   const dialog = (
     <>
@@ -638,9 +669,56 @@ export function useLogBugDialog(params: {
                       jiraConnected={jiraConnected}
                       linearConnected={linearConnected}
                       system={bugSelfSystem}
-                      onSystemChange={setBugSelfSystem}
+                      onSystemChange={handleBugSelfSystemChange}
                       url={bugUrl}
                       onUrlChange={setBugUrl}
+                      renderUrlField={(system, defaultField) => {
+                        if (system === "OTHER") return defaultField;
+                        return (
+                          <div className="mt-2 space-y-1">
+                            <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
+                              {bugSelfSelectedIssue ? (
+                                <a
+                                  href={bugSelfSelectedIssue.url || bugUrl || undefined}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="truncate text-[var(--foreground)] hover:underline"
+                                >
+                                  {bugSelfSelectedIssue.key}
+                                  {bugSelfSelectedIssue.summary ? ` — ${bugSelfSelectedIssue.summary}` : ""}
+                                </a>
+                              ) : (
+                                <span className="text-[var(--muted)]">No issue selected.</span>
+                              )}
+                              <Button type="button" size="sm" variant="secondary" onClick={() => setBugSelfIssuePickerOpen(true)}>
+                                {bugSelfSelectedIssue ? "Change issue" : "Select issue"}
+                              </Button>
+                            </div>
+                            {bugSelfIssueRequired && (
+                              <p className="text-[13px] text-[var(--error-foreground)]">
+                                Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
+                              </p>
+                            )}
+                          </div>
+                        );
+                      }}
+                    />
+                  )}
+                  {(bugSelfSystem === "JIRA" || bugSelfSystem === "LINEAR") && (
+                    <IssuePickerModal
+                      projectId={projectId}
+                      testcaseId={null}
+                      cycleId={null}
+                      provider={bugSelfSystem}
+                      open={bugSelfIssuePickerOpen}
+                      onClose={() => setBugSelfIssuePickerOpen(false)}
+                      selectedIssues={bugSelfSelectedIssue ? [bugSelfSelectedIssue] : []}
+                      mode="single"
+                      onConfirm={(issues) => {
+                        const issue = issues[0] ?? null;
+                        setBugSelfSelectedIssue(issue);
+                        setBugUrl(issue?.url ?? "");
+                      }}
                     />
                   )}
                 </>
@@ -668,7 +746,7 @@ export function useLogBugDialog(params: {
               <Button
                 variant="destructive"
                 onClick={handleBugSubmit}
-                disabled={bugSaving || !bugTitle.trim() || !bugSeverity}
+                disabled={bugSaving || !bugTitle.trim() || !bugSeverity || bugSelfIssueRequired}
               >
                 {bugSaving ? (
                   "Filing…"
