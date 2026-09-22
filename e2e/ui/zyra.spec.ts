@@ -1914,7 +1914,9 @@ test.describe("zyra / agents (UI)", () => {
     seedResumeMessage("resuming");
     const page = await open(browser, "/agents/zyra");
 
-    await expect(page.getByText(/Zyra is working on this/)).toBeVisible();
+    // Case-insensitive: the redesigned backlog uses a lowercase, log-style "zyra is working on
+    // this" line rather than sentence-cased prose.
+    await expect(page.getByText(/zyra is working on this/i)).toBeVisible();
     // The old static, disabled "Resuming…" button no longer exists in any form.
     await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
     await expect(page.getByText(/Resuming…/)).toHaveCount(0);

@@ -364,14 +364,19 @@ function MessageBubble({
   message,
   projectId,
   backlogSteps,
+  finishedBacklog,
   onContinue,
 }: {
   message: ZyraChatMessage;
   projectId: string;
-  // The live progress backlog for THIS message's in-flight resume, if any is known — empty
+  // The live progress backlog for THIS message's in-flight resume, if any is known. Empty
   // whenever this message isn't currently resuming, or (a reload mid-resume, no client-side
   // turnId survives that) no step data was ever available for it.
   backlogSteps?: ZyraBacklogStep[];
+  // The finished log for a message that already completed, kept for the rest of this page
+  // session (see messageBacklogs in the parent component). Undefined for a message sent before
+  // this feature existed, or one whose progress stream never fired a single stage.
+  finishedBacklog?: ZyraFinishedBacklog;
   // Only ever invoked from the Continue affordance below, which only renders for a timed-out turn —
   // the happy path (a message that answered normally) never touches this prop at all.
   onContinue: (messageId: string, opts?: { narrow?: boolean }) => Promise<void>;
@@ -453,6 +458,18 @@ function MessageBubble({
         {metaLabel && <span className="text-[11px] text-[var(--muted)]">{metaLabel}</span>}
       </div>
 
+      {finishedBacklog && finishedBacklog.steps.length > 0 && (
+        <details className="w-full max-w-[720px]">
+          <summary className="cursor-pointer select-none border-l-2 border-emerald-500 pl-2 font-mono text-[11px] text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300">
+            [DONE] {zyraFormatDuration(finishedBacklog.durationMs)} · {finishedBacklog.steps.length} steps
+            {zyraFinishedOutcome(finishedBacklog.steps) ? ` · ${zyraFinishedOutcome(finishedBacklog.steps)}` : ""}
+          </summary>
+          <div className="mt-1.5 flex flex-col gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+            {finishedBacklog.steps.map((step) => <ZyraBacklogRow key={step.stage} step={step} now={step.activatedAt} />)}
+          </div>
+        </details>
+      )}
+
       {reasoning && (
         <details className="w-full max-w-[720px]">
           <summary className="cursor-pointer text-xs font-medium text-[var(--muted)] hover:text-[var(--foreground)] select-none">
@@ -514,7 +531,7 @@ function MessageBubble({
       {message.status === ZYRA_MESSAGE_TIMED_OUT && message.resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP && (
         <div className="flex flex-col items-start gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-400">
           <span>
-            This has timed out {message.resumeAttempt + 1} times in a row — the batch may be too large for the provider to finish in time.
+            This has timed out {message.resumeAttempt + 1} times in a row. The batch may be too large for the provider to finish in time.
           </span>
           <div className="flex items-center gap-3">
             <Button type="button" size="sm" variant="ai" onClick={() => void handleContinueClick({ narrow: true })} disabled={clicking}>
@@ -536,11 +553,26 @@ function MessageBubble({
 }
 
 // ─── ZyraBacklog ──────────────────────────────────────────────────────────────
-// Live, step-by-step narration of one turn (a normal send or a Continue resume — both drive the
+// Live, step-by-step narration of one turn (a normal send or a Continue resume both drive the
 // same component, keyed by turnId, see submitMessage/handleContinue/watchZyraTurnProgress). Each
-// step's `meta` is the accurate, capability-gated data the backend actually gathered/did — see
-// legacy.service.ts's onStage call sites — this component only formats it.
-type ZyraBacklogStep = { stage: string; status: "active" | "done"; meta?: Record<string, unknown> };
+// step's `meta` is the accurate, capability-gated data the backend actually gathered/did (see
+// legacy.service.ts's onStage call sites); this component only formats it.
+//
+// Styled as a test-run log, not a chat assistant's checklist: a QA engineer already reads CI
+// output daily, so bracketed status tags and a commit-graph rail read as native rather than as
+// one more reskin of the icon-badge pattern every AI chat product uses.
+type ZyraBacklogStep = {
+  stage: string;
+  status: "active" | "done";
+  meta?: Record<string, unknown>;
+  // Client-observed, stamped once when this step object is created (i.e. the moment it became
+  // the active step) — used for the active step's own counter and, for the first context:* step,
+  // the "# gathering context" group's timestamp. Never recalculated after creation.
+  activatedAt: number;
+};
+
+/** The finished log kept for the rest of this page session, keyed by the real message id it produced. */
+type ZyraFinishedBacklog = { steps: ZyraBacklogStep[]; durationMs: number };
 
 const ZYRA_STAGE_LABELS: Record<string, string> = {
   received: "Received your request",
@@ -554,10 +586,27 @@ const ZYRA_STAGE_LABELS: Record<string, string> = {
   finalizing: "Finalizing",
 };
 
-/** A short "what happened" summary for a step's row — never invents anything not in `meta`. */
+function zyraFormatDuration(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
+/**
+ * 8 once this turn is known to route to `create` (a step named `generating` has actually fired),
+ * 7 otherwise. Deliberately NOT hardcoded to 8: an answer/list/archive turn never reaches
+ * `generating` at all, and claiming an 8th step that will never arrive would stall the fill rule
+ * short instead of ever reaching full.
+ */
+function zyraTotalKnownSteps(steps: ZyraBacklogStep[]): number {
+  return steps.some((s) => s.stage === "generating") ? 8 : 7;
+}
+
+/** A short "what happened" summary for a step's row, never inventing anything not in `meta`. */
 function zyraBacklogSummary(meta: Record<string, unknown> | undefined): string {
   if (!meta) return "";
-  if (meta.skipped) return `skipped — ${String(meta.reason || "disabled")}`;
+  if (meta.skipped) return `skipped: ${String(meta.reason || "disabled")}`;
   if (Array.isArray(meta.items)) {
     const count = typeof meta.count === "number" ? meta.count : meta.items.length;
     return count === 0 ? "none found" : `${count} found`;
@@ -573,39 +622,77 @@ function zyraBacklogSummary(meta: Record<string, unknown> | undefined): string {
     return parts.length ? parts.join(", ") : "nothing changed";
   }
   if (typeof meta.requestedCount === "number") {
-    return `${meta.requestedCount} requested${meta.suiteName ? ` into "${meta.suiteName}"` : ""}`;
+    return `${meta.requestedCount} requested${meta.suiteName ? ` into "${String(meta.suiteName)}"` : ""}`;
   }
-  if (typeof meta.totalContextItems === "number") return `${meta.totalContextItems} context items gathered`;
+  if (typeof meta.totalContextItems === "number") return `${meta.totalContextItems} context items`;
   return "";
 }
 
-/** One expandable row for a step that's already finished — named items rendered as plain text, never markdown/HTML, since these are user-authored titles/summaries pulled straight from the DB. */
-function ZyraBacklogRow({ step }: { step: ZyraBacklogStep }) {
+/** The finished disclosure's one-line outcome, read off whatever `finalizing` actually reported. */
+function zyraFinishedOutcome(steps: ZyraBacklogStep[]): string {
+  const finalStep = steps.find((s) => s.stage === "finalizing");
+  return finalStep ? zyraBacklogSummary(finalStep.meta) : "";
+}
+
+/** `[RUN]` / `[OK]` / `[SKIP]` / `[--]`, matched to the row's marker fill below. */
+function zyraStatusTag(step: ZyraBacklogStep): { text: string; className: string } {
+  if (step.status === "active") return { text: "[RUN]", className: "text-[var(--brand-primary)]" };
+  if (step.meta?.skipped) return { text: "[SKIP]", className: "text-amber-500" };
+  if (Array.isArray(step.meta?.items) && (step.meta!.items as unknown[]).length === 0) return { text: "[--]", className: "text-[var(--muted-2)]" };
+  return { text: "[OK]", className: "text-emerald-500" };
+}
+
+function zyraMarkerClass(step: ZyraBacklogStep): string {
+  if (step.status === "active") return "bg-[var(--brand-primary)] animate-pulse";
+  if (step.meta?.skipped) return "bg-amber-500";
+  if (Array.isArray(step.meta?.items) && (step.meta!.items as unknown[]).length === 0) return "border border-[var(--muted-2)] bg-transparent";
+  return "bg-emerald-500";
+}
+
+/** The item-row tag: a real key when the source has one, `DOC` for a knowledge item (no key of its own), nothing for a bug (its `id` is a UUID, never shown). */
+function zyraItemTag(stage: string, item: Record<string, unknown>): string {
+  if (item.externalId) return String(item.externalId);
+  if (item.key) return String(item.key);
+  if (stage === "context:knowledge") return "DOC";
+  return "";
+}
+
+/** One row, expandable when its step carries named items. Item titles/summaries are user-authored (a doc title, a Jira summary) and rendered as plain text, never markdown/HTML. */
+function ZyraBacklogRow({ step, now }: { step: ZyraBacklogStep; now: number }) {
   const [expanded, setExpanded] = useState(false);
   const items = Array.isArray(step.meta?.items) ? (step.meta!.items as Array<Record<string, unknown>>) : null;
   const canExpand = Boolean(items && items.length > 0);
   const summary = zyraBacklogSummary(step.meta);
+  const tag = zyraStatusTag(step);
+  const label = ZYRA_STAGE_LABELS[step.stage] || step.stage;
+  const ownElapsed = step.status === "active" ? zyraFormatDuration(now - step.activatedAt) : null;
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col">
       <button
         type="button"
         disabled={!canExpand}
         onClick={() => canExpand && setExpanded((v) => !v)}
-        className={`flex items-center gap-1.5 text-left text-[11px] ${canExpand ? "cursor-pointer" : "cursor-default"}`}
+        className={`flex w-full items-baseline gap-1.5 text-left text-[11.5px] ${canExpand ? "cursor-pointer" : "cursor-default"}`}
       >
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
-        <span className="font-semibold text-[var(--muted)]">{ZYRA_STAGE_LABELS[step.stage] || step.stage}</span>
-        {summary && <span className="text-[var(--muted-soft)]">— {summary}</span>}
-        {canExpand && <span className="text-[10px] text-[var(--muted-soft)]">{expanded ? "▲" : "▼"}</span>}
+        <span className={step.status === "active" ? "font-semibold text-[var(--foreground)]" : "text-[var(--muted)]"}>{label}</span>
+        <span className={`font-mono text-[10px] ${tag.className}`}>{tag.text}</span>
+        {summary && <span className="truncate text-[var(--muted-2)]">{summary}</span>}
+        {ownElapsed && <span className="font-mono text-[10px] tabular-nums text-[var(--muted-2)]">{ownElapsed}</span>}
+        {canExpand && <span className="ml-auto shrink-0 font-mono text-[10px] text-[var(--muted-2)]">{expanded ? "-" : "+"}</span>}
       </button>
       {expanded && items && (
-        <ul className="ml-3 list-disc space-y-0.5 pl-3.5 text-[11px] text-[var(--muted)]">
+        <ul className="mt-0.5 flex flex-col gap-0.5 pl-0.5 text-[11px] text-[var(--muted)]">
           {items.slice(0, 10).map((item, i) => {
-            const label = String(item.externalId || item.key || "");
+            const itemTag = zyraItemTag(step.stage, item);
             const title = String(item.title || item.summary || "");
-            return <li key={i}>{label ? `${label} — ${title}` : title}</li>;
+            return (
+              <li key={i} className="flex items-baseline gap-1.5 overflow-hidden">
+                {itemTag && <span className="shrink-0 font-mono text-[10px] text-[var(--brand-primary)]">{itemTag}</span>}
+                <span className="truncate">{title}</span>
+              </li>
+            );
           })}
-          {items.length > 10 && <li className="italic text-[var(--muted-soft)]">+{items.length - 10} more</li>}
+          {items.length > 10 && <li className="italic text-[var(--muted-2)]">+{items.length - 10} more</li>}
         </ul>
       )}
     </div>
@@ -613,32 +700,70 @@ function ZyraBacklogRow({ step }: { step: ZyraBacklogStep }) {
 }
 
 function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
-  // Client-observed elapsed time, anchored to when THIS component first rendered — not a true
-  // server-side "started at" timestamp (no such column exists). Honest for the common case (the
-  // user is watching it live) and still reasonable after a reload mid-resume: it reads as "this
-  // page has been watching it work for Xs", which is true even if work started earlier.
-  const [elapsedSec, setElapsedSec] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const start = Date.now();
-    const timer = setInterval(() => setElapsedSec(Math.round((Date.now() - start) / 1000)), 1000);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-  const activeStep = steps.find((s) => s.status === "active");
-  const doneSteps = steps.filter((s) => s.status === "done");
-  const headline = activeStep ? ZYRA_STAGE_LABELS[activeStep.stage] || activeStep.stage : "Zyra is working on this…";
+  // Anchor for the zero-steps fallback below, since there's no step to read activatedAt off yet.
+  // Client-observed only, same honesty caveat as everywhere else in this component: it reads as
+  // "this page has been watching for Ns," true even when the underlying work started earlier.
+  const [mountedAt] = useState(() => Date.now());
+
+  if (steps.length === 0) {
+    // No step data yet (a brand-new send whose first SSE event hasn't landed) or none ever
+    // arrived (a reload mid-resume lost the client-side turnId, or the progress feature is
+    // disabled). Honest either way: work is happening, no further detail is known.
+    return (
+      <div className="flex items-start gap-2">
+        <ZyraMark size={24} />
+        <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 font-mono text-[11px] tabular-nums text-[var(--muted)]">
+          <span className="h-1.5 w-1.5 shrink-0 animate-pulse bg-[var(--brand-primary)]" />
+          zyra is working on this · {zyraFormatDuration(now - mountedAt)} elapsed
+        </div>
+      </div>
+    );
+  }
+
+  const totalSteps = zyraTotalKnownSteps(steps);
+  const turnElapsed = zyraFormatDuration(now - steps[0].activatedAt);
+  let contextHeaderShown = false;
+
   return (
     <div className="flex items-start gap-2">
       <ZyraMark size={24} />
-      <div className="flex flex-col gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 text-xs text-[var(--muted)]">
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand-primary)] animate-pulse" />
-          <span>{headline} — {elapsedSec}s elapsed</span>
+      <div className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5">
+        <div className="mb-1.5 font-mono text-[11px] tabular-nums text-[var(--muted)]">
+          zyra · turn {steps.length}/{totalSteps} · {turnElapsed}
         </div>
-        {doneSteps.length > 0 && (
-          <div className="flex flex-col gap-1 border-t border-[var(--border)] pt-1.5">
-            {doneSteps.map((step) => <ZyraBacklogRow key={step.stage} step={step} />)}
-          </div>
-        )}
+        <div className="mb-2 h-px w-full overflow-hidden bg-[var(--border)]">
+          <div
+            className="h-full bg-gradient-to-r from-[var(--brand-primary)] to-[#4F46E5] transition-all duration-500"
+            style={{ width: `${Math.min(100, Math.round((steps.length / totalSteps) * 100))}%` }}
+          />
+        </div>
+        <div className="flex flex-col">
+          {steps.map((step, i) => {
+            const isFirstContext = step.stage.startsWith("context:") && !contextHeaderShown;
+            if (isFirstContext) contextHeaderShown = true;
+            return (
+              <div key={step.stage} className="flex gap-2.5">
+                <div className="flex w-2.5 flex-none flex-col items-center">
+                  <span className={`mt-[5px] h-1.5 w-1.5 shrink-0 ${zyraMarkerClass(step)}`} />
+                  {i < steps.length - 1 && <span className="w-px flex-1 bg-[var(--border)]" />}
+                </div>
+                <div className="min-w-0 flex-1 pb-1.5">
+                  {isFirstContext && (
+                    <div className="mb-1 font-mono text-[10px] text-[var(--muted-2)]">
+                      # gathering context · {zyraFormatDuration(step.activatedAt - steps[0].activatedAt)}
+                    </div>
+                  )}
+                  <ZyraBacklogRow step={step} now={now} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -760,12 +885,16 @@ export default function ZyraChatPage() {
   const [agent, setAgent] = useState<ZyraAgentState | null>(null);
   const [sessions, setSessions] = useState<ZyraChatSession[]>([]);
   const [activeSession, setActiveSession] = useState<ZyraChatSession | null>(null);
-  // Live progress backlog, keyed by turnId (not messageId — a normal send has no message id at
+  // Live progress backlog, keyed by turnId (not messageId: a normal send has no message id at
   // all until the turn completes). Purely a display enhancement, never authoritative: ZyraBacklog
   // renders straight off message.status either way, this only adds step-by-step detail on top.
-  // Cleared a few seconds after a turn settles (see watchZyraTurnProgress) so entries don't
-  // accumulate for the lifetime of the page.
+  // Moved into messageBacklogs (below) the moment a turn settles, so this map only ever holds
+  // in-flight turns.
   const [turnBacklogs, setTurnBacklogs] = useState<Record<string, ZyraBacklogStep[]>>({});
+  // The finished log for a message that already completed, keyed by the message's real id, kept
+  // for the rest of this page session (not database-persisted — a reload loses it, same as the
+  // rest of this feature). Powers the "[DONE]" disclosure on a normal completed reply.
+  const [messageBacklogs, setMessageBacklogs] = useState<Record<string, ZyraFinishedBacklog>>({});
   // messageId -> turnId, for a Continue resume's MessageBubble to find its own entry in
   // turnBacklogs above. Never set for a normal send (there's no message id yet to key by; that
   // path reads turnBacklogs[sendingTurnId] directly instead).
@@ -989,6 +1118,10 @@ export default function ZyraChatPage() {
       const result = await sendPromise;
       setActiveSession((prev) => prev && prev.id === sessionId ? result.session : prev);
       void refreshSessions();
+      // Belt and suspenders: the SSE "complete" event already does this (see watchZyraTurnProgress),
+      // but SSE was never meant to be authoritative here (feature flag off, a dropped connection) —
+      // this fires from the awaited response itself, independent of whether that event ever arrived.
+      finishTurn(turnId, result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Zyra could not answer.";
       setError(msg);
@@ -1025,8 +1158,30 @@ export default function ZyraChatPage() {
       void refreshSessions();
       if (result.accepted) watchZyraTurnProgress(sessionId, turnId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not resume that turn — try again.");
+      setError(err instanceof Error ? err.message : "Could not resume that turn. Try again.");
     }
+  }
+
+  // Moves a settled turn's step list out of turnBacklogs (in-flight only) into messageBacklogs
+  // (kept for the message it produced, for the rest of this page session). `resultPayload` is
+  // whatever shape the "complete" SSE event or the awaited POST response carries — both are
+  // `{ message: { id }, session }`, so this works from either call site. A no-op if the turn has
+  // no steps recorded (progress streaming was off or nothing ever arrived) or was already moved
+  // by the other call site, so it's always safe to call from both.
+  function finishTurn(turnId: string, resultPayload: unknown) {
+    setTurnBacklogs((prev) => {
+      const existing = prev[turnId];
+      if (!existing || existing.length === 0) return prev;
+      const doneSteps = existing.map((s) => ({ ...s, status: "done" as const }));
+      const finishedMessageId = (resultPayload as { message?: { id?: string } } | null | undefined)?.message?.id;
+      if (finishedMessageId) {
+        const durationMs = Date.now() - doneSteps[0].activatedAt;
+        setMessageBacklogs((mb) => (finishedMessageId in mb ? mb : { ...mb, [finishedMessageId]: { steps: doneSteps, durationMs } }));
+      }
+      const next = { ...prev };
+      delete next[turnId];
+      return next;
+    });
   }
 
   // Opens the SSE stream for one turn (a normal send or a Continue resume, both share this) and
@@ -1042,17 +1197,6 @@ export default function ZyraChatPage() {
     const stop = () => {
       source.close();
       openEventSourcesRef.current = openEventSourcesRef.current.filter((s) => s !== source);
-      // A short delay, not instant — the final step list stays visible for a moment instead of
-      // vanishing the instant the reply appears, then this entry is dropped so turnBacklogs doesn't
-      // grow for the lifetime of the page (a turnId is never reused).
-      setTimeout(() => {
-        setTurnBacklogs((prev) => {
-          if (!(turnId in prev)) return prev;
-          const next = { ...prev };
-          delete next[turnId];
-          return next;
-        });
-      }, 4000);
     };
     source.onmessage = (evt) => {
       let event: ZyraTurnProgressEvent;
@@ -1064,18 +1208,15 @@ export default function ZyraChatPage() {
       if (event.kind === "stage") {
         setTurnBacklogs((prev) => {
           const existing = (prev[turnId] || []).map((s) => ({ ...s, status: "done" as const }));
-          return { ...prev, [turnId]: [...existing, { stage: event.stage, status: "active" as const, meta: event.meta }] };
+          return { ...prev, [turnId]: [...existing, { stage: event.stage, status: "active" as const, meta: event.meta, activatedAt: Date.now() }] };
         });
         return;
       }
-      // complete / error / unknown are all terminal for this stream — the poller (or the fresh
-      // session a "complete" event's own payload implies) is what actually renders the outcome,
-      // this side channel's only job past this point is to mark the last step done and stop.
-      setTurnBacklogs((prev) => {
-        const existing = prev[turnId];
-        if (!existing || existing.length === 0) return prev;
-        return { ...prev, [turnId]: existing.map((s) => ({ ...s, status: "done" as const })) };
-      });
+      // complete / error / unknown are all terminal for this stream. "complete" carries the real
+      // message id, which is what lets finishTurn attach the finished log to that message; error/
+      // unknown carry nothing usable, so the in-flight entry is just dropped with no [DONE] chip
+      // for that turn (matches the "no backlog data" fallback already covered elsewhere).
+      finishTurn(turnId, event.kind === "complete" ? event.payload : undefined);
       stop();
     };
     source.onerror = stop;
@@ -1328,6 +1469,7 @@ export default function ZyraChatPage() {
                     message={msg}
                     projectId={projectId}
                     backlogSteps={resumeTurnIds[msg.id] ? turnBacklogs[resumeTurnIds[msg.id]] : undefined}
+                    finishedBacklog={messageBacklogs[msg.id]}
                     onContinue={handleContinue}
                   />
                 ))}
