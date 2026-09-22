@@ -39,6 +39,20 @@ export function formatEventTime(value: string): string {
   return `${String(hours12).padStart(2, "0")}:${mm}:${ss} ${period}`;
 }
 
+// A Zyra AI Memory document's changedSummary can itself be (or contain) a raw section-heading
+// timestamp — groupSections (text-diff.util.ts) labels those sections by their own `## <ISO
+// timestamp>` heading verbatim, and that label flows straight into the "X updated." sentence
+// backend-side. Rows written before this existed also have the raw string already cached in
+// changed_summary, so the fix has to happen here at render time (covers old and new rows alike)
+// rather than in the summary-generation code, which only reaches future writes. Same target shape
+// and same DD/MM/YYYY, hh:mm:ss AM/PM output as formatFieldLabel in ChangeDiffModal, which does the
+// equivalent job for an individual field's label.
+const ISO_TIMESTAMP_IN_TEXT_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
+
+export function formatIsoTimestampsInText(text: string): string {
+  return text.replace(ISO_TIMESTAMP_IN_TEXT_RE, (match) => `${formatEventDate(match)}, ${formatEventTime(match)}`);
+}
+
 function isLargeChange(entry: KnowledgeDocumentHistoryEntry): boolean {
   if (!entry.changedFields.length) return false;
   if (entry.changedFields.length > 1) return true;
@@ -167,11 +181,11 @@ export function ChangeHistoryList({
           {page === 0 ? "No update history recorded yet." : "No more changes."}
         </div>
       ) : (
-        <ul className="max-h-80 space-y-2 overflow-y-auto">
+        <ul className="max-h-80 space-y-3 overflow-y-auto">
           {state.events.map((event) => {
             const large = isLargeChange(event);
             return (
-              <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-1.5">
+              <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-2">
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 truncate text-[12px] font-medium text-[var(--foreground)]" title={`by ${event.actorName}`}>
                     {event.eventType === "created" ? "Added" : "Updated"}
@@ -199,9 +213,9 @@ export function ChangeHistoryList({
                   </span>
                 </div>
                 {event.changedSummary && (
-                  <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--muted)]">
-                    <span className="min-w-0 flex-1 truncate" title={event.changedSummary}>
-                      {event.changedSummary}
+                  <div className="mt-1.5 flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                    <span className="min-w-0 flex-1 truncate" title={formatIsoTimestampsInText(event.changedSummary)}>
+                      {formatIsoTimestampsInText(event.changedSummary)}
                     </span>
                     {large && (
                       <button

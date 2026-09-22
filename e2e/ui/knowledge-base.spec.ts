@@ -1339,6 +1339,48 @@ test.describe("knowledge base (UI)", () => {
     await expect(panel.getByText("Details, Comments updated.")).toBeVisible();
   });
 
+  /*
+   * Regression: a Zyra AI Memory section is labelled by its own `## <ISO timestamp>` heading
+   * (groupSections, text-diff.util.ts), and that raw label flows straight into the "<label>
+   * updated." summary sentence stored on the event row (changed_summary). ChangeDiffModal already
+   * reformats a raw-ISO *field label* inside the diff modal (see KBU-44), but the popover/modal
+   * list's own summary line rendered that same shape completely unformatted — the "T", milliseconds
+   * and "Z" all visible, unlike every other date in the product. ChangeHistory.tsx now reformats any
+   * ISO-timestamp substring inside changedSummary too, at render time, so this is fixed for rows
+   * that already have the raw string cached in the database as well as new ones.
+   */
+  test("KBU-37d the popover/modal list's own change summary formats a Zyra-memory-style timestamp too, not just the diff modal's field label", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso = "2026-09-18T14:28:46.521Z";
+    const title = stamp("E2E-83d: Raw ISO summary");
+    const documentId = seedMirrorDocument(title, "kbu-popover-iso-summary", 2, 0);
+    // A single-section change: summarizeTextChange's sentence is just "<label> updated.", so a raw
+    // label reaches the row unmodified by anything else in the sentence — the exact shape the
+    // screenshot bug report showed.
+    seedSyncEvent(documentId, "updated", `${iso} updated.`);
+
+    const page = await openKb(browser);
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel.getByText("Update History")).toBeVisible();
+
+    await expect(panel.getByText(`${expectedLabel(iso)} updated.`)).toBeVisible();
+    await expect(panel.getByText(iso, { exact: false })).toHaveCount(0);
+  });
+
   test("KBU-37b a failed fetch on page 2+ still leaves Previous clickable — it must not strand the user on the errored page", async ({ browser }) => {
     const title = stamp("E2E-83b: Broken page 2");
     const documentId = seedMirrorDocument(title, "kbu-added-on-4b", 3, 0);
