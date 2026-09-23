@@ -156,7 +156,12 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
         `${literal(projectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
         `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ${fields.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', ` +
-        `${literal(fields.status ?? "awaiting_review")}, ` +
+        // "awaiting_review" was the default here previously — it appears nowhere in the backend
+        // (grep the whole Tesbo-Backend-Nest tree) and isn't one of the two statuses zyraSave
+        // accepts ('in_review' or 'failed', legacy.service.ts's own status guard). Every caller
+        // that omits `status` gets a task-board row zyraSave then refuses to save, a stale
+        // mismatch from before task_status was renamed.
+        `${literal(fields.status ?? "in_review")}, ` +
         `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb);`,
     );
     return scalar(
@@ -504,8 +509,10 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
     // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
     // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
+    // Projects cap name at 30 chars — "E2E Zyra Default Range " plus a 13-digit timestamp
+    // overflowed that by 7, so every run of this test failed on project creation itself.
     const created = await asOwner.post("/api/projects", {
-      data: { name: `E2E Zyra Default Range ${Date.now()}` },
+      data: { name: `E2E Range ${Date.now()}` },
       failOnStatusCode: false,
     });
     expect(created.status(), await created.text()).toBe(201);
@@ -570,7 +577,10 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const start = Date.now();
     const res = await asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false });
     const elapsedMs = Date.now() - start;
-    expect(res.status(), `Continue — ${await res.text()}`).toBe(200);
+    // NestJS defaults every undecorated @Post() to 201 — none of the Zyra POST routes in this
+    // controller override it with @HttpCode(200), continueZyraChatMessage included, so 201 is
+    // this route's real, consistent response code, not 200.
+    expect(res.status(), `Continue — ${await res.text()}`).toBe(201);
     const body = await res.json();
     expect(body.accepted, "the claiming request must be told it started the resume").toBe(true);
 
@@ -597,8 +607,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false }),
       asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false }),
     ]);
-    expect(first.status()).toBe(200);
-    expect(second.status()).toBe(200);
+    // See ZYR-A-86's comment: this route's real (undecorated, NestJS-default) status is 201.
+    expect(first.status()).toBe(201);
+    expect(second.status()).toBe(201);
     const [firstBody, secondBody] = await Promise.all([first.json(), second.json()]);
     const acceptedCount = [firstBody.accepted, secondBody.accepted].filter(Boolean).length;
     expect(acceptedCount, "exactly one of two simultaneous Continue calls claims the row").toBe(1);
@@ -626,7 +637,8 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       data: { narrow: true },
       failOnStatusCode: false,
     });
-    expect(narrowed.status(), `a narrowed Continue past the cap must be accepted — ${await narrowed.text()}`).toBe(200);
+    // See ZYR-A-86's comment: this route's real (undecorated, NestJS-default) status is 201.
+    expect(narrowed.status(), `a narrowed Continue past the cap must be accepted — ${await narrowed.text()}`).toBe(201);
     expect((await narrowed.json()).accepted).toBe(true);
   });
 
@@ -1825,6 +1837,10 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
 
     // Backdate the chat activity, then use the task board — the newer of the two must win.
     exec(`UPDATE zyra_chat_sessions SET updated_at = now() - interval '10 days' WHERE id = ${literal(emptySession.id)};`);
+    // Re-read after backdating — chatSeenAt above is the PRE-backdate value, no longer what the
+    // row holds; comparing later assertions against it (instead of this) was off by exactly the
+    // 10-day interval just applied.
+    const chatBackdatedAt = scalar(`SELECT updated_at::text FROM zyra_chat_sessions WHERE id = ${literal(emptySession.id)};`);
     const taskId = seedTask();
     const afterTask = await readAgent();
     const taskSeenAt = scalar(`SELECT updated_at::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
@@ -1839,7 +1855,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(
       new Date(afterBothOld.lastUsedAt!).getTime(),
       "the more recent activity (chat, 10 days back) should still win over an older task-board update",
-    ).toBe(new Date(chatSeenAt).getTime());
+    ).toBe(new Date(chatBackdatedAt).getTime());
   });
 
   test("ZYR-A-44 a second project's Zyra activity is not reflected in this project's last-used date", async () => {
@@ -2484,9 +2500,21 @@ test.describe("zyra chat — citations (fake provider)", () => {
     return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
   }
 
+  /*
+   * provider is deliberately a custom-gateway string, not "openai" — OpenAI-wire by convention
+   * (providerWire's own comment in legacy.service.ts), so still compatible with this fake
+   * server's chat-completions shape, but absent from EMBEDDING_CAPABLE_PROVIDERS
+   * (rag-embedding-providers.ts: openai/google/mistral only). A KB doc seeded below
+   * (seedCitableSources) enqueues a real background embedding job (createKnowledgeDocument ->
+   * enqueueEmbedding); with provider "openai" that job treats this key as embeddings-capable and
+   * fires a real POST against this fake server's one chat-completions handler, which returns the
+   * wrong response shape and — since it shares the same request log and reply queue as the
+   * test's own router/generation calls — intermittently consumes a queued reply or inflates
+   * ai.requests.length out from under the test. Same technique ZYR-A-91/92 use.
+   */
   async function allocateFakeAiKey(): Promise<void> {
     const keyRes = await asOwner.post("/api/workspace/ai-keys", {
-      data: { name: `E2E citations fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      data: { name: `E2E citations fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
       failOnStatusCode: false,
     });
     expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
@@ -3451,5 +3479,260 @@ test.describe("zyra chat session soft-delete (hard-delete remediation Phase 6)",
     // Deleting again must 404 (already gone from every read path), never a raw driver error from
     // hitting an already-non-null deleted_at a second time.
     expect((await asOwner.delete(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false })).status()).toBe(404);
+  });
+});
+
+/*
+ * Task-board generation (processZyraTask, behind POST /agents/zyra/tasks — aiGenerate) is fire-
+ * and-forget: the route returns 201 immediately and the real work happens in the background, which
+ * is why the top describe block above never drives it through a live model (seedTask() arranges
+ * rows directly instead — see that function's own comment). That left this path's actual knowledge
+ * selection completely unexercised against a real generation call. This block drives it for real,
+ * polling task_status the way ZYR-A-86's waitForResumeToSettle already does for chat resume.
+ */
+test.describe("zyra task-board generation — knowledge relevance (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-relevance");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    // See FakeAiServer.reset()'s doc comment — one server instance is shared across this block's
+    // tests (one beforeAll).
+    ai?.reset();
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_folders WHERE project_id = ${project} AND is_root = false;`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  /*
+   * A custom-gateway provider (anything absent from PROVIDER_CATALOG) is OpenAI-wire by
+   * convention (see providerWire's own comment in legacy.service.ts) — compatible with this fake
+   * server's chat-completions shape — but is deliberately NOT one of the three
+   * EMBEDDING_CAPABLE_PROVIDERS (openai/google/mistral only, rag-embedding-providers.ts). That
+   * makes resolveEmbeddingAllocation report no embeddings-capable key anywhere, so
+   * RagRetrievalService skips its ANN half entirely instead of calling this fake server's
+   * chat-only endpoint as if it were a real /v1/embeddings and getting back the wrong response
+   * shape. Only the full-text half of retrieval runs, which is exactly what this test needs and
+   * keeps it independent of a real embeddings provider.
+   */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: {
+        name: `E2E relevance fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`,
+        provider: "e2e-fake-gateway",
+        apiKey: "sk-e2e-fake",
+        baseUrl: ai.baseUrl,
+        defaultModel: "gpt-4o-mini",
+      },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  async function createDoc(title: string, contentText: string): Promise<string> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title, contentText },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    return (await res.json()).id;
+  }
+
+  /** Polls until the task leaves 'todo'/'in_progress', or the attempt budget runs out — same
+   *  pattern as ZYR-A-86's waitForResumeToSettle for chat resume. */
+  async function waitForTaskSettled(taskId: string, maxAttempts = 40): Promise<string> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`) ?? "";
+  }
+
+  test("ZYR-A-91 task-board generation surfaces a KB document outside the 12-most-recently-updated window", async () => {
+    await allocateFakeAiKey();
+
+    // Created FIRST so the 12 filler docs below push it out of knowledgeSnapshot's own
+    // `ORDER BY updated_at DESC LIMIT 12` window — the exact shape of the reported bug: the
+    // relevant document genuinely exists in the knowledge base, it just isn't among the 12 most
+    // recently touched.
+    await createDoc(
+      "Aurora session policy",
+      "All authenticated sessions in the Aurora billing portal expire after exactly 20 minutes of inactivity, regardless of subscription tier.",
+    );
+    for (let i = 0; i < 12; i++) {
+      await createDoc(`Filler onboarding note ${i}`, "Unrelated onboarding checklist item with no bearing on this task.");
+    }
+
+    // Deliberately no `E2E ... ${Date.now()}` uniqueness prefix here (unlike this file's other
+    // fixtures) — user_story has no uniqueness constraint to collide on, and every extra word
+    // would join the full-text AND-query below (plainto_tsquery requires every query lexeme to be
+    // present in the matched document), so the story is kept to exactly the terms the Aurora doc
+    // above actually contains.
+    //
+    // Deliberately does NOT mention "20 minutes" — zyraDynamicTaskPrompt always embeds the raw
+    // story text verbatim as its own "Story:" line, independent of what knowledge gets
+    // retrieved, so the story text must not itself carry the value this test proves came from
+    // the KB doc, or the assertion below would pass whether or not retrieval worked at all.
+    const story = "Aurora billing portal sessions expire from inactivity.";
+    ai.queueReply({
+      drafts: [{
+        title: "Session expires after the configured inactivity timeout",
+        preconditions: "The user is signed in to the Aurora billing portal.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Leave the session idle for the configured timeout", expectedResult: "The session expires" }]),
+        testData: "",
+        expectedSummary: "The session expires after the configured timeout.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: ["KB 1"],
+      }],
+    });
+    // rememberZyraTurn's own summarization call, made unconditionally after a successful
+    // generation — same two-call shape processZyraTask always makes, not something this test
+    // is about, so a plain non-JSON reply (rememberZyraTurn just splits it into bullet lines).
+    ai.queueReply("- Generated a session-timeout test case for the Aurora billing portal.");
+
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: story }, failOnStatusCode: false });
+    expect(taskRes.status(), `creating the task — ${await taskRes.text()}`).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+
+    const finalStatus = await waitForTaskSettled(taskId);
+    expect(finalStatus, "generation must complete, not fail").toBe("in_review");
+
+    // Not asserting ai.requests.length here: task_status flips to 'in_review' (what
+    // waitForTaskSettled polls for) before processZyraTask's own later, unawaited-by-us call to
+    // rememberZyraTurn's summarization pass reaches this fake server — a real race against that
+    // second background call, not something this test is about. ai.requests[0] (the generation
+    // call) is already guaranteed to exist by the time task_status flips, since generation runs
+    // and its result is persisted before that UPDATE.
+    const generationPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(
+      generationPrompt,
+      "a KB doc outside the 12-most-recent window must still reach the model when the request is actually about it",
+    ).toContain("20 minutes of inactivity");
+  });
+
+  test("ZYR-A-92 regeneration after reviewer feedback also retrieves a KB document outside the 12-most-recently-updated window", async () => {
+    await allocateFakeAiKey();
+
+    await createDoc(
+      "Aurora session policy",
+      "All authenticated sessions in the Aurora billing portal expire after exactly 20 minutes of inactivity, regardless of subscription tier.",
+    );
+    for (let i = 0; i < 12; i++) {
+      await createDoc(`Filler onboarding note ${i}`, "Unrelated onboarding checklist item with no bearing on this task.");
+    }
+
+    // The INITIAL story deliberately shares nothing with the Aurora doc — this test is about what
+    // processZyraFeedback retrieves for the regeneration, not the initial generation (that's
+    // ZYR-A-91's job).
+    const initialStory = "Checkout page redesign for the mobile app.";
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout page renders on mobile",
+        preconditions: "The user is on the checkout page.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open checkout on a mobile device", expectedResult: "The redesigned layout renders" }]),
+        testData: "",
+        expectedSummary: "The redesigned checkout page renders correctly on mobile.",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+    ai.queueReply("- Generated a checkout page test case.");
+
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: initialStory }, failOnStatusCode: false });
+    expect(taskRes.status(), `creating the task — ${await taskRes.text()}`).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(await waitForTaskSettled(taskId), "initial generation must complete, not fail").toBe("in_review");
+
+    // task_status flips to 'in_review' before processZyraTask's own later, unawaited call to
+    // rememberZyraTurn's summarization pass reaches this fake server (see ZYR-A-91's identical
+    // comment) — drain that still-in-flight request before resetting below, or it lands AFTER the
+    // reset and steals one of the two replies queued for the regeneration phase, one call late.
+    for (let i = 0; i < 40 && ai.requests.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    // Isolates the requests this fake server sees from here on to the regeneration alone, so the
+    // assertion below can read ai.requests[0] unambiguously instead of guessing an index past
+    // however many calls the initial generation made (see ZYR-A-91's comment on that same race).
+    ai.reset();
+    ai.queueReply({
+      drafts: [{
+        title: "Session expires after the configured inactivity timeout",
+        preconditions: "The user is signed in to the Aurora billing portal.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Leave the session idle for the configured timeout", expectedResult: "The session expires" }]),
+        testData: "",
+        expectedSummary: "The session expires after the configured timeout.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: ["KB 1"],
+      }],
+    });
+    ai.queueReply("- Regenerated with a session-timeout test case for the Aurora billing portal.");
+
+    // Same reasoning as ZYR-A-91's story: only the exact terms the Aurora doc contains, so the
+    // full-text AND-query matches it, and no "20 minutes" here — that value must come from the
+    // retrieved document, not be echoed back from the feedback text itself (feedback, like story,
+    // is embedded verbatim in the regeneration prompt).
+    const feedbackRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Aurora billing portal sessions expire from inactivity." },
+      failOnStatusCode: false,
+    });
+    expect(feedbackRes.status(), `submitting feedback — ${await feedbackRes.text()}`).toBe(201);
+    expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+
+    const regenerationPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(
+      regenerationPrompt,
+      "regeneration after feedback must also retrieve a KB doc outside the 12-most-recent window, not just the initial generation",
+    ).toContain("20 minutes of inactivity");
   });
 });

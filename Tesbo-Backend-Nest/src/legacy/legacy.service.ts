@@ -13730,7 +13730,7 @@ export class LegacyService implements OnModuleInit {
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
       provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
       model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
-      const knowledge = await this.knowledgeSnapshot(projectId, options.knowledgeItemIds || []);
+      const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
       const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
@@ -13742,7 +13742,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       const drafts = aiResult.drafts;
       const inputText = [
@@ -13767,7 +13767,7 @@ export class LegacyService implements OnModuleInit {
       ];
       const finishedAt = new Date().toISOString();
       const activity = [
-        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
+        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel(options.knowledgeItemIds, knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
         { actor: "agent", stage: "in_progress", title: "Generation plan", detail: this.zyraThinking({ story, context, acceptanceCriteria, feedback, knowledgeCount: knowledge.length, jiraCount: jira.length, linearCount: linear.length }), createdAt: finishedAt },
         { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt }
       ];
@@ -14032,8 +14032,15 @@ export class LegacyService implements OnModuleInit {
       // testcases) — gathering them concurrently instead of one after another cuts this stage's
       // wall time down to the slowest of the four instead of their sum, without changing what any
       // of them return.
-      const [knowledge, jira, linear, existingTestcases] = await Promise.all([
-        this.knowledgeSnapshot(projectId),
+      // Feedback ALONE drives the retrieval query — not story/context too. Retrieval falls back
+      // to keyword (full-text) matching whenever no embeddings key is configured (a documented,
+      // common state — see resolveEmbeddingAllocation), and Postgres's plainto_tsquery ANDs every
+      // term together: concatenating the original story's topic with the feedback's would demand
+      // a single document cover both, so a reviewer pivoting to something the initial story never
+      // mentioned (e.g. "also check the session timeout") would match nothing at all. feedback is
+      // guaranteed non-empty here — zyraFeedback (the caller) already rejects an empty one.
+      const [{ knowledge, knowledgeConfidence }, jira, linear, existingTestcases] = await Promise.all([
+        this.zyraTaskKnowledge(projectId, [], [feedback]),
         this.jiraSnapshot(projectId, jiraIssueKeys),
         this.linearSnapshot(projectId, linearIssueKeys),
         this.existingTestcaseSnapshot(projectId, story, context)
@@ -14046,7 +14053,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
@@ -14054,7 +14061,7 @@ export class LegacyService implements OnModuleInit {
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
-        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
+        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel([], knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
         { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
@@ -15029,6 +15036,52 @@ export class LegacyService implements OnModuleInit {
     if (inserted.rows[0]?.id) this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", inserted.rows[0].id, "created");
   }
 
+  /**
+   * Knowledge selection for task-board generation (processZyraTask/processZyraFeedback) — the
+   * counterpart to buildZyraChatDecision's own knowledge gathering (~line 11614), which already
+   * fuses ragRetrieval.retrieveWithDiagnostics with a knowledgeSnapshot recency fallback. The
+   * task-board flow used to call knowledgeSnapshot alone, unconditionally: a plain "12
+   * most-recently-updated documents" read with no relation to what the task actually asked for.
+   * On a project with more than 12 knowledge-base items, or one where the relevant document
+   * simply hadn't been touched recently, that document was never shown to the model at all —
+   * "Zyra ignores specific values in Knowledge Base documents" (the embeddings existed; this
+   * function just never queried them).
+   *
+   * An explicit picker selection (`selectedItemIds` — the task-board "attach these documents" UI)
+   * is left exactly as before: a named-document lookup, not a search, per RagRetrievalService's
+   * own header comment ("does NOT replace knowledgeSnapshot() — that stays for the explicit-
+   * picker task-generation flow"). The user already chose these documents; second-guessing that
+   * choice with a relevance query would be a behaviour change nobody asked for.
+   */
+  private async zyraTaskKnowledge(
+    projectId: string,
+    selectedItemIds: string[],
+    queryParts: string[]
+  ): Promise<{ knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>; knowledgeConfidence?: RagRetrievalConfidence }> {
+    if (selectedItemIds.length) {
+      return { knowledge: await this.knowledgeSnapshot(projectId, selectedItemIds) };
+    }
+    const query = queryParts.filter(Boolean).join("\n\n");
+    const [knowledgeFallback, ragDiagnostics] = await Promise.all([
+      this.knowledgeSnapshot(projectId),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, query)
+    ]);
+    return {
+      knowledge: ragDiagnostics.items.length ? ragDiagnostics.items : knowledgeFallback,
+      knowledgeConfidence: ragDiagnostics.confidence
+    };
+  }
+
+  // For the "Read available sources" / "Re-read sources with feedback" activity-log lines —
+  // reusing the existing per-task activity feed (already rendered in the task's Activity tab)
+  // rather than adding a new tracing surface, so a support report ("Zyra didn't use my document")
+  // has somewhere to look without needing Langfuse access.
+  private zyraKnowledgeSourceLabel(selectedItemIds: string[] | undefined, confidence?: RagRetrievalConfidence): string {
+    if (selectedItemIds && selectedItemIds.length) return "explicitly selected";
+    if (confidence === "strong" || confidence === "weak") return `semantic/keyword match, confidence: ${confidence}`;
+    return "no strong match, showing recent documents";
+  }
+
   private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
     const selected = Array.from(new Set(selectedItemIds.filter(Boolean)));
     const values: any[] = [projectId];
@@ -15779,6 +15832,7 @@ export class LegacyService implements OnModuleInit {
     return [
       "You are Zyra the Test Generator, an AI testcase generation agent.",
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
+      "When a knowledge-base or ticket source states a specific value — a timeout, limit, threshold, format, count, or other concrete number or rule — use that exact value in the relevant testcase's steps, test data, or expected result. Never substitute a generic or invented placeholder value when the sources already gave you the real one.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
       "Apply these test design techniques wherever they genuinely fit the ticket's actual fields and flows — skip only the ones that truly don't apply, not by default:",
       "- Equivalence Partitioning: for each meaningful input, split it into valid and invalid classes and draft one representative case per class.",
