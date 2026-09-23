@@ -1,6 +1,7 @@
 "use client";
 
 import { ProjectIntegrationMapping } from "@/components/integrations/ProjectIntegrationMapping";
+import { IntegrationAiGenerationSettings } from "@/components/integrations/IntegrationAiGenerationSettings";
 import { getLinearStatus, listLinearTeams, connectLinearTeams } from "@/lib/api";
 
 export default function LinearProjectIntegrationPage() {
@@ -13,6 +14,7 @@ export default function LinearProjectIntegrationPage() {
       fetchStatus={getLinearStatus}
       fetchRemoteList={listLinearTeams}
       saveMapping={connectLinearTeams}
+      settingsPanel={<IntegrationAiGenerationSettings provider="linear" label="Linear" />}
     />
   );
 }

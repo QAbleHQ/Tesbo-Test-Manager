@@ -2,14 +2,10 @@
 
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { getProject, updateProject } from "@/lib/api";
+import { getProject, updateProject, type IntegrationProvider } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
 
-type ProjectSettingsPayload = {
-  jiraAutoComment?: boolean;
-  jiraTicketSelector?: boolean;
-  [key: string]: unknown;
-};
+type ProjectSettingsPayload = Record<string, unknown>;
 
 function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw as ProjectSettingsPayload;
@@ -23,19 +19,18 @@ function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
 }
 
 /**
- * Jira-only project settings, shown on the Jira integration page.
- *
- * These used to be their own "Jira" tab in the project settings nav rail; they live here so every
- * integration keeps its settings on its own page instead of leaking a tab into the rail. Loads and
- * saves the project's `settings` blob on its own — the surrounding mapping screen owns no state here.
+ * "<Provider> + AI Generation" settings, shown on that provider's project integration page. One
+ * shared component for Jira and Linear (and any future provider) — keyed dynamically off `provider`
+ * (`project.settings.${provider}AutoComment`) rather than a separate hardcoded component per
+ * provider, so a third provider only needs a `provider`/`label` pair passed in here, not a new file.
  */
-export function JiraProjectSettings() {
+export function IntegrationAiGenerationSettings({ provider, label }: { provider: IntegrationProvider; label: string }) {
   const params = useParams();
   const projectId = params.id as string;
+  const settingsKey = `${provider}AutoComment`;
 
   const [rawSettings, setRawSettings] = useState<unknown>(null);
   const [autoComment, setAutoComment] = useState(false);
-  const [ticketSelector, setTicketSelector] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -45,14 +40,13 @@ export function JiraProjectSettings() {
       const project = await getProject(projectId);
       const settings = parseProjectSettings(project.settings);
       setRawSettings(project.settings);
-      setAutoComment(settings.jiraAutoComment === true);
-      setTicketSelector(settings.jiraTicketSelector === true);
+      setAutoComment(settings[settingsKey] === true);
     } catch {
-      setMessage({ type: "error", text: "Failed to load Jira settings." });
+      setMessage({ type: "error", text: `Failed to load ${label} settings.` });
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, label, settingsKey]);
 
   useEffect(() => {
     void load();
@@ -64,15 +58,14 @@ export function JiraProjectSettings() {
     try {
       const nextSettings: ProjectSettingsPayload = {
         ...parseProjectSettings(rawSettings),
-        jiraAutoComment: autoComment,
-        jiraTicketSelector: ticketSelector,
+        [settingsKey]: autoComment,
       };
       await updateProject(projectId, { settings: JSON.stringify(nextSettings) });
       const refreshed = await getProject(projectId);
       setRawSettings(refreshed.settings);
-      setMessage({ type: "success", text: "Jira settings saved." });
+      setMessage({ type: "success", text: `${label} settings saved.` });
     } catch (err) {
-      setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to save Jira settings." });
+      setMessage({ type: "error", text: err instanceof Error ? err.message : `Failed to save ${label} settings.` });
     } finally {
       setSaving(false);
     }
@@ -81,9 +74,9 @@ export function JiraProjectSettings() {
   return (
     <Card className="p-4 space-y-4">
       <div>
-        <h2 className="text-base font-semibold text-[var(--foreground)]">Jira + AI Generation</h2>
+        <h2 className="text-base font-semibold text-[var(--foreground)]">{label} + AI Generation</h2>
         <p className="mt-1 text-sm text-[var(--muted)]">
-          Control how Jira tickets interact with AI test generation in this project.
+          Control how {label} tickets interact with AI test generation in this project.
         </p>
       </div>
 
@@ -99,23 +92,9 @@ export function JiraProjectSettings() {
               className="mt-0.5"
             />
             <div>
-              <span className="text-sm font-medium text-[var(--foreground)]">Auto-comment on Jira ticket</span>
+              <span className="text-sm font-medium text-[var(--foreground)]">Auto-comment on {label} ticket</span>
               <p className="text-xs text-[var(--muted)] mt-0.5">
-                When test cases are generated from a Jira ticket and saved, automatically add a comment to the Jira ticket listing the created test cases.
-              </p>
-            </div>
-          </label>
-          <label className="flex items-start gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={ticketSelector}
-              onChange={(e) => setTicketSelector(e.target.checked)}
-              className="mt-0.5"
-            />
-            <div>
-              <span className="text-sm font-medium text-[var(--foreground)]">Jira ticket selector on AI Generation</span>
-              <p className="text-xs text-[var(--muted)] mt-0.5">
-                Show a Jira ticket search dropdown on the AI Test Generation page so users can pick a ticket directly without going through the Knowledge Base.
+                When test cases are generated from a {label} ticket and saved, automatically add a comment to the {label} ticket listing the created test cases.
               </p>
             </div>
           </label>

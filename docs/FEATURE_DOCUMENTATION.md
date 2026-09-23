@@ -531,7 +531,7 @@ tenant boundary, and gives teams a single place to see the health/status of each
 - **Get project** (`GET /api/projects/:id` → `getProjectForUser`) — 404s if not found, archived, or (via `requireProjectAccess`) not in caller's workspace/membership.
 - **Update project** (`PATCH /api/projects/:id` → `updateProjectForUser`)
   - Fields: `name`, `description`, `settings` (JSON string blob), each independently `COALESCE`d so partial updates work.
-  - `settings` blob (parsed/serialized client-side) currently carries: `jiraAutoComment` (bool), `jiraTicketSelector` (bool), `testcaseIdPrefix` (string, normalized to max 3 upper-alphanumeric chars), `testRunEnvironments` (array of `{name, url}`).
+  - `settings` blob (parsed/serialized client-side) currently carries: `jiraAutoComment` (bool), `linearAutoComment` (bool), `testcaseIdPrefix` (string, normalized to max 3 upper-alphanumeric chars), `testRunEnvironments` (array of `{name, url}`).
   - Settings page has tabs: **General** (name, description, testcase ID prefix + Save), **Test Environments** (add/remove named env URLs, duplicate name-check case-insensitively), **Team Members**, **Jira** (only shown if Jira is connected workspace-wide), **Integrations** (Jira/Linear connect-in-workspace-settings links + "more integrations coming soon" placeholder).
   - Test-case-ID-prefix change **only affects newly created test cases going forward** — existing external IDs are not renamed/backfilled.
 - **Delete project** (`DELETE /api/projects/:id` → `deleteProjectForUser`)
