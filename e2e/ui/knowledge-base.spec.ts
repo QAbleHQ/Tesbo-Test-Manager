@@ -37,8 +37,9 @@ import {
  *     portal, with its title as an `h2`. `modal()` below scopes to it by that heading.
  *   - `FieldLabel` is a bare `<label>` with no `htmlFor`, so getByLabel() resolves nothing anywhere
  *     on this screen. Inputs are located by placeholder instead.
- *   - "Knowledge base" is BOTH the page `h1` and the root folder's `h2`, so every heading lookup
- *     here needs an explicit level.
+ *   - The content panel used to render "Knowledge base" a second time as an `h2`, identical to the
+ *     page's own `h1` (see KBU-47) — fixed, but heading lookups here still pass an explicit level
+ *     rather than relying on there being only one match by name.
  */
 
 test.describe("knowledge base (UI)", () => {
@@ -262,6 +263,39 @@ test.describe("knowledge base (UI)", () => {
 
     // And the tree in the left sidebar, which is a separate render from the table.
     await expect(page.getByRole("button", { name, exact: true }).first()).toBeVisible();
+  });
+
+  /*
+   * "[Knowledge Base] Remove Duplicate 'Knowledge Base' Label". The content panel repeated the
+   * page's own name a second time right below it: its breadcrumb line rendered kbBreadcrumb's
+   * result verbatim (which always includes the folder itself, so at root that's a single crumb
+   * reading "Knowledge base"), directly above an h2 that — at root — is also forced to read
+   * "Knowledge base" (see setFolderName in page.tsx). Both the one-crumb breadcrumb and the
+   * redundant second heading are now shown only once there's an actual subfolder to name; at root,
+   * the page's own h1 is the only "Knowledge base" text in that area.
+   */
+  test("KBU-47 the root folder's own name is not repeated a second time as a redundant sub-heading", async ({ browser }) => {
+    const page = await openKb(browser);
+
+    // At root: only the page's own h1 says "Knowledge base" — no second, content-panel heading
+    // repeating it, and no one-crumb breadcrumb line where that heading used to sit.
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 2 })).toHaveCount(0);
+
+    // Inside a real subfolder, both ARE useful — the breadcrumb shows the parent chain, and the
+    // heading names the folder actually being viewed, distinct from the page's own h1. This guards
+    // against overcorrecting into hiding them everywhere.
+    const name = stamp("BreadcrumbFolder");
+    await createFolder(page, name);
+    await row(page, name).getByText(name, { exact: true }).click();
+
+    const subfolderHeading = page.getByRole("heading", { name, level: 2 });
+    await expect(subfolderHeading).toBeVisible();
+    const subfolderBlock = subfolderHeading.locator("xpath=..");
+    const breadcrumbLine = subfolderBlock.locator(":scope > div").first();
+    expect(await subfolderBlock.evaluate((el) => el.firstElementChild?.tagName)).toBe("DIV");
+    await expect(breadcrumbLine).toContainText("Knowledge base");
+    await expect(breadcrumbLine).toContainText(name);
   });
 
   test("KBU-02 a document created from a template is stored with the template's body", { tag: '@tesbo.testId("TES-TC-1001")' }, async ({
