@@ -5773,7 +5773,10 @@ export class LegacyService implements OnModuleInit {
         clearsAssignee
       ]
     );
-    await this.logProjectActivity(
+    // Fire-and-forget: logProjectActivity already swallows its own errors (see its `.catch` below)
+    // and its result is never read, so there is no correctness reason for the status-update response
+    // — which a user is watching live in the execution table's dropdown — to wait on this write.
+    void this.logProjectActivity(
       before.rows[0].project_id,
       uid,
       "execution_updated",

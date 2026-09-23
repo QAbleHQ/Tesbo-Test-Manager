@@ -5,6 +5,7 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
 import {
+  IconAlertCircle,
   IconArrowRight,
   IconArrowsSort,
   IconSortAscending,
@@ -451,6 +452,9 @@ export default function TestRunDetailPage() {
 
   /* inline status editing */
   const [statusSaving, setStatusSaving] = useState<string | null>(null);
+  /* Set only when a status PATCH fails after the optimistic update below already showed the new
+     value — tells that one row's dropdown to roll back and explains why. */
+  const [statusError, setStatusError] = useState<{ id: string; message: string } | null>(null);
 
   /* right-side test case detail panel */
   const [panelExecution, setPanelExecution] = useState<ExecutionItem | null>(null);
@@ -689,19 +693,33 @@ export default function TestRunDetailPage() {
     }
   }
 
-  /* ───── Inline status change ───── */
+  /* ───── Inline status change ─────
+     Applied optimistically: the dropdown used to stay locked on the old value (disabled) until the
+     PATCH round trip resolved, which is what actually read as the "noticeable delay" — the write
+     itself is a single fast query, but the UI made the user wait for it anyway. The new value is
+     shown the instant it's picked; a failed PATCH rolls the row back and surfaces why via
+     statusError, the same revert-on-failure convention handleRemoveCase already uses. */
   async function handleStatusChange(executionId: string, newStatus: string) {
+    const prevStatus = executions.find((e) => e.id === executionId)?.status;
     setStatusSaving(executionId);
+    setStatusError(null);
+    setExecutions((prev) =>
+      prev.map((e) => (e.id === executionId ? { ...e, status: newStatus } : e))
+    );
     try {
       await updateExecution(cycleId, executionId, { status: newStatus });
-      setExecutions((prev) =>
-        prev.map((e) => (e.id === executionId ? { ...e, status: newStatus } : e))
-      );
-
       if (newStatus === "Failed") {
         const exec = executions.find((e) => e.id === executionId);
         if (exec) openBugDialogFor({ ...exec, status: newStatus }, "Failed");
       }
+    } catch (err) {
+      setExecutions((prev) =>
+        prev.map((e) => (e.id === executionId ? { ...e, status: prevStatus ?? e.status } : e))
+      );
+      setStatusError({
+        id: executionId,
+        message: err instanceof Error ? err.message : "Failed to update status. Please try again.",
+      });
     } finally {
       setStatusSaving(null);
     }
@@ -771,24 +789,39 @@ export default function TestRunDetailPage() {
   async function handlePanelSave() {
     if (!panelExecution) return;
     setPanelSaving(true);
+    // Optimistic: the row behind this panel reflects the pick immediately rather than only after
+    // the PATCH resolves — same fix, and same revert-on-failure below, as handleStatusChange.
+    const prev = panelExecution;
+    setExecutions((list) =>
+      list.map((e) =>
+        e.id === panelExecution.id
+          ? { ...e, status: panelStatus, actualResult: panelActualResult, assigneeId: panelAssigneeId || null }
+          : e
+      )
+    );
     try {
       await updateExecution(cycleId, panelExecution.id, {
         status: panelStatus,
         actualResult: panelActualResult,
         assigneeId: panelAssigneeId || null,
       });
-      setExecutions((prev) =>
-        prev.map((e) =>
-          e.id === panelExecution.id
-            ? { ...e, status: panelStatus, actualResult: panelActualResult, assigneeId: panelAssigneeId || null }
+      const wasFailed = prev.status === "Failed";
+      closeExecutionPanel();
+      if (panelStatus === "Failed" && !wasFailed) {
+        openBugDialogFor({ ...prev, status: panelStatus }, "Failed");
+      }
+    } catch (err) {
+      setExecutions((list) =>
+        list.map((e) =>
+          e.id === prev.id
+            ? { ...e, status: prev.status, actualResult: prev.actualResult, assigneeId: prev.assigneeId }
             : e
         )
       );
-      const wasFailed = panelExecution.status === "Failed";
-      closeExecutionPanel();
-      if (panelStatus === "Failed" && !wasFailed) {
-        openBugDialogFor({ ...panelExecution, status: panelStatus }, "Failed");
-      }
+      setStatusError({
+        id: prev.id,
+        message: err instanceof Error ? err.message : "Failed to update status. Please try again.",
+      });
     } finally {
       setPanelSaving(false);
     }
@@ -1442,19 +1475,29 @@ export default function TestRunDetailPage() {
                               )}
                             </div>
                             {isInProgress ? (
-                              <select
-                                value={e.status}
-                                onChange={(ev) => handleStatusChange(e.id, ev.target.value)}
-                                disabled={statusSaving === e.id}
-                                className="h-7 cursor-pointer rounded-[6px] border px-2 text-[11.5px] font-medium outline-none"
-                                style={execSelectStyle(e.status)}
-                              >
-                                {EXEC_STATUSES.map((s) => (
-                                  <option key={s} value={s} style={EXEC_OPTION_STYLE}>
-                                    {s}
-                                  </option>
-                                ))}
-                              </select>
+                              <span className="flex items-center gap-1.5">
+                                <select
+                                  value={e.status}
+                                  onChange={(ev) => handleStatusChange(e.id, ev.target.value)}
+                                  className={`h-7 cursor-pointer rounded-[6px] border px-2 text-[11.5px] font-medium outline-none ${
+                                    statusSaving === e.id ? "opacity-60" : ""
+                                  }`}
+                                  style={execSelectStyle(e.status)}
+                                >
+                                  {EXEC_STATUSES.map((s) => (
+                                    <option key={s} value={s} style={EXEC_OPTION_STYLE}>
+                                      {s}
+                                    </option>
+                                  ))}
+                                </select>
+                                {statusError?.id === e.id && (
+                                  <IconAlertCircle
+                                    size={15}
+                                    className="shrink-0 text-[var(--error-foreground)]"
+                                    title={statusError.message}
+                                  />
+                                )}
+                              </span>
                             ) : (
                               <StatusChip tone={statusToTone(e.status)}>{e.status}</StatusChip>
                             )}
