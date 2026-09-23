@@ -10998,7 +10998,7 @@ export class LegacyService implements OnModuleInit {
     if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const messages = await this.db.query(
       `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
-              status, testcases, activity, created_at, review_request_id
+              status, testcases, activity, created_at, review_request_id, resume_attempt
        FROM zyra_chat_messages
        WHERE session_id = $1 AND project_id = $2
        ORDER BY created_at ASC`,
@@ -11155,7 +11155,11 @@ export class LegacyService implements OnModuleInit {
           const hint = pending.kind === "proposal"
             ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
             : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
+          // No onStage here (unlike the first call above): this is a full second pass through
+          // context-gathering/routing/generating on the SAME turnId — re-narrating it would render
+          // as confusing duplicate backlog rows for a rare retry path that already discloses itself
+          // in its own reply wording via the [confirmation-retry:...] marker.
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
           const fired = retried.operations.length > 0;
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
           decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
@@ -11166,7 +11170,7 @@ export class LegacyService implements OnModuleInit {
           if (fired) traceMessageId = `${userMessageId}:confirm-retry`;
         }
       }
-      onStage?.("staging");
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11180,7 +11184,10 @@ export class LegacyService implements OnModuleInit {
       // `{testcaseIds: [], totalCount: 0}` on every create turn, silently erasing the
       // pendingReviewRequestIds recordZyraPendingReviewRequest had just set moments earlier in the
       // SAME call. See the changelog entry this was fixed alongside.
-      onStage?.("finalizing");
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
       const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId });
       const title = this.compactTitle(message);
       await this.db.query(
@@ -11213,8 +11220,13 @@ export class LegacyService implements OnModuleInit {
     // no live trace (tracing off, or a path that genuinely has none) simply skip recordReconciliation
     // below rather than needing a dummy value.
     traceMessageId?: string;
+    // How many consecutive resume attempts this message's chain has already burned through — 0 for
+    // every ordinary sendZyraChatMessage insert (a fresh turn), or priorAttempts+1/0 from
+    // processZyraChatResume depending on whether this attempt itself timed out again. See
+    // continueZyraChatMessage's ZYRA_RESUME_ATTEMPT_CAP check.
+    resumeAttempt?: number;
   }): Promise<Body> {
-    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId } = params;
+    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId, resumeAttempt } = params;
     const status = decision.timedOut ? "timed_out" : "completed";
     const resumeCheckpoint = decision.timedOut && decision.resumeCheckpoint ? JSON.stringify(decision.resumeCheckpoint) : null;
     const finalReply = this.finalizeZyraChatReply(decision, applied, testcases);
@@ -11245,9 +11257,9 @@ export class LegacyService implements OnModuleInit {
     }
     const assistant = await this.db.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb)
-       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id`,
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint, resume_attempt)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12)
+       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id, resume_attempt`,
       [
         sessionId,
         projectId,
@@ -11259,7 +11271,8 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(testcases),
         JSON.stringify(activity),
         applied.reviewRequestId || null,
-        resumeCheckpoint
+        resumeCheckpoint,
+        resumeAttempt || 0
       ]
     );
     const item = toCamel(assistant.rows[0]);
@@ -11268,10 +11281,21 @@ export class LegacyService implements OnModuleInit {
     return item;
   }
 
+  /** How many consecutive timeouts/failures a single resume chain tolerates before Continue stops
+   *  offering the identical-size retry and requires an explicit narrowed batch instead. */
+  private static readonly ZYRA_RESUME_ATTEMPT_CAP = 2;
+
   /*
    * Picks a timed-out turn back up. Basecamp-reported symptom: the provider stalled, the request
    * held open with no reply and no error, indistinguishable from "Zyra doesn't respond" (see
-   * ZYRA_ROUTER_TIMEOUT_MS/ZYRA_GENERATE_TIMEOUT_MS). This is what the chat's Continue button calls.
+   * ZYRA_ROUTER_TIMEOUT_MS/zyraGenerateTimeoutMs). This is what the chat's Continue button calls.
+   *
+   * Fire-and-forget, NOT synchronous: a resume can legitimately run for minutes (the same budget
+   * the original attempt had), and holding this HTTP request open for that long is exactly what
+   * made the "Resuming…" button look hung with zero feedback (Basecamp: misleading UX, not a
+   * bug in the generation itself). This claims the row, kicks off the real work in the
+   * background via processZyraChatResume, and returns immediately — the frontend polls
+   * getZyraChatSession (and optionally watches the turnId's SSE progress stream) for the result.
    *
    * Race safety: the UPDATE ... WHERE status = 'timed_out' below is the only thing that decides who
    * gets to resume a given checkpoint. It is a single atomic statement, so a double-click or two
@@ -11281,10 +11305,34 @@ export class LegacyService implements OnModuleInit {
    * the user sends a new message, so Continue can never resolve to a turn the conversation has since
    * moved past.
    */
-  async continueZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, messageId: string) {
+  async continueZyraChatMessage(
+    projectId: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void,
+    narrow?: boolean
+  ): Promise<{ session: Body; accepted: boolean }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId) || !isUuid(messageId)) throw new NotFoundException({ error: "Zyra chat message not found" });
+
+    const current = await this.db.query<{ resume_attempt: number }>(
+      "SELECT resume_attempt FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3",
+      [messageId, sessionId, projectId]
+    );
+    if (!current.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
+    const priorAttempts = Number(current.rows[0].resume_attempt) || 0;
+    // Defensive server-side re-check: the frontend hides the plain Continue button once the cap is
+    // hit, but a stale tab or a direct API call must not be able to bypass it — same "never trust
+    // the client alone" stance as the testcaseRange allow-list.
+    if (priorAttempts >= LegacyService.ZYRA_RESUME_ATTEMPT_CAP && !narrow) {
+      throw new BadRequestException({
+        error: "This turn has timed out repeatedly — try a smaller batch instead of the same size again.",
+        code: "zyra_resume_cap_exceeded"
+      });
+    }
 
     const claim = await this.db.query(
       `UPDATE zyra_chat_messages SET status = 'resuming'
@@ -11296,27 +11344,54 @@ export class LegacyService implements OnModuleInit {
       // Not (or no longer) claimable: already resumed by an earlier click, currently being resumed by
       // a concurrent one, expired by a newer message, or never existed. None of these are errors the
       // user caused right now — hand back the current session so the UI just reflects reality.
-      const existing = await this.db.query("SELECT 1 FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3", [messageId, sessionId, projectId]);
-      if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
-      return { message: null, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: false };
     }
 
     const checkpoint = (claim.rows[0].resume_checkpoint || {}) as Partial<ZyraResumeCheckpoint>;
     const resumeMessage = String(checkpoint.message || "");
-    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     if (!resumeMessage) {
       // A checkpoint with no message text is unusable — revert rather than strand it in 'resuming'.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
       throw new BadRequestException({ error: "This turn has no context to resume from — send a new message instead." });
     }
+    if (narrow) {
+      checkpoint.routedCount = { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false };
+    }
 
+    void this.processZyraChatResume(projectId, uid, userId, sessionId, messageId, checkpoint, priorAttempts, onStage, onSettled)
+      .catch(() => undefined);
+    return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: true };
+  }
+
+  /**
+   * The actual resume work, detached from continueZyraChatMessage's HTTP request — see that
+   * method's doc comment for why. Identical logic to what continueZyraChatMessage used to run
+   * inline, plus threading onStage through for SSE narration and tracking resume_attempt so
+   * repeated failures can eventually be capped.
+   */
+  private async processZyraChatResume(
+    projectId: string,
+    uid: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    checkpoint: Partial<ZyraResumeCheckpoint>,
+    priorAttempts: number,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<void> {
+    const resumeMessage = String(checkpoint.message || "");
+    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     try {
       const decision = checkpoint.stage === "generate"
         ? await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, {
             routedSuite: checkpoint.routedSuite ?? null,
             routedCount: checkpoint.routedCount ?? {}
-          })
-        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId);
+          }, undefined, onStage)
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, onStage);
+      // Same two stages sendZyraChatMessage narrates, mirrored here so a resumed turn's backlog has
+      // the identical shape as a fresh one — see the "unify both flows" design.
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11330,18 +11405,33 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
-      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId: checkpointUserMessageId });
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
+      // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
+      // row; a genuine completion resets it to 0 — see insertZyraAssistantMessage's resumeAttempt
+      // param and the "cap is per-chain" note on continueZyraChatMessage.
+      const nextResumeAttempt = decision.timedOut ? priorAttempts + 1 : 0;
+      const item = await this.insertZyraAssistantMessage({
+        sessionId, projectId, uid, decision, applied, testcases, activity,
+        traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt
+      });
       // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
       // again. A fresh timeout (decision.timedOut again) instead lands on the NEW message's own
       // resume_checkpoint, so Continue keeps working across repeated timeouts.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      onSettled?.({ ok: true, payload: { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) } });
     } catch (err) {
       // Anything that throws here (not a timeout — those are caught inside buildZyraChatDecision and
       // returned as another timed-out decision, not thrown) leaves this checkpoint resumable again
-      // rather than stranding it in 'resuming' forever.
-      await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      throw err;
+      // rather than stranding it in 'resuming' forever. Still counts toward the cap: the user's
+      // experience (clicked Continue, still failed, offered Continue again) is the same either way.
+      await this.db.query(
+        "UPDATE zyra_chat_messages SET status = 'timed_out', resume_attempt = $2 WHERE id = $1 AND status = 'resuming'",
+        [messageId, priorAttempts + 1]
+      );
+      onSettled?.({ ok: false, message: "This turn did not complete." });
     }
   }
 
@@ -11442,6 +11532,44 @@ export class LegacyService implements OnModuleInit {
     return this.zyraChatSession(projectId, userId, sessionId);
   }
 
+  /**
+   * The accuracy-critical branch for the live progress backlog: a capability-gated step (knowledge
+   * base, bugs) must never report `items`/`count` when the capability is OFF, even though the raw
+   * data was already fetched — reporting what was gathered regardless of the gate is exactly the
+   * "claims don't match what was actually used" failure this feature exists to prevent. Pulled out
+   * as its own pure function specifically so this branch has direct unit coverage, independent of
+   * buildZyraChatDecision's much larger surface.
+   */
+  private static zyraGatedBacklogMeta(enabled: boolean, items: Array<Record<string, unknown>>, disabledReason: string): Record<string, unknown> {
+    return enabled ? { items, count: items.length } : { skipped: true, reason: disabledReason };
+  }
+
+  /** Counts by `type` for the live progress backlog's "staging" step — e.g. `{ create: 5 }`. */
+  private static tallyZyraOperationTypes(operations: Array<{ type: string }>): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const op of operations) counts[op.type] = (counts[op.type] || 0) + 1;
+    return counts;
+  }
+
+  /**
+   * The `knowledge` array can carry the same document twice — once from an explicit folder-name
+   * match, once from RAG/recency (`[...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge :
+   * knowledgeFallback)]`, no dedup) — so the live progress backlog's "Knowledge Base" step would
+   * otherwise list one document twice. Keyed on the citation's real source id when present
+   * (title alone is not guaranteed unique — two docs can share a name), falling back to title.
+   */
+  private static dedupeZyraKnowledgeItems<T extends { title: string; citation?: { sourceId?: string } }>(items: T[]): T[] {
+    const seen = new Set<string>();
+    const out: T[] = [];
+    for (const item of items) {
+      const key = item.citation?.sourceId || item.title;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
   // One AI call understands the request, then the system executes it. There is deliberately no
   // keyword router in front of the model: a regex table cannot tell "start generating" from
   // "generate", or know that "save it" means create-these when the cases were never written and
@@ -11471,7 +11599,9 @@ export class LegacyService implements OnModuleInit {
     // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
     onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
-    onStage?.("context");
+    // No onStage call here — the old single "context" announcement fired before any gathering even
+    // started, and provably said nothing about what was actually found. See the granular
+    // context:knowledge/jira/testcases/bugs calls below, once capabilities are known.
     // Computed here, before context-gathering, purely so the retrieval-time query-embedding call
     // below can attach to the SAME trace startZyraTurn opens later (once gathered context exists —
     // see that call's own comment for why the turn itself still opens down there, unchanged). Same
@@ -11592,6 +11722,23 @@ export class LegacyService implements OnModuleInit {
     // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
     // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
     const bugsForChat = capabilities.knowledgeBase ? bugs : [];
+    // Progress narration for the live chat backlog — deliberately placed HERE, after `capabilities`
+    // is known, not up where gathering started (this used to be a single onStage?.("context") fired
+    // before any of knowledge/jira/testcases/bugs were even fetched). Reporting what was gathered
+    // before knowing whether the knowledge-base capability is even on would show a project with it
+    // OFF a backlog claiming Zyra read documents it never actually showed the model — the exact
+    // trust failure this feature exists to prevent. A capability that's off still gets its own
+    // step, marked `skipped`, rather than silently vanishing — showing Zyra correctly respected the
+    // setting is itself trust-building, not just showing what it read.
+    const knowledgeBacklogItems = LegacyService.dedupeZyraKnowledgeItems(knowledgeForChat);
+    onStage?.("context:knowledge", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, knowledgeBacklogItems.map((k) => ({ title: k.title })), "Knowledge base access is off for this project"
+    ));
+    onStage?.("context:jira", { items: mentionedJira.map((j) => ({ key: j.key, summary: j.summary })), count: mentionedJira.length });
+    onStage?.("context:testcases", { items: existingTestcases.map((tc) => ({ externalId: tc.externalId, title: tc.title })), count: existingTestcases.length });
+    onStage?.("context:bugs", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, bugsForChat.map((b) => ({ id: b.id, title: b.title })), "Knowledge base access is off for this project"
+    ));
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -11706,7 +11853,9 @@ export class LegacyService implements OnModuleInit {
       });
     }
 
-    onStage?.("routing");
+    onStage?.("routing", {
+      totalContextItems: knowledgeBacklogItems.length + mentionedJira.length + existingTestcases.length + bugsForChat.length
+    });
     try {
       const callRouter = () =>
         providerWire(provider) === "anthropic"
@@ -11884,7 +12033,7 @@ export class LegacyService implements OnModuleInit {
       conversation, routedSuite, routedCount, mentionedJira, capabilities, bugsForChat, onStage, trace,
       knowledgeConfidence
     } = params;
-    onStage?.("generating");
+    onStage?.("generating", { requestedCount: routedCount?.requestedCount ?? null, suiteName: routedSuite?.name ?? null });
     try {
       const decision = await this.generateZyraChatCreateDecision({
         projectId, userId, sessionId, provider, model, key, message,

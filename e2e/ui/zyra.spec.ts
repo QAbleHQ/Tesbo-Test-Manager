@@ -1886,6 +1886,71 @@ test.describe("zyra / agents (UI)", () => {
     expect(patchAttempts, "still only one retry, not an unbounded loop").toBe(2);
   });
 
+  // ─── Continue / resume (the misleading "Resuming…" hang fix) ───────────────
+  // Same "arrange through Postgres" rule as seedChatReviewBatch below — actually reaching a
+  // timed-out or in-flight resume through the live route needs a provider call that genuinely
+  // stalls, which this suite deliberately never drives (file header).
+  function seedResumeMessage(status: "timed_out" | "resuming", options: { resumeAttempt?: number } = {}): { sessionId: string; messageId: string } {
+    const t = tenant!;
+    exec(`INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES (${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E resume session');`);
+    const sessionId = scalar(`SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+    const checkpoint = JSON.stringify({
+      stage: "generate", userMessageId: "", message: "Write me some test cases",
+      routedSuite: null, routedCount: { requestedCount: 10, exhaustive: false },
+    });
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, resume_checkpoint, resume_attempt) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
+        `'⏱️ I did not hear back from the AI provider in time.', ${literal(status)}, ${literal(checkpoint)}::jsonb, ${options.resumeAttempt ?? 0});`,
+    );
+    const messageId = scalar(`SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    return { sessionId, messageId };
+  }
+
+  test("ZYU-90 a message already 'resuming' on page load shows a working indicator immediately, with elapsed time ticking", async ({ browser }) => {
+    // Loading the page with status already 'resuming' is exactly what a reload mid-Continue looks
+    // like (no client-side turnId survives a reload) — this is that gap the fix closes: previously
+    // nothing rendered at all for this status.
+    seedResumeMessage("resuming");
+    const page = await open(browser, "/agents/zyra");
+
+    // Case-insensitive: the redesigned backlog uses a lowercase, log-style "zyra is working on
+    // this" line rather than sentence-cased prose.
+    await expect(page.getByText(/zyra is working on this/i)).toBeVisible();
+    // The old static, disabled "Resuming…" button no longer exists in any form.
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
+    await expect(page.getByText(/Resuming…/)).toHaveCount(0);
+
+    const elapsedText = page.getByText(/\d+s elapsed/);
+    await expect(elapsedText).toBeVisible();
+    const first = Number((await elapsedText.textContent())?.match(/(\d+)s elapsed/)?.[1] ?? "0");
+    await page.waitForTimeout(2500);
+    const second = Number((await elapsedText.textContent())?.match(/(\d+)s elapsed/)?.[1] ?? "0");
+    expect(second, "the elapsed counter must actually advance — a frozen number is the exact misleading UX this fix replaces").toBeGreaterThan(first);
+  });
+
+  test("ZYU-91 after repeated timeouts, Continue is replaced by a narrowed-batch suggestion with an escape hatch back to full size", async ({ browser }) => {
+    seedResumeMessage("timed_out", { resumeAttempt: 2 });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/timed out 3 times in a row/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Continue with a smaller batch (5 cases)" })).toBeVisible();
+    // The identical-size Continue is gone once the cap is hit — offering it again would just repeat
+    // the same multi-minute wait for the same result.
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
+    // Never a hard dead end: the user can still choose to retry at the original size.
+    await expect(page.getByText("Try the original size again anyway")).toBeVisible();
+  });
+
+  test("ZYU-92 below the cap, the plain Continue button still renders exactly as before", async ({ browser }) => {
+    seedResumeMessage("timed_out", { resumeAttempt: 1 });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Continue with a smaller batch (5 cases)" })).toHaveCount(0);
+    await expect(page.getByText(/timed out .* times in a row/)).toHaveCount(0);
+  });
+
   // ─── Review step for Zyra-chat-generated test cases ────────────────────────
   // Chat no longer writes create/update/archive operations straight to `testcases` — they're
   // staged (applyZyraChatOperations) and shown in a review panel on the assistant's own message,
