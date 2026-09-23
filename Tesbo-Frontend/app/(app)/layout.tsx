@@ -11,7 +11,7 @@ export default function AppLayout({
   return (
     <AppDataProvider>
       <TopBarSlotsProvider>
-        <div className="tesbo-app-shell flex min-h-screen text-[var(--foreground)]">
+        <div className="tesbo-app-shell flex h-screen text-[var(--foreground)]">
           <Sidebar />
           <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
             <TopBar />
