@@ -16,6 +16,7 @@ import {
   listTestRuns,
   listSuites,
   listBugs,
+  listCustomTags,
   type ExecutionReportRow,
   type RequirementMatrixRow,
   type RepositorySummary,
@@ -23,6 +24,7 @@ import {
   type ReportsInsights,
   type ReportsTrends,
   type SuiteNode,
+  type CustomTag,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -59,6 +61,7 @@ interface ReportsHeaderStatsData {
 interface ReportsExecFiltersData {
   plans: { id: string; name: string }[];
   suites: SuiteNode[];
+  tags: CustomTag[];
 }
 
 /*
@@ -103,6 +106,7 @@ export default function ReportsPage() {
   const cachedExecFilters = getPageCache<ReportsExecFiltersData>(execFiltersCacheKey);
   const [plans, setPlans] = useState<{ id: string; name: string }[]>(cachedExecFilters?.plans ?? []);
   const [suites, setSuites] = useState<SuiteNode[]>(cachedExecFilters?.suites ?? []);
+  const [tags, setTags] = useState<CustomTag[]>(cachedExecFilters?.tags ?? []);
   // Tracks "have we ever successfully populated plans/suites this mount" (cache-seeded counts),
   // separately from `execFiltersLoading` ("is a fetch for them in flight right now") — the Execution
   // tab's dropdown uses the loading flag to show a placeholder instead of vanishing while empty.
@@ -173,15 +177,17 @@ export default function ReportsPage() {
   useEffect(() => {
     if (!auth || activeView !== "execution" || execFiltersLoaded || execFiltersLoading) return;
     setExecFiltersLoading(true);
-    Promise.all([listPlans(projectId), listSuites(projectId)])
-      .then(([pl, su]) => {
+    Promise.all([listPlans(projectId), listSuites(projectId), listCustomTags(projectId).catch(() => [])])
+      .then(([pl, su, tg]) => {
         const next: ReportsExecFiltersData = {
           plans: Array.isArray(pl) ? pl.map((p) => ({ id: p.id, name: p.name })) : [],
           suites: su,
+          tags: tg,
         };
         setPageCache(execFiltersCacheKey, next);
         setPlans(next.plans);
         setSuites(next.suites);
+        setTags(next.tags);
         setExecFiltersLoaded(true);
       })
       .catch(() => {})
@@ -430,6 +436,7 @@ export default function ReportsPage() {
                 runs={runs}
                 suites={suites}
                 members={members}
+                tags={tags}
                 filtersLoading={execFiltersLoading}
               />
             )}

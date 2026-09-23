@@ -48,6 +48,8 @@ export interface SeedCaseOptions {
   priority?: string;
   status?: string;
   automationTags?: string;
+  /** Ids from the project's custom_tags catalog (see seedCustomTag below). */
+  customTagIds?: string[];
   /** Backdates created_at (and updated_at with it, unless updatedDaysAgo says otherwise). */
   createdDaysAgo?: number;
   /** Backdates updated_at on its own, for the repository-summary "updated" windows. */
@@ -64,6 +66,13 @@ export async function seedProject(api: APIRequestContext, name: string): Promise
 export async function seedSuite(api: APIRequestContext, projectId: string, name: string): Promise<string> {
   const res = await api.post(`/api/projects/${projectId}/suites`, { data: { name }, failOnStatusCode: false });
   if (!res.ok()) throw new Error(`Could not create fixture suite "${name}": ${res.status()} ${await res.text()}`);
+  return (await res.json()).id;
+}
+
+/** Creates a project custom tag through the API and returns its id. */
+export async function seedCustomTag(api: APIRequestContext, projectId: string, name: string): Promise<string> {
+  const res = await api.post(`/api/projects/${projectId}/custom-tags`, { data: { name }, failOnStatusCode: false });
+  if (!res.ok()) throw new Error(`Could not create fixture custom tag "${name}": ${res.status()} ${await res.text()}`);
   return (await res.json()).id;
 }
 
@@ -85,6 +94,7 @@ export async function seedTestCase(
       priority: opts.priority ?? "P2",
       status: opts.status ?? "Draft",
       automationTags: opts.automationTags ?? null,
+      customTagIds: opts.customTagIds,
     },
     failOnStatusCode: false,
   });
@@ -269,6 +279,7 @@ export function purgeProject(projectId: string): void {
       `DELETE FROM plans WHERE project_id = ${id};`,
       `DELETE FROM bugs WHERE project_id = ${id};`,
       `DELETE FROM testcases WHERE project_id = ${id};`,
+      `DELETE FROM custom_tags WHERE project_id = ${id};`,
       `DELETE FROM suites WHERE project_id = ${id};`,
       `UPDATE projects SET archived_at = now() WHERE id = ${id};`,
     ].join(" "),

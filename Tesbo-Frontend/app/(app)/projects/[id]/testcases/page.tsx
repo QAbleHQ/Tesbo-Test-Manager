@@ -41,6 +41,8 @@ import {
   getCustomFieldValues,
   buildCustomFieldFiltersQueryParam,
   listBugs,
+  listCustomTags,
+  getTestCaseTags,
   UNASSIGNED_SUITE_ID,
   type TestCaseListItem,
   type SuiteNode,
@@ -49,6 +51,7 @@ import {
   type CustomFieldValue,
   type CustomFieldFilterCondition,
   type BugItem,
+  type CustomTag,
   type ZyraSourceRef,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
@@ -90,6 +93,7 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 // open=false, so there's no hydration mismatch to worry about).
 const ImportTestCasesModal = dynamic(() => import("@/components/ImportTestCasesModal"), { ssr: false });
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
+import CustomTagsMultiSelect from "@/components/customTags/CustomTagsMultiSelect";
 import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilterPopover";
 import { getConfiguredDefaultValue, validateCustomFieldValues } from "@/components/customFields/customFieldTypes";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
@@ -134,6 +138,7 @@ interface TestCasesPageData {
   suites: SuiteNode[];
   repoSummary: RepositorySummary | null;
   customFieldDefinitions: CustomFieldDefinition[];
+  customTags: CustomTag[];
 }
 
 function normalizeTestcaseIdPrefix(value: string): string {
@@ -472,6 +477,13 @@ export default function TestCasesPage() {
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, unknown>>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
 
+  // Custom tags: `customTags` is the project's tag catalog (used for both create-mode and
+  // edit-mode selection). `selectedTagIds` backs the create form; `panelTagIds` is the edit-mode
+  // selection, seeded from this test case's currently assigned tags.
+  const [customTags, setCustomTags] = useState<CustomTag[]>(cached?.customTags ?? []);
+  const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+  const [panelTagIds, setPanelTagIds] = useState<string[]>([]);
+
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [selectAllMatchingLoading, setSelectAllMatchingLoading] = useState(false);
   const [bulkAction, setBulkAction] = useState<BulkAction>("");
@@ -511,16 +523,23 @@ export default function TestCasesPage() {
   }
 
   const loadData = useCallback(async () => {
-    const [suiteList, summary, activeCustomFields] = await Promise.all([
+    const [suiteList, summary, activeCustomFields, tags] = await Promise.all([
       listSuites(projectId),
       getRepositorySummary(projectId).catch(() => null),
       listCustomFieldDefinitions(projectId, { statuses: ["active"] }).catch(() => []),
+      listCustomTags(projectId).catch(() => []),
     ]);
-    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions: activeCustomFields };
+    const next: TestCasesPageData = {
+      suites: suiteList,
+      repoSummary: summary,
+      customFieldDefinitions: activeCustomFields,
+      customTags: tags
+    };
     setPageCache(`testcases:${projectId}`, next);
     setSuites(next.suites);
     setRepoSummary(next.repoSummary);
     setCustomFieldDefinitions(next.customFieldDefinitions);
+    setCustomTags(next.customTags);
   }, [projectId]);
 
   /**
@@ -537,11 +556,11 @@ export default function TestCasesPage() {
       listSuites(projectId),
       getRepositorySummary(projectId).catch(() => null),
     ]);
-    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions };
+    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions, customTags };
     setPageCache(cacheKey, next);
     setSuites(next.suites);
     setRepoSummary(next.repoSummary);
-  }, [projectId, customFieldDefinitions, cacheKey]);
+  }, [projectId, customFieldDefinitions, customTags, cacheKey]);
 
   useEffect(() => {
     const saved = readStoredValue("tesbo_tc_suite_panel");
@@ -556,6 +575,7 @@ export default function TestCasesPage() {
       setSuites(existing.suites);
       setRepoSummary(existing.repoSummary);
       setCustomFieldDefinitions(existing.customFieldDefinitions);
+      setCustomTags(existing.customTags ?? []);
       setLoading(false);
     }
     loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
@@ -952,6 +972,8 @@ export default function TestCasesPage() {
     setCustomFieldValues(defaults);
     setCustomFieldErrors({});
     setPanelCustomFields([]);
+    setSelectedTagIds([]);
+    setPanelTagIds([]);
   }
 
   async function openCreatePanel() {
@@ -986,15 +1008,17 @@ export default function TestCasesPage() {
     setCustomFieldErrors({});
     setSelectedSourceRef(null);
     try {
-      const [data, customFields, bugs] = await Promise.all([
+      const [data, customFields, bugs, tags] = await Promise.all([
         getTestCase(projectId, testcaseId),
         getCustomFieldValues(projectId, testcaseId).catch(() => []),
         listBugs(projectId, { testcaseId }).catch(() => []),
+        getTestCaseTags(projectId, testcaseId).catch(() => []),
       ]);
       fillFormFromTestCase(data);
       setPanelCustomFields(customFields);
       setCustomFieldValues(Object.fromEntries(customFields.map((f) => [f.id, f.value])));
       setPanelBugs(bugs);
+      setPanelTagIds(tags.map((t) => t.id));
     } catch {
       setPanelError("Failed to load test case details.");
     } finally {
@@ -1059,7 +1083,7 @@ export default function TestCasesPage() {
     const nextRepoSummary = patch.repoSummary !== undefined ? patch.repoSummary : repoSummary;
     if (patch.suites) setSuites(nextSuites);
     if (patch.repoSummary !== undefined) setRepoSummary(nextRepoSummary);
-    setPageCache(cacheKey, { suites: nextSuites, repoSummary: nextRepoSummary, customFieldDefinitions });
+    setPageCache(cacheKey, { suites: nextSuites, repoSummary: nextRepoSummary, customFieldDefinitions, customTags });
   }
 
   function toggleCaseSelection(testcaseId: string) {
@@ -1417,6 +1441,7 @@ export default function TestCasesPage() {
           severity,
           testcaseIdPrefix,
           customFieldValues,
+          customTagIds: selectedTagIds,
         });
         setSuiteCasesPage(1);
         setSuiteSearch("");
@@ -1458,6 +1483,7 @@ export default function TestCasesPage() {
           component,
           severity,
           customFieldValues,
+          customTagIds: panelTagIds,
         });
         setPanelSuccess("Test case updated successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
@@ -2497,6 +2523,14 @@ export default function TestCasesPage() {
                         <FieldLabel>Notes</FieldLabel>
                         <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Add notes, links to screenshots, logs, or reference docs" />
                       </Field>
+                      {customTags.length > 0 && (
+                        <div className="border-t border-[var(--border)] pt-5">
+                          <FieldLabel>Custom Tags</FieldLabel>
+                          <div className="mt-3">
+                            <CustomTagsMultiSelect tags={customTags} selectedIds={selectedTagIds} onChange={setSelectedTagIds} />
+                          </div>
+                        </div>
+                      )}
                       {customFieldDefinitions.length > 0 && (
                         <div className="border-t border-[var(--border)] pt-5">
                           <FieldLabel>Custom Fields</FieldLabel>
@@ -2593,6 +2627,12 @@ export default function TestCasesPage() {
                             <FieldLabel>Notes</FieldLabel>
                             <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Add notes, links to screenshots, logs, or reference docs" />
                           </Field>
+                          {customTags.length > 0 && (
+                            <Field>
+                              <FieldLabel>Custom Tags</FieldLabel>
+                              <CustomTagsMultiSelect tags={customTags} selectedIds={panelTagIds} onChange={setPanelTagIds} />
+                            </Field>
+                          )}
                         </div>
                       )}
                       {panelTab === "steps" && (

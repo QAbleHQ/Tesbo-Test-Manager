@@ -10,6 +10,7 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import type { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
@@ -60,7 +61,8 @@ function makeLegacy(): LegacyService {
     suitesCache,
     testcasesListCache,
     projectOverviewCache,
-    {} as unknown as CustomFieldsService
+    {} as unknown as CustomFieldsService,
+    {} as unknown as CustomTagsService
   );
 }
 

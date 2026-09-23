@@ -17,6 +17,7 @@ import { LegacyModule } from "./legacy/legacy.module";
 import { McpModule } from "./mcp/mcp.module";
 import { BillingModule } from "./billing/billing.module";
 import { CustomFieldsModule } from "./custom-fields/custom-fields.module";
+import { CustomTagsModule } from "./custom-tags/custom-tags.module";
 import { AutomationModule } from "./automation/automation.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
 
@@ -39,6 +40,7 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     McpModule,
     BillingModule,
     CustomFieldsModule,
+    CustomTagsModule,
     PlanLimitsModule,
     AutomationModule,
     ZyraArchiveSweepModule

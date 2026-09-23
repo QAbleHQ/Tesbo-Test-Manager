@@ -38,6 +38,8 @@ export type RbacTenantKind =
   | "custom-fields"
   | "custom-field-values"
   | "custom-fields-ui"
+  | "custom-tags"
+  | "custom-tags-ui"
   | "reports"
   | "reports-ui"
   | "import-export"
