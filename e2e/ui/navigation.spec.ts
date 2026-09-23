@@ -999,6 +999,67 @@ test.describe("top bar — notifications", () => {
  * per-page string, and that the one shared markup shape (nav[aria-label="Breadcrumb"], the current
  * page as a non-link with aria-current="page") is what's actually on the page.
  */
+/*
+ * "[UI] Header Scrolls with Page Instead of Remaining Fixed". TopBar.tsx has always set `sticky
+ * top-0` — it never regressed to `static` — but that only pins an element within whichever
+ * ancestor box is ACTUALLY the one scrolling. app/(app)/layout.tsx's shell used `min-h-screen` (a
+ * floor, not a cap) on the row holding the sidebar and `main`; once a page's content grew taller
+ * than one viewport, `main` — a plain `flex-1` box with no definite height of its own — stretched
+ * to fit that content instead of being clamped to the viewport, so its own `overflow-y-auto` never
+ * had anything to internally scroll and the *document* scrolled instead, carrying the sticky
+ * header away with it. `h-screen` on the shell caps it at exactly one viewport, which is what
+ * actually makes `main` (and the sticky header inside it) the thing that scrolls.
+ */
+test.describe("top bar — sticky positioning", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  test("TOPBAR-01 the header stays pinned to the top while long page content scrolls beneath it", async ({ page }) => {
+    const api = await screensApi();
+    let projectId: string | undefined;
+    try {
+      const project = await createProject(api);
+      projectId = project.id;
+      // Enough rows, at a short viewport, to reliably exceed one screen's worth of content — real
+      // feature data rather than an injected spacer, so this exercises the actual page.
+      for (let i = 0; i < 20; i += 1) {
+        await createBug(api, projectId, { title: `E2E Sticky Header Bug ${i} ${Date.now()}` });
+      }
+
+      await page.setViewportSize({ width: 1280, height: 600 });
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+
+      const header = page.locator("header").first();
+      await expect(header).toBeVisible();
+      const before = await header.boundingBox();
+      expect(before, "the header did not render").not.toBeNull();
+      expect(before!.y, "the header should start pinned to the very top").toBeLessThan(1);
+
+      // A real scroll gesture over the content, not a synthetic DOM change — the mouse has to be
+      // over the content area for the wheel event to target it rather than the sidebar.
+      await page.mouse.move(700, 400);
+      await page.mouse.wheel(0, 2000);
+
+      const scrolled = await page.evaluate(() => ({
+        mainScrollTop: document.querySelector("main")?.scrollTop ?? 0,
+        windowScrollY: window.scrollY,
+      }));
+      expect(
+        scrolled.mainScrollTop,
+        "the content area (main) should be what actually scrolled, not the document",
+      ).toBeGreaterThan(0);
+      expect(scrolled.windowScrollY, "the document itself should not have scrolled").toBe(0);
+
+      const after = await header.boundingBox();
+      expect(after, "the header disappeared from the DOM after scrolling").not.toBeNull();
+      expect(after!.y, "the header moved out of view instead of staying pinned to the top").toBeLessThan(1);
+    } finally {
+      if (projectId) await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+});
+
 test.describe("breadcrumbs", () => {
   test.skip(!!skipReason, skipReason ?? "");
 
