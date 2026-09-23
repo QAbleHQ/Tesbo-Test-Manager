@@ -1541,15 +1541,27 @@ function KnowledgeBasePageInner() {
           <div className="flex min-h-0 flex-1 flex-col">
             {/* Folder breadcrumb + name + count */}
             <div className="shrink-0 border-b border-[var(--border)] px-4 py-3">
-              <div className="flex items-center gap-1 text-[12px] text-[var(--muted)]">
-                {breadcrumb.map((b, i) => (
-                  <span key={b.id} className="flex items-center gap-1">
-                    {i > 0 && <span>/</span>}
-                    <span>{b.name}</span>
-                  </span>
-                ))}
-              </div>
-              <h2 className="text-[15px] font-semibold text-[var(--foreground)]">{folderName}</h2>
+              {/* kbBreadcrumb (legacy.service.ts) always includes the folder itself as the last
+                  crumb, so a single-entry trail — the root folder, which has no parent — is just
+                  its own name repeated right above the h2 below. Only worth showing once there's
+                  an actual parent chain leading up to the current folder. */}
+              {breadcrumb.length > 1 && (
+                <div className="flex items-center gap-1 text-[12px] text-[var(--muted)]">
+                  {breadcrumb.map((b, i) => (
+                    <span key={b.id} className="flex items-center gap-1">
+                      {i > 0 && <span>/</span>}
+                      <span>{b.name}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {/* At root, folderName is forced to "Knowledge base" (see setFolderName above) —
+                  the exact same text as this page's own h1 a few rows above. Repeating it as a
+                  second heading here added nothing a subfolder's own distinct name does, so it's
+                  shown only once the user is actually inside a folder. */}
+              {breadcrumb.length > 1 && (
+                <h2 className="text-[15px] font-semibold text-[var(--foreground)]">{folderName}</h2>
+              )}
               <p className="text-[12px] text-[var(--muted)]">{items.length} item{items.length !== 1 ? "s" : ""}</p>
             </div>
 
