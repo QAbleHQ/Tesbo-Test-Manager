@@ -26,6 +26,7 @@ import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
+import { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 import { SuitesCacheService } from "../cache/suites-cache.service";
@@ -1182,7 +1183,8 @@ export class LegacyService implements OnModuleInit {
     private readonly suitesCache: SuitesCacheService,
     private readonly testcasesListCache: TestcasesListCacheService,
     private readonly projectOverviewCache: ProjectOverviewCacheService,
-    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService
+    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService,
+    @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService
   ) {}
 
   // --- API tokens (project-scoped machine credentials) -------------------
@@ -3807,6 +3809,7 @@ export class LegacyService implements OnModuleInit {
     await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled", {
       testCaseIsNew: true
     });
+    await this.customTags.setTagsForTestCase(projectId, row.id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
     // NOT enqueued here: this method also runs nested inside zyraSave's shared transaction
     // (via processZyraSaveEntriesSequential/Batched), where the embedding worker — a separate
     // connection — could query for this row before that outer transaction commits and find
@@ -4584,6 +4587,9 @@ export class LegacyService implements OnModuleInit {
     // enforcement re-checks against currently-active-required fields using existing
     // stored values — correct for "field made required after the fact".
     await this.customFields.setValuesForTestCase(uid, projectId, id, body.customFieldValues || {}, client, "skip-if-disabled");
+    if (body.customTagIds !== undefined) {
+      await this.customTags.setTagsForTestCase(projectId, id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
+    }
     // NOT enqueued here — same reasoning as insertTestCaseWithClient's comment (this method is
     // also called nested inside zyraSave's shared transaction). Callers enqueue post-commit.
     return row;
@@ -4660,6 +4666,7 @@ export class LegacyService implements OnModuleInit {
       );
       const row = res.rows[0];
       await this.customFields.copyValues(id, row.id, uid, client);
+      await this.customTags.copyTags(id, row.id, client);
       return row;
     });
 
@@ -6698,14 +6705,14 @@ export class LegacyService implements OnModuleInit {
          ci.testcase_id,
          COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
          COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
-         COALESCE(ci.snapshot_automation_tags, t.automation_tags, '') AS automation_tags,
          COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
          COALESCE(s.name, 'No Suite') AS suite_name,
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
          c.plan_id,
          COALESCE(CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END, 'No Plan') AS plan_name,
-         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name
+         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name,
+         COALESCE(tag_agg.tags, '[]'::json) AS custom_tags_json
        FROM cycles c
        JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
@@ -6713,6 +6720,12 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY ct.name) AS tags
+         FROM testcase_custom_tags tct
+         JOIN custom_tags ct ON ct.id = tct.tag_id
+         WHERE tct.testcase_id = t.id
+       ) tag_agg ON true
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
        ORDER BY c.created_at DESC, ci.position, ci.created_at`,
       [projectId]
@@ -6737,10 +6750,7 @@ export class LegacyService implements OnModuleInit {
       groups.set(groupId, row);
     };
     for (const row of res.rows) {
-      const tags = String(row.automation_tags || "")
-        .split(",")
-        .map((tag) => tag.trim())
-        .filter(Boolean);
+      const tcTags: { id: string; name: string }[] = Array.isArray(row.custom_tags_json) ? row.custom_tags_json : [];
       const matchesFilter = (() => {
         if (!filterValue || filterBy === "overall") return true;
         if (filterBy === "person") return String(row.assignee_id || "unassigned") === filterValue;
@@ -6748,7 +6758,7 @@ export class LegacyService implements OnModuleInit {
         if (filterBy === "run") return String(row.run_id) === filterValue;
         if (filterBy === "suite") return String(row.suite_id || "none") === filterValue;
         if (filterBy === "priority") return String(row.priority || "Unspecified") === filterValue;
-        if (filterBy === "tags") return tags.includes(filterValue);
+        if (filterBy === "tags") return tcTags.some((tag) => tag.id === filterValue);
         return true;
       })();
       if (!matchesFilter) continue;
@@ -6758,8 +6768,8 @@ export class LegacyService implements OnModuleInit {
       else if (filterBy === "suite") add(String(row.suite_id || "none"), String(row.suite_name || "No Suite"), status);
       else if (filterBy === "priority") add(String(row.priority || "Unspecified"), String(row.priority || "Unspecified"), status);
       else if (filterBy === "tags") {
-        const effectiveTags = tags.length ? tags : ["Untagged"];
-        for (const tag of effectiveTags) add(tag, tag, status);
+        const effectiveTags = tcTags.length ? tcTags : [{ id: "untagged", name: "Untagged" }];
+        for (const tag of effectiveTags) add(tag.id, tag.name, status);
       } else {
         add(String(row.run_id), String(row.run_name || "Untitled test run"), status);
       }

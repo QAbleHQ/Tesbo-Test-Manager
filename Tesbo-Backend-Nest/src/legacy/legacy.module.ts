@@ -5,6 +5,7 @@ import { RagModule } from "../rag/rag.module";
 import { IntegrationSyncModule } from "../integration-sync/integration-sync.module";
 import { PlanLimitsModule } from "../plan-limits/plan-limits.module";
 import { CustomFieldsModule } from "../custom-fields/custom-fields.module";
+import { CustomTagsModule } from "../custom-tags/custom-tags.module";
 import { LegacyController } from "./legacy.controller";
 import { LegacyService } from "./legacy.service";
 import { SignupController } from "./signup.controller";
@@ -13,7 +14,15 @@ import { ZyraProgressService } from "./zyra-progress.service";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 @Module({
-  imports: [AuthModule, StorageModule, RagModule, IntegrationSyncModule, PlanLimitsModule, forwardRef(() => CustomFieldsModule)],
+  imports: [
+    AuthModule,
+    StorageModule,
+    RagModule,
+    IntegrationSyncModule,
+    PlanLimitsModule,
+    forwardRef(() => CustomFieldsModule),
+    forwardRef(() => CustomTagsModule)
+  ],
   controllers: [LegacyController, SignupController],
   providers: [LegacyService, SignupService, ZyraProgressService, KbExtractionRunnerService],
   exports: [LegacyService]

@@ -4,7 +4,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
-import { IconKey, IconSettings, IconStack2, IconTrash } from "@tabler/icons-react";
+import { IconKey, IconSettings, IconStack2, IconTag, IconTrash } from "@tabler/icons-react";
 import {
   updateProject,
   deleteProject as deleteProjectRequest,
@@ -16,6 +16,7 @@ import {
   removeProjectMember,
   listApiKeys,
   listCustomFieldDefinitions,
+  listCustomTags,
   type JiraConnection,
   type LinearConnection,
   type ProjectIcon,
@@ -75,7 +76,7 @@ type ProjectSettingsPayload = {
   [key: string]: unknown;
 };
 
-type SettingsTab = "general" | "testRuns" | "members" | "apiTokens" | "customFields" | "integrations";
+type SettingsTab = "general" | "testRuns" | "members" | "apiTokens" | "customFields" | "integrations" | "customTags";
 type ProjectMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 type WorkspaceMember = { userId: string; email: string; name: string; role: string; joinedAt: string };
 
@@ -159,6 +160,7 @@ export default function ProjectSettingsPage() {
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [apiTokenCount, setApiTokenCount] = useState<number | null>(null);
   const [customFieldCount, setCustomFieldCount] = useState<number | null>(null);
+  const [customTagCount, setCustomTagCount] = useState<number | null>(null);
   const [deletingProject, setDeletingProject] = useState(false);
   const [deleteProjectModalOpen, setDeleteProjectModalOpen] = useState(false);
   const [deleteProjectTypedName, setDeleteProjectTypedName] = useState("");
@@ -180,6 +182,7 @@ export default function ProjectSettingsPage() {
       { key: "apiTokens", label: "API & MCP" },
       ...(canManageCustomFields ? [{ key: "customFields" as const, label: "Custom Fields" }] : []),
       { key: "integrations", label: "Integrations" },
+      ...(canManageCustomFields ? [{ key: "customTags" as const, label: "Custom Tags" }] : []),
     ],
     [canManageCustomFields]
   );
@@ -261,6 +264,7 @@ export default function ProjectSettingsPage() {
       .catch(() => setLinearIsPro(null));
     listApiKeys(projectId).then((l) => setApiTokenCount(l.length)).catch(() => {});
     listCustomFieldDefinitions(projectId).then((l) => setCustomFieldCount(l.length)).catch(() => {});
+    listCustomTags(projectId).then((l) => setCustomTagCount(l.length)).catch(() => {});
     loadWorkspaceMembers().catch(() => {});
   }, [loadWorkspaceMembers, projectId, router, currentUser]);
 
@@ -1061,6 +1065,40 @@ export default function ProjectSettingsPage() {
             <div>
               <h3 className="text-sm font-medium text-[var(--muted)]">More integrations coming soon</h3>
               <p className="text-xs text-[var(--muted-soft)] mt-0.5">Slack, GitHub, Azure DevOps and more.</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {activeTab === "customTags" && (
+        <Card className="p-4 space-y-4">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--foreground)]">Custom Tags</h2>
+            <p className="mt-1 text-sm text-[var(--muted)]">
+              Curate the tags this project&apos;s test cases can be labelled with.
+            </p>
+          </div>
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
+              <IconTag className="w-5 h-5 text-white" stroke={1.75} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">Test case custom tags</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                {customTagCount === null
+                  ? "Loading…"
+                  : customTagCount === 0
+                  ? "No custom tags yet"
+                  : `${customTagCount} tag${customTagCount === 1 ? "" : "s"}`}
+              </p>
+            </div>
+            <div className="shrink-0">
+              <Link
+                href={`/projects/${projectId}/settings/custom-tags`}
+                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+              >
+                Manage custom tags
+              </Link>
             </div>
           </div>
         </Card>

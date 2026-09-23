@@ -2,8 +2,8 @@
 
 import { useMemo } from "react";
 import { IconChartBar, IconTable } from "@tabler/icons-react";
-import { Input, Select } from "@/components/ui";
-import type { ExecutionReportRow, SuiteNode } from "@/lib/api";
+import { Select } from "@/components/ui";
+import type { CustomTag, ExecutionReportRow, SuiteNode } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
 import { DonutChart, StackedBarChart, Legend, STATUS_COLORS, STATUS_KEYS } from "./charts";
 import { MetricCard, LoadingBlock } from "./shared";
@@ -31,6 +31,7 @@ export function ExecutionReportTab({
   runs,
   suites,
   members,
+  tags,
   filtersLoading = false,
 }: {
   rows: ExecutionReportRow[];
@@ -45,7 +46,8 @@ export function ExecutionReportTab({
   runs: { id: string; name: string }[];
   suites: SuiteNode[];
   members: { userId: string; name: string; email: string }[];
-  /** True while plans/suites (deferred, fetched on this tab's first visit) are still in flight. */
+  tags: CustomTag[];
+  /** True while plans/suites/tags (deferred, fetched on this tab's first visit) are still in flight. */
   filtersLoading?: boolean;
 }) {
   const totals = useMemo(() => {
@@ -127,8 +129,22 @@ export function ExecutionReportTab({
             <option value="P3">P3 - Low</option>
           </Select>
         )}
-        {filterBy === "tags" && (
-          <Input type="text" value={filterValue} onChange={(e) => onFilterValueChange(e.target.value)} placeholder="Enter tag to filter…" className="w-48" />
+        {filterBy === "tags" && (tags.length > 0 || filtersLoading) && (
+          <Select
+            value={filterValue}
+            onChange={(e) => onFilterValueChange(e.target.value)}
+            className="min-w-[140px]"
+            disabled={tags.length === 0}
+          >
+            {tags.length === 0 ? (
+              <option value="">{filtersLoading ? "Loading tags…" : "No tags available"}</option>
+            ) : (
+              <>
+                <option value="">All Tags</option>
+                {tags.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </>
+            )}
+          </Select>
         )}
 
         <div className="ml-auto flex items-center overflow-hidden rounded-[6px] border border-[var(--border)]">

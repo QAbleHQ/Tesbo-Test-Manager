@@ -16,6 +16,7 @@ import {
   listRunExecutions,
   purgeProject,
   seedBug,
+  seedCustomTag,
   seedPlan,
   seedProject,
   seedRun,
@@ -99,6 +100,8 @@ interface ReportsFixture {
   /** run name -> the fixture's own view of what that run contains, for cross-checking. */
   expectedRunTotals: Map<string, number>;
   bugTitles: { thisWeek: string; twoWeeksAgo: string; longAgo: string };
+  /** Custom tag catalog ids backing filterBy=tags — see RPT-A-12/RPT-A-13. */
+  tags: { smoke: string; regression: string; api: string };
 }
 
 let tenant: RbacTenant | null = null;
@@ -114,20 +117,29 @@ async function buildFixture(api: APIRequestContext, projectId: string): Promise<
   const betaSuiteId = await seedSuite(api, projectId, "Beta");
   const planId = await seedPlan(api, projectId, "E2E Reports Regression Plan");
 
+  // Custom tags — the catalog behind filterBy=tags (RPT-A-12/RPT-A-13). Names mirror the tags
+  // these cases used to carry via the free-text automation_tags column, before Group by Tags was
+  // switched to read the real project tag catalog.
+  const tags = {
+    smoke: await seedCustomTag(api, projectId, "smoke"),
+    regression: await seedCustomTag(api, projectId, "regression"),
+    api: await seedCustomTag(api, projectId, "api"),
+  };
+
   const cases = {
     flaky: await seedTestCase(api, projectId, {
       title: "Checkout flickers between runs",
       suiteId: alphaSuiteId,
       priority: "P2",
       status: "Approved",
-      automationTags: "smoke,regression",
+      customTagIds: [tags.smoke, tags.regression],
     }),
     stable: await seedTestCase(api, projectId, {
       title: "Login always works",
       suiteId: alphaSuiteId,
       priority: "P1",
       status: "Approved",
-      automationTags: "smoke",
+      customTagIds: [tags.smoke],
     }),
     lowFlake: await seedTestCase(api, projectId, {
       title: "Search fails once in six runs",
@@ -145,7 +157,7 @@ async function buildFixture(api: APIRequestContext, projectId: string): Promise<
       title: "Health endpoint responds",
       priority: "P3",
       status: "Approved",
-      automationTags: "api",
+      customTagIds: [tags.api],
     }),
     old: await seedTestCase(api, projectId, {
       title: "Legacy case authored six weeks ago",
@@ -223,7 +235,7 @@ async function buildFixture(api: APIRequestContext, projectId: string): Promise<
   await seedBug(api, projectId, { title: bugTitles.twoWeeksAgo, severity: "High", createdDaysAgo: 15 });
   await seedBug(api, projectId, { title: bugTitles.longAgo, severity: "Low", status: "Closed", createdDaysAgo: 80 });
 
-  return { projectId, alphaSuiteId, betaSuiteId, planId, cases, runs, expectedRunTotals, bugTitles };
+  return { projectId, alphaSuiteId, betaSuiteId, planId, cases, runs, expectedRunTotals, bugTitles, tags };
 }
 
 test.beforeAll(async () => {
@@ -428,6 +440,8 @@ test.describe("execution report grouping", () => {
     expect((byName.get("regression") as any).total).toBe(11); // flaky only
     expect((byName.get("api") as any).total).toBe(1); // noSuite
     expect((byName.get("Untagged") as any).total).toBe(7); // lowFlake 6 + old 1
+    // Grouping is keyed by the catalog tag's id, not its name — a rename wouldn't fragment the group.
+    expect((byName.get("smoke") as any).groupId).toBe(fixture.tags.smoke);
   });
 
   test("RPT-A-13 filtering by one tag still reports the other tags carried by the matching cases", { tag: '@tesbo.testId("TES-TC-473")' }, async () => {
@@ -436,7 +450,7 @@ test.describe("execution report grouping", () => {
     // behaviour can't drift silently — see the finding in docs/e2e-coverage-waves.md.
     const body = await getJson(
       asOwner,
-      `/api/projects/${fixture.projectId}/reports/execution?filterBy=tags&filterValue=regression`,
+      `/api/projects/${fixture.projectId}/reports/execution?filterBy=tags&filterValue=${fixture.tags.regression}`,
     );
     const byName = new Map(body.rows.map((r: any) => [r.groupName, r]));
     expect((byName.get("regression") as any).total).toBe(11);
