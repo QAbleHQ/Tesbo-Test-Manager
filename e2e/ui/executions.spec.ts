@@ -1172,6 +1172,91 @@ test.describe("auto bug-filing on Failed", () => {
 });
 
 /*
+ * Regression: the inline status <select> in the run's execution table used to stay disabled and
+ * showing the OLD value for the full PATCH round trip (page.tsx's handleStatusChange awaited
+ * updateExecution before touching local state at all) — reported as a "noticeable delay" on every
+ * status change. It's now optimistic: the new value renders the instant it's picked, and only
+ * rolls back (with an inline error indicator) if the PATCH actually fails.
+ */
+test.describe("inline status change is optimistic", () => {
+  test("the status dropdown shows the new value immediately, before the PATCH response arrives", { tag: '@tesbo.testId("TES-TC-2060")' }, async ({ page }) => {
+    const title = `UI Optimistic Status Case ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+
+      // Hold the PATCH open indefinitely so the assertion below can only pass if the dropdown's
+      // displayed value changed WITHOUT waiting for a response — the exact failure mode reported.
+      let releaseResponse: (() => void) | undefined;
+      const held = new Promise<void>((resolve) => (releaseResponse = resolve));
+      await page.route(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/, async (route) => {
+        if (route.request().method() !== "PATCH") return route.continue();
+        await held;
+        await route.continue();
+      });
+
+      const row = page.getByRole("row", { name: title });
+      const select = row.getByRole("combobox");
+      await select.selectOption("Blocked");
+      await expect(select).toHaveValue("Blocked");
+
+      releaseResponse?.();
+      // Still "Blocked" once the (deliberately delayed) response actually lands — the optimistic
+      // value wasn't a flash that reverted once the real round trip caught up.
+      await expect(select).toHaveValue("Blocked");
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+        expect(executions.find((e: { testcaseId: string }) => e.testcaseId === testcase.id)?.status).toBe("Blocked");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("a failed status PATCH rolls the dropdown back to the last saved value and shows an error indicator", { tag: '@tesbo.testId("TES-TC-2061")' }, async ({ page }) => {
+    const title = `UI Optimistic Status Rollback Case ${Date.now()}`;
+    const { cycle, testcase } = await setUpCycleWithOneCase(title);
+
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+
+      await page.route(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/, (route) => {
+        if (route.request().method() !== "PATCH") return route.continue();
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Internal error" }) });
+      });
+
+      const row = page.getByRole("row", { name: title });
+      const select = row.getByRole("combobox");
+      await expect(select).toHaveValue("Untested");
+      await select.selectOption("Blocked");
+
+      // Rolls back once the failed PATCH resolves, and an error indicator appears on that row.
+      // IconAlertCircle renders its `title` prop as an SVG <title> child (see @tabler/icons-react's
+      // createReactComponent), not a `title` attribute on the element — so this locates that child
+      // node directly rather than an attribute selector, which would never match here.
+      await expect(select).toHaveValue("Untested");
+      await expect(row.locator("svg title")).toHaveText("Internal error");
+
+      const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+      try {
+        const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+        // Nothing was actually persisted by the mocked-failed request — the rollback matches reality.
+        expect(executions.find((e: { testcaseId: string }) => e.testcaseId === testcase.id)?.status).toBe("Untested");
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
+/*
  * "[Test Runs] Unable to assign test cases for execution" — the editable "Assign to" control.
  *
  * Before this change, assignee was read-only everywhere in the UI, and even when set through the

@@ -6,6 +6,7 @@ import { IconArrowsSort, IconColumns, IconSortAscending, IconSortDescending } fr
 import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { ZyraCitationsBadge } from "@/components/agents/ZyraCitationsBadge";
 
 /** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
 export type RepoTcSortColumn = "id" | "title" | "priority";
@@ -24,7 +25,8 @@ export type RepoTcColumnId =
   | "status"
   | "updated"
   | "type"
-  | "automation";
+  | "automation"
+  | "context";
 
 type RepoDataColumnId = Exclude<RepoTcColumnId, "select">;
 
@@ -39,6 +41,7 @@ const DATA_COLUMN_IDS: RepoDataColumnId[] = [
   "type",
   "automation",
   "status",
+  "context",
   "updated",
 ];
 
@@ -55,6 +58,7 @@ const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
   updated: "Updated",
   type: "Type",
   automation: "Automation Type",
+  context: "Context",
 };
 
 const FIELD_IDS: Record<RepoDataColumnId, string> = {
@@ -69,6 +73,7 @@ const FIELD_IDS: Record<RepoDataColumnId, string> = {
   updated: "updated",
   type: "type",
   automation: "automationStatus",
+  context: "sourceRefs",
 };
 
 // Column order is fixed, not user-customizable — drag-to-reorder was removed (only the per-column
@@ -88,6 +93,7 @@ const DATA_ORDER: RepoDataColumnId[] = [
   "type",
   "automation",
   "status",
+  "context",
   "updated",
 ];
 
@@ -108,6 +114,7 @@ const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
   updated: true,
   type: true,
   automation: true,
+  context: false,
 };
 
 const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -123,6 +130,7 @@ const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
   updated: 108,
   type: 120,
   automation: 136,
+  context: 168,
 };
 
 const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -138,6 +146,7 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
   updated: 96,
   type: 88,
   automation: 96,
+  context: 120,
 };
 
 const MAX_WIDTH = 560;
@@ -532,6 +541,12 @@ export function RepositoryTestCaseTable({
             >
               <span className={innerTruncate}>{tc.automationStatus}</span>
             </StatusChip>
+          </td>
+        );
+      case "context":
+        return (
+          <td key={col} style={tdStyle} className={cellClass} onClick={(e) => e.stopPropagation()}>
+            <ZyraCitationsBadge refs={tc.sourceRefs} projectId={projectId} />
           </td>
         );
       default:

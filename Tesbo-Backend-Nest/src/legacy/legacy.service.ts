@@ -26,6 +26,7 @@ import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
+import { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 import { SuitesCacheService } from "../cache/suites-cache.service";
@@ -1182,7 +1183,8 @@ export class LegacyService implements OnModuleInit {
     private readonly suitesCache: SuitesCacheService,
     private readonly testcasesListCache: TestcasesListCacheService,
     private readonly projectOverviewCache: ProjectOverviewCacheService,
-    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService
+    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService,
+    @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService
   ) {}
 
   // --- API tokens (project-scoped machine credentials) -------------------
@@ -3406,7 +3408,7 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
-              testcases.severity, testcases.component,
+              testcases.severity, testcases.component, testcases.source_refs,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb
@@ -3795,7 +3797,7 @@ export class LegacyService implements OnModuleInit {
         body.attachments || null,
         uid,
         this.normalizeEstimatedDuration(body.estimatedDuration),
-        JSON.stringify(body.sourceRefs || [])
+        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs))
       ]
     );
     const row = res.rows[0];
@@ -3807,6 +3809,7 @@ export class LegacyService implements OnModuleInit {
     await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled", {
       testCaseIsNew: true
     });
+    await this.customTags.setTagsForTestCase(projectId, row.id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
     // NOT enqueued here: this method also runs nested inside zyraSave's shared transaction
     // (via processZyraSaveEntriesSequential/Batched), where the embedding worker — a separate
     // connection — could query for this row before that outer transaction commits and find
@@ -4572,8 +4575,9 @@ export class LegacyService implements OnModuleInit {
         this.normalizeEstimatedDuration(body.estimatedDuration),
         // Every plain UI/API edit omits this, so COALESCE keeps whatever citations already existed
         // on the row — an update never silently clears them. Only a Zyra save that explicitly
-        // resolved new citations (zyraSaveAttempt) passes a real array here.
-        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null,
+        // resolved new citations (zyraSaveAttempt) passes a real array here. sanitizeSourceRefsInput
+        // both validates shape and caps length before it overwrites the column.
+        Array.isArray(body.sourceRefs) ? JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)) : null,
         clearsJira,
         clearsLinear
       ]
@@ -4583,6 +4587,9 @@ export class LegacyService implements OnModuleInit {
     // enforcement re-checks against currently-active-required fields using existing
     // stored values — correct for "field made required after the fact".
     await this.customFields.setValuesForTestCase(uid, projectId, id, body.customFieldValues || {}, client, "skip-if-disabled");
+    if (body.customTagIds !== undefined) {
+      await this.customTags.setTagsForTestCase(projectId, id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
+    }
     // NOT enqueued here — same reasoning as insertTestCaseWithClient's comment (this method is
     // also called nested inside zyraSave's shared transaction). Callers enqueue post-commit.
     return row;
@@ -4659,6 +4666,7 @@ export class LegacyService implements OnModuleInit {
       );
       const row = res.rows[0];
       await this.customFields.copyValues(id, row.id, uid, client);
+      await this.customTags.copyTags(id, row.id, client);
       return row;
     });
 
@@ -5773,7 +5781,10 @@ export class LegacyService implements OnModuleInit {
         clearsAssignee
       ]
     );
-    await this.logProjectActivity(
+    // Fire-and-forget: logProjectActivity already swallows its own errors (see its `.catch` below)
+    // and its result is never read, so there is no correctness reason for the status-update response
+    // — which a user is watching live in the execution table's dropdown — to wait on this write.
+    void this.logProjectActivity(
       before.rows[0].project_id,
       uid,
       "execution_updated",
@@ -6694,14 +6705,14 @@ export class LegacyService implements OnModuleInit {
          ci.testcase_id,
          COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
          COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
-         COALESCE(ci.snapshot_automation_tags, t.automation_tags, '') AS automation_tags,
          COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
          COALESCE(s.name, 'No Suite') AS suite_name,
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
          c.plan_id,
          COALESCE(CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END, 'No Plan') AS plan_name,
-         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name
+         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name,
+         COALESCE(tag_agg.tags, '[]'::json) AS custom_tags_json
        FROM cycles c
        JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
@@ -6709,6 +6720,12 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY ct.name) AS tags
+         FROM testcase_custom_tags tct
+         JOIN custom_tags ct ON ct.id = tct.tag_id
+         WHERE tct.testcase_id = t.id
+       ) tag_agg ON true
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
        ORDER BY c.created_at DESC, ci.position, ci.created_at`,
       [projectId]
@@ -6733,10 +6750,7 @@ export class LegacyService implements OnModuleInit {
       groups.set(groupId, row);
     };
     for (const row of res.rows) {
-      const tags = String(row.automation_tags || "")
-        .split(",")
-        .map((tag) => tag.trim())
-        .filter(Boolean);
+      const tcTags: { id: string; name: string }[] = Array.isArray(row.custom_tags_json) ? row.custom_tags_json : [];
       const matchesFilter = (() => {
         if (!filterValue || filterBy === "overall") return true;
         if (filterBy === "person") return String(row.assignee_id || "unassigned") === filterValue;
@@ -6744,7 +6758,7 @@ export class LegacyService implements OnModuleInit {
         if (filterBy === "run") return String(row.run_id) === filterValue;
         if (filterBy === "suite") return String(row.suite_id || "none") === filterValue;
         if (filterBy === "priority") return String(row.priority || "Unspecified") === filterValue;
-        if (filterBy === "tags") return tags.includes(filterValue);
+        if (filterBy === "tags") return tcTags.some((tag) => tag.id === filterValue);
         return true;
       })();
       if (!matchesFilter) continue;
@@ -6754,8 +6768,8 @@ export class LegacyService implements OnModuleInit {
       else if (filterBy === "suite") add(String(row.suite_id || "none"), String(row.suite_name || "No Suite"), status);
       else if (filterBy === "priority") add(String(row.priority || "Unspecified"), String(row.priority || "Unspecified"), status);
       else if (filterBy === "tags") {
-        const effectiveTags = tags.length ? tags : ["Untagged"];
-        for (const tag of effectiveTags) add(tag, tag, status);
+        const effectiveTags = tcTags.length ? tcTags : [{ id: "untagged", name: "Untagged" }];
+        for (const tag of effectiveTags) add(tag.id, tag.name, status);
       } else {
         add(String(row.run_id), String(row.run_name || "Untitled test run"), status);
       }
@@ -14571,8 +14585,15 @@ export class LegacyService implements OnModuleInit {
         linearUrl: ctx.linearUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
-        // no sourceRefs ever attached) simply carries none, same as it always has.
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
+        // if blank" protection as severity/component above, but expressed as null-vs-[] rather than
+        // null-vs-value: a brand-new row always takes whatever the draft resolved (even none, i.e.
+        // []); regenerating an already-linked row only overwrites when this run actually resolved
+        // something, otherwise passes null so updateTestCaseWithClient's COALESCE keeps the
+        // citations already on the row instead of silently wiping them on an ungrounded re-run.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
       if (existingLinkedRow?.id) {
@@ -14679,7 +14700,12 @@ export class LegacyService implements OnModuleInit {
         jiraUrl: ctx.jiraUrl,
         linearIssueKey: ctx.linearIssueKey,
         linearUrl: ctx.linearUrl,
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
+        // identical field — see that function's comment for why null (not []) is what protects an
+        // already-linked row's existing citations from being wiped by an ungrounded regeneration.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
 
@@ -14787,7 +14813,7 @@ export class LegacyService implements OnModuleInit {
       linear_url: payload.linearUrl || null,
       attachments: null,
       estimated_duration: null,
-      source_refs: Array.isArray(payload.sourceRefs) ? payload.sourceRefs : []
+      source_refs: LegacyService.sanitizeSourceRefsInput(payload.sourceRefs)
     }));
 
     const res = await client.query(
@@ -15862,6 +15888,30 @@ export class LegacyService implements OnModuleInit {
       if (!match) continue;
       seen.add(label);
       resolved.push(match);
+    }
+    return resolved;
+  }
+
+  // Guards the plain create/update endpoints' sourceRefs input the same way sanitizeZyraSourceRefs
+  // guards Zyra's own output. Zyra's citations are already verified against zyraSourceRefIndex before
+  // they ever reach a testcases row, but a raw REST/MCP call has no such check — and this column is
+  // now rendered and clickable in the repository table and detail panel, not just flashed in a
+  // transient review screen, so a malformed or oversized array can no longer be silently trusted.
+  // Same 20-entry cap as sanitizeZyraSourceRefs; entries missing a valid type/id are dropped rather
+  // than rejecting the whole request, matching how every other optional field on this endpoint
+  // already behaves (see insertTestCaseWithClient's own `body.x || y` defaulting).
+  private static sanitizeSourceRefsInput(raw: unknown): ZyraSourceRef[] {
+    const validTypes = new Set(["knowledge_document", "knowledge_file", "jira_ticket", "testcase", "bug"]);
+    if (!Array.isArray(raw)) return [];
+    const resolved: ZyraSourceRef[] = [];
+    for (const entry of raw.slice(0, 20)) {
+      if (!entry || typeof entry !== "object") continue;
+      const type = (entry as Body).type;
+      const id = (entry as Body).id;
+      if (typeof type !== "string" || !validTypes.has(type)) continue;
+      if (typeof id !== "string" || !id.trim()) continue;
+      const title = typeof (entry as Body).title === "string" ? (entry as Body).title.trim() : "";
+      resolved.push({ type: type as ZyraSourceRef["type"], id: id.trim(), title: title || id.trim() });
     }
     return resolved;
   }

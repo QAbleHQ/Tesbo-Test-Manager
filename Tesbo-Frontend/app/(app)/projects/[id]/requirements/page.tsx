@@ -65,13 +65,13 @@ interface ProviderMeta {
   logoLetter: string;
   /** Label for the provider's mapping screen — Jira maps projects, Linear maps teams. */
   manageLabel: string;
-  getStatus: (projectId: string) => Promise<{ connected: boolean }>;
+  getStatus: (projectId: string) => Promise<{ connected: boolean; connectedProjects?: unknown[] }>;
 }
 
 /**
  * Every tracker this page knows how to render. Tabs are filtered down to the ones actually
- * connected, so registering a provider here is all a new integration needs — and one that is
- * never connected never shows up.
+ * linked to *this* project, so registering a provider here is all a new integration needs — and
+ * one that is only connected at the workspace level, with no project-level link, never shows up.
  */
 const PROVIDERS: ProviderMeta[] = [
   {
@@ -276,11 +276,12 @@ export default function RequirementsPage() {
   const anySyncActive = jiraSync.isActive || linearSync.isActive;
   const syncStarting = jiraSync.starting || linearSync.starting;
 
-  // Only successfully connected trackers are offered as tabs; "All Sources" earns its place
-  // once there is more than one of them to combine.
+  // Only trackers actually linked to *this* project (not merely connected at the workspace
+  // level) are offered as tabs. "All Sources" is always shown alongside them — with zero linked
+  // trackers it's the only tab, since it's the default view the empty/connect states render under.
   const connectedProviders = PROVIDERS.filter((p) => connectedSources.includes(p.id));
   const sourceTabs: Array<{ id: Source; label: string; logoBg: string; logoLetter: string }> =
-    connectedProviders.length > 1 ? [ALL_TAB, ...connectedProviders] : connectedProviders;
+    [ALL_TAB, ...connectedProviders];
   const anyConnected = connectedProviders.length > 0;
   const sourceConnected = source === "all" ? anyConnected : connectedSources.includes(source);
   const stats = summary?.[source] ?? EMPTY_STATS;
@@ -469,9 +470,12 @@ export default function RequirementsPage() {
         setLoading(false);
       }
       const statuses = await Promise.all(
-        PROVIDERS.map((p) => p.getStatus(projectId).catch(() => ({ connected: false })))
+        PROVIDERS.map((p) => p.getStatus(projectId).catch(() => ({ connected: false, connectedProjects: [] })))
       );
-      const connected = PROVIDERS.filter((_, i) => statuses[i].connected).map((p) => p.id);
+      // A provider counts as "connected" here only once *this project* has an active link to it
+      // (a non-empty connectedProjects) — the workspace-level `connected` flag alone (set as soon
+      // as anyone in the workspace authorized the integration) says nothing about this project.
+      const connected = PROVIDERS.filter((_, i) => (statuses[i].connectedProjects?.length ?? 0) > 0).map((p) => p.id);
       setConnectedSources(connected);
       // With a single tracker connected there is no "All Sources" tab to sit under, so open
       // straight onto that provider and keep the active tab in sync with what's rendered.

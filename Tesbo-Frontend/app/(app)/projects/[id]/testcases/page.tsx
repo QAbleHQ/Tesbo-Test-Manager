@@ -41,6 +41,8 @@ import {
   getCustomFieldValues,
   buildCustomFieldFiltersQueryParam,
   listBugs,
+  listCustomTags,
+  getTestCaseTags,
   UNASSIGNED_SUITE_ID,
   type TestCaseListItem,
   type SuiteNode,
@@ -49,7 +51,20 @@ import {
   type CustomFieldValue,
   type CustomFieldFilterCondition,
   type BugItem,
+  type CustomTag,
+  type ZyraSourceRef,
 } from "@/lib/api";
+import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
+
+// Same 5-entry map as ZyraCitationsList/ZyraCitationsBadge — kept local rather than importing from
+// either, which don't export it (each of those components already keeps its own local copy too).
+const CONTEXT_TYPE_LABEL: Record<ZyraSourceRef["type"], string> = {
+  knowledge_document: "Knowledge base",
+  knowledge_file: "Knowledge base",
+  jira_ticket: "Jira",
+  testcase: "Test case",
+  bug: "Bug",
+};
 import { RepositoryTestCaseTable, type RepoTcSort, type RepoTcSortColumn } from "@/components/testcases/RepositoryTestCaseTable";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
@@ -78,6 +93,7 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 // open=false, so there's no hydration mismatch to worry about).
 const ImportTestCasesModal = dynamic(() => import("@/components/ImportTestCasesModal"), { ssr: false });
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
+import CustomTagsMultiSelect from "@/components/customTags/CustomTagsMultiSelect";
 import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilterPopover";
 import { getConfiguredDefaultValue, validateCustomFieldValues } from "@/components/customFields/customFieldTypes";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
@@ -110,7 +126,7 @@ const TESTCASE_SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
-type PanelTab = "overview" | "steps" | "customFields" | "bugs";
+type PanelTab = "overview" | "steps" | "customFields" | "bugs" | "context";
 type BulkAction = "" | "delete" | "update" | "archive" | "move";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
@@ -122,6 +138,7 @@ interface TestCasesPageData {
   suites: SuiteNode[];
   repoSummary: RepositorySummary | null;
   customFieldDefinitions: CustomFieldDefinition[];
+  customTags: CustomTag[];
 }
 
 function normalizeTestcaseIdPrefix(value: string): string {
@@ -421,6 +438,10 @@ export default function TestCasesPage() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [preconditions, setPreconditions] = useState("");
+  // Read-only — never sent back on save (see updateTestCaseWithClient's COALESCE-preserves-existing
+  // contract), so there's no setter used by the form itself beyond fillFormFromTestCase/resetForm.
+  const [panelSourceRefs, setPanelSourceRefs] = useState<ZyraSourceRef[]>([]);
+  const [selectedSourceRef, setSelectedSourceRef] = useState<ZyraSourceRef | null>(null);
   const [postconditions, setPostconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
   const [testData, setTestData] = useState("");
@@ -455,6 +476,13 @@ export default function TestCasesPage() {
   const [panelCustomFields, setPanelCustomFields] = useState<CustomFieldValue[]>([]);
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, unknown>>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
+
+  // Custom tags: `customTags` is the project's tag catalog (used for both create-mode and
+  // edit-mode selection). `selectedTagIds` backs the create form; `panelTagIds` is the edit-mode
+  // selection, seeded from this test case's currently assigned tags.
+  const [customTags, setCustomTags] = useState<CustomTag[]>(cached?.customTags ?? []);
+  const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+  const [panelTagIds, setPanelTagIds] = useState<string[]>([]);
 
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [selectAllMatchingLoading, setSelectAllMatchingLoading] = useState(false);
@@ -495,16 +523,23 @@ export default function TestCasesPage() {
   }
 
   const loadData = useCallback(async () => {
-    const [suiteList, summary, activeCustomFields] = await Promise.all([
+    const [suiteList, summary, activeCustomFields, tags] = await Promise.all([
       listSuites(projectId),
       getRepositorySummary(projectId).catch(() => null),
       listCustomFieldDefinitions(projectId, { statuses: ["active"] }).catch(() => []),
+      listCustomTags(projectId).catch(() => []),
     ]);
-    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions: activeCustomFields };
+    const next: TestCasesPageData = {
+      suites: suiteList,
+      repoSummary: summary,
+      customFieldDefinitions: activeCustomFields,
+      customTags: tags
+    };
     setPageCache(`testcases:${projectId}`, next);
     setSuites(next.suites);
     setRepoSummary(next.repoSummary);
     setCustomFieldDefinitions(next.customFieldDefinitions);
+    setCustomTags(next.customTags);
   }, [projectId]);
 
   /**
@@ -521,11 +556,11 @@ export default function TestCasesPage() {
       listSuites(projectId),
       getRepositorySummary(projectId).catch(() => null),
     ]);
-    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions };
+    const next: TestCasesPageData = { suites: suiteList, repoSummary: summary, customFieldDefinitions, customTags };
     setPageCache(cacheKey, next);
     setSuites(next.suites);
     setRepoSummary(next.repoSummary);
-  }, [projectId, customFieldDefinitions, cacheKey]);
+  }, [projectId, customFieldDefinitions, customTags, cacheKey]);
 
   useEffect(() => {
     const saved = readStoredValue("tesbo_tc_suite_panel");
@@ -540,6 +575,7 @@ export default function TestCasesPage() {
       setSuites(existing.suites);
       setRepoSummary(existing.repoSummary);
       setCustomFieldDefinitions(existing.customFieldDefinitions);
+      setCustomTags(existing.customTags ?? []);
       setLoading(false);
     }
     loadData().catch(() => router.replace("/projects")).finally(() => setLoading(false));
@@ -904,6 +940,7 @@ export default function TestCasesPage() {
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
     setPanelOriginalStatus((data.status as string) ?? "Draft");
     setPanelOriginalSuiteId((data.suiteId as string) || null);
+    setPanelSourceRefs(Array.isArray(data.sourceRefs) ? (data.sourceRefs as ZyraSourceRef[]) : []);
   }
 
   function resetForm(defaultSuiteId?: string | null) {
@@ -926,6 +963,7 @@ export default function TestCasesPage() {
     setPanelJiraIssueKey("");
     setPanelJiraUrl("");
     setPanelBugs([]);
+    setPanelSourceRefs([]);
     const defaults: Record<string, unknown> = {};
     for (const def of customFieldDefinitions) {
       const fallback = getConfiguredDefaultValue(def);
@@ -934,6 +972,8 @@ export default function TestCasesPage() {
     setCustomFieldValues(defaults);
     setCustomFieldErrors({});
     setPanelCustomFields([]);
+    setSelectedTagIds([]);
+    setPanelTagIds([]);
   }
 
   async function openCreatePanel() {
@@ -966,16 +1006,19 @@ export default function TestCasesPage() {
     setPanelOriginalStatus(null);
     setPanelOriginalSuiteId(null);
     setCustomFieldErrors({});
+    setSelectedSourceRef(null);
     try {
-      const [data, customFields, bugs] = await Promise.all([
+      const [data, customFields, bugs, tags] = await Promise.all([
         getTestCase(projectId, testcaseId),
         getCustomFieldValues(projectId, testcaseId).catch(() => []),
         listBugs(projectId, { testcaseId }).catch(() => []),
+        getTestCaseTags(projectId, testcaseId).catch(() => []),
       ]);
       fillFormFromTestCase(data);
       setPanelCustomFields(customFields);
       setCustomFieldValues(Object.fromEntries(customFields.map((f) => [f.id, f.value])));
       setPanelBugs(bugs);
+      setPanelTagIds(tags.map((t) => t.id));
     } catch {
       setPanelError("Failed to load test case details.");
     } finally {
@@ -987,6 +1030,7 @@ export default function TestCasesPage() {
     setPanelMode("closed");
     setPanelTestcaseId(null);
     setPanelError(null);
+    setSelectedSourceRef(null);
   }
 
   function clearSuiteFilters() {
@@ -1039,7 +1083,7 @@ export default function TestCasesPage() {
     const nextRepoSummary = patch.repoSummary !== undefined ? patch.repoSummary : repoSummary;
     if (patch.suites) setSuites(nextSuites);
     if (patch.repoSummary !== undefined) setRepoSummary(nextRepoSummary);
-    setPageCache(cacheKey, { suites: nextSuites, repoSummary: nextRepoSummary, customFieldDefinitions });
+    setPageCache(cacheKey, { suites: nextSuites, repoSummary: nextRepoSummary, customFieldDefinitions, customTags });
   }
 
   function toggleCaseSelection(testcaseId: string) {
@@ -1397,6 +1441,7 @@ export default function TestCasesPage() {
           severity,
           testcaseIdPrefix,
           customFieldValues,
+          customTagIds: selectedTagIds,
         });
         setSuiteCasesPage(1);
         setSuiteSearch("");
@@ -1438,6 +1483,7 @@ export default function TestCasesPage() {
           component,
           severity,
           customFieldValues,
+          customTagIds: panelTagIds,
         });
         setPanelSuccess("Test case updated successfully.");
         setTimeout(() => setPanelSuccess(null), 4000);
@@ -2301,7 +2347,7 @@ export default function TestCasesPage() {
             {/* Tabs (only for edit mode) */}
             {panelMode === "edit" && (
               <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
-                {(["overview", "steps", "customFields", "bugs"] as PanelTab[]).map((tab) => (
+                {(["overview", "steps", "customFields", "bugs", "context"] as PanelTab[]).map((tab) => (
                   <button
                     key={tab}
                     type="button"
@@ -2318,7 +2364,9 @@ export default function TestCasesPage() {
                       ? `Steps${steps.length > 0 ? ` (${steps.length})` : ""}`
                       : tab === "customFields"
                       ? `Custom Fields${panelCustomFields.length > 0 ? ` (${panelCustomFields.length})` : ""}`
-                      : `Bugs${panelBugs.length > 0 ? ` (${panelBugs.length})` : ""}`}
+                      : tab === "bugs"
+                      ? `Bugs${panelBugs.length > 0 ? ` (${panelBugs.length})` : ""}`
+                      : `Context${panelSourceRefs.length > 0 ? ` (${panelSourceRefs.length})` : ""}`}
                   </button>
                 ))}
               </div>
@@ -2475,6 +2523,14 @@ export default function TestCasesPage() {
                         <FieldLabel>Notes</FieldLabel>
                         <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Add notes, links to screenshots, logs, or reference docs" />
                       </Field>
+                      {customTags.length > 0 && (
+                        <div className="border-t border-[var(--border)] pt-5">
+                          <FieldLabel>Custom Tags</FieldLabel>
+                          <div className="mt-3">
+                            <CustomTagsMultiSelect tags={customTags} selectedIds={selectedTagIds} onChange={setSelectedTagIds} />
+                          </div>
+                        </div>
+                      )}
                       {customFieldDefinitions.length > 0 && (
                         <div className="border-t border-[var(--border)] pt-5">
                           <FieldLabel>Custom Fields</FieldLabel>
@@ -2571,6 +2627,12 @@ export default function TestCasesPage() {
                             <FieldLabel>Notes</FieldLabel>
                             <Textarea value={attachments} onChange={(e) => setAttachments(e.target.value)} rows={2} placeholder="Add notes, links to screenshots, logs, or reference docs" />
                           </Field>
+                          {customTags.length > 0 && (
+                            <Field>
+                              <FieldLabel>Custom Tags</FieldLabel>
+                              <CustomTagsMultiSelect tags={customTags} selectedIds={panelTagIds} onChange={setPanelTagIds} />
+                            </Field>
+                          )}
                         </div>
                       )}
                       {panelTab === "steps" && (
@@ -2671,6 +2733,38 @@ export default function TestCasesPage() {
                                 </div>
                               ))}
                             </div>
+                          )}
+                        </div>
+                      )}
+                      {panelTab === "context" && (
+                        <div className="px-6 py-5">
+                          {panelSourceRefs.length === 0 ? (
+                            <EmptyStateBlock
+                              title="No specific source cited"
+                              description="This test case wasn't grounded in a specific ticket, document, or existing item when it was created."
+                            />
+                          ) : (
+                            <div className="space-y-3">
+                              {panelSourceRefs.map((ref, index) => (
+                                <button
+                                  key={`${ref.type}-${ref.id}-${index}`}
+                                  type="button"
+                                  onClick={() => setSelectedSourceRef(ref)}
+                                  className="flex w-full items-start justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4 text-left hover:border-[var(--brand-primary)]"
+                                >
+                                  <div className="min-w-0">
+                                    <p className="text-sm font-semibold text-[var(--foreground)]">{ref.title || ref.id}</p>
+                                    <p className="mt-0.5 truncate text-[11px] text-[var(--muted)]" title={ref.id}>{ref.id}</p>
+                                  </div>
+                                  <span className="mt-[1px] shrink-0 rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">
+                                    {CONTEXT_TYPE_LABEL[ref.type] || ref.type}
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {selectedSourceRef && (
+                            <ZyraContextDrawer projectId={projectId} reference={selectedSourceRef} onClose={() => setSelectedSourceRef(null)} />
                           )}
                         </div>
                       )}

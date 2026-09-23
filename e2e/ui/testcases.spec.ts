@@ -721,3 +721,168 @@ test.describe("test case repository table — Severity and Component columns", (
     }
   });
 });
+
+// Regression coverage for: testcases.source_refs (added in V101_testcase_citations.sql, and always
+// written by Zyra) was never rendered anywhere after a case was saved — it only ever flashed in the
+// transient pre-acceptance review screen. Same "column selector had nothing to show" shape as
+// Severity/Component above, plus the detail panel's Overview tab, which reads the same data from the
+// single-testcase GET rather than from the repository list endpoint.
+test.describe("test case repository table and detail panel — Context column", () => {
+  test("Context can be shown via the column selector, shows the placeholder or a citation count, and survives a reload", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "bug", id: "E2E-NONEXISTENT-BUG", title: "A past citation" }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+      // No citations — the column must render the same placeholder Zyra's own review screen
+      // (ZyraCitationsList) shows for an uncited draft, not a blank cell.
+      const withoutCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without citation` },
+      });
+      created.push((await withoutCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      const rows = () => page.locator("table.tc-repo-table tbody tr");
+      await expect(rows()).toHaveCount(2);
+
+      const headerCells = page.locator("table.tc-repo-table thead tr th");
+      // Hidden by default, same as Suite/Jira/Severity/Component.
+      const defaultHeaderText = (await headerCells.allTextContents()).join(" | ");
+      expect(defaultHeaderText).not.toContain("Context");
+      const defaultCount = await headerCells.count();
+
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+
+      await expect(headerCells).toHaveCount(defaultCount + 1);
+      const headerTexts = await headerCells.allTextContents();
+      const contextIdx = headerTexts.findIndex((t) => t.includes("Context"));
+      expect(contextIdx, "Context header should be present once enabled").toBeGreaterThan(-1);
+
+      const rowWithCitation = rows().filter({ hasText: `${marker} with citation` });
+      const rowWithoutCitation = rows().filter({ hasText: `${marker} without citation` });
+      await expect(rowWithCitation.locator("td").nth(contextIdx)).toContainText("Context used (1)");
+      await expect(rowWithoutCitation.locator("td").nth(contextIdx)).toContainText("No specific source cited");
+
+      // Persistence: a reload must keep the column visible, same as any other column toggle.
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      await expect(headerCells).toHaveCount(defaultCount + 1);
+
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+      await expect(headerCells).toHaveCount(defaultCount);
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("clicking a citation in the Context column opens a menu, and clicking the cited item opens its live content in a drawer", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context Drawer ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      // The cited item is a real, resolvable test case in this project, so the drawer opened from
+      // the citation loads that case's actual live content rather than a stale-source message.
+      const citedRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} cited case` },
+      });
+      const cited = await citedRes.json();
+      created.push(cited.id);
+
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "testcase", id: cited.id, title: cited.title }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} with citation`);
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+
+      await page.getByRole("button", { name: "Context used (1)" }).click();
+      await page.getByRole("button", { name: cited.title, exact: false }).click();
+
+      const drawer = page.locator('div[role="presentation"]').last();
+      await expect(drawer.getByText("Test case", { exact: true })).toBeVisible();
+      await expect(drawer.getByText(cited.title)).toBeVisible();
+      await page.keyboard.press("Escape");
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("the detail panel has a dedicated Context tab showing the same citations as the repository table", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context Panel ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const citedRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} cited case` },
+      });
+      const cited = await citedRes.json();
+      created.push(cited.id);
+
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "testcase", id: cited.id, title: cited.title }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+      const withoutCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without citation` },
+      });
+      created.push((await withoutCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      const panel = page.locator("aside");
+
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} with citation`);
+      await page.getByRole("button", { name: `${marker} with citation` }).click();
+      await panel.getByRole("button", { name: "Context (1)" }).click();
+      const citationCard = panel.getByRole("button", { name: cited.title, exact: false });
+      await expect(citationCard).toBeVisible();
+      await expect(citationCard).toContainText("Test case");
+
+      // Clicking the cited item opens its live content in a drawer.
+      await citationCard.click();
+      const drawer = page.locator('div[role="presentation"]').last();
+      await expect(drawer.getByText(cited.title)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await panel.getByRole("button", { name: "Close panel" }).click();
+
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} without citation`);
+      await page.getByRole("button", { name: `${marker} without citation` }).click();
+      // No count suffix when there's nothing to cite.
+      await expect(panel.getByRole("button", { name: "Context", exact: true })).toBeVisible();
+      await panel.getByRole("button", { name: "Context", exact: true }).click();
+      await expect(panel.getByText("No specific source cited")).toBeVisible();
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
