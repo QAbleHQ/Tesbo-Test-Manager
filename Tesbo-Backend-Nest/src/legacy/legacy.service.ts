@@ -3408,7 +3408,7 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
-              testcases.severity, testcases.component,
+              testcases.severity, testcases.component, testcases.source_refs,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb
@@ -3797,7 +3797,7 @@ export class LegacyService implements OnModuleInit {
         body.attachments || null,
         uid,
         this.normalizeEstimatedDuration(body.estimatedDuration),
-        JSON.stringify(body.sourceRefs || [])
+        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs))
       ]
     );
     const row = res.rows[0];
@@ -4575,8 +4575,9 @@ export class LegacyService implements OnModuleInit {
         this.normalizeEstimatedDuration(body.estimatedDuration),
         // Every plain UI/API edit omits this, so COALESCE keeps whatever citations already existed
         // on the row — an update never silently clears them. Only a Zyra save that explicitly
-        // resolved new citations (zyraSaveAttempt) passes a real array here.
-        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null,
+        // resolved new citations (zyraSaveAttempt) passes a real array here. sanitizeSourceRefsInput
+        // both validates shape and caps length before it overwrites the column.
+        Array.isArray(body.sourceRefs) ? JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)) : null,
         clearsJira,
         clearsLinear
       ]
@@ -5780,7 +5781,10 @@ export class LegacyService implements OnModuleInit {
         clearsAssignee
       ]
     );
-    await this.logProjectActivity(
+    // Fire-and-forget: logProjectActivity already swallows its own errors (see its `.catch` below)
+    // and its result is never read, so there is no correctness reason for the status-update response
+    // — which a user is watching live in the execution table's dropdown — to wait on this write.
+    void this.logProjectActivity(
       before.rows[0].project_id,
       uid,
       "execution_updated",
@@ -14581,8 +14585,15 @@ export class LegacyService implements OnModuleInit {
         linearUrl: ctx.linearUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
-        // no sourceRefs ever attached) simply carries none, same as it always has.
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
+        // if blank" protection as severity/component above, but expressed as null-vs-[] rather than
+        // null-vs-value: a brand-new row always takes whatever the draft resolved (even none, i.e.
+        // []); regenerating an already-linked row only overwrites when this run actually resolved
+        // something, otherwise passes null so updateTestCaseWithClient's COALESCE keeps the
+        // citations already on the row instead of silently wiping them on an ungrounded re-run.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
       if (existingLinkedRow?.id) {
@@ -14689,7 +14700,12 @@ export class LegacyService implements OnModuleInit {
         jiraUrl: ctx.jiraUrl,
         linearIssueKey: ctx.linearIssueKey,
         linearUrl: ctx.linearUrl,
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
+        // identical field — see that function's comment for why null (not []) is what protects an
+        // already-linked row's existing citations from being wiped by an ungrounded regeneration.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
 
@@ -14797,7 +14813,7 @@ export class LegacyService implements OnModuleInit {
       linear_url: payload.linearUrl || null,
       attachments: null,
       estimated_duration: null,
-      source_refs: Array.isArray(payload.sourceRefs) ? payload.sourceRefs : []
+      source_refs: LegacyService.sanitizeSourceRefsInput(payload.sourceRefs)
     }));
 
     const res = await client.query(
@@ -15872,6 +15888,30 @@ export class LegacyService implements OnModuleInit {
       if (!match) continue;
       seen.add(label);
       resolved.push(match);
+    }
+    return resolved;
+  }
+
+  // Guards the plain create/update endpoints' sourceRefs input the same way sanitizeZyraSourceRefs
+  // guards Zyra's own output. Zyra's citations are already verified against zyraSourceRefIndex before
+  // they ever reach a testcases row, but a raw REST/MCP call has no such check — and this column is
+  // now rendered and clickable in the repository table and detail panel, not just flashed in a
+  // transient review screen, so a malformed or oversized array can no longer be silently trusted.
+  // Same 20-entry cap as sanitizeZyraSourceRefs; entries missing a valid type/id are dropped rather
+  // than rejecting the whole request, matching how every other optional field on this endpoint
+  // already behaves (see insertTestCaseWithClient's own `body.x || y` defaulting).
+  private static sanitizeSourceRefsInput(raw: unknown): ZyraSourceRef[] {
+    const validTypes = new Set(["knowledge_document", "knowledge_file", "jira_ticket", "testcase", "bug"]);
+    if (!Array.isArray(raw)) return [];
+    const resolved: ZyraSourceRef[] = [];
+    for (const entry of raw.slice(0, 20)) {
+      if (!entry || typeof entry !== "object") continue;
+      const type = (entry as Body).type;
+      const id = (entry as Body).id;
+      if (typeof type !== "string" || !validTypes.has(type)) continue;
+      if (typeof id !== "string" || !id.trim()) continue;
+      const title = typeof (entry as Body).title === "string" ? (entry as Body).title.trim() : "";
+      resolved.push({ type: type as ZyraSourceRef["type"], id: id.trim(), title: title || id.trim() });
     }
     return resolved;
   }

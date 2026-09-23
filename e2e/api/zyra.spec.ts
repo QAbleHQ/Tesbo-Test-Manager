@@ -2356,6 +2356,63 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
     }
   });
+
+  /*
+   * Zyra regeneration silently wiped an already-linked case's existing citations. draft.sourceRefs
+   * was always written as a real (possibly empty) array, so updateTestCaseWithClient's
+   * `COALESCE($28::jsonb, source_refs)` always took the new value and never fell back to what the
+   * row already had — an ungrounded re-run (no citations resolved this turn) erased them outright.
+   * Same "only fill if blank" protection severity/component get in ZYR-A-73 above, now extended to
+   * source_refs. Invisible before the repository table's Context column existed (nothing rendered
+   * source_refs after creation); ZYR-A-89/90 pin both directions now that it's a real user-facing
+   * regression.
+   */
+  test("ZYR-A-89 regenerating an already-linked test case with no new citations never wipes its existing ones", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const existingCitation = { type: "testcase", id: `E2E-CITED-${Date.now()}`, title: "E2E previously cited case" };
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E already-cited case", priority: "P2", jiraIssueKey, sourceRefs: [existingCitation] },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the already-cited case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const draftTitle = `E2E regenerated content ${Date.now()}`;
+      // draftOverrides omits sourceRefs entirely — the same shape a task-board draft (no chat
+      // pipeline, no citations ever attached) always has.
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ title: draftTitle }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      // Content is genuinely regenerated (this is a real redirect-to-update, not a no-op)...
+      expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe(draftTitle);
+      // ...but the citation this case already had must survive untouched.
+      const after = await (await asOwner.get(url(`/testcases/${testcaseId}`))).json();
+      expect(after.sourceRefs, "an ungrounded regeneration must never wipe citations the case already had").toEqual([existingCitation]);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-90 regenerating an already-linked test case with freshly resolved citations replaces the stale ones", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const staleCitation = { type: "testcase", id: `E2E-STALE-${Date.now()}`, title: "E2E stale citation" };
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E stale-cited case", priority: "P2", jiraIssueKey, sourceRefs: [staleCitation] },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the stale-cited case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const freshCitation = { type: "bug", id: `E2E-FRESH-${Date.now()}`, title: "E2E fresh citation" };
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ sourceRefs: [freshCitation] }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      const after = await (await asOwner.get(url(`/testcases/${testcaseId}`))).json();
+      expect(after.sourceRefs, "a regeneration that actually resolved citations must overwrite the stale ones, not just add to them").toEqual([freshCitation]);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
 });
 
 /*
