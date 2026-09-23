@@ -216,14 +216,16 @@ EOS
             switch_host_nginx_port "${BACKEND_DOMAIN}" "${TARGET_BE}"
 
             nginx -t
-            # Host nginx may be running outside systemd (unit failed/inactive). Prefer
-            # systemctl when active; otherwise signal the master via pid file so stage
-            # cutover still works without starting a second nginx or touching other stacks.
+            # Stage edge nginx (127.0.0.1:1080/1081) must stay under systemd. If the unit is
+            # inactive/failed, start it before reload — a bare "nginx -s reload" cannot revive a
+            # dead master and previously left app-stage on Cloudflare 502 while app ports were fine.
             if systemctl is-active --quiet nginx; then
               systemctl reload nginx
             else
-              echo "WARN: nginx.service inactive; reloading via nginx -s reload (pid $(cat /run/nginx.pid 2>/dev/null || echo unknown))"
-              nginx -s reload
+              echo "WARN: nginx.service inactive; reset-failed + start + reload"
+              systemctl reset-failed nginx || true
+              systemctl start nginx
+              systemctl reload nginx || nginx -s reload
             fi
 
             echo "==> Verifying host nginx cutover before stopping old stack"
