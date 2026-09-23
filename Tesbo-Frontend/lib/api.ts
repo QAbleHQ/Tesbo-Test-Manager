@@ -1416,6 +1416,10 @@ export interface TestCaseListItem {
   severity?: string | null;
   component?: string | null;
   customFieldValues?: Record<string, unknown>;
+  /** Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * case when Zyra generated it — see ZyraSourceRef. Empty/absent for every manually-created,
+   * imported, or duplicated case, since only Zyra ever populates this. */
+  sourceRefs?: ZyraSourceRef[];
 }
 
 export async function listTestCases(
