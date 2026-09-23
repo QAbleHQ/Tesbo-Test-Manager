@@ -1688,6 +1688,32 @@ export async function getCustomFieldValues(projectId: string, testcaseId: string
   return api<CustomFieldValue[]>(`/api/projects/${projectId}/testcases/${testcaseId}/custom-field-values`);
 }
 
+/** custom_tags.name is VARCHAR(40). */
+export const CUSTOM_TAG_NAME_MAX_LENGTH = 40;
+
+export interface CustomTag {
+  id: string;
+  projectId: string;
+  name: string;
+  createdAt: string;
+}
+
+export async function listCustomTags(projectId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/custom-tags`);
+}
+
+export async function createCustomTag(projectId: string, data: { name: string }): Promise<CustomTag> {
+  return api<CustomTag>(`/api/projects/${projectId}/custom-tags`, { method: "POST", body: data });
+}
+
+export async function deleteCustomTag(projectId: string, tagId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/custom-tags/${tagId}`, { method: "DELETE" });
+}
+
+export async function getTestCaseTags(projectId: string, testcaseId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/testcases/${testcaseId}/tags`);
+}
+
 export interface LinkedIssueTaskStatus {
   taskId: string;
   status: string;
