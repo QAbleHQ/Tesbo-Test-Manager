@@ -262,6 +262,120 @@ test.describe("custom tags (UI)", () => {
     await expect(panel.getByText("Custom Tags", { exact: true })).toHaveCount(0);
   });
 
+  // ─── Repository toolbar — Tags filter ───────────────────────────────────────
+
+  // The trigger's accessible name gains the selection-count badge ("Tags 2"), so match both forms.
+  const TAGS_FILTER = /^Tags(\s*\d+)?$/;
+
+  async function defineCase(title: string, customTagIds: string[] = []): Promise<any> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/testcases`, { data: { title, customTagIds }, failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(201);
+    return res.json();
+  }
+
+  test("the Tags filter narrows the repository to cases carrying any selected tag, and chips undo it", async ({ browser }) => {
+    const [smoke, flaky, other] = await Promise.all([
+      defineTag(tagName("Smoke")),
+      defineTag(tagName("Flaky")),
+      defineTag(tagName("Other")),
+    ]);
+    const stamp = `Filter ${Date.now()}`;
+    const smokeCase = await defineCase(`E2E ${stamp} smoke`, [smoke.id]);
+    const flakyCase = await defineCase(`E2E ${stamp} flaky`, [flaky.id]);
+    const otherCase = await defineCase(`E2E ${stamp} other`, [other.id]);
+    const plainCase = await defineCase(`E2E ${stamp} plain`);
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    const titles = page.locator("table.tc-repo-table tbody tr td button", { hasText: stamp });
+    await expect(titles).toHaveCount(4);
+
+    // Each row shows its custom tag as a chip under the title.
+    const smokeRow = page.locator("table.tc-repo-table tbody tr", { hasText: smokeCase.title });
+    await expect(smokeRow.getByTitle("Custom tag")).toHaveText(smoke.name);
+
+    // The filter lists the whole catalog.
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    const listbox = page.getByRole("listbox", { name: "Filter by tags" });
+    for (const t of [smoke, flaky, other]) await expect(listbox.getByText(t.name, { exact: true })).toBeVisible();
+
+    // One tag, then a second: the list is the union, and the request actually carries both ids.
+    await tagCheckbox(listbox, smoke.name).check();
+    await expect(titles).toHaveCount(1);
+    await expect(titles.first()).toHaveText(smokeCase.title);
+    const twoTagRequest = page.waitForRequest((r) => r.url().includes("/testcases?") && r.url().includes(flaky.id));
+    await tagCheckbox(listbox, flaky.name).check();
+    const req = await twoTagRequest;
+    expect(new URL(req.url()).searchParams.get("customTagIds")?.split(",").sort()).toEqual([smoke.id, flaky.id].sort());
+    await expect(titles).toHaveCount(2);
+    await expect(page.getByText(otherCase.title)).toHaveCount(0);
+    await expect(page.getByText(plainCase.title)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: TAGS_FILTER })).toContainText("2");
+    await page.keyboard.press("Escape");
+    // Selections live only in the dropdown (checked boxes + the count badge) — no "Tag: …" chips
+    // are rendered in the toolbar's active-filter row.
+    await expect(page.getByText(/^Tag:/)).toHaveCount(0);
+
+    // Reopening shows both still ticked; unticking one drops just that tag.
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    await expect(tagCheckbox(listbox, smoke.name)).toBeChecked();
+    await expect(tagCheckbox(listbox, flaky.name)).toBeChecked();
+    await tagCheckbox(listbox, smoke.name).uncheck();
+    await expect(titles).toHaveCount(1);
+    await expect(titles.first()).toHaveText(flakyCase.title);
+    await page.keyboard.press("Escape");
+
+    // "Clear all" drops the rest and restores the whole list.
+    await page.getByRole("button", { name: "Clear all" }).click();
+    await expect(titles).toHaveCount(4);
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    await expect(tagCheckbox(listbox, flaky.name)).not.toBeChecked();
+    await page.keyboard.press("Escape");
+
+    // The dropdown's own Clear resets a multi-tag selection in one go.
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    await tagCheckbox(listbox, other.name).check();
+    await tagCheckbox(listbox, smoke.name).check();
+    await expect(titles).toHaveCount(2);
+    await listbox.getByRole("button", { name: "Clear" }).click();
+    await expect(titles).toHaveCount(4);
+  });
+
+  test("a tag nobody carries empties the list instead of showing everything", async ({ browser }) => {
+    const unused = await defineTag(tagName("Unused"));
+    const stamp = `Empty ${Date.now()}`;
+    await defineCase(`E2E ${stamp} plain`);
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await expect(page.getByText(`E2E ${stamp} plain`)).toBeVisible();
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    await tagCheckbox(page.getByRole("listbox", { name: "Filter by tags" }), unused.name).check();
+    await expect(page.locator("table.tc-repo-table tbody tr td button", { hasText: stamp })).toHaveCount(0);
+    await expect(page.getByText("No test cases found")).toBeVisible();
+  });
+
+  test("with an empty catalog the Tags filter says so and points at settings", async ({ browser }) => {
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    const listbox = page.getByRole("listbox", { name: "Filter by tags" });
+    await expect(listbox.getByText(/No custom tags in this project yet/)).toBeVisible();
+    await expect(listbox.locator("input[type='checkbox']")).toHaveCount(0);
+  });
+
+  test("when the filtered list request fails, the screen reports the error", async ({ browser }) => {
+    const tag = await defineTag(tagName("Broken"));
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    // Only the tag-filtered request fails, so everything else on the page still loads normally.
+    await page.route(/\/testcases\?.*customTagIds=/, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "E2E forced failure" }) }),
+    );
+    await page.getByRole("button", { name: TAGS_FILTER }).click();
+    await tagCheckbox(page.getByRole("listbox", { name: "Filter by tags" }), tag.name).check();
+    await expect(page.getByText("E2E forced failure")).toBeVisible();
+  });
+
   // ─── Insights -> Execution Report ───────────────────────────────────────────
 
   test("Group by Tags offers no values for an empty catalog, and the real catalog once tags exist", async ({ browser }) => {

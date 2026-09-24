@@ -143,8 +143,18 @@ export function SyncStatusPanel({ run, label, className = "" }: { run: SyncRun |
           <span className="text-sm font-semibold" style={{ color: tone.text }}>
             {headline}
           </span>
-          {run.remoteProjectKey && (
-            <span className="rounded bg-[var(--surface)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--muted)]">{run.remoteProjectKey}</span>
+          {/* A Linear Project's key is an opaque slugId, so Linear shows the mapped name and keeps the
+              key as the tooltip. Runs recorded before the name was stored fall back to the key. */}
+          {run.provider === "linear" && run.remoteProjectName ? (
+            <span
+              data-testid="sync-run-remote"
+              title={run.remoteProjectKey || undefined}
+              className="rounded bg-[var(--surface)] px-1.5 py-0.5 text-[11px] text-[var(--muted)]"
+            >
+              {run.remoteProjectName}
+            </span>
+          ) : run.remoteProjectKey && (
+            <span data-testid="sync-run-remote" className="rounded bg-[var(--surface)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--muted)]">{run.remoteProjectKey}</span>
           )}
         </div>
         <span className="text-xs text-[var(--muted)]">

@@ -261,11 +261,14 @@ export async function cleanupRun(
  * a fixture project's teardown already cleans them up.
  *
  * Mark a requirement covered by creating a test case carrying the same `jiraIssueKey`.
+ *
+ * `descriptions` optionally sets a ticket's description by key; keys not in it are left NULL.
  */
 export function seedJiraRequirements(
   organizationId: string,
   projectId: string,
   keys: string[],
+  descriptions: Record<string, string> = {},
 ): void {
   exec(
     `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
@@ -281,11 +284,11 @@ export function seedJiraRequirements(
     .map(
       (key) =>
         `(${literal(projectId)}, ${literal(connectionId)}, ${literal(key)}, ${literal(key)}, ` +
-        `${literal(`Requirement ${key}`)}, 'Story', 'Open')`,
+        `${literal(`Requirement ${key}`)}, 'Story', 'Open', ${literal(descriptions[key] ?? null)})`,
     )
     .join(", ");
   exec(
-    `INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status) ` +
+    `INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status, description) ` +
       `VALUES ${values} ON CONFLICT DO NOTHING;`,
   );
 }
@@ -295,6 +298,7 @@ export function seedLinearRequirements(
   organizationId: string,
   projectId: string,
   keys: string[],
+  descriptions: Record<string, string> = {},
 ): void {
   exec(
     `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
@@ -310,11 +314,11 @@ export function seedLinearRequirements(
     .map(
       (key) =>
         `(${literal(projectId)}, ${literal(connectionId)}, ${literal(key)}, ${literal(key)}, ` +
-        `${literal(`Requirement ${key}`)}, 'Story', 'Todo')`,
+        `${literal(`Requirement ${key}`)}, 'Story', 'Todo', ${literal(descriptions[key] ?? null)})`,
     )
     .join(", ");
   exec(
-    `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status) ` +
+    `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status, description) ` +
       `VALUES ${values} ON CONFLICT DO NOTHING;`,
   );
 }
