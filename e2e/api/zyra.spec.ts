@@ -9,6 +9,7 @@ import {
   type RbacTenant,
 } from "../utils/rbac-tenant";
 import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
+import { env } from "../utils/env";
 import { parseSseEvents } from "../utils/sse";
 
 /*
@@ -3734,5 +3735,879 @@ test.describe("zyra task-board generation — knowledge relevance (fake provider
       regenerationPrompt,
       "regeneration after feedback must also retrieve a KB doc outside the 12-most-recent window, not just the initial generation",
     ).toContain("20 minutes of inactivity");
+  });
+});
+
+/*
+ * Ticket auto-comment after a Zyra save — "Auto-comment on Jira/Linear ticket" in the project's
+ * integration settings (projects.settings.jiraAutoComment / linearAutoComment).
+ *
+ * The flow under test, end to end through the real routes:
+ *   1. a Task-board task is created with Knowledge Base documents selected; a document that is a
+ *      ticket's mirror (source_role = 'mirror') links the task to that ticket — but only when the
+ *      selection points at exactly ONE ticket;
+ *   2. Zyra generates drafts (the fake provider, utils/fake-ai-server.ts);
+ *   3. the save links the new test cases to the ticket and records ONE ticket comment for that save
+ *      in integration_ticket_comments (V123), listing exactly the test cases it wrote.
+ *
+ * WHAT IS AND ISN'T OBSERVABLE. Jira and Linear base URLs are compiled in (see
+ * api/integrations.spec.ts's header), so no fake upstream can receive the comment. What IS proven
+ * here is everything Tesbo decides and records: whether a comment is due, for which ticket, with
+ * which test cases, in what words, and that a skip or a provider failure never fails the save. The
+ * "posted" end state itself needs a real Jira site and is verified by hand, not here.
+ *
+ * One consequence worth knowing: a delivery test (setting on + connected) reaches the real
+ * api.atlassian.com / api.linear.app with the fixture's nonsense token. That request cannot write
+ * anything — it is refused (or fails to connect, on a box with no egress) — and the ledger records
+ * it as 'failed', which is the terminal state these tests wait for.
+ */
+test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+  // Replies scripted since the last ai.reset() — see drainBackgroundAi().
+  let queued = 0;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-autocomment");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    // Same shared-server reset as the other fake-provider blocks in this file.
+    ai?.reset();
+    queued = 0;
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(async () => {
+    if (!tenant) return;
+    await drainBackgroundAi();
+    purge();
+  });
+
+  /*
+   * processZyraTask runs in the background, and makes one more provider call (rememberZyraTurn's
+   * summary) AFTER the task already reads in_review. Either can reach the shared fake server after
+   * the next test's ai.reset() and consume the reply that test scripted. So before a test ends:
+   * every task in the project has settled, and every reply it scripted has been asked for.
+   */
+  async function drainBackgroundAi(): Promise<void> {
+    for (let i = 0; i < 80; i++) {
+      const busy = scalar(
+        "SELECT count(*) FROM ai_generation_requests WHERE project_id = " + literal(tenant!.mainProjectId) +
+          " AND task_status IN ('todo', 'in_progress');",
+      );
+      if (busy === "0" && ai.requests.length >= queued) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  function purge(): void {
+    const projects = `${literal(tenant!.mainProjectId)}, ${literal(tenant!.secondProjectId)}`;
+    const org = literal(tenant!.organizationId);
+    // integration_ticket_comments cascades off ai_generation_requests (ON DELETE CASCADE, V123).
+    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM testcases WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM linear_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_folders WHERE project_id IN (${projects}) AND is_root = false;`);
+    exec(`DELETE FROM integration_connections WHERE organization_id = ${org};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+    exec(`UPDATE projects SET settings = '{}'::jsonb WHERE id IN (${projects});`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  // Same custom-gateway provider as the relevance block above, for the same reason: OpenAI-wire, so
+  // the fake server can answer it, but not embeddings-capable, so a seeded KB doc's background
+  // embedding job never consumes one of this test's queued replies.
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: {
+        name: `E2E autocomment fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`,
+        provider: "e2e-fake-gateway",
+        apiKey: "sk-e2e-fake",
+        baseUrl: ai.baseUrl,
+        defaultModel: "gpt-4o-mini",
+      },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  /** Saved through the same PATCH the integration settings panel sends (IntegrationAiGenerationSettings.tsx). */
+  async function setAutoComment(settings: { jiraAutoComment?: boolean; linearAutoComment?: boolean }): Promise<void> {
+    const current = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}`)).json();
+    const parsed = typeof current.settings === "string" ? JSON.parse(current.settings || "{}") : current.settings || {};
+    const res = await asOwner.patch(`/api/projects/${tenant!.mainProjectId}`, {
+      data: { settings: JSON.stringify({ ...parsed, ...settings }) },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving the auto-comment setting — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  /** A workspace connection row, as api/integrations.spec.ts seeds it — never a real OAuth leg. */
+  function seedConnection(provider: "jira" | "linear", options: { disconnected?: boolean } = {}): string {
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
+        `refresh_token, token_expires_at, connected_by, disconnected_at) VALUES (${literal(tenant!.organizationId)}, ` +
+        `${literal(provider)}, ${literal(`e2e-${provider}-site`)}, 'https://e2e.invalid', 'e2e-not-a-real-token', '', ` +
+        `now() + interval '1 hour', ${literal(tenant!.owner.userId)}, ${options.disconnected ? "now()" : "NULL"});`,
+    );
+    return scalar(
+      `SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} ` +
+        `AND provider = ${literal(provider)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  function rootFolderId(projectId = tenant!.mainProjectId): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(projectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND is_root = true;`);
+  }
+
+  /**
+   * A synced ticket and its Knowledge Base mirror, exactly as integration-sync.processor.ts leaves
+   * them: the mirror's source_external_id is the provider's issue ID, not the key — which is why the
+   * backend has to go through the ticket table to find the key at all.
+   */
+  function seedTicketWithMirror(provider: "jira" | "linear", connectionId: string, key: string, projectId = tenant!.mainProjectId): string {
+    const issueId = `id-${key}-${Date.now()}`;
+    if (provider === "jira") {
+      exec(
+        "INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description, " +
+          `issue_type, status, jira_url) VALUES (${literal(projectId)}, ${literal(connectionId)}, ${literal(issueId)}, ` +
+          `${literal(key)}, ${literal(`E2E ${key} loan approval`)}, 'seeded by the e2e suite', 'Story', 'To Do', ` +
+          `${literal(`https://e2e.invalid/browse/${key}`)});`,
+      );
+    } else {
+      exec(
+        "INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, " +
+          `description, issue_type, status, linear_url) VALUES (${literal(projectId)}, ${literal(connectionId)}, ` +
+          `${literal(issueId)}, ${literal(key)}, ${literal(`E2E ${key} loan approval`)}, 'seeded by the e2e suite', 'Bug', ` +
+          `'Todo', ${literal(`https://e2e.invalid/issue/${key}`)});`,
+      );
+    }
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(rootFolderId(projectId))}, ` +
+        `${literal(`${key}: E2E loan approval`)}, 'Approve or reject loan applications.', '<p>Approve or reject loan applications.</p>', ` +
+        `'requirement_note', 'published', ${literal(provider)}, ${literal(issueId)}, 'mirror', true);`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(projectId)} AND source_external_id = ${literal(issueId)};`,
+    );
+  }
+
+  /** A plain, user-written KB document — not a ticket mirror, even if it mentions a key. */
+  async function createNote(title: string, contentText: string): Promise<string> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title, contentText },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    return (await res.json()).id;
+  }
+
+  function draft(title: string): Record<string, unknown> {
+    return {
+      title,
+      preconditions: "A loan application is pending.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open the application", expectedResult: "It opens" }]),
+      testData: "",
+      expectedSummary: "The application can be reviewed.",
+      priority: "P2",
+      tags: ["zyra"],
+      sourceRefs: [],
+    };
+  }
+
+  /** Scripts one generation (plus the memory-summarization call processZyraTask always makes after). */
+  function queueGeneration(titles: string[]): void {
+    ai.queueReply({ drafts: titles.map(draft) });
+    ai.queueReply("- Generated loan approval test cases.");
+    queued += 2;
+  }
+
+  async function waitForTaskSettled(taskId: string, maxAttempts = 60): Promise<string> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`) ?? "";
+  }
+
+  /** Creates a task through the real route (aiGenerate) and returns the created task. */
+  async function createTask(data: Record<string, unknown>): Promise<any> {
+    const res = await asOwner.post(url("/tasks"), { data: { userStory: `E2E loan approval ${Date.now()}`, ...data }, failOnStatusCode: false });
+    expect(res.status(), `creating the task — ${await res.text()}`).toBe(201);
+    return res.json();
+  }
+
+  /**
+   * A Task-board row already in review, written directly — for the save-side cases that don't need
+   * to re-prove generation. Same load-bearing details as seedTask() in the first block
+   * (agent_name, bare-array generated_payload).
+   */
+  function seedReviewTask(fields: { titles: string[]; jiraIssueKey?: string; linearIssueKey?: string }): string {
+    const drafts = fields.titles.map(draft);
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys, linear_issue_keys) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', 'E2E loan approval', ` +
+        `${drafts.length}, ${drafts.length}, 0, ${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', 'in_review', ` +
+        `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb, ` +
+        `${literal(JSON.stringify(fields.linearIssueKey ? [fields.linearIssueKey] : []))}::jsonb);`,
+    );
+    return scalar(
+      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  async function save(taskId: string, selectedDraftIndexes?: number[]): Promise<APIResponse> {
+    return asOwner.post(url(`/tasks/${taskId}/save`), {
+      data: selectedDraftIndexes ? { selectedDraftIndexes } : {},
+      failOnStatusCode: false,
+    });
+  }
+
+  type LedgerRow = { provider: string; issue_key: string; status: string; testcase_ids: string[]; comment_text: string; reason: string | null; save_event_id: string };
+
+  function ledger(taskId: string): LedgerRow[] {
+    const raw = scalar(
+      "SELECT coalesce(json_agg(json_build_object('provider', provider, 'issue_key', issue_key, 'status', status, " +
+        "'testcase_ids', testcase_ids, 'comment_text', comment_text, 'reason', reason, 'save_event_id', save_event_id) " +
+        `ORDER BY created_at), '[]') FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`,
+    );
+    return JSON.parse(raw || "[]");
+  }
+
+  /** Waits for a delivery to leave 'pending' — it runs in the background after the save returns. */
+  async function waitForDelivery(taskId: string, maxAttempts = 120): Promise<LedgerRow[]> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const rows = ledger(taskId);
+      if (rows.length && rows.every((row) => row.status !== "pending")) return rows;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return ledger(taskId);
+  }
+
+  function activityTitles(taskId: string): string[] {
+    const raw = scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    return (JSON.parse(raw || "[]") as Array<{ title: string }>).map((entry) => entry.title);
+  }
+
+  function linkedKey(testcaseId: string, column: "jira_issue_key" | "linear_issue_key" = "jira_issue_key"): string {
+    return scalar(`SELECT coalesce(${column}, '') FROM testcases WHERE id = ${literal(testcaseId)};`);
+  }
+
+  // ─── The primary flow ─────────────────────────────────────────────────────
+
+  test("ZYR-AC-01 KB doc of a Jira ticket → Zyra generates → save posts ONE comment listing exactly those test cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const key = "MFLP-6";
+    const docId = seedTicketWithMirror("jira", connectionId, key);
+    await setAutoComment({ jiraAutoComment: true });
+
+    // An unrelated test case already in the project — it must never appear in the ticket's comment.
+    const unrelated = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: `E2E unrelated case ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(unrelated.status()).toBe(201);
+    const unrelatedTitle = (await unrelated.json()).title;
+
+    const titles = ["Approver can approve a pending loan", "Approver can reject a pending loan with a reason"];
+    queueGeneration(titles);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    const taskId = created.generationRequestId;
+
+    // The KB selection alone linked the task to its ticket — no key was sent.
+    expect(created.task.jiraIssueKeys).toEqual([key]);
+    const jiraSource = (created.task.sources as Array<{ type: string; title: string; detail: string }>).find((s) => s.type === "jira");
+    expect(jiraSource).toMatchObject({ title: key, detail: "Linked from the selected Knowledge Base document." });
+
+    expect(await waitForTaskSettled(taskId), "generation must complete").toBe("in_review");
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    expect(saved.savedCount).toBe(2);
+    expect(saved).not.toHaveProperty("saveEventId");
+    const savedIds = (saved.testcases as Array<{ id: string }>).map((t) => t.id);
+    for (const id of savedIds) expect(linkedKey(id), "each saved test case is linked to the ticket").toBe(key);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows, "exactly one comment for the one ticket this save touched").toHaveLength(1);
+    const [row] = rows;
+    expect(row).toMatchObject({ provider: "jira", issue_key: key });
+    expect([...row.testcase_ids].sort()).toEqual([...savedIds].sort());
+    expect(row.comment_text.split("\n")[0]).toBe("**Generated by Tesbo Test Manager**");
+    expect(row.comment_text).toContain(`Zyra saved 2 test cases for ${key} in Tesbo.`);
+    expect(row.comment_text).toContain("**Added (2)**");
+    // Against this machine's stack (FRONTEND_URL=http://localhost:…, no PUBLIC_APP_URL) each test case
+    // must be plain "ID — title": a link would open every reader's own localhost. Against a deployed
+    // stack (stage) it must link to that test case's page on that same deployment. The full matrix,
+    // including PUBLIC_APP_URL, is pinned in Tesbo-Backend-Nest's ticket-comment-links.spec.ts.
+    for (const t of saved.testcases as Array<{ id: string; externalId: string; title: string }>) {
+      if (env.targetIsLocal) {
+        expect(row.comment_text).toContain(`- ${t.externalId} — ${t.title}`);
+      } else {
+        expect(row.comment_text).toContain(`[${t.externalId}](`);
+        expect(row.comment_text).toContain(`/projects/${tenant!.mainProjectId}/testcases/${t.id}) — ${t.title}`);
+      }
+    }
+    expect(row.comment_text).not.toMatch(/localhost|127\.0\.0\.1/);
+    if (env.targetIsLocal) expect(row.comment_text).not.toContain("](");
+    expect(row.comment_text).not.toContain(unrelatedTitle);
+
+    // The fixture connection can't actually post (see the block header), so the terminal state here
+    // is 'failed' with the provider's reason — and the save above still succeeded regardless.
+    expect(["posted", "failed"]).toContain(row.status);
+    if (row.status === "failed") expect(row.reason, "a failure records why").toBeTruthy();
+    const save_events = scalar(`SELECT save_events::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    expect(save_events, "the ledger's save event is the one the task recorded").toContain(row.save_event_id);
+    expect(activityTitles(taskId)).toContain(row.status === "posted" ? "Posted Jira comment" : "Jira comment failed");
+  });
+
+  test("ZYR-AC-02 regenerating with feedback keeps the ticket link, and the comment lists the regenerated test cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const key = "MFLP-7";
+    const docId = seedTicketWithMirror("jira", connectionId, key);
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueGeneration(["First-pass loan check"]);
+    const taskId = (await createTask({ knowledgeItemIds: [docId] })).generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    // Drain the first run's memory-summarization call before re-scripting (see ZYR-A-92's comment).
+    for (let i = 0; i < 40 && ai.requests.length < 2; i++) await new Promise((r) => setTimeout(r, 250));
+    ai.reset();
+    queued = 0;
+
+    queueGeneration(["Regenerated loan approval audit trail"]);
+    const feedback = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Also cover the audit trail." },
+      failOnStatusCode: false,
+    });
+    expect(feedback.status(), `submitting feedback — ${await feedback.text()}`).toBe(201);
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    // Nothing is commented until the user saves — regeneration alone never posts.
+    expect(ledger(taskId)).toHaveLength(0);
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue_key).toBe(key);
+    expect(rows[0].comment_text).toContain("Regenerated loan approval audit trail");
+    expect(rows[0].comment_text).not.toContain("First-pass loan check");
+    expect(rows[0].testcase_ids).toEqual((saved.testcases as Array<{ id: string }>).map((t) => t.id));
+  });
+
+  // ─── The setting and the connection ───────────────────────────────────────
+
+  test("ZYR-AC-03 auto-comment OFF: the test cases are saved and linked as normal, and no comment is attempted", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Off-case A", "Off-case B"], jiraIssueKey: "MFLP-8" });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    expect(saved.savedCount).toBe(2);
+    for (const t of saved.testcases as Array<{ id: string }>) expect(linkedKey(t.id)).toBe("MFLP-8");
+
+    const rows = ledger(taskId);
+    expect(rows.map((r) => r.status)).toEqual(["skipped_disabled"]);
+    expect(activityTitles(taskId)).toContain("No Jira comment posted");
+  });
+
+  test("ZYR-AC-04 auto-comment never switched on (no setting at all) is treated as off", async () => {
+    seedConnection("jira");
+    const taskId = seedReviewTask({ titles: ["Default-case"], jiraIssueKey: "MFLP-9" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_disabled"]);
+  });
+
+  test("ZYR-AC-05 Jira disconnected: the save succeeds and the comment is recorded as skipped, not failed", async () => {
+    seedConnection("jira", { disconnected: true });
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Disconnected-case"], jiraIssueKey: "MFLP-10" });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    expect((await saveRes.json()).savedCount).toBe(1);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_not_connected"]);
+  });
+
+  test("ZYR-AC-06 Jira never connected: same — skipped, and the save is unaffected", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Never-connected-case"], jiraIssueKey: "MFLP-11" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_not_connected"]);
+  });
+
+  // ─── Which test cases, and how many comments ──────────────────────────────
+
+  test("ZYR-AC-07 a partial save lists only the drafts actually saved", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Kept one", "Dropped one", "Kept two"], jiraIssueKey: "MFLP-12" });
+
+    const saveRes = await save(taskId, [0, 2]);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    const [row] = ledger(taskId);
+    expect(row.testcase_ids).toEqual((saved.testcases as Array<{ id: string }>).map((t) => t.id));
+    expect(row.comment_text).toContain("Kept one");
+    expect(row.comment_text).toContain("Kept two");
+    expect(row.comment_text).not.toContain("Dropped one");
+  });
+
+  test("ZYR-AC-08 saving nothing (every draft deselected) records no comment at all", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    seedConnection("jira");
+    const taskId = seedReviewTask({ titles: ["Never saved"], jiraIssueKey: "MFLP-13" });
+
+    const saveRes = await save(taskId, []);
+    expect(saveRes.status()).toBeLessThan(300);
+    expect((await saveRes.json()).savedCount).toBe(0);
+    expect(ledger(taskId)).toHaveLength(0);
+  });
+
+  test("ZYR-AC-09 two concurrent saves of the same task produce exactly one comment", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Race-case"], jiraIssueKey: "MFLP-14" });
+
+    const [a, b] = await Promise.all([save(taskId), save(taskId)]);
+    expect([a.status(), b.status()].sort(), "one save wins, the other is refused as already saved").toEqual([201, 409]);
+    expect(ledger(taskId)).toHaveLength(1);
+
+    // And a later re-submit is refused the same way — still one comment.
+    expect((await save(taskId)).status()).toBe(409);
+    expect(ledger(taskId)).toHaveLength(1);
+  });
+
+  test("ZYR-AC-10 re-running a ticket updates its linked test cases in place, and that save's comment lists them as Updated", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const first = seedReviewTask({ titles: ["Original loan case"], jiraIssueKey: "MFLP-15" });
+    const firstSave = await (await save(first)).json();
+    const originalId = (firstSave.testcases as Array<{ id: string }>)[0].id;
+
+    const second = seedReviewTask({ titles: ["Refined loan case"], jiraIssueKey: "MFLP-15" });
+    const secondRes = await save(second);
+    expect(secondRes.status(), `saving — ${await secondRes.text()}`).toBe(201);
+
+    const [row] = ledger(second);
+    expect(row.testcase_ids).toEqual([originalId]);
+    expect(row.comment_text).toContain("**Updated (1)**");
+    expect(row.comment_text).toContain("Refined loan case");
+    expect(row.comment_text).not.toContain("**Added");
+    // Each save keeps its own record: the first task's comment is untouched by the second save.
+    expect(ledger(first)).toHaveLength(1);
+    expect(ledger(first)[0].save_event_id).not.toBe(row.save_event_id);
+  });
+
+  // ─── Which ticket the KB selection links to ───────────────────────────────
+
+  test("ZYR-AC-11 KB docs from TWO tickets link to neither, and say so — no comment for either ticket", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-20");
+    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-21");
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueGeneration(["Two-ticket case"]);
+    const created = await createTask({ knowledgeItemIds: [docA, docB] });
+    const taskId = created.generationRequestId;
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    const note = (JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{ title: string; detail: string }>)
+      .find((e) => e.title === "Not linked to a ticket");
+    expect(note?.detail).toContain("MFLP-20");
+    expect(note?.detail).toContain("MFLP-21");
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const saved = await (await save(taskId)).json();
+    expect(linkedKey((saved.testcases as Array<{ id: string }>)[0].id)).toBe("");
+    expect(ledger(taskId)).toHaveLength(0);
+  });
+
+  test("ZYR-AC-12 two docs of the SAME ticket still link to it", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-22");
+    // A second mirror for the same key (e.g. re-synced under a new mapping) — one ticket, not two.
+    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-22");
+    const created = await createTask({ knowledgeItemIds: [docA, docB] });
+    expect(created.task.jiraIssueKeys).toEqual(["MFLP-22"]);
+  });
+
+  test("ZYR-AC-13 a user's own KB note is not a ticket, even if it mentions a key — no link", async () => {
+    await allocateFakeAiKey();
+    const noteId = await createNote("Notes on MFLP-6", "MFLP-6 needs an approval workflow.");
+    const created = await createTask({ knowledgeItemIds: [noteId] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    expect(created.task.linearIssueKeys ?? []).toEqual([]);
+  });
+
+  test("ZYR-AC-14 a ticket mirror from ANOTHER project can't link this project's task", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const foreignDoc = seedTicketWithMirror("jira", connectionId, "MFLP-23", tenant!.secondProjectId);
+    const created = await createTask({ knowledgeItemIds: [foreignDoc] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+  });
+
+  test("ZYR-AC-15 an explicit ticket key (the Requirements page) wins over the KB selection", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docId = seedTicketWithMirror("jira", connectionId, "MFLP-24");
+    const created = await createTask({ jiraIssueKeys: ["MFLP-99"], knowledgeItemIds: [docId] });
+    expect(created.task.jiraIssueKeys).toEqual(["MFLP-99"]);
+  });
+
+  test("ZYR-AC-16 malformed and unknown knowledgeItemIds are ignored, not a 500", async () => {
+    await allocateFakeAiKey();
+    const created = await createTask({ knowledgeItemIds: ["not-a-uuid", "00000000-0000-4000-8000-000000000000", 42, null] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+  });
+
+  // ─── Linear follows the same rules ────────────────────────────────────────
+
+  test("ZYR-AC-17 Linear: a KB doc of a Linear ticket links it, and linearAutoComment gates a markdown comment", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("linear");
+    const docId = seedTicketWithMirror("linear", connectionId, "ENG-42");
+    await setAutoComment({ linearAutoComment: true, jiraAutoComment: false });
+
+    queueGeneration(["Linear loan case"]);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    const taskId = created.generationRequestId;
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    expect(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe('["ENG-42"]');
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const saved = await (await save(taskId)).json();
+    const testcaseId = (saved.testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId, "linear_issue_key")).toBe("ENG-42");
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "linear", issue_key: "ENG-42" });
+    expect(rows[0].comment_text).toMatch(/^\*\*Generated by Tesbo Test Manager\*\*/);
+    expect(rows[0].comment_text).toContain("Linear loan case");
+    expect(["posted", "failed"]).toContain(rows[0].status);
+  });
+
+  test("ZYR-AC-18 Linear off: skipped even while Jira's setting is on", async () => {
+    seedConnection("linear");
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Linear off case"], linearIssueKey: "ENG-43" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => [r.provider, r.status])).toEqual([["linear", "skipped_disabled"]]);
+  });
+
+  // ─── Authorization ────────────────────────────────────────────────────────
+
+  test("ZYR-AC-19 another workspace's user can't save the task, so nothing is commented", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Foreign save"], jiraIssueKey: "MFLP-30" });
+    const outsider = await provisionRbacTenant("zyra");
+    test.skip(!outsider, "the second tenant could not be provisioned");
+    const asOutsider = await loginAs(outsider!.owner);
+    try {
+      const res = await asOutsider.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+      expect([401, 403, 404]).toContain(res.status());
+      expect(ledger(taskId)).toHaveLength(0);
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    } finally {
+      await asOutsider.dispose();
+    }
+  });
+
+  // ─── Ticket keys have no length limit (V124) ──────────────────────────────
+
+  /*
+   * Regression test. Every column a ticket key passes through was VARCHAR(64), so a longer key
+   * failed the save outright at the testcases write (a truncation error), and could not be synced
+   * into jira_tickets at all. Both halves are driven: the KB-link path (jira_tickets → task) and the
+   * save path (task → testcases → integration_ticket_comments).
+   */
+  test("ZYR-AC-20 a ticket key longer than 64 characters links, saves and is recorded in full", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const longKey = `MFLP-${"9".repeat(295)}`;
+    expect(longKey.length).toBe(300);
+    const docId = seedTicketWithMirror("jira", connectionId, longKey);
+    await setAutoComment({ jiraAutoComment: false });
+
+    queueGeneration(["Long-key loan case"]);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    expect(created.task.jiraIssueKeys).toEqual([longKey]);
+    const taskId = created.generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const testcaseId = ((await saveRes.json()).testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId), "the full key is stored on the test case, not truncated").toBe(longKey);
+
+    const rows = ledger(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue_key).toBe(longKey);
+    expect(rows[0].comment_text).toContain(`for ${longKey} in Tesbo.`);
+  });
+
+  test("ZYR-AC-21 an explicit long key (the Requirements page path) saves in full too", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const longKey = `REQ-${"x".repeat(196)}`;
+    const taskId = seedReviewTask({ titles: ["Explicit long-key case"], jiraIssueKey: longKey });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const testcaseId = ((await saveRes.json()).testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId)).toBe(longKey);
+    expect(ledger(taskId).map((r) => r.issue_key)).toEqual([longKey]);
+  });
+  // ─── Listing a task's ticket comments, and retrying a failed one ─────────
+
+  /** Makes a save's recorded comment 'failed', as a refused post would have left it. */
+  function markFailed(taskId: string, reason = "seeded failure"): string {
+    exec(`UPDATE integration_ticket_comments SET status = 'failed', reason = ${literal(reason)} WHERE generation_request_id = ${literal(taskId)};`);
+    return scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)} LIMIT 1;`);
+  }
+
+  function retryUrl(taskId: string, commentId: string): string {
+    return url(`/tasks/${taskId}/ticket-comments/${commentId}/retry`);
+  }
+
+  test("ZYR-AC-22 GET ticket-comments lists this task's comments only, with their outcome", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const mine = seedReviewTask({ titles: ["Listed A", "Listed B"], jiraIssueKey: "KAN-40" });
+    const other = seedReviewTask({ titles: ["Other task"], jiraIssueKey: "KAN-41" });
+    expect((await save(mine)).status()).toBe(201);
+    expect((await save(other)).status()).toBe(201);
+
+    const res = await asOwner.get(url(`/tasks/${mine}/ticket-comments`), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    const { list } = await res.json();
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ provider: "jira", issueKey: "KAN-40", status: "skipped_disabled", reason: null, testcaseCount: 2 });
+    // Internal columns (the comment body, who posted it) are not part of this response.
+    expect(list[0]).not.toHaveProperty("commentText");
+    expect(list[0]).not.toHaveProperty("comment_text");
+
+    // A task with no saves yet has an empty list, not an error.
+    const unsaved = seedReviewTask({ titles: ["Unsaved"], jiraIssueKey: "KAN-42" });
+    expect((await (await asOwner.get(url(`/tasks/${unsaved}/ticket-comments`))).json()).list).toEqual([]);
+  });
+
+  test("ZYR-AC-23 retrying a failed comment re-sends it and records the new outcome (Jira not connected here: fails offline, with that reason)", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Retry me"], jiraIssueKey: "KAN-43" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const res = await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(201);
+    const body = await res.json();
+    // No connection in this tenant, so the re-send stops before any outbound call — and the record
+    // says so, replacing the earlier reason.
+    expect(body).toMatchObject({ id: commentId, status: "failed", reason: "Jira is not connected." });
+    expect(scalar(`SELECT reason FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("Jira is not connected.");
+    const titles = activityTitles(taskId);
+    expect(titles).toContain("Retrying Jira comment");
+    expect(titles[titles.length - 1]).toBe("Jira comment failed");
+    // The rebuilt comment still lists exactly the saved test case.
+    expect(scalar(`SELECT comment_text FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toContain("Retry me");
+  });
+
+  test("ZYR-AC-24 only a failed comment can be retried: skipped → 409, unknown or malformed id → 404", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Skipped one"], jiraIssueKey: "KAN-44" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`);
+
+    const skipped = await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+    expect(skipped.status()).toBe(409);
+    expect(await skipped.text()).toContain("only a failed comment can be retried");
+    expect(scalar(`SELECT status FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("skipped_disabled");
+
+    expect((await asOwner.post(retryUrl(taskId, "00000000-0000-4000-8000-000000000000"), { failOnStatusCode: false })).status()).toBe(404);
+    expect((await asOwner.post(retryUrl(taskId, "not-a-uuid"), { failOnStatusCode: false })).status()).toBe(404);
+    // A real comment id under the wrong task is not found either.
+    const otherTask = seedReviewTask({ titles: ["Elsewhere"] });
+    expect((await asOwner.post(retryUrl(otherTask, commentId), { failOnStatusCode: false })).status()).toBe(404);
+  });
+
+  test("ZYR-AC-25 two retries at once: one re-sends, the other is refused — never two concurrent posts", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Double retry"], jiraIssueKey: "KAN-45" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const [a, b] = await Promise.all([
+      asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false }),
+      asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false }),
+    ]);
+    const statuses = [a.status(), b.status()].sort();
+    // The loser either lost the failed -> pending claim (409), or ran after the winner had already
+    // finished and found it failed again (201). What must never happen is two re-sends at once:
+    // exactly one "Retrying" entry per successful claim.
+    expect(statuses[0]).toBe(201);
+    expect([201, 409]).toContain(statuses[1]);
+    const retries = activityTitles(taskId).filter((t) => t === "Retrying Jira comment").length;
+    expect(retries).toBe(statuses.filter((s) => s === 201).length);
+  });
+
+  test("ZYR-AC-26 retrying after every listed test case was deleted fails with that reason, and posts nothing", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Deleted before retry"], jiraIssueKey: "KAN-46" });
+    const saved = await (await save(taskId)).json();
+    const commentId = markFailed(taskId);
+    for (const t of saved.testcases as Array<{ id: string }>) {
+      const del = await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${t.id}`, { failOnStatusCode: false });
+      expect(del.status(), await del.text()).toBeLessThan(300);
+    }
+
+    const body = await (await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false })).json();
+    expect(body.status).toBe("failed");
+    expect(body.reason).toMatch(/None of the test cases in this comment exist anymore/);
+    expect(activityTitles(taskId)).not.toContain("Retrying Jira comment");
+  });
+
+  test("ZYR-AC-27 the ticket-comment routes are refused to an anonymous caller and to another workspace", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Private comment"], jiraIssueKey: "KAN-47" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const outsider = await provisionRbacTenant("zyra");
+    test.skip(!outsider, "the second tenant could not be provisioned");
+    const anon = await anonymousContext();
+    const asOutsider = await loginAs(outsider!.owner);
+    try {
+      for (const [who, api] of [["anonymous", anon], ["another workspace", asOutsider]] as const) {
+        const list = await api.get(url(`/tasks/${taskId}/ticket-comments`), { failOnStatusCode: false });
+        expect([401, 403, 404], `${who} listing answered ${list.status()}`).toContain(list.status());
+        const retry = await api.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+        expect([401, 403, 404], `${who} retrying answered ${retry.status()}`).toContain(retry.status());
+      }
+      // Nothing was re-sent: the record is exactly as the owner left it.
+      expect(scalar(`SELECT status || '|' || reason FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("failed|seeded failure");
+    } finally {
+      await anon.dispose();
+      await asOutsider.dispose();
+    }
+  });
+  // ─── Credential lifecycle: a connection this deployment can't renew (V125) ─
+
+  /*
+   * The KAN-4 root cause, reproduced: the connection's token was issued to a different Atlassian
+   * OAuth app than the one this deployment renews with, so renewal can never succeed here. The token
+   * is an unsigned JWT naming another client_id — getIntegrationConnection reads that claim and
+   * refuses BEFORE contacting Atlassian, so these tests make no outbound call. Stored as plaintext,
+   * which decryptSecret passes through, like the other connection fixtures in this suite.
+   */
+  function foreignAppToken(): string {
+    const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    return `${b64({ alg: "RS256" })}.${b64({ client_id: `e2e-other-deployment-app-${Date.now()}` })}.sig`;
+  }
+
+  function seedForeignAppConnection(options: { expired: boolean }): string {
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
+        `refresh_token, token_expires_at, connected_by) VALUES (${literal(tenant!.organizationId)}, 'jira', ` +
+        `'e2e-jira-site', 'https://e2e.invalid', ${literal(foreignAppToken())}, 'e2e-refresh-token', ` +
+        `${options.expired ? "now() - interval '5 minutes'" : "now() + interval '1 hour'"}, ${literal(tenant!.owner.userId)});`,
+    );
+    return scalar(`SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+  }
+
+  async function jiraStatus(): Promise<any> {
+    const res = await asOwner.get(`/api/projects/${tenant!.mainProjectId}/jira/status`, { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    return res.json();
+  }
+
+  test("ZYR-AC-28 status no longer reads healthy for a connection this deployment can't renew", async () => {
+    seedForeignAppConnection({ expired: false });
+    const status = await jiraStatus();
+    expect(status.connected).toBe(true);
+    expect(status.needsReconnect).toBe(true);
+    expect(status.authError).toMatch(/different Atlassian OAuth app/);
+
+    // The workspace-level status (the page where Reconnect lives) says the same.
+    const ws = await (await asOwner.get("/api/workspace/integrations/jira/status")).json();
+    expect(ws).toMatchObject({ connected: true, needsReconnect: true });
+  });
+
+  test("ZYR-AC-29 an expired foreign-app token: the comment fails with an actionable reason, and the dead refresh token is recorded, not re-sent", async () => {
+    const connectionId = seedForeignAppConnection({ expired: true });
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Foreign app case"], jiraIssueKey: "KAN-50" });
+    expect((await save(taskId)).status()).toBe(201);
+
+    const [row] = await waitForDelivery(taskId);
+    expect(row.status).toBe("failed");
+    expect(row.reason).toMatch(/needs to be reconnected from this Tesbo deployment/);
+    expect(row.reason).toMatch(/different Atlassian OAuth app/);
+
+    // The refusal is recorded against this exact refresh token (V125)…
+    const markedAt = scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`);
+    expect(markedAt, "the refusal was not recorded").toBeTruthy();
+    expect(scalar(`SELECT auth_error_refresh_fingerprint = encode(sha256(convert_to(refresh_token, 'UTF8')), 'hex') FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+
+    // …so a Retry gets the same reason straight from the record, without another renewal attempt.
+    const commentId = scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`);
+    const retried = await (await asOwner.post(url(`/tasks/${taskId}/ticket-comments/${commentId}/retry`), { failOnStatusCode: false })).json();
+    expect(retried.status).toBe("failed");
+    expect(retried.reason).toMatch(/different Atlassian OAuth app/);
+    expect(scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe(markedAt);
+
+    const status = await jiraStatus();
+    expect(status).toMatchObject({ connected: true, needsReconnect: true });
+  });
+
+  test("ZYR-AC-30 a recorded refusal heals itself when the refresh token changes (reconnect, or another deployment renewed it)", async () => {
+    const connectionId = seedForeignAppConnection({ expired: false });
+    // A refusal recorded for an OLDER refresh token than the one the row holds now.
+    exec(
+      `UPDATE integration_connections SET auth_error = 'Jira needs to be reconnected: old refusal', auth_error_at = now(), ` +
+        `auth_error_refresh_fingerprint = encode(sha256(convert_to('some-older-refresh-token', 'UTF8')), 'hex') WHERE id = ${literal(connectionId)};`,
+    );
+    const status = await jiraStatus();
+    // Still flagged — but for the app mismatch, which is true of the CURRENT token, not the stale record.
+    expect(status.authError).not.toContain("old refusal");
+    expect(status.authError).toMatch(/different Atlassian OAuth app/);
   });
 });
