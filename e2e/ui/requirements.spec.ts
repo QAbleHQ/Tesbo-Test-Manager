@@ -317,3 +317,72 @@ test.describe("requirements page — View in Knowledge base follows the active s
     },
   );
 });
+
+/*
+ * The Linear sync panel's project label. A Linear Project mapping stores its opaque slugId in the
+ * key slot (V95), so the panel used to label a completed sync "4081f3c6e1df" — now it shows the
+ * mapped name (remote_project_name, V126) and keeps the slugId as the hover tooltip, falling back
+ * to the key for runs recorded before the name was stored. The run is seeded directly: a real sync
+ * would call Linear's live API (see api/integrations.spec.ts's file header).
+ */
+test.describe("requirements page — Linear sync panel names the project", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  function seedLinearSyncRun(projectId: string, key: string, name: string | null): void {
+    exec(
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, " +
+        "remote_project_key, remote_project_name, error, started_at, finished_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, 'linear', 'succeeded', 'done', 'manual', ` +
+        `${literal(key)}, ${name === null ? "NULL" : literal(name)}, ` +
+        `${literal(`No changes in ${name ?? key} since the last sync.`)}, now(), now());`,
+    );
+  }
+
+  test("REQ-U-09 a Linear sync shows the project name, with the slugId only as the tooltip", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Linear connection and a sync run");
+    const project = await createProject(api);
+    const slug = `e2e${uniqueSuffix()}`; // shaped like a Linear slugId: opaque, lowercase, no spaces
+    const name = `E2E Orange HRMS ${uniqueSuffix()}`;
+    try {
+      seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedLinearSyncRun(project.id, slug, name);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
+      const chip = panel.getByTestId("sync-run-remote");
+      await expect(chip).toHaveText(name);
+      await expect(chip).toHaveAttribute("title", slug);
+      await expect(panel).toContainText(`No changes in ${name} since the last sync.`);
+      // The reported defect: the opaque slugId was the visible label.
+      await expect(panel.getByText(slug, { exact: true })).toHaveCount(0);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-10 a Linear sync recorded before names were stored falls back to its key", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Linear connection and a sync run");
+    const project = await createProject(api);
+    const slug = `e2e${uniqueSuffix()}`; // shaped like a Linear slugId: opaque, lowercase, no spaces
+    try {
+      seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedLinearSyncRun(project.id, slug, null);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
+      await expect(panel.getByTestId("sync-run-remote")).toHaveText(slug);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+});
