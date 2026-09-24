@@ -1,5 +1,6 @@
 import { BadRequestException, ForbiddenException, forwardRef, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import type { PoolClient } from "pg";
+import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
 import { DatabaseService } from "../database/database.service";
 import { isUuid, LegacyService } from "../legacy/legacy.service";
 import { CustomTagDto } from "./custom-tags.types";
@@ -33,7 +34,8 @@ function mapTagRow(row: Body): CustomTagDto {
 export class CustomTagsService {
   constructor(
     private readonly db: DatabaseService,
-    @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService
+    @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService,
+    private readonly testcasesListCache: TestcasesListCacheService
   ) {}
 
   private async requireManageAccess(userId: string | null | undefined, projectId: string) {
@@ -76,6 +78,9 @@ export class CustomTagsService {
     const res = await this.db.query("DELETE FROM custom_tags WHERE id = $1 AND project_id = $2 RETURNING *", [tagId, projectId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Custom tag not found" });
     const dto = mapTagRow(res.rows[0]);
+    // The repository list rows carry each case's tags (listTestCasesUncached), and the delete
+    // cascades off every case — a cached unfiltered page would otherwise keep showing the tag.
+    await this.testcasesListCache.invalidate(projectId);
     await this.legacy.logProjectActivity(projectId, userId ?? null, "custom_tag_deleted", "custom_tag", dto.id, dto.name, { before: dto });
     return { success: true };
   }

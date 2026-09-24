@@ -3207,8 +3207,14 @@ export class LegacyService implements OnModuleInit {
       !query.linearIssueKey &&
       !query.search &&
       !query.customFieldFilters &&
+      LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
+  }
+
+  private static parseCustomTagIdsParam(raw: unknown): string[] {
+    const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+    return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
 
   /**
@@ -3330,6 +3336,23 @@ export class LegacyService implements OnModuleInit {
       );
     }
 
+    /*
+     * `customTagIds` — comma-separated custom tag ids (or the param repeated). A case matches when it
+     * carries ANY of them, the usual meaning of a multi-select filter. An EXISTS rather than a join,
+     * so a case with several matching tags is still one row and COUNT(*) OVER () stays honest.
+     * Malformed ids are a 400 for the same reason as `suiteId` above: dropping them silently would
+     * widen the filter to the whole repository. A well-formed id from another project matches
+     * nothing, since testcase_custom_tags only ever links a case to its own project's tags.
+     */
+    const customTagIds = LegacyService.parseCustomTagIdsParam(query.customTagIds);
+    if (customTagIds.length) {
+      if (!customTagIds.every(isUuid)) throw new BadRequestException({ error: "customTagIds must be valid ids" });
+      values.push(customTagIds);
+      filters.push(
+        `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
+      );
+    }
+
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by
     // definition_id + testcase_id, so no fan-out risk) — see CustomFieldsService.buildListFilterSql.
     let customFieldJoinSql = "";
@@ -3413,6 +3436,12 @@ export class LegacyService implements OnModuleInit {
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb
               ) AS custom_field_values,
+              COALESCE(
+                (SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY lower(ct.name))
+                 FROM testcase_custom_tags tct JOIN custom_tags ct ON ct.id = tct.tag_id
+                 WHERE tct.testcase_id = testcases.id),
+                '[]'::json
+              ) AS custom_tags,
               COUNT(*) OVER () AS total_count
        FROM testcases ${customFieldJoinSql} WHERE ${where}
        ORDER BY ${orderBySql} LIMIT $${values.length - 1} OFFSET $${values.length}`,
