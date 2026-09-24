@@ -1,4 +1,4 @@
-import { LegacyService } from "../legacy/legacy.service";
+import { BUG_SEVERITIES, LegacyService } from "../legacy/legacy.service";
 import { McpError, RpcCode, type McpTool, type McpToolContext } from "./mcp.types";
 
 /** Per-item cap for tools that loop over a single-record legacy call once per array entry — kept
@@ -29,6 +29,31 @@ function requireString(args: Record<string, unknown>, key: string): string {
     throw new McpError(RpcCode.ToolExecutionError, `"${key}" is required and must be a non-empty string`);
   }
   return value;
+}
+
+/**
+ * "[MCP] Test case created by MCP is not adding Severity" — testcases.severity is free text with no
+ * CHECK constraint, so a calling LLM that guessed "Major" from a bare `severity: string` schema had
+ * that stored verbatim, and the Test Case Detail dropdown (TESTCASE_SEVERITIES in testcases/page.tsx,
+ * the same four values) can't select it and shows its "Select" placeholder instead. Match the
+ * caller's value case-insensitively onto that vocabulary, and refuse anything else by name rather
+ * than storing it or substituting a default. Omitted/empty is left exactly as the caller sent it, so
+ * an unset severity keeps the create path's existing null behaviour.
+ */
+const SEVERITY_SCHEMA = {
+  type: "string",
+  enum: [...BUG_SEVERITIES],
+  description: `One of ${BUG_SEVERITIES.join(", ")} (matched case-insensitively). Omit to leave severity unset.`
+};
+
+function canonicalizeSeverity(body: Record<string, unknown>): Record<string, unknown> {
+  const raw = body.severity;
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) return body;
+  const match = BUG_SEVERITIES.find((s) => s.toLowerCase() === String(raw).trim().toLowerCase());
+  if (!match) {
+    throw new McpError(RpcCode.ToolExecutionError, `"severity" must be one of ${BUG_SEVERITIES.join(", ")} — got "${String(raw)}"`);
+  }
+  return { ...body, severity: match };
 }
 
 /**
@@ -215,7 +240,7 @@ export function buildMcpTools(): McpTool[] {
           },
           testData: { type: "string" },
           priority: { type: "string" },
-          severity: { type: "string" },
+          severity: SEVERITY_SCHEMA,
           type: { type: "string" },
           automationStatus: { type: "string" },
           component: { type: "string" },
@@ -239,7 +264,7 @@ export function buildMcpTools(): McpTool[] {
         const body = Array.isArray(args.steps)
           ? { ...args, steps: JSON.stringify(ctx.legacy.safeSteps(args.steps)) }
           : args;
-        return ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, body);
+        return ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, canonicalizeSeverity(body));
       }
     },
     {
@@ -269,7 +294,7 @@ export function buildMcpTools(): McpTool[] {
           },
           testData: { type: "string" },
           priority: { type: "string" },
-          severity: { type: "string" },
+          severity: SEVERITY_SCHEMA,
           type: { type: "string" },
           automationStatus: { type: "string" },
           component: { type: "string" },
@@ -287,7 +312,9 @@ export function buildMcpTools(): McpTool[] {
         await requireProjectOwnedRow(ctx, "testcases", testcaseId, "Test case");
         const { testcaseId: _ignored, ...rest } = args;
         // Same step-synonym tolerance as create_testcase — see its handler comment.
-        const body = Array.isArray(rest.steps) ? { ...rest, steps: JSON.stringify(ctx.legacy.safeSteps(rest.steps)) } : rest;
+        const body = canonicalizeSeverity(
+          Array.isArray(rest.steps) ? { ...rest, steps: JSON.stringify(ctx.legacy.safeSteps(rest.steps)) } : rest
+        );
         await preserveOmittedSuiteAndOwner(ctx, testcaseId, body);
         await ctx.legacy.updateTestCase(testcaseId, ctx.actorId, body);
         return ctx.legacy.getTestCase(testcaseId);
@@ -380,7 +407,7 @@ export function buildMcpTools(): McpTool[] {
                 },
                 testData: { type: "string" },
                 priority: { type: "string" },
-                severity: { type: "string" },
+                severity: SEVERITY_SCHEMA,
                 type: { type: "string" },
                 automationStatus: { type: "string" },
                 component: { type: "string" },
@@ -411,7 +438,7 @@ export function buildMcpTools(): McpTool[] {
             }
             // Same step-synonym tolerance as create_testcase — see its handler comment.
             const body = Array.isArray(item.steps) ? { ...item, steps: JSON.stringify(ctx.legacy.safeSteps(item.steps)) } : item;
-            const created = await ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, body);
+            const created = await ctx.legacy.createTestCase(ctx.projectId, ctx.actorId, canonicalizeSeverity(body));
             results.push({ index, ok: true, testcase: created });
           } catch (err) {
             results.push({ index, ok: false, error: describeError(err) });

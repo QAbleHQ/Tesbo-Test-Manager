@@ -1303,6 +1303,31 @@ export async function closeZyraTask(projectId: string, taskId: string): Promise<
   });
 }
 
+/** One ticket comment a Zyra save produced (integration_ticket_comments). */
+export interface ZyraTicketComment {
+  id: string;
+  provider: "jira" | "linear";
+  issueKey: string;
+  status: "pending" | "posted" | "failed" | "skipped_disabled" | "skipped_not_connected";
+  reason: string | null;
+  testcaseCount: number;
+  postedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listZyraTaskTicketComments(projectId: string, taskId: string): Promise<ZyraTicketComment[]> {
+  const res = await api<{ list: ZyraTicketComment[] }>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments`);
+  return res.list || [];
+}
+
+/** Re-sends a failed ticket comment; resolves with its outcome (posted, or failed with the reason). */
+export async function retryZyraTicketComment(projectId: string, taskId: string, commentId: string): Promise<ZyraTicketComment> {
+  return api<ZyraTicketComment>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments/${commentId}/retry`, {
+    method: "POST",
+  });
+}
+
 export async function saveZyraTask(
   projectId: string,
   taskId: string,
@@ -3028,6 +3053,9 @@ export async function disconnectIntegration(provider: IntegrationProvider): Prom
 
 export interface IntegrationConnectionStatus {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   siteUrl?: string;
   tokenExpiresAt?: string | null;
@@ -3044,6 +3072,9 @@ export async function getIntegrationStatus(provider: IntegrationProvider): Promi
 
 export interface JiraConnection {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   cloudId?: string;
   siteUrl?: string;
@@ -3223,6 +3254,9 @@ export async function searchJiraIssuesLive(projectId: string, search: string): P
 
 export interface LinearConnection {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   siteUrl?: string;
   tokenExpiresAt?: string;
