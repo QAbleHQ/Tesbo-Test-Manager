@@ -447,6 +447,21 @@ export function RepositoryTestCaseTable({
             >
               {tc.title}
             </button>
+            {/* Project custom tags (brand-tinted, what the toolbar's Tags filter matches on) ahead of the
+                free-text automation tags (mono, grey) — two different things, so they look different. */}
+            {(tc.customTags?.length ?? 0) > 0 && (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {tc.customTags!.map((tag) => (
+                  <span
+                    key={tag.id}
+                    title="Custom tag"
+                    className="rounded-full bg-[var(--brand-soft)] px-2 py-px text-[10.5px] font-medium text-[var(--accent-light)]"
+                  >
+                    {tag.name}
+                  </span>
+                ))}
+              </div>
+            )}
             {tags.length > 0 && (
               <div className="mt-1 flex flex-wrap gap-1">
                 {tags.map((tag) => (

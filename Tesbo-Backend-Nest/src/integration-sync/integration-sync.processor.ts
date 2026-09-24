@@ -154,7 +154,14 @@ export class IntegrationSyncProcessor extends WorkerHost {
         await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} project is mapped to this project yet.`);
         return;
       }
-      await this.db.query("UPDATE integration_sync_runs SET remote_project_key = $2, updated_at = now() WHERE id = $1", [runId, remote.remote_key]);
+      // A Linear Project's remote_key is its opaque slugId (V95), so Linear runs record and show the
+      // mapped name (V126). Jira keeps its human-readable key and records no name.
+      const remoteName = provider === "linear" && remote.remote_name ? remote.remote_name : null;
+      const remoteLabel = remoteName || remote.remote_key;
+      await this.db.query(
+        "UPDATE integration_sync_runs SET remote_project_key = $2, remote_project_name = $3, updated_at = now() WHERE id = $1",
+        [runId, remote.remote_key, remoteName]
+      );
 
       // Created before any ticket lands, so the folder exists by the time the first document
       // needs a home — and only ever for projects that actually ran a sync.
@@ -197,11 +204,11 @@ export class IntegrationSyncProcessor extends WorkerHost {
         // empty/unchanged project.
         let emptyNote: string;
         if (skipped) {
-          emptyNote = `All ${skipped} updated ticket${skipped === 1 ? "" : "s"} in ${remote.remote_key} had invalid data and were skipped — see server logs.`;
+          emptyNote = `All ${skipped} updated ticket${skipped === 1 ? "" : "s"} in ${remoteLabel} had invalid data and were skipped — see server logs.`;
         } else if (since) {
-          emptyNote = `No changes in ${remote.remote_key} since the last sync.`;
+          emptyNote = `No changes in ${remoteLabel} since the last sync.`;
         } else {
-          emptyNote = `No tickets found in ${remote.remote_key}.`;
+          emptyNote = `No tickets found in ${remoteLabel}.`;
         }
         await this.runs.finishRun(runId, emptyNote);
         return;

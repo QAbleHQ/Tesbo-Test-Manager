@@ -37,6 +37,8 @@ export interface SyncRunView {
   status: string;
   stage: string;
   remoteProjectKey: string | null;
+  /** Linear only (V126) — the mapped Team/Project name; null for Jira and for pre-V126 runs. */
+  remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;
   failedTickets: number;
@@ -99,11 +101,16 @@ export class IntegrationSyncService {
     const cycleDate = triggerSource === "nightly" ? nightlyCycleDate() : null;
 
     try {
+      // $9 is the project id for Linear and NULL for Jira, so the name subquery only ever resolves
+      // for Linear — recorded here, not just by the processor, so a still-queued run already shows
+      // the name rather than a Linear Project's opaque slugId.
       const inserted = await this.db.query<{ id: string }>(
-        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, triggered_by, trigger_source, nightly_cycle_date, status, stage)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', 'queued')
+        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, remote_project_name, triggered_by, trigger_source, nightly_cycle_date, status, stage)
+         VALUES ($1, $2, $3, $4, $5,
+                 (SELECT linear_team_name FROM linear_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1),
+                 $6, $7, $8, 'queued', 'queued')
          RETURNING id`,
-        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate]
+        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate, provider === "linear" ? projectId : null]
       );
       const runId = inserted.rows[0].id;
 
@@ -249,7 +256,7 @@ export class IntegrationSyncService {
   // ── Reads ──
 
   private static readonly RUN_SELECT = `
-    SELECT r.id, r.provider, r.status, r.stage, r.remote_project_key, r.total_tickets, r.processed_tickets,
+    SELECT r.id, r.provider, r.status, r.stage, r.remote_project_key, r.remote_project_name, r.total_tickets, r.processed_tickets,
            r.failed_tickets, r.documents_created, r.documents_updated, r.comments_synced, r.decision_summaries,
            r.error, r.started_at, r.finished_at, r.created_at,
            COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS triggered_by_name
@@ -297,6 +304,7 @@ export class IntegrationSyncService {
       status: String(row.status),
       stage: String(row.stage),
       remoteProjectKey: row.remote_project_key ? String(row.remote_project_key) : null,
+      remoteProjectName: row.remote_project_name ? String(row.remote_project_name) : null,
       totalTickets: Number(row.total_tickets || 0),
       processedTickets: Number(row.processed_tickets || 0),
       failedTickets: Number(row.failed_tickets || 0),

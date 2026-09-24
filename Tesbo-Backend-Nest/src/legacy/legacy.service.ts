@@ -12,6 +12,7 @@ import { DatabaseService } from "../database/database.service";
 import { endZyraTurn, recordExistingCoverage, recordGeneration, recordJiraContext, recordKnowledgeContext, recordReconciliation, startZyraTurn, type TurnHandle } from "../observability/ai-trace";
 import { StorageService } from "../storage/storage.service";
 import { encryptSecret, decryptSecret } from "../common/crypto.util";
+import { externallyReachableBaseUrl } from "../common/external-url.util";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
@@ -36,6 +37,17 @@ import { ProjectOverviewCacheService } from "../cache/project-overview-cache.ser
 type Body = Record<string, any>;
 
 /** Everything processZyraSaveEntriesSequential/Batched need that isn't `selected` or `client` itself. */
+type TicketProvider = "jira" | "linear";
+
+// See getIntegrationConnection: the access token the caller just had refused (401), to force one renewal.
+interface IntegrationConnectionLoadOptions {
+  rejectedAccessToken?: string;
+}
+
+// Most test cases one ticket auto-comment lists by name (see zyraTicketCommentContent); the rest are
+// counted. Keeps a very large save well under Jira's comment size limit.
+const ZYRA_TICKET_COMMENT_MAX_ITEMS = 100;
+
 interface ZyraSaveEntryContext {
   projectId: string;
   uid: string;
@@ -57,7 +69,7 @@ interface ZyraSaveEntryContext {
 }
 
 /** The four buckets V67's bugs_severity_check allows, and the four the dashboard reports. */
-const BUG_SEVERITIES = ["Critical", "High", "Medium", "Low"] as const;
+export const BUG_SEVERITIES = ["Critical", "High", "Medium", "Low"] as const;
 /*
  * Bug priority — Basecamp 10226247009. Severity is how bad it is, priority is how soon it gets
  * worked on; a cosmetic defect on the signup page is Low severity and P0 priority. P0..P3 is the
@@ -1227,120 +1239,395 @@ export class LegacyService implements OnModuleInit {
     void this.ragIngestion.enqueueTestcaseEmbedding({ projectId, testcaseId, reason }).catch(() => undefined);
   }
 
-  // Fire-and-forget wrapper around syncTestCaseActionToIntegrations, called live ({ dryRun: false })
-  // from zyraSave()'s post-commit loop — see that call site's own comment for why this runs there
-  // and not inside zyraSaveAttempt's transaction. Same "never blocks the caller" contract as
-  // enqueueTestcaseEmbedding right above: syncTestCaseActionToIntegrations already never throws (a
-  // posting failure comes back as a result entry, not a rejection — see its own comment), so this
-  // .catch is a defensive backstop, not the primary safety mechanism.
-  private enqueueTestcaseIntegrationSync(projectId: string, actorId: string, testcase: Body, action: "add" | "update" | "archive"): void {
-    void this.syncTestCaseActionToIntegrations(projectId, actorId, testcase, action, { dryRun: false }).catch(() => undefined);
-  }
-
-  // jira_sync_test_case / linear_sync_test_case (ZYRA_TICKET_WORKFLOW.md §13) — posts a comment
-  // on the linked Jira/Linear issue when a test case is added, updated, or archived. Comment-only,
-  // as scoped: no issue create/update/transition, unlike this method's name might suggest — see
-  // ZYRA_BINDING_REPORT.md §11 for why that's a real gap and not something to quietly widen here.
-  // Reuses jiraComment()/linearComment() as the actual write mechanism and jiraStatus()/
-  // linearStatus() for the connection check, rather than talking to either provider directly.
+  // "Auto-comment on Jira/Linear ticket" (projects.settings.jiraAutoComment / linearAutoComment,
+  // IntegrationAiGenerationSettings.tsx). Called from zyraSave once a save has committed: posts ONE
+  // comment per ticket, listing exactly the test cases that save wrote for it. The list is grouped
+  // from the committed rows themselves (their own jira_issue_key/linear_issue_key), so a test case
+  // from another task, or from an earlier save of this one, can never appear in it.
   //
-  // NOT called from anywhere yet. This makes the capability exist and be dry-run-testable; wiring
-  // it into zyraSave's post-commit path (alongside enqueueTestcaseEmbedding, which that method
-  // already calls once per touched row) is a separate, later step.
+  // Replaces the earlier per-row sync (one "Test case added by Zyra" comment per test case, posted
+  // whether or not the setting was on). Every outcome — including the skips — is recorded in
+  // integration_ticket_comments before anything leaves the building (V123 says why), and that claim
+  // is what makes this idempotent: it is keyed on the save event, so a second pass over the same save
+  // finds its claim already taken and posts nothing. Only the provider call itself runs in the
+  // background; the decision and the claim are cheap DB work finished before zyraSave returns.
   //
-  // A test case with neither jiraIssueKey nor linearIssueKey set resolves to an empty array —
-  // nothing to sync to, which is not an error. A test case linked to both gets one attempt each.
-  //
-  // Defaults to dry run — pass { dryRun: false } explicitly for a real write. Dry run still runs
-  // the connection check and builds the real comment text (so the dry-run log is the actual
-  // message a real run would send, not a placeholder), it just stops short of the jiraComment/
-  // linearComment call.
-  async syncTestCaseActionToIntegrations(
+  // Never throws — a comment is a side effect of a save that has already succeeded.
+  private async queueZyraTicketComments(
     projectId: string,
-    actorId: string | null | undefined,
-    testcase: Body,
-    action: "add" | "update" | "archive",
-    opts: { dryRun?: boolean } = {}
-  ): Promise<Body[]> {
-    const dryRun = opts.dryRun !== false;
-    const results: Body[] = [];
-    if (testcase.jiraIssueKey) results.push(await this.syncTestcaseActionToJira(projectId, actorId, testcase, action, dryRun));
-    if (testcase.linearIssueKey) results.push(await this.syncTestcaseActionToLinear(projectId, actorId, testcase, action, dryRun));
-    return results;
-  }
-
-  private zyraTestcaseKbUrl(projectId: string, testcaseId: string): string {
-    return `${this.config.frontendUrl}/projects/${projectId}/testcases/${testcaseId}`;
-  }
-
-  // Three distinct, unambiguous message shapes — one per action type — rather than one templated
-  // string with a variable verb, so each is individually greppable in a Jira/Linear issue's
-  // comment history.
-  private zyraIntegrationSyncComment(action: "add" | "update" | "archive", title: string, kbUrl: string): string {
-    if (action === "add") return `Test case added by Zyra: ${title} — ${kbUrl}`;
-    if (action === "update") return `Test case updated by Zyra: ${title} — ${kbUrl}`;
-    return `Test case archived by Zyra: ${title} — ${kbUrl}`;
-  }
-
-  private async syncTestcaseActionToJira(
-    projectId: string,
-    actorId: string | null | undefined,
-    testcase: Body,
-    action: "add" | "update" | "archive",
-    dryRun: boolean
-  ): Promise<Body> {
-    const issueKey = String(testcase.jiraIssueKey || "");
-    // §13's own guardrail: "if no integration is connected... skipped silently — not treated as a
-    // partial failure." Checked via the same jiraStatus() a caller would use to decide whether to
-    // sync at all — not a bespoke connection probe.
-    const status = await this.jiraStatus(projectId, actorId);
-    if (!status.connected) {
-      return { provider: "jira", issueKey, attempted: false, posted: false, dryRun, comment: null, reason: "Jira is not connected for this project — skipped, not an error." };
-    }
-    const comment = this.zyraIntegrationSyncComment(action, String(testcase.title || "Untitled test case"), this.zyraTestcaseKbUrl(projectId, String(testcase.id || "")));
-    if (dryRun) {
-      this.logger.log(`[dry run] Would post Jira comment on ${issueKey}: ${comment}`);
-      return { provider: "jira", issueKey, attempted: true, posted: false, dryRun: true, comment, reason: "Dry run — no API call made." };
-    }
+    uid: string,
+    taskId: string,
+    saveEventId: string,
+    rows: Body[],
+    actions: Array<"add" | "update" | "archive">
+  ): Promise<void> {
     try {
-      await this.jiraComment(projectId, actorId, { issueKey, comment });
-      return { provider: "jira", issueKey, attempted: true, posted: true, dryRun: false, comment, reason: "Posted." };
+      const groups = this.zyraTicketCommentGroups(rows, actions);
+      if (!groups.length) return;
+      const settings = this.parseProjectSettings((await this.getProject(projectId)).settings);
+      const connected = new Map<TicketProvider, boolean>();
+      for (const group of groups) {
+        const enabled = settings[`${group.provider}AutoComment`] === true;
+        if (enabled && !connected.has(group.provider)) {
+          connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
+        }
+        const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
+        const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries);
+        const claim = await this.db.query<{ id: string }>(
+          `INSERT INTO integration_ticket_comments
+             (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+           ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
+           RETURNING id`,
+          [
+            projectId,
+            taskId,
+            saveEventId,
+            group.provider,
+            group.issueKey,
+            JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
+            status,
+            content.markdown,
+            uid
+          ]
+        );
+        const claimId = claim.rows[0]?.id;
+        if (!claimId) continue;
+        const label = group.provider === "jira" ? "Jira" : "Linear";
+        if (status === "pending") {
+          void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
+        } else if (status === "skipped_disabled") {
+          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${group.issueKey} was not commented on.`);
+        } else {
+          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${group.issueKey} was not commented on.`);
+        }
+      }
     } catch (err) {
-      // A best-effort side action, never a partial failure of the underlying KB write (same
-      // principle §13 states for "no integration connected") — so a real posting error is
-      // reported back rather than thrown, leaving the caller (once this is wired in) free to
-      // decide whether that matters for a given action.
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Failed to post Zyra sync comment to Jira ${issueKey}: ${message}`);
-      return { provider: "jira", issueKey, attempted: true, posted: false, dryRun: false, comment, reason: message };
+      this.logger.warn(`Failed to queue Zyra ticket comments for task ${taskId}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  private async syncTestcaseActionToLinear(
+  // Which ticket(s) each committed row belongs to. Keyed per provider + key: a row carries the key it
+  // was actually written with, so a chat save that touched test cases of two tickets yields two
+  // groups, each listing only its own rows.
+  private zyraTicketCommentGroups(
+    rows: Body[],
+    actions: Array<"add" | "update" | "archive">
+  ): Array<{ provider: TicketProvider; issueKey: string; entries: Array<{ row: Body; action: "add" | "update" | "archive" }> }> {
+    const groups = new Map<string, { provider: TicketProvider; issueKey: string; entries: Array<{ row: Body; action: "add" | "update" | "archive" }> }>();
+    rows.forEach((row, index) => {
+      const action = actions[index];
+      if (!row?.id || !action) return;
+      for (const provider of ["jira", "linear"] as const) {
+        const issueKey = String((provider === "jira" ? row.jiraIssueKey : row.linearIssueKey) || "").trim();
+        if (!issueKey) continue;
+        const mapKey = `${provider}:${issueKey}`;
+        const group = groups.get(mapKey) ?? { provider, issueKey, entries: [] };
+        // Listed once per ticket even if the batch touched the same row twice — the later action wins.
+        group.entries = group.entries.filter((entry) => String(entry.row.id) !== String(row.id));
+        group.entries.push({ row, action });
+        groups.set(mapKey, group);
+      }
+    });
+    return Array.from(groups.values());
+  }
+
+  // The link a ticket comment gives each test case — read by people other than this deployment's
+  // own user, on their own machines. PUBLIC_APP_URL when set, else FRONTEND_URL (already the public
+  // address on stage/production). Null when that address could only work on this machine or
+  // network (a local stack's http://localhost:1020): the comment then lists the test case as plain
+  // text instead of a link that opens each reader's own localhost.
+  private zyraTestcaseKbUrl(projectId: string, testcaseId: string): string | null {
+    const base = externallyReachableBaseUrl(this.config.publicAppUrl || this.config.frontendUrl);
+    return base ? `${base}/projects/${projectId}/testcases/${testcaseId}` : null;
+  }
+
+  // One comment body, rendered twice from the same sections: Atlassian Document Format for Jira
+  // (REST v3 only accepts ADF — the same shape jiraComment already sends) and markdown for Linear,
+  // which is also what the ledger stores as comment_text. Capped so a very large save still fits
+  // comfortably under Jira's comment size limit; the overflow is counted, not silently dropped.
+  private zyraTicketCommentContent(
     projectId: string,
-    actorId: string | null | undefined,
-    testcase: Body,
-    action: "add" | "update" | "archive",
-    dryRun: boolean
-  ): Promise<Body> {
-    const issueKey = String(testcase.linearIssueKey || "");
-    const status = await this.linearStatus(projectId, actorId);
-    if (!status.connected) {
-      return { provider: "linear", issueKey, attempted: false, posted: false, dryRun, comment: null, reason: "Linear is not connected for this project — skipped, not an error." };
-    }
-    const comment = this.zyraIntegrationSyncComment(action, String(testcase.title || "Untitled test case"), this.zyraTestcaseKbUrl(projectId, String(testcase.id || "")));
-    if (dryRun) {
-      this.logger.log(`[dry run] Would post Linear comment on ${issueKey}: ${comment}`);
-      return { provider: "linear", issueKey, attempted: true, posted: false, dryRun: true, comment, reason: "Dry run — no API call made." };
-    }
+    issueKey: string,
+    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>
+  ): { markdown: string; adf: Body } {
+    let budget = ZYRA_TICKET_COMMENT_MAX_ITEMS;
+    const sections = (
+      [["add", "Added"], ["update", "Updated"], ["archive", "Archived"]] as const
+    ).map(([action, label]) => {
+      const all = entries.filter((entry) => entry.action === action);
+      const shown = all.slice(0, Math.max(0, budget));
+      budget -= shown.length;
+      return {
+        label: `${label} (${all.length})`,
+        items: shown.map(({ row }) => ({
+          externalId: String(row.externalId || "").trim(),
+          title: String(row.title || "").trim() || "Untitled test case",
+          url: this.zyraTestcaseKbUrl(projectId, String(row.id))
+        }))
+      };
+    }).filter((section) => section.items.length);
+    const total = entries.length;
+    const hidden = total - sections.reduce((sum, section) => sum + section.items.length, 0);
+    const heading = "Generated by Tesbo Test Manager";
+    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${issueKey} in Tesbo.`;
+    const overflow = hidden > 0 ? `…and ${hidden} more in Tesbo.` : "";
+
+    const escapeLinkText = (text: string) => text.replace(/([\[\]\\])/g, "\\$1");
+    // No reachable URL (see zyraTestcaseKbUrl): the same line, as plain text.
+    const markdownItem = (item: { externalId: string; title: string; url: string | null }) => {
+      const label = item.externalId || item.title;
+      const head = item.url ? `[${escapeLinkText(label)}](${item.url})` : label;
+      return item.externalId ? `- ${head} — ${item.title}` : `- ${head}`;
+    };
+    const markdown = [
+      `**${heading}**`,
+      summary,
+      ...sections.map((section) => [
+        `**${section.label}**`,
+        ...section.items.map(markdownItem)
+      ].join("\n")),
+      ...(overflow ? [overflow] : [])
+    ].join("\n\n");
+
+    const text = (value: string, marks?: Body[]) => (marks ? { type: "text", text: value, marks } : { type: "text", text: value });
+    const paragraph = (...content: Body[]) => ({ type: "paragraph", content });
+    const adf = {
+      type: "doc",
+      version: 1,
+      content: [
+        paragraph(text(heading, [{ type: "strong" }])),
+        paragraph(text(summary)),
+        ...sections.flatMap((section) => [
+          paragraph(text(section.label, [{ type: "strong" }])),
+          {
+            type: "bulletList",
+            content: section.items.map((item) => ({
+              type: "listItem",
+              content: [(() => {
+                const marks = item.url ? [{ type: "link", attrs: { href: item.url } }] : undefined;
+                return item.externalId
+                  ? paragraph(text(item.externalId, marks), text(` — ${item.title}`))
+                  : paragraph(text(item.title, marks));
+              })()]
+            }))
+          }
+        ]),
+        ...(overflow ? [paragraph(text(overflow))] : [])
+      ]
+    };
+    return { markdown, adf };
+  }
+
+  private async deliverZyraTicketComment(
+    projectId: string,
+    taskId: string,
+    claimId: string,
+    provider: TicketProvider,
+    issueKey: string,
+    count: number,
+    content: { markdown: string; adf: Body }
+  ): Promise<void> {
+    const label = provider === "jira" ? "Jira" : "Linear";
     try {
-      await this.linearComment(projectId, actorId, { issueKey, comment });
-      return { provider: "linear", issueKey, attempted: true, posted: true, dryRun: false, comment, reason: "Posted." };
+      const remoteId = provider === "jira"
+        ? await this.jiraPostComment(projectId, issueKey, content.adf)
+        : await this.linearPostComment(projectId, issueKey, content.markdown);
+      await this.db.query(
+        "UPDATE integration_ticket_comments SET status = 'posted', remote_comment_id = $2, posted_at = now(), updated_at = now() WHERE id = $1",
+        [claimId, remoteId]
+      );
+      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${issueKey}.`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Failed to post Zyra sync comment to Linear ${issueKey}: ${message}`);
-      return { provider: "linear", issueKey, attempted: true, posted: false, dryRun: false, comment, reason: message };
+      const reason = this.integrationErrorReason(err, label);
+      this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
+      await this.db.query(
+        "UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1",
+        [claimId, reason.slice(0, 2000)]
+      ).catch(() => undefined);
+      await this.appendZyraTaskActivity(projectId, taskId, `${label} comment failed`, `Couldn't post the test case list to ${issueKey}: ${reason}`);
     }
+  }
+
+  private formatTicketComment(row: Body): Body {
+    return {
+      id: String(row.id),
+      provider: row.provider,
+      issueKey: row.issue_key,
+      status: row.status,
+      reason: row.reason ?? null,
+      testcaseCount: normalizeJsonArray(row.testcase_ids).length,
+      postedAt: row.posted_at ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  // The ticket comments one task's saves produced — what the task page shows next to its Retry action.
+  async zyraTaskTicketComments(projectId: string, userId: string | null | undefined, taskId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    if (!isUuid(taskId)) throw new NotFoundException({ error: "Zyra task not found" });
+    const res = await this.db.query(
+      `SELECT id, provider, issue_key, status, reason, testcase_ids, posted_at, created_at, updated_at
+       FROM integration_ticket_comments WHERE project_id = $1 AND generation_request_id = $2
+       ORDER BY created_at ASC`,
+      [projectId, taskId]
+    );
+    return { list: res.rows.map((row) => this.formatTicketComment(row)) };
+  }
+
+  // Re-sends ONE failed ticket comment — e.g. after reconnecting Jira. Only 'failed' is retryable: a
+  // 'posted' comment is already on the ticket, 'pending' is in flight, and a skip was a decision (the
+  // setting was off, or nothing was connected), not an error. The failed -> pending UPDATE is the
+  // claim, so a double-click or a second tab can never post the same comment twice.
+  //
+  // The comment is rebuilt from the test cases' current titles, not replayed byte for byte, so a
+  // rename since the save is reflected, and a test case deleted since is left out.
+  async zyraRetryTicketComment(projectId: string, userId: string | null | undefined, taskId: string, commentId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(taskId) || !isUuid(commentId)) throw new NotFoundException({ error: "Ticket comment not found" });
+    const claimed = await this.db.query(
+      `UPDATE integration_ticket_comments SET status = 'pending', reason = NULL, posted_by = $4, updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND generation_request_id = $3 AND status = 'failed'
+       RETURNING *`,
+      [commentId, projectId, taskId, uid]
+    );
+    const row = claimed.rows[0];
+    if (!row) {
+      const existing = await this.db.query(
+        "SELECT status FROM integration_ticket_comments WHERE id = $1 AND project_id = $2 AND generation_request_id = $3",
+        [commentId, projectId, taskId]
+      );
+      if (!existing.rows[0]) throw new NotFoundException({ error: "Ticket comment not found" });
+      throw new ConflictException({ error: `This comment is "${existing.rows[0].status}" — only a failed comment can be retried.` });
+    }
+    const provider = row.provider as TicketProvider;
+    const label = provider === "jira" ? "Jira" : "Linear";
+    const content = await this.rebuildZyraTicketCommentContent(projectId, row);
+    if (!content) {
+      const reason = "None of the test cases in this comment exist anymore, so there is nothing to post.";
+      await this.db.query("UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1", [row.id, reason]);
+      await this.appendZyraTaskActivity(projectId, taskId, `${label} comment failed`, `Couldn't post the test case list to ${row.issue_key}: ${reason}`);
+    } else {
+      await this.db.query("UPDATE integration_ticket_comments SET comment_text = $2 WHERE id = $1", [row.id, content.markdown]);
+      await this.appendZyraTaskActivity(projectId, taskId, `Retrying ${label} comment`, `Re-sending the test case list to ${row.issue_key}.`);
+      // Awaited here (unlike after a save), so the caller gets the outcome in the response.
+      await this.deliverZyraTicketComment(projectId, taskId, String(row.id), provider, String(row.issue_key), content.count, content);
+    }
+    const fresh = await this.db.query("SELECT * FROM integration_ticket_comments WHERE id = $1", [row.id]);
+    return this.formatTicketComment(fresh.rows[0]);
+  }
+
+  private async rebuildZyraTicketCommentContent(projectId: string, row: Body): Promise<{ markdown: string; adf: Body; count: number } | null> {
+    const ids = normalizeJsonArray(row.testcase_ids).map(String).filter((id) => isUuid(id));
+    if (!ids.length) return null;
+    const res = await this.db.query(
+      "SELECT id, external_id, title FROM testcases WHERE project_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL",
+      [projectId, ids]
+    );
+    const byId = new Map(res.rows.map((tc) => [String(tc.id), tc]));
+    const actions = this.zyraTicketCommentActions(String(row.comment_text || ""));
+    const entries = ids
+      .filter((id) => byId.has(id))
+      .map((id) => ({
+        row: { id, externalId: byId.get(id)!.external_id, title: byId.get(id)!.title },
+        // Recovered from the section it was listed under when first built. A case past the list cap
+        // (never listed by name) was not recorded under any section and falls back to "add".
+        action:
+          actions.get(id.toLowerCase()) ??
+          actions.get(`ext:${String(byId.get(id)!.external_id || "").toLowerCase()}`) ??
+          ("add" as const)
+      }));
+    if (!entries.length) return null;
+    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries), count: entries.length };
+  }
+
+  // Which section (Added / Updated / Archived) each test case was listed under in a comment
+  // zyraTicketCommentContent built — read back from its own markdown. A linked line is keyed by the
+  // test case id in its URL; a plain line (no reachable URL, see zyraTestcaseKbUrl) by the external
+  // id it starts with, as "ext:<id>".
+  private zyraTicketCommentActions(markdown: string): Map<string, "add" | "update" | "archive"> {
+    const sectionAction: Record<string, "add" | "update" | "archive"> = { Added: "add", Updated: "update", Archived: "archive" };
+    const actions = new Map<string, "add" | "update" | "archive">();
+    let current: "add" | "update" | "archive" | null = null;
+    for (const line of markdown.split("\n")) {
+      const heading = /^\*\*(Added|Updated|Archived) \(\d+\)\*\*$/.exec(line.trim());
+      if (heading) {
+        current = sectionAction[heading[1]];
+        continue;
+      }
+      if (!current) continue;
+      const id = /\/testcases\/([0-9a-f-]{36})\)/i.exec(line)?.[1];
+      if (id) {
+        actions.set(id.toLowerCase(), current);
+        continue;
+      }
+      const plain = /^- ([^\s[\]]+) — /.exec(line.trim())?.[1];
+      if (plain) actions.set(`ext:${plain.toLowerCase()}`, current);
+    }
+    return actions;
+  }
+
+  // Connection check only (no token refresh, no network) — the refresh happens at post time.
+  private async ticketProviderConnected(projectId: string, provider: TicketProvider): Promise<boolean> {
+    if (provider === "jira") return Boolean(await this.getJiraConnection(projectId, false));
+    const organizationId = await this.projectOrganizationId(projectId);
+    return Boolean(await this.getIntegrationConnection(organizationId, "linear", false));
+  }
+
+  private async appendZyraTaskActivity(projectId: string, taskId: string, title: string, detail: string): Promise<void> {
+    const entry = [{ actor: "system", stage: "info", title, detail, createdAt: new Date().toISOString() }];
+    await this.db.query(
+      "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb WHERE id = $1 AND project_id = $2",
+      [taskId, projectId, JSON.stringify(entry)]
+    ).catch(() => undefined);
+  }
+
+  // The user-facing half of a provider error: HttpExceptions thrown by jiraFetch/linearGraphQL carry
+  // it as `error` on their response body rather than as the exception's own message. 401 and 403
+  // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
+  // different fixes, so they get different reasons here.
+  private integrationErrorReason(err: unknown, provider: "Jira" | "Linear"): string {
+    const providerStatus = (err as { providerStatus?: number })?.providerStatus;
+    if (providerStatus === 401) {
+      return `${provider} rejected the connection's credentials (401) — the authorization has expired or been revoked. Reconnect ${provider} in workspace settings, then retry.`;
+    }
+    if (providerStatus === 403) {
+      return `${provider} refused the comment (403) — the connected ${provider} account doesn't have permission to comment on this issue. Give that account comment permission in the ${provider} project, or reconnect with an account that has it, then retry.`;
+    }
+    const response = (err as { getResponse?: () => unknown })?.getResponse?.();
+    if (response && typeof response === "object" && typeof (response as Body).error === "string") return String((response as Body).error);
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  // Which ticket a Task-board task's Knowledge Base selection belongs to (see aiGenerate). Only
+  // mirror documents count — a user's own note that mentions a key is not the ticket — and they
+  // resolve to a key through the ticket table the mirror was written from, because a mirror stores
+  // the provider's issue id in source_external_id, not the key. Project-scoped on both sides, so a
+  // document id from another project resolves to nothing. `linked` is set only when the selection
+  // points at exactly one ticket; `tickets` lists every one it found.
+  private async zyraTicketFromKnowledgeSelection(
+    projectId: string,
+    knowledgeItemIds: string[]
+  ): Promise<{ linked: { provider: TicketProvider; issueKey: string } | null; tickets: Array<{ provider: TicketProvider; issueKey: string }> } | null> {
+    const ids = Array.from(new Set(knowledgeItemIds.filter((id) => isUuid(id))));
+    if (!ids.length) return null;
+    const res = await this.db.query<{ provider: TicketProvider; issue_key: string }>(
+      `SELECT DISTINCT d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key) AS issue_key
+       FROM knowledge_documents d
+       LEFT JOIN jira_tickets j
+         ON d.source_provider = 'jira' AND j.project_id = d.project_id AND j.jira_issue_id = d.source_external_id
+       LEFT JOIN linear_tickets l
+         ON d.source_provider = 'linear' AND l.project_id = d.project_id AND l.linear_issue_id = d.source_external_id
+       WHERE d.project_id = $1 AND d.id = ANY($2::uuid[]) AND d.is_deleted = false
+         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear')
+         AND COALESCE(j.jira_issue_key, l.linear_issue_key) IS NOT NULL
+       ORDER BY 1, 2`,
+      [projectId, ids]
+    );
+    const tickets = res.rows.map((row) => ({ provider: row.provider, issueKey: String(row.issue_key) }));
+    return { linked: tickets.length === 1 ? tickets[0] : null, tickets };
   }
 
   async onModuleInit(): Promise<void> {
@@ -3207,8 +3494,14 @@ export class LegacyService implements OnModuleInit {
       !query.linearIssueKey &&
       !query.search &&
       !query.customFieldFilters &&
+      LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
+  }
+
+  private static parseCustomTagIdsParam(raw: unknown): string[] {
+    const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+    return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
 
   /**
@@ -3330,6 +3623,23 @@ export class LegacyService implements OnModuleInit {
       );
     }
 
+    /*
+     * `customTagIds` — comma-separated custom tag ids (or the param repeated). A case matches when it
+     * carries ANY of them, the usual meaning of a multi-select filter. An EXISTS rather than a join,
+     * so a case with several matching tags is still one row and COUNT(*) OVER () stays honest.
+     * Malformed ids are a 400 for the same reason as `suiteId` above: dropping them silently would
+     * widen the filter to the whole repository. A well-formed id from another project matches
+     * nothing, since testcase_custom_tags only ever links a case to its own project's tags.
+     */
+    const customTagIds = LegacyService.parseCustomTagIdsParam(query.customTagIds);
+    if (customTagIds.length) {
+      if (!customTagIds.every(isUuid)) throw new BadRequestException({ error: "customTagIds must be valid ids" });
+      values.push(customTagIds);
+      filters.push(
+        `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
+      );
+    }
+
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by
     // definition_id + testcase_id, so no fan-out risk) — see CustomFieldsService.buildListFilterSql.
     let customFieldJoinSql = "";
@@ -3413,6 +3723,12 @@ export class LegacyService implements OnModuleInit {
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb
               ) AS custom_field_values,
+              COALESCE(
+                (SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY lower(ct.name))
+                 FROM testcase_custom_tags tct JOIN custom_tags ct ON ct.id = tct.tag_id
+                 WHERE tct.testcase_id = testcases.id),
+                '[]'::json
+              ) AS custom_tags,
               COUNT(*) OVER () AS total_count
        FROM testcases ${customFieldJoinSql} WHERE ${where}
        ORDER BY ${orderBySql} LIMIT $${values.length - 1} OFFSET $${values.length}`,
@@ -9771,6 +10087,9 @@ export class LegacyService implements OnModuleInit {
            auth_method = 'oauth',
            personal_token_identifier = NULL,
            disconnected_at = NULL,
+           auth_error = NULL,
+           auth_error_at = NULL,
+           auth_error_refresh_fingerprint = NULL,
            updated_at = now()
          RETURNING id, external_id, site_url`,
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
@@ -9809,6 +10128,9 @@ export class LegacyService implements OnModuleInit {
          auth_method = 'oauth',
          personal_token_identifier = NULL,
          disconnected_at = NULL,
+         auth_error = NULL,
+         auth_error_at = NULL,
+         auth_error_refresh_fingerprint = NULL,
          updated_at = now()
        RETURNING id, site_url`,
       [workspace.id, String(org.id || ""), `https://linear.app/${org.urlKey}`, encryptSecret(accessToken), encryptSecret(String(token.refresh_token || "")), expiresAt, userId || null]
@@ -9882,6 +10204,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, p),
       id: connection.id,
       siteUrl: connection.site_url,
       tokenExpiresAt: connection.token_expires_at,
@@ -9940,6 +10263,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, "jira"),
       id: connection.id,
       cloudId: connection.cloud_id,
       siteUrl: connection.site_url,
@@ -10127,22 +10451,44 @@ export class LegacyService implements OnModuleInit {
     const issueKey = String(body.issueKey || body.jiraIssueKey || "").trim();
     const comment = String(body.comment || body.body || "").trim();
     if (!issueKey || !comment) throw new BadRequestException({ error: "Jira issue key and comment are required." });
+    await this.jiraPostAdfComment(connection, issueKey, {
+      type: "doc",
+      version: 1,
+      content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }]
+    });
+    return { ok: true };
+  }
+
+  // For internal callers that have already authorized (the ticket auto-comment after a Zyra save):
+  // resolves the connection itself, refreshing the token if due. Returns Jira's comment id.
+  //
+  // A 401 on the post itself (a token revoked before its expiry, or replaced by another deployment
+  // sharing the row) gets exactly one forced renewal and one more attempt — never a loop, and never a
+  // second send of the same refused token.
+  private async jiraPostComment(projectId: string, issueKey: string, adf: Body): Promise<string | null> {
+    const connection = await this.getJiraConnection(projectId, true);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    try {
+      return await this.jiraPostAdfComment(connection, issueKey, adf);
+    } catch (err) {
+      if ((err as { providerStatus?: number })?.providerStatus !== 401) throw err;
+      const renewed = await this.getJiraConnection(projectId, true, { rejectedAccessToken: String(connection.access_token) });
+      if (!renewed || String(renewed.access_token) === String(connection.access_token)) throw err;
+      return this.jiraPostAdfComment(renewed, issueKey, adf);
+    }
+  }
+
+  private async jiraPostAdfComment(connection: Body, issueKey: string, adf: Body): Promise<string | null> {
     const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
-    await this.jiraFetch(
+    const created = await this.jiraFetch<Body>(
       `${baseUrl}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
       {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          body: {
-            type: "doc",
-            version: 1,
-            content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }]
-          }
-        })
+        body: JSON.stringify({ body: adf })
       }
     );
-    return { ok: true };
+    return created?.id ? String(created.id) : null;
   }
 
   // Live search against Jira (not the jira_tickets sync cache) — used by the bug-linking picker,
@@ -10183,14 +10529,29 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
-  private async getJiraConnection(projectId: string, refresh: boolean): Promise<Body | null> {
+  private async getJiraConnection(projectId: string, refresh: boolean, options: IntegrationConnectionLoadOptions = {}): Promise<Body | null> {
     const organizationId = await this.projectOrganizationId(projectId);
-    const connection = await this.getIntegrationConnection(organizationId, "jira", refresh);
+    const connection = await this.getIntegrationConnection(organizationId, "jira", refresh, options);
     if (!connection) return null;
     return { ...connection, cloud_id: connection.external_id };
   }
 
-  private async getIntegrationConnection(organizationId: string, provider: IntegrationProvider, refresh: boolean): Promise<Body | null> {
+  // `options.rejectedAccessToken`: the caller just had this access token refused (401) even though
+  // token_expires_at said it was still valid — revoked early, or replaced by another deployment
+  // sharing this row. Renews regardless of the clock, unless the row already holds a different token
+  // by the time the lock is taken (someone else renewed it meanwhile), in which case that one is used.
+  //
+  // Throws a "needs to be reconnected" BadRequestException, WITHOUT contacting the provider, when the
+  // renewal can't possibly succeed: this refresh token was already refused (V125's marker), or — Jira
+  // — the token was issued to a different OAuth app than the one this deployment renews with. A
+  // refusal from the provider itself (401/403 on the token endpoint) is recorded the same way, so the
+  // same dead refresh token is never sent twice.
+  private async getIntegrationConnection(
+    organizationId: string,
+    provider: IntegrationProvider,
+    refresh: boolean,
+    options: IntegrationConnectionLoadOptions = {}
+  ): Promise<Body | null> {
     // disconnected_at IS NULL: a soft-disconnected row (integrationDisconnect) still exists so its
     // historical tickets/mappings stay intact, but must read as "not connected" everywhere.
     const res = await this.db.query(
@@ -10199,9 +10560,13 @@ export class LegacyService implements OnModuleInit {
     );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
+    const forced = Boolean(options.rejectedAccessToken);
     // Fast, lock-free path: this is what the overwhelming majority of calls hit, so it stays exactly
     // as cheap as it always was. Only a token actually due for refresh pays for the transaction below.
-    if (!refresh || this.isIntegrationTokenStillValid(connection) || !connection.refresh_token) return connection;
+    if (!refresh || !connection.refresh_token) return connection;
+    if (!forced && this.isIntegrationTokenStillValid(connection)) return connection;
+    const alreadyRefused = this.refusedRefreshReason(connection);
+    if (alreadyRefused) throw new BadRequestException({ error: alreadyRefused });
 
     // A connection is organization-scoped and can be mapped into several Tesbo projects, so two
     // interactive requests (or an interactive request racing the nightly sync worker's own
@@ -10211,7 +10576,10 @@ export class LegacyService implements OnModuleInit {
     // already-invalidated refresh token. SELECT ... FOR UPDATE serializes them: whichever request
     // gets here first does the one real refresh; the rest block on the row lock, then re-check the
     // now-current row and reuse what the first already wrote.
-    return this.db.transaction(async (client) => {
+    //
+    // A refusal is returned out of the transaction rather than thrown inside it: throwing would roll
+    // back, and the refusal marker has to be written afterwards (recordRefusedRefresh).
+    const outcome = await this.db.transaction(async (client): Promise<{ connection: Body | null } | { refused: string; row: Body }> => {
       const locked = await client.query(
         "SELECT * FROM integration_connections WHERE id = $1 AND disconnected_at IS NULL FOR UPDATE",
         [connection.id]
@@ -10219,52 +10587,158 @@ export class LegacyService implements OnModuleInit {
       const current = locked.rows[0] as Body | undefined;
       // Disconnected by a concurrent integrationDisconnect while this request was queued on the
       // lock — must not resurrect a connection the user just told us to drop.
-      if (!current) return null;
-      if (this.isIntegrationTokenStillValid(current) || !current.refresh_token) return current;
+      if (!current) return { connection: null };
+      const renewedMeanwhile = forced
+        ? String(current.access_token) !== String(options.rejectedAccessToken)
+        : this.isIntegrationTokenStillValid(current);
+      if (renewedMeanwhile || !current.refresh_token) return { connection: current };
+      const refusedNow = this.refusedRefreshReason(current);
+      if (refusedNow) return { refused: refusedNow, row: current };
 
       const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
       const providerLabel: "Jira" | "Linear" = provider === "jira" ? "Jira" : "Linear";
+      if (provider === "jira") {
+        const issuer = this.jiraTokenOAuthClientId(current);
+        if (issuer && issuer !== clientId) {
+          return {
+            refused:
+              "Jira needs to be reconnected from this Tesbo deployment: its authorization was granted to a different Atlassian OAuth app than the one this deployment uses, so this deployment can't renew it. Reconnect Jira in workspace settings (or run this deployment with the same Jira OAuth app as the one that connected it).",
+            row: current
+          };
+        }
+      }
       const refreshToken = decryptSecret(String(current.refresh_token || ""));
-      const token =
-        provider === "jira"
-          ? await this.providerTokenFetch<Body>(
-              "https://auth.atlassian.com/oauth/token",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken })
-              },
-              providerLabel
-            )
-          : await this.providerTokenFetch<Body>(
-              // Linear's OAuth token endpoint accepts grant_type=refresh_token the same way Jira's
-              // does — the same endpoint (and form-urlencoded shape) integrationCallback already
-              // uses for the initial authorization-code exchange. Added because Linear's own OAuth
-              // policy now issues short-lived (~24h) access tokens with a rotating refresh token,
-              // contradicting this method's former assumption that Linear tokens never expire.
-              "https://api.linear.app/oauth/token",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString()
-              },
-              providerLabel
-            );
+      let token: Body;
+      try {
+        token =
+          provider === "jira"
+            ? await this.providerTokenFetch<Body>(
+                "https://auth.atlassian.com/oauth/token",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken })
+                },
+                providerLabel
+              )
+            : await this.providerTokenFetch<Body>(
+                // Linear's OAuth token endpoint accepts grant_type=refresh_token the same way Jira's
+                // does — the same endpoint (and form-urlencoded shape) integrationCallback already
+                // uses for the initial authorization-code exchange. Added because Linear's own OAuth
+                // policy now issues short-lived (~24h) access tokens with a rotating refresh token,
+                // contradicting this method's former assumption that Linear tokens never expire.
+                "https://api.linear.app/oauth/token",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString()
+                },
+                providerLabel
+              );
+      } catch (err) {
+        // 401/403 from the token endpoint is the provider's final word on this refresh token — record
+        // it. Anything else (network, 5xx) is transient and surfaces as-is, unrecorded.
+        const status = (err as { providerStatus?: number })?.providerStatus;
+        if (status === 401 || status === 403) {
+          return {
+            refused:
+              status === 401
+                ? `${providerLabel} needs to be reconnected: ${providerLabel} rejected this deployment's OAuth app credentials when renewing the connection (401). Reconnect ${providerLabel} in workspace settings.`
+                : `${providerLabel} needs to be reconnected: ${providerLabel} refused to renew the connection (403) — its authorization was revoked or has already been used. Reconnect ${providerLabel} in workspace settings.`,
+            row: current
+          };
+        }
+        throw err;
+      }
       const accessToken = String(token.access_token || "");
       const rotatedRefreshToken = String(token.refresh_token || refreshToken);
       const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
       const encryptedAccessToken = encryptSecret(accessToken);
       const encryptedRefreshToken = encryptSecret(rotatedRefreshToken);
       await client.query(
-        "UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1",
+        `UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now(),
+           auth_error = NULL, auth_error_at = NULL, auth_error_refresh_fingerprint = NULL
+         WHERE id = $1`,
         [current.id, encryptedAccessToken, encryptedRefreshToken, expiresAt]
       );
-      return { ...current, access_token: encryptedAccessToken, refresh_token: encryptedRefreshToken, token_expires_at: expiresAt };
+      return {
+        connection: {
+          ...current,
+          access_token: encryptedAccessToken,
+          refresh_token: encryptedRefreshToken,
+          token_expires_at: expiresAt,
+          auth_error: null,
+          auth_error_at: null,
+          auth_error_refresh_fingerprint: null
+        }
+      };
     });
+    if ("refused" in outcome) {
+      await this.recordRefusedRefresh(outcome.row, outcome.refused);
+      throw new BadRequestException({ error: outcome.refused });
+    }
+    return outcome.connection;
   }
 
   private isIntegrationTokenStillValid(connection: Body): boolean {
     return new Date(connection.token_expires_at).getTime() > Date.now() + 60_000;
+  }
+
+  // SHA-256 of the stored (encrypted) refresh_token value — see V125. Never the token itself.
+  private refreshTokenFingerprint(storedRefreshToken: unknown): string {
+    return createHash("sha256").update(String(storedRefreshToken || "")).digest("hex");
+  }
+
+  /** The recorded refusal, if it was for the refresh token this row holds right now (V125). */
+  private refusedRefreshReason(connection: Body): string | null {
+    if (!connection.auth_error || !connection.auth_error_refresh_fingerprint || !connection.refresh_token) return null;
+    return connection.auth_error_refresh_fingerprint === this.refreshTokenFingerprint(connection.refresh_token)
+      ? String(connection.auth_error)
+      : null;
+  }
+
+  // Keyed on the refresh token that was refused: if the row has moved on since (a reconnect, or
+  // another deployment renewed it), the WHERE matches nothing and the fresh token is left alone.
+  private async recordRefusedRefresh(connection: Body, reason: string): Promise<void> {
+    await this.db.query(
+      `UPDATE integration_connections SET auth_error = $2, auth_error_at = now(), auth_error_refresh_fingerprint = $3
+       WHERE id = $1 AND refresh_token = $4`,
+      [connection.id, reason, this.refreshTokenFingerprint(connection.refresh_token), connection.refresh_token]
+    ).catch((err) => this.logger.warn(`Failed to record refused token refresh for connection ${connection.id}: ${err instanceof Error ? err.message : err}`));
+  }
+
+  // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
+  // refresh token only renews through that same app, so a mismatch is knowable without asking
+  // Atlassian. Returns null when the token isn't a readable JWT — then the check is simply skipped.
+  private jiraTokenOAuthClientId(connection: Body): string | null {
+    try {
+      const payload = decryptSecret(String(connection.access_token || "")).split(".")[1];
+      if (!payload) return null;
+      const claims = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Body;
+      const clientId = claims.client_id ?? claims["https://atlassian.com/oauthClientId"];
+      return typeof clientId === "string" && clientId ? clientId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Whether this deployment can keep using the connection, without contacting the provider — what
+  // the status endpoints report alongside `connected`, so a connection that exists but can no longer
+  // be renewed doesn't read as healthy.
+  private integrationConnectionHealth(connection: Body, provider: IntegrationProvider): { needsReconnect: boolean; authError: string | null } {
+    const refused = this.refusedRefreshReason(connection);
+    if (refused) return { needsReconnect: true, authError: refused };
+    if (provider === "jira" && connection.refresh_token) {
+      const issuer = this.jiraTokenOAuthClientId(connection);
+      const ownClientId = this.envIntegrationConfig("jira")?.clientId;
+      if (issuer && ownClientId && issuer !== ownClientId) {
+        return {
+          needsReconnect: true,
+          authError: "This Jira connection was authorized through a different Atlassian OAuth app than the one this Tesbo deployment uses, so this deployment can't renew it once the current access token expires. Reconnect Jira in workspace settings."
+        };
+      }
+    }
+    return { needsReconnect: false, authError: null };
   }
 
   /** Shared fetch+status-check for a provider's OAuth token endpoint — generalizes jiraFetch's
@@ -10297,9 +10771,15 @@ export class LegacyService implements OnModuleInit {
   // Linear error body is not useful to a user and shouldn't be shown to one; every other status is
   // left with its existing (truncated) detail since those are less common and the detail still
   // helps in support/debugging.
+  //
+  // The status also rides along on the exception (non-enumerable, so never serialized into a
+  // response) for callers that need to tell the two apart — see integrationErrorReason, where a 403
+  // on a ticket comment means "no permission", which reconnecting would not fix.
   private cleanAuthErrorOrNull(provider: "Jira" | "Linear", status: number): BadRequestException | null {
     if (status !== 401 && status !== 403) return null;
-    return new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
+    const error = new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
+    Object.defineProperty(error, "providerStatus", { value: status, enumerable: false });
+    return error;
   }
 
   /** True for exactly the error cleanAuthErrorOrNull produces — used to tell "this connection's
@@ -10360,6 +10840,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, "linear"),
       id: connection.id,
       siteUrl: connection.site_url,
       tokenExpiresAt: connection.token_expires_at,
@@ -10652,15 +11133,40 @@ export class LegacyService implements OnModuleInit {
     const issueKey = String(body.issueKey || body.linearIssueKey || "").trim();
     const comment = String(body.comment || body.body || "").trim();
     if (!issueKey || !comment) throw new BadRequestException({ error: "Linear issue key and comment are required." });
+    await this.linearCreateComment(connection, issueKey, comment);
+    return { ok: true };
+  }
+
+  // Internal counterpart of linearComment for callers that have already authorized — see
+  // jiraPostComment. `body` is markdown, which Linear renders. Returns Linear's comment id.
+  private async linearPostComment(projectId: string, issueKey: string, body: string): Promise<string | null> {
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "linear", true);
+    if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
+    // Same single forced renewal on a 401 as jiraPostComment.
+    let created: { success: boolean; id: string | null };
+    try {
+      created = await this.linearCreateComment(connection, issueKey, body);
+    } catch (err) {
+      if ((err as { providerStatus?: number })?.providerStatus !== 401) throw err;
+      const renewed = await this.getIntegrationConnection(organizationId, "linear", true, { rejectedAccessToken: String(connection.access_token) });
+      if (!renewed || String(renewed.access_token) === String(connection.access_token)) throw err;
+      created = await this.linearCreateComment(renewed, issueKey, body);
+    }
+    if (!created.success) throw new BadRequestException({ error: "Linear did not accept the comment." });
+    return created.id;
+  }
+
+  private async linearCreateComment(connection: Body, issueKey: string, body: string): Promise<{ success: boolean; id: string | null }> {
     const linearAuthHeader = this.linearAuthHeader(connection);
     const lookup = await this.linearGraphQL<Body>(linearAuthHeader, "query Issue($id: String!) { issue(id: $id) { id } }", { id: issueKey });
     const issueId = lookup?.issue?.id || issueKey;
-    await this.linearGraphQL(
+    const result = await this.linearGraphQL<Body>(
       linearAuthHeader,
-      "mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
-      { issueId, body: comment }
+      "mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+      { issueId, body }
     );
-    return { ok: true };
+    return { success: result?.commentCreate?.success === true, id: result?.commentCreate?.comment?.id ? String(result.commentCreate.comment.id) : null };
   }
 
   // Live search against Linear (not the linear_tickets sync cache) — same rationale as jiraSearchIssues.
@@ -13615,11 +14121,34 @@ export class LegacyService implements OnModuleInit {
       { actor: "user", stage: "todo", title: "Task created", detail: story, createdAt: now },
       { actor: "agent", stage: "todo", title: "Waiting for Zyra", detail: "Zyra will pick up this task and move it to In Progress.", createdAt: now }
     ];
+    // A Task-board task names its ticket only indirectly, through the Knowledge Base documents the
+    // user picked — a ticket synced into the KB is a mirror document (source_role = 'mirror'). The
+    // Requirements page passes the key explicitly instead, and that always wins. Resolved once, here,
+    // and stored in jira_issue_keys/linear_issue_keys like an explicit key, so everything downstream
+    // (the save's ticket link and tags, regeneration, the ticket auto-comment) reads one source of
+    // truth instead of re-deriving it from a selection that is not itself persisted.
+    const derivedTicket = jiraIssueKeys.length || linearIssueKeys.length
+      ? null
+      : await this.zyraTicketFromKnowledgeSelection(projectId, knowledgeItemIds);
+    if (derivedTicket?.linked) {
+      (derivedTicket.linked.provider === "jira" ? jiraIssueKeys : linearIssueKeys).push(derivedTicket.linked.issueKey);
+    } else if (derivedTicket?.tickets.length) {
+      // More than one ticket behind the selection: the save links every test case to exactly one
+      // ticket, so none of them can be attributed to the right one — link none rather than guess.
+      activityLog.push({
+        actor: "system",
+        stage: "todo",
+        title: "Not linked to a ticket",
+        detail: `The selected Knowledge Base documents belong to ${derivedTicket.tickets.length} tickets (${derivedTicket.tickets.map((t) => t.issueKey).join(", ")}). Test cases from this task won't be linked to a ticket and no ticket comment will be posted. Create one task per ticket to link them.`,
+        createdAt: now
+      });
+    }
+    const derivedKey = derivedTicket?.linked?.issueKey;
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Selected Jira ticket queued for Zyra." })),
-      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Selected Linear ticket queued for Zyra." }))
+      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Jira ticket queued for Zyra." })),
+      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Linear ticket queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
@@ -13740,7 +14269,7 @@ export class LegacyService implements OnModuleInit {
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
       provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
       model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
-      const knowledge = await this.knowledgeSnapshot(projectId, options.knowledgeItemIds || []);
+      const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
       const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
@@ -13752,7 +14281,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       const drafts = aiResult.drafts;
       const inputText = [
@@ -13777,7 +14306,7 @@ export class LegacyService implements OnModuleInit {
       ];
       const finishedAt = new Date().toISOString();
       const activity = [
-        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
+        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel(options.knowledgeItemIds, knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
         { actor: "agent", stage: "in_progress", title: "Generation plan", detail: this.zyraThinking({ story, context, acceptanceCriteria, feedback, knowledgeCount: knowledge.length, jiraCount: jira.length, linearCount: linear.length }), createdAt: finishedAt },
         { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt }
       ];
@@ -14042,8 +14571,15 @@ export class LegacyService implements OnModuleInit {
       // testcases) — gathering them concurrently instead of one after another cuts this stage's
       // wall time down to the slowest of the four instead of their sum, without changing what any
       // of them return.
-      const [knowledge, jira, linear, existingTestcases] = await Promise.all([
-        this.knowledgeSnapshot(projectId),
+      // Feedback ALONE drives the retrieval query — not story/context too. Retrieval falls back
+      // to keyword (full-text) matching whenever no embeddings key is configured (a documented,
+      // common state — see resolveEmbeddingAllocation), and Postgres's plainto_tsquery ANDs every
+      // term together: concatenating the original story's topic with the feedback's would demand
+      // a single document cover both, so a reviewer pivoting to something the initial story never
+      // mentioned (e.g. "also check the session timeout") would match nothing at all. feedback is
+      // guaranteed non-empty here — zyraFeedback (the caller) already rejects an empty one.
+      const [{ knowledge, knowledgeConfidence }, jira, linear, existingTestcases] = await Promise.all([
+        this.zyraTaskKnowledge(projectId, [], [feedback]),
         this.jiraSnapshot(projectId, jiraIssueKeys),
         this.linearSnapshot(projectId, linearIssueKeys),
         this.existingTestcaseSnapshot(projectId, story, context)
@@ -14056,7 +14592,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
@@ -14064,7 +14600,7 @@ export class LegacyService implements OnModuleInit {
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
-        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
+        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel([], knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
         { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
@@ -14427,7 +14963,10 @@ export class LegacyService implements OnModuleInit {
         : await this.processZyraSaveEntriesSequential(client, selected, entryCtx);
 
       const savedAt = new Date().toISOString();
-      const events = [{ suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
+      // saveEventId names this one save — the ticket auto-comment keys its idempotency claim on it
+      // (see queueZyraTicketComments), so the same save can never be commented on twice.
+      const saveEventId = randomUUID();
+      const events = [{ id: saveEventId, suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
       const saveActivity = [{ actor: "user", stage: "done", title: "Accepted and saved testcases", detail: `Saved ${touched.length} testcase(s).`, createdAt: savedAt }];
       // Q11: recorded on the batch itself (not just swallowed) when a target suite turned out to be
       // gone — this is a silent, non-blocking fallback everywhere else in this save, so the only
@@ -14492,9 +15031,9 @@ export class LegacyService implements OnModuleInit {
           [taskId, projectId, touched.length, JSON.stringify(events), JSON.stringify(saveActivity)]
         );
       }
-      // touchedActions is consumed by zyraSave() (for the post-commit integration-sync loop) and
-      // deleted from the result there before it reaches the HTTP response — see its own comment.
-      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, touchedActions, remaining: remainingPayload.length };
+      // touchedActions and saveEventId are consumed by zyraSave() (for the post-commit ticket
+      // auto-comment) and deleted from the result there before it reaches the HTTP response.
+      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, touchedActions, saveEventId, remaining: remainingPayload.length };
     });
   }
 
@@ -14884,18 +15423,17 @@ export class LegacyService implements OnModuleInit {
         // the HTTP response this function returns, so it's read here and stripped below rather
         // than left on `result`.
         const touchedActions = Array.isArray((result as Body)?.touchedActions) ? ((result as Body).touchedActions as Array<"add" | "update" | "archive">) : [];
-        testcases.forEach((row, index) => {
+        testcases.forEach((row) => {
           if (!row?.id) return;
           this.enqueueTestcaseEmbedding(projectId, String(row.id), "updated");
-          // Same commit-boundary discipline as the embedding enqueue right above — this call is
-          // itself fire-and-forget (see its own comment) and reuses the SAME per-row loop, over the
-          // SAME already-committed rows, so it applies uniformly regardless of how each row's
-          // action was decided: an explicit user update/archive today, or feature #1's
-          // similarity-redirect create->update, both produce a row here identically.
-          const action = touchedActions[index];
-          if (action) this.enqueueTestcaseIntegrationSync(projectId, uid, row, action);
         });
+        // Same commit-boundary discipline: one ticket comment per ticket for this whole save, over
+        // the SAME already-committed rows, however each row's action was decided (an explicit
+        // update/archive, or feature #1's similarity-redirect create->update). Never throws.
+        const saveEventId = (result as Body)?.saveEventId;
+        if (saveEventId) await this.queueZyraTicketComments(projectId, uid, taskId, String(saveEventId), testcases, touchedActions);
         delete (result as Body).touchedActions;
+        delete (result as Body).saveEventId;
         return result;
       } catch (error) {
         const collided =
@@ -15037,6 +15575,52 @@ export class LegacyService implements OnModuleInit {
       [project.rows[0]?.organization_id, projectId, folderId, title, stampedEntry, `<pre>${escapeHtml(stampedEntry)}</pre>`, userId]
     );
     if (inserted.rows[0]?.id) this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", inserted.rows[0].id, "created");
+  }
+
+  /**
+   * Knowledge selection for task-board generation (processZyraTask/processZyraFeedback) — the
+   * counterpart to buildZyraChatDecision's own knowledge gathering (~line 11614), which already
+   * fuses ragRetrieval.retrieveWithDiagnostics with a knowledgeSnapshot recency fallback. The
+   * task-board flow used to call knowledgeSnapshot alone, unconditionally: a plain "12
+   * most-recently-updated documents" read with no relation to what the task actually asked for.
+   * On a project with more than 12 knowledge-base items, or one where the relevant document
+   * simply hadn't been touched recently, that document was never shown to the model at all —
+   * "Zyra ignores specific values in Knowledge Base documents" (the embeddings existed; this
+   * function just never queried them).
+   *
+   * An explicit picker selection (`selectedItemIds` — the task-board "attach these documents" UI)
+   * is left exactly as before: a named-document lookup, not a search, per RagRetrievalService's
+   * own header comment ("does NOT replace knowledgeSnapshot() — that stays for the explicit-
+   * picker task-generation flow"). The user already chose these documents; second-guessing that
+   * choice with a relevance query would be a behaviour change nobody asked for.
+   */
+  private async zyraTaskKnowledge(
+    projectId: string,
+    selectedItemIds: string[],
+    queryParts: string[]
+  ): Promise<{ knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>; knowledgeConfidence?: RagRetrievalConfidence }> {
+    if (selectedItemIds.length) {
+      return { knowledge: await this.knowledgeSnapshot(projectId, selectedItemIds) };
+    }
+    const query = queryParts.filter(Boolean).join("\n\n");
+    const [knowledgeFallback, ragDiagnostics] = await Promise.all([
+      this.knowledgeSnapshot(projectId),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, query)
+    ]);
+    return {
+      knowledge: ragDiagnostics.items.length ? ragDiagnostics.items : knowledgeFallback,
+      knowledgeConfidence: ragDiagnostics.confidence
+    };
+  }
+
+  // For the "Read available sources" / "Re-read sources with feedback" activity-log lines —
+  // reusing the existing per-task activity feed (already rendered in the task's Activity tab)
+  // rather than adding a new tracing surface, so a support report ("Zyra didn't use my document")
+  // has somewhere to look without needing Langfuse access.
+  private zyraKnowledgeSourceLabel(selectedItemIds: string[] | undefined, confidence?: RagRetrievalConfidence): string {
+    if (selectedItemIds && selectedItemIds.length) return "explicitly selected";
+    if (confidence === "strong" || confidence === "weak") return `semantic/keyword match, confidence: ${confidence}`;
+    return "no strong match, showing recent documents";
   }
 
   private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
@@ -15789,6 +16373,7 @@ export class LegacyService implements OnModuleInit {
     return [
       "You are Zyra the Test Generator, an AI testcase generation agent.",
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
+      "When a knowledge-base or ticket source states a specific value — a timeout, limit, threshold, format, count, or other concrete number or rule — use that exact value in the relevant testcase's steps, test data, or expected result. Never substitute a generic or invented placeholder value when the sources already gave you the real one.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
       "Apply these test design techniques wherever they genuinely fit the ticket's actual fields and flows — skip only the ones that truly don't apply, not by default:",
       "- Equivalence Partitioning: for each meaningful input, split it into valid and invalid classes and draft one representative case per class.",

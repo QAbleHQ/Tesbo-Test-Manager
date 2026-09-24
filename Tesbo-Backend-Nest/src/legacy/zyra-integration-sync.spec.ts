@@ -22,18 +22,13 @@ import type Redis from "ioredis";
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 /*
- * jira_sync_test_case / linear_sync_test_case (ZYRA_TICKET_WORKFLOW.md §13) —
- * syncTestCaseActionToIntegrations() and its two private per-provider helpers.
+ * The ticket auto-comment's pure halves — zyraTicketCommentGroups() (which committed rows belong to
+ * which ticket) and zyraTicketCommentContent() (what the comment says, as Jira ADF and as markdown).
+ * Both are pure, so they are exercised directly; the gating, claim and delivery around them are
+ * covered in zyra-save-integration-sync.spec.ts, and end to end in e2e/api/zyra.spec.ts.
  *
- * Comment-only capability: posts a comment on the linked Jira/Linear issue via the existing
- * jiraComment()/linearComment(), gated by the existing jiraStatus()/linearStatus() connection
- * check. Not wired into any live code path yet (see ZYRA_BINDING_REPORT.md §11), so these tests
- * exercise the new method directly rather than through zyraSave or any HTTP route.
- *
- * jiraStatus/linearStatus/jiraComment/linearComment are mocked at the instance level (jest.spyOn)
- * rather than mocking db.query/fetch underneath them — those four methods are the documented
- * integration points the new capability was explicitly asked to reuse, so asserting on how it
- * calls them (or doesn't) is the right boundary for these tests, not their own internals.
+ * Replaces the tests of syncTestCaseActionToIntegrations(), the per-row "Test case added by Zyra"
+ * comment this feature supersedes (one comment per test case, posted regardless of the setting).
  */
 
 const FRONTEND_URL = "https://app.example.com";
@@ -65,162 +60,121 @@ function makeLegacy(): LegacyService {
     {} as unknown as CustomTagsService
   );
 }
+type Body = Record<string, any>;
+type Action = "add" | "update" | "archive";
 
-const KB_URL = `${FRONTEND_URL}/projects/p1/testcases/tc-1`;
-
-const TESTCASE = { id: "tc-1", title: "Login rejects an expired session", jiraIssueKey: "EAD-11215" };
-
-function mockConnected(svc: LegacyService, connected: boolean) {
-  jest.spyOn(svc, "jiraStatus").mockResolvedValue({ connected, connectedProjects: [], history: [] } as never);
-  jest.spyOn(svc, "linearStatus").mockResolvedValue({ connected, connectedProjects: [], history: [] } as never);
+interface CommentInternals {
+  zyraTicketCommentGroups(rows: Body[], actions: Action[]): Array<{ provider: "jira" | "linear"; issueKey: string; entries: Array<{ row: Body; action: Action }> }>;
+  zyraTicketCommentContent(projectId: string, issueKey: string, entries: Array<{ row: Body; action: Action }>): { markdown: string; adf: Body };
 }
 
-describe("syncTestCaseActionToIntegrations — connection check", () => {
-  it("skips Jira silently (not an error) when the project has no Jira connection", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, false);
-    const jiraComment = jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
+function internals(svc: LegacyService): CommentInternals {
+  return svc as unknown as CommentInternals;
+}
 
-    const results = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, "add");
+function row(id: string, fields: Body = {}): Body {
+  return { id, externalId: `EAD-TC-${id}`, title: `Test ${id}`, jiraIssueKey: "EAD-1", linearIssueKey: null, ...fields };
+}
 
-    expect(results).toEqual([
-      expect.objectContaining({ provider: "jira", attempted: false, posted: false, comment: null })
-    ]);
-    expect(jiraComment).not.toHaveBeenCalled();
-  });
+/** Every text node in an ADF document, in order — enough to assert on content without pinning layout. */
+function adfText(node: Body): string[] {
+  if (node.type === "text") return [String(node.text)];
+  return (node.content ?? []).flatMap((child: Body) => adfText(child));
+}
 
-  it("skips Linear silently (not an error) when the project has no Linear connection", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, false);
-    const linearComment = jest.spyOn(svc, "linearComment").mockResolvedValue({ ok: true } as never);
-
-    const results = await svc.syncTestCaseActionToIntegrations("p1", "u1", { ...TESTCASE, jiraIssueKey: undefined, linearIssueKey: "ENG-42" }, "update");
-
-    expect(results).toEqual([
-      expect.objectContaining({ provider: "linear", attempted: false, posted: false, comment: null })
-    ]);
-    expect(linearComment).not.toHaveBeenCalled();
-  });
-
-  it("resolves to an empty array for a test case linked to neither Jira nor Linear", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    await expect(svc.syncTestCaseActionToIntegrations("p1", "u1", { id: "tc-2", title: "Unlinked case" }, "add")).resolves.toEqual([]);
-  });
-
-  it("attempts both providers when a test case is linked to both", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-    jest.spyOn(svc, "linearComment").mockResolvedValue({ ok: true } as never);
-
-    const results = await svc.syncTestCaseActionToIntegrations(
-      "p1",
-      "u1",
-      { ...TESTCASE, linearIssueKey: "ENG-42" },
-      "add",
-      { dryRun: false }
+describe("zyraTicketCommentGroups — which committed rows belong to which ticket", () => {
+  it("groups rows by the key each was written with, one group per ticket", () => {
+    const groups = internals(makeLegacy()).zyraTicketCommentGroups(
+      [row("1"), row("2", { jiraIssueKey: "EAD-2" }), row("3")],
+      ["add", "add", "update"]
     );
-
-    expect(results.map((r) => r.provider).sort()).toEqual(["jira", "linear"]);
-  });
-});
-
-describe("syncTestCaseActionToIntegrations — dry run (the default)", () => {
-  it("produces the real comment content without calling jiraComment", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    const jiraComment = jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-
-    // No opts passed at all — dry run must be the default, not something the caller opts into.
-    const results = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, "add");
-
-    expect(jiraComment).not.toHaveBeenCalled();
-    expect(results).toEqual([
-      expect.objectContaining({
-        provider: "jira",
-        issueKey: "EAD-11215",
-        attempted: true,
-        posted: false,
-        dryRun: true,
-        comment: `Test case added by Zyra: ${TESTCASE.title} — ${KB_URL}`
-      })
+    expect(groups.map((g) => [g.provider, g.issueKey, g.entries.map((e) => e.row.id)])).toEqual([
+      ["jira", "EAD-1", ["1", "3"]],
+      ["jira", "EAD-2", ["2"]]
     ]);
   });
 
-  it("still requires dryRun explicitly set to false — dryRun: true behaves identically to the default", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    const jiraComment = jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-
-    await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, "add", { dryRun: true });
-
-    expect(jiraComment).not.toHaveBeenCalled();
-  });
-
-  it("makes a real write when dryRun is explicitly false", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    const jiraComment = jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-
-    const results = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, "update", { dryRun: false });
-
-    expect(jiraComment).toHaveBeenCalledWith("p1", "u1", {
-      issueKey: "EAD-11215",
-      comment: `Test case updated by Zyra: ${TESTCASE.title} — ${KB_URL}`
-    });
-    expect(results).toEqual([expect.objectContaining({ posted: true, dryRun: false })]);
-  });
-
-  it("reports a posting failure without throwing, so the caller isn't blown up by a best-effort side action", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    jest.spyOn(svc, "jiraComment").mockRejectedValue(new Error("Jira issue EAD-11215 not found"));
-
-    const results = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, "archive", { dryRun: false });
-
-    expect(results).toEqual([
-      expect.objectContaining({ attempted: true, posted: false, reason: "Jira issue EAD-11215 not found" })
-    ]);
-  });
-});
-
-describe("syncTestCaseActionToIntegrations — per-action message format", () => {
-  it.each([
-    ["add", `Test case added by Zyra: ${TESTCASE.title} — ${KB_URL}`],
-    ["update", `Test case updated by Zyra: ${TESTCASE.title} — ${KB_URL}`],
-    ["archive", `Test case archived by Zyra: ${TESTCASE.title} — ${KB_URL}`]
-  ] as const)("formats a distinct message for action=%s", async (action, expected) => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-
-    const [result] = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, action);
-    expect(result.comment).toBe(expected);
-  });
-
-  it("keeps all three formats distinct from one another", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
-
-    const comments = await Promise.all(
-      (["add", "update", "archive"] as const).map(async (action) => {
-        const [result] = await svc.syncTestCaseActionToIntegrations("p1", "u1", TESTCASE, action);
-        return result.comment;
-      })
+  it("leaves out rows with no ticket, and rows with no action", () => {
+    const groups = internals(makeLegacy()).zyraTicketCommentGroups(
+      [row("1", { jiraIssueKey: null }), row("2"), row("3")],
+      ["add", "add"]
     );
-    expect(new Set(comments).size).toBe(3);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].entries.map((e) => e.row.id)).toEqual(["2"]);
+  });
+
+  it("puts a Linear-linked row in a Linear group", () => {
+    const groups = internals(makeLegacy()).zyraTicketCommentGroups([row("1", { jiraIssueKey: null, linearIssueKey: "ENG-9" })], ["add"]);
+    expect(groups).toEqual([expect.objectContaining({ provider: "linear", issueKey: "ENG-9" })]);
+  });
+
+  it("lists a row touched twice in one batch once, under its later action", () => {
+    const groups = internals(makeLegacy()).zyraTicketCommentGroups([row("1"), row("1")], ["update", "archive"]);
+    expect(groups[0].entries).toEqual([expect.objectContaining({ action: "archive" })]);
+  });
+
+  it("returns nothing for an empty save", () => {
+    expect(internals(makeLegacy()).zyraTicketCommentGroups([], [])).toEqual([]);
   });
 });
 
-describe("syncTestCaseActionToIntegrations — the KB link", () => {
-  it("points at this backend's own frontend test-case route, not a guessed URL shape", async () => {
-    const svc = makeLegacy();
-    mockConnected(svc, true);
-    jest.spyOn(svc, "jiraComment").mockResolvedValue({ ok: true } as never);
+describe("zyraTicketCommentContent — what the ticket comment says", () => {
+  const entries = [
+    { row: row("1", { title: "Login rejects an expired session" }), action: "add" as const },
+    { row: row("2", { title: "Login locks after five failures" }), action: "add" as const },
+    { row: row("3", { title: "Session timeout is configurable" }), action: "update" as const }
+  ];
 
-    const [result] = await svc.syncTestCaseActionToIntegrations("proj-7", "u1", { id: "case-99", title: "T", jiraIssueKey: "EAD-1" }, "add");
-    expect(result.comment).toContain(`${FRONTEND_URL}/projects/proj-7/testcases/case-99`);
+  it("names Tesbo as the origin, and lists every test case with its id, title and link", () => {
+    const { markdown, adf } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", entries);
+    expect(markdown.split("\n")[0]).toBe("**Generated by Tesbo Test Manager**");
+    expect(markdown).toContain("Zyra saved 3 test cases for EAD-1 in Tesbo.");
+    expect(markdown).toContain(`- [EAD-TC-1](${FRONTEND_URL}/projects/p1/testcases/1) — Login rejects an expired session`);
+    expect(markdown).toContain(`- [EAD-TC-3](${FRONTEND_URL}/projects/p1/testcases/3) — Session timeout is configurable`);
+
+    const text = adfText(adf);
+    expect(text[0]).toBe("Generated by Tesbo Test Manager");
+    expect(text).toEqual(expect.arrayContaining(["EAD-TC-1", " — Login rejects an expired session", "EAD-TC-3"]));
+    expect(JSON.stringify(adf)).toContain(`"href":"${FRONTEND_URL}/projects/p1/testcases/2"`);
+  });
+
+  it("separates added from updated test cases, with a count on each", () => {
+    const { markdown } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", entries);
+    const added = markdown.indexOf("**Added (2)**");
+    const updated = markdown.indexOf("**Updated (1)**");
+    expect(added).toBeGreaterThan(-1);
+    expect(updated).toBeGreaterThan(added);
+    expect(markdown).not.toContain("Archived");
+  });
+
+  it("uses the singular for one test case", () => {
+    const { markdown } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", [entries[0]]);
+    expect(markdown).toContain("Zyra saved 1 test case for EAD-1 in Tesbo.");
+  });
+
+  it("is valid ADF: a version-1 doc, and no empty text node (Jira rejects those)", () => {
+    const { adf } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", [
+      { row: row("1", { externalId: "", title: "" }), action: "add" }
+    ]);
+    expect(adf).toMatchObject({ type: "doc", version: 1 });
+    expect(adfText(adf).every((t) => t.length > 0)).toBe(true);
+    expect(adfText(adf)).toContain("Untitled test case");
+  });
+
+  it("caps the list and counts what it left out, rather than dropping it silently", () => {
+    const many = Array.from({ length: 130 }, (_, i) => ({ row: row(String(i)), action: "add" as const }));
+    const { markdown, adf } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", many);
+    expect(markdown).toContain("Zyra saved 130 test cases");
+    expect(markdown).toContain("**Added (130)**");
+    expect((markdown.match(/^- \[/gm) ?? []).length).toBe(100);
+    expect(markdown).toContain("…and 30 more in Tesbo.");
+    expect(adfText(adf)).toContain("…and 30 more in Tesbo.");
+  });
+
+  it("escapes brackets in markdown link text so a title can't break the link", () => {
+    const { markdown } = internals(makeLegacy()).zyraTicketCommentContent("p1", "EAD-1", [
+      { row: row("1", { externalId: "", title: "Cart [beta] totals" }), action: "add" }
+    ]);
+    expect(markdown).toContain(String.raw`- [Cart \[beta\] totals](`);
   });
 });

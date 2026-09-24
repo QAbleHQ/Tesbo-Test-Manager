@@ -249,6 +249,52 @@ test.describe("test case creation", () => {
       await api.dispose();
     }
   });
+
+  // "[MCP] Test case created by MCP is not adding Severity" — the MCP create_testcase tool stored
+  // whatever severity string it was sent ("Major"), which this dropdown can't select, so the detail
+  // panel showed "Select". See the matching api/mcp.spec.ts block for the refusal side.
+  test("a test case created through MCP with a severity shows that severity in Test Case Detail", async ({ page }) => {
+    const title = `UI MCP severity test case ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    // Cookie-free: AuthMiddleware prefers a session cookie over the bearer token, and a real MCP
+    // client never sends one (same reasoning as callMcpTool in api/mcp.spec.ts).
+    const mcpApi = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    let tokenId = "";
+    let testcaseId = "";
+    try {
+      const tokenBody = await (
+        await api.post(`/api/projects/${ctx.projectId}/apikeys`, { data: { name: `E2E UI MCP severity ${Date.now()}`, scopes: ["write"] } })
+      ).json();
+      tokenId = tokenBody.id;
+      const rpc = await mcpApi.post(`/api/projects/${ctx.projectId}/mcp`, {
+        headers: { Authorization: `Bearer ${tokenBody.token}` },
+        data: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "create_testcase", arguments: { title, severity: "high", priority: "P1", component: "Buzz" } },
+        },
+      });
+      const body = await rpc.json();
+      expect(body.error).toBeUndefined();
+      const created = JSON.parse(body.result.content[0].text);
+      testcaseId = created.id;
+      expect(created.severity).toBe("High");
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+      await expect(fieldControl(page, "Severity")).toHaveValue("High");
+      await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("High");
+      // Neighbouring fields from the same MCP call still land.
+      await expect(fieldControl(page, "Priority")).toHaveValue("P1");
+      await expect(fieldControl(page, "Component")).toHaveValue("Buzz");
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      if (tokenId) await api.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      await mcpApi.dispose();
+      await api.dispose();
+    }
+  });
 });
 
 /*

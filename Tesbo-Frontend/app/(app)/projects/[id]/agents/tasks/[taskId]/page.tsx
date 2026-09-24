@@ -11,11 +11,14 @@ import {
   getZyraTask,
   listJiraTickets,
   listSuites,
+  listZyraTaskTicketComments,
+  retryZyraTicketComment,
   saveZyraTask,
   sendZyraFeedback,
   type JiraTicket,
   type SuiteNode,
   type ZyraTask,
+  type ZyraTicketComment,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
@@ -28,6 +31,14 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 type SaveMode = "existing" | "new";
 type DetailTab = "testcases" | "feedback" | "activities" | "sources";
+
+const TICKET_COMMENT_STATUS: Record<ZyraTicketComment["status"], { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" }> = {
+  pending: { label: "Posting…", tone: "info" },
+  posted: { label: "Posted", tone: "success" },
+  failed: { label: "Failed", tone: "error" },
+  skipped_disabled: { label: "Not posted — auto-comment off", tone: "neutral" },
+  skipped_not_connected: { label: "Not posted — not connected", tone: "warning" },
+};
 
 function normalizeStatus(status: string): string {
   if (status === "accepted") return "done";
@@ -120,6 +131,8 @@ export default function ZyraTaskDetailPage() {
   const [task, setTask] = useState<ZyraTask | null>(null);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
+  const [ticketComments, setTicketComments] = useState<ZyraTicketComment[]>([]);
+  const [retryingCommentId, setRetryingCommentId] = useState<string | null>(null);
   const [selectedDrafts, setSelectedDrafts] = useState<number[]>([]);
   const [feedback, setFeedback] = useState("");
   const [referenceNote, setReferenceNote] = useState("");
@@ -138,13 +151,15 @@ export default function ZyraTaskDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [taskData, suiteList, jiraStatus] = await Promise.all([
+      const [taskData, suiteList, jiraStatus, comments] = await Promise.all([
         getZyraTask(projectId, taskId),
         listSuites(projectId).catch(() => []),
         getJiraStatus(projectId).catch(() => ({ connected: false })),
+        listZyraTaskTicketComments(projectId, taskId).catch(() => [] as ZyraTicketComment[]),
       ]);
       setTask(taskData);
       setSuites(suiteList);
+      setTicketComments(comments);
       setSelectedDrafts((prev) => prev.filter((index) => index < taskData.drafts.length));
       if (jiraStatus.connected) {
         const tickets = await listJiraTickets(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
@@ -191,6 +206,38 @@ export default function ZyraTaskDetailPage() {
     }, 5000);
     return () => clearInterval(timer);
   }, [task, refreshTask]);
+
+  // A ticket comment is posted in the background after a save, so it can still read "Posting…" when
+  // the save returns — re-read until none is pending, then stop.
+  const hasPendingTicketComment = ticketComments.some((comment) => comment.status === "pending");
+  useEffect(() => {
+    if (!hasPendingTicketComment) return;
+    const timer = setInterval(() => {
+      void Promise.all([
+        listZyraTaskTicketComments(projectId, taskId).then(setTicketComments),
+        getZyraTask(projectId, taskId).then(setTask),
+      ]).catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [hasPendingTicketComment, projectId, taskId]);
+
+  async function handleRetryTicketComment(comment: ZyraTicketComment) {
+    setRetryingCommentId(comment.id);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await retryZyraTicketComment(projectId, taskId, comment.id);
+      const label = result.provider === "jira" ? "Jira" : "Linear";
+      if (result.status === "posted") setMessage(`Comment posted on ${label} ${result.issueKey}.`);
+      else setError(`Comment still couldn't be posted on ${label} ${result.issueKey}${result.reason ? `: ${result.reason}` : "."}`);
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to retry the ticket comment.");
+      await loadData();
+    } finally {
+      setRetryingCommentId(null);
+    }
+  }
 
   function toggleDraft(index: number) {
     setSelectedDrafts((prev) => prev.includes(index) ? prev.filter((item) => item !== index) : [...prev, index]);
@@ -413,6 +460,41 @@ export default function ZyraTaskDetailPage() {
           </div>
         </div>
       </Card>
+
+      {ticketComments.length > 0 && (
+        <Card className="p-4">
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">Ticket comments</h3>
+          <p className="mt-1 text-xs text-[var(--muted)]">
+            What was posted to the linked ticket after each save. A failed comment can be sent again once the cause is fixed.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {ticketComments.map((comment) => {
+              const status = TICKET_COMMENT_STATUS[comment.status] ?? { label: comment.status, tone: "neutral" as const };
+              return (
+                <li key={comment.id} className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-[var(--border)] px-3 py-2">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                      <span className="font-medium text-[var(--foreground)]">{comment.provider === "jira" ? "Jira" : "Linear"} {comment.issueKey}</span>
+                      <StatusChip tone={status.tone}>{status.label}</StatusChip>
+                      <span className="text-xs text-[var(--muted)]">
+                        {comment.testcaseCount} testcase{comment.testcaseCount === 1 ? "" : "s"} · {new Date(comment.postedAt || comment.updatedAt).toLocaleString()}
+                      </span>
+                    </div>
+                    {comment.status === "failed" && comment.reason && (
+                      <p className="text-xs text-[var(--error-foreground)]">{comment.reason}</p>
+                    )}
+                  </div>
+                  {comment.status === "failed" && (
+                    <Button variant="secondary" onClick={() => void handleRetryTicketComment(comment)} disabled={retryingCommentId !== null}>
+                      {retryingCommentId === comment.id ? "Retrying..." : "Retry comment"}
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </Card>
+      )}
 
       <div className="flex flex-wrap gap-2 border-b border-[var(--border)]">
         {tabItems.map((tab) => (
