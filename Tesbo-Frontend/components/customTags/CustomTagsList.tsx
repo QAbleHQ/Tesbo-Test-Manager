@@ -82,7 +82,7 @@ export default function CustomTagsList({
       {tags.length === 0 ? (
         <p className="text-sm text-[var(--muted)]">No custom tags yet. Add one above to start tagging test cases.</p>
       ) : (
-        <ul className="divide-y divide-[var(--border-subtle)] rounded-lg border border-[var(--border)]">
+        <ul className="max-h-[420px] divide-y divide-[var(--border-subtle)] overflow-y-auto rounded-lg border border-[var(--border)]">
           {tags.map((tag) => (
             <li key={tag.id} className="flex items-center justify-between px-4 py-2.5">
               <span className="text-sm font-medium text-[var(--foreground)]">{tag.name}</span>
