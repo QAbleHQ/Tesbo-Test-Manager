@@ -88,9 +88,12 @@ export default function CustomTagsSettingsPage() {
     );
   }
 
+  // `.ct-fixed-page` pins this page to the viewport (see globals.css), so the app shell's own
+  // scrollbar stays still and only the tag list scrolls, however many tags the project has.
   return (
-    <StandardPageLayout header={header}>
-      <Card className="p-4 space-y-4">
+    <div className="ct-fixed-page flex h-full min-h-0 w-full flex-col">
+      {header}
+      <Card className="flex min-h-0 flex-1 flex-col gap-4 p-4">
         <p className="text-sm text-[var(--muted)]">
           Tags created here become selectable on this project&apos;s test cases, and can be used to group and filter
           Insights &rarr; Execution Report.
@@ -98,6 +101,6 @@ export default function CustomTagsSettingsPage() {
         {loadError && <p className="text-sm text-[var(--error-foreground)]">{loadError}</p>}
         {!loading && <CustomTagsList projectId={projectId} tags={tags} onChanged={() => loadTags()} />}
       </Card>
-    </StandardPageLayout>
+    </div>
   );
 }

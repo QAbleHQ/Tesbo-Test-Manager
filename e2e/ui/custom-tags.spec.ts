@@ -156,6 +156,54 @@ test.describe("custom tags (UI)", () => {
     expect((await api.get(tagsApiUrl()).then((r) => r.json())).map((t: any) => t.name)).not.toContain(name);
   });
 
+  test("with a long catalog the page itself never scrolls — only the tag list does", async ({ browser }) => {
+    // Enough tags to overflow any sane viewport height; created in one go so the page loads them all.
+    const names = Array.from({ length: 30 }, (_, i) => tagName(`Scroll ${String(i).padStart(2, "0")}`));
+    await Promise.all(names.map((n) => defineTag(n)));
+
+    const page = await pageAs(browser, "owner");
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(customTagsUrl());
+    await expect(page.getByText(names[0], { exact: true })).toBeVisible();
+
+    // <main> in app/(app)/layout.tsx is the shell's scroll container — the rightmost scrollbar.
+    const main = page.locator("main").first();
+    const list = page.locator("ul").filter({ hasText: names[0] });
+    const overflow = (loc: typeof main) =>
+      loc.evaluate((el) => ({ scroll: el.scrollHeight, client: el.clientHeight, top: el.scrollTop }));
+
+    const mainBefore = await overflow(main);
+    expect(mainBefore.scroll, "the page shell must not overflow").toBeLessThanOrEqual(mainBefore.client + 1);
+    const listBefore = await overflow(list);
+    expect(listBefore.scroll, "the tag list should be the thing that scrolls").toBeGreaterThan(listBefore.client);
+
+    // Wheel-scrolling over the list reaches the last tag while the shell stays at the top.
+    await list.hover();
+    await page.mouse.wheel(0, 5000);
+    await expect(page.getByRole("button", { name: `Delete tag ${names[names.length - 1]}` })).toBeInViewport();
+    expect((await overflow(list)).top).toBeGreaterThan(0);
+    expect((await overflow(main)).top).toBe(0);
+
+    // Adding one more tag to an already-long list still doesn't grow the page.
+    const extra = tagName("Scroll extra");
+    await page.getByPlaceholder("e.g. Regression, Smoke, Flaky").fill(extra);
+    await page.getByRole("button", { name: "Add tag" }).click();
+    await expect(page.getByText(extra, { exact: true })).toBeAttached();
+    const mainAfter = await overflow(main);
+    expect(mainAfter.scroll).toBeLessThanOrEqual(mainAfter.client + 1);
+  });
+
+  test("with only a couple of tags the page doesn't scroll either", async ({ browser }) => {
+    const name = tagName("Short");
+    await defineTag(name);
+    const page = await pageAs(browser, "owner");
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(customTagsUrl());
+    await expect(page.getByText(name, { exact: true })).toBeVisible();
+    const m = await page.locator("main").first().evaluate((el) => ({ scroll: el.scrollHeight, client: el.clientHeight }));
+    expect(m.scroll).toBeLessThanOrEqual(m.client + 1);
+  });
+
   // ─── On the test case panel ─────────────────────────────────────────────────
 
   test("tags selected on create are saved and remain selected when reopened for edit", async ({ browser }) => {
@@ -169,7 +217,13 @@ test.describe("custom tags (UI)", () => {
     const title = `E2E Custom Tags UI Case ${Date.now()}`;
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
     await expect(panel.getByText("Custom Tags", { exact: true })).toBeVisible();
+
+    const trigger = panel.getByRole("button", { name: "Custom tags" });
+    await trigger.click();
     await tagCheckbox(panel, alpha.name).check();
+    await page.keyboard.press("Escape");
+    // The dropdown closes and the trigger itself now shows the selection as a chip.
+    await expect(trigger.getByText(alpha.name, { exact: true })).toBeVisible();
 
     await panel.getByRole("button", { name: "Create", exact: true }).click();
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
@@ -180,15 +234,17 @@ test.describe("custom tags (UI)", () => {
     const assignedAfterCreate = await api.get(`/api/projects/${tenant!.mainProjectId}/testcases/${created.id}/tags`).then((r) => r.json());
     expect(assignedAfterCreate.map((t: any) => t.id)).toEqual([alpha.id]);
 
-    // Reopen for edit: the checkbox reflects what was actually persisted, not just local state.
+    // Reopen for edit: the chip reflects what was actually persisted, not just local state.
     await page.goto(testcasesUrl());
     await page.getByRole("button", { name: title }).click();
-    await expect(tagCheckbox(panel, alpha.name)).toBeChecked();
-    await expect(tagCheckbox(panel, beta.name)).not.toBeChecked();
+    await expect(trigger.getByText(alpha.name, { exact: true })).toBeVisible();
+    await expect(trigger.getByText(beta.name, { exact: true })).toHaveCount(0);
 
     // Changing the selection and saving replaces the assignment.
+    await trigger.click();
     await tagCheckbox(panel, beta.name).check();
     await tagCheckbox(panel, alpha.name).uncheck();
+    await page.keyboard.press("Escape");
     await panel.getByRole("button", { name: "Save changes" }).click();
     await expect(panel.getByText("Test case updated successfully.")).toBeVisible();
 
