@@ -1445,6 +1445,21 @@ export class LegacyController {
     return this.legacy.zyraSave(projectId, req.userId, taskId, body);
   }
 
+  @Get("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments")
+  zyraTaskTicketComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
+    return this.legacy.zyraTaskTicketComments(projectId, req.userId, taskId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments/:commentId/retry")
+  retryZyraTicketComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.zyraRetryTicketComment(projectId, req.userId, taskId, commentId);
+  }
+
   // ─── Knowledge Base v2 (folders / documents / files) ────────────────────────
   // NOTE: these routes must stay ABOVE the legacy /knowledge-base/:itemId routes
   // below, since literal segments like "folders"/"search" would otherwise be

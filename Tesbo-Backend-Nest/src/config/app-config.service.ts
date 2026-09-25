@@ -58,6 +58,12 @@ export class AppConfigService {
   readonly sessionCookieName = "tesbo_session";
   readonly corsAllowedOrigins = this.parseCorsAllowedOrigins();
   readonly frontendUrl = this.string("FRONTEND_URL", "http://localhost:1010");
+  // Optional. The address people OUTSIDE this deployment reach it at, for links Tesbo writes into
+  // other systems (Jira/Linear ticket comments). Unset: FRONTEND_URL is used. Either way the link is
+  // only written if the address is externally reachable (common/external-url.util.ts) — so a local
+  // stack never posts localhost links. Does not affect invite/reset/billing emails or OAuth, which
+  // keep using FRONTEND_URL.
+  readonly publicAppUrl = this.optionalString("PUBLIC_APP_URL");
   readonly uploadDir = this.string("UPLOAD_DIR", "./uploads");
   readonly maxUploadSize = this.integer("MAX_UPLOAD_SIZE", 10485760);
   // Applies to JSON/urlencoded request bodies (e.g. knowledge base document saves), not file uploads

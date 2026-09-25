@@ -57,6 +57,9 @@ services:
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1010}
+      # Optional: public address for links written into Jira/Linear comments. Unset = FRONTEND_URL.
+      # A localhost/private address produces plain test-case IDs instead of links.
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:1010,http://127.0.0.1:1010,http://localhost:3000,http://127.0.0.1:3000}
       # Optional: derived from FRONTEND_URL + /integrations/callback when left unset.
       JIRA_REDIRECT_URI: ${JIRA_REDIRECT_URI:-}

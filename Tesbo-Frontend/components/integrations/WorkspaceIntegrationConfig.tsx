@@ -161,6 +161,14 @@ function WorkspaceIntegrationConfigInner({
         </div>
       )}
 
+      {status?.connected && status.needsReconnect && (
+        <div role="alert" className="rounded-lg border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning-foreground)]">
+          <p className="font-medium">{label} needs to be reconnected</p>
+          {status.authError && <p className="mt-1">{status.authError}</p>}
+          <p className="mt-1">Disconnect below, then connect again to authorize this Tesbo deployment.</p>
+        </div>
+      )}
+
       {!canManage && (
         <Card className="p-4">
           <p className="text-sm text-[var(--muted)]">Only the workspace owner can connect {label}.</p>

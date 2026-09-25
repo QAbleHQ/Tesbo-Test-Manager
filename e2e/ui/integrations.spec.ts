@@ -1,4 +1,6 @@
-import { expect, test, type BrowserContext, type Page } from "@playwright/test";
+import path from "node:path";
+import { expect, request as pwRequest, test, type BrowserContext, type Page } from "@playwright/test";
+import { env } from "../utils/env";
 
 /*
  * The "Connect Jira" OAuth flow at .../settings/integrations/jira — the new-tab redesign in
@@ -263,5 +265,103 @@ test.describe("Jira integration — Disconnect (UI)", () => {
     expect(mock.disconnectCalls).toBe(2);
 
     await pageB.close();
+  });
+});
+
+/*
+ * Regression: the project-level Jira integration page has a "Jira + AI Generation" settings
+ * section with an "Auto-comment on Jira ticket" checkbox, persisted into the project's own
+ * `settings` JSON blob. Linear's equivalent page had no such section at all — not a missing
+ * backend capability (settings storage, the read/write API, and the `settingsPanel` slot on the
+ * shared ProjectIntegrationMapping are all already provider-generic), just a component that was
+ * never built and wired in for Linear.
+ *
+ * IntegrationAiGenerationSettings.tsx is the single component behind both providers' pages —
+ * keyed dynamically off its `provider` prop (`project.settings.${provider}AutoComment`) rather
+ * than a hardcoded Jira file and a hardcoded Linear file — so the two providers' settings persist
+ * independently on a project that has both linked.
+ *
+ * The workspace-level OAuth connection can't be driven for real here (see this file's own header
+ * comment), so `.../status` and `.../teams`/`.../projects` are mocked just enough to get past
+ * ProjectIntegrationMapping's "not connected" early return — everything below that point (the
+ * settings panel itself) talks to the real backend via getProject/updateProject, same as
+ * projects.spec.ts's other project-settings coverage.
+ */
+test.describe("Jira/Linear + AI Generation project settings", () => {
+  function apiContext() {
+    return pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state.json") });
+  }
+
+  async function createProject(api: Awaited<ReturnType<typeof apiContext>>, label: string): Promise<string> {
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await api.post("/api/projects", { data: { name: `${label} ${suffix}`, key: `E2E${label.replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 5)}${suffix}` } })
+    ).json();
+    return created.id;
+  }
+
+  /** Stands in for a real OAuth connection so ProjectIntegrationMapping renders its connected
+   *  state (and therefore the settingsPanel below it) instead of the "not connected" screen. */
+  async function mockConnected(context: BrowserContext, projectId: string, provider: "jira" | "linear") {
+    const remotePath = provider === "jira" ? "projects" : "teams";
+    await context.route(`**/api/projects/${projectId}/${provider}/status`, (route) =>
+      route.fulfill({ json: { connected: true, siteUrl: `https://e2e.${provider}.invalid` } })
+    );
+    await context.route(`**/api/projects/${projectId}/${provider}/${remotePath}`, (route) => route.fulfill({ json: [] }));
+  }
+
+  test("the Linear integration page shows a 'Linear + AI Generation' section with an Auto-comment checkbox, matching Jira's", { tag: '@tesbo.testId("TES-TC-2070")' }, async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Linear AI Gen Parity");
+      await mockConnected(context, projectId, "linear");
+
+      await page.goto(`/projects/${projectId}/settings/integrations/linear`);
+      await expect(page.getByRole("heading", { name: "Linear + AI Generation" })).toBeVisible();
+
+      const autoComment = page.getByRole("checkbox", { name: /Auto-comment on Linear ticket/ });
+      await expect(autoComment).toBeVisible();
+      await expect(autoComment).not.toBeChecked();
+      // The ticket-selector checkbox was deliberately dropped from both providers — never shipped.
+      await expect(page.getByText("ticket selector", { exact: false })).toHaveCount(0);
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("saving Linear's Auto-comment setting persists independently of Jira's on the same project", { tag: '@tesbo.testId("TES-TC-2071")' }, async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Both AI Gen Settings");
+      await mockConnected(context, projectId, "jira");
+      await mockConnected(context, projectId, "linear");
+
+      // Jira: turn Auto-comment ON.
+      await page.goto(`/projects/${projectId}/settings/integrations/jira`);
+      await page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ }).check();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Jira settings saved.")).toBeVisible();
+
+      // Linear: leave Auto-comment OFF — the opposite of Jira's, so a bug that wrote both
+      // providers' settings under the same key (or clobbered the other provider's half of the
+      // blob on save) would show up as a wrong combination below.
+      const fetched = await (await api.get(`/api/projects/${projectId}`)).json();
+      const settings = typeof fetched.settings === "string" ? JSON.parse(fetched.settings) : fetched.settings || {};
+      expect(settings.jiraAutoComment).toBe(true);
+      expect(settings.linearAutoComment).toBeFalsy();
+
+      // Reload and confirm both panels read their own state back correctly, independently.
+      await page.goto(`/projects/${projectId}/settings/integrations/linear`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Linear ticket/ })).not.toBeChecked();
+
+      await page.goto(`/projects/${projectId}/settings/integrations/jira`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ })).toBeChecked();
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
   });
 });

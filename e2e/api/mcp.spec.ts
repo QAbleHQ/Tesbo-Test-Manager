@@ -425,6 +425,182 @@ test.describe("MCP create_testcase stores steps in the shape the test case edito
   });
 });
 
+/*
+ * "[MCP] Test case created by MCP is not adding Severity" — severity was never dropped: MCP stored
+ * whatever string the caller sent, and a calling LLM given a bare `severity: string` schema sent
+ * "Major". testcases.severity has no CHECK constraint, so that persisted, and the Test Case Detail
+ * Severity dropdown — which only offers Critical/High/Medium/Low — showed its "Select" placeholder
+ * because the stored value matches none of its options. The MCP test-case tools now advertise that
+ * vocabulary as an enum, map a value onto it case-insensitively, and refuse anything else by name
+ * instead of storing it. An omitted severity stays unset exactly as before.
+ */
+test.describe("MCP test case severity uses the vocabulary Test Case Detail can display", () => {
+  async function withWriteToken(
+    request: APIRequestContext,
+    fn: (mcpApi: APIRequestContext, token: string, createdIds: string[]) => Promise<void>,
+  ) {
+    const mcpApi = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    const createdIds: string[] = [];
+    let tokenId: string | undefined;
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP Severity token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      await fn(mcpApi, tokenBody.token as string, createdIds);
+    } finally {
+      for (const id of createdIds) await deleteCase(request, id);
+      if (tokenId) await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      await mcpApi.dispose();
+    }
+  }
+
+  async function fetchCase(request: APIRequestContext, id: string) {
+    const res = await request.get(`/api/projects/${ctx.projectId}/testcases/${id}`);
+    expect(res.ok()).toBeTruthy();
+    return res.json();
+  }
+
+  test("create_testcase persists the exact severity given, in the response and in what Test Case Detail reads", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      for (const severity of ["Critical", "High", "Medium", "Low"]) {
+        const created = await callMcpTool(mcpApi, token, "create_testcase", { title: `E2E MCP Severity ${severity} ${Date.now()}`, severity });
+        createdIds.push(created.id);
+        expect(created.severity).toBe(severity);
+        expect((await fetchCase(request, created.id)).severity).toBe(severity);
+      }
+    });
+  });
+
+  test("create_testcase maps a differently-cased severity onto the canonical value", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      const created = await callMcpTool(mcpApi, token, "create_testcase", { title: `E2E MCP Severity case ${Date.now()}`, severity: "  critical " });
+      createdIds.push(created.id);
+      expect(created.severity).toBe("Critical");
+      expect((await fetchCase(request, created.id)).severity).toBe("Critical");
+    });
+  });
+
+  test("create_testcase without severity leaves it unset, as before", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      const omitted = await callMcpTool(mcpApi, token, "create_testcase", { title: `E2E MCP Severity omitted ${Date.now()}` });
+      createdIds.push(omitted.id);
+      expect(omitted.severity).toBeNull();
+      expect((await fetchCase(request, omitted.id)).severity).toBeFalsy();
+
+      const blank = await callMcpTool(mcpApi, token, "create_testcase", { title: `E2E MCP Severity blank ${Date.now()}`, severity: "" });
+      createdIds.push(blank.id);
+      expect(blank.severity).toBeNull();
+    });
+  });
+
+  // The regression: before the fix this call succeeded and stored "Major", which Test Case
+  // Detail renders as "Select".
+  test("create_testcase refuses a severity outside the vocabulary and creates nothing", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token) => {
+      const title = `E2E MCP Severity invalid ${Date.now()}`;
+      const error = await callMcpToolExpectError(mcpApi, token, "create_testcase", { title, severity: "Major" });
+      expect(error.message).toContain("severity");
+      expect(error.message).toContain("Critical, High, Medium, Low");
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { search: title } })).json();
+      expect(list.filter((tc: { title: string }) => tc.title === title)).toHaveLength(0);
+    });
+  });
+
+  test("create_testcase's other fields are saved exactly as before alongside a severity", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      const title = `E2E MCP Severity other fields ${Date.now()}`;
+      const steps = [{ stepNumber: 1, action: "Open the post", expectedResult: "Post is editable" }];
+      const created = await callMcpTool(mcpApi, token, "create_testcase", {
+        title,
+        description: "desc",
+        preconditions: "pre",
+        steps,
+        testData: "data",
+        priority: "P1",
+        severity: "High",
+        type: "Regression",
+        automationStatus: "Automated",
+        component: "Buzz",
+        status: "In Review",
+      });
+      createdIds.push(created.id);
+      const fetched = await fetchCase(request, created.id);
+      expect(fetched).toMatchObject({
+        title,
+        description: "desc",
+        preconditions: "pre",
+        testData: "data",
+        priority: "P1",
+        severity: "High",
+        type: "Regression",
+        automationStatus: "Automated",
+        component: "Buzz",
+        status: "In Review",
+      });
+      expect(JSON.parse(fetched.steps)).toEqual(steps);
+    });
+  });
+
+  test("bulk_create_testcases applies the same rule per item without failing the rest of the batch", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      const stamp = Date.now();
+      const result = await callMcpTool(mcpApi, token, "bulk_create_testcases", {
+        testcases: [
+          { title: `E2E MCP Bulk Severity ok ${stamp}`, severity: "medium" },
+          { title: `E2E MCP Bulk Severity bad ${stamp}`, severity: "Blocker" },
+          { title: `E2E MCP Bulk Severity none ${stamp}` },
+        ],
+      });
+      for (const r of result.results) if (r.ok) createdIds.push(r.testcase.id);
+      expect(result).toMatchObject({ total: 3, succeeded: 2, failed: 1 });
+      const [ok, bad, none] = result.results;
+      expect(ok.ok).toBe(true);
+      expect((await fetchCase(request, ok.testcase.id)).severity).toBe("Medium");
+      expect(bad).toMatchObject({ index: 1, ok: false });
+      expect(bad.error).toContain("severity");
+      expect(none.ok).toBe(true);
+      expect((await fetchCase(request, none.testcase.id)).severity).toBeFalsy();
+    });
+  });
+
+  test("update_testcase sets a canonical severity, refuses an unknown one, and leaves it alone when omitted", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token, createdIds) => {
+      const created = await callMcpTool(mcpApi, token, "create_testcase", { title: `E2E MCP Severity update ${Date.now()}`, severity: "Low" });
+      createdIds.push(created.id);
+
+      const updated = await callMcpTool(mcpApi, token, "update_testcase", { testcaseId: created.id, severity: "high" });
+      expect(updated.severity).toBe("High");
+
+      const error = await callMcpToolExpectError(mcpApi, token, "update_testcase", { testcaseId: created.id, severity: "Major" });
+      expect(error.message).toContain("severity");
+      expect((await fetchCase(request, created.id)).severity).toBe("High");
+
+      const untouched = await callMcpTool(mcpApi, token, "update_testcase", { testcaseId: created.id, component: "Buzz" });
+      expect(untouched.severity).toBe("High");
+      expect(untouched.component).toBe("Buzz");
+    });
+  });
+
+  test("tools/list advertises the severity vocabulary on every test case write tool", async ({ request }) => {
+    await withWriteToken(request, async (mcpApi, token) => {
+      const res = await mcpApi.post(`/api/projects/${ctx.projectId}/mcp`, {
+        headers: { Authorization: `Bearer ${token}` },
+        data: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      });
+      expect(res.ok()).toBeTruthy();
+      const tools = (await res.json()).result.tools as Array<{ name: string; inputSchema: any }>;
+      const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+      const expected = ["Critical", "High", "Medium", "Low"];
+      expect(byName.create_testcase.inputSchema.properties.severity.enum).toEqual(expected);
+      expect(byName.update_testcase.inputSchema.properties.severity.enum).toEqual(expected);
+      expect(byName.bulk_create_testcases.inputSchema.properties.testcases.items.properties.severity.enum).toEqual(expected);
+    });
+  });
+});
+
 test.describe("MCP search_knowledge_base", () => {
   test("finds a Knowledge Base document created via REST, scoped to the token's project", async ({ request }) => {
     const title = `E2E MCP KB ${Date.now()}`;
