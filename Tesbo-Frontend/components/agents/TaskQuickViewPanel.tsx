@@ -5,9 +5,10 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
 import { closeZyraTask, type ZyraTask } from "@/lib/api";
-import { Button, CopyButton, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
+import { Button, CopyButton, StatusChip, PriorityBadge, SeverityBadge, type Priority, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { ACTION_LABEL, TechniqueBadges } from "./ZyraChatReviewPanel";
 
 export const JIRA_BADGE_CLASS =
   "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
@@ -57,6 +58,14 @@ const TASK_STATUS_LABELS: Record<string, string> = {
 export function taskStatusLabel(status: string): string {
   const normalized = normalizeTaskStatus(status);
   return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
+}
+
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// See ZyraChatReviewPanel's identical guard — a draft's severity is only guaranteed to match this
+// set once actually saved (normalizeZyraSeverity); an in-review preview can still carry something
+// else, so this never trusts the string directly.
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
 }
 
 function firstStepText(stepsJson: string): string | null {
@@ -135,10 +144,12 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const failureDetail = failed ? latestFailureDetail(activities) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
   const draftsTsv = toTsv(
-    ["Title", "Priority", "Preconditions", "Steps", "Expected Result", "Tags"],
+    ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
     task.drafts.map((draft) => [
       draft.title,
       draft.priority,
+      draft.severity ?? "",
+      draft.component ?? "",
       draft.preconditions,
       stepsText(draft.stepsJson),
       draft.expectedSummary,
@@ -258,11 +269,24 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 return (
                   <div key={`${task.id}-draft-${index}`} className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
                     <div className="mb-1.5 flex items-center gap-2">
+                      {draft.action && (
+                        <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
+                          {ACTION_LABEL[draft.action] || draft.action}
+                        </StatusChip>
+                      )}
                       <PriorityBadge priority={draft.priority as Priority} />
+                      {knownSeverity(draft.severity) && <SeverityBadge severity={knownSeverity(draft.severity)!} />}
+                      {draft.component && <span className="text-[11px] text-[var(--muted-soft)]">{draft.component}</span>}
+                      {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
                       {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
                     </div>
                     <div className="text-[13px] font-medium leading-snug text-[var(--foreground)]">{draft.title}</div>
                     {step && <div className="mt-1.5 text-[12px] text-[var(--muted)]">1 → {step}</div>}
+                    {draft.techniques?.length ? <div className="mt-1.5"><TechniqueBadges techniques={draft.techniques} /></div> : null}
+                    {/* Only an update/archive draft carries a reason (why the sweep or the chat turn
+                        flagged this) — a plain task-board create draft never has one, so this stays
+                        silent for the case that already worked before this normalization existed. */}
+                    {draft.reason && <div className="mt-1.5 text-[12px] italic text-[var(--muted)]">{draft.reason}</div>}
                   </div>
                 );
               })}

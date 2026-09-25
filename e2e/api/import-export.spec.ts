@@ -40,6 +40,8 @@ const EXPORT_HEADERS = [
   "description",
   "preconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",
@@ -59,6 +61,12 @@ const EXPORT_HEADERS = [
  * UI) were added so the template, the import mapping and the Create Test Case form expose the same
  * field set — both already had DB columns and worked through the single-create/update routes, but
  * were silently dropped by the bulk import path (see PreparedImportRow/insertImportChunk).
+ *
+ * "action" and "expectedResult" were added because the Map Columns screen has always offered them
+ * as a plain single-step alternative to the "steps" DSL, but no template ever had headers for them
+ * to map to — they always showed "-- Skip --" on the official template. "steps" stays mapped in the
+ * same file and still wins on import (ImportTestCasesModal.tsx's handleImport), so this only adds
+ * columns; it does not change what importing the unmodified template produces.
  */
 const TEMPLATE_HEADERS = [
   "title",
@@ -66,6 +74,8 @@ const TEMPLATE_HEADERS = [
   "preconditions",
   "postconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",
@@ -230,18 +240,51 @@ test.describe("import / export", () => {
       status: "Approved",
       component: "Billing",
       suite: "",
+      // `kept` was seeded with no steps at all — action/expectedResult must come out as empty
+      // strings, not "undefined" text or a missing column.
+      steps: "",
+      action: "",
+      expectedResult: "",
     });
     // The suite column is the joined suite NAME, not its id — that's what makes an export
     // re-importable, since the import maps "Suite" by name.
     expect(records.find((r) => r.title === inSuite.title)!.suite).toBe(suite.name);
   });
 
-  test("serialises each step as \"action => expected result\", joined by \" | \"", { tag: '@tesbo.testId("TES-TC-198")' }, async () => {
+  test("exports a single step's Action/Expected Result into their own columns, not steps", { tag: '@tesbo.testId("TES-TC-198")' }, async () => {
+    // Action/Expected Result only take a case with EXACTLY one step: the importer's own Action/
+    // Expected Result columns (ImportTestCasesModal.tsx's handleImport) build exactly one step from
+    // them with no " | " splitting, so anything exported there for more than one step could never
+    // round-trip back through a re-import correctly. A single-step case is unambiguous either way,
+    // so it gets the plain columns instead of the "action => expected" DSL, and `steps` must not
+    // carry a duplicate copy of the same text.
     const stamp = Date.now();
     const project = await newProject(`E2E Export Steps ${stamp}`);
     const seeded = await seedCase(
       {
         title: `E2E Export Steps ${stamp}`,
+        // No expected result on the one step — must come out as "", not undefined/missing.
+        steps: [{ stepNumber: 1, action: "Open the login page" }],
+      },
+      project,
+    );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.action).toBe("Open the login page");
+    expect(row.expectedResult).toBe("");
+    expect(row.steps, "a single step must not also be duplicated into the steps column").toBe("");
+  });
+
+  test("exports 2+ steps into the steps column as \"action => expected\", joined by \" | \" — never into Action/Expected Result", async () => {
+    // The DSL column (not Action/Expected Result) is what the importer's Steps mapping already
+    // splits on both "|" and "=>" regardless of step count, so this is the only shape that survives
+    // a re-import unscathed once there's more than one step.
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Multi Steps ${stamp}`);
+    const seeded = await seedCase(
+      {
+        title: `E2E Export Multi Steps ${stamp}`,
         steps: [
           { stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" },
           // No expected result: the separator must not be emitted for an absent half, or a
@@ -253,9 +296,56 @@ test.describe("import / export", () => {
     );
 
     const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
-    expect(records.find((r) => r.title === seeded.title)!.steps).toBe(
-      "Open the login page => The form is shown | Submit empty credentials",
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.steps).toBe("Open the login page => The form is shown | Submit empty credentials");
+    expect(row.action, "2+ steps must not land in Action/Expected Result — a re-import can't split them back apart").toBe("");
+    expect(row.expectedResult).toBe("");
+  });
+
+  test("still exports a legacy plain-string step into the steps column, not Action/Expected Result", async () => {
+    // A step can also be a bare string with no action/expectedResult of its own (older data, or a
+    // synonym-key shape safeSteps() didn't recognize) — that text belongs in `steps`, the one column
+    // built for it, and must not surface as a bogus Action or Expected Result value.
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Steps Legacy ${stamp}`);
+    const seeded = await seedCase(
+      { title: `E2E Export Steps Legacy ${stamp}`, steps: ["Open the app and sign in"] },
+      project,
     );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.steps).toBe("Open the app and sign in");
+    expect(row.action).toBe("");
+    expect(row.expectedResult).toBe("");
+  });
+
+  test("still exports Action/Expected Result when steps were stored as a JSON-encoded string, not a genuine array", async () => {
+    /*
+     * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test
+     * Cases" — the create/edit modal pre-stringifies `steps` before every save (testcases/page.tsx
+     * `steps: JSON.stringify(steps)`), and insertTestCaseWithClient encodes it a second time, so the
+     * jsonb column ends up holding a JSON string scalar rather than a genuine array. The editor's own
+     * parseSteps() expects exactly that string, but exportTestcases' `normalizeJsonArray(row.steps)`
+     * was `Array.isArray(value) ? value : []` — the mirror-image assumption — so this shape (which is
+     * what every modal-created test case, and now every Zyra/MCP-created one, actually persists)
+     * exported as a blank Steps/Action/Expected Result column instead of silently failing to save.
+     * One step here (not several): safeSteps() has to see through the JSON-string wrapper before
+     * the single-vs-multi-step decision above it can even run.
+     */
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Steps Shape ${stamp}`);
+    const steps = [{ stepNumber: 1, action: "Open the login page", expectedResult: "The form is shown" }];
+    const seeded = await seedCase(
+      { title: `E2E Export Steps Shape ${stamp}`, steps: JSON.stringify(steps) },
+      project,
+    );
+
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.action).toBe("Open the login page");
+    expect(row.expectedResult).toBe("The form is shown");
+    expect(row.steps).toBe("");
   });
 
   test("quotes values containing commas, quotes and newlines so they survive the round trip", { tag: '@tesbo.testId("TES-TC-199")' }, async () => {
@@ -274,18 +364,70 @@ test.describe("import / export", () => {
     expect(body).toContain('"E2E Export ""quoted"", comma');
   });
 
-  test("orders rows by most recently updated", { tag: '@tesbo.testId("TES-TC-200")' }, async () => {
-    const stamp = Date.now();
-    const project = await newProject(`E2E Export Order ${stamp}`);
-    const first = await seedCase({ title: `E2E Export Order A ${stamp}` }, project);
-    const second = await seedCase({ title: `E2E Export Order B ${stamp}` }, project);
-    await asOwner.put(`/api/projects/${project}/testcases/${first.id}`, {
-      data: { description: "touched last" },
-    });
+  test(
+    "orders rows the same way the repository shows them by default (newest first, ID sequence), not by last-updated",
+    { tag: '@tesbo.testId("TES-TC-200")' },
+    async () => {
+      /*
+       * Was: "orders rows by most recently updated" — export deliberately used `updated_at DESC`
+       * while the repository list used `created_at DESC` (ID sequence), on the theory that the two
+       * were allowed to diverge (see the removed comment in LegacyService.exportTestCases). That is
+       * exactly what "[Test Cases] Exported Test Cases Lose Their Original Sequence" reported:
+       * editing an old case silently moved it to the top of every future export while its position on
+       * screen never changed. Export's default now matches the repository's own default order, via
+       * the shared LegacyService.buildTestcaseOrderBySql.
+       */
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Order ${stamp}`);
+      const first = await seedCase({ title: `E2E Export Order A ${stamp}` }, project);
+      const second = await seedCase({ title: `E2E Export Order B ${stamp}` }, project);
+      // Editing the OLDER case must NOT move it in the export — that was the exact reported defect.
+      await asOwner.put(`/api/projects/${project}/testcases/${first.id}`, {
+        data: { description: "touched last" },
+      });
 
-    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
-    expect(records.map((r) => r.title)).toEqual([first.title, second.title]);
-  });
+      const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+      // Newest-created first, same as the repository's own default (unsorted) view — unaffected by
+      // which one was edited more recently.
+      expect(records.map((r) => r.title)).toEqual([second.title, first.title]);
+    },
+  );
+
+  test(
+    "an export can be sorted by the same ID/title/priority columns the repository table offers",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Sort ${stamp}`);
+      const alpha = await seedCase({ title: `E2E Export Sort Alpha ${stamp}`, priority: "P0" }, project);
+      const zebra = await seedCase({ title: `E2E Export Sort Zebra ${stamp}`, priority: "P3" }, project);
+
+      const byTitleAsc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "title", sortDir: "asc" },
+      });
+      expect(parseCsvRecords(await byTitleAsc.text()).records.map((r) => r.title)).toEqual([
+        alpha.title,
+        zebra.title,
+      ]);
+
+      const byTitleDesc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "title", sortDir: "desc" },
+      });
+      expect(parseCsvRecords(await byTitleDesc.text()).records.map((r) => r.title)).toEqual([
+        zebra.title,
+        alpha.title,
+      ]);
+
+      const byPriorityAsc = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { sortBy: "priority", sortDir: "asc" },
+      });
+      // P0 (Critical) ranks ahead of P3 (Low) ascending — the same ranking the priority filter and
+      // the on-screen sort use, not alphabetical.
+      expect(parseCsvRecords(await byPriorityAsc.text()).records.map((r) => r.title)).toEqual([
+        alpha.title,
+        zebra.title,
+      ]);
+    },
+  );
 
   test("a project with no test cases exports the header row and nothing else", { tag: '@tesbo.testId("TES-TC-201")' }, async () => {
     const project = await newProject(`E2E Export Empty ${Date.now()}`);
@@ -356,6 +498,232 @@ test.describe("import / export", () => {
     expect(row[`cf_${select.key}`]).toBe("R2");
   });
 
+  /* ───────────────────────── test case export filtering ─────────────────────────
+   *
+   * Basecamp-style report: "Exporting a specific suite exports all test cases" — LegacyController's
+   * exportCsv/exportXlsx took no @Query() at all, and LegacyService.exportTestCases ran a query
+   * filtered only by project_id, so selecting a suite (or any other repository filter) on screen had
+   * no effect on the downloaded file; it always contained the whole project. Fixed by having export
+   * build its WHERE clause the same way listTestCasesForUser already does (suite/status/priority/
+   * type/automationStatus/jira/linear/search/customFieldFilters), via a shared
+   * LegacyService.buildTestcaseFilterFragments helper, and by threading the frontend's active
+   * filters into the export link (Tesbo-Frontend testcases/page.tsx's getExportUrl calls).
+   *
+   * One behavior change rides along with reusing the list's filter logic: an export with NO filters
+   * at all now excludes Archived cases by default, the same as the on-screen list — previously the
+   * unfiltered export's query had no status predicate whatsoever and returned every status. That is
+   * asserted explicitly below rather than left as an undocumented side effect.
+   */
+
+  test(
+    "exporting a specific suite only exports that suite's test cases, not the whole project",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Suite Filter ${stamp}`);
+      const suiteA = await (
+        await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E Export Suite A ${stamp}` } })
+      ).json();
+      const suiteB = await (
+        await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E Export Suite B ${stamp}` } })
+      ).json();
+      const inA = await seedCase({ title: `E2E Export In A ${stamp}`, suiteId: suiteA.id }, project);
+      const inB = await seedCase({ title: `E2E Export In B ${stamp}`, suiteId: suiteB.id }, project);
+      const unfiled = await seedCase({ title: `E2E Export Unfiled ${stamp}` }, project);
+
+      const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { suiteId: suiteA.id },
+      });
+      const { records } = parseCsvRecords(await res.text());
+      expect(records.map((r) => r.title)).toEqual([inA.title]);
+      expect(records.map((r) => r.title), "another suite's cases must not leak into the export").not.toContain(inB.title);
+      expect(records.map((r) => r.title), "unfiled cases must not leak into a suite-scoped export").not.toContain(
+        unfiled.title,
+      );
+
+      // The unfiltered export (no suiteId at all) is unchanged: it still returns everything.
+      const wholeProject = await asOwner.get(`/api/projects/${project}/testcases/export/csv`);
+      const { records: allRecords } = parseCsvRecords(await wholeProject.text());
+      expect(allRecords.map((r) => r.title).sort()).toEqual([inA.title, inB.title, unfiled.title].sort());
+    },
+  );
+
+  test("the XLSX export also honors a suite filter", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Suite Filter Xlsx ${stamp}`);
+    const suite = await (
+      await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E Export Xlsx Suite ${stamp}` } })
+    ).json();
+    const inSuite = await seedCase({ title: `E2E Export Xlsx In Suite ${stamp}`, suiteId: suite.id }, project);
+    const outsideSuite = await seedCase({ title: `E2E Export Xlsx Outside ${stamp}` }, project);
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/xlsx`, {
+      params: { suiteId: suite.id },
+    });
+    expect(res.status()).toBe(200);
+    const workbook = XLSX.read(await res.body(), { type: "buffer" });
+    const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Test Cases"]);
+    expect(rows.map((r) => r.title)).toEqual([inSuite.title]);
+    expect(rows.map((r) => r.title)).not.toContain(outsideSuite.title);
+  });
+
+  test(
+    "exporting a suite also includes cases nested in its descendant suites, matching the on-screen list",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Suite Descendants ${stamp}`);
+      const parent = await (
+        await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E Export Parent ${stamp}` } })
+      ).json();
+      const child = await (
+        await asOwner.post(`/api/projects/${project}/suites`, {
+          data: { name: `E2E Export Child ${stamp}`, parentId: parent.id },
+        })
+      ).json();
+      const inParent = await seedCase({ title: `E2E Export In Parent ${stamp}`, suiteId: parent.id }, project);
+      const inChild = await seedCase({ title: `E2E Export In Child ${stamp}`, suiteId: child.id }, project);
+      const elsewhere = await seedCase({ title: `E2E Export Elsewhere ${stamp}` }, project);
+
+      // Without includeDescendants, only the exact suite's own cases come out — same as the list.
+      const exact = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { suiteId: parent.id },
+      });
+      expect(parseCsvRecords(await exact.text()).records.map((r) => r.title)).toEqual([inParent.title]);
+
+      // With it, the child's cases are included too.
+      const withDescendants = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { suiteId: parent.id, includeDescendants: "true" },
+      });
+      const { records } = parseCsvRecords(await withDescendants.text());
+      expect(records.map((r) => r.title).sort()).toEqual([inChild.title, inParent.title].sort());
+      expect(records.map((r) => r.title)).not.toContain(elsewhere.title);
+    },
+  );
+
+  test('exporting suiteId="none" exports only test cases filed under no suite', async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Unfiled Filter ${stamp}`);
+    const suite = await (
+      await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E Export Unfiled Suite ${stamp}` } })
+    ).json();
+    const filed = await seedCase({ title: `E2E Export Filed ${stamp}`, suiteId: suite.id }, project);
+    const unfiled = await seedCase({ title: `E2E Export Truly Unfiled ${stamp}` }, project);
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+      params: { suiteId: "none" },
+    });
+    const { records } = parseCsvRecords(await res.text());
+    expect(records.map((r) => r.title)).toEqual([unfiled.title]);
+    expect(records.map((r) => r.title)).not.toContain(filed.title);
+  });
+
+  test(
+    "a malformed suiteId is refused with 400, not silently ignored into an unfiltered export",
+    async () => {
+      const res = await asOwner.get(`/api/projects/${projectId}/testcases/export/csv`, {
+        params: { suiteId: "not-a-uuid" },
+        failOnStatusCode: false,
+      });
+      expect(res.status()).toBe(400);
+    },
+  );
+
+  test(
+    "an export can be scoped by status, priority, type and automationStatus together, matching only the intersection",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Field Filters ${stamp}`);
+      const match = await seedCase(
+        {
+          title: `E2E Export Match ${stamp}`,
+          status: "Approved",
+          priority: "P1",
+          type: "Regression",
+          automationStatus: "Automated",
+        },
+        project,
+      );
+      const wrongStatus = await seedCase({ title: `E2E Export Wrong Status ${stamp}`, priority: "P1", type: "Regression" }, project);
+      const wrongPriority = await seedCase(
+        { title: `E2E Export Wrong Priority ${stamp}`, status: "Approved", type: "Regression" },
+        project,
+      );
+
+      const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { status: "Approved", priority: "P1", type: "Regression", automationStatus: "Automated" },
+      });
+      const { records } = parseCsvRecords(await res.text());
+      expect(records.map((r) => r.title)).toEqual([match.title]);
+      expect(records.map((r) => r.title)).not.toContain(wrongStatus.title);
+      expect(records.map((r) => r.title)).not.toContain(wrongPriority.title);
+    },
+  );
+
+  test("an export can be scoped by the same free-text search the repository search box uses", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Search Filter ${stamp}`);
+    const matching = await seedCase({ title: `E2E Export Zebra Findable ${stamp}` }, project);
+    const other = await seedCase({ title: `E2E Export Other Case ${stamp}` }, project);
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+      params: { search: "zebra findable" },
+    });
+    const { records } = parseCsvRecords(await res.text());
+    expect(records.map((r) => r.title)).toEqual([matching.title]);
+    expect(records.map((r) => r.title)).not.toContain(other.title);
+  });
+
+  test("an export can be scoped by a custom field filter, matching only the rows that satisfy it", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Custom Field Filter ${stamp}`);
+    const text = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `Platform ${stamp}`, fieldType: "text" },
+      })
+    ).json();
+    const matching = await seedCase(
+      { title: `E2E Export CF Match ${stamp}`, customFieldValues: { [text.id]: "Chrome regression" } },
+      project,
+    );
+    const other = await seedCase(
+      { title: `E2E Export CF Other ${stamp}`, customFieldValues: { [text.id]: "Safari smoke" } },
+      project,
+    );
+
+    const conditions = [{ definitionId: text.id, operator: "contains", value: "chrome" }];
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+      params: { customFieldFilters: JSON.stringify(conditions) },
+    });
+    const { records } = parseCsvRecords(await res.text());
+    expect(records.map((r) => r.title)).toEqual([matching.title]);
+    expect(records.map((r) => r.title)).not.toContain(other.title);
+  });
+
+  test(
+    "excludes Archived cases from an unfiltered export by default; status=Archived / includeArchived=true still reach them",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Archived ${stamp}`);
+      const active = await seedCase({ title: `E2E Export Active ${stamp}` }, project);
+      const archived = await seedCase({ title: `E2E Export Archived Case ${stamp}`, status: "Archived" }, project);
+
+      const unfiltered = await asOwner.get(`/api/projects/${project}/testcases/export/csv`);
+      const { records: unfilteredRecords } = parseCsvRecords(await unfiltered.text());
+      expect(unfilteredRecords.map((r) => r.title)).toEqual([active.title]);
+
+      const byStatus = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { status: "Archived" },
+      });
+      expect(parseCsvRecords(await byStatus.text()).records.map((r) => r.title)).toEqual([archived.title]);
+
+      const includeArchived = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { includeArchived: "true" },
+      });
+      expect(
+        parseCsvRecords(await includeArchived.text()).records.map((r) => r.title).sort(),
+      ).toEqual([active.title, archived.title].sort());
+    },
+  );
+
   /* ───────────────────────── test case XLSX export ───────────────────────── */
 
   test("exports a workbook whose \"Test Cases\" sheet matches the CSV", { tag: '@tesbo.testId("TES-TC-204")' }, async () => {
@@ -385,8 +753,13 @@ test.describe("import / export", () => {
       title: seeded.title,
       description: "In the workbook",
       priority: "P3",
-      steps: "Click => It clicks",
+      action: "Click",
+      expectedResult: "It clicks",
     });
+    // Action/Expected Result must not also be duplicated into `steps` — an empty `steps` cell reads
+    // back as either "" or an absent key depending on how the sheet library round-trips a blank
+    // string, so accept either rather than pinning one.
+    expect(rows[0].steps || "").toBe("");
   });
 
   test("a project with no test cases still exports a workbook carrying the header row", { tag: '@tesbo.testId("TES-TC-205")' }, async () => {
@@ -449,6 +822,11 @@ test.describe("import / export", () => {
     expect(records[0].steps).toContain(" => ");
     expect(records[0].steps).toContain(" | ");
     expect(records[0].title).toBeTruthy();
+    // The Action/Expected Result pair must also carry a worked example — otherwise Map Columns still
+    // shows them as unmapped the moment a user removes the "steps" column to try the plain-column
+    // style instead.
+    expect(records[0].action).toBeTruthy();
+    expect(records[0].expectedResult).toBeTruthy();
     // A worked value for every base column, so filling the template in unmodified round-trips —
     // in particular Automation Type must be one of TESTCASE_AUTOMATION_TYPES, since the importer
     // stores whatever string it's given with no server-side enum check.

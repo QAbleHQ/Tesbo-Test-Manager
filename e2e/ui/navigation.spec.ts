@@ -1,6 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
-import { dbControlAvailable } from "../utils/psql";
+import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 import {
   addProjectMember,
   createBug,
@@ -818,10 +818,12 @@ test.describe("top bar — notifications", () => {
   /*
    * BetterBugs: "Notification Icon Does Not Respond When Clicked" — the bell in TopBar.tsx had no
    * onClick at all. Fixed by wiring it to a dropdown panel backed by GET /api/notifications
-   * (notifications.spec.ts pins that route's own contract). The backend route is still a stub that
-   * always answers an empty list (see legacy.controller.ts's comment on it), so the primary path
-   * here is necessarily the empty state — these tests are about the panel's own behaviour
-   * (open/close, keyboard, error handling), not about real notification content.
+   * (notifications.spec.ts pins that route's own contract, including real seeded rows). NOTIF-UI-
+   * 01..07 below exercise the panel with no real notifications present (open/close, keyboard, error
+   * handling) — that empty state is still the common case for a fresh workspace. NOTIF-UI-08/09
+   * seed a real row to cover the part that needs one: clicking a notification navigates to what it
+   * links to and marks it read, and a notification with no resolvable link renders as plain text
+   * rather than a dead click target.
    */
 
   const bell = (page: Page) => page.getByRole("button", { name: "Notifications" });
@@ -902,6 +904,89 @@ test.describe("top bar — notifications", () => {
 
     await expect(panel(page).getByText("No notifications")).toBeVisible();
   });
+
+  /** Inserts a notification row for the screens tenant's own user. Caller deletes it in `finally`. */
+  function seedNotification(fields: { title: string; linkEntityType: string | null; linkEntityId: string | null }): string {
+    const userId = scalar(`SELECT id FROM users WHERE email = ${literal(tenant!.email)};`);
+    const id = crypto.randomUUID();
+    exec(
+      `INSERT INTO notifications (id, user_id, type, title, body, link_entity_type, link_entity_id) ` +
+        `VALUES (${literal(id)}, ${literal(userId)}, 'zyra_archive_sweep', ${literal(fields.title)}, ` +
+        `'Review them on the Zyra task board.', ${fields.linkEntityType ? literal(fields.linkEntityType) : "NULL"}, ` +
+        `${fields.linkEntityId ? literal(fields.linkEntityId) : "NULL"});`,
+    );
+    return id;
+  }
+
+  function deleteNotification(id: string): void {
+    exec(`DELETE FROM notifications WHERE id = ${literal(id)};`);
+  }
+
+  test("NOTIF-UI-08 clicking a notification navigates to its task board and persists read_at", { tag: '@tesbo.testId("TES-TC-1356")' }, async ({
+    page,
+  }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a real notification row");
+    const title = `Zyra found 2 archive candidates ${Date.now()}`;
+    const id = seedNotification({ title, linkEntityType: "zyra_task_board", linkEntityId: tenant!.projectId });
+    try {
+      await bell(page).click();
+      // role="menuitem", not "button": the clickable notification is a real <button>, but it also
+      // carries an explicit role="menuitem" (matching the user menu's own Logout/My Account items
+      // elsewhere in this file) so it reads correctly as a menu entry — and an explicit role
+      // attribute overrides an element's implicit native role in the accessibility tree, so
+      // Chromium (and getByRole) reports it as "menuitem", never "button".
+      const item = panel(page).getByRole("menuitem", { name: new RegExp(title) });
+      await expect(item).toBeVisible();
+      expect(await item.evaluate((el) => el.tagName), "a linkable notification should render as a real <button>, not just a styled div").toBe("BUTTON");
+
+      await item.click();
+
+      await page.waitForURL(`**/projects/${tenant!.projectId}/agents/tasks`);
+      await expect(panel(page)).toBeHidden();
+
+      // Persisted state, not just the click having happened — a fresh read through the real API,
+      // the same one TopBar.tsx's own optimistic update is trying to stay honest with.
+      const api = await screensApi();
+      try {
+        const res = await api.get("/api/notifications");
+        const row = (await res.json()).find((n: { id: string }) => n.id === id);
+        expect(row?.read_at, "clicking the notification should have marked it read server-side").toBeTruthy();
+      } finally {
+        await api.dispose();
+      }
+    } finally {
+      deleteNotification(id);
+    }
+  });
+
+  test("NOTIF-UI-09 a notification with no resolvable link renders as plain text, not a dead click target", { tag: '@tesbo.testId("TES-TC-1357")' }, async ({
+    page,
+  }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a real notification row");
+    const title = `Untyped notification ${Date.now()}`;
+    // An older/malformed row: no link_entity_type at all (the exact shape a pre-this-feature row,
+    // or a future notification type nobody has wired a destination for yet, would have).
+    const id = seedNotification({ title, linkEntityType: null, linkEntityId: null });
+    try {
+      await bell(page).click();
+      // Both the linkable and inert variants carry role="menuitem" (NOTIF-UI-08's own comment
+      // explains why an accessible-role check alone can't tell them apart — the linkable one is a
+      // <button role="menuitem">, so role-based lookup finds this one too). The real distinguishing
+      // property is the underlying element: linkable is a <button>, inert is a plain <div>.
+      const item = panel(page).getByRole("menuitem", { name: new RegExp(title) });
+      await expect(item).toBeVisible();
+      expect(await item.evaluate((el) => el.tagName), "an unlinkable notification must not render as a clickable <button>").toBe("DIV");
+
+      // Clicking the row must not navigate away or throw, even though it renders no button at all.
+      const pageErrors: string[] = [];
+      page.on("pageerror", (error) => pageErrors.push(error.message));
+      await item.click();
+      await expect(page).toHaveURL(/\/projects$/);
+      expect(pageErrors).toEqual([]);
+    } finally {
+      deleteNotification(id);
+    }
+  });
 });
 
 /*
@@ -914,6 +999,67 @@ test.describe("top bar — notifications", () => {
  * per-page string, and that the one shared markup shape (nav[aria-label="Breadcrumb"], the current
  * page as a non-link with aria-current="page") is what's actually on the page.
  */
+/*
+ * "[UI] Header Scrolls with Page Instead of Remaining Fixed". TopBar.tsx has always set `sticky
+ * top-0` — it never regressed to `static` — but that only pins an element within whichever
+ * ancestor box is ACTUALLY the one scrolling. app/(app)/layout.tsx's shell used `min-h-screen` (a
+ * floor, not a cap) on the row holding the sidebar and `main`; once a page's content grew taller
+ * than one viewport, `main` — a plain `flex-1` box with no definite height of its own — stretched
+ * to fit that content instead of being clamped to the viewport, so its own `overflow-y-auto` never
+ * had anything to internally scroll and the *document* scrolled instead, carrying the sticky
+ * header away with it. `h-screen` on the shell caps it at exactly one viewport, which is what
+ * actually makes `main` (and the sticky header inside it) the thing that scrolls.
+ */
+test.describe("top bar — sticky positioning", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  test("TOPBAR-01 the header stays pinned to the top while long page content scrolls beneath it", async ({ page }) => {
+    const api = await screensApi();
+    let projectId: string | undefined;
+    try {
+      const project = await createProject(api);
+      projectId = project.id;
+      // Enough rows, at a short viewport, to reliably exceed one screen's worth of content — real
+      // feature data rather than an injected spacer, so this exercises the actual page.
+      for (let i = 0; i < 20; i += 1) {
+        await createBug(api, projectId, { title: `E2E Sticky Header Bug ${i} ${Date.now()}` });
+      }
+
+      await page.setViewportSize({ width: 1280, height: 600 });
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+
+      const header = page.locator("header").first();
+      await expect(header).toBeVisible();
+      const before = await header.boundingBox();
+      expect(before, "the header did not render").not.toBeNull();
+      expect(before!.y, "the header should start pinned to the very top").toBeLessThan(1);
+
+      // A real scroll gesture over the content, not a synthetic DOM change — the mouse has to be
+      // over the content area for the wheel event to target it rather than the sidebar.
+      await page.mouse.move(700, 400);
+      await page.mouse.wheel(0, 2000);
+
+      const scrolled = await page.evaluate(() => ({
+        mainScrollTop: document.querySelector("main")?.scrollTop ?? 0,
+        windowScrollY: window.scrollY,
+      }));
+      expect(
+        scrolled.mainScrollTop,
+        "the content area (main) should be what actually scrolled, not the document",
+      ).toBeGreaterThan(0);
+      expect(scrolled.windowScrollY, "the document itself should not have scrolled").toBe(0);
+
+      const after = await header.boundingBox();
+      expect(after, "the header disappeared from the DOM after scrolling").not.toBeNull();
+      expect(after!.y, "the header moved out of view instead of staying pinned to the top").toBeLessThan(1);
+    } finally {
+      if (projectId) await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+});
+
 test.describe("breadcrumbs", () => {
   test.skip(!!skipReason, skipReason ?? "");
 

@@ -38,6 +38,8 @@ export type RbacTenantKind =
   | "custom-fields"
   | "custom-field-values"
   | "custom-fields-ui"
+  | "custom-tags"
+  | "custom-tags-ui"
   | "reports"
   | "reports-ui"
   | "import-export"
@@ -97,7 +99,18 @@ export type RbacTenantKind =
   | "zyra-citations"
   // SSE progress narration (GET .../turns/:turnId/events). Its own tenant so a concurrent turn
   // from another spec never lands in this suite's session and confuses which stream is whose.
-  | "zyra-progress";
+  | "zyra-progress"
+  // Test-case semantic embeddings (testcase_embeddings, embedTexts, TESTCASE_SIMILARITY_THRESHOLD).
+  // Own tenant for the same reason as "kb-embeddings": these tests attach/detach workspace AI
+  // keys, and "zyra"/"ai-keys" assert on their own tenant's key set.
+  | "testcase-embeddings"
+  // Zyra task-board generation's knowledge-relevance ordering ("KB 1", "BUG 1", ...) — its own,
+  // genuinely-empty tenant for the same determinism reason as "zyra-citations".
+  | "zyra-relevance"
+  // The Jira/Linear ticket auto-comment after a Zyra save. Its own tenant because it toggles the
+  // project's auto-comment settings and seeds and disconnects workspace-level integration
+  // connections, both of which would change what other integration/Zyra suites see.
+  | "zyra-autocomment";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

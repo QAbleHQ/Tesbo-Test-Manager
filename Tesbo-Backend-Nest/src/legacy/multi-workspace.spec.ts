@@ -11,6 +11,7 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import type { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
@@ -81,7 +82,8 @@ function makeLegacy(db: DatabaseService): LegacyService {
     suitesCache,
     testcasesListCache,
     projectOverviewCache,
-    {} as unknown as CustomFieldsService
+    {} as unknown as CustomFieldsService,
+    {} as unknown as CustomTagsService
   );
 }
 
@@ -97,6 +99,20 @@ async function rejection(promise: Promise<unknown>): Promise<any> {
 
 const ORG_1 = { id: "org-1", name: "Acme Corp", slug: "acme-corp", role: "owner", created_at: "2024-01-01T00:00:00.000Z" };
 const ORG_2_AS_QA = { id: "org-2", name: "Beta Inc", slug: "beta-inc", role: "qa_engineer", created_at: "2024-06-01T00:00:00.000Z" };
+
+// removeWorkspaceMember/changeWorkspaceMemberRole validate targetUserId with isUuid() (see
+// legacy.service.ts) — these tests previously used human-readable placeholder ids ("target-user",
+// "ghost-user", ...), which meant every one of them was silently short-circuited by that guard
+// (BadRequestException "userId is not a valid user id") before ever reaching the behaviour it
+// claims to test. Real UUID-shaped ids here so each test exercises its actual assertion.
+const OWNER_USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
+const MANAGER_USER_ID = "aaaaaaaa-0000-0000-0000-000000000002";
+const TARGET_USER_ID = "aaaaaaaa-0000-0000-0000-000000000003";
+const GHOST_USER_ID = "aaaaaaaa-0000-0000-0000-000000000004";
+const SOLE_OWNER_USER_ID = "aaaaaaaa-0000-0000-0000-000000000005";
+const CO_OWNER_USER_ID = "aaaaaaaa-0000-0000-0000-000000000006";
+const OTHER_OWNER_USER_ID = "aaaaaaaa-0000-0000-0000-000000000007";
+const NOT_A_UUID = "not-a-uuid-at-all";
 
 describe("LegacyService — multi-workspace / organization switching", () => {
   describe("workspace() — resolving the active organization", () => {
@@ -247,15 +263,15 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2", rows: [] }
       ]);
       const svc = makeLegacy(db);
-      await svc.removeWorkspaceMember("owner-user", "target-user");
+      await svc.removeWorkspaceMember(OWNER_USER_ID, TARGET_USER_ID);
       const deleteCall = query.mock.calls.find((c) => String(c[0]).includes("DELETE FROM organization_members"));
-      expect(deleteCall![1]).toEqual(["org-1", "target-user"]);
+      expect(deleteCall![1]).toEqual(["org-1", TARGET_USER_ID]);
     });
 
     it("rejects a caller trying to remove themselves", async () => {
       const { db, query } = makeDb([activeOrgRoute(ORG_1)]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.removeWorkspaceMember("owner-user", "owner-user"));
+      const err = await rejection(svc.removeWorkspaceMember(OWNER_USER_ID, OWNER_USER_ID));
       expect(err).toBeInstanceOf(BadRequestException);
       expect(err.getResponse()).toEqual({ error: "You cannot remove yourself" });
       // Short-circuits before ever checking membership rows or deleting.
@@ -268,7 +284,7 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "om.role, u.email FROM organization_members om JOIN users u ON u.id = om.user_id", rows: [] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.removeWorkspaceMember("owner-user", "ghost-user"));
+      const err = await rejection(svc.removeWorkspaceMember(OWNER_USER_ID, GHOST_USER_ID));
       expect(err).toBeInstanceOf(NotFoundException);
       expect(err.getResponse()).toEqual({ error: "Member not found" });
     });
@@ -280,7 +296,7 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "SELECT COUNT(*) AS count FROM organization_members WHERE organization_id = $1 AND role = 'owner'", rows: [{ count: "1" }] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.removeWorkspaceMember("owner-user", "sole-owner-user"));
+      const err = await rejection(svc.removeWorkspaceMember(OWNER_USER_ID, SOLE_OWNER_USER_ID));
       expect(err).toBeInstanceOf(BadRequestException);
       expect(err.getResponse()).toEqual({ error: "Cannot remove the last owner" });
       expect(query.mock.calls.some((c) => String(c[0]).includes("DELETE FROM organization_members"))).toBe(false);
@@ -294,9 +310,9 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2", rows: [] }
       ]);
       const svc = makeLegacy(db);
-      await svc.removeWorkspaceMember("owner-user", "co-owner-user");
+      await svc.removeWorkspaceMember(OWNER_USER_ID, CO_OWNER_USER_ID);
       const deleteCall = query.mock.calls.find((c) => String(c[0]).includes("DELETE FROM organization_members"));
-      expect(deleteCall![1]).toEqual(["org-1", "co-owner-user"]);
+      expect(deleteCall![1]).toEqual(["org-1", CO_OWNER_USER_ID]);
     });
 
     it("forbids a non-owner (manager) from removing team members", async () => {
@@ -306,10 +322,19 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "SELECT COUNT(*) AS count FROM organization_members WHERE organization_id = $1 AND role = 'owner'", rows: [{ count: "1" }] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.removeWorkspaceMember("manager-user", "target-user"));
+      const err = await rejection(svc.removeWorkspaceMember(MANAGER_USER_ID, TARGET_USER_ID));
       expect(err).toBeInstanceOf(ForbiddenException);
       expect(err.getResponse()).toEqual({ error: "Only the owner can remove team members" });
       expect(query.mock.calls.some((c) => String(c[0]).includes("DELETE FROM organization_members"))).toBe(false);
+    });
+
+    it("rejects a malformed (non-UUID) target id with a 400, before any membership lookup — the one scenario the guard exists for", async () => {
+      const { db, query } = makeDb([activeOrgRoute(ORG_1)]);
+      const svc = makeLegacy(db);
+      const err = await rejection(svc.removeWorkspaceMember(OWNER_USER_ID, NOT_A_UUID));
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect(err.getResponse()).toEqual({ error: "userId is not a valid user id" });
+      expect(query.mock.calls.some((c) => String(c[0]).includes("om.role, u.email FROM organization_members"))).toBe(false);
     });
   });
 
@@ -321,15 +346,15 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "UPDATE organization_members SET role = $1 WHERE organization_id = $2 AND user_id = $3", rows: [] }
       ]);
       const svc = makeLegacy(db);
-      await svc.changeWorkspaceMemberRole("owner-user", "target-user", "manager");
+      await svc.changeWorkspaceMemberRole(OWNER_USER_ID, TARGET_USER_ID, "manager");
       const updateCall = query.mock.calls.find((c) => String(c[0]).includes("UPDATE organization_members SET role = $1"));
-      expect(updateCall![1]).toEqual(["manager", "org-1", "target-user"]);
+      expect(updateCall![1]).toEqual(["manager", "org-1", TARGET_USER_ID]);
     });
 
     it("forbids a non-owner from changing roles", async () => {
       const { db, query } = makeDb([activeOrgRoute({ ...ORG_1, role: "manager" })]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.changeWorkspaceMemberRole("manager-user", "target-user", "qa_engineer"));
+      const err = await rejection(svc.changeWorkspaceMemberRole(MANAGER_USER_ID, TARGET_USER_ID, "qa_engineer"));
       expect(err).toBeInstanceOf(ForbiddenException);
       expect(err.getResponse()).toEqual({ error: "Only the owner can change roles" });
       expect(query.mock.calls.some((c) => String(c[0]).includes("om.role, u.email FROM organization_members"))).toBe(false);
@@ -338,7 +363,7 @@ describe("LegacyService — multi-workspace / organization switching", () => {
     it("rejects the owner trying to change their own role", async () => {
       const { db } = makeDb([activeOrgRoute(ORG_1)]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.changeWorkspaceMemberRole("owner-user", "owner-user", "manager"));
+      const err = await rejection(svc.changeWorkspaceMemberRole(OWNER_USER_ID, OWNER_USER_ID, "manager"));
       expect(err).toBeInstanceOf(BadRequestException);
       expect(err.getResponse()).toEqual({ error: "You cannot change your own role" });
     });
@@ -349,7 +374,7 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "om.role, u.email FROM organization_members om JOIN users u ON u.id = om.user_id", rows: [] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.changeWorkspaceMemberRole("owner-user", "ghost-user", "manager"));
+      const err = await rejection(svc.changeWorkspaceMemberRole(OWNER_USER_ID, GHOST_USER_ID, "manager"));
       expect(err).toBeInstanceOf(NotFoundException);
       expect(err.getResponse()).toEqual({ error: "Member not found" });
     });
@@ -360,7 +385,7 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "om.role, u.email FROM organization_members om JOIN users u ON u.id = om.user_id", rows: [{ role: "owner" }] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.changeWorkspaceMemberRole("owner-user", "other-owner-user", "manager"));
+      const err = await rejection(svc.changeWorkspaceMemberRole(OWNER_USER_ID, OTHER_OWNER_USER_ID, "manager"));
       expect(err).toBeInstanceOf(ForbiddenException);
       expect(err.getResponse()).toEqual({ error: "Owner role cannot be changed" });
       expect(query.mock.calls.some((c) => String(c[0]).includes("UPDATE organization_members SET role"))).toBe(false);
@@ -372,10 +397,18 @@ describe("LegacyService — multi-workspace / organization switching", () => {
         { match: "om.role, u.email FROM organization_members om JOIN users u ON u.id = om.user_id", rows: [{ role: "qa_engineer" }] }
       ]);
       const svc = makeLegacy(db);
-      const err = await rejection(svc.changeWorkspaceMemberRole("owner-user", "target-user", "owner"));
+      const err = await rejection(svc.changeWorkspaceMemberRole(OWNER_USER_ID, TARGET_USER_ID, "owner"));
       expect(err).toBeInstanceOf(ForbiddenException);
       expect(err.getResponse()).toEqual({ error: "Cannot promote to owner" });
       expect(query.mock.calls.some((c) => String(c[0]).includes("UPDATE organization_members SET role"))).toBe(false);
+    });
+
+    it("rejects a malformed (non-UUID) target id with a 400, before any membership lookup — the one scenario the guard exists for", async () => {
+      const { db } = makeDb([activeOrgRoute(ORG_1)]);
+      const svc = makeLegacy(db);
+      const err = await rejection(svc.changeWorkspaceMemberRole(OWNER_USER_ID, NOT_A_UUID, "manager"));
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect(err.getResponse()).toEqual({ error: "userId is not a valid user id" });
     });
   });
 

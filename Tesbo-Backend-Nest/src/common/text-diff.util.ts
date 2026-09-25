@@ -68,6 +68,15 @@ function groupSections(content: string): Map<string, string> {
     buffer = [];
   };
 
+  // A heading and its body are usually pushed as separate `\n\n`-joined blocks (see the file
+  // comment), so `block` here is often just the heading line and this strips nothing but the
+  // whole match. But a caller can also glue a heading directly onto its body with a single `\n`
+  // (e.g. Zyra's AI Memory log entries, `## <timestamp>\n<note>` — see rememberZyraMemory), where
+  // this is what keeps that body out of the section's stored text: without it, the heading line
+  // itself becomes part of `text` below and shows up a second time, verbatim, next to the field's
+  // own `label` (already the heading's text) in the Change History diff.
+  const bodyAfterHeading = (block: string): string => block.replace(/^[^\n]*\n?/, "");
+
   for (const block of content.split("\n\n")) {
     const firstLine = (block.split("\n")[0] || "").trim();
     const titleHeading = firstLine.match(/^#\s+(.*)$/);
@@ -75,8 +84,9 @@ function groupSections(content: string): Map<string, string> {
 
     if (titleHeading) {
       flush();
+      const text = bodyAfterHeading(block) || titleHeading[1].trim();
       const existing = sections.get("Title");
-      sections.set("Title", existing ? `${existing}\n\n${block}` : block);
+      sections.set("Title", existing ? `${existing}\n\n${text}` : text);
       activeLabel = DETAILS_LABEL;
       continue;
     }
@@ -84,7 +94,8 @@ function groupSections(content: string): Map<string, string> {
       flush();
       const text = sectionHeading[1].trim();
       activeLabel = COMMENT_HEADING_RE.test(text) ? "Comments" : text || DETAILS_LABEL;
-      buffer = [block];
+      const rest = bodyAfterHeading(block);
+      buffer = rest ? [rest] : [];
       continue;
     }
     buffer.push(block);

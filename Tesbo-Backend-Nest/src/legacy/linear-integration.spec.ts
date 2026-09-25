@@ -12,6 +12,7 @@ import type { IntegrationSyncService } from "../integration-sync/integration-syn
 import type { ApiTokenService } from "../auth/api-token.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import type { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
@@ -107,7 +108,8 @@ function makeLegacy(db: DatabaseService, integrationSync: Partial<IntegrationSyn
     suitesCache,
     testcasesListCache,
     projectOverviewCache,
-    {} as unknown as CustomFieldsService
+    {} as unknown as CustomFieldsService,
+    {} as unknown as CustomTagsService
   );
 }
 
@@ -494,18 +496,47 @@ describe("LegacyService#integrationCallback", () => {
 });
 
 describe("LegacyService#linkedLinearKeys — issue-linking aggregate", () => {
+  // linkedLinearKeys(projectId, userId) runs requireProjectAccess(userId, projectId) first, which
+  // needs (a) a real userId — requireUser() throws "Authentication required" on a missing one —
+  // and (b) a UUID-shaped projectId — isUuid() throws "Project not found" otherwise (see
+  // legacy.service.ts). The tests below previously called linkedLinearKeys("proj-1") with no
+  // userId at all, so every one of them failed at requireUser() before ever reaching the
+  // aggregation query this describe block is meant to test.
+  const PROJECT_ID = "11111111-1111-1111-1111-111111111111";
+  const USER_ID = "22222222-2222-2222-2222-222222222222";
+  const ORG_ID = "org-1";
+
+  /** requireProjectAccess's own two lookups: the caller's workspace, then project membership. */
+  function projectAccessRoutes(): Route[] {
+    return [
+      workspaceRoute("qa_engineer", ORG_ID),
+      { match: "JOIN project_members pm ON pm.project_id = p.id", rows: [{ id: PROJECT_ID, organization_id: ORG_ID, caller_role: "qa_engineer" }] }
+    ];
+  }
+
   it("aggregates linked Linear issue keys and their testcase counts", async () => {
-    const { db, calls } = makeDb([{ match: "FROM testcases WHERE project_id", rows: [{ linear_issue_key: "ENG-1", count: 3 }, { linear_issue_key: "ENG-2", count: 1 }] }]);
+    const { db, calls } = makeDb([
+      ...projectAccessRoutes(),
+      { match: "FROM testcases WHERE project_id", rows: [{ linear_issue_key: "ENG-1", count: 3 }, { linear_issue_key: "ENG-2", count: 1 }] }
+    ]);
     const svc = makeLegacy(db);
-    const res = await svc.linkedLinearKeys("proj-1");
-    expect(res).toEqual({ keys: ["ENG-1", "ENG-2"], counts: { "ENG-1": 3, "ENG-2": 1 } });
-    expect(calls[0].params).toEqual(["proj-1"]);
+    const res = await svc.linkedLinearKeys(PROJECT_ID, USER_ID);
+    expect(res).toEqual({ keys: ["ENG-1", "ENG-2"], counts: { "ENG-1": 3, "ENG-2": 1 }, tasks: {} });
+    const aggregateCall = calls.find((c) => c.sql.includes("FROM testcases WHERE project_id"));
+    expect(aggregateCall!.params).toEqual([PROJECT_ID]);
   });
 
   it("returns empty keys/counts when no testcase links a Linear issue", async () => {
-    const { db } = makeDb([{ match: "FROM testcases WHERE project_id", rows: [] }]);
+    const { db } = makeDb([...projectAccessRoutes(), { match: "FROM testcases WHERE project_id", rows: [] }]);
     const svc = makeLegacy(db);
-    expect(await svc.linkedLinearKeys("proj-1")).toEqual({ keys: [], counts: {} });
+    expect(await svc.linkedLinearKeys(PROJECT_ID, USER_ID)).toEqual({ keys: [], counts: {}, tasks: {} });
+  });
+
+  it("404s when the project id is not a valid UUID — never reaches the aggregation query", async () => {
+    const { db, calls } = makeDb([...projectAccessRoutes(), { match: "FROM testcases WHERE project_id", rows: [] }]);
+    const err = await rejection(makeLegacy(db).linkedLinearKeys("not-a-uuid-at-all", USER_ID));
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(calls.some((c) => c.sql.includes("FROM testcases WHERE project_id"))).toBe(false);
   });
 });
 
@@ -683,59 +714,25 @@ describe("LegacyService#integrationDisconnect", () => {
     expect(updateCall!.params).toEqual(["org-1", "jira"]);
   });
 
-  // Regression: the "Jira"/"Linear" Knowledge Base folder ensureProviderFolder creates
-  // (integration-sync.service.ts) used to be left completely untouched by disconnect — fully
-  // visible and populated, as if the integration were still connected. It's now found (by
-  // source_provider, scoped to the whole organization — not just the currently-mapped project) and
-  // soft-deleted in the same transaction, tagged so restoreKnowledgeFolder can refuse to bring it
-  // back. See e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof against a
-  // real database; this pins the query shape and the never-a-DELETE guarantee at the unit level.
-  it("soft-deletes the provider's Knowledge Base folder as part of the same disconnect, tagged non-restorable", async () => {
-    const { db, calls } = makeDb([
-      workspaceRoute("owner"),
-      {
-        match: "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id",
-        rows: [{ id: "folder-1", project_id: "proj-1", name: "Jira" }]
-      }
-    ]);
+  // Regression: disconnect used to find the "Jira"/"Linear" Knowledge Base folder
+  // ensureProviderFolder creates (integration-sync.service.ts) — by source_provider, scoped to the
+  // whole organization — and soft-delete it and its documents in the same transaction, tagged so
+  // restoreKnowledgeFolder would refuse to bring it back. That made every ticket a workspace had
+  // ever imported disappear from the Knowledge Base the moment the integration was disconnected.
+  // Disconnect is now purely a credentials/mapping state flip: it must never look up, touch, or
+  // soft-delete anything under knowledge_folders/knowledge_documents. See
+  // e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof against a real database.
+  it("never queries or touches knowledge_folders or knowledge_documents", async () => {
+    const { db, calls } = makeDb([workspaceRoute("owner")]);
     const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
     const res = await svc.integrationDisconnect("user-1", "jira");
     expect(res).toEqual({ disconnected: true });
 
-    const folderLookup = calls.find((c) => c.sql.includes("SELECT id, project_id, name FROM knowledge_folders WHERE organization_id"));
-    expect(folderLookup!.params).toEqual(["org-1", "jira"]);
-    expect(folderLookup!.sql).toMatch(/AND\s+source_provider\s*=\s*\$2\s+AND\s+is_deleted\s*=\s*false/);
-
-    const folderUpdate = calls.find((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true"));
-    // the found folder must be soft-deleted, never hard-deleted
-    expect(folderUpdate).toBeDefined();
-    // folderIds is bound as a Postgres array (= ANY($1::uuid[])) so several provider folders across
-    // several projects can be cascaded in one set-based pass — see cascadeSoftDeleteFolderTree.
-    expect(folderUpdate!.params).toEqual([["folder-1"], "user-1", "integration_disconnect"]);
+    expect(calls.some((c) => /knowledge_folders|knowledge_documents/i.test(c.sql))).toBe(false);
     expect(calls.some((c) => c.sql.trim().toUpperCase().startsWith("DELETE"))).toBe(false);
   });
 
-  it("cascades every affected folder across every project in one set-based pass, not one round-trip per folder", async () => {
-    const { db, calls } = makeDb([
-      workspaceRoute("owner"),
-      {
-        match: "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id",
-        rows: [
-          { id: "folder-1", project_id: "proj-1", name: "Jira" },
-          { id: "folder-2", project_id: "proj-2", name: "Jira" }
-        ]
-      }
-    ]);
-    const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
-    await svc.integrationDisconnect("user-1", "jira");
-
-    const folderUpdate = calls.find((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true"));
-    expect(folderUpdate!.params[0]).toEqual(["folder-1", "folder-2"]);
-    // Exactly one soft-delete UPDATE for the whole batch, not one per folder.
-    expect(calls.filter((c) => c.sql.includes("UPDATE knowledge_folders SET is_deleted = true")).length).toBe(1);
-  });
-
-  it("is a safe no-op when there is no provider folder to clean up", async () => {
+  it("is a safe no-op regardless of what Knowledge Base folders exist for this provider", async () => {
     const { db } = makeDb([workspaceRoute("owner")]);
     const svc = makeLegacy(db, { failActiveRunsForConnection: jest.fn().mockResolvedValue(undefined) });
     await expect(svc.integrationDisconnect("user-1", "linear")).resolves.toEqual({ disconnected: true });

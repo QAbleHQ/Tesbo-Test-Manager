@@ -6,7 +6,7 @@ import { getKnowledgeDocumentHistory, type KnowledgeDocumentHistoryEntry } from 
 import { ChangeDiffModal } from "./ChangeDiffModal";
 
 /**
- * The Change History timeline for one Knowledge Base document — shared between the knowledge-base
+ * The Update History timeline for one Knowledge Base document — shared between the knowledge-base
  * list's info-icon popover (ChangeHistoryTrigger, knowledge-base/page.tsx) and the document detail
  * page's "History" modal (documents/[documentId]/page.tsx). Renders the same shape for a synced
  * Jira/Linear mirror (the sync pipeline's own log) and a manually-created document (synthesized
@@ -20,14 +20,16 @@ export const CHANGE_HISTORY_PAGE_SIZE = 5;
 const LARGE_CHANGE_THRESHOLD = 160;
 
 // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — a fixed format, deliberately not locale-dependent.
-function formatEventDate(value: string): string {
+// Exported for ChangeDiffModal, which formats the same way wherever a diff's own field label is
+// a raw timestamp (a Zyra AI Memory entry's heading — see formatFieldLabel there).
+export function formatEventDate(value: string): string {
   const date = new Date(value);
   const dd = String(date.getDate()).padStart(2, "0");
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   return `${dd}/${mm}/${date.getFullYear()}`;
 }
 
-function formatEventTime(value: string): string {
+export function formatEventTime(value: string): string {
   const date = new Date(value);
   const hours24 = date.getHours();
   const period = hours24 >= 12 ? "PM" : "AM";
@@ -35,6 +37,20 @@ function formatEventTime(value: string): string {
   const mm = String(date.getMinutes()).padStart(2, "0");
   const ss = String(date.getSeconds()).padStart(2, "0");
   return `${String(hours12).padStart(2, "0")}:${mm}:${ss} ${period}`;
+}
+
+// A Zyra AI Memory document's changedSummary can itself be (or contain) a raw section-heading
+// timestamp — groupSections (text-diff.util.ts) labels those sections by their own `## <ISO
+// timestamp>` heading verbatim, and that label flows straight into the "X updated." sentence
+// backend-side. Rows written before this existed also have the raw string already cached in
+// changed_summary, so the fix has to happen here at render time (covers old and new rows alike)
+// rather than in the summary-generation code, which only reaches future writes. Same target shape
+// and same DD/MM/YYYY, hh:mm:ss AM/PM output as formatFieldLabel in ChangeDiffModal, which does the
+// equivalent job for an individual field's label.
+const ISO_TIMESTAMP_IN_TEXT_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
+
+export function formatIsoTimestampsInText(text: string): string {
+  return text.replace(ISO_TIMESTAMP_IN_TEXT_RE, (match) => `${formatEventDate(match)}, ${formatEventTime(match)}`);
 }
 
 function isLargeChange(entry: KnowledgeDocumentHistoryEntry): boolean {
@@ -54,7 +70,7 @@ export function ChangeHistoryList({
   projectId: string;
   documentId: string;
   /** The popover has no surrounding chrome of its own and needs its own heading; a Modal usage
-   *  already renders "Change history" in its title bar, so that caller passes false. */
+   *  already renders "Update History" in its title bar, so that caller passes false. */
   showHeading?: boolean;
   /** Only a manual document's version-diff entries carry a versionId to restore — the button never
    *  renders on any other row, so it's safe to always pass this (as the detail page's History
@@ -62,7 +78,7 @@ export function ChangeHistoryList({
   onRestoreVersion?: (entry: KnowledgeDocumentHistoryEntry) => void;
   /** Disables every row's Restore button while one restore is in flight. */
   restoringVersionId?: string | null;
-  /** Fires the instant a "Check Difference" click opens ChangeDiffModal, and again when it closes.
+  /** Fires the instant a "View Details" click opens ChangeDiffModal, and again when it closes.
    *  ChangeDiffModal is a React child of this component, not of whatever renders it — a caller that
    *  can auto-close itself (ChangeHistoryTrigger's hover popover) must know a diff is showing so it
    *  doesn't tear this whole subtree down (and the diff modal with it) out from under the user; see
@@ -154,22 +170,22 @@ export function ChangeHistoryList({
   return (
     <div>
       {showHeading && (
-        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Change history</div>
+        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">Update History</div>
       )}
       {state.loading ? (
         <div className="py-2 text-[12px] text-[var(--muted)]">Loading…</div>
       ) : state.error ? (
-        <div className="py-2 text-[12px] text-[var(--error-foreground)]">Couldn&apos;t load change history.</div>
+        <div className="py-2 text-[12px] text-[var(--error-foreground)]">Couldn&apos;t load update history.</div>
       ) : state.events.length === 0 ? (
         <div className="py-2 text-[12px] text-[var(--muted)]">
-          {page === 0 ? "No change history recorded yet." : "No more changes."}
+          {page === 0 ? "No update history recorded yet." : "No more changes."}
         </div>
       ) : (
-        <ul className="max-h-80 space-y-2 overflow-y-auto">
+        <ul className="max-h-80 space-y-3 overflow-y-auto">
           {state.events.map((event) => {
             const large = isLargeChange(event);
             return (
-              <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-1.5">
+              <li key={event.id} className="rounded-[6px] border border-[var(--border-subtle)] bg-[var(--surface-secondary)]/50 px-2.5 py-2">
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 truncate text-[12px] font-medium text-[var(--foreground)]" title={`by ${event.actorName}`}>
                     {event.eventType === "created" ? "Added" : "Updated"}
@@ -197,9 +213,9 @@ export function ChangeHistoryList({
                   </span>
                 </div>
                 {event.changedSummary && (
-                  <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--muted)]">
-                    <span className="min-w-0 flex-1 truncate" title={event.changedSummary}>
-                      {event.changedSummary}
+                  <div className="mt-1.5 flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                    <span className="min-w-0 flex-1 truncate" title={formatIsoTimestampsInText(event.changedSummary)}>
+                      {formatIsoTimestampsInText(event.changedSummary)}
                     </span>
                     {large && (
                       <button
@@ -210,7 +226,7 @@ export function ChangeHistoryList({
                         }}
                         className="shrink-0 font-medium text-[var(--accent-light)] hover:underline"
                       >
-                        Check Difference
+                        View Details
                       </button>
                     )}
                   </div>

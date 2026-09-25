@@ -464,7 +464,7 @@ export class CustomFieldsService {
       `SELECT d.id, d.key, d.name, d.description, d.field_type, d.status, d.required, d.config, d.display_order, v.value
        FROM custom_field_definitions d
        LEFT JOIN custom_field_values v ON v.definition_id = d.id AND v.testcase_id = $2
-       WHERE d.project_id = $1 AND (d.status <> 'archived' OR v.id IS NOT NULL) AND (d.deleted_at IS NULL OR v.id IS NOT NULL)
+       WHERE d.project_id = $1 AND d.status = 'active' AND (d.deleted_at IS NULL OR v.id IS NOT NULL)
        ORDER BY d.display_order`,
       [projectId, testcaseId]
     );

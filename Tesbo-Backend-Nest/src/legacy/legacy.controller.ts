@@ -5,7 +5,6 @@ import {
   Delete,
   Get,
   MessageEvent,
-  NotFoundException,
   NotImplementedException,
   Param,
   Patch,
@@ -34,6 +33,8 @@ const TESTCASE_EXPORT_BASE_HEADERS = [
   "description",
   "preconditions",
   "steps",
+  "action",
+  "expectedResult",
   "testData",
   "priority",
   "severity",
@@ -899,9 +900,14 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/testcases/export/csv")
-  async exportCsv(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Res() res: Response) {
+  async exportCsv(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
-    const rows = await this.legacy.exportTestCases(projectId, definitions);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", 'attachment; filename="testcases.csv"');
@@ -909,9 +915,14 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/testcases/export/xlsx")
-  async exportXlsx(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Res() res: Response) {
+  async exportXlsx(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
-    const rows = await this.legacy.exportTestCases(projectId, definitions);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
     const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
     await this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
   }
@@ -940,6 +951,14 @@ export class LegacyController {
       // "action => expected result" per step, separated by " | " — the expected result after
       // "=>" is optional but importing it this way carries it into each step's Expected Result.
       steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
+      // The Map Columns screen also offers a plain Action/Expected Result pair for a file with one
+      // step per row instead of the "=>"/"|" DSL above (see ImportTestCasesModal.tsx's handleImport).
+      // Populated here so those two fields auto-map instead of showing "-- Skip --" out of the box;
+      // mirrors the DSL's first step so both examples agree. Steps stays mapped in this same file, so
+      // on import it still wins over these two exactly as it always has — this pair only matters once
+      // Steps itself is left unmapped.
+      action: "Open login page",
+      expectedResult: "Login form is displayed",
       testData: "user@example.com",
       priority: "P2",
       severity: "Medium",
@@ -1332,13 +1351,29 @@ export class LegacyController {
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")
-  continueZyraChatMessage(
+  async continueZyraChatMessage(
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Param("sessionId") sessionId: string,
-    @Param("messageId") messageId: string
+    @Param("messageId") messageId: string,
+    @Body() body: Record<string, any>
   ) {
-    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId);
+    // Same optional, purely-additive turnId contract as sendZyraChatMessage above — a caller that
+    // omits it gets exactly today's fire-and-forget behavior with no progress narration. The one
+    // difference from sendZyraChatMessage: this route no longer awaits the underlying work before
+    // responding (see continueZyraChatMessage's own doc comment for why), so complete()/
+    // completeWithError() can't be called here after an await — they're wired in as onSettled and
+    // fired from inside the background resume itself once it actually finishes.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    const onStage = turnId ? this.zyraProgress.stageEmitter(turnId, { projectId, sessionId, userId: req.userId || "" }) : undefined;
+    const onSettled = turnId
+      ? (result: { ok: true; payload: unknown } | { ok: false; message: string }) =>
+          result.ok ? this.zyraProgress.complete(turnId, result.payload) : this.zyraProgress.completeWithError(turnId, result.message)
+      : undefined;
+    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId, onStage, onSettled, Boolean(body?.narrow));
   }
 
   @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/stop-plan")
@@ -1408,6 +1443,21 @@ export class LegacyController {
   @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/save")
   saveZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string, @Body() body: Record<string, any>) {
     return this.legacy.zyraSave(projectId, req.userId, taskId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments")
+  zyraTaskTicketComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
+    return this.legacy.zyraTaskTicketComments(projectId, req.userId, taskId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments/:commentId/retry")
+  retryZyraTicketComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.zyraRetryTicketComment(projectId, req.userId, taskId, commentId);
   }
 
   // ─── Knowledge Base v2 (folders / documents / files) ────────────────────────
@@ -1879,25 +1929,18 @@ export class LegacyController {
     return this.legacy.workspaceActivitySummaryForUser(req.userId);
   }
 
-  /*
-   * Notifications are not implemented yet — there is no table behind them, so the list is empty and
-   * there is nothing to mark read. Both routes still take the caller: they previously took none at
-   * all, which meant "your notifications" was answerable without knowing who was asking, and
-   * mark-as-read reported success for any id to anybody.
-   *
-   * The empty list is a missing feature, recorded in docs/e2e-coverage-waves.md. The 404 below is the
-   * honest answer while it stays missing: no such notification exists.
-   */
+  // Real as of the archive sweep's notification work: `notifications` (V6) previously had no writer
+  // anywhere in this codebase, so both routes were honest stubs (empty list, always-404 read) rather
+  // than faking success — see LegacyService.notifyProjectMembers' own comment for the full history.
   @Get("/api/notifications")
   async notifications(@Req() req: AuthenticatedRequest) {
-    await this.legacy.requireSession(req.userId);
-    return [];
+    return this.legacy.notificationsForUser(req.userId);
   }
 
   @Post("/api/notifications/:id/read")
   async readNotification(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
-    await this.legacy.requireSession(req.userId);
-    throw new NotFoundException({ error: "Notification not found" });
+    await this.legacy.markNotificationRead(req.userId, id);
+    return { ok: true };
   }
 
   @Get("/api/admin/customers")

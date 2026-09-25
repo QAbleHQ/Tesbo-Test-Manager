@@ -231,10 +231,12 @@ test.describe("zyra / agents (UI)", () => {
 
   interface ChatEntry {
     opType: "create" | "update" | "archive";
-    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null };
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
     testcaseId?: string;
     externalId?: string;
     fields?: Record<string, unknown>;
+    /** Mirrors ZyraChatTestcaseRow.sourceRefs — what ZyraCitationsList/ZyraContextDrawer read. */
+    sourceRefs?: Array<{ type: string; id: string; title: string }>;
   }
 
   /**
@@ -289,10 +291,15 @@ test.describe("zyra / agents (UI)", () => {
       preconditions: entry.draft?.preconditions ?? "",
       expectedSummary: entry.draft?.description ?? "",
       stepsJson: entry.draft?.stepsJson ?? "[]",
+      // Mirrors chatDraftRow's own severity/component handling (legacy.service.ts) — this row is
+      // seeded directly rather than produced by the live endpoint, so it must match that shape.
+      severity: entry.draft?.severity ?? entry.fields?.severity ?? null,
+      component: entry.draft?.component ?? entry.fields?.component ?? null,
       action: entry.opType === "create" ? "proposed-create" : entry.opType === "archive" ? "proposed-archive" : "proposed-update",
       reason: "",
       draftIndex: index,
       reviewRequestId: taskId,
+      sourceRefs: entry.sourceRefs ?? [],
     }));
     exec(
       "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
@@ -730,6 +737,64 @@ test.describe("zyra / agents (UI)", () => {
     expect(state.settings.testcaseRange, "the choice is persisted, not just rendered").toBe("10-30");
   });
 
+  test("ZYU-07b the test-cases-per-task options render in the new order with no Minimum tier", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    const page = await open(browser, "/agents/zyra/settings");
+
+    // aria-pressed is unique to the four range cards (Toggle switches use role="switch", every
+    // other on-page button has no aria-pressed at all), so this locator is exactly the range row
+    // in DOM order — which is also render order, so this doubles as the ordering assertion.
+    const rangeButtons = page.locator("button[aria-pressed]");
+    await expect(rangeButtons).toHaveCount(4);
+    await expect(rangeButtons.nth(0)).toContainText("1–10");
+    await expect(rangeButtons.nth(1)).toContainText("10–30");
+    await expect(rangeButtons.nth(2)).toContainText("30–50");
+    await expect(rangeButtons.nth(3)).toContainText("All");
+
+    // "Removed entirely" means the card, the label and the value are all gone, not just hidden.
+    await expect(page.getByRole("button", { name: /Minimum/ })).toHaveCount(0);
+    await expect(page.getByText("1–3", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-07c a project that has never saved this setting defaults to 30–50 Extensive", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    // purgeZyra() strips the zyraAgent settings key after every test in this file (see the
+    // afterEach above), so this project genuinely has no saved testcaseRange at this point.
+    const page = await open(browser, "/agents/zyra/settings");
+
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /1–10 Focused/ })).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: /All Exhaustive/ })).toHaveAttribute("aria-pressed", "false");
+
+    const state = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra`)).json();
+    expect(state.settings.testcaseRange, "a project that never saved this setting defaults to 30-50").toBe("30-50");
+  });
+
+  test("ZYU-07d selecting 30-50 persists across a reload, and Reset to defaults returns to 30-50", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+    const page = await open(browser, "/agents/zyra/settings");
+
+    // Move off the default first, so the save below is a real, observable change.
+    await page.getByRole("button", { name: /10–30 Broad/ }).click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+    await page.reload();
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "true");
+
+    await page.getByRole("button", { name: /30–50 Extensive/ }).click();
+    await page.getByRole("button", { name: "Save settings" }).click();
+    await page.reload();
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "false");
+
+    const state = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra`)).json();
+    expect(state.settings.testcaseRange, "the choice is persisted, not just rendered").toBe("30-50");
+
+    // Reset to defaults is a local (unsaved) selection change — pick a different card first so the
+    // click is a real, observable move back to the default rather than a no-op.
+    await page.getByRole("button", { name: /10–30 Broad/ }).click();
+    await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "true");
+    await page.getByRole("button", { name: "Reset to defaults" }).click();
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+  });
+
   test("ZYU-08 reset to defaults puts every capability back on", { tag: '@tesbo.testId("TES-TC-1093")' }, async ({ browser }) => {
     const page = await open(browser, "/agents/zyra/settings");
 
@@ -1038,6 +1103,129 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("button", { name: "Sources (1)" })).toBeVisible();
   });
 
+  /*
+   * ZYU-77/78/79: technique badges (TechniqueBadges, shared by TaskQuickViewPanel and this same
+   * [taskId] page — see ZYRA_IMPLEMENTATION_LOG.md's "surface techniques to human reviewers"
+   * entry). generated_payload is rendered verbatim (formatAiTask), so seeding a draft's
+   * `techniques` field directly controls what a reviewer actually sees here — no live model call
+   * needed, same boundary every other test in this file draws.
+   */
+  test("ZYU-77 a single technique renders as one badge", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{ title: "Reject usernames over 64 characters", priority: "P2", preconditions: "", steps: [], techniques: ["boundary_value_analysis"] }],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByText("Boundary Value Analysis", { exact: true })).toBeVisible();
+  });
+
+  test("ZYU-78 multiple techniques on one case each render their own badge", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{
+        title: "Archive a case whose linked ticket just closed",
+        priority: "P2",
+        preconditions: "",
+        steps: [],
+        techniques: ["state_testing", "error_guessing", "security_perspective"],
+      }],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByText("State Testing", { exact: true })).toBeVisible();
+    await expect(page.getByText("Error Guessing", { exact: true })).toBeVisible();
+    await expect(page.getByText("Security Perspective", { exact: true })).toBeVisible();
+  });
+
+  test("ZYU-79 the general fallback and a missing techniques field both render no badge at all, not a meaningless 'General' pill", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [
+        { title: "Case tagged only general", priority: "P2", preconditions: "", steps: [], techniques: ["general"] },
+        { title: "Case with no techniques field", priority: "P2", preconditions: "", steps: [] }, // older-shaped draft
+      ],
+    });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    await expect(page.getByRole("cell", { name: "Case tagged only general" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "Case with no techniques field" })).toBeVisible();
+    // Every real technique label, checked absent rather than just "no visible badge row" — proves
+    // this isn't merely mis-styled but genuinely renders nothing for either case.
+    for (const label of ["Equivalence Partitioning", "Boundary Value Analysis", "Decision Table", "State Testing", "Use Case Testing", "Pairwise Testing", "Error Guessing", "Security Perspective", "General", "general"]) {
+      await expect(page.getByText(label, { exact: true })).toHaveCount(0);
+    }
+  });
+
+  // ─── Ticket comments panel (auto-comment outcome + Retry) ─────────────────
+
+  /**
+   * One integration_ticket_comments row for a task, as a save would have left it — seeded directly,
+   * since producing a real 'failed' or 'posted' outcome needs a live Jira (see api/zyra.spec.ts's
+   * "ticket auto-comment" block, which drives the real save path). The comment lists one real test
+   * case, so a Retry has something to rebuild.
+   */
+  async function seedTicketComment(taskId: string, fields: { status: string; reason?: string | null; issueKey?: string }): Promise<string> {
+    const created = await api.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: stamp("Commented case") },
+      failOnStatusCode: false,
+    });
+    expect(created.status()).toBe(201);
+    const testcase = await created.json();
+    const issueKey = fields.issueKey ?? "KAN-4";
+    const text = `**Generated by Tesbo Test Manager**\n\n**Added (1)**\n- [${testcase.externalId}](http://localhost/projects/${tenant!.mainProjectId}/testcases/${testcase.id}) — ${testcase.title}`;
+    exec(
+      "INSERT INTO integration_ticket_comments (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, reason) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(taskId)}, gen_random_uuid(), 'jira', ${literal(issueKey)}, ` +
+        `${literal(JSON.stringify([testcase.id]))}::jsonb, ${literal(fields.status)}, ${literal(text)}, ` +
+        `${fields.reason ? literal(fields.reason) : "NULL"});`,
+    );
+    return scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)} AND issue_key = ${literal(issueKey)};`);
+  }
+
+  test("ZYU-TC-01 a task with no ticket comments shows no Ticket comments panel", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(page.getByRole("button", { name: "Generated Testcases (2)" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Ticket comments" })).toHaveCount(0);
+  });
+
+  test("ZYU-TC-02 each outcome is labelled, and only a failed comment offers Retry", async ({ browser }) => {
+    const taskId = seedTask({ status: "done" });
+    await seedTicketComment(taskId, { status: "posted", issueKey: "KAN-1" });
+    await seedTicketComment(taskId, { status: "skipped_disabled", issueKey: "KAN-2" });
+    await seedTicketComment(taskId, { status: "failed", issueKey: "KAN-3", reason: "Jira refused the comment (403) — no permission." });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await expect(page.getByRole("heading", { name: "Ticket comments" })).toBeVisible();
+    const row = (key: string) => page.getByRole("listitem").filter({ hasText: `Jira ${key}` });
+    await expect(row("KAN-1").getByText("Posted", { exact: true })).toBeVisible();
+    await expect(row("KAN-2").getByText("Not posted — auto-comment off")).toBeVisible();
+    await expect(row("KAN-3").getByText("Failed", { exact: true })).toBeVisible();
+    await expect(row("KAN-3").getByText("Jira refused the comment (403) — no permission.")).toBeVisible();
+
+    await expect(page.getByRole("button", { name: "Retry comment" })).toHaveCount(1);
+    await expect(row("KAN-3").getByRole("button", { name: "Retry comment" })).toBeVisible();
+  });
+
+  test("ZYU-TC-03 Retry re-sends the comment and shows the new outcome (Jira not connected: fails with that reason)", async ({ browser }) => {
+    const taskId = seedTask({ status: "done" });
+    const commentId = await seedTicketComment(taskId, { status: "failed", reason: "An older failure" });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Retry comment" }).click();
+
+    // This tenant has no Jira connection, so the re-send fails before any outbound call. The page
+    // reports it, and the row now carries the new reason instead of the old one.
+    await expect(page.getByText(/Comment still couldn't be posted on Jira KAN-4: Jira is not connected\./)).toBeVisible();
+    const row = page.getByRole("listitem").filter({ hasText: "Jira KAN-4" });
+    await expect(row.getByText("Jira is not connected.", { exact: true })).toBeVisible();
+    await expect(row.getByText("An older failure")).toHaveCount(0);
+    await expect(row.getByRole("button", { name: "Retry comment" })).toBeEnabled();
+
+    // Persisted, not just displayed.
+    expect(scalar(`SELECT status || '|' || reason FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe(
+      "failed|Jira is not connected.",
+    );
+  });
+
   test("ZYU-13 selection drives the bulk actions", { tag: '@tesbo.testId("TES-TC-1098")' }, async ({ browser }) => {
     const taskId = seedTask();
     const page = await open(browser, `/agents/tasks/${taskId}`);
@@ -1085,6 +1273,42 @@ test.describe("zyra / agents (UI)", () => {
         { message: "the saved draft lands in the named suite as a test case" },
       )
       .toBe(1);
+  });
+
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — drives the actual Save
+   * button (not the API directly, see api/zyra.spec.ts ZYR-A-71..74 for that half) to prove the
+   * browser's own save action forwards a draft's severity/component through to the real row, the
+   * same way ZYU-14 proves it for suite placement.
+   */
+  test("ZYU-80 saving a draft with severity and component persists both onto the real test case", async ({ browser }) => {
+    const taskId = seedTask({
+      drafts: [{ title: "Sign in with a valid password", priority: "P1", severity: "High", component: "Auth", preconditions: "", steps: [] }],
+    });
+    const suiteName = stamp("Suite");
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    // The actual display bug this ticket was about: severity/component must be visible on the
+    // review table BEFORE saving, not just present in the row that eventually gets persisted —
+    // this is what a reviewer is deciding whether to approve.
+    const draftRow = page.getByRole("row", { name: /Sign in with a valid password/ });
+    await expect(draftRow.getByText("High")).toBeVisible();
+    await expect(draftRow.getByText("Auth")).toBeVisible();
+
+    await draftRow.getByRole("button", { name: "Save" }).click();
+
+    const dialog = modal(page, "Save generated testcases");
+    await dialog.getByRole("combobox").first().selectOption("new");
+    await dialog.getByRole("textbox").last().fill(suiteName);
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    await expect
+      .poll(
+        () => scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`),
+        { message: "the draft's severity must reach the saved row, not just the review table" },
+      )
+      .toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`)).toBe("Auth");
   });
 
   test("ZYU-15 deleting a draft removes it from the task and leaves the rest", { tag: '@tesbo.testId("TES-TC-1100")' }, async ({ browser }) => {
@@ -1734,6 +1958,71 @@ test.describe("zyra / agents (UI)", () => {
     expect(patchAttempts, "still only one retry, not an unbounded loop").toBe(2);
   });
 
+  // ─── Continue / resume (the misleading "Resuming…" hang fix) ───────────────
+  // Same "arrange through Postgres" rule as seedChatReviewBatch below — actually reaching a
+  // timed-out or in-flight resume through the live route needs a provider call that genuinely
+  // stalls, which this suite deliberately never drives (file header).
+  function seedResumeMessage(status: "timed_out" | "resuming", options: { resumeAttempt?: number } = {}): { sessionId: string; messageId: string } {
+    const t = tenant!;
+    exec(`INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES (${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E resume session');`);
+    const sessionId = scalar(`SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+    const checkpoint = JSON.stringify({
+      stage: "generate", userMessageId: "", message: "Write me some test cases",
+      routedSuite: null, routedCount: { requestedCount: 10, exhaustive: false },
+    });
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, resume_checkpoint, resume_attempt) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
+        `'⏱️ I did not hear back from the AI provider in time.', ${literal(status)}, ${literal(checkpoint)}::jsonb, ${options.resumeAttempt ?? 0});`,
+    );
+    const messageId = scalar(`SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    return { sessionId, messageId };
+  }
+
+  test("ZYU-90 a message already 'resuming' on page load shows a working indicator immediately, with elapsed time ticking", async ({ browser }) => {
+    // Loading the page with status already 'resuming' is exactly what a reload mid-Continue looks
+    // like (no client-side turnId survives a reload) — this is that gap the fix closes: previously
+    // nothing rendered at all for this status.
+    seedResumeMessage("resuming");
+    const page = await open(browser, "/agents/zyra");
+
+    // Case-insensitive: the redesigned backlog uses a lowercase, log-style "zyra is working on
+    // this" line rather than sentence-cased prose.
+    await expect(page.getByText(/zyra is working on this/i)).toBeVisible();
+    // The old static, disabled "Resuming…" button no longer exists in any form.
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
+    await expect(page.getByText(/Resuming…/)).toHaveCount(0);
+
+    const elapsedText = page.getByText(/\d+s elapsed/);
+    await expect(elapsedText).toBeVisible();
+    const first = Number((await elapsedText.textContent())?.match(/(\d+)s elapsed/)?.[1] ?? "0");
+    await page.waitForTimeout(2500);
+    const second = Number((await elapsedText.textContent())?.match(/(\d+)s elapsed/)?.[1] ?? "0");
+    expect(second, "the elapsed counter must actually advance — a frozen number is the exact misleading UX this fix replaces").toBeGreaterThan(first);
+  });
+
+  test("ZYU-91 after repeated timeouts, Continue is replaced by a narrowed-batch suggestion with an escape hatch back to full size", async ({ browser }) => {
+    seedResumeMessage("timed_out", { resumeAttempt: 2 });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/timed out 3 times in a row/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Continue with a smaller batch (5 cases)" })).toBeVisible();
+    // The identical-size Continue is gone once the cap is hit — offering it again would just repeat
+    // the same multi-minute wait for the same result.
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
+    // Never a hard dead end: the user can still choose to retry at the original size.
+    await expect(page.getByText("Try the original size again anyway")).toBeVisible();
+  });
+
+  test("ZYU-92 below the cap, the plain Continue button still renders exactly as before", async ({ browser }) => {
+    seedResumeMessage("timed_out", { resumeAttempt: 1 });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByRole("button", { name: "Continue", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Continue with a smaller batch (5 cases)" })).toHaveCount(0);
+    await expect(page.getByText(/timed out .* times in a row/)).toHaveCount(0);
+  });
+
   // ─── Review step for Zyra-chat-generated test cases ────────────────────────
   // Chat no longer writes create/update/archive operations straight to `testcases` — they're
   // staged (applyZyraChatOperations) and shown in a review panel on the assistant's own message,
@@ -1793,6 +2082,40 @@ test.describe("zyra / agents (UI)", () => {
       .toContain("Sign in with a wrong password — edited");
   });
 
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the edit form
+   * (ZyraDraftEditor) never exposed these two fields at all, even though the backend's
+   * sanitizeZyraUpdateFields allowlist already accepted them. Mirrors ZYU-66's edit/persist
+   * pattern exactly, for the two fields that were actually missing.
+   */
+  test("ZYU-82 editing a proposed row's severity and component updates what's displayed and what's stored", async ({ browser }) => {
+    const { taskId } = seedChatReviewBatch();
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
+    await row.getByRole("button", { name: "Edit" }).click();
+    // Field order in ZyraDraftEditor: Title (textbox 0), Priority (combobox 0), Severity
+    // (combobox 1), Component (textbox 1), Preconditions/Expected result/Steps after that.
+    // The seeded draft has no severity, so the placeholder option must read "Select", not "No severity".
+    await expect(row.getByRole("combobox").nth(1).locator("option:checked")).toHaveText("Select");
+    await row.getByRole("combobox").nth(1).selectOption("Medium");
+    await row.getByRole("textbox").nth(1).fill("Search");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(row.getByText("Medium")).toBeVisible();
+    await expect(row.getByText("Search")).toBeVisible();
+
+    const readDraft = (field: "severity" | "component") =>
+      scalar(
+        `SELECT d->'draft'->>'${field}' FROM ai_generation_requests r, jsonb_array_elements(r.generated_payload) d ` +
+          `WHERE r.id = ${literal(taskId)} AND d->'draft'->>'title' = 'Sign in with a wrong password';`,
+      );
+    await expect
+      .poll(() => readDraft("severity"), { message: "the severity edit must persist, not just render client-side" })
+      .toBe("Medium");
+    expect(readDraft("component")).toBe("Search");
+  });
+
   test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {
     const suiteName = stamp("Chat review suite");
     const createdSuite = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
@@ -1826,6 +2149,32 @@ test.describe("zyra / agents (UI)", () => {
     expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
   });
 
+  test("ZYU-81 saving a chat-staged proposal with severity and component persists both onto the real test case", async ({ browser }) => {
+    const draftTitle = stamp("Chat-saved severity case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2", severity: "Critical", component: "Billing" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    // Same display bug, chat surface: severity/component must be visible in the review card
+    // BEFORE saving (this is chatDraftRow's own output — the exact place the fields were dropped).
+    const draftRow = page.getByRole("listitem").filter({ hasText: draftTitle });
+    await expect(draftRow.getByText("Critical")).toBeVisible();
+    await expect(draftRow.getByText("Billing")).toBeVisible();
+
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+
+    await expect
+      .poll(
+        () => scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`),
+        { message: "a chat-staged proposal's severity must reach the saved row" },
+      )
+      .toBe("Critical");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("Billing");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
   test("ZYU-68 a review batch already resolved elsewhere shows a read-only note instead of live controls", async ({ browser }) => {
     seedChatReviewBatch({ status: "done" });
     const page = await open(browser, "/agents/zyra");
@@ -1850,6 +2199,176 @@ test.describe("zyra / agents (UI)", () => {
     await expect
       .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
       .toBe("in_review");
+  });
+
+  /*
+   * Regression test for the Test Case Repository not reflecting a Zyra save until a manual reload.
+   * The Test Cases page seeds its first render from an in-memory, per-tab cache (pageDataCache,
+   * keyed `testcases:${projectId}`) rather than always fetching live first — see its own doc
+   * comment. The chat review panel used to save into the repository without ever touching that
+   * cache, so a tab that had Test Cases open earlier in the session, then saved via Zyra, then
+   * navigated back, rendered the pre-save snapshot (old suite list, old counts) until the page's
+   * own background revalidation fetch happened to finish.
+   *
+   * The fix is NOT to drop the cache entry on save (that was tried and reverted — it traded "shows
+   * stale data instantly" for "shows a blocking spinner until a live fetch finishes", which is its
+   * own regression: a real, noticeably slower Test Cases open right after every Zyra save).
+   * ZyraChatReviewPanel.tsx instead refetches suites/summary in the BACKGROUND the moment the save
+   * succeeds (refreshTestCasesPageCache) and writes the result into the same cache entry, so the
+   * correct data is already sitting there by the time the user actually clicks over.
+   *
+   * To prove both halves of that without racing the real backend's timing: first wait for the
+   * background refresh's own network call to complete (so the cache is provably updated before
+   * navigating), THEN artificially delay the Test Cases page's own mount-time fetch of the same
+   * endpoint. If the fix works, the very first paint after navigating already shows the new suite
+   * and count — sourced from the cache, not from that (still in-flight, delayed) fetch — and no
+   * loading spinner ever appears. Before this fix, that first paint would have shown the stale
+   * suite-less snapshot; with the earlier (reverted) invalidate-only approach, it would have shown
+   * a spinner instead. Either wrong prior behavior is distinguishable from the two assertions below.
+   */
+  test("ZYU-80 navigating from a Zyra save back to Test Cases shows the new suite and counts immediately, with no loading spinner", async ({
+    browser,
+  }) => {
+    // Prime the Test Cases page's cache with a pre-save snapshot — no suites, no test cases yet —
+    // the same way a real user would already have this page open earlier in the session.
+    const page = await open(browser, "/testcases");
+    await expect(page.getByText("Zyra generated test cases")).toHaveCount(0);
+    await expect(page.getByText(/0 test cases across 0 suites/)).toBeVisible();
+
+    // Leaving suiteId null means the backend files this under its default "Zyra generated test
+    // cases" suite (LegacyService.ZYRA_DRAFT_SUITE_NAME) — a suite that does not exist yet, so its
+    // very appearance after saving is itself proof the repository picked up the new data.
+    const draftTitle = stamp("Fresh from Zyra");
+    seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+
+    // Client-side navigation only, via the same sidebar/modal links a real user clicks (ZYU-02) —
+    // a page.goto() would do a full document load and reset pageDataCache's module state for free,
+    // which would prove nothing about the bug.
+    await page.getByRole("link", { name: "Agents", exact: true }).click();
+    await page.getByRole("button", { name: /Zyra the Test Generator/ }).click();
+    await page.getByRole("link", { name: /Agent workspace/ }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/agents/zyra$`));
+
+    const suitesPath = `/api/projects/${tenant!.mainProjectId}/suites`;
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    // Set up the wait before clicking — the background refresh's request can land before the next
+    // line would otherwise get a chance to start listening for it.
+    const backgroundRefresh = page.waitForResponse(
+      (res) => new URL(res.url()).pathname === suitesPath && res.request().method() === "GET",
+    );
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    await expect
+      .poll(
+        () =>
+          Number(
+            scalar(
+              `SELECT COUNT(*) FROM testcases t JOIN suites s ON s.id = t.suite_id ` +
+                `WHERE t.project_id = ${literal(tenant!.mainProjectId)} AND s.name = 'Zyra generated test cases' AND t.title = ${literal(draftTitle)};`,
+            ),
+          ),
+        { message: "the saved proposal must land in the default Zyra suite as a real test case" },
+      )
+      .toBe(1);
+    // Confirms the background cache refresh's own suites fetch has completed — the cache is
+    // provably holding fresh data now, before we ever navigate back to Test Cases.
+    await backgroundRefresh;
+
+    // Only now delay the Test Cases page's OWN mount-time fetch of the same endpoint — everything
+    // above, including the background refresh just awaited, must stay fast and unaffected.
+    await page.route(
+      (url) => url.pathname === suitesPath,
+      async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await route.continue();
+      },
+    );
+
+    await page.getByRole("link", { name: "Test cases" }).click();
+
+    // The very first paint after navigating back already has the background-refreshed cache to
+    // seed from: no loading state at all, and the new suite/count are correct immediately — sourced
+    // from that cache, not from the mount's own fetch, which is still artificially stuck mid-flight.
+    await expect(page.getByRole("status")).toHaveCount(0);
+    await expect(page.getByText("Zyra generated test cases")).toBeVisible();
+    await expect(page.getByText(/1 test case across 1 suite/)).toBeVisible();
+  });
+
+  /**
+   * Representative coverage for the same fix generalized beyond Test Cases: dashboard, reports
+   * (overview + execFilters), requirements, agents/tasks, agents/zyra/settings, and the workspace
+   * projects list all cache a test-case-derived count/summary the same way testcases/page.tsx did,
+   * and are now refreshed by the same lib/zyraCacheSync.ts helper ZYU-80 already exercises end to
+   * end. Every one of those pages goes through the identical generic patchPageCacheIfCached() —
+   * the only per-page risk is a wrong cache key or field name, which type-checking alone would not
+   * catch (a string literal typo still compiles). This pins that the dashboard's wiring — cache key
+   * `dashboard:${projectId}`, field `summary.testCases.total`, endpoint `GET .../dashboard` — is
+   * actually correct, the same way ZYU-80 pins it for testcases/page.tsx, rather than trusting the
+   * other five pages' wiring by code review alone.
+   */
+  test("ZYU-81 saving via Zyra also refreshes the dashboard's Test cases stat, not just the Test Cases page", async ({
+    browser,
+  }) => {
+    // Same locator convention as ui/project-dashboard.spec.ts's own statCard/statValue helpers:
+    // filtered on containing a <p> as well as the label, since the sidebar's own "Test cases" nav
+    // link is also an /projects/... link carrying the same words but has no <p> inside it.
+    const testCasesCard = (p: Page) =>
+      p.locator('a[href*="/projects/"]').filter({ has: p.locator("p") }).filter({ hasText: "Test cases" }).first();
+    const cardValue = (card: Locator) => card.evaluate((el) => el.querySelector("p")?.textContent?.trim() ?? "");
+
+    const page = await open(browser, "/dashboard");
+    await expect(testCasesCard(page)).toBeVisible();
+    expect(await cardValue(testCasesCard(page))).toBe("0");
+
+    const draftTitle = stamp("Fresh from Zyra for dashboard");
+    seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title: draftTitle, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } }],
+    });
+
+    await page.getByRole("link", { name: "Agents", exact: true }).click();
+    await page.getByRole("button", { name: /Zyra the Test Generator/ }).click();
+    await page.getByRole("link", { name: /Agent workspace/ }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/agents/zyra$`));
+
+    const dashboardPath = `/api/projects/${tenant!.mainProjectId}/dashboard`;
+    await expect(page.getByText(draftTitle)).toBeVisible();
+    const backgroundRefresh = page.waitForResponse(
+      (res) => new URL(res.url()).pathname === dashboardPath && res.request().method() === "GET",
+    );
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+    // Confirms the background cache refresh's own dashboard-summary fetch has completed — the
+    // cache is provably holding the fresh count now, before navigating back to the dashboard.
+    await backgroundRefresh;
+
+    // Only now delay the dashboard page's OWN mount-time fetch of the same endpoint.
+    await page.route(
+      (url) => url.pathname === dashboardPath,
+      async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await route.continue();
+      },
+    );
+
+    // "Project home" is the sidebar link that reaches the dashboard — it's a client-side redirect
+    // (app/(app)/projects/[id]/page.tsx does router.replace to .../dashboard), still client-side
+    // navigation throughout, so pageDataCache's module state survives the hop.
+    await page.getByRole("link", { name: "Project home" }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/dashboard$`));
+
+    // Correct immediately, sourced from the background-refreshed cache — not from the mount's own
+    // fetch, which is still artificially stuck mid-flight.
+    expect(await cardValue(testCasesCard(page))).toBe("1");
   });
 
   /*
@@ -1955,5 +2474,163 @@ test.describe("zyra / agents (UI)", () => {
 
     await expect(page.getByText("Created the Smoke Tests suite.")).toBeVisible();
     await expect(page.getByText(/didn.t return structured data for this reply/)).toHaveCount(0);
+  });
+
+  // ─── Citation drawer (ZyraContextDrawer): Markdown rendering ───────────────
+  //
+  // Bug report: "Zyra Context shows raw Markdown formatting for Jira and Knowledge Base content".
+  // A citation opened from ZyraCitationsList's "Context used (N)" list ("Context used" as seen in
+  // the review panel above) is always a knowledge_document lookup — Jira/Linear tickets sync into
+  // knowledge_documents as mirror rows (integration-sync.processor.ts), so there is only one
+  // component in this path, KnowledgeDocumentDetail inside ZyraContextDrawer.tsx, and it is what
+  // both the "JIRA" and "KNOWLEDGE BASE" chips in the bug screenshots open. Before the fix it
+  // rendered `contentText` as a raw `<p className="whitespace-pre-wrap">` string; it now runs the
+  // same `renderMarkdown` (lib/markdown.ts) already used for Zyra chat and the Sources tab
+  // (ZYU-34..39 above cover that renderer's use there). The seeded content below mirrors exactly
+  // what IntegrationSyncDocumentBuilder.buildMirror emits for a real Jira ticket (heading, a
+  // `- **Label:** value` meta list, an `_italic_` placeholder, and a markdown link) — so this proves
+  // both a native Knowledge Base document and a Jira-mirrored one render correctly, since they are
+  // the same row shape and the same component.
+
+  test("ZYU-77 the citation drawer renders a cited document's Markdown as formatted HTML, not raw symbols", async ({
+    browser,
+  }) => {
+    const title = stamp("Citation markdown doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText:
+        `# ${title}\n\n- **Status:** Open\n- **Priority:** High\n\n` +
+        "## Description\n\n_No description provided in the source ticket._\n\n" +
+        "## Comments\n\n_No comments on the source ticket._\n\n" +
+        "See [Open in Jira](https://example.atlassian.net/browse/KAN-9) for the source ticket.",
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E citation drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E citation drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    await expect(drawer.getByRole("heading", { name: title, level: 1 })).toBeVisible();
+    await expect(drawer.getByRole("heading", { name: "Description", level: 2 })).toBeVisible();
+    await expect(drawer.getByRole("heading", { name: "Comments", level: 2 })).toBeVisible();
+    await expect(drawer.locator("li", { hasText: "High" })).toBeVisible();
+    await expect(drawer.locator("strong", { hasText: "Status:" })).toBeVisible();
+    await expect(drawer.locator("em", { hasText: "No comments on the source ticket." })).toBeVisible();
+    // Plain text with no markdown syntax renders unchanged.
+    await expect(drawer.getByText("for the source ticket.", { exact: false })).toBeVisible();
+
+    const link = drawer.getByRole("link", { name: "Open in Jira" });
+    await expect(link).toBeVisible();
+    await expect(link).toHaveAttribute("href", "https://example.atlassian.net/browse/KAN-9");
+    await expect(link).toHaveAttribute("target", "_blank");
+
+    // The raw markdown symbols must not appear anywhere as literal text.
+    await expect(drawer.getByText(`# ${title}`, { exact: true })).toHaveCount(0);
+    await expect(drawer.getByText("**Status:**", { exact: false })).toHaveCount(0);
+    await expect(drawer.getByText("_No comments on the source ticket._", { exact: true })).toHaveCount(0);
+    await expect(drawer.getByText("[Open in Jira](https://example.atlassian.net/browse/KAN-9)", { exact: false })).toHaveCount(0);
+  });
+
+  test("ZYU-78 the citation drawer escapes HTML-like content in a cited document instead of rendering or executing it", async ({
+    browser,
+  }) => {
+    // Same safety guarantee ZYU-38 pins for the Sources tab's use of renderMarkdown — proven here
+    // too because the drawer is a second, independent dangerouslySetInnerHTML call site.
+    const marker = `xss-marker-${Date.now()}`;
+    const title = stamp("Citation injection doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText: `<img src=x onerror="window.__zyraDrawerXss='${marker}'">`,
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E injection drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E injection drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    await expect(drawer.locator("img")).toHaveCount(0);
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraDrawerXss);
+    expect(injected, "the markdown renderer escapes HTML before parsing, so this must never execute").toBeUndefined();
+    await expect(drawer.getByText("<img", { exact: false })).toBeVisible();
+  });
+
+  test("ZYU-79 the citation drawer never lets a link's own URL text break out of its href attribute", async ({ browser }) => {
+    /*
+     * Regression: renderMarkdown's escaping (lib/markdown.ts) escaped `&`/`<`/`>` but not `"`, and
+     * its own link markup interpolates the captured URL straight into a double-quoted href
+     * attribute — so a cited document whose text contains a markdown link with a `"` inside the
+     * URL (e.g. copy-pasted from a browser address bar mid-incident) could close that attribute
+     * early and leave a bare, injected attribute (onmouseover=...) sitting on the rendered <a>
+     * element. No space before the link's closing `)`, so the regex still matches and produces a
+     * real <a href> either way — proving the fix has to be the escaping, not a malformed link.
+     * Checked at the DOM level (via the browser's own HTML parser), not just string-matching the
+     * markup, since that parser's quote-handling quirks are exactly what this vulnerability turns on.
+     */
+    const title = stamp("Citation link injection doc");
+    const doc = await createKnowledgeDoc({
+      title,
+      contentText: 'See [details](https://example.com"onmouseover=alert(1)) for the source ticket.',
+    });
+
+    seedChatReviewBatch({
+      entries: [
+        {
+          opType: "create",
+          draft: { suiteId: null, title: "E2E link injection drafted case", description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+          sourceRefs: [{ type: "knowledge_document", id: doc.id, title }],
+        },
+      ],
+    });
+
+    const page = await open(browser, "/agents/zyra");
+    const titleRe = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    await expect(page.getByText("E2E link injection drafted case")).toBeVisible();
+    await page.getByRole("button", { name: "Context used (1)" }).click();
+    await page.getByRole("button", { name: titleRe }).click();
+
+    const drawer = page.locator('div[role="presentation"]').last();
+    const link = drawer.getByRole("link", { name: "details" });
+    await expect(link).toBeVisible();
+
+    const attrs = await link.evaluate((el) => ({
+      href: el.getAttribute("href"),
+      onmouseover: el.getAttribute("onmouseover"),
+      attributeCount: el.attributes.length,
+    }));
+    // Pre-fix, the browser's own HTML parser closed href="..." at the raw `"` and attached this as
+    // a second, genuine attribute on the element instead of leaving it inert inside href's value.
+    expect(attrs.onmouseover, "no attribute must be injected via a broken-out href").toBeNull();
+    // The whole malicious fragment lands inside href instead (decoded back through the &quot;
+    // entity the fix produces) — inert data, never parsed as markup.
+    expect(attrs.href).toContain('example.com"onmouseover=alert(1');
+    // Exactly the three attributes renderMarkdown's own link markup sets: href, target, rel.
+    expect(attrs.attributeCount).toBe(3);
   });
 });

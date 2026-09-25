@@ -337,6 +337,58 @@ test.describe("test case repository (UI)", () => {
     const headers = page.getByRole("columnheader");
     expect(await headers.count(), "at least one data column must survive").toBeGreaterThan(1);
   });
+
+  /*
+   * Regression: column order used to be a stored preference (RepositoryTestCaseTable's old
+   * `dataOrder`), left over from when headers could be dragged to reorder — a preference saved
+   * before Severity/Component existed (or from before drag-reorder was removed entirely) kept its
+   * stale order forever, with any newly-added column silently appended at the very end regardless
+   * of where the code's own default put it. That's why Severity/Component always trailed after
+   * Updated on an existing browser even after the code's default order changed. Order is now fixed
+   * in code (DATA_ORDER) and never read from or written to storage, so it can't drift like that.
+   */
+  test("TCR-20 data columns render in a fixed order regardless of a stale stored preference", async ({ browser }) => {
+    await seedCase(stamp("ColumnOrder"));
+    const page = await openRepository(browser);
+
+    // A preference saved before Severity/Component existed — exactly the shape that used to freeze
+    // the old, incomplete order forever. `dataOrder` is intentionally absent from TablePrefs now,
+    // so this stale value must simply be ignored rather than read back.
+    await page.evaluate((pid) => {
+      window.localStorage.setItem(
+        `tesbo-repo-tc-table:v1:${pid}`,
+        JSON.stringify({ dataOrder: ["id", "title", "priority", "type", "automation", "status", "updated"] }),
+      );
+    }, tenant!.mainProjectId);
+    await page.reload();
+
+    await page.getByRole("button", { name: "Columns", exact: true }).click();
+    for (const label of ["Jira", "Component", "Severity"]) {
+      const checkbox = page.getByRole("checkbox").and(page.locator(`xpath=//label[.//span[text()=${JSON.stringify(label)}]]//input`));
+      if (!(await checkbox.isChecked())) await checkbox.check();
+    }
+    await page.keyboard.press("Escape");
+
+    const headers = page.locator("table.tc-repo-table thead tr th");
+    // Bulk-select is index 0; Suite stays hidden (only shows with the suite panel collapsed).
+    const expectedOrder = [
+      "ID",
+      "Test case title",
+      "Jira",
+      "Component",
+      "Priority",
+      "Severity",
+      "Type",
+      "Automation Type",
+      "Status",
+      "Updated",
+    ];
+    await expect(headers).toHaveCount(expectedOrder.length + 1);
+    for (const [i, label] of expectedOrder.entries()) {
+      await expect(headers.nth(i + 1), `header ${i + 1} should be "${label}"`).toContainText(label);
+    }
+  });
+
   // ─── Cases that belong to no suite ─────────────────────────────────────────
 
   /*
@@ -723,5 +775,74 @@ test.describe("test case repository (UI)", () => {
       targetRow,
       "the Suite column truncated to one level, dropping the root",
     ).toContainText(`${rootName} / ${childName} / ${grandchildName}`);
+  });
+
+  // ─── Export scopes to the selected suite ────────────────────────────────────
+  /*
+   * Basecamp-style report: "Exporting a specific suite exports all test cases" — selecting a suite in
+   * this tree and clicking Export downloaded the whole project regardless. testcases/page.tsx's
+   * "Export as CSV"/"Export as Excel" links were built from getExportUrl(projectId, format) alone,
+   * with no suiteId (or any other active filter) in the URL at all, so the backend had nothing to
+   * filter by even once it gained the ability to. Fixed by threading the same suite/filter state the
+   * on-screen table already fetches with into the export link. The actual file contents (does the
+   * backend really honor the query param) are covered at the API level in
+   * e2e/api/import-export.spec.ts; this proves the UI link itself carries the selected suite, which
+   * is the half of the regression that lived entirely in the frontend.
+   */
+  test("TCR-18 the Export menu links carry the selected suite, not just the project", async ({ browser }) => {
+    const suiteName = stamp("ExportSuite");
+    const suiteId = await seedSuite(suiteName);
+    const inSuite = stamp("ExportInSuite");
+    await seedCase(inSuite, { suiteId });
+    const outsideSuite = stamp("ExportOutside");
+    await seedCase(outsideSuite);
+
+    const page = await openRepository(browser);
+
+    // Before selecting a suite, the export links carry no suiteId — the "All test cases" export is
+    // unchanged.
+    await page.getByRole("button", { name: "Export" }).click();
+    const unfilteredCsvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(unfilteredCsvHref, "the whole-project export must not carry a suiteId").not.toContain("suiteId=");
+    await page.keyboard.press("Escape");
+
+    await page.getByRole("button", { name: new RegExp(suiteName) }).click();
+    await expect(row(page, inSuite)).toBeVisible();
+
+    await page.getByRole("button", { name: "Export" }).click();
+    const csvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(
+      csvHref,
+      "the export link must carry the selected suite, not silently export the whole project",
+    ).toContain(`suiteId=${suiteId}`);
+
+    const xlsxHref = await page.getByRole("link", { name: "Export as Excel" }).getAttribute("href");
+    expect(xlsxHref).toContain(`suiteId=${suiteId}`);
+  });
+
+  /*
+   * Basecamp-style report: "[Test Cases] Exported Test Cases Lose Their Original Sequence" —
+   * export always sorted by most-recently-updated regardless of the repository table's own order,
+   * so editing an old case moved it to the top of the export without moving it on screen. Fixed by
+   * having export share the table's own order-by logic (LegacyService.buildTestcaseOrderBySql) and
+   * having the frontend's Export links carry the table's active column sort
+   * (currentTestCaseExportFilters in testcases/page.tsx), the same way TCR-18 covers the suite
+   * filter. Whether a sorted export's ROWS actually come back in that order is covered at the API
+   * level in e2e/api/import-export.spec.ts; this proves the link the UI builds carries the sort.
+   */
+  test("TCR-19 the Export menu links carry the repository table's active column sort", async ({ browser }) => {
+    await seedCase(stamp("SortLink"));
+    const page = await openRepository(browser);
+
+    await page.getByRole("button", { name: "Sort by Test case title" }).click();
+
+    await page.getByRole("button", { name: "Export" }).click();
+    const csvHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+    expect(csvHref, "the export link must carry the table's active sort column").toContain("sortBy=title");
+    expect(csvHref, "…and its direction").toContain("sortDir=asc");
+
+    const xlsxHref = await page.getByRole("link", { name: "Export as Excel" }).getAttribute("href");
+    expect(xlsxHref).toContain("sortBy=title");
+    expect(xlsxHref).toContain("sortDir=asc");
   });
 });

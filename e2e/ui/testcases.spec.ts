@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, request as pwRequest, test, type Locator } from "@playwright/test";
+import { expect, request as pwRequest, test, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 const STATE_PATH = path.join(__dirname, "../.auth/state.json");
+
+/** The label isn't tied to its control via for/id, so this walks the DOM structure instead. */
+function fieldControl(page: Page, label: string): Locator {
+  return page.locator(
+    `xpath=//label[normalize-space(text())="${label}"]/following-sibling::*[self::input or self::select or self::textarea]`,
+  );
+}
 
 test.describe("test case creation", () => {
   test("a user can create a test case from the UI and see it in the list", { tag: '@tesbo.testId("TES-TC-836")' }, async ({ page }) => {
@@ -18,6 +25,12 @@ test.describe("test case creation", () => {
 
     const panel = page.locator("aside");
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
+    // Suite/Type/Priority/Automation Type start unselected (see the dedicated test below), but
+    // this happy-path test still exercises picking a value for each explicitly.
+    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
+    await fieldControl(page, "Type").selectOption("Functional");
+    await fieldControl(page, "Priority").selectOption("P2");
+    await fieldControl(page, "Automation Type").selectOption("Not Automated");
     await panel.getByRole("button", { name: "Create", exact: true }).click();
 
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
@@ -51,20 +64,18 @@ test.describe("test case creation", () => {
     const postconditions = "User is redirected to the dashboard.";
     const component = "Login";
 
-    /** The label isn't tied to its control via for/id, so this walks the DOM structure instead. */
-    const fieldControl = (label: string): Locator =>
-      page.locator(
-        `xpath=//label[normalize-space(text())="${label}"]/following-sibling::*[self::input or self::select or self::textarea]`,
-      );
-
     await page.goto(`/projects/${ctx.projectId}/testcases`);
     await page.getByRole("button", { name: "Add test case" }).first().click();
 
     const panel = page.locator("aside");
     await panel.getByPlaceholder("Describe what this test case validates").fill(title);
-    await fieldControl("Postconditions").fill(postconditions);
-    await fieldControl("Component").fill(component);
-    await fieldControl("Severity").selectOption("Medium");
+    await fieldControl(page, "Postconditions").fill(postconditions);
+    await fieldControl(page, "Component").fill(component);
+    await fieldControl(page, "Severity").selectOption("Medium");
+    await fieldControl(page, "Suite").selectOption({ label: "No suite" });
+    await fieldControl(page, "Type").selectOption("Functional");
+    await fieldControl(page, "Priority").selectOption("P2");
+    await fieldControl(page, "Automation Type").selectOption("Not Automated");
     await panel.getByRole("button", { name: "Create", exact: true }).click();
 
     await expect(panel.getByText("Test case created successfully.")).toBeVisible();
@@ -73,9 +84,9 @@ test.describe("test case creation", () => {
     // Reopening the row loads the edit panel (View/Edit) — the three new fields must come back
     // exactly as saved, proving the round trip through the API rather than just the form state.
     await page.getByRole("button", { name: title }).click();
-    await expect(fieldControl("Postconditions")).toHaveValue(postconditions);
-    await expect(fieldControl("Component")).toHaveValue(component);
-    await expect(fieldControl("Severity")).toHaveValue("Medium");
+    await expect(fieldControl(page, "Postconditions")).toHaveValue(postconditions);
+    await expect(fieldControl(page, "Component")).toHaveValue(component);
+    await expect(fieldControl(page, "Severity")).toHaveValue("Medium");
 
     // Clean up via the API so repeat runs don't accumulate test cases in the smoke project.
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -87,6 +98,200 @@ test.describe("test case creation", () => {
       const match = list.find((tc: { id: string; title: string }) => tc.title === title);
       if (match) await api.delete(`/api/projects/${ctx.projectId}/testcases/${match.id}`);
     } finally {
+      await api.dispose();
+    }
+  });
+
+  // Suite, Type, Priority, Automation Type, Component and Severity are all optional on Create:
+  // Create Test Case must open with the dropdowns on "Select"/"No suite" and Component empty,
+  // and leaving every one of them untouched must both (a) succeed, and (b) persist them as blank/
+  // null rather than a real value the user never chose. The form always includes these fields in
+  // its payload (testcases/page.tsx), blank or not, so an untouched field reaches the API as an
+  // explicit "" — insertTestCaseWithClient in legacy.service.ts now only applies its "P2"/
+  // "Functional"/"Not Automated" fallbacks when the key is missing entirely (import/Zyra/MCP,
+  // which never send this form's payload shape), not when it's sent blank. Status is excluded:
+  // it has no "Select" placeholder and is never left blank, so it keeps defaulting to "Draft".
+  test("Create Test Case opens with Suite, Type, Priority, Automation Type and Component unselected/empty, and creating without filling them saves them blank rather than defaulted", async ({ page }) => {
+    const title = `UI unselected defaults test case ${Date.now()}`;
+
+    await page.goto(`/projects/${ctx.projectId}/testcases`);
+    await page.getByRole("button", { name: "Add test case" }).first().click();
+
+    const panel = page.locator("aside");
+
+    await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Component")).toHaveValue("");
+    await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("Select");
+    await expect(fieldControl(page, "Status").locator("option:checked")).toHaveText("Draft");
+
+    // Submit with all of the above left untouched — no client-side error, a real create.
+    await panel.getByPlaceholder("Describe what this test case validates").fill(title);
+    await panel.getByRole("button", { name: "Create", exact: true }).click();
+    await expect(panel.getByText("Test case created successfully.")).toBeVisible();
+    await panel.getByRole("button", { name: "Close panel" }).click();
+
+    // Persisted state, not just the toast: the API-visible row must carry blank/null values,
+    // not the "No suite"/"Functional"/"P2"/"Not Automated" defaults this used to silently apply.
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const listRes = await api.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: title },
+      });
+      const list = await listRes.json();
+      const match = list.find((tc: { id: string; title: string }) => tc.title === title);
+      expect(match).toBeTruthy();
+      expect(match.suiteId).toBeNull();
+      expect(match.type).toBeNull();
+      expect(match.priority).toBe("");
+      expect(match.automationStatus).toBeNull();
+      expect(match.component).toBeFalsy();
+      expect(match.severity).toBeFalsy();
+      // Status is the one field NOT covered by this optional-field fix — it keeps its default.
+      expect(match.status).toBe("Draft");
+
+      if (match) await api.delete(`/api/projects/${ctx.projectId}/testcases/${match.id}`);
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  // Companion to the create-time test above: fillFormFromTestCase (testcases/page.tsx) used to
+  // re-populate a reopened case's Type/Automation Type with "Functional"/"Not Automated" whenever
+  // the stored value was blank, and Suite with whatever suite the repository view happened to be
+  // filtered on — so a case saved blank by the fix above would silently gain a real value the
+  // moment it was opened and saved again, undoing the fix on the very next edit. Priority is
+  // excluded from that regression (an empty string isn't nullish, so it already round-tripped).
+  test("Edit Test Case shows a blank Type/Priority/Automation Type/Suite/Severity as Select/No suite, and saving with no changes keeps them blank", async ({ page }) => {
+    const title = `UI edit blank fields test case ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    try {
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title, priority: "", type: "", automationStatus: "", severity: "", component: "" },
+        })
+      ).json();
+      testcaseId = created.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText("No suite");
+      await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Select");
+      await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("Select");
+
+      // Save without touching anything.
+      await panel.getByRole("button", { name: "Save changes" }).click();
+      await expect(panel.getByText("Test case updated successfully.")).toBeVisible();
+
+      const after = await (
+        await api.get(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`)
+      ).json();
+      expect(after.suiteId).toBeNull();
+      expect(after.type).toBeFalsy();
+      expect(after.priority).toBe("");
+      expect(after.automationStatus).toBeFalsy();
+      expect(after.severity).toBeFalsy();
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  // A case that already has real values must not be disturbed by the fix above — reopening and
+  // saving it unchanged has to round-trip the exact values it already had.
+  test("Edit Test Case preserves existing Type/Priority/Automation Type/Suite values when saved with no changes", async ({ page }) => {
+    const title = `UI edit populated fields test case ${Date.now()}`;
+    const suiteName = `E2E Edit Preserve Suite ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    let suiteId = "";
+    try {
+      const suite = await (
+        await api.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: suiteName } })
+      ).json();
+      suiteId = suite.id;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+          data: { title, priority: "P1", type: "Regression", automationStatus: "Automated", suiteId },
+        })
+      ).json();
+      testcaseId = created.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await expect(fieldControl(page, "Suite").locator("option:checked")).toHaveText(suiteName);
+      await expect(fieldControl(page, "Type").locator("option:checked")).toHaveText("Regression");
+      await expect(fieldControl(page, "Priority").locator("option:checked")).toHaveText("P1");
+      await expect(fieldControl(page, "Automation Type").locator("option:checked")).toHaveText("Automated");
+
+      await panel.getByRole("button", { name: "Save changes" }).click();
+      await expect(panel.getByText("Test case updated successfully.")).toBeVisible();
+
+      const after = await (
+        await api.get(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`)
+      ).json();
+      expect(after.suiteId).toBe(suiteId);
+      expect(after.type).toBe("Regression");
+      expect(after.priority).toBe("P1");
+      expect(after.automationStatus).toBe("Automated");
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      if (suiteId) await api.delete(`/api/suites/${suiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  // "[MCP] Test case created by MCP is not adding Severity" — the MCP create_testcase tool stored
+  // whatever severity string it was sent ("Major"), which this dropdown can't select, so the detail
+  // panel showed "Select". See the matching api/mcp.spec.ts block for the refusal side.
+  test("a test case created through MCP with a severity shows that severity in Test Case Detail", async ({ page }) => {
+    const title = `UI MCP severity test case ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    // Cookie-free: AuthMiddleware prefers a session cookie over the bearer token, and a real MCP
+    // client never sends one (same reasoning as callMcpTool in api/mcp.spec.ts).
+    const mcpApi = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    let tokenId = "";
+    let testcaseId = "";
+    try {
+      const tokenBody = await (
+        await api.post(`/api/projects/${ctx.projectId}/apikeys`, { data: { name: `E2E UI MCP severity ${Date.now()}`, scopes: ["write"] } })
+      ).json();
+      tokenId = tokenBody.id;
+      const rpc = await mcpApi.post(`/api/projects/${ctx.projectId}/mcp`, {
+        headers: { Authorization: `Bearer ${tokenBody.token}` },
+        data: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "create_testcase", arguments: { title, severity: "high", priority: "P1", component: "Buzz" } },
+        },
+      });
+      const body = await rpc.json();
+      expect(body.error).toBeUndefined();
+      const created = JSON.parse(body.result.content[0].text);
+      testcaseId = created.id;
+      expect(created.severity).toBe("High");
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+      await expect(fieldControl(page, "Severity")).toHaveValue("High");
+      await expect(fieldControl(page, "Severity").locator("option:checked")).toHaveText("High");
+      // Neighbouring fields from the same MCP call still land.
+      await expect(fieldControl(page, "Priority")).toHaveValue("P1");
+      await expect(fieldControl(page, "Component")).toHaveValue("Buzz");
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      if (tokenId) await api.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      await mcpApi.dispose();
       await api.dispose();
     }
   });
@@ -480,5 +685,250 @@ test.describe("test case repository table — column sort", () => {
 
     // And once the delayed response lands, the indicator clears again.
     await expect(page.getByText("Updating…")).toHaveCount(0, { timeout: 5000 });
+  });
+});
+
+// Regression coverage for: Severity and Component are real testcases columns, already wired
+// through create/edit and export (see "Postconditions, Component and Severity can be set..."
+// above), but the repository list endpoint itself omitted both, so the column selector had
+// nothing to show even once a column existed for them.
+test.describe("test case repository table — Severity and Component columns", () => {
+  test("Severity and Component can be shown via the column selector, display the right value, survive a reload, and hide again", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Severity Component ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const withValues = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} with values`, severity: "Critical", component: "Checkout" },
+      });
+      created.push((await withValues.json()).id);
+      // No severity/component set — the column must render an em dash, not a blank cell.
+      const withoutValues = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without values` },
+      });
+      created.push((await withoutValues.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      const rows = () => page.locator("table.tc-repo-table tbody tr");
+      await expect(rows()).toHaveCount(2);
+
+      const headerCells = page.locator("table.tc-repo-table thead tr th");
+      // Hidden by default, same as Suite and Jira.
+      const defaultHeaderText = (await headerCells.allTextContents()).join(" | ");
+      expect(defaultHeaderText).not.toContain("Severity");
+      expect(defaultHeaderText).not.toContain("Component");
+      const defaultCount = await headerCells.count();
+
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Severity" }).locator('input[type="checkbox"]').click();
+      await page.locator("label", { hasText: "Component" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click(); // toggles the menu closed again
+
+      await expect(headerCells).toHaveCount(defaultCount + 2);
+      const headerTexts = await headerCells.allTextContents();
+      const severityIdx = headerTexts.findIndex((t) => t.includes("Severity"));
+      const componentIdx = headerTexts.findIndex((t) => t.includes("Component"));
+      expect(severityIdx, "Severity header should be present once enabled").toBeGreaterThan(-1);
+      expect(componentIdx, "Component header should be present once enabled").toBeGreaterThan(-1);
+
+      const rowWithValues = rows().filter({ hasText: `${marker} with values` });
+      const rowWithoutValues = rows().filter({ hasText: `${marker} without values` });
+      await expect(rowWithValues.locator("td").nth(severityIdx)).toHaveText("Critical");
+      await expect(rowWithValues.locator("td").nth(componentIdx)).toHaveText("Checkout");
+      await expect(rowWithoutValues.locator("td").nth(severityIdx)).toHaveText("—");
+      await expect(rowWithoutValues.locator("td").nth(componentIdx)).toHaveText("—");
+
+      // Persistence: a reload must keep both columns visible, same as any other column toggle.
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      await expect(headerCells).toHaveCount(defaultCount + 2);
+
+      // Hiding them again removes the columns and that choice persists too.
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Severity" }).locator('input[type="checkbox"]').click();
+      await page.locator("label", { hasText: "Component" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+      await expect(headerCells).toHaveCount(defaultCount);
+
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      const headerTextAfterHide = (await headerCells.allTextContents()).join(" | ");
+      expect(headerTextAfterHide).not.toContain("Severity");
+      expect(headerTextAfterHide).not.toContain("Component");
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
+
+// Regression coverage for: testcases.source_refs (added in V101_testcase_citations.sql, and always
+// written by Zyra) was never rendered anywhere after a case was saved — it only ever flashed in the
+// transient pre-acceptance review screen. Same "column selector had nothing to show" shape as
+// Severity/Component above, plus the detail panel's Overview tab, which reads the same data from the
+// single-testcase GET rather than from the repository list endpoint.
+test.describe("test case repository table and detail panel — Context column", () => {
+  test("Context can be shown via the column selector, shows the placeholder or a citation count, and survives a reload", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "bug", id: "E2E-NONEXISTENT-BUG", title: "A past citation" }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+      // No citations — the column must render the same placeholder Zyra's own review screen
+      // (ZyraCitationsList) shows for an uncited draft, not a blank cell.
+      const withoutCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without citation` },
+      });
+      created.push((await withoutCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      const rows = () => page.locator("table.tc-repo-table tbody tr");
+      await expect(rows()).toHaveCount(2);
+
+      const headerCells = page.locator("table.tc-repo-table thead tr th");
+      // Hidden by default, same as Suite/Jira/Severity/Component.
+      const defaultHeaderText = (await headerCells.allTextContents()).join(" | ");
+      expect(defaultHeaderText).not.toContain("Context");
+      const defaultCount = await headerCells.count();
+
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+
+      await expect(headerCells).toHaveCount(defaultCount + 1);
+      const headerTexts = await headerCells.allTextContents();
+      const contextIdx = headerTexts.findIndex((t) => t.includes("Context"));
+      expect(contextIdx, "Context header should be present once enabled").toBeGreaterThan(-1);
+
+      const rowWithCitation = rows().filter({ hasText: `${marker} with citation` });
+      const rowWithoutCitation = rows().filter({ hasText: `${marker} without citation` });
+      await expect(rowWithCitation.locator("td").nth(contextIdx)).toContainText("Context used (1)");
+      await expect(rowWithoutCitation.locator("td").nth(contextIdx)).toContainText("No specific source cited");
+
+      // Persistence: a reload must keep the column visible, same as any other column toggle.
+      await page.reload();
+      await page.getByPlaceholder("Search by ID, title, or type").fill(marker);
+      await expect(rows()).toHaveCount(2);
+      await expect(headerCells).toHaveCount(defaultCount + 1);
+
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+      await expect(headerCells).toHaveCount(defaultCount);
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("clicking a citation in the Context column opens a menu, and clicking the cited item opens its live content in a drawer", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context Drawer ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      // The cited item is a real, resolvable test case in this project, so the drawer opened from
+      // the citation loads that case's actual live content rather than a stale-source message.
+      const citedRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} cited case` },
+      });
+      const cited = await citedRes.json();
+      created.push(cited.id);
+
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "testcase", id: cited.id, title: cited.title }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} with citation`);
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+
+      await page.getByRole("button", { name: "Context used (1)" }).click();
+      await page.getByRole("button", { name: cited.title, exact: false }).click();
+
+      const drawer = page.locator('div[role="presentation"]').last();
+      await expect(drawer.getByText("Test case", { exact: true })).toBeVisible();
+      await expect(drawer.getByText(cited.title)).toBeVisible();
+      await page.keyboard.press("Escape");
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("the detail panel has a dedicated Context tab showing the same citations as the repository table", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context Panel ${Date.now()}`;
+    const created: string[] = [];
+    try {
+      const citedRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} cited case` },
+      });
+      const cited = await citedRes.json();
+      created.push(cited.id);
+
+      const withCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: {
+          title: `${marker} with citation`,
+          sourceRefs: [{ type: "testcase", id: cited.id, title: cited.title }],
+        },
+      });
+      created.push((await withCitationRes.json()).id);
+      const withoutCitationRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} without citation` },
+      });
+      created.push((await withoutCitationRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      const panel = page.locator("aside");
+
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} with citation`);
+      await page.getByRole("button", { name: `${marker} with citation` }).click();
+      await panel.getByRole("button", { name: "Context (1)" }).click();
+      const citationCard = panel.getByRole("button", { name: cited.title, exact: false });
+      await expect(citationCard).toBeVisible();
+      await expect(citationCard).toContainText("Test case");
+
+      // Clicking the cited item opens its live content in a drawer.
+      await citationCard.click();
+      const drawer = page.locator('div[role="presentation"]').last();
+      await expect(drawer.getByText(cited.title)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await panel.getByRole("button", { name: "Close panel" }).click();
+
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} without citation`);
+      await page.getByRole("button", { name: `${marker} without citation` }).click();
+      // No count suffix when there's nothing to cite.
+      await expect(panel.getByRole("button", { name: "Context", exact: true })).toBeVisible();
+      await panel.getByRole("button", { name: "Context", exact: true }).click();
+      await expect(panel.getByText("No specific source cited")).toBeVisible();
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
   });
 });

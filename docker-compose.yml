@@ -48,11 +48,18 @@ services:
         condition: service_completed_successfully
     environment:
       PORT: 7000
+      # Set by Jenkinsfile/Jenkinsfile.stage from `git rev-parse --short HEAD` before this file is
+      # invoked; "local" everywhere else. Surfaced on /health so two environments pointed at the
+      # same DATABASE_URL can be diffed in one curl instead of DB forensics.
+      GIT_SHA: ${GIT_SHA:-local}
       DATABASE_URL: ${DATABASE_URL}
       DATABASE_USER: ${DATABASE_USER}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1010}
+      # Optional: public address for links written into Jira/Linear comments. Unset = FRONTEND_URL.
+      # A localhost/private address produces plain test-case IDs instead of links.
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:1010,http://127.0.0.1:1010,http://localhost:3000,http://127.0.0.1:3000}
       # Optional: derived from FRONTEND_URL + /integrations/callback when left unset.
       JIRA_REDIRECT_URI: ${JIRA_REDIRECT_URI:-}
@@ -133,6 +140,9 @@ services:
         # Stage only — set DSN + ENVIRONMENT=stage on stage .env; leave empty on prod
         NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
         NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${NEXT_PUBLIC_SENTRY_ENVIRONMENT:-}
+        # PostHog — set on production (app.tesbo.io); leave empty on stage
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
     restart: unless-stopped
     depends_on:
       backend:

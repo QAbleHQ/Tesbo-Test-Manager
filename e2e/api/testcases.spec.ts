@@ -66,6 +66,143 @@ test.describe("test case CRUD", () => {
     expect(getAfterDeleteRes.status()).toBe(404);
   });
 
+  // Regression coverage for: severity/component are real testcases columns already returned by
+  // the single-testcase GET, but the repository list SELECT (listTestCasesUncached) omitted both,
+  // so the frontend's column selector had no data to show even once a column existed for them.
+  test("the list endpoint returns severity and component, including as null when unset", { tag: '@tesbo.testId("TES-TC-565")' }, async ({ request }) => {
+    const withValues = await createCase(request, { severity: "Critical", component: "Checkout" });
+    const withoutValues = await createCase(request);
+
+    try {
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withValues.title },
+      });
+      expect(listRes.ok()).toBeTruthy();
+      const listed = (await listRes.json()).find((tc: { id: string }) => tc.id === withValues.id);
+      expect(listed.severity).toBe("Critical");
+      expect(listed.component).toBe("Checkout");
+
+      const listResUnset = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withoutValues.title },
+      });
+      const listedUnset = (await listResUnset.json()).find((tc: { id: string }) => tc.id === withoutValues.id);
+      expect(listedUnset.severity).toBeNull();
+      expect(listedUnset.component).toBeNull();
+    } finally {
+      await deleteCase(request, withValues.id);
+      await deleteCase(request, withoutValues.id);
+    }
+  });
+
+  // Same regression shape as the severity/component test above, for the Context column: source_refs
+  // has existed on this table since V101_testcase_citations.sql and is already returned by the
+  // single-testcase GET, but listTestCasesUncached's SELECT omitted it — so the repository table's
+  // Context column had no data to render.
+  test("the list endpoint returns sourceRefs, including as an empty array for a manually-created case", async ({ request }) => {
+    const citation = { type: "testcase", id: `E2E-SRC-${Date.now()}`, title: "E2E cited case" };
+    const withCitation = await createCase(request, { sourceRefs: [citation] });
+    const withoutCitation = await createCase(request);
+    try {
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withCitation.title },
+      });
+      const listed = (await listRes.json()).find((tc: { id: string }) => tc.id === withCitation.id);
+      expect(listed.sourceRefs).toEqual([citation]);
+
+      const listResUnset = await request.get(`/api/projects/${ctx.projectId}/testcases`, {
+        params: { search: withoutCitation.title },
+      });
+      const listedUnset = (await listResUnset.json()).find((tc: { id: string }) => tc.id === withoutCitation.id);
+      expect(listedUnset.sourceRefs).toEqual([]);
+    } finally {
+      await deleteCase(request, withCitation.id);
+      await deleteCase(request, withoutCitation.id);
+    }
+  });
+
+  /*
+   * Unlike every other field on this endpoint, sourceRefs was never validated at all beyond
+   * `Array.isArray` — no shape check, no cap. Harmless while nothing rendered it outside Zyra's own
+   * (already-capped, already-verified) review screen; now that it's a persistently visible, clickable
+   * column, a malformed or oversized array via a raw API call needs to be guarded the same way Zyra's
+   * own sanitizeZyraSourceRefs guards model output. sanitizeSourceRefsInput (legacy.service.ts) drops
+   * malformed entries silently rather than rejecting the whole request, matching how every other
+   * optional field here already behaves.
+   */
+  test("malformed sourceRefs entries are dropped silently, well-formed ones are kept", async ({ request }) => {
+    const good = { type: "bug", id: "E2E-GOOD-1", title: "A real citation" };
+    const created = await createCase(request, {
+      sourceRefs: [
+        good,
+        { type: "not_a_real_type", id: "x", title: "bad type" },
+        { type: "testcase", id: "", title: "blank id" },
+        { type: "testcase", title: "missing id entirely" },
+        "just a string, not an object",
+        null,
+        42,
+      ],
+    });
+    try {
+      expect(created.sourceRefs).toEqual([good]);
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  test("a sourceRefs array longer than 20 entries is capped at 20 on create", async ({ request }) => {
+    const refs = Array.from({ length: 25 }, (_, i) => ({ type: "bug", id: `E2E-CAP-${i}`, title: `Citation ${i}` }));
+    const created = await createCase(request, { sourceRefs: refs });
+    try {
+      expect(created.sourceRefs).toHaveLength(20);
+      expect(created.sourceRefs).toEqual(refs.slice(0, 20));
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  test("update: an explicit sourceRefs array overwrites existing citations, but omitting the field preserves them", async ({ request }) => {
+    const original = { type: "testcase", id: "E2E-ORIGINAL", title: "Original citation" };
+    const created = await createCase(request, { sourceRefs: [original] });
+    try {
+      // Omitting sourceRefs on an otherwise-ordinary field edit must never clear it — this is the
+      // same COALESCE-preserves-existing contract every plain UI edit already relies on.
+      const plainEdit = await request.put(`/api/projects/${ctx.projectId}/testcases/${created.id}`, {
+        data: { title: `${created.title} (edited)` },
+      });
+      expect(plainEdit.ok()).toBeTruthy();
+      expect((await plainEdit.json()).sourceRefs).toEqual([original]);
+
+      const replacement = { type: "bug", id: "E2E-REPLACEMENT", title: "Replacement citation" };
+      const withNewRefs = await request.put(`/api/projects/${ctx.projectId}/testcases/${created.id}`, {
+        data: { sourceRefs: [replacement] },
+      });
+      expect(withNewRefs.ok()).toBeTruthy();
+      expect((await withNewRefs.json()).sourceRefs).toEqual([replacement]);
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  // A duplicated test case was not generated by Zyra from the original's sources — it's a fresh,
+  // empty copy that happens to share content, and must start with no citations of its own.
+  test("duplicating a test case does not carry its citations forward onto the copy", async ({ request }) => {
+    const citation = { type: "testcase", id: "E2E-DUP-SOURCE", title: "Source citation" };
+    const created = await createCase(request, { sourceRefs: [citation] });
+    let duplicateId: string | undefined;
+    try {
+      const dupRes = await request.post(`/api/projects/${ctx.projectId}/testcases/${created.id}/duplicate`);
+      expect(dupRes.ok()).toBeTruthy();
+      const duplicate = await dupRes.json();
+      duplicateId = duplicate.id;
+
+      const getRes = await request.get(`/api/projects/${ctx.projectId}/testcases/${duplicate.id}`);
+      expect((await getRes.json()).sourceRefs).toEqual([]);
+    } finally {
+      await deleteCase(request, created.id);
+      if (duplicateId) await deleteCase(request, duplicateId);
+    }
+  });
+
   test("defaults are applied when optional fields are omitted on create", { tag: '@tesbo.testId("TES-TC-552")' }, async ({ request }) => {
     const created = await createCase(request);
     try {
@@ -76,6 +213,37 @@ test.describe("test case CRUD", () => {
       expect(created.suiteId).toBeNull();
       expect(created.steps).toEqual([]);
       expect(created.externalId).toBeTruthy();
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  // Distinct from TES-TC-552 above: that test proves a field OMITTED from the body gets a
+  // default. This proves a field explicitly SENT as blank does not — the Create Test Case form
+  // always includes suite/type/priority/automationStatus/component/severity in its payload, blank
+  // or not (testcases/page.tsx), so an unselected/untouched field on that form arrives here as an
+  // explicit "", not a missing key. Before this, insertTestCaseWithClient's `body.x || <default>`
+  // treated both cases the same, so a Create submitted without picking these fields silently
+  // saved "P2"/"Functional"/"Not Automated"/"No severity" — a real value the user never chose.
+  test("explicit blank priority/type/automationStatus/severity/component on create are saved blank, not defaulted", async ({ request }) => {
+    const created = await createCase(request, {
+      suiteId: undefined,
+      priority: "",
+      type: "",
+      automationStatus: "",
+      severity: "",
+      component: "",
+    });
+    try {
+      expect(created.priority).toBe("");
+      expect(created.type).toBeNull();
+      expect(created.automationStatus).toBeNull();
+      expect(created.severity).toBeNull();
+      expect(created.component).toBeNull();
+      expect(created.suiteId).toBeNull();
+      // Status is excluded from this optional-field behavior on purpose: the Create form never
+      // leaves it blank, so it keeps defaulting to "Draft" the same as before.
+      expect(created.status).toBe("Draft");
     } finally {
       await deleteCase(request, created.id);
     }

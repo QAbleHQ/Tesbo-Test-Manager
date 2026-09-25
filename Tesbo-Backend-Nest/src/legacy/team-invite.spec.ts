@@ -11,6 +11,7 @@ import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import type { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import type { KbExtractionRunnerService } from "./kb-extraction-runner.service";
@@ -127,7 +128,8 @@ function makeService(dbOpts: Parameters<typeof makeDb>[0] = {}, emailOverrides: 
     suitesCache,
     testcasesListCache,
     projectOverviewCache,
-    {} as unknown as CustomFieldsService
+    {} as unknown as CustomFieldsService,
+    {} as unknown as CustomTagsService
   );
   return { svc, db, query, txQuery, email };
 }

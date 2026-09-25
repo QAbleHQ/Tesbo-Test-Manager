@@ -851,6 +851,28 @@ export interface AiGeneratedDraft {
   expectedSummary: string;
   priority: string;
   tags: string[];
+  /**
+   * Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generated and
+   * persisted (normalizeAiDrafts/zyraBatchInsertTestCases) since before this field existed on this
+   * type; a draft from an older task can still lack it entirely, so treat absent the same as null.
+   */
+  severity?: string | null;
+  component?: string | null;
+  // The following are only ever present on a normalized update/archive entry (formatAiTask's
+  // server-side normalization of a non-create ai_generation_requests.generated_payload item — see
+  // ZYRA_IMPLEMENTATION_LOG.md). A plain task-board create draft never carries them.
+  action?: "proposed-create" | "proposed-update" | "proposed-archive" | string;
+  reason?: string;
+  externalId?: string;
+  /**
+   * The test-design technique(s) (ZYRA_TICKET_WORKFLOW.md §6/§8) that produced this case, already
+   * validated server-side against a fixed set (normalizeZyraTechniques) — never raw model output.
+   * Only ever present on a create-shaped draft (never update/archive, which don't go through
+   * generation). `["general"]` means no specific technique applied, not "uncategorized" — render
+   * accordingly (omit rather than show a meaningless badge). Absent entirely on an older draft
+   * from before this field existed.
+   */
+  techniques?: string[];
 }
 
 export interface GenerateAiTestCasesBody {
@@ -887,7 +909,10 @@ export async function generateAiTestCases(
 
 export interface AiGenerationHistoryItem {
   id: string;
-  requestedBy: string;
+  // null for a system-initiated row (e.g. a scheduled sweep) — see
+  // V107_ai_generation_requests_system_actor.sql. Not rendered anywhere today; kept honest for
+  // whatever eventually reads it.
+  requestedBy: string | null;
   provider: string;
   model: string | null;
   userStory: string;
@@ -934,7 +959,10 @@ export async function trackAiGenerationSaved(
 
 export interface ZyraTask {
   id: string;
-  provider: "openai" | "anthropic";
+  // "zyra_chat" for a chat-staged batch, "zyra_archive_sweep" for a sweep-staged one — not just
+  // "openai" | "anthropic" (real task-board generation calls), matching what the backend actually
+  // stores in ai_generation_requests.provider.
+  provider: "openai" | "anthropic" | "zyra_chat" | "zyra_archive_sweep" | string;
   model: string | null;
   userStory: string;
   acceptanceCriteria: string;
@@ -942,7 +970,7 @@ export interface ZyraTask {
   requestedCount: number;
   generatedCount: number;
   savedCount: number;
-  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | "accepted" | "rejected" | string;
+  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | string;
   feedback: string;
   context: string;
   jiraIssueKeys: string[];
@@ -990,6 +1018,12 @@ export interface ZyraAgentState {
    * task.generatedCount over-counts drafts that were never actually saved.
    */
   testcasesCreated: number;
+  /**
+   * All-time SUM(saved_count)/SUM(generated_count) across every task-board run for this project
+   * (chat-created testcases and failed runs excluded — see zyraAgent() on the backend), not
+   * derived from `tasks` below, which is capped to the 50 most recently updated rows.
+   */
+  approvalRate: number | null;
   tasks: ZyraTask[];
 }
 
@@ -1003,6 +1037,9 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /** See AiGeneratedDraft.severity/component — same fields, same server-side chatDraftRow/chatTestcaseRow normalization. */
+  severity?: string | null;
+  component?: string | null;
   /**
    * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
    * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/
@@ -1021,6 +1058,8 @@ export interface ZyraChatTestcaseRow {
    * not grounded in any specific source.
    */
   sourceRefs?: ZyraSourceRef[];
+  /** See AiGeneratedDraft.techniques — same field, same server-side validation, same rendering rule. */
+  techniques?: string[];
 }
 
 export interface ZyraSourceRef {
@@ -1035,6 +1074,10 @@ export interface ZyraSourceRef {
  * degrades to "no Continue button" rather than a type error.
  */
 export const ZYRA_MESSAGE_TIMED_OUT = "timed_out";
+/** Set while a Continue resume is running in the background — see continueZyraChatMessage. */
+export const ZYRA_MESSAGE_RESUMING = "resuming";
+/** How many consecutive timeouts a resume chain tolerates before Continue requires `narrow: true`. */
+export const ZYRA_RESUME_ATTEMPT_CAP = 2;
 
 export interface ZyraChatMessage {
   id: string;
@@ -1051,6 +1094,8 @@ export interface ZyraChatMessage {
   createdAt: string;
   /** Set when this message proposed create/update/archive operations awaiting review/Save. */
   reviewRequestId?: string | null;
+  /** How many consecutive resume attempts this message's chain has already burned through. */
+  resumeAttempt: number;
 }
 
 export interface ZyraChatActivePlan {
@@ -1119,14 +1164,21 @@ export async function deleteZyraChatSession(projectId: string, sessionId: string
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
+/**
+ * `opts.turnId`, if supplied, lets an already-open (or about-to-open) `GET .../turns/:turnId/events`
+ * SSE stream narrate this same request while it runs — see openZyraTurnProgress. Purely additive:
+ * the backend route has accepted this since the SSE service was built, this is just the first
+ * caller to actually send one. Omitting it reproduces today's behavior exactly.
+ */
 export async function sendZyraChatMessage(
   projectId: string,
   sessionId: string,
-  message: string
+  message: string,
+  opts: { turnId?: string } = {}
 ): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
-    body: { message },
+    body: { message, turnId: opts.turnId },
   });
 }
 
@@ -1134,17 +1186,51 @@ export async function sendZyraChatMessage(
  * Resumes a turn whose provider call timed out (message.status === ZYRA_MESSAGE_TIMED_OUT) — picks
  * the SAME turn back up server-side (skipping the routing call if it had already resolved a
  * suite/count before generation stalled) rather than re-sending the user's message from scratch.
- * `message` in the response is null when the checkpoint was already claimed by a concurrent call
- * (a double-click, another tab) — that is not an error, the caller should just re-render `session`.
+ *
+ * Fire-and-forget: this resolves quickly with `accepted` telling the caller whether ITS click is
+ * the one driving the resume (`true`) or someone else already claimed it (`false`, e.g. a
+ * double-click or another tab) — either way `session` already reflects current reality (the
+ * target message's `status` is `resuming`/`resumed`/`expired`), so the caller should render from
+ * that rather than from any local "did I click it" state. The actual resume can take minutes;
+ * poll `getZyraChatSession` (or watch `opts.turnId`'s SSE progress stream, if provided) for the
+ * eventual `completed`/`timed_out` outcome instead of awaiting it here.
+ *
+ * `opts.narrow: true` resumes at a smaller batch (`ZYRA_RETRY_BATCH`, 5) instead of the turn's
+ * original size — required once `resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP`, otherwise the request
+ * is rejected with `code: "zyra_resume_cap_exceeded"`.
  */
 export async function continueZyraChatMessage(
   projectId: string,
   sessionId: string,
-  messageId: string
-): Promise<{ message: ZyraChatMessage | null; session: ZyraChatSession }> {
+  messageId: string,
+  opts: { turnId?: string; narrow?: boolean } = {}
+): Promise<{ session: ZyraChatSession; accepted: boolean }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`, {
     method: "POST",
+    body: { turnId: opts.turnId, narrow: opts.narrow },
   });
+}
+
+export type ZyraTurnProgressEvent =
+  | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  | { kind: "complete"; payload: unknown }
+  | { kind: "error"; message: string }
+  | { kind: "unknown" };
+
+/**
+ * Best-effort live narration for one turn ("routing…", "generating…") — a pure enhancement over
+ * an already-running request (send or continue) that supplied this same `turnId`. Never the source
+ * of truth: the caller must still poll/re-fetch the session for the actual result, since this
+ * stream can legitimately say nothing (feature flag off, the turn already finished, a network
+ * blip) without that meaning anything went wrong. `withCredentials` is required — this is a
+ * cross-origin request to API_BASE, and a plain EventSource does not send the session cookie
+ * cross-origin without it.
+ */
+export function openZyraTurnProgress(projectId: string, sessionId: string, turnId: string): EventSource {
+  return new EventSource(
+    `${API_BASE}/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/turns/${turnId}/events`,
+    { withCredentials: true }
+  );
 }
 
 export async function stopZyraChatPlan(projectId: string, sessionId: string): Promise<ZyraChatSession> {
@@ -1213,6 +1299,31 @@ export async function editZyraTaskDraft(
 
 export async function closeZyraTask(projectId: string, taskId: string): Promise<ZyraTask> {
   return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/close`, {
+    method: "POST",
+  });
+}
+
+/** One ticket comment a Zyra save produced (integration_ticket_comments). */
+export interface ZyraTicketComment {
+  id: string;
+  provider: "jira" | "linear";
+  issueKey: string;
+  status: "pending" | "posted" | "failed" | "skipped_disabled" | "skipped_not_connected";
+  reason: string | null;
+  testcaseCount: number;
+  postedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listZyraTaskTicketComments(projectId: string, taskId: string): Promise<ZyraTicketComment[]> {
+  const res = await api<{ list: ZyraTicketComment[] }>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments`);
+  return res.list || [];
+}
+
+/** Re-sends a failed ticket comment; resolves with its outcome (posted, or failed with the reason). */
+export async function retryZyraTicketComment(projectId: string, taskId: string, commentId: string): Promise<ZyraTicketComment> {
+  return api<ZyraTicketComment>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments/${commentId}/retry`, {
     method: "POST",
   });
 }
@@ -1327,7 +1438,15 @@ export interface TestCaseListItem {
   jiraUrl?: string | null;
   linearIssueKey?: string | null;
   linearUrl?: string | null;
+  severity?: string | null;
+  component?: string | null;
   customFieldValues?: Record<string, unknown>;
+  /** Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * case when Zyra generated it — see ZyraSourceRef. Empty/absent for every manually-created,
+   * imported, or duplicated case, since only Zyra ever populates this. */
+  sourceRefs?: ZyraSourceRef[];
+  /** The project custom tags assigned to this case, sorted by name. */
+  customTags?: { id: string; name: string }[];
 }
 
 export async function listTestCases(
@@ -1347,6 +1466,8 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Custom tag ids — a case matches when it carries any one of them. */
+    customTagIds?: string[];
     /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
     sortBy?: "id" | "title" | "priority";
     sortDir?: "asc" | "desc";
@@ -1365,6 +1486,7 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
+  if (params?.customTagIds?.length) sp.set("customTagIds", params.customTagIds.join(","));
   if (params?.sortBy) sp.set("sortBy", params.sortBy);
   if (params?.sortDir) sp.set("sortDir", params.sortDir);
   const path = `/api/projects/${projectId}/testcases?${sp}`;
@@ -1600,6 +1722,32 @@ export async function getCustomFieldValues(projectId: string, testcaseId: string
   return api<CustomFieldValue[]>(`/api/projects/${projectId}/testcases/${testcaseId}/custom-field-values`);
 }
 
+/** custom_tags.name is VARCHAR(40). */
+export const CUSTOM_TAG_NAME_MAX_LENGTH = 40;
+
+export interface CustomTag {
+  id: string;
+  projectId: string;
+  name: string;
+  createdAt: string;
+}
+
+export async function listCustomTags(projectId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/custom-tags`);
+}
+
+export async function createCustomTag(projectId: string, data: { name: string }): Promise<CustomTag> {
+  return api<CustomTag>(`/api/projects/${projectId}/custom-tags`, { method: "POST", body: data });
+}
+
+export async function deleteCustomTag(projectId: string, tagId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/custom-tags/${tagId}`, { method: "DELETE" });
+}
+
+export async function getTestCaseTags(projectId: string, testcaseId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/testcases/${testcaseId}/tags`);
+}
+
 export interface LinkedIssueTaskStatus {
   taskId: string;
   status: string;
@@ -1614,8 +1762,47 @@ export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: s
 }
 
 // Test case import/export
-export function getExportUrl(projectId: string, format: "csv" | "xlsx"): string {
-  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}`;
+export interface TestCaseExportFilters {
+  suiteId?: string;
+  /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+  includeDescendants?: boolean;
+  status?: string;
+  priority?: string;
+  type?: string;
+  automationStatus?: string;
+  jiraIssueKey?: string;
+  linearIssueKey?: string;
+  search?: string;
+  /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
+  customFieldFilters?: string;
+  /** Custom tag ids — a case matches when it carries any one of them. */
+  customTagIds?: string[];
+  /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
+  sortBy?: "id" | "title" | "priority";
+  sortDir?: "asc" | "desc";
+}
+
+// Mirrors the repository screen's own filters AND its current column sort (see loadSelectedSuiteCases'
+// listTestCases call and suiteCasesSort) so "Export" produces exactly what's currently
+// selected/filtered/sorted on screen, not the whole project in an unrelated order — an unfiltered,
+// unsorted export is still the default when `filters` is omitted.
+export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
+  const sp = new URLSearchParams();
+  if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
+  if (filters?.includeDescendants) sp.set("includeDescendants", "true");
+  if (filters?.status) sp.set("status", filters.status);
+  if (filters?.priority) sp.set("priority", filters.priority);
+  if (filters?.type) sp.set("type", filters.type);
+  if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
+  if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
+  if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+  if (filters?.search) sp.set("search", filters.search);
+  if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+  if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
+  if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
+  if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
+  const qs = sp.toString();
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}${qs ? `?${qs}` : ""}`;
 }
 
 export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {
@@ -2874,6 +3061,9 @@ export async function disconnectIntegration(provider: IntegrationProvider): Prom
 
 export interface IntegrationConnectionStatus {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   siteUrl?: string;
   tokenExpiresAt?: string | null;
@@ -2890,6 +3080,9 @@ export async function getIntegrationStatus(provider: IntegrationProvider): Promi
 
 export interface JiraConnection {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   cloudId?: string;
   siteUrl?: string;
@@ -2963,6 +3156,8 @@ export interface SyncRun {
   status: SyncRunStatus;
   stage: SyncRunStage;
   remoteProjectKey: string | null;
+  /** Linear only — the mapped Team/Project name. Null for Jira and for runs recorded before it existed. */
+  remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;
   failedTickets: number;
@@ -3069,6 +3264,9 @@ export async function searchJiraIssuesLive(projectId: string, search: string): P
 
 export interface LinearConnection {
   connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
   id?: string;
   siteUrl?: string;
   tokenExpiresAt?: string;
@@ -3403,7 +3601,7 @@ export function getKnowledgeDocument(
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
 }
 
-// The Change History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// The Update History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
 // timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
 // are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
 export interface KnowledgeChangedField {

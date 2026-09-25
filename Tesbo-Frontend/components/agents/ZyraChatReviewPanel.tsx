@@ -2,7 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow } from "@/lib/api";
-import { Button, CopyButton, StatusChip } from "@/components/ui";
+import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { Button, CopyButton, StatusChip, SeverityBadge, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
 import { ZyraCitationsList } from "./ZyraCitations";
@@ -26,11 +28,65 @@ function priorityTone(priority?: string) {
   return "neutral" as const;
 }
 
-const ACTION_LABEL: Record<string, string> = {
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// A draft's severity is free-ish text end to end (normalizeZyraSeverity only guarantees the SAVED
+// row matches this set — a not-yet-saved preview can still carry an older/invalid value), so guard
+// before handing it to SeverityBadge rather than trusting the string.
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
+}
+
+// Exported so the task-board surfaces (TaskQuickViewPanel, the [taskId] detail page) can label a
+// normalized update/archive draft row the same way this panel already does, instead of each
+// defining its own copy — see formatAiTask's server-side normalization, which is what makes a
+// non-create draft carry this same `action` value outside the chat flow now too.
+export const ACTION_LABEL: Record<string, string> = {
   "proposed-create": "New",
   "proposed-update": "Update",
   "proposed-archive": "Archive",
 };
+
+// Display names for the fixed technique vocabulary (ZYRA_TECHNIQUES in legacy.service.ts,
+// ZYRA_TICKET_WORKFLOW.md §6/§8). Deliberately excludes "general" — see TechniqueBadges below.
+const TECHNIQUE_LABEL: Record<string, string> = {
+  equivalence_partitioning: "Equivalence Partitioning",
+  boundary_value_analysis: "Boundary Value Analysis",
+  decision_table: "Decision Table",
+  state_testing: "State Testing",
+  use_case_testing: "Use Case Testing",
+  pairwise_testing: "Pairwise Testing",
+  error_guessing: "Error Guessing",
+  security_perspective: "Security Perspective",
+};
+
+// Same rectangular-pill weight as JIRA_BADGE_CLASS (TaskQuickViewPanel) — a prose label instead of
+// a monospace ticket key, so no font-mono here.
+const TECHNIQUE_BADGE_CLASS =
+  "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)]";
+
+/**
+ * One badge per real technique a case was tagged with. Exported so the task-board surfaces
+ * (TaskQuickViewPanel, the [taskId] detail page) render this identically instead of each
+ * reimplementing the filter — matching how ACTION_LABEL is already shared for the same reason.
+ *
+ * `["general"]` (normalizeZyraTechniques' fallback for "no specific technique applied") is
+ * filtered out rather than shown as its own badge — a "General" pill next to real technique names
+ * would read as if it were one of them, when it actually means none matched. No techniques at all
+ * (empty array, or the field missing entirely on an older draft from before this feature existed)
+ * renders nothing — no empty row, no placeholder text, matching how ZyraCitationsList and the
+ * plain `tags` line elsewhere already render nothing rather than a hollow "no data" note.
+ */
+export function TechniqueBadges({ techniques }: { techniques?: string[] }) {
+  const real = (techniques || []).filter((t) => t !== "general");
+  if (!real.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {real.map((t) => (
+        <span key={t} className={TECHNIQUE_BADGE_CLASS}>{TECHNIQUE_LABEL[t] || t}</span>
+      ))}
+    </div>
+  );
+}
 
 /**
  * Renders a not-yet-saved batch of create/update/archive proposals from a Zyra chat message —
@@ -50,6 +106,7 @@ export function ZyraChatReviewPanel({
   reviewRequestId: string;
   initialRows: ZyraChatTestcaseRow[];
 }) {
+  const { workspace } = useAppData();
   const [status, setStatus] = useState<"checking" | "in_review" | "resolved">("checking");
   const [rows, setRows] = useState<ZyraChatTestcaseRow[]>(initialRows);
   const [selected, setSelected] = useState<number[]>(() => initialRows.map((_, index) => index));
@@ -117,11 +174,22 @@ export function ZyraChatReviewPanel({
         preconditions: values.preconditions,
         description: values.description,
         stepsJson: values.stepsJson,
+        severity: values.severity,
+        component: values.component,
       });
       setRows((prev) =>
         prev.map((row, i) =>
           i === index
-            ? { ...row, title: values.title, priority: values.priority, preconditions: values.preconditions, expectedSummary: values.description, stepsJson: values.stepsJson }
+            ? {
+                ...row,
+                title: values.title,
+                priority: values.priority,
+                preconditions: values.preconditions,
+                expectedSummary: values.description,
+                stepsJson: values.stepsJson,
+                severity: values.severity || null,
+                component: values.component || null,
+              }
             : row
         )
       );
@@ -141,6 +209,9 @@ export function ZyraChatReviewPanel({
     try {
       const savedSet = new Set(selected);
       const result = await saveZyraTask(projectId, reviewRequestId, { selectedDraftIndexes: selected });
+      // Fire-and-forget: refreshes every module whose cache holds test-case-derived data, in the
+      // background, without making this save feel slower. See lib/zyraCacheSync.ts.
+      refreshPageCachesAfterZyraSave(projectId, workspace?.id);
       // A partial selection leaves the rest staged for a later Save — only once nothing remains
       // does the batch resolve (matches the server: see zyraSaveAttempt's `remaining` handling).
       setRows((prev) => prev.filter((_, i) => !savedSet.has(i)).map((row, newIndex) => ({ ...row, draftIndex: newIndex })));
@@ -171,8 +242,17 @@ export function ZyraChatReviewPanel({
   }
 
   const tsv = toTsv(
-    ["Action", "Title", "Priority", "Preconditions", "First step", "Expected result"],
-    rows.map((row) => [ACTION_LABEL[row.action || ""] || row.action || "", row.title, row.priority || "P2", row.preconditions || "", firstStepPreview(row.stepsJson), row.expectedSummary || ""])
+    ["Action", "Title", "Priority", "Severity", "Component", "Preconditions", "First step", "Expected result"],
+    rows.map((row) => [
+      ACTION_LABEL[row.action || ""] || row.action || "",
+      row.title,
+      row.priority || "P2",
+      row.severity || "",
+      row.component || "",
+      row.preconditions || "",
+      firstStepPreview(row.stepsJson),
+      row.expectedSummary || "",
+    ])
   );
 
   return (
@@ -219,10 +299,19 @@ export function ZyraChatReviewPanel({
                       <StatusChip tone={priorityTone(row.priority)} className="!rounded-[5px] !px-1.5 !py-0 !font-mono !text-[10px] !font-semibold">
                         {row.priority || "P2"}
                       </StatusChip>
+                      {knownSeverity(row.severity) && (
+                        <SeverityBadge severity={knownSeverity(row.severity)!} className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium" />
+                      )}
+                      {row.component && <span className="text-[11px] text-[var(--muted)]">{row.component}</span>}
                       {row.externalId && <span className="font-mono text-[11px] text-[var(--muted)]">{row.externalId}</span>}
                     </div>
                     <p className="mt-1 text-[13px] font-medium text-[var(--foreground)]">{row.title}</p>
                     <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--muted)]">{firstStepPreview(row.stepsJson)}</p>
+                    {row.techniques?.length ? (
+                      <div className="mt-1">
+                        <TechniqueBadges techniques={row.techniques} />
+                      </div>
+                    ) : null}
                     <div className="mt-1">
                       <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
                     </div>

@@ -1,4 +1,6 @@
 import * as Sentry from "@sentry/nextjs";
+import posthog from "posthog-js";
+import { getPostHogConfig } from "@/lib/posthog";
 import { getSentryRuntimeConfig, shouldSendClientEvent } from "@/lib/sentry";
 
 const config = getSentryRuntimeConfig();
@@ -31,6 +33,24 @@ if (config.enabled) {
         event.tags = { ...event.tags, page_url: url };
       }
       return event;
+    },
+  });
+}
+
+// PostHog: only when NEXT_PUBLIC_POSTHOG_KEY is set (typically production app.tesbo.io).
+// Email is NOT masked — identify() attaches the real Tesbo login email so Persons show who used the app.
+const posthogConfig = getPostHogConfig();
+if (posthogConfig.enabled) {
+  posthog.init(posthogConfig.key, {
+    api_host: posthogConfig.host,
+    defaults: "2026-05-30",
+    capture_pageview: true,
+    capture_pageleave: true,
+    person_profiles: "identified_only",
+    session_recording: {
+      // Keep password fields private; do not blanket-mask text so emails stay readable in replays.
+      maskAllInputs: false,
+      maskInputOptions: { password: true },
     },
   });
 }

@@ -6,6 +6,7 @@ import { IconArrowsSort, IconColumns, IconSortAscending, IconSortDescending } fr
 import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { ZyraCitationsBadge } from "@/components/agents/ZyraCitationsBadge";
 
 /** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
 export type RepoTcSortColumn = "id" | "title" | "priority";
@@ -19,10 +20,13 @@ export type RepoTcColumnId =
   | "suite"
   | "jira"
   | "priority"
+  | "severity"
+  | "component"
   | "status"
   | "updated"
   | "type"
-  | "automation";
+  | "automation"
+  | "context";
 
 type RepoDataColumnId = Exclude<RepoTcColumnId, "select">;
 
@@ -31,11 +35,14 @@ const DATA_COLUMN_IDS: RepoDataColumnId[] = [
   "title",
   "suite",
   "jira",
+  "component",
   "priority",
-  "status",
-  "updated",
+  "severity",
   "type",
   "automation",
+  "status",
+  "context",
+  "updated",
 ];
 
 const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
@@ -45,10 +52,13 @@ const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
   suite: "Suite",
   jira: "Jira",
   priority: "Priority",
+  severity: "Severity",
+  component: "Component",
   status: "Status",
   updated: "Updated",
   type: "Type",
   automation: "Automation Type",
+  context: "Context",
 };
 
 const FIELD_IDS: Record<RepoDataColumnId, string> = {
@@ -57,21 +67,33 @@ const FIELD_IDS: Record<RepoDataColumnId, string> = {
   suite: "suite",
   jira: "jira",
   priority: "priority",
+  severity: "severity",
+  component: "component",
   status: "status",
   updated: "updated",
   type: "type",
   automation: "automationStatus",
+  context: "sourceRefs",
 };
 
-const DEFAULT_DATA_ORDER: RepoDataColumnId[] = [
+// Column order is fixed, not user-customizable — drag-to-reorder was removed (only the per-column
+// resize handle remains), so unlike `visible`/`widths` below this is never read from or written to
+// storage. It used to be, under the name DEFAULT_DATA_ORDER: a stored order from before a column
+// was added (or from before drag-reorder existed at all) would freeze that stale order forever,
+// since loadPrefs kept whatever was stored and only appended new columns at the end — reported as
+// Severity/Component always trailing after Updated regardless of where the code default put them.
+const DATA_ORDER: RepoDataColumnId[] = [
   "id",
   "title",
   "suite",
   "jira",
+  "component",
   "priority",
+  "severity",
   "type",
   "automation",
   "status",
+  "context",
   "updated",
 ];
 
@@ -86,10 +108,13 @@ const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
   suite: false,
   jira: false,
   priority: true,
+  severity: false,
+  component: false,
   status: true,
   updated: true,
   type: true,
   automation: true,
+  context: false,
 };
 
 const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -99,10 +124,13 @@ const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
   suite: 160,
   jira: 112,
   priority: 88,
+  severity: 100,
+  component: 140,
   status: 112,
   updated: 108,
   type: 120,
   automation: 136,
+  context: 168,
 };
 
 const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
@@ -112,10 +140,13 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
   suite: 96,
   jira: 80,
   priority: 72,
+  severity: 80,
+  component: 96,
   status: 88,
   updated: 96,
   type: 88,
   automation: 96,
+  context: 120,
 };
 
 const MAX_WIDTH = 560;
@@ -135,31 +166,12 @@ function repoAutomationTone(automationStatus: string) {
 }
 
 type TablePrefs = {
-  dataOrder: RepoDataColumnId[];
   visible: Record<RepoDataColumnId, boolean>;
   widths: Partial<Record<RepoTcColumnId, number>>;
 };
 
 function storageKey(projectId: string) {
   return `tesbo-repo-tc-table:v1:${projectId}`;
-}
-
-function normalizeDataOrder(raw: unknown): RepoDataColumnId[] {
-  const set = new Set(DATA_COLUMN_IDS);
-  const seen = new Set<string>();
-  const out: RepoDataColumnId[] = [];
-  if (Array.isArray(raw)) {
-    for (const id of raw) {
-      if (typeof id === "string" && set.has(id as RepoDataColumnId) && !seen.has(id)) {
-        seen.add(id);
-        out.push(id as RepoDataColumnId);
-      }
-    }
-  }
-  for (const id of DEFAULT_DATA_ORDER) {
-    if (!seen.has(id)) out.push(id);
-  }
-  return out;
 }
 
 function normalizeVisible(raw: unknown): Record<RepoDataColumnId, boolean> {
@@ -177,13 +189,11 @@ function normalizeVisible(raw: unknown): Record<RepoDataColumnId, boolean> {
 
 function loadPrefs(projectId: string): Omit<TablePrefs, "widths"> & { widths: Record<RepoTcColumnId, number> } {
   const widths: Record<RepoTcColumnId, number> = { ...DEFAULT_WIDTHS };
-  let dataOrder = DEFAULT_DATA_ORDER;
   let visible = DEFAULT_VISIBLE;
   try {
     const raw = readStoredValue(storageKey(projectId));
-    if (!raw) return { dataOrder, visible, widths };
+    if (!raw) return { visible, widths };
     const parsed = JSON.parse(raw) as Partial<TablePrefs>;
-    dataOrder = normalizeDataOrder(parsed.dataOrder);
     visible = normalizeVisible(parsed.visible);
     if (parsed.widths && typeof parsed.widths === "object") {
       for (const id of Object.keys(DEFAULT_WIDTHS) as RepoTcColumnId[]) {
@@ -196,7 +206,7 @@ function loadPrefs(projectId: string): Omit<TablePrefs, "widths"> & { widths: Re
   } catch {
     /* ignore */
   }
-  return { dataOrder, visible, widths };
+  return { visible, widths };
 }
 
 export type RepositoryTestCaseTableProps = {
@@ -237,7 +247,6 @@ export function RepositoryTestCaseTable({
   sort,
   onToggleSort,
 }: RepositoryTestCaseTableProps) {
-  const [dataOrder, setDataOrder] = useState<RepoDataColumnId[]>(DEFAULT_DATA_ORDER);
   const [visible, setVisible] = useState<Record<RepoDataColumnId, boolean>>(DEFAULT_VISIBLE);
   const [widths, setWidths] = useState<Record<RepoTcColumnId, number>>(DEFAULT_WIDTHS);
   const [prefsReady, setPrefsReady] = useState(false);
@@ -251,7 +260,6 @@ export function RepositoryTestCaseTable({
     const t = window.setTimeout(() => {
       if (cancelled) return;
       const p = loadPrefs(projectId);
-      setDataOrder(p.dataOrder);
       setVisible(p.visible);
       setWidths(p.widths);
       setPrefsReady(true);
@@ -265,12 +273,12 @@ export function RepositoryTestCaseTable({
   useEffect(() => {
     if (!prefsReady) return;
     try {
-      const payload: TablePrefs = { dataOrder, visible, widths };
+      const payload: TablePrefs = { visible, widths };
       writeStoredValue(storageKey(projectId), JSON.stringify(payload));
     } catch {
       /* ignore */
     }
-  }, [prefsReady, projectId, dataOrder, visible, widths]);
+  }, [prefsReady, projectId, visible, widths]);
 
   useEffect(() => {
     if (!columnsMenuOpen) return;
@@ -313,8 +321,8 @@ export function RepositoryTestCaseTable({
   }, [widths]);
 
   const visibleDataColumns = useMemo(
-    () => dataOrder.filter((id) => (id === "suite" ? !suitePanelOpen || visible.suite : visible[id])),
-    [dataOrder, visible, suitePanelOpen],
+    () => DATA_ORDER.filter((id) => (id === "suite" ? !suitePanelOpen || visible.suite : visible[id])),
+    [visible, suitePanelOpen],
   );
 
   const orderedColumns: RepoTcColumnId[] = useMemo(
@@ -439,6 +447,21 @@ export function RepositoryTestCaseTable({
             >
               {tc.title}
             </button>
+            {/* Project custom tags (brand-tinted, what the toolbar's Tags filter matches on) ahead of the
+                free-text automation tags (mono, grey) — two different things, so they look different. */}
+            {(tc.customTags?.length ?? 0) > 0 && (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {tc.customTags!.map((tag) => (
+                  <span
+                    key={tag.id}
+                    title="Custom tag"
+                    className="rounded-full bg-[var(--brand-soft)] px-2 py-px text-[10.5px] font-medium text-[var(--accent-light)]"
+                  >
+                    {tag.name}
+                  </span>
+                ))}
+              </div>
+            )}
             {tags.length > 0 && (
               <div className="mt-1 flex flex-wrap gap-1">
                 {tags.map((tag) => (
@@ -512,6 +535,18 @@ export function RepositoryTestCaseTable({
             <span className={innerTruncate}>{tc.type}</span>
           </td>
         );
+      case "severity":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.severity || "—"}</span>
+          </td>
+        );
+      case "component":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.component || "—"}</span>
+          </td>
+        );
       case "automation":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
@@ -521,6 +556,12 @@ export function RepositoryTestCaseTable({
             >
               <span className={innerTruncate}>{tc.automationStatus}</span>
             </StatusChip>
+          </td>
+        );
+      case "context":
+        return (
+          <td key={col} style={tdStyle} className={cellClass} onClick={(e) => e.stopPropagation()}>
+            <ZyraCitationsBadge refs={tc.sourceRefs} projectId={projectId} />
           </td>
         );
       default:

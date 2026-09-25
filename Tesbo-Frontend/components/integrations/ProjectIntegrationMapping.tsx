@@ -29,6 +29,8 @@ interface RemoteItem {
 
 interface ConnectionStatus {
   connected: boolean;
+  needsReconnect?: boolean;
+  authError?: string | null;
   siteUrl?: string;
   connectedProjects?: { id: string }[];
 }
@@ -96,9 +98,13 @@ export function ProjectIntegrationMapping({
         const config = await getIntegrationConfig(provider).catch(() => null);
         setOauthConfigured(!!config?.configured);
       }
-    } catch {
-      setMessage({ type: "error", text: `Failed to load ${label} integration data.` });
+    } catch (err) {
+      // The backend's own reason (e.g. "Jira needs to be reconnected: …") is what tells the user
+      // what to do; a generic message here used to hide it.
+      setMessage({ type: "error", text: err instanceof Error && err.message ? err.message : `Failed to load ${label} integration data.` });
     } finally {
+      // Also on failure — otherwise "Loading … projects" spins forever after a failed list call.
+      setItemsLoading(false);
       setLoading(false);
     }
   }, [projectId, router, fetchStatus, fetchRemoteList, label, provider]);
@@ -235,6 +241,15 @@ export function ProjectIntegrationMapping({
         />
       }
     >
+      {status.needsReconnect && (
+        <div role="alert" className="rounded-lg border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning-foreground)]">
+          <p className="font-medium">{label} needs to be reconnected</p>
+          {status.authError && <p className="mt-1">{status.authError}</p>}
+          <Link href={`${workspaceConfigHref}?returnProjectId=${projectId}`} className="mt-1 inline-block font-medium underline">
+            Reconnect {label} in workspace settings
+          </Link>
+        </div>
+      )}
       {message && (
         <div
           className={`rounded-lg border px-3 py-2 text-sm ${

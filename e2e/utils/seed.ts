@@ -48,6 +48,8 @@ export interface SeedCaseOptions {
   priority?: string;
   status?: string;
   automationTags?: string;
+  /** Ids from the project's custom_tags catalog (see seedCustomTag below). */
+  customTagIds?: string[];
   /** Backdates created_at (and updated_at with it, unless updatedDaysAgo says otherwise). */
   createdDaysAgo?: number;
   /** Backdates updated_at on its own, for the repository-summary "updated" windows. */
@@ -64,6 +66,13 @@ export async function seedProject(api: APIRequestContext, name: string): Promise
 export async function seedSuite(api: APIRequestContext, projectId: string, name: string): Promise<string> {
   const res = await api.post(`/api/projects/${projectId}/suites`, { data: { name }, failOnStatusCode: false });
   if (!res.ok()) throw new Error(`Could not create fixture suite "${name}": ${res.status()} ${await res.text()}`);
+  return (await res.json()).id;
+}
+
+/** Creates a project custom tag through the API and returns its id. */
+export async function seedCustomTag(api: APIRequestContext, projectId: string, name: string): Promise<string> {
+  const res = await api.post(`/api/projects/${projectId}/custom-tags`, { data: { name }, failOnStatusCode: false });
+  if (!res.ok()) throw new Error(`Could not create fixture custom tag "${name}": ${res.status()} ${await res.text()}`);
   return (await res.json()).id;
 }
 
@@ -85,6 +94,7 @@ export async function seedTestCase(
       priority: opts.priority ?? "P2",
       status: opts.status ?? "Draft",
       automationTags: opts.automationTags ?? null,
+      customTagIds: opts.customTagIds,
     },
     failOnStatusCode: false,
   });
@@ -256,12 +266,20 @@ export function purgeProject(projectId: string): void {
     throw new Error(`Refusing to purge project ${projectId} ("${name}") — it isn't an E2E fixture project.`);
   }
   const id = literal(projectId);
+  // Ordered child-before-parent, per hard-delete remediation (V110-V117): cycle_items.cycle_id,
+  // executions.cycle_item_id, bug_links.bug_id and plan_items.plan_id are all ON DELETE RESTRICT
+  // now, not CASCADE — this used to rely on the cascade to clean up in any order at all.
   exec(
     [
-      `DELETE FROM bugs WHERE project_id = ${id};`,
+      `DELETE FROM executions WHERE cycle_item_id IN (SELECT ci.id FROM cycle_items ci JOIN cycles c ON c.id = ci.cycle_id WHERE c.project_id = ${id});`,
+      `DELETE FROM cycle_items WHERE cycle_id IN (SELECT id FROM cycles WHERE project_id = ${id});`,
+      `DELETE FROM bug_links WHERE bug_id IN (SELECT id FROM bugs WHERE project_id = ${id});`,
       `DELETE FROM cycles WHERE project_id = ${id};`,
+      `DELETE FROM plan_items WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ${id});`,
       `DELETE FROM plans WHERE project_id = ${id};`,
+      `DELETE FROM bugs WHERE project_id = ${id};`,
       `DELETE FROM testcases WHERE project_id = ${id};`,
+      `DELETE FROM custom_tags WHERE project_id = ${id};`,
       `DELETE FROM suites WHERE project_id = ${id};`,
       `UPDATE projects SET archived_at = now() WHERE id = ${id};`,
     ].join(" "),

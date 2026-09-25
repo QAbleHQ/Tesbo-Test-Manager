@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { logout as logoutRequest } from "@/lib/api";
+import { resetTesboUser } from "@/lib/posthog";
 import { removeStoredValue } from "@/lib/storage";
 import { clearPageCache } from "@/lib/pageDataCache";
 
@@ -24,6 +25,7 @@ export function useLogout() {
       await logoutRequest();
       if (typeof window !== "undefined") removeStoredValue("token");
       clearPageCache();
+      resetTesboUser();
       router.replace("/login");
       router.refresh();
     } catch {

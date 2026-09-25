@@ -40,9 +40,20 @@ import {
  * parameter at all, so there is no actor to record even in principle. ACT-A-02 stays red until that
  * handler takes a caller and the branch records it. Do not weaken it to `toBeDefined()`.
  *
- * Also pinned here: the feed calls itself an audit log, but `deleteSuite` / `deleteCycle` are HARD
- * deletes and the synthetic rows are derived from the live row — so removing an entity retroactively
- * erases its history. ACT-A-11 states the audit-log expectation.
+ * Also pinned here: the feed calls itself an audit log, and the synthetic rows are derived from the
+ * live row — so an entity's hard deletion retroactively erases its history. `deleteSuite` is no
+ * longer one: migrations/V110_suites_soft_delete.sql plus the deleteSuite rewrite mean a deleted
+ * suite's row survives (soft-deleted), so its "created"/"updated" synthetic entries now survive too —
+ * genuinely, not merely because a separate audit_logs entry happens to remember it. ACT-A-11 states
+ * the audit-log expectation and now passes for the reason the feed's own name implies it should, not
+ * despite it.
+ *
+ * `deleteCycle` was also a hard delete when the paragraph above was first written, so the same
+ * erasure applied to cycle-created/cycle-updated too — that has since changed. Hard-delete
+ * remediation Phase 1 (migrations/V111_cycles_soft_delete.sql) made deleteCycle a soft-delete, and
+ * Phase 2 applied the identical "(deleted)" marker treatment `activityEventsSql` already gives
+ * suites to the cycle-created/cycle-updated branches (legacy.service.ts:7161-7173). ACT-A-18 below
+ * is the cycle equivalent of ACT-A-11.
  */
 
 test.describe("activity feed", () => {
@@ -108,7 +119,9 @@ test.describe("activity feed", () => {
     exec(`DELETE FROM executions WHERE cycle_item_id IN (SELECT ci.id FROM cycle_items ci JOIN cycles c ON c.id = ci.cycle_id WHERE c.project_id IN (${projects}));`);
     exec(`DELETE FROM cycle_items WHERE cycle_id IN (SELECT id FROM cycles WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM cycles WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM plan_items WHERE plan_id IN (SELECT id FROM plans WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM plans WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM bug_links WHERE bug_id IN (SELECT id FROM bugs WHERE project_id IN (${projects}));`);
     exec(`DELETE FROM bugs WHERE project_id IN (${projects});`);
     exec(`DELETE FROM testcases WHERE project_id IN (${projects});`);
     exec(`DELETE FROM suites WHERE project_id IN (${projects});`);
@@ -173,6 +186,12 @@ test.describe("activity feed", () => {
   async function createTestCase(title: string, api: APIRequestContext = asOwner): Promise<string> {
     const res = await api.post(`/api/projects/${tenant!.mainProjectId}/testcases`, { data: { title } });
     expect(res.ok(), `creating test case — ${await res.text()}`).toBeTruthy();
+    return (await res.json()).id;
+  }
+
+  async function createCycle(name: string, api: APIRequestContext = asOwner): Promise<string> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/cycles`, { data: { name } });
+    expect(res.ok(), `creating run — ${await res.text()}`).toBeTruthy();
     return (await res.json()).id;
   }
 
@@ -376,14 +395,21 @@ test.describe("activity feed", () => {
     });
     expect(deleted.ok(), `deleting the suite — ${await deleted.text()}`).toBeTruthy();
 
-    // The page calls itself "a full audit log". deleteSuite is a HARD delete and the suite branches
-    // read from the live row, so the record of it ever existing goes with it — an audit log that
-    // forgets is the one thing an audit log may not do.
+    // The page calls itself "a full audit log". Before Zyra context integrity Phase 3/4
+    // (migrations/V110_suites_soft_delete.sql, legacy.service.ts's deleteSuite rewrite), deleteSuite
+    // was a HARD delete and the suite branches read from the live row, so the record of it ever
+    // existing went with it — an audit log that forgets is the one thing an audit log may not do.
+    // Now the suite row survives (soft-deleted), so this entry survives too — genuinely, not by
+    // accident of a separate audit_logs row remembering it. Per Q10's resolution, the surviving name
+    // is marked "(deleted)" rather than shown as if the suite were still live — the same
+    // "history, not current state" treatment planItemRows gets (see plans.spec.ts).
     const { list } = await feed({ limit: 100 });
+    const entry = entryFor(list, `${suiteName} (deleted)`);
     expect(
-      entryFor(list, suiteName),
-      "the audit log lost its record of the suite when the suite was deleted",
+      entry,
+      `the audit log lost its record of the suite when the suite was deleted — got ${JSON.stringify(list.map((i) => i.entityName))}`,
     ).toBeTruthy();
+    expect(entry!.entityType).toBe("suite");
   });
 
   test("ACT-A-12 another project's activity is not in this project's feed", { tag: '@tesbo.testId("TES-TC-897")' }, async () => {
@@ -549,5 +575,54 @@ test.describe("activity feed", () => {
     } finally {
       await asGuest.dispose();
     }
+  });
+
+  // ─── Hard-delete remediation Phase 2: cycle-created/cycle-updated survive the run's own deletion ──
+
+  test("ACT-A-18 a run's created/updated history survives the run being soft-deleted, marked rather than blanked", async () => {
+    // The cycle equivalent of ACT-A-11's suite case. Before this fix, cycle-created/cycle-updated
+    // rendered the LIVE cycles.name with no deleted_at-aware CASE at all, so once deleteCycle
+    // (hard-delete remediation Phase 1) started soft-deleting the row instead of removing it, the
+    // synthetic rows kept resolving the live (still-present) name forever — a "deleted" run's
+    // history never said so. This proves both halves: the entry survives, AND it is marked.
+    const runName = stamp("RunDeletedButRemembered");
+    const cycleId = await createCycle(runName);
+    const createdEntry = entryFor((await feed({ limit: 100 })).list, runName, "created");
+    expect(createdEntry, "the run's own creation must appear in the feed before it is touched").toBeTruthy();
+    expect(createdEntry!.entityType).toBe("cycle");
+
+    // updated_at must move past created_at by more than the union's 1-second guard before the
+    // synthetic "updated" branch fires at all — same requirement activityEventsSql applies to every
+    // other entity. Backdating created_at (rather than sleeping in the test) makes that gap
+    // deterministic without slowing the suite down.
+    const renamed = `${runName} (renamed)`;
+    exec(`UPDATE cycles SET created_at = now() - interval '5 seconds' WHERE id = ${literal(cycleId)};`);
+    const patchRes = await asOwner.patch(`/api/cycles/${cycleId}`, { data: { name: renamed } });
+    expect(patchRes.ok(), `renaming the run — ${await patchRes.text()}`).toBeTruthy();
+    const updatedEntry = entryFor((await feed({ limit: 100 })).list, renamed, "updated");
+    expect(updatedEntry, "the rename must appear as its own 'updated' entry").toBeTruthy();
+
+    const deleteRes = await asOwner.delete(`/api/cycles/${cycleId}`);
+    expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+    const { list } = await feed({ limit: 100 });
+    // Both branches select the live cycles.name column (there is no snapshot the way plan_items
+    // takes one) — so once the run is renamed, BOTH the "created" and "updated" synthetic rows read
+    // the same current name, and after the delete both independently apply the CASE WHEN marker to
+    // it. Two distinct entries (different id suffix and action), same displayed name — which is
+    // exactly why the fix has to live in both branches rather than one: an unfixed "created" branch
+    // would still leak the live name even with "updated" already marked correctly.
+    const createdAfterDelete = entryFor(list, `${renamed} (deleted)`, "created");
+    expect(
+      createdAfterDelete,
+      `the run's creation entry lost its record when the run was deleted — got ${JSON.stringify(list.map((i) => i.entityName))}`,
+    ).toBeTruthy();
+    expect(createdAfterDelete!.entityType).toBe("cycle");
+
+    const updatedAfterDelete = entryFor(list, `${renamed} (deleted)`, "updated");
+    expect(
+      updatedAfterDelete,
+      `the run's rename entry lost its record when the run was deleted — got ${JSON.stringify(list.map((i) => i.entityName))}`,
+    ).toBeTruthy();
   });
 });

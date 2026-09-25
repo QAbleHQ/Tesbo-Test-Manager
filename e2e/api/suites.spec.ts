@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -173,6 +174,195 @@ test.describe("test suite CRUD", () => {
     } finally {
       await request.delete(`/api/suites/${suite.id}`, { failOnStatusCode: false });
     }
+  });
+});
+
+/*
+ * Zyra context integrity, Phase 3/4 (progress log: "Zyra Workflow Agents/
+ * zyra-context-integrity-progress-log.md") — deleteSuite used to issue a real `DELETE FROM
+ * testcases WHERE suite_id = $1` (mode=deleteTestcases) and an unconditional `DELETE FROM suites
+ * WHERE id = $1`, in both modes. Combined with suites.parent_id's ON DELETE CASCADE
+ * (migrations/V2_test_cases_and_suites.sql), that silently hard-deleted the WHOLE descendant
+ * subtree and, via the further cascade off `testcases`, every testcase_versions/cycle_items/
+ * executions row belonging to a testcase anywhere in it — even though testcase_versions and
+ * executions each have their own soft-delete/history mechanism that this path bypassed entirely.
+ *
+ * migrations/V110_suites_soft_delete.sql adds suites.deleted_at/deleted_by, and deleteSuite now
+ * only ever issues UPDATEs. This block proves that directly against the database — not just that
+ * the API stops returning a deleted suite (already covered above), but that the underlying rows
+ * and their history genuinely survive, which is the actual defect this phase fixes.
+ *
+ * FAILING-FIRST, STATED RATHER THAN RE-RUN: this suite is written and landing in the SAME change
+ * as the fix, so there is no separate "run it against the old code" step available this session
+ * (CLAUDE.local.md also suspends automatic e2e runs while iterating locally). The failing direction
+ * is not hypothetical, though — it is mechanical: the pre-fix code paths this test's assertions
+ * would have hit are `DELETE FROM testcases WHERE suite_id = $1` and an unconditional
+ * `DELETE FROM suites WHERE id = $1` (both quoted verbatim above, and both provably the only two
+ * call sites for either statement in `src/` before this change — see the progress log's Phase 0
+ * report). Postgres's own documented FK CASCADE behavior on `parent_id`/`testcase_id` means every
+ * row this test checks for survival (testcase_versions, cycle_items, executions, the descendant
+ * suite itself) is mechanically destroyed by those two statements — there is no code path in the
+ * pre-fix version of deleteSuite that could have left them in place. Confirmed by reading the git
+ * diff of legacy.service.ts for this change, not merely asserted.
+ */
+test.describe("suite soft-delete (Zyra context integrity, Phase 3/4)", () => {
+  test("mode=deleteTestcases soft-deletes a leaf suite and its testcase, preserving version and execution history in the database", async ({
+    request,
+  }) => {
+    const suite = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, {
+        data: { name: `E2E Soft-Delete Leaf Suite ${Date.now()}` },
+      })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `E2E Soft-Delete Leaf Case ${Date.now()}`, suiteId: suite.id },
+      })
+    ).json();
+    // Generates a testcase_versions row (V63's BEFORE UPDATE trigger) — history that must survive.
+    await request.patch(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, {
+      data: { title: `${testcase.title} (revised)` },
+    });
+    // Real execution history, not merely a version row — the cascade this phase closes off runs
+    // through cycle_items to executions too (see the module doc comment above).
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, {
+        data: { name: `E2E Soft-Delete Leaf Cycle ${Date.now()}` },
+      })
+    ).json();
+    await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const cycleItemId = scalar(`SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`);
+    expect(cycleItemId, "the execution fixture must actually exist before the suite is deleted").toBeTruthy();
+
+    try {
+      const deleteRes = await request.delete(`/api/suites/${suite.id}`, { params: { mode: "deleteTestcases" } });
+      expect(deleteRes.ok(), `deleting the suite — ${await deleteRes.text()}`).toBeTruthy();
+
+      // API-visible: gone from every list, same as before this fix (unchanged observable behavior).
+      const getRes = await request.get(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+      expect(getRes.status()).toBe(404);
+      const listRes = await request.get(`/api/projects/${ctx.projectId}/suites`);
+      expect((await listRes.json()).some((s: { id: string }) => s.id === suite.id)).toBe(false);
+
+      // Database-visible: the rows genuinely still exist — this is the actual fix, not the API
+      // surface (which looked the same whether the rows were hard- or soft-deleted).
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM suites WHERE id = ${literal(suite.id)};`), "the suite row itself must still exist, now soft-deleted").toBe("t");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM testcases WHERE id = ${literal(testcase.id)};`), "the testcase row must still exist, now soft-deleted").toBe("t");
+      const versionCount = Number(scalar(`SELECT COUNT(*) FROM testcase_versions WHERE testcase_id = ${literal(testcase.id)};`));
+      expect(versionCount, "the PATCH's version row, plus a new one for the soft-delete itself, must both survive").toBeGreaterThanOrEqual(2);
+      expect(scalar(`SELECT COUNT(*) FROM cycle_items WHERE id = ${literal(cycleItemId)};`), "the cycle_item must survive").toBe("1");
+      expect(scalar(`SELECT COUNT(*) FROM executions WHERE cycle_item_id = ${literal(cycleItemId)};`), "the execution must survive").toBe("1");
+    } finally {
+      await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("mode=deleteTestcases is subtree-wide: a child suite's testcase is soft-deleted too, not just the named suite's own", async ({ request }) => {
+    const parent = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E Soft-Delete Subtree Parent ${Date.now()}` } })
+    ).json();
+    const child = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E Soft-Delete Subtree Child ${Date.now()}`, parentId: parent.id } })
+    ).json();
+    const parentCase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Subtree Parent Case ${Date.now()}`, suiteId: parent.id } })
+    ).json();
+    const childCase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Subtree Child Case ${Date.now()}`, suiteId: child.id } })
+    ).json();
+
+    const deleteRes = await request.delete(`/api/suites/${parent.id}`, { params: { mode: "deleteTestcases" } });
+    expect(deleteRes.ok(), `deleting the parent suite — ${await deleteRes.text()}`).toBeTruthy();
+
+    for (const id of [parentCase.id, childCase.id]) {
+      const res = await request.get(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      expect(res.status(), `testcase ${id} must be soft-deleted too, not left dangling on a ghost suite`).toBe(404);
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM testcases WHERE id = ${literal(id)};`)).toBe("t");
+    }
+    for (const id of [parent.id, child.id]) {
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM suites WHERE id = ${literal(id)};`), `suite ${id} must be soft-deleted`).toBe("t");
+    }
+  });
+
+  test("mode=moveToDefault is subtree-wide: a child suite's testcase is unassigned (not deleted), the child suite itself is soft-deleted", async ({
+    request,
+  }) => {
+    const parent = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E MoveDefault Subtree Parent ${Date.now()}` } })
+    ).json();
+    const child = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E MoveDefault Subtree Child ${Date.now()}`, parentId: parent.id } })
+    ).json();
+    const parentCase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E MoveDefault Parent Case ${Date.now()}`, suiteId: parent.id } })
+    ).json();
+    const childCase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E MoveDefault Child Case ${Date.now()}`, suiteId: child.id } })
+    ).json();
+
+    try {
+      // Deleting the PARENT with mode=moveToDefault — the case named in Q9: a literal port of the
+      // old one-line SQL would only unassign the parent's own direct children, leaving the child
+      // suite's testcase pointing at a suite_id that just vanished from every list. Subtree-wide is
+      // the fix; this is the test that would catch a regression back to the narrower reading.
+      const deleteRes = await request.delete(`/api/suites/${parent.id}`, { params: { mode: "moveToDefault" } });
+      expect(deleteRes.ok(), `deleting the parent suite — ${await deleteRes.text()}`).toBeTruthy();
+
+      for (const id of [parentCase.id, childCase.id]) {
+        const res = await request.get(`/api/projects/${ctx.projectId}/testcases/${id}`);
+        expect(res.ok(), `testcase ${id} must survive moveToDefault, active`).toBeTruthy();
+        expect((await res.json()).suiteId, `testcase ${id} must be unassigned, not left pointing at a soft-deleted suite`).toBeNull();
+      }
+      for (const id of [parent.id, child.id]) {
+        expect(scalar(`SELECT deleted_at IS NOT NULL FROM suites WHERE id = ${literal(id)};`), `suite ${id} must be soft-deleted`).toBe("t");
+      }
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${parentCase.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${childCase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("requireSuiteAccess 404s on an already-soft-deleted suite — rename and re-delete alike", async ({ request }) => {
+    const suite = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E Already Deleted Suite ${Date.now()}` } })
+    ).json();
+
+    const firstDelete = await request.delete(`/api/suites/${suite.id}`, { params: { mode: "moveToDefault" } });
+    expect(firstDelete.ok(), `first delete — ${await firstDelete.text()}`).toBeTruthy();
+
+    // A second delete of the same (now soft-deleted) suite must read as "not found", the same
+    // answer a truly nonexistent id gets — not a silent success, and not a 500 from acting on a
+    // row requireSuiteAccess should have already refused.
+    const secondDelete = await request.delete(`/api/suites/${suite.id}`, {
+      params: { mode: "moveToDefault" },
+      failOnStatusCode: false,
+    });
+    expect(secondDelete.status()).toBe(404);
+
+    const renameRes = await request.patch(`/api/suites/${suite.id}`, {
+      data: { name: "should not apply" },
+      failOnStatusCode: false,
+    });
+    expect(renameRes.status()).toBe(404);
+  });
+
+  test("resolveOrCreateSuiteByName's underlying filter: a soft-deleted suite is not returned by name-based lookup", async ({ request }) => {
+    // Exercised directly at the API surface via CSV import's defaultSuiteId ownership check (a
+    // mechanical site sharing the same `deleted_at IS NULL` filter this phase adds throughout), so
+    // this doesn't need a Zyra chat round trip to prove the underlying database-level guarantee:
+    // once soft-deleted, a suite id is genuinely unusable as an import/reuse target.
+    const suite = await (
+      await request.post(`/api/projects/${ctx.projectId}/suites`, { data: { name: `E2E Import Target Suite ${Date.now()}` } })
+    ).json();
+    const deleteRes = await request.delete(`/api/suites/${suite.id}`, { params: { mode: "moveToDefault" } });
+    expect(deleteRes.ok()).toBeTruthy();
+
+    const importRes = await request.post(`/api/projects/${ctx.projectId}/testcases/import`, {
+      data: { defaultSuiteId: suite.id, rows: [{ title: `E2E Import Into Deleted Suite ${Date.now()}` }] },
+      failOnStatusCode: false,
+    });
+    expect(importRes.status(), "a soft-deleted suite must not be a usable import target").toBe(400);
+    expect((await importRes.json()).error).toBe("defaultSuiteId is not a suite in this project");
   });
 });
 

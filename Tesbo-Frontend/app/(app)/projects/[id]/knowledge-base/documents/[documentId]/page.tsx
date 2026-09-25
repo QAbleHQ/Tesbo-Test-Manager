@@ -532,7 +532,7 @@ export default function KnowledgeDocumentPage() {
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = doc.sourceProvider === "linear" ? "Linear" : "Jira";
 
-  // Change History is the same data and component everywhere — the Knowledge Base list's
+  // Update History is the same data and component everywhere — the Knowledge Base list's
   // info-icon popover and this modal never drift into showing different things for the same
   // document, whether it's a synced mirror or a manually-created one. Only the confirmation step
   // below is specific to this modal.
@@ -744,7 +744,7 @@ export default function KnowledgeDocumentPage() {
         />
       </div>
 
-      <Modal open={historyOpen} onClose={closeHistoryModal} title="Change history">
+      <Modal open={historyOpen} onClose={closeHistoryModal} title="Update History">
         {historyModalBody}
       </Modal>
     </div>

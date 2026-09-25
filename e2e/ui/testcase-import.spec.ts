@@ -471,6 +471,37 @@ test.describe("test case import wizard", () => {
     }
   });
 
+  test("an imported test case's steps still show correctly when reopened for editing", async ({ browser }) => {
+    // Regression test for: testcases.steps comes back as a genuine array for a row written by
+    // import (steps is a jsonb column and insertImportChunk never stringifies it — see
+    // insertImportChunk in legacy.service.ts), but as a JSON-encoded string for a row written by
+    // this page's own create/edit save or by Zyra (both double-encode). parseSteps
+    // (testcases/page.tsx) used to assume the string shape exclusively, so reopening an IMPORTED
+    // case's edit panel silently showed one blank step instead of the steps that were actually
+    // imported, even though GET /testcases/:id (asserted above) already returned them correctly.
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Steps Reopen");
+      const { page, projectId } = fixture;
+      const title = `E2E Steps Reopen Case ${Date.now()}`;
+      const steps = "Open the login page => The form is shown | Submit empty credentials => Validation error is shown";
+
+      await openWizard(page, projectId);
+      await uploadCsv(page, toCsv(["Title", "Steps"], [[title, steps]]));
+      await runImport(page, 1);
+      await page.getByRole("button", { name: "Done" }).click();
+
+      await page.getByRole("button", { name: title }).click();
+      const panel = page.locator("aside");
+      const actionFields = panel.getByPlaceholder("Describe the action to perform");
+      await expect(actionFields).toHaveCount(2);
+      await expect(actionFields.nth(0)).toHaveValue("Open the login page");
+      await expect(actionFields.nth(1)).toHaveValue("Submit empty credentials");
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
   test("builds a single step from separate Action/Expected Result columns when Steps isn't mapped", { tag: '@tesbo.testId("TES-TC-2103")' }, async ({ browser }) => {
     let fixture: Fixture | undefined;
     try {
@@ -523,6 +554,35 @@ test.describe("test case import wizard", () => {
       const listed = (await listCases(projectId)).find((c) => c.title === title)!;
       const imported = await getCase(projectId, listed.id);
       expect(imported.steps).toEqual([{ stepNumber: 1, action: "Open the app", expectedResult: "It loads" }]);
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("the downloaded sample CSV template auto-maps its Action and Expected Result columns", { tag: '@tesbo.testId("TES-TC-2105")' }, async ({ browser }) => {
+    // Regression test for: the official sample template only ever had a combined "steps" column, so
+    // Action and Expected Result had no header to match and always showed "-- Skip --" in Map
+    // Columns, even though those two fields are otherwise fully supported (TES-TC-2103/2104).
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "Template Automap");
+      const { page, projectId } = fixture;
+
+      const templateRes = await page.request.get(
+        `${env.apiBaseUrl}/api/projects/${projectId}/testcases/import/template?format=csv`,
+      );
+      expect(templateRes.status()).toBe(200);
+      const templateCsv = await templateRes.text();
+
+      await openWizard(page, projectId);
+      await uploadCsv(page, templateCsv);
+
+      await expect(mappingFor(page, "Steps")).not.toHaveValue("");
+      await expect(mappingFor(page, "Action"), "the template's own Action column must auto-map").not.toHaveValue("");
+      await expect(
+        mappingFor(page, "Expected Result"),
+        "the template's own Expected Result column must auto-map",
+      ).not.toHaveValue("");
     } finally {
       await disposeProject(fixture);
     }

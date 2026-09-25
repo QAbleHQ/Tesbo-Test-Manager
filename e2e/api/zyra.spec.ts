@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext, type APIResponse } from "@playwright/test";
-import { exec, literal, scalar } from "../utils/psql";
+import { column, exec, literal, scalar } from "../utils/psql";
+import { purgeProject } from "../utils/seed";
 import {
   anonymousContext,
   loginAs,
@@ -8,6 +9,7 @@ import {
   type RbacTenant,
 } from "../utils/rbac-tenant";
 import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
+import { env } from "../utils/env";
 import { parseSseEvents } from "../utils/sse";
 
 /*
@@ -70,9 +72,11 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
   function purge(t: RbacTenant): void {
     const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
     exec(`DELETE FROM zyra_chat_messages WHERE session_id IN (SELECT id FROM zyra_chat_sessions WHERE project_id IN (${projects}));`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116), not CASCADE — must
+    // go before zyra_chat_sessions, not after.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id IN (${projects});`);
     exec(`DELETE FROM zyra_token_usage WHERE project_id IN (${projects});`);
-    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
   }
@@ -115,11 +119,22 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * already exists is the only way to reach the task read, feedback, draft, close and save routes at
    * all. This is the suite's usual "arrange through Postgres when the API path is unavailable" rule.
    */
-  function seedTask(fields: { status?: string; drafts?: number } = {}): string {
+  function seedTask(
+    fields: {
+      status?: string;
+      drafts?: number;
+      jiraIssueKey?: string;
+      draftOverrides?: Array<Record<string, unknown>>;
+      savedCount?: number;
+      projectId?: string;
+    } = {},
+  ): string {
+    const projectId = fields.projectId ?? tenant!.mainProjectId;
     const drafts = Array.from({ length: fields.drafts ?? 2 }, (_, i) => ({
       title: `E2E draft ${i + 1}`,
       steps: [{ action: "open the app", expected: "it opens" }],
       priority: "P2",
+      ...(fields.draftOverrides?.[i] ?? {}),
     }));
     /*
      * Two details of this row are load-bearing and were both wrong on the first attempt.
@@ -129,17 +144,29 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
      * does not exist. And generated_payload is a bare ARRAY of drafts, not an object wrapping one:
      * zyraDeleteDraft runs normalizeJsonArray over the column directly, so `{testcases: [...]}`
      * measures as zero drafts and every index is out of range.
+     *
+     * jira_issue_keys defaults to '[]' (its own column default) whenever fields.jiraIssueKey is
+     * omitted — every existing caller keeps behaving exactly as before. Passed, it's what
+     * processZyraSaveEntriesSequential/Batched's `existingLinked` lookup matches an already-saved
+     * test case's own jira_issue_key against, to exercise the "regenerating an already-linked case"
+     * path (severity/component "only fill if blank") rather than a brand-new create.
      */
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status) VALUES (" +
-        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
-        `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ` +
+        "requested_count, generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys) VALUES (" +
+        `${literal(projectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ` +
+        `'As a user I want to sign in', ${drafts.length}, ${drafts.length}, ${fields.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', ` +
-        `${literal(fields.status ?? "awaiting_review")});`,
+        // "awaiting_review" was the default here previously — it appears nowhere in the backend
+        // (grep the whole Tesbo-Backend-Nest tree) and isn't one of the two statuses zyraSave
+        // accepts ('in_review' or 'failed', legacy.service.ts's own status guard). Every caller
+        // that omits `status` gets a task-board row zyraSave then refuses to save, a stale
+        // mismatch from before task_status was renamed.
+        `${literal(fields.status ?? "in_review")}, ` +
+        `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb);`,
     );
     return scalar(
-      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
+      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(projectId)} ` +
         "ORDER BY created_at DESC LIMIT 1;",
     );
   }
@@ -153,7 +180,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
    * expect once a row carries chat_session_id (legacy.service.ts applyZyraChatOperations) — NOT
    * the flat AiGeneratedDraft shape seedTask()'s Task-board rows use.
    */
-  function seedChatReviewTask(options: { status?: string; entries?: Array<Record<string, unknown>> } = {}): {
+  function seedChatReviewTask(
+    options: { status?: string; entries?: Array<Record<string, unknown>>; savedCount?: number } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
@@ -183,9 +212,9 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     ];
     exec(
       "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, " +
-        "requested_count, generated_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
+        "requested_count, generated_count, saved_count, generated_payload, agent_name, task_status, chat_session_id) VALUES (" +
         `${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'zyra_chat', 'gpt-4o-mini', ` +
-        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ` +
+        `'Zyra chat proposal', ${entries.length}, ${entries.length}, ${options.savedCount ?? 0}, ` +
         `${literal(JSON.stringify(entries))}::jsonb, 'Zyra the Test Generator', ` +
         `${literal(options.status ?? "in_review")}, ${literal(sessionId)});`,
     );
@@ -432,9 +461,26 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(JSON.stringify(agent)).toContain("10-30");
   });
 
+  test("ZYR-A-09b the 30-50 tier round-trips the same way as every other range", { tag: '@tesbo.testId("TES-TC-603")' }, async () => {
+    const res = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "30-50" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `updating settings — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(body.testcaseRange).toBe("30-50");
+    expect(body.testcaseCount).toBe(40);
+
+    const agent = await (await asOwner.get(url("/agents/zyra"))).json();
+    expect(agent.settings.testcaseRange).toBe("30-50");
+    expect(agent.settings.testcaseCount).toBe(40);
+  });
+
   test("ZYR-A-10 an unknown testcaseRange falls back instead of being stored", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
-    // The valid set is minimum / 1-10 / 10-30 / all. A value outside it must not reach the settings
-    // JSON, or the generation step later reads a range it cannot interpret.
+    // The valid set is 1-10 / 10-30 / 30-50 / all. A value outside it must not reach the settings
+    // JSON, or the generation step later reads a range it cannot interpret. The removed "minimum"
+    // tier is exercised here too — it is now just another unrecognized string, the same as any
+    // other invalid value, and must not be stored or silently reinterpreted.
     await asOwner.patch(url("/agents/zyra/settings"), { data: { testcaseRange: "all" }, failOnStatusCode: false });
     const res = await asOwner.patch(url("/agents/zyra/settings"), {
       data: { testcaseRange: "everything-please" },
@@ -446,6 +492,155 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
     );
     expect(stored, "an invalid range was written to the project settings").not.toContain("everything-please");
+
+    const minimumRes = await asOwner.patch(url("/agents/zyra/settings"), {
+      data: { testcaseRange: "minimum" },
+      failOnStatusCode: false,
+    });
+    expect(minimumRes.status()).toBeLessThan(500);
+    const minimumBody = await minimumRes.json();
+    expect(minimumBody.testcaseRange, "the removed 'minimum' tier must not be accepted").not.toBe("minimum");
+
+    const storedAfterMinimum = scalar(
+      `SELECT settings::text FROM projects WHERE id = ${literal(tenant!.mainProjectId)};`,
+    );
+    expect(storedAfterMinimum, "the removed 'minimum' tier reached the stored settings").not.toContain('"minimum"');
+  });
+
+  test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
+    // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
+    // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
+    // Projects cap name at 30 chars — "E2E Zyra Default Range " plus a 13-digit timestamp
+    // overflowed that by 7, so every run of this test failed on project creation itself.
+    const created = await asOwner.post("/api/projects", {
+      data: { name: `E2E Range ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), await created.text()).toBe(201);
+    const project = await created.json();
+    try {
+      const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
+      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
+      expect(agent.settings.testcaseCount).toBe(40);
+    } finally {
+      purgeProject(project.id);
+    }
+  });
+
+  // ─── Continue / resume ────────────────────────────────────────────────────
+
+  /*
+   * A "timed_out" assistant message with a usable resume_checkpoint, written directly — same
+   * "arrange through Postgres" rule as seedTask/seedChatReviewTask, since actually reaching this
+   * state through the live route needs a provider call that genuinely stalls for minutes, which
+   * this suite deliberately never drives (file header). The checkpoint's stage is "generate" (skip
+   * routing) with no AI key allocated on this tenant, so buildZyraChatDecision's own "no provider
+   * configured" degraded path resolves the resume almost instantly — real enough to exercise the
+   * fire-and-forget claim/complete lifecycle without a multi-minute wait.
+   */
+  function seedTimedOutMessage(options: { resumeAttempt?: number; sessionId?: string } = {}): { sessionId: string; messageId: string } {
+    const t = tenant!;
+    const sessionId = options.sessionId ?? (() => {
+      exec(`INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES (${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E resume session');`);
+      return scalar(`SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+    })();
+    const checkpoint = JSON.stringify({
+      stage: "generate",
+      userMessageId: "",
+      message: "Write me some test cases",
+      routedSuite: null,
+      routedCount: { requestedCount: 10, exhaustive: false },
+    });
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, resume_checkpoint, resume_attempt) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
+        `'⏱️ I did not hear back from the AI provider in time.', 'timed_out', ${literal(checkpoint)}::jsonb, ${options.resumeAttempt ?? 0});`,
+    );
+    const messageId = scalar(
+      `SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} AND status = 'timed_out' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    return { sessionId, messageId };
+  }
+
+  /** Polls until the seeded message leaves 'resuming', or the attempt budget runs out. */
+  async function waitForResumeToSettle(sessionId: string, messageId: string, maxAttempts = 20): Promise<string> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const status = scalar(`SELECT status FROM zyra_chat_messages WHERE id = ${literal(messageId)};`);
+      if (status !== "resuming") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT status FROM zyra_chat_messages WHERE id = ${literal(messageId)};`) ?? "";
+  }
+
+  test("ZYR-A-86 Continue returns immediately (fire-and-forget), and the resume completes in the background", { tag: '@tesbo.testId("TES-TC-3016")' }, async () => {
+    const { sessionId, messageId } = seedTimedOutMessage();
+
+    const start = Date.now();
+    const res = await asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false });
+    const elapsedMs = Date.now() - start;
+    // NestJS defaults every undecorated @Post() to 201 — none of the Zyra POST routes in this
+    // controller override it with @HttpCode(200), continueZyraChatMessage included, so 201 is
+    // this route's real, consistent response code, not 200.
+    expect(res.status(), `Continue — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    expect(body.accepted, "the claiming request must be told it started the resume").toBe(true);
+
+    // The whole point of the fix: this must never block for anywhere near the multi-minute
+    // generate budget. A generous ceiling (well under even the base 180s) still catches a
+    // regression back to the old synchronous behavior without being flaky on a loaded CI box.
+    expect(elapsedMs, "Continue must return fast, not hold the connection open for the resume itself").toBeLessThan(15000);
+
+    const claimedMessage = body.session.messages.find((m: { id: string }) => m.id === messageId);
+    expect(claimedMessage.status, "the claimed message flips to 'resuming' in the same response").toBe("resuming");
+
+    const finalStatus = await waitForResumeToSettle(sessionId, messageId);
+    expect(finalStatus, "a resume with no real AI key resolves quickly via the degraded path, not stuck in 'resuming'").toBe("resumed");
+
+    const session = await (await asOwner.get(url(`/agents/zyra/chat/sessions/${sessionId}`))).json();
+    const newMessage = session.messages.find((m: { id: string; role: string }) => m.role === "assistant" && m.id !== messageId);
+    expect(newMessage, "the resumed turn's own follow-up message").toBeTruthy();
+    expect(newMessage.resumeAttempt, "a genuine completion resets the chain").toBe(0);
+  });
+
+  test("ZYR-A-87 a second concurrent Continue on the same message is not accepted", { tag: '@tesbo.testId("TES-TC-3017")' }, async () => {
+    const { sessionId, messageId } = seedTimedOutMessage();
+    const [first, second] = await Promise.all([
+      asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false }),
+      asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false }),
+    ]);
+    // See ZYR-A-86's comment: this route's real (undecorated, NestJS-default) status is 201.
+    expect(first.status()).toBe(201);
+    expect(second.status()).toBe(201);
+    const [firstBody, secondBody] = await Promise.all([first.json(), second.json()]);
+    const acceptedCount = [firstBody.accepted, secondBody.accepted].filter(Boolean).length;
+    expect(acceptedCount, "exactly one of two simultaneous Continue calls claims the row").toBe(1);
+
+    await waitForResumeToSettle(sessionId, messageId);
+    const generatedCount = scalar(
+      `SELECT COUNT(*)::text FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} AND role = 'assistant';`,
+    );
+    // The original timed-out message plus exactly one follow-up — never two, which is what a
+    // double-fired generation would leave behind.
+    expect(generatedCount, "only one resume actually ran the generation pipeline").toBe("2");
+  });
+
+  test("ZYR-A-88 after the cap, a plain Continue is rejected and a narrowed one is accepted", { tag: '@tesbo.testId("TES-TC-3018")' }, async () => {
+    const { sessionId, messageId } = seedTimedOutMessage({ resumeAttempt: 2 });
+
+    const plain = await asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false });
+    expect(plain.status(), "a plain Continue past the cap must be refused, not silently retried at full size").toBe(400);
+    const plainBody = await plain.json();
+    expect(plainBody.code).toBe("zyra_resume_cap_exceeded");
+    // Refused before ever claiming the row — still 'timed_out', not 'resuming'.
+    expect(scalar(`SELECT status FROM zyra_chat_messages WHERE id = ${literal(messageId)};`)).toBe("timed_out");
+
+    const narrowed = await asOwner.post(url(`/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`), {
+      data: { narrow: true },
+      failOnStatusCode: false,
+    });
+    // See ZYR-A-86's comment: this route's real (undecorated, NestJS-default) status is 201.
+    expect(narrowed.status(), `a narrowed Continue past the cap must be accepted — ${await narrowed.text()}`).toBe(201);
+    expect((await narrowed.json()).accepted).toBe(true);
   });
 
   // ─── Chat sessions ────────────────────────────────────────────────────────
@@ -1037,6 +1232,214 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(Number((await after.json()).testcasesCreated), "a non-uuid audit row changed the count").toBe(before);
   });
 
+  // ─── The agent's "Approval rate" tile ──────────────────────────────────────
+
+  /** Reads the agent payload's approvalRate field, failing loudly if the field is missing entirely. */
+  const approvalRate = async (api: APIRequestContext = asOwner, projectId?: string): Promise<number | null> => {
+    const res = await api.get(url("/agents/zyra", projectId), { failOnStatusCode: false });
+    expect(res.status(), `reading the agent — ${await res.text()}`).toBe(200);
+    const body = await res.json();
+    expect(
+      Object.prototype.hasOwnProperty.call(body, "approvalRate"),
+      "the agent payload carries no approvalRate field at all",
+    ).toBe(true);
+    return body.approvalRate;
+  };
+
+  test(
+    "ZYR-A-75 the approval rate reflects drafts actually saved, not a taskStatus the backend never writes",
+    { tag: '@tesbo.testId("TES-TC-1215")' },
+    async () => {
+      /*
+       * "[Zyra] Approval Rate Is Not Updated After Saving Generated Test Cases" — the Agents screen
+       * computed this tile client-side as decided = tasks.filter(t => t.taskStatus === "accepted" ||
+       * t.taskStatus === "rejected"), then approved/decided. But zyraTask/processZyraTask/aiSave only
+       * ever write task_status as 'todo' | 'in_progress' | 'in_review' | 'failed' | 'done' — grep the
+       * whole service for `task_status = '...'` and "accepted"/"rejected" never appears. `decided` was
+       * therefore always empty and the tile always rendered "—", regardless of how many drafts were
+       * actually saved. Fails on the unfixed backend because the field is absent from the response
+       * entirely (approvalRate is asserted `.toBeDefined()`-equivalent above via the hasOwnProperty
+       * check); a frontend-only fix wired to the same never-true filter would still fail this, since
+       * the assertion below requires the *exact* saved/generated ratio, not just a defined field.
+       *
+       * approvalRate is now SUM(saved_count)/SUM(generated_count) over 'done' task-board rows.
+       */
+      seedTask({ drafts: 5, savedCount: 4, status: "done" });
+      expect(await approvalRate(), "a 4-of-5-saved done task did not read as 80%").toBe(80);
+    },
+  );
+
+  test("ZYR-A-76 no task-board runs at all reads null, not 0 or an error", { tag: '@tesbo.testId("TES-TC-1216")' }, async () => {
+    // The empty state every new project starts in, and what the screenshot in the bug report showed
+    // — this must render as the dash, not a misleading 0%.
+    expect(await approvalRate()).toBeNull();
+  });
+
+  test(
+    "ZYR-A-77 a task still awaiting review does not drag the rate down before anything is decided",
+    { tag: '@tesbo.testId("TES-TC-1217")' },
+    async () => {
+      // in_review means drafts were generated and are pending the user's decision — nothing has been
+      // approved OR rejected yet. Counting its 0 saved_count here would read as "0% approved" for work
+      // that is simply still in progress. todo/in_progress (queued/generating, no drafts yet) must be
+      // equally inert.
+      seedTask({ drafts: 5, savedCount: 0, status: "in_review" });
+      seedTask({ drafts: 0, savedCount: 0, status: "todo" });
+      seedTask({ drafts: 0, savedCount: 0, status: "in_progress" });
+      expect(await approvalRate(), "a pending task was counted as 0% approved instead of being excluded").toBeNull();
+    },
+  );
+
+  test(
+    "ZYR-A-78 a task that failed before producing anything to review is excluded, not counted as rejected",
+    { tag: '@tesbo.testId("TES-TC-1218")' },
+    async () => {
+      // Forced generated_count > 0 here even though a real failure normally leaves it at 0 (failures
+      // only happen before drafts exist) — this proves the exclusion is enforced by task_status, not
+      // just incidentally by an always-zero generated_count.
+      seedTask({ drafts: 3, savedCount: 0, status: "failed" });
+      expect(await approvalRate(), "a failed generation was treated as a rejection").toBeNull();
+
+      seedTask({ drafts: 2, savedCount: 2, status: "done" });
+      expect(
+        await approvalRate(),
+        "a failed task's drafts diluted the rate of an unrelated, fully-saved task",
+      ).toBe(100);
+    },
+  );
+
+  test(
+    "ZYR-A-79 the rate aggregates proportionally across multiple done tasks, including a non-round percentage",
+    { tag: '@tesbo.testId("TES-TC-1219")' },
+    async () => {
+      seedTask({ drafts: 3, savedCount: 1, status: "done" });
+      seedTask({ drafts: 4, savedCount: 2, status: "done" });
+      // 3 saved of 7 generated = 42.857...% — pins the rounding, not just the direction.
+      expect(await approvalRate()).toBe(43);
+    },
+  );
+
+  test(
+    "ZYR-A-80 a partial save and a close-without-saving, both through the real routes, feed the rate correctly",
+    { tag: '@tesbo.testId("TES-TC-1220")' },
+    async () => {
+      // Exercises POST .../tasks/:id/save (zyraSave/zyraSaveAttempt) and POST .../tasks/:id/close
+      // (zyraCloseTask) for real — the actual product actions behind the Save and Close buttons —
+      // rather than seeding task_status = 'done' directly. Task-board batches resolve to 'done' on
+      // ANY save (see zyraSaveAttempt's own comment), partial or not, unlike a chat-staged batch.
+      const partialTaskId = seedTask({ drafts: 3, status: "in_review" });
+      const saveRes = await asOwner.post(url(`/agents/zyra/tasks/${partialTaskId}/save`), {
+        data: { selectedDraftIndexes: [0, 1] },
+        failOnStatusCode: false,
+      });
+      expect(saveRes.status(), `partially saving the batch — ${await saveRes.text()}`).toBe(201);
+      const saveBody = await saveRes.json();
+      expect(saveBody.savedCount, "2 of 3 selected drafts should have saved").toBe(2);
+      const createdIds: string[] = (saveBody.testcases ?? []).map((t: { id: string }) => t.id);
+
+      try {
+        expect(
+          scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(partialTaskId)};`),
+          "a task-board batch must resolve to 'done' even on a partial save",
+        ).toBe("done");
+
+        const closedTaskId = seedTask({ drafts: 2, status: "in_review" });
+        const closeRes = await asOwner.post(url(`/agents/zyra/tasks/${closedTaskId}/close`), {
+          failOnStatusCode: false,
+        });
+        expect(closeRes.status(), `closing without saving — ${await closeRes.text()}`).toBe(201);
+        expect(
+          scalar(`SELECT saved_count FROM ai_generation_requests WHERE id = ${literal(closedTaskId)};`),
+        ).toBe("0");
+
+        // 2 saved of 3 (partial save) + 0 saved of 2 (closed without saving) = 2 of 5 = 40%.
+        expect(
+          await approvalRate(),
+          "a partial save and a close-without-saving did not aggregate into the expected rate",
+        ).toBe(40);
+      } finally {
+        for (const id of createdIds) {
+          await asOwner.delete(url(`/testcases/${id}`), { failOnStatusCode: false });
+        }
+      }
+    },
+  );
+
+  test(
+    "ZYR-A-81 a chat-approved batch counts toward the approval rate exactly like a task-board save",
+    { tag: '@tesbo.testId("TES-TC-1221")' },
+    async () => {
+      /*
+       * "[Zyra] Approval Rate does not update after approving additional test cases" — reproduced
+       * against the ZYR-A-75 fix itself: that fix scoped the aggregate to `chat_session_id IS NULL`
+       * on the theory that chat "has no comparable generated-vs-saved concept". It does: chat
+       * proposals are inserted into this same table with a real generated_count
+       * (applyZyraChatOperations), and approving them in the Agent workspace calls the exact same
+       * aiSave route the task board uses (ZyraChatReviewPanel -> saveZyraTask), which increments
+       * saved_count and sets task_status = 'done' with no branch on chat_session_id at all. So a
+       * chat-approved batch is byte-for-byte the same shape as a task-board one once saved, and
+       * excluding it is what left the tile frozen for anyone whose whole workflow is the chat panel.
+       */
+      seedChatReviewTask({ status: "done", savedCount: 1 });
+      expect(await approvalRate(), "an approved chat batch did not count toward the rate").toBe(100);
+    },
+  );
+
+  test("ZYR-A-83 the rate aggregates chat and task-board saves together, not just one or the other", async () => {
+    seedTask({ drafts: 2, savedCount: 1, status: "done" });
+    seedChatReviewTask({
+      status: "done",
+      savedCount: 1,
+      entries: [
+        { opType: "create", draft: { title: "E2E chat draft A" }, reason: "" },
+        { opType: "create", draft: { title: "E2E chat draft B" }, reason: "" },
+      ],
+    });
+    // 1 saved of 2 (task board) + 1 saved of 2 (chat) = 2 of 4 = 50%.
+    expect(await approvalRate(), "chat and task-board saves did not aggregate into one rate").toBe(50);
+  });
+
+  test(
+    "ZYR-A-84 closing a chat batch without saving, through the real route, still counts its drafts as unapproved",
+    async () => {
+      // Mirrors ZYR-A-80's task-board close, but through a chat-staged row — zyraCloseTask branches
+      // on nothing chat-specific, so this must resolve to 'done' with saved_count 0 exactly the same.
+      const { taskId } = seedChatReviewTask({ status: "in_review" });
+      const closeRes = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/close`), { failOnStatusCode: false });
+      expect(closeRes.status(), `closing a chat batch without saving — ${await closeRes.text()}`).toBe(201);
+      expect(
+        scalar(`SELECT task_status, saved_count FROM ai_generation_requests WHERE id = ${literal(taskId)};`),
+      ).toBe("done");
+
+      seedTask({ drafts: 1, savedCount: 1, status: "done" });
+      // 1 saved of 1 (task board) + 0 saved of 1 (closed chat batch) = 1 of 2 = 50%.
+      expect(
+        await approvalRate(),
+        "a closed-without-saving chat batch was not counted as generated-but-unapproved",
+      ).toBe(50);
+    },
+  );
+
+  test("ZYR-A-85 a chat batch still awaiting review does not drag the rate down before anything is decided", async () => {
+    // Same reasoning as ZYR-A-77's task-board case, now for the origin that used to be exempt from
+    // this aggregate entirely — an undecided chat batch must be excluded, not counted as 0% approved.
+    seedChatReviewTask({ status: "in_review" });
+    expect(await approvalRate(), "a pending chat batch was counted as 0% approved instead of being excluded").toBeNull();
+  });
+
+  test(
+    "ZYR-A-82 the approval rate is scoped per project — a second tenant's saves never leak in",
+    { tag: '@tesbo.testId("TES-TC-1222")' },
+    async () => {
+      // Same account, its own second project — the cheapest way to catch a dropped WHERE project_id.
+      seedTask({ drafts: 4, savedCount: 4, status: "done", projectId: tenant!.mainProjectId });
+      expect(
+        await approvalRate(asOwner, tenant!.secondProjectId),
+        "a save recorded against the main project leaked into a sibling project's approval rate",
+      ).toBeNull();
+    },
+  );
+
   // ─── The agent's "Token usage" tile ─────────────────────────────────────────
 
   /** A ledger row, written directly — see seedTask()'s comment for why: no live model is called here. */
@@ -1435,6 +1838,10 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
 
     // Backdate the chat activity, then use the task board — the newer of the two must win.
     exec(`UPDATE zyra_chat_sessions SET updated_at = now() - interval '10 days' WHERE id = ${literal(emptySession.id)};`);
+    // Re-read after backdating — chatSeenAt above is the PRE-backdate value, no longer what the
+    // row holds; comparing later assertions against it (instead of this) was off by exactly the
+    // 10-day interval just applied.
+    const chatBackdatedAt = scalar(`SELECT updated_at::text FROM zyra_chat_sessions WHERE id = ${literal(emptySession.id)};`);
     const taskId = seedTask();
     const afterTask = await readAgent();
     const taskSeenAt = scalar(`SELECT updated_at::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
@@ -1449,7 +1856,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(
       new Date(afterBothOld.lastUsedAt!).getTime(),
       "the more recent activity (chat, 10 days back) should still win over an older task-board update",
-    ).toBe(new Date(chatSeenAt).getTime());
+    ).toBe(new Date(chatBackdatedAt).getTime());
   });
 
   test("ZYR-A-44 a second project's Zyra activity is not reflected in this project's last-used date", async () => {
@@ -1614,6 +2021,105 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
       expect(res.status(), `saving a chat-staged update — ${await res.text()}`).toBe(201);
       expect(scalar(`SELECT priority FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("P0");
       expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Updated via chat review");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  /*
+   * "[Zyra] Test Steps, Actions, and Expected Results Are Missing After Saving Generated Test
+   * Cases" — a Zyra-generated test case saved fine, but its steps showed as one blank
+   * Action/Expected Result pair in the Test Case Repository regardless of how many steps were
+   * actually generated.
+   *
+   * Root cause: the create/edit modal pre-stringifies `steps` into a JSON string before every save
+   * (testcases/page.tsx), and the shared writers (insertTestCaseWithClient/updateTestCaseWithClient,
+   * patchTestCaseFromZyraWithClient) unconditionally JSON.stringify whatever they're given — so the
+   * modal's already-a-string input gets encoded a second time, landing in the jsonb column as a JSON
+   * string scalar, which is exactly the shape the modal's own parseSteps() reads back. Zyra's save
+   * paths instead handed over a real array (via safeSteps()), which got encoded only once and stored
+   * as a genuine jsonb array — a shape parseSteps() silently discards, substituting one blank step.
+   * Fixed by pre-stringifying steps once at the point Zyra hands them to each writer, matching what
+   * the modal already sends, without changing the modal, safeSteps' synonym normalization, or
+   * anything Zyra generates or displays before save.
+   */
+  test("ZYR-A-51b saving a chat-staged create draft persists real step content the editor can read, not one blank step", async () => {
+    const draftTitle = `E2E chat steps ${Date.now()}`;
+    // More than one step (the observed bug always collapsed to exactly one), with content that
+    // would break a naive re-encode: an apostrophe, a quote, and a literal backslash.
+    const steps = [
+      { stepNumber: 1, action: "Enter a valid destination (e.g. 'Paris')", expectedResult: `Destination field accepts the input.` },
+      { stepNumber: 2, action: "Set Check-in Date to 14 days from today", expectedResult: "Check-in date is set successfully." },
+      { stepNumber: 3, action: `Click "Search Hotels"`, expectedResult: `Path separator check: C:\\temp is rejected` },
+    ];
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        {
+          opType: "create",
+          draft: {
+            suiteId: null,
+            title: draftTitle,
+            description: "",
+            preconditions: "",
+            stepsJson: JSON.stringify(steps),
+            priority: "P1",
+            type: "Functional",
+            status: "Draft",
+          },
+          reason: "",
+        },
+      ],
+    });
+
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), {
+      data: { selectedDraftIndexes: [0] },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving a chat-staged create — ${await res.text()}`).toBe(201);
+
+    const testcaseId = scalar(
+      `SELECT id FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`,
+    );
+    try {
+      const fetched = await asOwner.get(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+      expect(fetched.status(), `fetching the saved case — ${await fetched.text()}`).toBe(200);
+      const rawSteps = (await fetched.json()).steps;
+      // The editor's parseSteps() (testcases/page.tsx) only accepts a JSON-encoded string for this
+      // field — an array here is exactly the shape it silently discards.
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual(steps);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-52b saving a chat-staged update proposal replaces an existing test case's steps in the editor-readable shape", async () => {
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: `E2E update steps target ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    const testcaseId = (await created.json()).id;
+    const steps = [
+      { stepNumber: 1, action: "Updated step one", expectedResult: "Updated result one" },
+      { stepNumber: 2, action: "Updated step two", expectedResult: "Updated result two" },
+    ];
+    try {
+      const { taskId } = seedChatReviewTask({
+        entries: [
+          { opType: "update", testcaseId, externalId: "E2E-1", fields: { stepsJson: JSON.stringify(steps) }, reason: "" },
+        ],
+      });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), {
+        data: { selectedDraftIndexes: [0] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `saving a chat-staged step update — ${await res.text()}`).toBe(201);
+
+      const fetched = await asOwner.get(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+      expect(fetched.status(), `fetching the updated case — ${await fetched.text()}`).toBe(200);
+      const rawSteps = (await fetched.json()).steps;
+      expect(typeof rawSteps).toBe("string");
+      expect(JSON.parse(rawSteps)).toEqual(steps);
     } finally {
       await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
     }
@@ -1799,6 +2305,131 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
     expect(stored, "a race between two discards lost one of the removals").toHaveLength(2);
   });
+
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — Zyra never asked the
+   * model for these two fields, so every generated test case saved with both null regardless of
+   * what the task-board draft carried. ZYR-A-71/72 cover the plain persistence path (a draft that
+   * already has the fields, and one that doesn't); ZYR-A-73/74 cover the "regenerating an
+   * already-linked test case" path, where an automatic redirect must never silently overwrite a
+   * human-set value — see processZyraSaveEntriesSequential/Batched's "only fill if blank" comment.
+   */
+  test("ZYR-A-71 a task-board draft's severity and component are persisted on save", async () => {
+    const draftTitle = `E2E severity component ${Date.now()}`;
+    const taskId = seedTask({ drafts: 1, draftOverrides: [{ title: draftTitle, severity: "High", component: "Auth" }] });
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+    expect(res.status(), `saving the draft — ${await res.text()}`).toBe(201);
+    expect(scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("Auth");
+  });
+
+  test("ZYR-A-72 a task-board draft with no severity or component still saves — both stay null, not a failure", async () => {
+    const draftTitle = `E2E no severity component ${Date.now()}`;
+    const taskId = seedTask({ drafts: 1, draftOverrides: [{ title: draftTitle }] });
+    const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+    expect(res.status(), `saving the draft — ${await res.text()}`).toBe(201);
+    expect(scalar(`SELECT severity FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("");
+    expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(draftTitle)};`)).toBe("");
+  });
+
+  test("ZYR-A-73 regenerating an already-linked test case never overwrites its already-set severity/component with a fresh draft guess", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E already-linked case", priority: "P2", jiraIssueKey, severity: "Critical", component: "Payments" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the already-linked case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const draftTitle = `E2E regenerated content ${Date.now()}`;
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ title: draftTitle, severity: "Low", component: "Billing" }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      // Content is genuinely regenerated (this is a real redirect-to-update, not a no-op)...
+      expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe(draftTitle);
+      // ...but severity/component were already set by a human and must survive untouched.
+      expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(testcaseId)};`), "an already-set severity must never be overwritten by a regenerated draft").toBe("Critical");
+      expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(testcaseId)};`), "an already-set component must never be overwritten by a regenerated draft").toBe("Payments");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-74 regenerating an already-linked test case with no severity/component yet fills them in from the fresh draft", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E blank severity component case", priority: "P2", jiraIssueKey },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the blank case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ severity: "Medium", component: "Search" }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Medium");
+      expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe("Search");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  /*
+   * Zyra regeneration silently wiped an already-linked case's existing citations. draft.sourceRefs
+   * was always written as a real (possibly empty) array, so updateTestCaseWithClient's
+   * `COALESCE($28::jsonb, source_refs)` always took the new value and never fell back to what the
+   * row already had — an ungrounded re-run (no citations resolved this turn) erased them outright.
+   * Same "only fill if blank" protection severity/component get in ZYR-A-73 above, now extended to
+   * source_refs. Invisible before the repository table's Context column existed (nothing rendered
+   * source_refs after creation); ZYR-A-89/90 pin both directions now that it's a real user-facing
+   * regression.
+   */
+  test("ZYR-A-89 regenerating an already-linked test case with no new citations never wipes its existing ones", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const existingCitation = { type: "testcase", id: `E2E-CITED-${Date.now()}`, title: "E2E previously cited case" };
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E already-cited case", priority: "P2", jiraIssueKey, sourceRefs: [existingCitation] },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the already-cited case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const draftTitle = `E2E regenerated content ${Date.now()}`;
+      // draftOverrides omits sourceRefs entirely — the same shape a task-board draft (no chat
+      // pipeline, no citations ever attached) always has.
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ title: draftTitle }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      // Content is genuinely regenerated (this is a real redirect-to-update, not a no-op)...
+      expect(scalar(`SELECT title FROM testcases WHERE id = ${literal(testcaseId)};`)).toBe(draftTitle);
+      // ...but the citation this case already had must survive untouched.
+      const after = await (await asOwner.get(url(`/testcases/${testcaseId}`))).json();
+      expect(after.sourceRefs, "an ungrounded regeneration must never wipe citations the case already had").toEqual([existingCitation]);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-A-90 regenerating an already-linked test case with freshly resolved citations replaces the stale ones", async () => {
+    const jiraIssueKey = `E2E-ZYRA-${Date.now()}`;
+    const staleCitation = { type: "testcase", id: `E2E-STALE-${Date.now()}`, title: "E2E stale citation" };
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: "E2E stale-cited case", priority: "P2", jiraIssueKey, sourceRefs: [staleCitation] },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the stale-cited case — ${await created.text()}`).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const freshCitation = { type: "bug", id: `E2E-FRESH-${Date.now()}`, title: "E2E fresh citation" };
+      const taskId = seedTask({ drafts: 1, jiraIssueKey, draftOverrides: [{ sourceRefs: [freshCitation] }] });
+      const res = await asOwner.post(url(`/agents/zyra/tasks/${taskId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+      expect(res.status(), `saving the regenerated draft — ${await res.text()}`).toBe(201);
+      const after = await (await asOwner.get(url(`/testcases/${testcaseId}`))).json();
+      expect(after.sourceRefs, "a regeneration that actually resolved citations must overwrite the stale ones, not just add to them").toEqual([freshCitation]);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
 });
 
 /*
@@ -1848,12 +2479,20 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const project = literal(tenant!.mainProjectId);
     const org = literal(tenant!.organizationId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    // ZYR-A-66 creates its own suite to exercise projectSuiteSummaries/zyraChatProjectSnapshot's
+    // per-suite count — deleted after testcases above so no FK on suite_id is still live.
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
     exec(`DELETE FROM bugs WHERE project_id = ${project};`);
     exec(`DELETE FROM jira_tickets WHERE project_id = ${project};`);
     exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    // ZYR-A-65 creates a non-root folder to exercise knowledgeFolderSnapshot's quoted-name lookup;
+    // the root folder itself must survive (it cannot be recreated through the API — see
+    // knowledge-base.spec.ts's purgeKb doc comment for the same constraint).
+    exec(`DELETE FROM knowledge_folders WHERE project_id = ${project} AND is_root = false;`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
   }
@@ -1862,9 +2501,21 @@ test.describe("zyra chat — citations (fake provider)", () => {
     return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
   }
 
+  /*
+   * provider is deliberately a custom-gateway string, not "openai" — OpenAI-wire by convention
+   * (providerWire's own comment in legacy.service.ts), so still compatible with this fake
+   * server's chat-completions shape, but absent from EMBEDDING_CAPABLE_PROVIDERS
+   * (rag-embedding-providers.ts: openai/google/mistral only). A KB doc seeded below
+   * (seedCitableSources) enqueues a real background embedding job (createKnowledgeDocument ->
+   * enqueueEmbedding); with provider "openai" that job treats this key as embeddings-capable and
+   * fires a real POST against this fake server's one chat-completions handler, which returns the
+   * wrong response shape and — since it shares the same request log and reply queue as the
+   * test's own router/generation calls — intermittently consumes a queued reply or inflates
+   * ai.requests.length out from under the test. Same technique ZYR-A-91/92 use.
+   */
   async function allocateFakeAiKey(): Promise<void> {
     const keyRes = await asOwner.post("/api/workspace/ai-keys", {
-      data: { name: `E2E citations fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl },
+      data: { name: `E2E citations fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
       failOnStatusCode: false,
     });
     expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
@@ -2041,6 +2692,566 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant")!;
     expect(String(lastAssistant.content || "")).not.toContain("I don't have anything about this in the project's knowledge base");
   });
+
+  // knowledgeFolderSnapshot (legacy.service.ts) is the direct folder-name-lookup path — used when a
+  // message quotes a folder name literally, since neither the recency fallback nor RAG retrieval can
+  // match on a folder's name alone. Every other knowledge read site (knowledgeSnapshot, annSearch,
+  // ftsSearch, zyraChatProjectSnapshot) gates an ai_memory document behind `status = 'approved'`;
+  // this one previously did not, so an unreviewed (or rejected) AI-memory note sitting in a
+  // quote-matched folder was fed to the model as trusted context. This test drives the real "create"
+  // turn end to end and asserts on the literal prompt text the fake AI server received — the most
+  // direct proof that the excluded document's content never reached the model, independent of
+  // whatever the model does with citations afterward.
+  test("ZYR-A-65 a quoted folder-name lookup excludes an unapproved ai_memory document but still surfaces an approved one and a general document", async () => {
+    await allocateFakeAiKey();
+
+    const folderName = `E2E Folder Gate ${Date.now()}`;
+    const folderRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/folders`, {
+      data: { name: folderName },
+      failOnStatusCode: false,
+    });
+    expect(folderRes.status(), `creating the folder — ${await folderRes.text()}`).toBe(201);
+    const folderId = (await folderRes.json()).id;
+
+    async function createFolderDoc(title: string, contentText: string, documentType: string): Promise<string> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+        data: { folderId, documentType, title, contentText },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      return (await res.json()).id;
+    }
+
+    const generalMarker = "GENERAL-MARKER-VISIBLE";
+    const approvedMemoryMarker = "APPROVED-MEMORY-MARKER-VISIBLE";
+    const draftMemoryMarker = "DRAFT-MEMORY-MARKER-MUST-NOT-LEAK";
+
+    await createFolderDoc("General note", generalMarker, "general");
+    const approvedMemoryId = await createFolderDoc("Approved memory", approvedMemoryMarker, "ai_memory");
+    const approveRes = await asOwner.patch(
+      `/api/projects/${tenant!.mainProjectId}/knowledge-base/documents/${approvedMemoryId}/approve-ai-memory`,
+      { failOnStatusCode: false },
+    );
+    expect(approveRes.status(), `approving the memory doc — ${await approveRes.text()}`).toBe(200);
+    // Left in the default "draft" status deliberately — never approved (and never rejected either,
+    // to also cover the "simply not yet reviewed" case, not only the rejected one).
+    await createFolderDoc("Draft memory", draftMemoryMarker, "ai_memory");
+
+    const sessionId = await newSession("E2E folder gate");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case from the named folder.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Placeholder from folder contents",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Pull the details from the "${folderName}" knowledge base folder and create a test case for it.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // Index 1 is the generation call — see ZYR-A-63's comment on the same three-call shape
+    // (router, generation, rememberZyraTurn's summarization).
+    const generationPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+    expect(generationPrompt).toContain(generalMarker);
+    expect(generationPrompt).toContain(approvedMemoryMarker);
+    expect(generationPrompt, "an unapproved ai_memory document must not reach the model as context").not.toContain(draftMemoryMarker);
+  });
+
+  // Phase 1 of the Zyra context-integrity task (see
+  // "Zyra Workflow Agents/zyra-context-integrity-progress-log.md"): `status = 'Archived'` is a
+  // second "gone" state alongside `deleted_at` — it's what the repository screen's archive action
+  // sets, and listTestCases already hides it there. Before this fix, existingTestcaseSnapshot (the
+  // "Existing testcases" grounding/citation source), projectSuiteSummaries, and
+  // zyraChatProjectSnapshot's testcase_count all still counted/cited an archived case as live, so a
+  // user who archived something kept seeing Zyra treat it as current coverage. This drives one real
+  // create turn and asserts on the literal router-prompt text plus the final sourceRefs — the same
+  // style ZYR-A-65 uses — so the proof is against what the model was actually given, not an
+  // inference from downstream behavior.
+  test("ZYR-A-66 an archived test case is excluded from grounding context, citations, and every reported count", async () => {
+    await allocateFakeAiKey();
+
+    const suiteName = `E2E Archived Gap Suite ${Date.now()}`;
+    const suiteRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(suiteRes.status(), `creating the suite — ${await suiteRes.text()}`).toBe(201);
+    const suiteId = (await suiteRes.json()).id;
+
+    async function createTestcase(title: string, suiteIdForCase: string | null): Promise<{ id: string; externalId: string }> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+        data: { title, suiteId: suiteIdForCase },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      const body = await res.json();
+      return { id: body.id, externalId: body.externalId };
+    }
+
+    const active = await createTestcase("Archived-gap active case", suiteId);
+    // Unassigned on purpose — exercises unassignedTestCaseCount (= total - sum of suite counts)
+    // alongside the per-suite count, per the pre-phase inspection note's "count fields that will
+    // shift" edge case. Its id/externalId aren't needed below; only its existence matters.
+    await createTestcase("Archived-gap unassigned case", null);
+    const archived = await createTestcase("Archived-gap archived case", suiteId);
+    const archiveRes = await asOwner.put(`/api/projects/${tenant!.mainProjectId}/testcases/${archived.id}`, {
+      data: { status: "Archived" },
+      failOnStatusCode: false,
+    });
+    expect(archiveRes.status(), `archiving the third case — ${await archiveRes.text()}`).toBe(200);
+
+    const sessionId = await newSession("E2E archived gap");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case, citing existing coverage.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    // The model cites both the still-active case and the archived one; only the active citation can
+    // survive sanitizeZyraSourceRefs, because the archived one is no longer in this turn's
+    // zyraSourceRefIndex — same mechanism ZYR-A-63 proves for a wholly-fabricated label.
+    ai.queueReply({
+      drafts: [{
+        title: "A new case citing both the active and the archived case",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [active.externalId, archived.externalId],
+      }],
+    });
+
+    // Deliberately does not mention either external id in the raw message text — the router prompt
+    // embeds the raw user message verbatim as its own chat turn (see the `{ role: "user", content:
+    // message }` entry alongside the system `context`), so naming the archived id here would make it
+    // appear in ai.requests[0] regardless of whether existingTestcaseSnapshot excluded it, and the
+    // assertion below would no longer prove anything about the query.
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a new test case for the archived-gap scenario, reusing what already exists for it." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // Index 0 is the router call — existingTestcaseSnapshot, projectSuiteSummaries and
+    // zyraChatProjectSnapshot are all assembled into this one prompt (see buildZyraChatDecision).
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt).toContain(active.externalId);
+    expect(routerPrompt, "an archived test case must not appear in the 'Existing testcases' grounding section").not.toContain(archived.externalId);
+    expect(routerPrompt, "the suite's own count must exclude the archived case").toContain(`${suiteName} (id: ${suiteId}, 1 testcase(s))`);
+    expect(routerPrompt, "unassignedTestCaseCount must still reconcile against the reduced total").toContain("Unassigned (no suite) (1 testcase(s))");
+    expect(routerPrompt, "the project-wide total must exclude the archived case").toContain("The total test case count for this project is 2,");
+
+    const testcases = await lastAssistantTestcases(sessionId);
+    expect(testcases).toHaveLength(1);
+    const sourceRefs = testcases[0].sourceRefs as Array<{ type: string; id: string; title: string }>;
+    expect(sourceRefs, "the archived case's citation must be dropped, the still-active one kept").toEqual([
+      { type: "testcase", id: active.externalId, title: "Archived-gap active case" },
+    ]);
+  });
+
+  // Edge case named explicitly in the Phase 1 pre-inspection note: a project where every test case
+  // is archived must report zero coverage cleanly — an empty "Existing testcases" section and a
+  // zero total — not an unhandled exception from any of the three changed queries.
+  test("ZYR-A-67 a project with only archived test cases reports zero existing coverage, not a crash", async () => {
+    await allocateFakeAiKey();
+
+    const onlyCaseRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: "Archived-gap only case" },
+      failOnStatusCode: false,
+    });
+    expect(onlyCaseRes.status()).toBe(201);
+    const onlyCaseId = (await onlyCaseRes.json()).id;
+    const archiveRes = await asOwner.put(`/api/projects/${tenant!.mainProjectId}/testcases/${onlyCaseId}`, {
+      data: { status: "Archived" },
+      failOnStatusCode: false,
+    });
+    expect(archiveRes.status(), `archiving the only case — ${await archiveRes.text()}`).toBe(200);
+
+    const sessionId = await newSession("E2E all archived");
+    // A pure "answer" turn makes exactly one AI call (the router) — no generation, no
+    // rememberZyraTurn summarization — so ai.requests[0] is the only call to inspect.
+    ai.queueReply({
+      reply: "This project currently has 0 existing test cases.",
+      reasoningSummary: "Answered directly, no operations.",
+      action: "answer", actionType: "answer", operations: [], testcases: [],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many existing test cases does this project have?" },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the answer message — ${await turn.text()}`).toBeLessThan(300);
+
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt, "no suite was created in this scenario").toContain("No suites yet.");
+    expect(routerPrompt, "the only test case in the project is archived, so grounding must be empty, not a stale full list").toContain("No existing testcases.");
+    expect(routerPrompt, "the project-wide total must be zero, not the physical row count").toContain("The total test case count for this project is 0,");
+  });
+
+  // Zyra context integrity, Phase 3/4 (suites soft-delete) — Q11: a chat-staged `create` draft
+  // resolves its target suite once (matchZyraSuiteByName, here — see resolveOrCreateSuiteByName's
+  // own test below for the create_suite path) and that resolved id sits frozen inside
+  // ai_generation_requests.generated_payload until the user hits Save, potentially long after. Before
+  // suites were soft-deletable this could never go stale silently: a suite id that resolved once
+  // couldn't stop existing without a hard delete, and a hard-deleted suite would make the save's INSERT
+  // fail loudly on the FK. Now the row still exists (just filtered out of every list), so the FK is
+  // satisfied and the old code would have silently written a suite_id that looks deleted everywhere
+  // else. Per Yuvraj's resolution (Q11): fall back to unassigned rather than failing the batch, and
+  // note the fallback in the batch's own activity_log.
+  test("ZYR-A-68 a create draft's staged suite falls back to unassigned (not a failed save) if the suite is soft-deleted before Save", async () => {
+    await allocateFakeAiKey();
+    const suiteName = `E2E Suite Deleted Before Save ${Date.now()}`;
+    const suiteRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/suites`, {
+      data: { name: suiteName },
+      failOnStatusCode: false,
+    });
+    expect(suiteRes.status(), `creating the suite — ${await suiteRes.text()}`).toBe(201);
+    const suiteId = (await suiteRes.json()).id;
+
+    const sessionId = await newSession("E2E suite deleted before save");
+    // Router: routes to create. matchZyraSuiteByName (legacy.service.ts) matches the suite by its
+    // name appearing verbatim in the raw message, so the staged draft below gets `suiteId` set to it
+    // without needing a routedSuite field on this reply.
+    ai.queueReply({
+      reply: "", reasoningSummary: `Creating a test case for the ${suiteName} suite.`,
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Case staged against a suite that will be deleted before Save",
+        preconditions: "n/a",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do the thing", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "n/a",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Create a test case for the ${suiteName} suite.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(taskId, "the create turn must have staged a review batch").toBeTruthy();
+
+    const stagedSuiteId = scalar(
+      `SELECT generated_payload->0->'draft'->>'suiteId' FROM ai_generation_requests WHERE id = ${literal(taskId)};`,
+    );
+    expect(stagedSuiteId, "the draft must have resolved the suite by name before this test deletes it").toBe(suiteId);
+
+    // The suite is deleted (soft, per this fix) BETWEEN staging and Save — the exact window Q11 is
+    // about. moveToDefault is the mode that matters here: it does not touch the testcases, only the
+    // suite itself stops resolving to anything live.
+    const deleteRes = await asOwner.delete(`/api/suites/${suiteId}`, {
+      params: { mode: "moveToDefault" },
+      failOnStatusCode: false,
+    });
+    expect(deleteRes.ok(), `deleting the suite — ${await deleteRes.text()}`).toBeTruthy();
+
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    expect(saveRes.status(), `saving despite the deleted suite — ${await saveRes.text()}`).toBeLessThan(300);
+    const saved = await saveRes.json();
+    expect(saved.savedCount, "the batch must still save, not fail outright").toBe(1);
+    expect(saved.testcases).toHaveLength(1);
+
+    // Ground truth from the database, not just the response shape.
+    const persistedSuiteId = scalar(`SELECT suite_id FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`);
+    expect(persistedSuiteId, "the new test case must land unassigned, not pointing at the deleted suite").toBe("");
+
+    const activityLog = JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{
+      title?: string;
+      detail?: string;
+    }>;
+    expect(
+      activityLog.some((entry) => /no longer available/i.test(entry.title || "")),
+      `the fallback must be noted on the batch's own activity log — got ${JSON.stringify(activityLog)}`,
+    ).toBe(true);
+  });
+
+  // Zyra context integrity, Phase 3/4 — resolveOrCreateSuiteByName (legacy.service.ts) is the
+  // create_suite / move_to_suite resolver: before this fix it matched by name with no `deleted_at`
+  // filter, so asking Zyra to (re-)create a suite whose name matches one that was just soft-deleted
+  // would silently reattach to the dead row instead of creating a fresh, listable one.
+  test("ZYR-A-69 create_suite creates a fresh suite when the same name was used by a suite that is now soft-deleted", async () => {
+    await allocateFakeAiKey();
+    const suiteName = `E2E Suite Reuse By Name ${Date.now()}`;
+
+    const session1 = await newSession("E2E suite reuse 1");
+    ai.queueReply({
+      reply: "Created the suite.", reasoningSummary: "Creating the requested suite.",
+      action: "create_suite", actionType: "suite", operations: [{ type: "create_suite", suiteName }], testcases: [],
+    });
+    const turn1 = await asOwner.post(url(`/chat/sessions/${session1}/messages`), {
+      data: { message: `Create a suite called ${suiteName}` },
+      failOnStatusCode: false,
+    });
+    expect(turn1.status(), `first create_suite turn — ${await turn1.text()}`).toBeLessThan(300);
+
+    const firstSuiteId = scalar(
+      `SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(suiteName)} AND deleted_at IS NULL;`,
+    );
+    expect(firstSuiteId, "the first turn must have created the suite").toBeTruthy();
+
+    const del = await asOwner.delete(`/api/suites/${firstSuiteId}`, { params: { mode: "moveToDefault" }, failOnStatusCode: false });
+    expect(del.ok(), `deleting the first suite — ${await del.text()}`).toBeTruthy();
+
+    // Same name, a second, independent turn — resolveOrCreateSuiteByName must not find the
+    // soft-deleted row a live match and reuse it.
+    const session2 = await newSession("E2E suite reuse 2");
+    ai.queueReply({
+      reply: "Created the suite.", reasoningSummary: "Creating the requested suite.",
+      action: "create_suite", actionType: "suite", operations: [{ type: "create_suite", suiteName }], testcases: [],
+    });
+    const turn2 = await asOwner.post(url(`/chat/sessions/${session2}/messages`), {
+      data: { message: `Create a suite called ${suiteName}` },
+      failOnStatusCode: false,
+    });
+    expect(turn2.status(), `second create_suite turn — ${await turn2.text()}`).toBeLessThan(300);
+
+    const activeMatches = column(
+      `SELECT id FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(suiteName)} AND deleted_at IS NULL;`,
+    );
+    expect(activeMatches, "exactly one ACTIVE suite with this name after the second turn").toHaveLength(1);
+    expect(activeMatches[0], "must be a freshly created suite, not the soft-deleted original resurrected").not.toBe(firstSuiteId);
+
+    // Listed via the real API too, not only visible to a direct DB query — proves the soft-deleted
+    // original is genuinely gone from what the user (and Zyra) sees, not merely uncounted.
+    const suitesList = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}/suites`)).json();
+    expect(suitesList.filter((s: { name: string }) => s.name === suiteName)).toHaveLength(1);
+  });
+
+  // Hard-delete remediation Phase 3: bugsSnapshot had no deleted_at filter, predicted as a live gap
+  // by the original Zyra context-integrity audit before `bugs.deleted_at` existed at all. Both bugs
+  // share a distinctive keyword so they both match zyraSearchTerms' relevance search; only the
+  // deleted one should be excluded once the fix lands.
+  test("ZYR-A-70 a soft-deleted bug is excluded from Zyra's relevance-matched bug context", async () => {
+    await allocateFakeAiKey();
+    const keyword = `quantumwidget${Date.now()}`;
+
+    async function createBug(title: string): Promise<string> {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+        data: { title, description: "seeded for ZYR-A-70" },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+      return (await res.json()).id;
+    }
+
+    const activeTitle = `Crash in the ${keyword} checkout flow`;
+    const deletedTitle = `Timeout in the ${keyword} settings panel`;
+    await createBug(activeTitle);
+    const deletedId = await createBug(deletedTitle);
+
+    const delRes = await asOwner.delete(`/api/bugs/${deletedId}`, { failOnStatusCode: false });
+    expect(delRes.ok(), `deleting the second bug — ${await delRes.text()}`).toBeTruthy();
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM bugs WHERE id = ${literal(deletedId)};`)).toBe("t");
+
+    const sessionId = await newSession("E2E bug relevance gap");
+    ai.queueReply({
+      reply: "Let me check.", reasoningSummary: "Answering directly, no operations.",
+      action: "answer", actionType: "answer", operations: [], testcases: [],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Are there any known bugs related to ${keyword}?` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the question — ${await turn.text()}`).toBeLessThan(300);
+
+    const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(routerPrompt, "the still-live bug must be cited").toContain(activeTitle);
+    expect(routerPrompt, "a soft-deleted bug must not reach the model as grounding context").not.toContain(deletedTitle);
+  });
+
+  /*
+   * "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the model was never asked
+   * for either field (zyraSystemPrompt) and the parser never extracted them (normalizeAiDrafts), so
+   * a chat-generated draft always saved with both null. These drive the real chat "create" turn
+   * through the fake provider — unlike ZYR-A-71..74 in the other describe block above, which seed a
+   * draft directly and only exercise the SAVE/persistence half, these exercise the PROMPT and
+   * NORMALIZATION half: what's asked for, and how a model's raw answer is sanitized before it's ever
+   * staged.
+   */
+  test("ZYR-A-71 a chat-generated test case's severity and component are asked for, returned, and persisted on save", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E severity component generation");
+
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case for checkout.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout rejects an expired card",
+        preconditions: "A cart has at least one item.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Pay with an expired card", expectedResult: "Checkout is blocked with a clear error" }]),
+        testData: "",
+        expectedSummary: "The expired card is rejected before payment is attempted.",
+        priority: "P1",
+        severity: "High",
+        component: "Checkout",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Create a test case for checkout rejecting an expired card." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `sending the create message — ${await turn.text()}`).toBeLessThan(300);
+
+    // The model was actually asked for both fields (zyraSystemPrompt's JSON shape), not just
+    // happened to answer with them.
+    const draftingPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+    expect(draftingPrompt, "the model must be asked for severity").toContain("severity");
+    expect(draftingPrompt, "the model must be asked for component").toContain("component");
+
+    // The display/preview gap this ticket was actually about: the chat UI (ZyraChatReviewPanel)
+    // renders straight from this turn's response body, BEFORE anything is saved — chatDraftRow
+    // used to rebuild this row and silently drop severity/component even though generation and
+    // save both had them all along. Asserting only the post-save DB row (below) would have passed
+    // throughout the whole time this bug was live.
+    const turnBody = await turn.json();
+    const proposedRow = (turnBody.message?.testcases ?? []).find((tc: { action?: string }) => tc.action === "proposed-create");
+    expect(proposedRow, "the create turn must stage a proposed-create row on the assistant message").toBeTruthy();
+    expect(proposedRow.severity, "severity must reach the chat preview, not just the saved row").toBe("High");
+    expect(proposedRow.component, "component must reach the chat preview, not just the saved row").toBe("Checkout");
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(taskId, "the create turn must have staged a review batch").toBeTruthy();
+
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBeLessThan(300);
+    const saved = await saveRes.json();
+    expect(saved.testcases).toHaveLength(1);
+
+    expect(scalar(`SELECT severity FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("High");
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("Checkout");
+  });
+
+  test("ZYR-A-72 a severity value outside the fixed vocabulary is dropped to null on the saved row, never stored verbatim", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E invalid severity");
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [{
+        title: "Case with an invented severity label",
+        preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+        priority: "P2", severity: "Blocker", component: "Auth", tags: ["zyra"], sourceRefs: [],
+      }],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Create a test case." }, failOnStatusCode: false });
+    expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    const saved = await saveRes.json();
+    expect(
+      scalar(`SELECT severity FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`),
+      "an unrecognized severity ('Blocker' is not Critical/High/Medium/Low) must never be stored verbatim",
+    ).toBe("");
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("Auth");
+  });
+
+  test("ZYR-A-73 a blank component is stored as null and an over-long one is truncated, not rejected", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E component bounds");
+    const overlong = "x".repeat(300);
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 2, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: [
+        { title: "Case with a blank component", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a", priority: "P2", severity: "Low", component: "", tags: ["zyra"], sourceRefs: [] },
+        { title: "Case with an over-long component", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a", priority: "P2", severity: "Low", component: overlong, tags: ["zyra"], sourceRefs: [] },
+      ],
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Create two test cases." }, failOnStatusCode: false });
+    expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+    const taskId = scalar(
+      `SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} AND task_status = 'in_review' ORDER BY created_at DESC LIMIT 1;`,
+    );
+    const saveRes = await asOwner.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+    const saved = await saveRes.json();
+    expect(saved.testcases).toHaveLength(2);
+    expect(scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[0].id)};`)).toBe("");
+    const stored = scalar(`SELECT component FROM testcases WHERE id = ${literal(saved.testcases[1].id)};`);
+    expect(stored.length, `an over-long component must be truncated to the column's 255-char bound, got ${stored.length}`).toBe(255);
+    expect(stored).toBe(overlong.slice(0, 255));
+  });
+
+  test("ZYR-A-74 an existing test case's component is offered to the model as reusable grounding context, scoped to this project only", async () => {
+    await allocateFakeAiKey();
+    const componentName = `PaymentsGateway${Date.now()}`;
+    const otherProjectComponentName = `OtherProjectOnlyComponent${Date.now()}`;
+
+    const seeded = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: "Existing payments case", component: componentName },
+      failOnStatusCode: false,
+    });
+    expect(seeded.status(), `seeding the existing case — ${await seeded.text()}`).toBe(201);
+    const seededId = (await seeded.json()).id;
+
+    // Same organization, a DIFFERENT project — proves the grounding query is project-scoped, not
+    // merely "not world-readable": a component from another project this same owner can also reach
+    // must still never leak into this project's generation context.
+    const seededOther = await asOwner.post(`/api/projects/${tenant!.secondProjectId}/testcases`, {
+      data: { title: "Other project's case", component: otherProjectComponentName },
+      failOnStatusCode: false,
+    });
+    expect(seededOther.status(), `seeding the other-project case — ${await seededOther.text()}`).toBe(201);
+    const seededOtherId = (await seededOther.json()).id;
+
+    try {
+      const sessionId = await newSession("E2E component grounding");
+      ai.queueReply({
+        reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+      });
+      ai.queueReply({
+        drafts: [{
+          title: "A new payments case", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+          priority: "P2", severity: "Low", component: componentName, tags: ["zyra"], sourceRefs: [],
+        }],
+      });
+
+      const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Create a new payments test case." }, failOnStatusCode: false,
+      });
+      expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+      const draftingPrompt = JSON.stringify(ai.requests[1]?.messages ?? []);
+      expect(draftingPrompt, "an existing component in THIS project must be offered as reusable grounding").toContain(componentName);
+      expect(draftingPrompt, "another project's component name must never leak into this project's grounding context").not.toContain(otherProjectComponentName);
+    } finally {
+      await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${seededId}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/projects/${tenant!.secondProjectId}/testcases/${seededOtherId}`, { failOnStatusCode: false });
+    }
+  });
 });
 
 /*
@@ -2084,8 +3295,9 @@ test.describe("zyra chat — progress streaming (fake provider)", () => {
     const project = literal(tenant!.mainProjectId);
     const org = literal(tenant!.organizationId);
     exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
-    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT now (V116) — before sessions.
     exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
@@ -2206,5 +3418,1196 @@ test.describe("zyra chat — progress streaming (fake provider)", () => {
     expect(res.status()).toBe(200);
     const events = parseSseEvents(await res.text());
     expect(events).toEqual([{ kind: "unknown" }]);
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 6: zyra_chat_sessions itself. deleteZyraChatSession issued a real
+ * DELETE, and zyra_chat_messages.session_id / ai_generation_requests.chat_session_id were both
+ * ON DELETE CASCADE, so deleting a conversation destroyed the whole transcript (plus any staged,
+ * unsaved review batch) with no audit trail. V116 converts it to soft-delete, matching every other
+ * entity. These tests prove the session row genuinely survives (not just that the API stops showing
+ * it) and that every access-gated route treats a deleted session as gone.
+ */
+test.describe("zyra chat session soft-delete (hard-delete remediation Phase 6)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-chat");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  test("deleting a chat session soft-deletes the row — it is not physically removed", async () => {
+    const sessionId = await newSession(`E2E Session Soft-Delete ${Date.now()}`);
+
+    const delRes = await asOwner.delete(url(`/chat/sessions/${sessionId}`));
+    expect(delRes.ok(), `deleting the session — ${await delRes.text()}`).toBeTruthy();
+
+    // DB-level proof, not just the API's 404s below — the row must still physically exist.
+    expect(scalar(`SELECT deleted_at IS NOT NULL FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("t");
+    expect(scalar(`SELECT COUNT(*)::text FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("1");
+
+    // Every access-gated route treats it as gone.
+    expect((await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false })).status()).toBe(404);
+    expect((await asOwner.patch(url(`/chat/sessions/${sessionId}`), { data: { title: "renamed" }, failOnStatusCode: false })).status()).toBe(404);
+    expect(
+      (await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "hello" }, failOnStatusCode: false })).status(),
+    ).toBe(404);
+    const list = await (await asOwner.get(url("/chat/sessions"))).json();
+    expect(list.list.some((s: { id: string }) => s.id === sessionId)).toBeFalsy();
+
+    // Deleting again must 404 (already gone from every read path), never a raw driver error from
+    // hitting an already-non-null deleted_at a second time.
+    expect((await asOwner.delete(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false })).status()).toBe(404);
+  });
+});
+
+/*
+ * Task-board generation (processZyraTask, behind POST /agents/zyra/tasks — aiGenerate) is fire-
+ * and-forget: the route returns 201 immediately and the real work happens in the background, which
+ * is why the top describe block above never drives it through a live model (seedTask() arranges
+ * rows directly instead — see that function's own comment). That left this path's actual knowledge
+ * selection completely unexercised against a real generation call. This block drives it for real,
+ * polling task_status the way ZYR-A-86's waitForResumeToSettle already does for chat resume.
+ */
+test.describe("zyra task-board generation — knowledge relevance (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-relevance");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    // See FakeAiServer.reset()'s doc comment — one server instance is shared across this block's
+    // tests (one beforeAll).
+    ai?.reset();
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_folders WHERE project_id = ${project} AND is_root = false;`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  /*
+   * A custom-gateway provider (anything absent from PROVIDER_CATALOG) is OpenAI-wire by
+   * convention (see providerWire's own comment in legacy.service.ts) — compatible with this fake
+   * server's chat-completions shape — but is deliberately NOT one of the three
+   * EMBEDDING_CAPABLE_PROVIDERS (openai/google/mistral only, rag-embedding-providers.ts). That
+   * makes resolveEmbeddingAllocation report no embeddings-capable key anywhere, so
+   * RagRetrievalService skips its ANN half entirely instead of calling this fake server's
+   * chat-only endpoint as if it were a real /v1/embeddings and getting back the wrong response
+   * shape. Only the full-text half of retrieval runs, which is exactly what this test needs and
+   * keeps it independent of a real embeddings provider.
+   */
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: {
+        name: `E2E relevance fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`,
+        provider: "e2e-fake-gateway",
+        apiKey: "sk-e2e-fake",
+        baseUrl: ai.baseUrl,
+        defaultModel: "gpt-4o-mini",
+      },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  async function createDoc(title: string, contentText: string): Promise<string> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title, contentText },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    return (await res.json()).id;
+  }
+
+  /** Polls until the task leaves 'todo'/'in_progress', or the attempt budget runs out — same
+   *  pattern as ZYR-A-86's waitForResumeToSettle for chat resume. */
+  async function waitForTaskSettled(taskId: string, maxAttempts = 40): Promise<string> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`) ?? "";
+  }
+
+  test("ZYR-A-91 task-board generation surfaces a KB document outside the 12-most-recently-updated window", async () => {
+    await allocateFakeAiKey();
+
+    // Created FIRST so the 12 filler docs below push it out of knowledgeSnapshot's own
+    // `ORDER BY updated_at DESC LIMIT 12` window — the exact shape of the reported bug: the
+    // relevant document genuinely exists in the knowledge base, it just isn't among the 12 most
+    // recently touched.
+    await createDoc(
+      "Aurora session policy",
+      "All authenticated sessions in the Aurora billing portal expire after exactly 20 minutes of inactivity, regardless of subscription tier.",
+    );
+    for (let i = 0; i < 12; i++) {
+      await createDoc(`Filler onboarding note ${i}`, "Unrelated onboarding checklist item with no bearing on this task.");
+    }
+
+    // Deliberately no `E2E ... ${Date.now()}` uniqueness prefix here (unlike this file's other
+    // fixtures) — user_story has no uniqueness constraint to collide on, and every extra word
+    // would join the full-text AND-query below (plainto_tsquery requires every query lexeme to be
+    // present in the matched document), so the story is kept to exactly the terms the Aurora doc
+    // above actually contains.
+    //
+    // Deliberately does NOT mention "20 minutes" — zyraDynamicTaskPrompt always embeds the raw
+    // story text verbatim as its own "Story:" line, independent of what knowledge gets
+    // retrieved, so the story text must not itself carry the value this test proves came from
+    // the KB doc, or the assertion below would pass whether or not retrieval worked at all.
+    const story = "Aurora billing portal sessions expire from inactivity.";
+    ai.queueReply({
+      drafts: [{
+        title: "Session expires after the configured inactivity timeout",
+        preconditions: "The user is signed in to the Aurora billing portal.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Leave the session idle for the configured timeout", expectedResult: "The session expires" }]),
+        testData: "",
+        expectedSummary: "The session expires after the configured timeout.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: ["KB 1"],
+      }],
+    });
+    // rememberZyraTurn's own summarization call, made unconditionally after a successful
+    // generation — same two-call shape processZyraTask always makes, not something this test
+    // is about, so a plain non-JSON reply (rememberZyraTurn just splits it into bullet lines).
+    ai.queueReply("- Generated a session-timeout test case for the Aurora billing portal.");
+
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: story }, failOnStatusCode: false });
+    expect(taskRes.status(), `creating the task — ${await taskRes.text()}`).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+
+    const finalStatus = await waitForTaskSettled(taskId);
+    expect(finalStatus, "generation must complete, not fail").toBe("in_review");
+
+    // Not asserting ai.requests.length here: task_status flips to 'in_review' (what
+    // waitForTaskSettled polls for) before processZyraTask's own later, unawaited-by-us call to
+    // rememberZyraTurn's summarization pass reaches this fake server — a real race against that
+    // second background call, not something this test is about. ai.requests[0] (the generation
+    // call) is already guaranteed to exist by the time task_status flips, since generation runs
+    // and its result is persisted before that UPDATE.
+    const generationPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(
+      generationPrompt,
+      "a KB doc outside the 12-most-recent window must still reach the model when the request is actually about it",
+    ).toContain("20 minutes of inactivity");
+  });
+
+  test("ZYR-A-92 regeneration after reviewer feedback also retrieves a KB document outside the 12-most-recently-updated window", async () => {
+    await allocateFakeAiKey();
+
+    await createDoc(
+      "Aurora session policy",
+      "All authenticated sessions in the Aurora billing portal expire after exactly 20 minutes of inactivity, regardless of subscription tier.",
+    );
+    for (let i = 0; i < 12; i++) {
+      await createDoc(`Filler onboarding note ${i}`, "Unrelated onboarding checklist item with no bearing on this task.");
+    }
+
+    // The INITIAL story deliberately shares nothing with the Aurora doc — this test is about what
+    // processZyraFeedback retrieves for the regeneration, not the initial generation (that's
+    // ZYR-A-91's job).
+    const initialStory = "Checkout page redesign for the mobile app.";
+    ai.queueReply({
+      drafts: [{
+        title: "Checkout page renders on mobile",
+        preconditions: "The user is on the checkout page.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open checkout on a mobile device", expectedResult: "The redesigned layout renders" }]),
+        testData: "",
+        expectedSummary: "The redesigned checkout page renders correctly on mobile.",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+    ai.queueReply("- Generated a checkout page test case.");
+
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: initialStory }, failOnStatusCode: false });
+    expect(taskRes.status(), `creating the task — ${await taskRes.text()}`).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(await waitForTaskSettled(taskId), "initial generation must complete, not fail").toBe("in_review");
+
+    // task_status flips to 'in_review' before processZyraTask's own later, unawaited call to
+    // rememberZyraTurn's summarization pass reaches this fake server (see ZYR-A-91's identical
+    // comment) — drain that still-in-flight request before resetting below, or it lands AFTER the
+    // reset and steals one of the two replies queued for the regeneration phase, one call late.
+    for (let i = 0; i < 40 && ai.requests.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    // Isolates the requests this fake server sees from here on to the regeneration alone, so the
+    // assertion below can read ai.requests[0] unambiguously instead of guessing an index past
+    // however many calls the initial generation made (see ZYR-A-91's comment on that same race).
+    ai.reset();
+    ai.queueReply({
+      drafts: [{
+        title: "Session expires after the configured inactivity timeout",
+        preconditions: "The user is signed in to the Aurora billing portal.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Leave the session idle for the configured timeout", expectedResult: "The session expires" }]),
+        testData: "",
+        expectedSummary: "The session expires after the configured timeout.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: ["KB 1"],
+      }],
+    });
+    ai.queueReply("- Regenerated with a session-timeout test case for the Aurora billing portal.");
+
+    // Same reasoning as ZYR-A-91's story: only the exact terms the Aurora doc contains, so the
+    // full-text AND-query matches it, and no "20 minutes" here — that value must come from the
+    // retrieved document, not be echoed back from the feedback text itself (feedback, like story,
+    // is embedded verbatim in the regeneration prompt).
+    const feedbackRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Aurora billing portal sessions expire from inactivity." },
+      failOnStatusCode: false,
+    });
+    expect(feedbackRes.status(), `submitting feedback — ${await feedbackRes.text()}`).toBe(201);
+    expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+
+    const regenerationPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+    expect(
+      regenerationPrompt,
+      "regeneration after feedback must also retrieve a KB doc outside the 12-most-recent window, not just the initial generation",
+    ).toContain("20 minutes of inactivity");
+  });
+});
+
+/*
+ * Ticket auto-comment after a Zyra save — "Auto-comment on Jira/Linear ticket" in the project's
+ * integration settings (projects.settings.jiraAutoComment / linearAutoComment).
+ *
+ * The flow under test, end to end through the real routes:
+ *   1. a Task-board task is created with Knowledge Base documents selected; a document that is a
+ *      ticket's mirror (source_role = 'mirror') links the task to that ticket — but only when the
+ *      selection points at exactly ONE ticket;
+ *   2. Zyra generates drafts (the fake provider, utils/fake-ai-server.ts);
+ *   3. the save links the new test cases to the ticket and records ONE ticket comment for that save
+ *      in integration_ticket_comments (V123), listing exactly the test cases it wrote.
+ *
+ * WHAT IS AND ISN'T OBSERVABLE. Jira and Linear base URLs are compiled in (see
+ * api/integrations.spec.ts's header), so no fake upstream can receive the comment. What IS proven
+ * here is everything Tesbo decides and records: whether a comment is due, for which ticket, with
+ * which test cases, in what words, and that a skip or a provider failure never fails the save. The
+ * "posted" end state itself needs a real Jira site and is verified by hand, not here.
+ *
+ * One consequence worth knowing: a delivery test (setting on + connected) reaches the real
+ * api.atlassian.com / api.linear.app with the fixture's nonsense token. That request cannot write
+ * anything — it is refused (or fails to connect, on a box with no egress) — and the ledger records
+ * it as 'failed', which is the terminal state these tests wait for.
+ */
+test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+  // Replies scripted since the last ai.reset() — see drainBackgroundAi().
+  let queued = 0;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-autocomment");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    // Same shared-server reset as the other fake-provider blocks in this file.
+    ai?.reset();
+    queued = 0;
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(async () => {
+    if (!tenant) return;
+    await drainBackgroundAi();
+    purge();
+  });
+
+  /*
+   * processZyraTask runs in the background, and makes one more provider call (rememberZyraTurn's
+   * summary) AFTER the task already reads in_review. Either can reach the shared fake server after
+   * the next test's ai.reset() and consume the reply that test scripted. So before a test ends:
+   * every task in the project has settled, and every reply it scripted has been asked for.
+   */
+  async function drainBackgroundAi(): Promise<void> {
+    for (let i = 0; i < 80; i++) {
+      const busy = scalar(
+        "SELECT count(*) FROM ai_generation_requests WHERE project_id = " + literal(tenant!.mainProjectId) +
+          " AND task_status IN ('todo', 'in_progress');",
+      );
+      if (busy === "0" && ai.requests.length >= queued) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  function purge(): void {
+    const projects = `${literal(tenant!.mainProjectId)}, ${literal(tenant!.secondProjectId)}`;
+    const org = literal(tenant!.organizationId);
+    // integration_ticket_comments cascades off ai_generation_requests (ON DELETE CASCADE, V123).
+    exec(`DELETE FROM ai_generation_requests WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM testcases WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM linear_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_folders WHERE project_id IN (${projects}) AND is_root = false;`);
+    exec(`DELETE FROM integration_connections WHERE organization_id = ${org};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+    exec(`UPDATE projects SET settings = '{}'::jsonb WHERE id IN (${projects});`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  // Same custom-gateway provider as the relevance block above, for the same reason: OpenAI-wire, so
+  // the fake server can answer it, but not embeddings-capable, so a seeded KB doc's background
+  // embedding job never consumes one of this test's queued replies.
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: {
+        name: `E2E autocomment fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`,
+        provider: "e2e-fake-gateway",
+        apiKey: "sk-e2e-fake",
+        baseUrl: ai.baseUrl,
+        defaultModel: "gpt-4o-mini",
+      },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  /** Saved through the same PATCH the integration settings panel sends (IntegrationAiGenerationSettings.tsx). */
+  async function setAutoComment(settings: { jiraAutoComment?: boolean; linearAutoComment?: boolean }): Promise<void> {
+    const current = await (await asOwner.get(`/api/projects/${tenant!.mainProjectId}`)).json();
+    const parsed = typeof current.settings === "string" ? JSON.parse(current.settings || "{}") : current.settings || {};
+    const res = await asOwner.patch(`/api/projects/${tenant!.mainProjectId}`, {
+      data: { settings: JSON.stringify({ ...parsed, ...settings }) },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving the auto-comment setting — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  /** A workspace connection row, as api/integrations.spec.ts seeds it — never a real OAuth leg. */
+  function seedConnection(provider: "jira" | "linear", options: { disconnected?: boolean } = {}): string {
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
+        `refresh_token, token_expires_at, connected_by, disconnected_at) VALUES (${literal(tenant!.organizationId)}, ` +
+        `${literal(provider)}, ${literal(`e2e-${provider}-site`)}, 'https://e2e.invalid', 'e2e-not-a-real-token', '', ` +
+        `now() + interval '1 hour', ${literal(tenant!.owner.userId)}, ${options.disconnected ? "now()" : "NULL"});`,
+    );
+    return scalar(
+      `SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} ` +
+        `AND provider = ${literal(provider)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  function rootFolderId(projectId = tenant!.mainProjectId): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(projectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(projectId)} AND is_root = true;`);
+  }
+
+  /**
+   * A synced ticket and its Knowledge Base mirror, exactly as integration-sync.processor.ts leaves
+   * them: the mirror's source_external_id is the provider's issue ID, not the key — which is why the
+   * backend has to go through the ticket table to find the key at all.
+   */
+  function seedTicketWithMirror(provider: "jira" | "linear", connectionId: string, key: string, projectId = tenant!.mainProjectId): string {
+    const issueId = `id-${key}-${Date.now()}`;
+    if (provider === "jira") {
+      exec(
+        "INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description, " +
+          `issue_type, status, jira_url) VALUES (${literal(projectId)}, ${literal(connectionId)}, ${literal(issueId)}, ` +
+          `${literal(key)}, ${literal(`E2E ${key} loan approval`)}, 'seeded by the e2e suite', 'Story', 'To Do', ` +
+          `${literal(`https://e2e.invalid/browse/${key}`)});`,
+      );
+    } else {
+      exec(
+        "INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, " +
+          `description, issue_type, status, linear_url) VALUES (${literal(projectId)}, ${literal(connectionId)}, ` +
+          `${literal(issueId)}, ${literal(key)}, ${literal(`E2E ${key} loan approval`)}, 'seeded by the e2e suite', 'Bug', ` +
+          `'Todo', ${literal(`https://e2e.invalid/issue/${key}`)});`,
+      );
+    }
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(rootFolderId(projectId))}, ` +
+        `${literal(`${key}: E2E loan approval`)}, 'Approve or reject loan applications.', '<p>Approve or reject loan applications.</p>', ` +
+        `'requirement_note', 'published', ${literal(provider)}, ${literal(issueId)}, 'mirror', true);`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(projectId)} AND source_external_id = ${literal(issueId)};`,
+    );
+  }
+
+  /** A plain, user-written KB document — not a ticket mirror, even if it mentions a key. */
+  async function createNote(title: string, contentText: string): Promise<string> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title, contentText },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    return (await res.json()).id;
+  }
+
+  function draft(title: string): Record<string, unknown> {
+    return {
+      title,
+      preconditions: "A loan application is pending.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open the application", expectedResult: "It opens" }]),
+      testData: "",
+      expectedSummary: "The application can be reviewed.",
+      priority: "P2",
+      tags: ["zyra"],
+      sourceRefs: [],
+    };
+  }
+
+  /** Scripts one generation (plus the memory-summarization call processZyraTask always makes after). */
+  function queueGeneration(titles: string[]): void {
+    ai.queueReply({ drafts: titles.map(draft) });
+    ai.queueReply("- Generated loan approval test cases.");
+    queued += 2;
+  }
+
+  async function waitForTaskSettled(taskId: string, maxAttempts = 60): Promise<string> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`) ?? "";
+  }
+
+  /** Creates a task through the real route (aiGenerate) and returns the created task. */
+  async function createTask(data: Record<string, unknown>): Promise<any> {
+    const res = await asOwner.post(url("/tasks"), { data: { userStory: `E2E loan approval ${Date.now()}`, ...data }, failOnStatusCode: false });
+    expect(res.status(), `creating the task — ${await res.text()}`).toBe(201);
+    return res.json();
+  }
+
+  /**
+   * A Task-board row already in review, written directly — for the save-side cases that don't need
+   * to re-prove generation. Same load-bearing details as seedTask() in the first block
+   * (agent_name, bare-array generated_payload).
+   */
+  function seedReviewTask(fields: { titles: string[]; jiraIssueKey?: string; linearIssueKey?: string }): string {
+    const drafts = fields.titles.map(draft);
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys, linear_issue_keys) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', 'E2E loan approval', ` +
+        `${drafts.length}, ${drafts.length}, 0, ${literal(JSON.stringify(drafts))}::jsonb, 'Zyra the Test Generator', 'in_review', ` +
+        `${literal(JSON.stringify(fields.jiraIssueKey ? [fields.jiraIssueKey] : []))}::jsonb, ` +
+        `${literal(JSON.stringify(fields.linearIssueKey ? [fields.linearIssueKey] : []))}::jsonb);`,
+    );
+    return scalar(
+      `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  async function save(taskId: string, selectedDraftIndexes?: number[]): Promise<APIResponse> {
+    return asOwner.post(url(`/tasks/${taskId}/save`), {
+      data: selectedDraftIndexes ? { selectedDraftIndexes } : {},
+      failOnStatusCode: false,
+    });
+  }
+
+  type LedgerRow = { provider: string; issue_key: string; status: string; testcase_ids: string[]; comment_text: string; reason: string | null; save_event_id: string };
+
+  function ledger(taskId: string): LedgerRow[] {
+    const raw = scalar(
+      "SELECT coalesce(json_agg(json_build_object('provider', provider, 'issue_key', issue_key, 'status', status, " +
+        "'testcase_ids', testcase_ids, 'comment_text', comment_text, 'reason', reason, 'save_event_id', save_event_id) " +
+        `ORDER BY created_at), '[]') FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`,
+    );
+    return JSON.parse(raw || "[]");
+  }
+
+  /** Waits for a delivery to leave 'pending' — it runs in the background after the save returns. */
+  async function waitForDelivery(taskId: string, maxAttempts = 120): Promise<LedgerRow[]> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const rows = ledger(taskId);
+      if (rows.length && rows.every((row) => row.status !== "pending")) return rows;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return ledger(taskId);
+  }
+
+  function activityTitles(taskId: string): string[] {
+    const raw = scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    return (JSON.parse(raw || "[]") as Array<{ title: string }>).map((entry) => entry.title);
+  }
+
+  function linkedKey(testcaseId: string, column: "jira_issue_key" | "linear_issue_key" = "jira_issue_key"): string {
+    return scalar(`SELECT coalesce(${column}, '') FROM testcases WHERE id = ${literal(testcaseId)};`);
+  }
+
+  // ─── The primary flow ─────────────────────────────────────────────────────
+
+  test("ZYR-AC-01 KB doc of a Jira ticket → Zyra generates → save posts ONE comment listing exactly those test cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const key = "MFLP-6";
+    const docId = seedTicketWithMirror("jira", connectionId, key);
+    await setAutoComment({ jiraAutoComment: true });
+
+    // An unrelated test case already in the project — it must never appear in the ticket's comment.
+    const unrelated = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+      data: { title: `E2E unrelated case ${Date.now()}` },
+      failOnStatusCode: false,
+    });
+    expect(unrelated.status()).toBe(201);
+    const unrelatedTitle = (await unrelated.json()).title;
+
+    const titles = ["Approver can approve a pending loan", "Approver can reject a pending loan with a reason"];
+    queueGeneration(titles);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    const taskId = created.generationRequestId;
+
+    // The KB selection alone linked the task to its ticket — no key was sent.
+    expect(created.task.jiraIssueKeys).toEqual([key]);
+    const jiraSource = (created.task.sources as Array<{ type: string; title: string; detail: string }>).find((s) => s.type === "jira");
+    expect(jiraSource).toMatchObject({ title: key, detail: "Linked from the selected Knowledge Base document." });
+
+    expect(await waitForTaskSettled(taskId), "generation must complete").toBe("in_review");
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    expect(saved.savedCount).toBe(2);
+    expect(saved).not.toHaveProperty("saveEventId");
+    const savedIds = (saved.testcases as Array<{ id: string }>).map((t) => t.id);
+    for (const id of savedIds) expect(linkedKey(id), "each saved test case is linked to the ticket").toBe(key);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows, "exactly one comment for the one ticket this save touched").toHaveLength(1);
+    const [row] = rows;
+    expect(row).toMatchObject({ provider: "jira", issue_key: key });
+    expect([...row.testcase_ids].sort()).toEqual([...savedIds].sort());
+    expect(row.comment_text.split("\n")[0]).toBe("**Generated by Tesbo Test Manager**");
+    expect(row.comment_text).toContain(`Zyra saved 2 test cases for ${key} in Tesbo.`);
+    expect(row.comment_text).toContain("**Added (2)**");
+    // Against this machine's stack (FRONTEND_URL=http://localhost:…, no PUBLIC_APP_URL) each test case
+    // must be plain "ID — title": a link would open every reader's own localhost. Against a deployed
+    // stack (stage) it must link to that test case's page on that same deployment. The full matrix,
+    // including PUBLIC_APP_URL, is pinned in Tesbo-Backend-Nest's ticket-comment-links.spec.ts.
+    for (const t of saved.testcases as Array<{ id: string; externalId: string; title: string }>) {
+      if (env.targetIsLocal) {
+        expect(row.comment_text).toContain(`- ${t.externalId} — ${t.title}`);
+      } else {
+        expect(row.comment_text).toContain(`[${t.externalId}](`);
+        expect(row.comment_text).toContain(`/projects/${tenant!.mainProjectId}/testcases/${t.id}) — ${t.title}`);
+      }
+    }
+    expect(row.comment_text).not.toMatch(/localhost|127\.0\.0\.1/);
+    if (env.targetIsLocal) expect(row.comment_text).not.toContain("](");
+    expect(row.comment_text).not.toContain(unrelatedTitle);
+
+    // The fixture connection can't actually post (see the block header), so the terminal state here
+    // is 'failed' with the provider's reason — and the save above still succeeded regardless.
+    expect(["posted", "failed"]).toContain(row.status);
+    if (row.status === "failed") expect(row.reason, "a failure records why").toBeTruthy();
+    const save_events = scalar(`SELECT save_events::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+    expect(save_events, "the ledger's save event is the one the task recorded").toContain(row.save_event_id);
+    expect(activityTitles(taskId)).toContain(row.status === "posted" ? "Posted Jira comment" : "Jira comment failed");
+  });
+
+  test("ZYR-AC-02 regenerating with feedback keeps the ticket link, and the comment lists the regenerated test cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const key = "MFLP-7";
+    const docId = seedTicketWithMirror("jira", connectionId, key);
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueGeneration(["First-pass loan check"]);
+    const taskId = (await createTask({ knowledgeItemIds: [docId] })).generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    // Drain the first run's memory-summarization call before re-scripting (see ZYR-A-92's comment).
+    for (let i = 0; i < 40 && ai.requests.length < 2; i++) await new Promise((r) => setTimeout(r, 250));
+    ai.reset();
+    queued = 0;
+
+    queueGeneration(["Regenerated loan approval audit trail"]);
+    const feedback = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Also cover the audit trail." },
+      failOnStatusCode: false,
+    });
+    expect(feedback.status(), `submitting feedback — ${await feedback.text()}`).toBe(201);
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    // Nothing is commented until the user saves — regeneration alone never posts.
+    expect(ledger(taskId)).toHaveLength(0);
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue_key).toBe(key);
+    expect(rows[0].comment_text).toContain("Regenerated loan approval audit trail");
+    expect(rows[0].comment_text).not.toContain("First-pass loan check");
+    expect(rows[0].testcase_ids).toEqual((saved.testcases as Array<{ id: string }>).map((t) => t.id));
+  });
+
+  // ─── The setting and the connection ───────────────────────────────────────
+
+  test("ZYR-AC-03 auto-comment OFF: the test cases are saved and linked as normal, and no comment is attempted", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Off-case A", "Off-case B"], jiraIssueKey: "MFLP-8" });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    expect(saved.savedCount).toBe(2);
+    for (const t of saved.testcases as Array<{ id: string }>) expect(linkedKey(t.id)).toBe("MFLP-8");
+
+    const rows = ledger(taskId);
+    expect(rows.map((r) => r.status)).toEqual(["skipped_disabled"]);
+    expect(activityTitles(taskId)).toContain("No Jira comment posted");
+  });
+
+  test("ZYR-AC-04 auto-comment never switched on (no setting at all) is treated as off", async () => {
+    seedConnection("jira");
+    const taskId = seedReviewTask({ titles: ["Default-case"], jiraIssueKey: "MFLP-9" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_disabled"]);
+  });
+
+  test("ZYR-AC-05 Jira disconnected: the save succeeds and the comment is recorded as skipped, not failed", async () => {
+    seedConnection("jira", { disconnected: true });
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Disconnected-case"], jiraIssueKey: "MFLP-10" });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    expect((await saveRes.json()).savedCount).toBe(1);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_not_connected"]);
+  });
+
+  test("ZYR-AC-06 Jira never connected: same — skipped, and the save is unaffected", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Never-connected-case"], jiraIssueKey: "MFLP-11" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => r.status)).toEqual(["skipped_not_connected"]);
+  });
+
+  // ─── Which test cases, and how many comments ──────────────────────────────
+
+  test("ZYR-AC-07 a partial save lists only the drafts actually saved", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Kept one", "Dropped one", "Kept two"], jiraIssueKey: "MFLP-12" });
+
+    const saveRes = await save(taskId, [0, 2]);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const saved = await saveRes.json();
+    const [row] = ledger(taskId);
+    expect(row.testcase_ids).toEqual((saved.testcases as Array<{ id: string }>).map((t) => t.id));
+    expect(row.comment_text).toContain("Kept one");
+    expect(row.comment_text).toContain("Kept two");
+    expect(row.comment_text).not.toContain("Dropped one");
+  });
+
+  test("ZYR-AC-08 saving nothing (every draft deselected) records no comment at all", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    seedConnection("jira");
+    const taskId = seedReviewTask({ titles: ["Never saved"], jiraIssueKey: "MFLP-13" });
+
+    const saveRes = await save(taskId, []);
+    expect(saveRes.status()).toBeLessThan(300);
+    expect((await saveRes.json()).savedCount).toBe(0);
+    expect(ledger(taskId)).toHaveLength(0);
+  });
+
+  test("ZYR-AC-09 two concurrent saves of the same task produce exactly one comment", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Race-case"], jiraIssueKey: "MFLP-14" });
+
+    const [a, b] = await Promise.all([save(taskId), save(taskId)]);
+    expect([a.status(), b.status()].sort(), "one save wins, the other is refused as already saved").toEqual([201, 409]);
+    expect(ledger(taskId)).toHaveLength(1);
+
+    // And a later re-submit is refused the same way — still one comment.
+    expect((await save(taskId)).status()).toBe(409);
+    expect(ledger(taskId)).toHaveLength(1);
+  });
+
+  test("ZYR-AC-10 re-running a ticket updates its linked test cases in place, and that save's comment lists them as Updated", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const first = seedReviewTask({ titles: ["Original loan case"], jiraIssueKey: "MFLP-15" });
+    const firstSave = await (await save(first)).json();
+    const originalId = (firstSave.testcases as Array<{ id: string }>)[0].id;
+
+    const second = seedReviewTask({ titles: ["Refined loan case"], jiraIssueKey: "MFLP-15" });
+    const secondRes = await save(second);
+    expect(secondRes.status(), `saving — ${await secondRes.text()}`).toBe(201);
+
+    const [row] = ledger(second);
+    expect(row.testcase_ids).toEqual([originalId]);
+    expect(row.comment_text).toContain("**Updated (1)**");
+    expect(row.comment_text).toContain("Refined loan case");
+    expect(row.comment_text).not.toContain("**Added");
+    // Each save keeps its own record: the first task's comment is untouched by the second save.
+    expect(ledger(first)).toHaveLength(1);
+    expect(ledger(first)[0].save_event_id).not.toBe(row.save_event_id);
+  });
+
+  // ─── Which ticket the KB selection links to ───────────────────────────────
+
+  test("ZYR-AC-11 KB docs from TWO tickets link to neither, and say so — no comment for either ticket", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-20");
+    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-21");
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueGeneration(["Two-ticket case"]);
+    const created = await createTask({ knowledgeItemIds: [docA, docB] });
+    const taskId = created.generationRequestId;
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    const note = (JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{ title: string; detail: string }>)
+      .find((e) => e.title === "Not linked to a ticket");
+    expect(note?.detail).toContain("MFLP-20");
+    expect(note?.detail).toContain("MFLP-21");
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const saved = await (await save(taskId)).json();
+    expect(linkedKey((saved.testcases as Array<{ id: string }>)[0].id)).toBe("");
+    expect(ledger(taskId)).toHaveLength(0);
+  });
+
+  test("ZYR-AC-12 two docs of the SAME ticket still link to it", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-22");
+    // A second mirror for the same key (e.g. re-synced under a new mapping) — one ticket, not two.
+    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-22");
+    const created = await createTask({ knowledgeItemIds: [docA, docB] });
+    expect(created.task.jiraIssueKeys).toEqual(["MFLP-22"]);
+  });
+
+  test("ZYR-AC-13 a user's own KB note is not a ticket, even if it mentions a key — no link", async () => {
+    await allocateFakeAiKey();
+    const noteId = await createNote("Notes on MFLP-6", "MFLP-6 needs an approval workflow.");
+    const created = await createTask({ knowledgeItemIds: [noteId] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    expect(created.task.linearIssueKeys ?? []).toEqual([]);
+  });
+
+  test("ZYR-AC-14 a ticket mirror from ANOTHER project can't link this project's task", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const foreignDoc = seedTicketWithMirror("jira", connectionId, "MFLP-23", tenant!.secondProjectId);
+    const created = await createTask({ knowledgeItemIds: [foreignDoc] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+  });
+
+  test("ZYR-AC-15 an explicit ticket key (the Requirements page) wins over the KB selection", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const docId = seedTicketWithMirror("jira", connectionId, "MFLP-24");
+    const created = await createTask({ jiraIssueKeys: ["MFLP-99"], knowledgeItemIds: [docId] });
+    expect(created.task.jiraIssueKeys).toEqual(["MFLP-99"]);
+  });
+
+  test("ZYR-AC-16 malformed and unknown knowledgeItemIds are ignored, not a 500", async () => {
+    await allocateFakeAiKey();
+    const created = await createTask({ knowledgeItemIds: ["not-a-uuid", "00000000-0000-4000-8000-000000000000", 42, null] });
+    expect(created.task.jiraIssueKeys).toEqual([]);
+  });
+
+  // ─── Linear follows the same rules ────────────────────────────────────────
+
+  test("ZYR-AC-17 Linear: a KB doc of a Linear ticket links it, and linearAutoComment gates a markdown comment", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("linear");
+    const docId = seedTicketWithMirror("linear", connectionId, "ENG-42");
+    await setAutoComment({ linearAutoComment: true, jiraAutoComment: false });
+
+    queueGeneration(["Linear loan case"]);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    const taskId = created.generationRequestId;
+    expect(created.task.jiraIssueKeys).toEqual([]);
+    expect(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe('["ENG-42"]');
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const saved = await (await save(taskId)).json();
+    const testcaseId = (saved.testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId, "linear_issue_key")).toBe("ENG-42");
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "linear", issue_key: "ENG-42" });
+    expect(rows[0].comment_text).toMatch(/^\*\*Generated by Tesbo Test Manager\*\*/);
+    expect(rows[0].comment_text).toContain("Linear loan case");
+    expect(["posted", "failed"]).toContain(rows[0].status);
+  });
+
+  test("ZYR-AC-18 Linear off: skipped even while Jira's setting is on", async () => {
+    seedConnection("linear");
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Linear off case"], linearIssueKey: "ENG-43" });
+
+    expect((await save(taskId)).status()).toBe(201);
+    expect(ledger(taskId).map((r) => [r.provider, r.status])).toEqual([["linear", "skipped_disabled"]]);
+  });
+
+  // ─── Authorization ────────────────────────────────────────────────────────
+
+  test("ZYR-AC-19 another workspace's user can't save the task, so nothing is commented", async () => {
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Foreign save"], jiraIssueKey: "MFLP-30" });
+    const outsider = await provisionRbacTenant("zyra");
+    test.skip(!outsider, "the second tenant could not be provisioned");
+    const asOutsider = await loginAs(outsider!.owner);
+    try {
+      const res = await asOutsider.post(url(`/tasks/${taskId}/save`), { data: {}, failOnStatusCode: false });
+      expect([401, 403, 404]).toContain(res.status());
+      expect(ledger(taskId)).toHaveLength(0);
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    } finally {
+      await asOutsider.dispose();
+    }
+  });
+
+  // ─── Ticket keys have no length limit (V124) ──────────────────────────────
+
+  /*
+   * Regression test. Every column a ticket key passes through was VARCHAR(64), so a longer key
+   * failed the save outright at the testcases write (a truncation error), and could not be synced
+   * into jira_tickets at all. Both halves are driven: the KB-link path (jira_tickets → task) and the
+   * save path (task → testcases → integration_ticket_comments).
+   */
+  test("ZYR-AC-20 a ticket key longer than 64 characters links, saves and is recorded in full", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const longKey = `MFLP-${"9".repeat(295)}`;
+    expect(longKey.length).toBe(300);
+    const docId = seedTicketWithMirror("jira", connectionId, longKey);
+    await setAutoComment({ jiraAutoComment: false });
+
+    queueGeneration(["Long-key loan case"]);
+    const created = await createTask({ knowledgeItemIds: [docId] });
+    expect(created.task.jiraIssueKeys).toEqual([longKey]);
+    const taskId = created.generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const testcaseId = ((await saveRes.json()).testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId), "the full key is stored on the test case, not truncated").toBe(longKey);
+
+    const rows = ledger(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issue_key).toBe(longKey);
+    expect(rows[0].comment_text).toContain(`for ${longKey} in Tesbo.`);
+  });
+
+  test("ZYR-AC-21 an explicit long key (the Requirements page path) saves in full too", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const longKey = `REQ-${"x".repeat(196)}`;
+    const taskId = seedReviewTask({ titles: ["Explicit long-key case"], jiraIssueKey: longKey });
+
+    const saveRes = await save(taskId);
+    expect(saveRes.status(), `saving — ${await saveRes.text()}`).toBe(201);
+    const testcaseId = ((await saveRes.json()).testcases as Array<{ id: string }>)[0].id;
+    expect(linkedKey(testcaseId)).toBe(longKey);
+    expect(ledger(taskId).map((r) => r.issue_key)).toEqual([longKey]);
+  });
+  // ─── Listing a task's ticket comments, and retrying a failed one ─────────
+
+  /** Makes a save's recorded comment 'failed', as a refused post would have left it. */
+  function markFailed(taskId: string, reason = "seeded failure"): string {
+    exec(`UPDATE integration_ticket_comments SET status = 'failed', reason = ${literal(reason)} WHERE generation_request_id = ${literal(taskId)};`);
+    return scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)} LIMIT 1;`);
+  }
+
+  function retryUrl(taskId: string, commentId: string): string {
+    return url(`/tasks/${taskId}/ticket-comments/${commentId}/retry`);
+  }
+
+  test("ZYR-AC-22 GET ticket-comments lists this task's comments only, with their outcome", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const mine = seedReviewTask({ titles: ["Listed A", "Listed B"], jiraIssueKey: "KAN-40" });
+    const other = seedReviewTask({ titles: ["Other task"], jiraIssueKey: "KAN-41" });
+    expect((await save(mine)).status()).toBe(201);
+    expect((await save(other)).status()).toBe(201);
+
+    const res = await asOwner.get(url(`/tasks/${mine}/ticket-comments`), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    const { list } = await res.json();
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ provider: "jira", issueKey: "KAN-40", status: "skipped_disabled", reason: null, testcaseCount: 2 });
+    // Internal columns (the comment body, who posted it) are not part of this response.
+    expect(list[0]).not.toHaveProperty("commentText");
+    expect(list[0]).not.toHaveProperty("comment_text");
+
+    // A task with no saves yet has an empty list, not an error.
+    const unsaved = seedReviewTask({ titles: ["Unsaved"], jiraIssueKey: "KAN-42" });
+    expect((await (await asOwner.get(url(`/tasks/${unsaved}/ticket-comments`))).json()).list).toEqual([]);
+  });
+
+  test("ZYR-AC-23 retrying a failed comment re-sends it and records the new outcome (Jira not connected here: fails offline, with that reason)", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Retry me"], jiraIssueKey: "KAN-43" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const res = await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(201);
+    const body = await res.json();
+    // No connection in this tenant, so the re-send stops before any outbound call — and the record
+    // says so, replacing the earlier reason.
+    expect(body).toMatchObject({ id: commentId, status: "failed", reason: "Jira is not connected." });
+    expect(scalar(`SELECT reason FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("Jira is not connected.");
+    const titles = activityTitles(taskId);
+    expect(titles).toContain("Retrying Jira comment");
+    expect(titles[titles.length - 1]).toBe("Jira comment failed");
+    // The rebuilt comment still lists exactly the saved test case.
+    expect(scalar(`SELECT comment_text FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toContain("Retry me");
+  });
+
+  test("ZYR-AC-24 only a failed comment can be retried: skipped → 409, unknown or malformed id → 404", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Skipped one"], jiraIssueKey: "KAN-44" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`);
+
+    const skipped = await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+    expect(skipped.status()).toBe(409);
+    expect(await skipped.text()).toContain("only a failed comment can be retried");
+    expect(scalar(`SELECT status FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("skipped_disabled");
+
+    expect((await asOwner.post(retryUrl(taskId, "00000000-0000-4000-8000-000000000000"), { failOnStatusCode: false })).status()).toBe(404);
+    expect((await asOwner.post(retryUrl(taskId, "not-a-uuid"), { failOnStatusCode: false })).status()).toBe(404);
+    // A real comment id under the wrong task is not found either.
+    const otherTask = seedReviewTask({ titles: ["Elsewhere"] });
+    expect((await asOwner.post(retryUrl(otherTask, commentId), { failOnStatusCode: false })).status()).toBe(404);
+  });
+
+  test("ZYR-AC-25 two retries at once: one re-sends, the other is refused — never two concurrent posts", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Double retry"], jiraIssueKey: "KAN-45" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const [a, b] = await Promise.all([
+      asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false }),
+      asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false }),
+    ]);
+    const statuses = [a.status(), b.status()].sort();
+    // The loser either lost the failed -> pending claim (409), or ran after the winner had already
+    // finished and found it failed again (201). What must never happen is two re-sends at once:
+    // exactly one "Retrying" entry per successful claim.
+    expect(statuses[0]).toBe(201);
+    expect([201, 409]).toContain(statuses[1]);
+    const retries = activityTitles(taskId).filter((t) => t === "Retrying Jira comment").length;
+    expect(retries).toBe(statuses.filter((s) => s === 201).length);
+  });
+
+  test("ZYR-AC-26 retrying after every listed test case was deleted fails with that reason, and posts nothing", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Deleted before retry"], jiraIssueKey: "KAN-46" });
+    const saved = await (await save(taskId)).json();
+    const commentId = markFailed(taskId);
+    for (const t of saved.testcases as Array<{ id: string }>) {
+      const del = await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${t.id}`, { failOnStatusCode: false });
+      expect(del.status(), await del.text()).toBeLessThan(300);
+    }
+
+    const body = await (await asOwner.post(retryUrl(taskId, commentId), { failOnStatusCode: false })).json();
+    expect(body.status).toBe("failed");
+    expect(body.reason).toMatch(/None of the test cases in this comment exist anymore/);
+    expect(activityTitles(taskId)).not.toContain("Retrying Jira comment");
+  });
+
+  test("ZYR-AC-27 the ticket-comment routes are refused to an anonymous caller and to another workspace", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const taskId = seedReviewTask({ titles: ["Private comment"], jiraIssueKey: "KAN-47" });
+    expect((await save(taskId)).status()).toBe(201);
+    const commentId = markFailed(taskId);
+
+    const outsider = await provisionRbacTenant("zyra");
+    test.skip(!outsider, "the second tenant could not be provisioned");
+    const anon = await anonymousContext();
+    const asOutsider = await loginAs(outsider!.owner);
+    try {
+      for (const [who, api] of [["anonymous", anon], ["another workspace", asOutsider]] as const) {
+        const list = await api.get(url(`/tasks/${taskId}/ticket-comments`), { failOnStatusCode: false });
+        expect([401, 403, 404], `${who} listing answered ${list.status()}`).toContain(list.status());
+        const retry = await api.post(retryUrl(taskId, commentId), { failOnStatusCode: false });
+        expect([401, 403, 404], `${who} retrying answered ${retry.status()}`).toContain(retry.status());
+      }
+      // Nothing was re-sent: the record is exactly as the owner left it.
+      expect(scalar(`SELECT status || '|' || reason FROM integration_ticket_comments WHERE id = ${literal(commentId)};`)).toBe("failed|seeded failure");
+    } finally {
+      await anon.dispose();
+      await asOutsider.dispose();
+    }
+  });
+  // ─── Credential lifecycle: a connection this deployment can't renew (V125) ─
+
+  /*
+   * The KAN-4 root cause, reproduced: the connection's token was issued to a different Atlassian
+   * OAuth app than the one this deployment renews with, so renewal can never succeed here. The token
+   * is an unsigned JWT naming another client_id — getIntegrationConnection reads that claim and
+   * refuses BEFORE contacting Atlassian, so these tests make no outbound call. Stored as plaintext,
+   * which decryptSecret passes through, like the other connection fixtures in this suite.
+   */
+  function foreignAppToken(): string {
+    const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    return `${b64({ alg: "RS256" })}.${b64({ client_id: `e2e-other-deployment-app-${Date.now()}` })}.sig`;
+  }
+
+  function seedForeignAppConnection(options: { expired: boolean }): string {
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
+        `refresh_token, token_expires_at, connected_by) VALUES (${literal(tenant!.organizationId)}, 'jira', ` +
+        `'e2e-jira-site', 'https://e2e.invalid', ${literal(foreignAppToken())}, 'e2e-refresh-token', ` +
+        `${options.expired ? "now() - interval '5 minutes'" : "now() + interval '1 hour'"}, ${literal(tenant!.owner.userId)});`,
+    );
+    return scalar(`SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+  }
+
+  async function jiraStatus(): Promise<any> {
+    const res = await asOwner.get(`/api/projects/${tenant!.mainProjectId}/jira/status`, { failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    return res.json();
+  }
+
+  test("ZYR-AC-28 status no longer reads healthy for a connection this deployment can't renew", async () => {
+    seedForeignAppConnection({ expired: false });
+    const status = await jiraStatus();
+    expect(status.connected).toBe(true);
+    expect(status.needsReconnect).toBe(true);
+    expect(status.authError).toMatch(/different Atlassian OAuth app/);
+
+    // The workspace-level status (the page where Reconnect lives) says the same.
+    const ws = await (await asOwner.get("/api/workspace/integrations/jira/status")).json();
+    expect(ws).toMatchObject({ connected: true, needsReconnect: true });
+  });
+
+  test("ZYR-AC-29 an expired foreign-app token: the comment fails with an actionable reason, and the dead refresh token is recorded, not re-sent", async () => {
+    const connectionId = seedForeignAppConnection({ expired: true });
+    await setAutoComment({ jiraAutoComment: true });
+    const taskId = seedReviewTask({ titles: ["Foreign app case"], jiraIssueKey: "KAN-50" });
+    expect((await save(taskId)).status()).toBe(201);
+
+    const [row] = await waitForDelivery(taskId);
+    expect(row.status).toBe("failed");
+    expect(row.reason).toMatch(/needs to be reconnected from this Tesbo deployment/);
+    expect(row.reason).toMatch(/different Atlassian OAuth app/);
+
+    // The refusal is recorded against this exact refresh token (V125)…
+    const markedAt = scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`);
+    expect(markedAt, "the refusal was not recorded").toBeTruthy();
+    expect(scalar(`SELECT auth_error_refresh_fingerprint = encode(sha256(convert_to(refresh_token, 'UTF8')), 'hex') FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+
+    // …so a Retry gets the same reason straight from the record, without another renewal attempt.
+    const commentId = scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`);
+    const retried = await (await asOwner.post(url(`/tasks/${taskId}/ticket-comments/${commentId}/retry`), { failOnStatusCode: false })).json();
+    expect(retried.status).toBe("failed");
+    expect(retried.reason).toMatch(/different Atlassian OAuth app/);
+    expect(scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe(markedAt);
+
+    const status = await jiraStatus();
+    expect(status).toMatchObject({ connected: true, needsReconnect: true });
+  });
+
+  test("ZYR-AC-30 a recorded refusal heals itself when the refresh token changes (reconnect, or another deployment renewed it)", async () => {
+    const connectionId = seedForeignAppConnection({ expired: false });
+    // A refusal recorded for an OLDER refresh token than the one the row holds now.
+    exec(
+      `UPDATE integration_connections SET auth_error = 'Jira needs to be reconnected: old refusal', auth_error_at = now(), ` +
+        `auth_error_refresh_fingerprint = encode(sha256(convert_to('some-older-refresh-token', 'UTF8')), 'hex') WHERE id = ${literal(connectionId)};`,
+    );
+    const status = await jiraStatus();
+    // Still flagged — but for the app mismatch, which is true of the CURRENT token, not the stale record.
+    expect(status.authError).not.toContain("old refusal");
+    expect(status.authError).toMatch(/different Atlassian OAuth app/);
   });
 });

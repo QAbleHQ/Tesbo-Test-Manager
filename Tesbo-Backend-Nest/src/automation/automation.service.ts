@@ -230,8 +230,10 @@ export class AutomationService {
    *
    * **`externalId` makes the call idempotent.** A GitHub Actions workflow that is re-run presents
    * the same run id; without this it would open a second Tesbo run holding half the results.
-   * Backed by the partial unique index on (project_id, external_id) from V84, so two shards racing
-   * to create the run both end up with the same one.
+   * Backed by the partial unique index on (project_id, external_id) from V84, narrowed by V112 to
+   * `WHERE external_id IS NOT NULL AND deleted_at IS NULL` -- so two live shards racing to create
+   * the run both end up with the same one, while a resubmit *after* that run was soft-deleted opens
+   * a genuine new run instead of resolving back to a dead one it can never attach cases to again.
    */
   async createRun(userId: string | null | undefined, projectId: string, body: Body) {
     await this.legacy.requireProjectAccess(userId, projectId);
@@ -251,9 +253,16 @@ export class AutomationService {
 
     // Idempotency check before the insert so a re-run gets its existing run back with the same
     // shape as a fresh create, rather than a 409 it would have to special-case.
+    //
+    // `AND deleted_at IS NULL`: closes the gap V112_cycles_external_id_partial_index.sql's commit
+    // describes -- without this filter, a resubmit after the run was soft-deleted (V111) would
+    // resolve back to the dead row and hand the caller a "reused" run that attachCases' EXISTS
+    // guard then silently refuses to write into. Now the dead row simply doesn't match, the insert
+    // below runs, and (because the unique index is now partial on deleted_at IS NULL too) it
+    // succeeds and opens a genuine new run for the same externalId.
     if (externalId) {
       const existing = await this.db.query<{ id: string }>(
-        "SELECT id FROM cycles WHERE project_id = $1 AND external_id = $2",
+        "SELECT id FROM cycles WHERE project_id = $1 AND external_id = $2 AND deleted_at IS NULL",
         [projectId, externalId]
       );
       if (existing.rows[0]) {
@@ -296,9 +305,20 @@ export class AutomationService {
     } catch (err) {
       // Two shards racing on the same externalId: the loser's insert violates the partial unique
       // index. Resolve to the winner's run instead of failing the shard's whole session.
+      //
+      // `AND deleted_at IS NULL` here too: the unique index this violation came from
+      // (idx_cycles_project_external_id, V112) is now itself partial on deleted_at IS NULL, so
+      // the row that won the race is necessarily live at the moment of the violation. The filter
+      // does not make `!raced.rows[0]` unreachable, though -- it stays reachable for a genuine
+      // live-row race: the winner gets soft-deleted (DELETE /api/cycles/:id) in the window between
+      // this insert's unique-violation and this SELECT running, in which case falling through to
+      // `throw err` (rather than silently reusing a run this shard is about to find is gone) is the
+      // right behaviour. Not separately covered by an e2e test -- it needs a delete to land inside
+      // a sub-millisecond window between two concurrent inserts, which is not practical to force
+      // deterministically from outside the process.
       if (externalId && this.isUniqueViolation(err)) {
         const raced = await this.db.query<{ id: string }>(
-          "SELECT id FROM cycles WHERE project_id = $1 AND external_id = $2",
+          "SELECT id FROM cycles WHERE project_id = $1 AND external_id = $2 AND deleted_at IS NULL",
           [projectId, externalId]
         );
         if (!raced.rows[0]) throw err;
@@ -356,12 +376,35 @@ export class AutomationService {
          SELECT COALESCE(MAX(position), 0) AS pos FROM cycle_items WHERE cycle_id = $1
        ),
        ins AS (
-         INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
-         SELECT $1, t.id, t.title, base.pos + i.ord
+         -- The EXISTS guard stops the CI ingest path from writing cases into a run that has been
+         -- soft-deleted (hard-delete remediation Phase 1). createRun's externalId-reuse lookups and
+         -- recordResult's requireRun both now filter deleted_at themselves too
+         -- (V112_cycles_external_id_partial_index.sql closed the createRun half of that gap), so in
+         -- the common case the run this statement runs against is already known live -- but every
+         -- caller resolves the run in a separate statement before reaching this INSERT, leaving a
+         -- window where a concurrent delete could land in between. This EXISTS guard is what closes
+         -- that window at the point of the actual write, rather than trusting an earlier read to
+         -- still be true. cycle_items_cycle_id_testcase_id_key is now a partial unique index (WHERE
+         -- deleted_at IS NULL) — the ON CONFLICT target below repeats that predicate so Postgres can
+         -- infer it, and a previously-removed case gets a fresh row instead of no-op'ing forever.
+         -- snapshot_title is joined by every other field the run's execution list, detail panel,
+         -- CSV export and reports display (V119) — captured here at add-time so a run's history
+         -- stops depending on the live testcase row surviving a later soft-delete.
+         INSERT INTO cycle_items (
+           cycle_id, testcase_id, snapshot_title, position,
+           snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+           snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+           snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+         )
+         SELECT $1, t.id, t.title, base.pos + i.ord,
+                t.external_id, t.priority, t.type, t.suite_id,
+                t.description, t.preconditions, t.postconditions, t.steps,
+                t.test_data, t.automation_status, t.automation_tags
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
-         ON CONFLICT (cycle_id, testcase_id) DO NOTHING
+          WHERE EXISTS (SELECT 1 FROM cycles c WHERE c.id = $1 AND c.deleted_at IS NULL)
+         ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING
          RETURNING id
        )
        INSERT INTO executions (cycle_item_id)
@@ -624,7 +667,7 @@ export class AutomationService {
              'fileSize', a.file_size, 'contentType', a.content_type
            ) ORDER BY a.created_at) AS items
              FROM attachments a
-            WHERE a.entity_type = 'execution' AND a.entity_id = e.id
+            WHERE a.entity_type = 'execution' AND a.entity_id = e.id AND a.deleted_at IS NULL
          ) ev ON true
         WHERE ci.cycle_id = $1 AND e.deleted_at IS NULL
         ORDER BY ci.position, t.external_id`,
@@ -798,8 +841,11 @@ export class AutomationService {
    */
   private async requireRun(projectId: string, runId: string) {
     if (!isUuid(runId)) throw new NotFoundException({ error: "Run not found" });
+    // deleted_at IS NULL: a soft-deleted run must stop accepting result submissions, closes, etc.
+    // through the automation ingest path exactly the way it stops resolving anywhere else
+    // (hard-delete remediation Phase 1 — see progress log).
     const res = await this.db.query<{ id: string; name: string; closed_at: string | null; source: string }>(
-      "SELECT id, name, closed_at, source FROM cycles WHERE id = $1 AND project_id = $2",
+      "SELECT id, name, closed_at, source FROM cycles WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
       [runId, projectId]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Run not found" });
@@ -807,11 +853,16 @@ export class AutomationService {
   }
 
   private async runSummary(runId: string) {
+    // AND deleted_at IS NULL: every caller of runSummary reaches it either straight after
+    // requireRun (getRun, closeRun) or straight after resolving/inserting a live row in createRun,
+    // so this filter changes no existing caller's behaviour -- it just stops runSummary itself
+    // from being a route back to describing a soft-deleted run's data, closing the same gap as the
+    // two createRun lookup sites above (V112_cycles_external_id_partial_index.sql).
     const res = await this.db.query<Body>(
       `SELECT id, name, status, source, triggered_by, commit_sha, branch_name, build_url, external_id,
               environment, build_version, release_name, started_at, ended_at, closed_at, close_status,
               last_result_at, created_at
-         FROM cycles WHERE id = $1`,
+         FROM cycles WHERE id = $1 AND deleted_at IS NULL`,
       [runId]
     );
     const row = res.rows[0] ?? {};

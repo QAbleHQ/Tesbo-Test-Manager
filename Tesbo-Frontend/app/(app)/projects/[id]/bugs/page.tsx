@@ -18,6 +18,7 @@ import {
   type BugAttachment,
   type BugSeverity,
   type BugPriority,
+  type IssueSearchResult,
 } from "@/lib/api";
 import {
   Button,
@@ -40,6 +41,7 @@ import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
+import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
@@ -464,6 +466,22 @@ export default function BugsPage() {
   const [createDestination, setCreateDestination] = useState<TrackingDestination>("TESBO");
   const [createSelfSystem, setCreateSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [createUrl, setCreateUrl] = useState("");
+  // Same searchable-picker treatment as Edit Bug's editSelectedIssue/editIssuePickerOpen (see
+  // handleEditSystemChange) — kept as its own state rather than shared, since Create and Edit
+  // reset independently and must not bleed into each other.
+  const [createSelectedIssue, setCreateSelectedIssue] = useState<IssueSearchResult | null>(null);
+  const [createIssuePickerOpen, setCreateIssuePickerOpen] = useState(false);
+
+  function handleCreateSystemChange(system: SelfLoggedSystem) {
+    setCreateSelfSystem(system);
+    setCreateSelectedIssue((prev) => {
+      if (prev && prev.provider !== system) {
+        setCreateUrl("");
+        return null;
+      }
+      return prev;
+    });
+  }
   const [createEvidenceMode, setCreateEvidenceMode] = useState<EvidenceMode>("FILES");
   const [createStagedFiles, setCreateStagedFiles] = useState<File[]>([]);
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
@@ -489,6 +507,28 @@ export default function BugsPage() {
   const [editDestination, setEditDestination] = useState<TrackingDestination>("TESBO");
   const [editSelfSystem, setEditSelfSystem] = useState<SelfLoggedSystem>("OTHER");
   const [editUrl, setEditUrl] = useState("");
+  // The Jira/Linear ticket currently linked to the bug being edited, so Edit Bug can offer a
+  // searchable picker (reusing IssuePickerModal) instead of a plain URL box for those systems.
+  const [editSelectedIssue, setEditSelectedIssue] = useState<IssueSearchResult | null>(null);
+  const [editIssuePickerOpen, setEditIssuePickerOpen] = useState(false);
+
+  // Switching which system (Jira/Linear/Other) is selected has to drop a previously-picked issue
+  // that belongs to a different provider — otherwise a Jira key saved while Linear is selected
+  // would be submitted under integrationProvider: "LINEAR", and the stale ticket would also leak
+  // into the Linear picker's result list (it's kept "selected" there purely by key match failing
+  // to exclude it).
+  function handleEditSystemChange(system: SelfLoggedSystem) {
+    setEditSelfSystem(system);
+    setEditSelectedIssue((prev) => {
+      if (prev && prev.provider !== system) {
+        // The URL field tracked the old provider's ticket — clear it along with the pick so a
+        // Jira browse link can't linger under integrationProvider: "LINEAR" (or "OTHER").
+        setEditUrl("");
+        return null;
+      }
+      return prev;
+    });
+  }
   const [editEvidenceMode, setEditEvidenceMode] = useState<EvidenceMode>("FILES");
   const [editStagedFiles, setEditStagedFiles] = useState<File[]>([]);
   const [editAttachments, setEditAttachments] = useState<BugAttachment[]>([]);
@@ -629,6 +669,8 @@ export default function BugsPage() {
     setCreateDestination("TESBO");
     setCreateSelfSystem(jiraConnected ? "JIRA" : linearConnected ? "LINEAR" : "OTHER");
     setCreateUrl("");
+    setCreateSelectedIssue(null);
+    setCreateIssuePickerOpen(false);
     setCreateEvidenceMode("FILES");
     setCreateStagedFiles([]);
     setCreateBetterbugsUrl("");
@@ -637,7 +679,7 @@ export default function BugsPage() {
 
   /* create */
   async function handleCreate() {
-    if (!createTitle.trim() || (hasTestRuns && !createLinks.length)) return;
+    if (!createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired) return;
     // Belt-and-suspenders alongside the button's `disabled={creating}`: guards a re-entrant call
     // (e.g. a key-repeat Enter) that lands before the disabled state has re-rendered.
     if (creating) return;
@@ -657,7 +699,7 @@ export default function BugsPage() {
           assigneeId: createAssigneeId || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
           integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
-          integrationIssueKey: null,
+          integrationIssueKey: selfLogged && createSelfSystem !== "OTHER" ? createSelectedIssue?.key || null : null,
           betterbugsUrl: createEvidenceMode === "BETTERBUGS" ? createBetterbugsUrl.trim() : undefined,
           links: createLinks.map((link) => ({
             testcaseId: link.testcaseId,
@@ -704,8 +746,20 @@ export default function BugsPage() {
       }))
     );
     setEditDestination(bug.externalUrl ? "SELF" : "TESBO");
-    setEditSelfSystem(bug.integrationProvider === "JIRA" || bug.integrationProvider === "LINEAR" ? bug.integrationProvider : "OTHER");
+    // updateBug/createBug store integrationProvider verbatim — unlike severity/priority, there is
+    // no backend normalization — so a value ever written as "jira"/"Jira" instead of "JIRA" (an
+    // older client, a hand-crafted API call) has to still be recognized here, or a bug with a
+    // perfectly real Jira/Linear link falls through to "Other".
+    const normalizedProvider = bug.integrationProvider?.toUpperCase();
+    const detectedProvider: SelfLoggedSystem =
+      normalizedProvider === "JIRA" || normalizedProvider === "LINEAR" ? normalizedProvider : "OTHER";
+    setEditSelfSystem(detectedProvider);
     setEditUrl(bug.externalUrl || "");
+    setEditSelectedIssue(
+      (detectedProvider === "JIRA" || detectedProvider === "LINEAR") && bug.integrationIssueKey
+        ? { provider: detectedProvider, key: bug.integrationIssueKey, summary: "", status: "", url: bug.externalUrl || "" }
+        : null
+    );
     setEditEvidenceMode(bug.betterbugsUrl ? "BETTERBUGS" : "FILES");
     setEditStagedFiles([]);
     setEditAttachments(bug.attachments);
@@ -722,7 +776,7 @@ export default function BugsPage() {
 
   /* save edit */
   async function handleEditSave() {
-    if (!editBug || !editTitle.trim() || (hasTestRuns && !editLinks.length)) return;
+    if (!editBug || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired) return;
     const selfLogged = (jiraConnected || linearConnected) && editDestination === "SELF";
     setSaving(true);
     setEditError(null);
@@ -736,7 +790,7 @@ export default function BugsPage() {
         assigneeId: editAssigneeId || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
         integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
-        integrationIssueKey: null,
+        integrationIssueKey: selfLogged && editSelfSystem !== "OTHER" ? editSelectedIssue?.key || null : null,
         betterbugsUrl: editEvidenceMode === "BETTERBUGS" ? editBetterbugsUrl.trim() : undefined,
         links: editLinks.map((link) => ({
           testcaseId: link.testcaseId,
@@ -775,6 +829,22 @@ export default function BugsPage() {
   if (loading) {
     return <PageLoader variant="content" />;
   }
+
+  // Requirement: switching Jira <-> Linear (or picking Jira/Linear for the first time) clears the
+  // previous pick and must not be saveable again until a ticket from the NEW provider is chosen —
+  // otherwise Save would silently persist integrationProvider set with integrationIssueKey null.
+  const editIssueRequired =
+    (jiraConnected || linearConnected) &&
+    editDestination === "SELF" &&
+    (editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") &&
+    !editSelectedIssue;
+  // Same rule for Create: picking Jira/Linear as the system requires an actual ticket before
+  // Report Bug is enabled, so a fresh bug can't be saved with a provider set and no key.
+  const createIssueRequired =
+    (jiraConnected || linearConnected) &&
+    createDestination === "SELF" &&
+    (createSelfSystem === "JIRA" || createSelfSystem === "LINEAR") &&
+    !createSelectedIssue;
 
   return (
     <div className="min-h-screen bg-[var(--background)]">
@@ -1422,9 +1492,56 @@ export default function BugsPage() {
               jiraConnected={jiraConnected}
               linearConnected={linearConnected}
               system={createSelfSystem}
-              onSystemChange={setCreateSelfSystem}
+              onSystemChange={handleCreateSystemChange}
               url={createUrl}
               onUrlChange={setCreateUrl}
+              renderUrlField={(system, defaultField) => {
+                if (system === "OTHER") return defaultField;
+                return (
+                  <div className="mt-2 space-y-1">
+                    <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
+                      {createSelectedIssue ? (
+                        <a
+                          href={createSelectedIssue.url || createUrl || undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="truncate text-[var(--foreground)] hover:underline"
+                        >
+                          {createSelectedIssue.key}
+                          {createSelectedIssue.summary ? ` — ${createSelectedIssue.summary}` : ""}
+                        </a>
+                      ) : (
+                        <span className="text-[var(--muted)]">No issue selected.</span>
+                      )}
+                      <Button type="button" size="sm" variant="secondary" onClick={() => setCreateIssuePickerOpen(true)}>
+                        {createSelectedIssue ? "Change issue" : "Select issue"}
+                      </Button>
+                    </div>
+                    {createIssueRequired && (
+                      <p className="text-[13px] text-[var(--error-foreground)]">
+                        Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
+            />
+          )}
+          {(createSelfSystem === "JIRA" || createSelfSystem === "LINEAR") && (
+            <IssuePickerModal
+              projectId={projectId}
+              testcaseId={null}
+              cycleId={null}
+              provider={createSelfSystem}
+              open={createIssuePickerOpen}
+              onClose={() => setCreateIssuePickerOpen(false)}
+              selectedIssues={createSelectedIssue ? [createSelectedIssue] : []}
+              mode="single"
+              onConfirm={(issues) => {
+                const issue = issues[0] ?? null;
+                setCreateSelectedIssue(issue);
+                setCreateUrl(issue?.url ?? "");
+              }}
             />
           )}
           <div className="flex justify-end gap-2 pt-2">
@@ -1434,7 +1551,7 @@ export default function BugsPage() {
             <Button
               variant="primary"
               onClick={handleCreate}
-              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length)}
+              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired}
             >
               {creating ? "Creating…" : "Report Bug"}
             </Button>
@@ -1448,6 +1565,7 @@ export default function BugsPage() {
         onClose={() => {
           setEditError(null);
           setEditBug(null);
+          setEditIssuePickerOpen(false);
         }}
         title="Edit Bug"
       >
@@ -1478,6 +1596,71 @@ export default function BugsPage() {
               rows={3}
             />
           </Field>
+          {/* Status is edit-only (Create Bug always starts "Open"), so it has no equivalent slot in
+              that form's Severity/Priority/Assign-to row. Kept as its own field right before them
+              rather than disrupting that row's order. */}
+          <Field>
+            <FieldLabel>Status</FieldLabel>
+            <Select
+              value={editStatus}
+              onChange={(e) => setEditStatus(e.target.value)}
+            >
+              <option value="Open">Open</option>
+              <option value="In Progress">In Progress</option>
+              <option value="Closed">Closed</option>
+              <option value="Reopened">Reopened</option>
+            </Select>
+          </Field>
+          <div className="grid grid-cols-3 gap-3">
+            <Field>
+              <FieldLabel>Severity</FieldLabel>
+              <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
+                {BUG_SEVERITIES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Priority</FieldLabel>
+              <Select
+                value={editPriority}
+                onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
+                aria-label="Bug priority"
+              >
+                <option value="">Not set</option>
+                {BUG_PRIORITIES.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Assign to</FieldLabel>
+              <Select
+                value={editAssigneeId}
+                onChange={(e) => setEditAssigneeId(e.target.value)}
+                aria-label="Assign to"
+              >
+                <option value="">Unassigned</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>
+                    {m.name || m.email}
+                  </option>
+                ))}
+                {/* Current assignee not among this project's members — an AI agent or a stale row.
+                    Kept visible as a disabled option so Save doesn't silently clear a real
+                    assignment nobody touched. */}
+                {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
+                  <option value={editAssigneeId} disabled>
+                    {editBug?.assigneeName || "Unknown assignee"} (not a project member)
+                  </option>
+                )}
+              </Select>
+            </Field>
+          </div>
           <BugEvidenceField
             mode={editEvidenceMode}
             onModeChange={setEditEvidenceMode}
@@ -1511,71 +1694,58 @@ export default function BugsPage() {
               jiraConnected={jiraConnected}
               linearConnected={linearConnected}
               system={editSelfSystem}
-              onSystemChange={setEditSelfSystem}
+              onSystemChange={handleEditSystemChange}
               url={editUrl}
               onUrlChange={setEditUrl}
+              renderUrlField={(system, defaultField) => {
+                if (system === "OTHER") return defaultField;
+                return (
+                  <div className="mt-2 space-y-1">
+                    <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
+                      {editSelectedIssue ? (
+                        <a
+                          href={editSelectedIssue.url || editUrl || undefined}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="truncate text-[var(--foreground)] hover:underline"
+                        >
+                          {editSelectedIssue.key}
+                          {editSelectedIssue.summary ? ` — ${editSelectedIssue.summary}` : ""}
+                        </a>
+                      ) : (
+                        <span className="text-[var(--muted)]">No issue selected.</span>
+                      )}
+                      <Button type="button" size="sm" variant="secondary" onClick={() => setEditIssuePickerOpen(true)}>
+                        {editSelectedIssue ? "Change issue" : "Select issue"}
+                      </Button>
+                    </div>
+                    {editIssueRequired && (
+                      <p className="text-[13px] text-[var(--error-foreground)]">
+                        Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
             />
           )}
-          <Field>
-            <FieldLabel>Status</FieldLabel>
-            <Select
-              value={editStatus}
-              onChange={(e) => setEditStatus(e.target.value)}
-            >
-              <option value="Open">Open</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Closed">Closed</option>
-              <option value="Reopened">Reopened</option>
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Severity</FieldLabel>
-            <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
-              {BUG_SEVERITIES.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Priority</FieldLabel>
-            <Select
-              value={editPriority}
-              onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
-              aria-label="Bug priority"
-            >
-              <option value="">Not set</option>
-              {BUG_PRIORITIES.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel>Assign to</FieldLabel>
-            <Select
-              value={editAssigneeId}
-              onChange={(e) => setEditAssigneeId(e.target.value)}
-              aria-label="Assign to"
-            >
-              <option value="">Unassigned</option>
-              {members.map((m) => (
-                <option key={m.userId} value={m.userId}>
-                  {m.name || m.email}
-                </option>
-              ))}
-              {/* Current assignee not among this project's members — an AI agent or a stale row.
-                  Kept visible as a disabled option so Save doesn't silently clear a real
-                  assignment nobody touched. */}
-              {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
-                <option value={editAssigneeId} disabled>
-                  {editBug?.assigneeName || "Unknown assignee"} (not a project member)
-                </option>
-              )}
-            </Select>
-          </Field>
+          {(editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") && (
+            <IssuePickerModal
+              projectId={projectId}
+              testcaseId={null}
+              cycleId={null}
+              provider={editSelfSystem}
+              open={editIssuePickerOpen}
+              onClose={() => setEditIssuePickerOpen(false)}
+              selectedIssues={editSelectedIssue ? [editSelectedIssue] : []}
+              mode="single"
+              onConfirm={(issues) => {
+                const issue = issues[0] ?? null;
+                setEditSelectedIssue(issue);
+                setEditUrl(issue?.url ?? "");
+              }}
+            />
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="secondary" onClick={() => setEditBug(null)}>
               Cancel
@@ -1583,7 +1753,7 @@ export default function BugsPage() {
             <Button
               variant="primary"
               onClick={handleEditSave}
-              disabled={saving || !editTitle.trim() || (hasTestRuns && !editLinks.length)}
+              disabled={saving || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired}
             >
               {saving ? "Saving…" : "Save Changes"}
             </Button>

@@ -12,19 +12,22 @@ import { DatabaseService } from "../database/database.service";
 import { endZyraTurn, recordExistingCoverage, recordGeneration, recordJiraContext, recordKnowledgeContext, recordReconciliation, startZyraTurn, type TurnHandle } from "../observability/ai-trace";
 import { StorageService } from "../storage/storage.service";
 import { encryptSecret, decryptSecret } from "../common/crypto.util";
+import { externallyReachableBaseUrl } from "../common/external-url.util";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
 import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
+import { TESTCASE_UPDATE_THRESHOLD } from "../rag/rag.constants";
 import type { RagRetrievalConfidence } from "../rag/rag.types";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
-import { PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { JIRA_PAGE_SIZE, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
 import { CustomFieldsService, CustomFieldWriteContext } from "../custom-fields/custom-fields.service";
+import { CustomTagsService } from "../custom-tags/custom-tags.service";
 import { CustomFieldDefinitionDto, QueryRunner } from "../custom-fields/custom-fields.types";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 import { SuitesCacheService } from "../cache/suites-cache.service";
@@ -34,6 +37,17 @@ import { ProjectOverviewCacheService } from "../cache/project-overview-cache.ser
 type Body = Record<string, any>;
 
 /** Everything processZyraSaveEntriesSequential/Batched need that isn't `selected` or `client` itself. */
+type TicketProvider = "jira" | "linear";
+
+// See getIntegrationConnection: the access token the caller just had refused (401), to force one renewal.
+interface IntegrationConnectionLoadOptions {
+  rejectedAccessToken?: string;
+}
+
+// Most test cases one ticket auto-comment lists by name (see zyraTicketCommentContent); the rest are
+// counted. Keeps a very large save well under Jira's comment size limit.
+const ZYRA_TICKET_COMMENT_MAX_ITEMS = 100;
+
 interface ZyraSaveEntryContext {
   projectId: string;
   uid: string;
@@ -45,10 +59,17 @@ interface ZyraSaveEntryContext {
   linearIssueKey: string | null;
   linearUrl: string | null;
   existingLinked: { rows: Body[] };
+  // Every suite id a create-type entry in this save could target (batchSuiteId, and each draft's
+  // own per-entry suiteId), re-validated live under this same transaction — see zyraSaveAttempt's
+  // Q11 handling. A suite resolved once, at generation/staging time, can sit unsaved for hours (a
+  // chat-staged create batch, or a Task-board batch) and be soft-deleted out from under it before
+  // Save; an id absent from this set is treated as gone and the entry falls back to unassigned
+  // rather than failing the batch.
+  validSuiteIds: Set<string>;
 }
 
 /** The four buckets V67's bugs_severity_check allows, and the four the dashboard reports. */
-const BUG_SEVERITIES = ["Critical", "High", "Medium", "Low"] as const;
+export const BUG_SEVERITIES = ["Critical", "High", "Medium", "Low"] as const;
 /*
  * Bug priority — Basecamp 10226247009. Severity is how bad it is, priority is how soon it gets
  * worked on; a cosmetic defect on the signup page is Low severity and P0 priority. P0..P3 is the
@@ -174,6 +195,30 @@ const ZYRA_AGENT_NAME = "Zyra the Test Generator";
 const LEGACY_ZYRA_AGENT_NAME = "Zyra the Edge Hunter";
 const ZYRA_AGENT_NAMES = [ZYRA_AGENT_NAME, LEGACY_ZYRA_AGENT_NAME];
 
+// ai_generation_requests.provider value for a row staged by the archive sweep (sub-task C) rather
+// than an LLM call or the chat-staging path — same overload 'zyra_chat' already uses (see
+// V107_ai_generation_requests_system_actor.sql's own reasoning for why `provider`, not a new
+// column, is the right place for this).
+const ZYRA_ARCHIVE_SWEEP_PROVIDER = "zyra_archive_sweep";
+
+// The fixed technique vocabulary zyraSystemPrompt() instructs the model to tag every draft with
+// (ZYRA_TICKET_WORKFLOW.md §6/§8's eight named techniques, plus a fallback). Single source of
+// truth for both the prompt text (so the model is told exactly this set, not a paraphrase of it)
+// and normalizeZyraTechniques' validation — the two can never drift apart silently since both
+// read the same array.
+const ZYRA_TECHNIQUES = [
+  "equivalence_partitioning",
+  "boundary_value_analysis",
+  "decision_table",
+  "state_testing",
+  "use_case_testing",
+  "pairwise_testing",
+  "error_guessing",
+  "security_perspective",
+  "general"
+] as const;
+type ZyraTechnique = typeof ZYRA_TECHNIQUES[number];
+
 /** Frontend treats this path as "no custom logo" and renders the theme-aware lockup. */
 const DEFAULT_BRAND_LOGO_URL = "/brand/tesbo-logo-horizontal.svg";
 
@@ -205,13 +250,13 @@ type ZyraGenerationInput = {
   knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
   jira: Array<{ key: string; summary: string; description: string }>;
   linear: Array<{ key: string; summary: string; description: string }>;
-  existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string }>;
+  existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>;
   // Optional and defaulted to [] wherever built, so every existing caller of the functions this
   // type feeds (zyraGenerationContext, generateZyraChatTestcasesWithAi, ...) keeps compiling and
   // behaving unchanged if it never learns about bugs.
   bugs?: Array<{ id: string; title: string; description: string; status: string; priority: string }>;
   requestedCount: number;
-  testcaseRange?: string; // "minimum" | "1-10" | "10-30" | "all"
+  testcaseRange?: string; // "1-10" | "10-30" | "30-50" | "all"
   // How relevant `knowledge` actually is (see RagRetrievalService / RAG_MIN_SIMILARITY /
   // RAG_CONFIDENT_SIMILARITY) — undefined for a caller that never resolved one. Told to the model
   // explicitly in zyraDynamicTaskPrompt so a weak match is written up hedged rather than confidently,
@@ -296,6 +341,10 @@ type ZyraAppliedOperations = {
   activity: Body[];
   moveBreakdown?: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }>;
   reviewRequestId: string | null;
+  // Named move_to_suite targets (external id / internal id) that never resolved to a real row —
+  // see applyZyraChatOperations' own comment. 0 when every move fully resolved, or when the turn
+  // had no move_to_suite operations naming explicit ids at all.
+  unresolvedMoveTargetCount?: number;
 };
 
 // Structurally satisfied by both DatabaseService and a transaction's PoolClient (both expose this
@@ -678,6 +727,49 @@ function assertIntegrationProvider(provider: string): IntegrationProvider {
     throw new BadRequestException({ error: "Unsupported integration provider." });
   }
   return provider;
+}
+
+// ── Archive-sweep sub-task B: normalized live ticket-category lookup ──
+// Jira's own vocabulary (statusCategory.key: new/indeterminate/done) and Linear's (state.type:
+// backlog/unstarted/started/completed/cancelled) collapse to this one signal — the only thing an
+// archive sweep needs to decide anything. See fetchLiveTicketCategory below for the full contract.
+type NormalizedTicketDoneness = "done" | "not_done";
+
+interface TicketCategoryLookup {
+  /** True once the issue itself was resolved (found and readable) — independent of whether its
+   *  category mapped to a known bucket. False covers "no connection", "issue not found/inaccessible"
+   *  and "the live call itself failed" alike; callers that only care about a done/not-done verdict
+   *  should treat every `found: false` the same way: skip this one, don't archive on it. */
+  found: boolean;
+  /** null whenever `found` is false, OR the issue's own category/type string didn't match any of
+   *  the known values this function maps (Jira and Linear each define these as closed, fixed enums
+   *  today, so this branch is defensive rather than expected — but an unmapped category must never
+   *  silently read as "done": that is the one wrong answer with a destructive consequence). */
+  doneness: NormalizedTicketDoneness | null;
+  /** The raw statusCategory.key (Jira) or state.type (Linear) string, for logging/audit — present
+   *  whenever the issue was found, even if doneness above is null (unmapped). */
+  rawCategory: string | null;
+  reason: "ok" | "not_connected" | "not_found" | "unmapped_category" | "error";
+  /** Only set for reason "error" — a short, truncated diagnostic, never shown to an end user. */
+  detail?: string;
+}
+
+const NOT_CONNECTED_RESULT: TicketCategoryLookup = { found: false, doneness: null, rawCategory: null, reason: "not_connected" };
+const NOT_FOUND_RESULT: TicketCategoryLookup = { found: false, doneness: null, rawCategory: null, reason: "not_found" };
+
+/** Best-effort HTTP status extraction from the errors providerTokenFetch/jiraFetch already throw.
+ *  Those are BadRequestException({ error: "... failed (${status}).", detail }) — a NestJS
+ *  HttpException constructed with an object payload carries that object on `.getResponse()`, not on
+ *  `.message` (which Nest defaults to the generic "Bad Request Exception"), so this reads the same
+ *  place isReconnectError already does on these exact errors, then string-matches the status back
+ *  out of the `error` text — those helpers are shared with several other callers and deliberately
+ *  not touched here just to carry a typed status code for this one caller. Falls back to `.message`
+ *  for anything that isn't a NestJS HttpException (a plain network-failure Error, for instance). */
+function extractHttpStatus(err: unknown): number | null {
+  const response = err instanceof HttpException ? (err.getResponse() as Body) : null;
+  const message = String(response?.error || (err instanceof Error ? err.message : String(err)));
+  const match = /\((\d{3})\)/.exec(message);
+  return match ? Number(match[1]) : null;
 }
 
 const JIRA_OAUTH_SCOPE = "read:jira-work read:jira-user write:jira-work offline_access";
@@ -1103,7 +1195,8 @@ export class LegacyService implements OnModuleInit {
     private readonly suitesCache: SuitesCacheService,
     private readonly testcasesListCache: TestcasesListCacheService,
     private readonly projectOverviewCache: ProjectOverviewCacheService,
-    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService
+    @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService,
+    @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService
   ) {}
 
   // --- API tokens (project-scoped machine credentials) -------------------
@@ -1135,6 +1228,408 @@ export class LegacyService implements OnModuleInit {
     void this.ragIngestion.enqueueEmbedding({ organizationId, projectId, sourceType, sourceId, reason }).catch(() => undefined);
   }
 
+  // Test-case counterpart of enqueueEmbedding. Called from insertTestCaseWithClient,
+  // updateTestCaseWithClient, and patchTestCaseFromZyraWithClient — the three low-level methods
+  // createTestCase(), updateTestCase(), and patchTestCaseFromZyra() all funnel through (including
+  // the Zyra chat/task review-batch save loops, which call the WithClient variants directly).
+  // Not called from bulkCreateTestCases (import) or zyraBatchInsertTestCases (staged Zyra
+  // drafts, not yet written to testcases) — see rag-ingestion.service.ts's enqueueTestcaseEmbedding
+  // comment for why that's a deliberate scope limit, not an oversight.
+  private enqueueTestcaseEmbedding(projectId: string, testcaseId: string, reason: "created" | "updated"): void {
+    void this.ragIngestion.enqueueTestcaseEmbedding({ projectId, testcaseId, reason }).catch(() => undefined);
+  }
+
+  // "Auto-comment on Jira/Linear ticket" (projects.settings.jiraAutoComment / linearAutoComment,
+  // IntegrationAiGenerationSettings.tsx). Called from zyraSave once a save has committed: posts ONE
+  // comment per ticket, listing exactly the test cases that save wrote for it. The list is grouped
+  // from the committed rows themselves (their own jira_issue_key/linear_issue_key), so a test case
+  // from another task, or from an earlier save of this one, can never appear in it.
+  //
+  // Replaces the earlier per-row sync (one "Test case added by Zyra" comment per test case, posted
+  // whether or not the setting was on). Every outcome — including the skips — is recorded in
+  // integration_ticket_comments before anything leaves the building (V123 says why), and that claim
+  // is what makes this idempotent: it is keyed on the save event, so a second pass over the same save
+  // finds its claim already taken and posts nothing. Only the provider call itself runs in the
+  // background; the decision and the claim are cheap DB work finished before zyraSave returns.
+  //
+  // Never throws — a comment is a side effect of a save that has already succeeded.
+  private async queueZyraTicketComments(
+    projectId: string,
+    uid: string,
+    taskId: string,
+    saveEventId: string,
+    rows: Body[],
+    actions: Array<"add" | "update" | "archive">
+  ): Promise<void> {
+    try {
+      const groups = this.zyraTicketCommentGroups(rows, actions);
+      if (!groups.length) return;
+      const settings = this.parseProjectSettings((await this.getProject(projectId)).settings);
+      const connected = new Map<TicketProvider, boolean>();
+      for (const group of groups) {
+        const enabled = settings[`${group.provider}AutoComment`] === true;
+        if (enabled && !connected.has(group.provider)) {
+          connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
+        }
+        const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
+        const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries);
+        const claim = await this.db.query<{ id: string }>(
+          `INSERT INTO integration_ticket_comments
+             (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+           ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
+           RETURNING id`,
+          [
+            projectId,
+            taskId,
+            saveEventId,
+            group.provider,
+            group.issueKey,
+            JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
+            status,
+            content.markdown,
+            uid
+          ]
+        );
+        const claimId = claim.rows[0]?.id;
+        if (!claimId) continue;
+        const label = group.provider === "jira" ? "Jira" : "Linear";
+        if (status === "pending") {
+          void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
+        } else if (status === "skipped_disabled") {
+          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${group.issueKey} was not commented on.`);
+        } else {
+          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${group.issueKey} was not commented on.`);
+        }
+      }
+    } catch (err) {
+      this.logger.warn(`Failed to queue Zyra ticket comments for task ${taskId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Which ticket(s) each committed row belongs to. Keyed per provider + key: a row carries the key it
+  // was actually written with, so a chat save that touched test cases of two tickets yields two
+  // groups, each listing only its own rows.
+  private zyraTicketCommentGroups(
+    rows: Body[],
+    actions: Array<"add" | "update" | "archive">
+  ): Array<{ provider: TicketProvider; issueKey: string; entries: Array<{ row: Body; action: "add" | "update" | "archive" }> }> {
+    const groups = new Map<string, { provider: TicketProvider; issueKey: string; entries: Array<{ row: Body; action: "add" | "update" | "archive" }> }>();
+    rows.forEach((row, index) => {
+      const action = actions[index];
+      if (!row?.id || !action) return;
+      for (const provider of ["jira", "linear"] as const) {
+        const issueKey = String((provider === "jira" ? row.jiraIssueKey : row.linearIssueKey) || "").trim();
+        if (!issueKey) continue;
+        const mapKey = `${provider}:${issueKey}`;
+        const group = groups.get(mapKey) ?? { provider, issueKey, entries: [] };
+        // Listed once per ticket even if the batch touched the same row twice — the later action wins.
+        group.entries = group.entries.filter((entry) => String(entry.row.id) !== String(row.id));
+        group.entries.push({ row, action });
+        groups.set(mapKey, group);
+      }
+    });
+    return Array.from(groups.values());
+  }
+
+  // The link a ticket comment gives each test case — read by people other than this deployment's
+  // own user, on their own machines. PUBLIC_APP_URL when set, else FRONTEND_URL (already the public
+  // address on stage/production). Null when that address could only work on this machine or
+  // network (a local stack's http://localhost:1020): the comment then lists the test case as plain
+  // text instead of a link that opens each reader's own localhost.
+  private zyraTestcaseKbUrl(projectId: string, testcaseId: string): string | null {
+    const base = externallyReachableBaseUrl(this.config.publicAppUrl || this.config.frontendUrl);
+    return base ? `${base}/projects/${projectId}/testcases/${testcaseId}` : null;
+  }
+
+  // One comment body, rendered twice from the same sections: Atlassian Document Format for Jira
+  // (REST v3 only accepts ADF — the same shape jiraComment already sends) and markdown for Linear,
+  // which is also what the ledger stores as comment_text. Capped so a very large save still fits
+  // comfortably under Jira's comment size limit; the overflow is counted, not silently dropped.
+  private zyraTicketCommentContent(
+    projectId: string,
+    issueKey: string,
+    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>
+  ): { markdown: string; adf: Body } {
+    let budget = ZYRA_TICKET_COMMENT_MAX_ITEMS;
+    const sections = (
+      [["add", "Added"], ["update", "Updated"], ["archive", "Archived"]] as const
+    ).map(([action, label]) => {
+      const all = entries.filter((entry) => entry.action === action);
+      const shown = all.slice(0, Math.max(0, budget));
+      budget -= shown.length;
+      return {
+        label: `${label} (${all.length})`,
+        items: shown.map(({ row }) => ({
+          externalId: String(row.externalId || "").trim(),
+          title: String(row.title || "").trim() || "Untitled test case",
+          url: this.zyraTestcaseKbUrl(projectId, String(row.id))
+        }))
+      };
+    }).filter((section) => section.items.length);
+    const total = entries.length;
+    const hidden = total - sections.reduce((sum, section) => sum + section.items.length, 0);
+    const heading = "Generated by Tesbo Test Manager";
+    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${issueKey} in Tesbo.`;
+    const overflow = hidden > 0 ? `…and ${hidden} more in Tesbo.` : "";
+
+    const escapeLinkText = (text: string) => text.replace(/([\[\]\\])/g, "\\$1");
+    // No reachable URL (see zyraTestcaseKbUrl): the same line, as plain text.
+    const markdownItem = (item: { externalId: string; title: string; url: string | null }) => {
+      const label = item.externalId || item.title;
+      const head = item.url ? `[${escapeLinkText(label)}](${item.url})` : label;
+      return item.externalId ? `- ${head} — ${item.title}` : `- ${head}`;
+    };
+    const markdown = [
+      `**${heading}**`,
+      summary,
+      ...sections.map((section) => [
+        `**${section.label}**`,
+        ...section.items.map(markdownItem)
+      ].join("\n")),
+      ...(overflow ? [overflow] : [])
+    ].join("\n\n");
+
+    const text = (value: string, marks?: Body[]) => (marks ? { type: "text", text: value, marks } : { type: "text", text: value });
+    const paragraph = (...content: Body[]) => ({ type: "paragraph", content });
+    const adf = {
+      type: "doc",
+      version: 1,
+      content: [
+        paragraph(text(heading, [{ type: "strong" }])),
+        paragraph(text(summary)),
+        ...sections.flatMap((section) => [
+          paragraph(text(section.label, [{ type: "strong" }])),
+          {
+            type: "bulletList",
+            content: section.items.map((item) => ({
+              type: "listItem",
+              content: [(() => {
+                const marks = item.url ? [{ type: "link", attrs: { href: item.url } }] : undefined;
+                return item.externalId
+                  ? paragraph(text(item.externalId, marks), text(` — ${item.title}`))
+                  : paragraph(text(item.title, marks));
+              })()]
+            }))
+          }
+        ]),
+        ...(overflow ? [paragraph(text(overflow))] : [])
+      ]
+    };
+    return { markdown, adf };
+  }
+
+  private async deliverZyraTicketComment(
+    projectId: string,
+    taskId: string,
+    claimId: string,
+    provider: TicketProvider,
+    issueKey: string,
+    count: number,
+    content: { markdown: string; adf: Body }
+  ): Promise<void> {
+    const label = provider === "jira" ? "Jira" : "Linear";
+    try {
+      const remoteId = provider === "jira"
+        ? await this.jiraPostComment(projectId, issueKey, content.adf)
+        : await this.linearPostComment(projectId, issueKey, content.markdown);
+      await this.db.query(
+        "UPDATE integration_ticket_comments SET status = 'posted', remote_comment_id = $2, posted_at = now(), updated_at = now() WHERE id = $1",
+        [claimId, remoteId]
+      );
+      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${issueKey}.`);
+    } catch (err) {
+      const reason = this.integrationErrorReason(err, label);
+      this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
+      await this.db.query(
+        "UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1",
+        [claimId, reason.slice(0, 2000)]
+      ).catch(() => undefined);
+      await this.appendZyraTaskActivity(projectId, taskId, `${label} comment failed`, `Couldn't post the test case list to ${issueKey}: ${reason}`);
+    }
+  }
+
+  private formatTicketComment(row: Body): Body {
+    return {
+      id: String(row.id),
+      provider: row.provider,
+      issueKey: row.issue_key,
+      status: row.status,
+      reason: row.reason ?? null,
+      testcaseCount: normalizeJsonArray(row.testcase_ids).length,
+      postedAt: row.posted_at ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  // The ticket comments one task's saves produced — what the task page shows next to its Retry action.
+  async zyraTaskTicketComments(projectId: string, userId: string | null | undefined, taskId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    if (!isUuid(taskId)) throw new NotFoundException({ error: "Zyra task not found" });
+    const res = await this.db.query(
+      `SELECT id, provider, issue_key, status, reason, testcase_ids, posted_at, created_at, updated_at
+       FROM integration_ticket_comments WHERE project_id = $1 AND generation_request_id = $2
+       ORDER BY created_at ASC`,
+      [projectId, taskId]
+    );
+    return { list: res.rows.map((row) => this.formatTicketComment(row)) };
+  }
+
+  // Re-sends ONE failed ticket comment — e.g. after reconnecting Jira. Only 'failed' is retryable: a
+  // 'posted' comment is already on the ticket, 'pending' is in flight, and a skip was a decision (the
+  // setting was off, or nothing was connected), not an error. The failed -> pending UPDATE is the
+  // claim, so a double-click or a second tab can never post the same comment twice.
+  //
+  // The comment is rebuilt from the test cases' current titles, not replayed byte for byte, so a
+  // rename since the save is reflected, and a test case deleted since is left out.
+  async zyraRetryTicketComment(projectId: string, userId: string | null | undefined, taskId: string, commentId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(taskId) || !isUuid(commentId)) throw new NotFoundException({ error: "Ticket comment not found" });
+    const claimed = await this.db.query(
+      `UPDATE integration_ticket_comments SET status = 'pending', reason = NULL, posted_by = $4, updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND generation_request_id = $3 AND status = 'failed'
+       RETURNING *`,
+      [commentId, projectId, taskId, uid]
+    );
+    const row = claimed.rows[0];
+    if (!row) {
+      const existing = await this.db.query(
+        "SELECT status FROM integration_ticket_comments WHERE id = $1 AND project_id = $2 AND generation_request_id = $3",
+        [commentId, projectId, taskId]
+      );
+      if (!existing.rows[0]) throw new NotFoundException({ error: "Ticket comment not found" });
+      throw new ConflictException({ error: `This comment is "${existing.rows[0].status}" — only a failed comment can be retried.` });
+    }
+    const provider = row.provider as TicketProvider;
+    const label = provider === "jira" ? "Jira" : "Linear";
+    const content = await this.rebuildZyraTicketCommentContent(projectId, row);
+    if (!content) {
+      const reason = "None of the test cases in this comment exist anymore, so there is nothing to post.";
+      await this.db.query("UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1", [row.id, reason]);
+      await this.appendZyraTaskActivity(projectId, taskId, `${label} comment failed`, `Couldn't post the test case list to ${row.issue_key}: ${reason}`);
+    } else {
+      await this.db.query("UPDATE integration_ticket_comments SET comment_text = $2 WHERE id = $1", [row.id, content.markdown]);
+      await this.appendZyraTaskActivity(projectId, taskId, `Retrying ${label} comment`, `Re-sending the test case list to ${row.issue_key}.`);
+      // Awaited here (unlike after a save), so the caller gets the outcome in the response.
+      await this.deliverZyraTicketComment(projectId, taskId, String(row.id), provider, String(row.issue_key), content.count, content);
+    }
+    const fresh = await this.db.query("SELECT * FROM integration_ticket_comments WHERE id = $1", [row.id]);
+    return this.formatTicketComment(fresh.rows[0]);
+  }
+
+  private async rebuildZyraTicketCommentContent(projectId: string, row: Body): Promise<{ markdown: string; adf: Body; count: number } | null> {
+    const ids = normalizeJsonArray(row.testcase_ids).map(String).filter((id) => isUuid(id));
+    if (!ids.length) return null;
+    const res = await this.db.query(
+      "SELECT id, external_id, title FROM testcases WHERE project_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL",
+      [projectId, ids]
+    );
+    const byId = new Map(res.rows.map((tc) => [String(tc.id), tc]));
+    const actions = this.zyraTicketCommentActions(String(row.comment_text || ""));
+    const entries = ids
+      .filter((id) => byId.has(id))
+      .map((id) => ({
+        row: { id, externalId: byId.get(id)!.external_id, title: byId.get(id)!.title },
+        // Recovered from the section it was listed under when first built. A case past the list cap
+        // (never listed by name) was not recorded under any section and falls back to "add".
+        action:
+          actions.get(id.toLowerCase()) ??
+          actions.get(`ext:${String(byId.get(id)!.external_id || "").toLowerCase()}`) ??
+          ("add" as const)
+      }));
+    if (!entries.length) return null;
+    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries), count: entries.length };
+  }
+
+  // Which section (Added / Updated / Archived) each test case was listed under in a comment
+  // zyraTicketCommentContent built — read back from its own markdown. A linked line is keyed by the
+  // test case id in its URL; a plain line (no reachable URL, see zyraTestcaseKbUrl) by the external
+  // id it starts with, as "ext:<id>".
+  private zyraTicketCommentActions(markdown: string): Map<string, "add" | "update" | "archive"> {
+    const sectionAction: Record<string, "add" | "update" | "archive"> = { Added: "add", Updated: "update", Archived: "archive" };
+    const actions = new Map<string, "add" | "update" | "archive">();
+    let current: "add" | "update" | "archive" | null = null;
+    for (const line of markdown.split("\n")) {
+      const heading = /^\*\*(Added|Updated|Archived) \(\d+\)\*\*$/.exec(line.trim());
+      if (heading) {
+        current = sectionAction[heading[1]];
+        continue;
+      }
+      if (!current) continue;
+      const id = /\/testcases\/([0-9a-f-]{36})\)/i.exec(line)?.[1];
+      if (id) {
+        actions.set(id.toLowerCase(), current);
+        continue;
+      }
+      const plain = /^- ([^\s[\]]+) — /.exec(line.trim())?.[1];
+      if (plain) actions.set(`ext:${plain.toLowerCase()}`, current);
+    }
+    return actions;
+  }
+
+  // Connection check only (no token refresh, no network) — the refresh happens at post time.
+  private async ticketProviderConnected(projectId: string, provider: TicketProvider): Promise<boolean> {
+    if (provider === "jira") return Boolean(await this.getJiraConnection(projectId, false));
+    const organizationId = await this.projectOrganizationId(projectId);
+    return Boolean(await this.getIntegrationConnection(organizationId, "linear", false));
+  }
+
+  private async appendZyraTaskActivity(projectId: string, taskId: string, title: string, detail: string): Promise<void> {
+    const entry = [{ actor: "system", stage: "info", title, detail, createdAt: new Date().toISOString() }];
+    await this.db.query(
+      "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb WHERE id = $1 AND project_id = $2",
+      [taskId, projectId, JSON.stringify(entry)]
+    ).catch(() => undefined);
+  }
+
+  // The user-facing half of a provider error: HttpExceptions thrown by jiraFetch/linearGraphQL carry
+  // it as `error` on their response body rather than as the exception's own message. 401 and 403
+  // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
+  // different fixes, so they get different reasons here.
+  private integrationErrorReason(err: unknown, provider: "Jira" | "Linear"): string {
+    const providerStatus = (err as { providerStatus?: number })?.providerStatus;
+    if (providerStatus === 401) {
+      return `${provider} rejected the connection's credentials (401) — the authorization has expired or been revoked. Reconnect ${provider} in workspace settings, then retry.`;
+    }
+    if (providerStatus === 403) {
+      return `${provider} refused the comment (403) — the connected ${provider} account doesn't have permission to comment on this issue. Give that account comment permission in the ${provider} project, or reconnect with an account that has it, then retry.`;
+    }
+    const response = (err as { getResponse?: () => unknown })?.getResponse?.();
+    if (response && typeof response === "object" && typeof (response as Body).error === "string") return String((response as Body).error);
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  // Which ticket a Task-board task's Knowledge Base selection belongs to (see aiGenerate). Only
+  // mirror documents count — a user's own note that mentions a key is not the ticket — and they
+  // resolve to a key through the ticket table the mirror was written from, because a mirror stores
+  // the provider's issue id in source_external_id, not the key. Project-scoped on both sides, so a
+  // document id from another project resolves to nothing. `linked` is set only when the selection
+  // points at exactly one ticket; `tickets` lists every one it found.
+  private async zyraTicketFromKnowledgeSelection(
+    projectId: string,
+    knowledgeItemIds: string[]
+  ): Promise<{ linked: { provider: TicketProvider; issueKey: string } | null; tickets: Array<{ provider: TicketProvider; issueKey: string }> } | null> {
+    const ids = Array.from(new Set(knowledgeItemIds.filter((id) => isUuid(id))));
+    if (!ids.length) return null;
+    const res = await this.db.query<{ provider: TicketProvider; issue_key: string }>(
+      `SELECT DISTINCT d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key) AS issue_key
+       FROM knowledge_documents d
+       LEFT JOIN jira_tickets j
+         ON d.source_provider = 'jira' AND j.project_id = d.project_id AND j.jira_issue_id = d.source_external_id
+       LEFT JOIN linear_tickets l
+         ON d.source_provider = 'linear' AND l.project_id = d.project_id AND l.linear_issue_id = d.source_external_id
+       WHERE d.project_id = $1 AND d.id = ANY($2::uuid[]) AND d.is_deleted = false
+         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear')
+         AND COALESCE(j.jira_issue_key, l.linear_issue_key) IS NOT NULL
+       ORDER BY 1, 2`,
+      [projectId, ids]
+    );
+    const tickets = res.rows.map((row) => ({ provider: row.provider, issueKey: String(row.issue_key) }));
+    return { linked: tickets.length === 1 ? tickets[0] : null, tickets };
+  }
+
   async onModuleInit(): Promise<void> {
     this.resumeInterruptedZyraChatPlans().catch((err) => {
       this.logger.warn(`Failed to resume Zyra chat plans on startup: ${err instanceof Error ? err.message : err}`);
@@ -1150,7 +1645,7 @@ export class LegacyService implements OnModuleInit {
   // self-heals instead of stalling silently.
   private async resumeInterruptedZyraChatPlans(): Promise<void> {
     const res = await this.db.query(
-      "SELECT id, project_id, user_id, active_plan FROM zyra_chat_sessions WHERE active_plan IS NOT NULL AND active_plan->>'status' = 'running'"
+      "SELECT id, project_id, user_id, active_plan FROM zyra_chat_sessions WHERE deleted_at IS NULL AND active_plan IS NOT NULL AND active_plan->>'status' = 'running'"
     ).catch(() => ({ rows: [] as Body[] }));
     for (const row of res.rows) {
       const plan = row.active_plan as Body | null;
@@ -2314,7 +2809,7 @@ export class LegacyService implements OnModuleInit {
         [ids]
       ),
       this.db.query<{ project_id: string; count: number }>(
-        `SELECT project_id, COUNT(*)::int AS count FROM suites WHERE project_id = ANY($1::uuid[]) GROUP BY project_id`,
+        `SELECT project_id, COUNT(*)::int AS count FROM suites WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL GROUP BY project_id`,
         [ids]
       ),
       this.db.query<{ project_id: string; user_id: string; name: string }>(
@@ -2339,9 +2834,9 @@ export class LegacyService implements OnModuleInit {
       }>(
         `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
            FROM cycles c
-           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
            LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-          WHERE c.project_id = ANY($1::uuid[])
+          WHERE c.project_id = ANY($1::uuid[]) AND c.deleted_at IS NULL
           GROUP BY c.id
          HAVING COUNT(e.id) FILTER (WHERE e.status NOT IN ('Untested', 'Retest')) > 0
           ORDER BY c.project_id, c.created_at DESC`,
@@ -2351,20 +2846,24 @@ export class LegacyService implements OnModuleInit {
       // query there additionally drops a testcase_* row when a zyra_* sibling exists within five
       // seconds; that sibling is itself in this union, so the presence of activity is identical and
       // only the timestamp can differ, by less than the five seconds that rule spans.
+      // cycles rows are filtered to deleted_at IS NULL here (unlike listActivity's own union, which
+      // deliberately keeps a deleted cycle's history visible) because this is a "what's currently
+      // going on" rollup, not an audit trail — a soft-deleted run's stale created_at/updated_at
+      // should not keep a project reading as "active" forever (hard-delete remediation Phase 2).
       this.db.query<{ project_id: string; last_activity_at: string }>(
         `SELECT project_id, MAX(created_at) AS last_activity_at FROM (
-           SELECT project_id, created_at FROM suites WHERE project_id = ANY($1::uuid[])
+           SELECT project_id, created_at FROM suites WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM suites
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM plans WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM plans WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM plans
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM cycles WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM cycles WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM cycles
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
-           UNION ALL SELECT project_id, created_at FROM bugs WHERE project_id = ANY($1::uuid[])
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
+           UNION ALL SELECT project_id, created_at FROM bugs WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL
            UNION ALL SELECT project_id, updated_at FROM bugs
-             WHERE project_id = ANY($1::uuid[]) AND updated_at > created_at + interval '1 second'
+             WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND updated_at > created_at + interval '1 second'
            UNION ALL SELECT project_id, created_at FROM audit_logs WHERE project_id = ANY($1::uuid[])
          ) events GROUP BY project_id`,
         [ids]
@@ -2728,7 +3227,10 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(suiteId)) throw new NotFoundException({ error: "Suite not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM suites WHERE id = $1", [suiteId]);
+    const res = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM suites WHERE id = $1 AND deleted_at IS NULL",
+      [suiteId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Suite not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -2765,11 +3267,11 @@ export class LegacyService implements OnModuleInit {
   private async listSuitesUncached(projectId: string) {
     const res = await this.db.query(
       `WITH RECURSIVE descendants AS (
-         SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1
+         SELECT id AS root_id, id AS node_id, ARRAY[id] AS path FROM suites WHERE project_id = $1 AND deleted_at IS NULL
          UNION ALL
          SELECT d.root_id, s.id, d.path || s.id
          FROM suites s JOIN descendants d ON s.parent_id = d.node_id
-         WHERE s.project_id = $1 AND NOT s.id = ANY(d.path)
+         WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(d.path)
        ),
        recursive_counts AS (
          SELECT d.root_id, COUNT(t.id)::int AS recursive_test_case_count
@@ -2785,7 +3287,7 @@ export class LegacyService implements OnModuleInit {
               )::int AS recursive_test_case_count
        FROM suites s
        LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
-       WHERE s.project_id = $1
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id
        ORDER BY s.position, s.name`,
       [projectId]
@@ -2805,13 +3307,29 @@ export class LegacyService implements OnModuleInit {
    * token is bound to one project, see McpService), the Zyra chat flow, and CSV import — all of which
    * authorized before they got here. Route traffic goes through createSuiteForUser.
    */
+  // Once suites were soft-deleted (V110) this stopped being enforced by the database: a parentId
+  // pointing at a soft-deleted (or another project's) suite used to raise a loud FK violation on
+  // insert; the row still existing now means the FK is satisfied and the write silently succeeds.
+  // listSuitesUncached only ever returns live suites, and the frontend's tree builder buckets a
+  // suite as either a root (no parentId) or a child listed under its parent (map keyed by
+  // parentId) — a suite whose parent is absent from that list is neither, and renders nowhere, for
+  // every user, permanently, with no path through the product to notice or recover it. Checked
+  // explicitly here rather than left to the FK, which can no longer catch it.
+  private async requireLiveSuiteInProject(projectId: string, suiteId: string): Promise<void> {
+    if (!isUuid(suiteId)) throw new BadRequestException({ error: "parentId is not a valid suite id" });
+    const res = await this.db.query("SELECT id FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [suiteId, projectId]);
+    if (!res.rows[0]) throw new BadRequestException({ error: "parentId does not reference a suite in this project" });
+  }
+
   async createSuite(projectId: string, body: Body) {
     const name = String(body.name || "").trim();
     if (!name) throw new BadRequestException({ error: "name is required" });
     validateBoundedField(name, "Suite name", SUITE_NAME_MAX_LENGTH);
+    const parentId = body.parentId || null;
+    if (parentId) await this.requireLiveSuiteInProject(projectId, parentId);
     const res = await this.db.query(
       "INSERT INTO suites (project_id, parent_id, name, position) VALUES ($1, $2, $3, $4) RETURNING id, parent_id, name, position, created_at",
-      [projectId, body.parentId || null, name, Number(body.position || 0)]
+      [projectId, parentId, name, Number(body.position || 0)]
     );
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
@@ -2821,19 +3339,101 @@ export class LegacyService implements OnModuleInit {
   async updateSuite(userId: string | null | undefined, suiteId: string, body: Body) {
     const projectId = await this.requireSuiteAccess(userId, suiteId);
     validateBoundedField(body.name, "Suite name", SUITE_NAME_MAX_LENGTH);
+    const parentId = body.parentId ?? null;
+    if (parentId) await this.requireLiveSuiteInProject(projectId, parentId);
     await this.db.query(
       "UPDATE suites SET name = COALESCE($2, name), parent_id = $3, position = COALESCE($4, position), updated_at = now() WHERE id = $1",
-      [suiteId, body.name ?? null, body.parentId ?? null, body.position ?? null]
+      [suiteId, body.name ?? null, parentId, body.position ?? null]
     );
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
   }
 
+  /**
+   * Soft-deletes a suite and its whole descendant subtree, instead of the hard `DELETE`s this used
+   * to issue (see migrations/V110_suites_soft_delete.sql and the Zyra context integrity progress
+   * log's Phase 3/4 inspection for the full audit). `suites.parent_id` used to be `ON DELETE
+   * CASCADE`, so the old unconditional `DELETE FROM suites WHERE id = $1` silently destroyed every
+   * descendant suite, and — via the further cascade off `testcases` — every version/execution/
+   * custom-field/etc. row belonging to a testcase anywhere in that subtree. None of that is a real
+   * `DELETE` any more: the subtree is walked explicitly (the same recursive-CTE shape already used
+   * by listSuitesUncached/listTestCasesUncached) and both halves become `UPDATE`s.
+   *
+   * Subtree-wide by design, in both modes — matching what the FK cascade actually did for free
+   * before this rewrite, not the one-line literal SQL this replaces (which only ever touched the
+   * named suite's *direct* testcases). A narrower, direct-children-only port would leave every
+   * descendant suite's testcases pointing at a suite_id that just went invisible (soft-deleted,
+   * filtered out of every list) — an active testcase with a ghost suite, unreachable from the tree
+   * and not shown as "Unassigned" either. See Q9 in the progress log.
+   *
+   * mode: "deleteTestcases" soft-deletes every testcase anywhere in the subtree via the exact
+   * `deleted_at = now()` idiom deleteTestCase/bulkDeleteTestCases already use — which is what makes
+   * this free: V63's BEFORE UPDATE trigger fires on this statement shape already, writing a
+   * `change_type='delete'` version row for every affected testcase, so none of
+   * testcase_versions/cycle_items→executions/plan_items/custom_field_values/bug_links/
+   * testcase_embeddings/automation_sessions/automation_scripts get touched at all — nothing is
+   * being DELETEd any more, so nothing cascades away.
+   * mode: "moveToDefault" unassigns every testcase anywhere in the subtree (suite_id = NULL) —
+   * they survive, just with no suite, matching what "move to default" has always meant, made
+   * subtree-wide instead of relying on the FK to do it by accident.
+   * Both modes then soft-delete every suite in the subtree, the named one and every descendant,
+   * in the same statement.
+   */
   async deleteSuite(userId: string | null | undefined, suiteId: string, mode = "moveToDefault") {
+    const uid = this.requireUser(userId);
     const projectId = await this.requireSuiteAccess(userId, suiteId);
-    if (mode === "deleteTestcases") await this.db.query("DELETE FROM testcases WHERE suite_id = $1", [suiteId]);
-    else await this.db.query("UPDATE testcases SET suite_id = NULL WHERE suite_id = $1", [suiteId]);
-    await this.db.query("DELETE FROM suites WHERE id = $1", [suiteId]);
+    await this.db.transaction(async (client) => {
+      // Per-project advisory lock, taken first, before anything is read — serializes deleteSuite
+      // against itself for a given project (two overlapping-subtree deletes simply queue instead of
+      // one reading a subtree the other is mid-mutating). Distinct key namespace from the existing
+      // `testcase-external-id:${projectId}` lock so the two never contend over unrelated work.
+      //
+      // Deliberately narrow (Q12): NOT taken by createSuite/updateSuite(reparent)/resolveImportSuites,
+      // so a suite created as a child of this subtree in the small window between this lock being
+      // acquired and the subtree being soft-deleted is a real, accepted race — the new suite's
+      // parent_id would point at a suite that is about to disappear from every list. This is bounded
+      // to the same class of "acted on stale data" race this codebase already tolerates elsewhere
+      // (nothing today stops createSuite racing a concurrent updateSuite re-parent either), and is a
+      // documented, known gap per Q12's resolution, not an oversight.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`suite-tree:${projectId}`]);
+
+      const subtree = await client.query<{ id: string }>(
+        `WITH RECURSIVE subtree AS (
+           SELECT id, ARRAY[id] AS path FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
+           UNION ALL
+           SELECT s.id, sub.path || s.id
+           FROM suites s JOIN subtree sub ON s.parent_id = sub.id
+           WHERE s.project_id = $2 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
+         )
+         SELECT id FROM subtree`,
+        [suiteId, projectId]
+      );
+      const subtreeIds = subtree.rows.map((row) => row.id);
+      // Only reachable via a race: requireSuiteAccess above already confirmed this suite was active,
+      // a moment before this transaction's advisory lock was granted. A concurrent deleteSuite on the
+      // same suite (or an ancestor) that committed in between makes this re-check under the lock come
+      // up empty — treated as "not found" for the same reason an already-soft-deleted suite is,
+      // rather than proceeding to update zero rows and reporting success.
+      if (!subtreeIds.length) throw new NotFoundException({ error: "Suite not found" });
+
+      if (mode === "deleteTestcases") {
+        await client.query(
+          `UPDATE testcases SET deleted_at = now(), deleted_by = $2, updated_by = $2, updated_at = now()
+           WHERE suite_id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+          [subtreeIds, uid]
+        );
+      } else {
+        await client.query(
+          `UPDATE testcases SET suite_id = NULL, updated_at = now()
+           WHERE suite_id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+          [subtreeIds]
+        );
+      }
+      await client.query(
+        "UPDATE suites SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [subtreeIds, uid]
+      );
+    });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
   }
@@ -2894,12 +3494,31 @@ export class LegacyService implements OnModuleInit {
       !query.linearIssueKey &&
       !query.search &&
       !query.customFieldFilters &&
+      LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
   }
 
-  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
-    const filters: string[] = ["project_id = $1", "deleted_at IS NULL"];
+  private static parseCustomTagIdsParam(raw: unknown): string[] {
+    const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+    return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
+  }
+
+  /**
+   * The WHERE/CTE/join fragments shared by every "which test cases match the current repository
+   * filters" caller — the on-screen list (`listTestCasesUncached`) and the CSV/XLSX export
+   * (`exportTestCases`), which used to run its own unfiltered query and therefore ignored the suite
+   * (and every other) filter a user had selected on screen (Basecamp: "Exporting a specific suite
+   * exports all test cases"). Keeping the two in one place means a filter added to one can't quietly
+   * stop applying to the other again.
+   *
+   * All column references are qualified with `testcases.` rather than left bare: `exportTestCases`
+   * joins `suites`, which also has `project_id` and `deleted_at` columns, and an unqualified
+   * reference to either would be ambiguous. `testcases` itself is always the bare table name (never
+   * aliased) in both callers, so `testcases.column` resolves correctly in each.
+   */
+  private async buildTestcaseFilterFragments(projectId: string, query: Body) {
+    const filters: string[] = ["testcases.project_id = $1", "testcases.deleted_at IS NULL"];
     const values: any[] = [projectId];
     /*
      * `suiteId=none` asks for the cases that belong to no suite.
@@ -2915,7 +3534,7 @@ export class LegacyService implements OnModuleInit {
      */
     const suiteFilter = String(query.suiteId ?? "");
     const wantsUnfiled = suiteFilter.toLowerCase() === UNASSIGNED_SUITE_ID;
-    if (wantsUnfiled) filters.push("suite_id IS NULL");
+    if (wantsUnfiled) filters.push("testcases.suite_id IS NULL");
     /*
      * Anything else in `suiteId` has to be a uuid before it reaches the column. `suite_id` is uuid,
      * so a malformed value (a stale id pasted from a URL, a truncated copy/paste) came back as
@@ -2949,13 +3568,13 @@ export class LegacyService implements OnModuleInit {
     if (wantsSubtree) {
       values.push(suiteFilter);
       suiteSubtreeCteSql = `WITH RECURSIVE suite_subtree AS (
-         SELECT id, ARRAY[id] AS path FROM suites WHERE id = $${values.length} AND project_id = $1
+         SELECT id, ARRAY[id] AS path FROM suites WHERE id = $${values.length} AND project_id = $1 AND deleted_at IS NULL
          UNION ALL
          SELECT s.id, sub.path || s.id
          FROM suites s JOIN suite_subtree sub ON s.parent_id = sub.id
-         WHERE s.project_id = $1 AND NOT s.id = ANY(sub.path)
+         WHERE s.project_id = $1 AND s.deleted_at IS NULL AND NOT s.id = ANY(sub.path)
        ) `;
-      filters.push("suite_id IN (SELECT id FROM suite_subtree)");
+      filters.push("testcases.suite_id IN (SELECT id FROM suite_subtree)");
     }
     /*
      * Archived cases are out of the working list unless they are asked for.
@@ -2972,7 +3591,7 @@ export class LegacyService implements OnModuleInit {
     const statusFilter = String(query.status ?? "").trim();
     const includeArchived =
       statusFilter.toLowerCase() === "archived" || String(query.includeArchived ?? "").toLowerCase() === "true";
-    if (!includeArchived) filters.push("status IS DISTINCT FROM 'Archived'");
+    if (!includeArchived) filters.push("testcases.status IS DISTINCT FROM 'Archived'");
     for (const [param, column] of [
       ["suiteId", "suite_id"],
       ["status", "status"],
@@ -2989,14 +3608,35 @@ export class LegacyService implements OnModuleInit {
         // whose source file used "REGRESSION" instead of the app's canonical "Regression") —
         // match case-insensitively so filtering by type still finds it instead of silently
         // returning zero rows.
-        filters.push(param === "type" ? `lower(${column}) = lower($${values.length})` : `${column} = $${values.length}`);
+        filters.push(
+          param === "type"
+            ? `lower(testcases.${column}) = lower($${values.length})`
+            : `testcases.${column} = $${values.length}`
+        );
       }
     }
     if (query.search) {
       values.push(`%${String(query.search).toLowerCase()}%`);
       const p = values.length;
       filters.push(
-        `(lower(title) LIKE $${p} OR lower(coalesce(description, '')) LIKE $${p} OR lower(coalesce(external_id, '')) LIKE $${p} OR lower(coalesce(type, '')) LIKE $${p})`
+        `(lower(testcases.title) LIKE $${p} OR lower(coalesce(testcases.description, '')) LIKE $${p} OR lower(coalesce(testcases.external_id, '')) LIKE $${p} OR lower(coalesce(testcases.type, '')) LIKE $${p})`
+      );
+    }
+
+    /*
+     * `customTagIds` — comma-separated custom tag ids (or the param repeated). A case matches when it
+     * carries ANY of them, the usual meaning of a multi-select filter. An EXISTS rather than a join,
+     * so a case with several matching tags is still one row and COUNT(*) OVER () stays honest.
+     * Malformed ids are a 400 for the same reason as `suiteId` above: dropping them silently would
+     * widen the filter to the whole repository. A well-formed id from another project matches
+     * nothing, since testcase_custom_tags only ever links a case to its own project's tags.
+     */
+    const customTagIds = LegacyService.parseCustomTagIdsParam(query.customTagIds);
+    if (customTagIds.length) {
+      if (!customTagIds.every(isUuid)) throw new BadRequestException({ error: "customTagIds must be valid ids" });
+      values.push(customTagIds);
+      filters.push(
+        `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
       );
     }
 
@@ -3010,40 +3650,63 @@ export class LegacyService implements OnModuleInit {
       values.push(...cf.params);
     }
 
-    const where = filters.join(" AND ");
-    /*
-     * Repository table sort (ID/Test case title/Priority), additive to the default order above.
-     * `sortBy` is matched against a fixed allow-list rather than interpolated as a column name, so
-     * there is no injection surface here even though it lands directly in ORDER BY text.
-     *
-     * Only three columns are exposed because those are the only three the repository's header
-     * offers a sort control for:
-     *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
-     *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
-     *     sequence, matching compareExternalId() on the frontend.
-     *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
-     *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
-     *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
-     *     a missing priority sorts last of all regardless of direction.
-     *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
-     * `testcases.id` is always the final tiebreaker so paging stays stable across identical sort keys,
-     * the same reasoning as the default order's own id tiebreaker above.
-     */
+    return { filters, values, suiteSubtreeCteSql, customFieldJoinSql };
+  }
+
+  /**
+   * Repository table sort (ID/Test case title/Priority) — shared by the on-screen list and export
+   * (see exportTestCases) so a sorted export always matches the order the repository is currently
+   * showing, the same "export matches the screen" contract the suite/status/etc. filters already
+   * follow (buildTestcaseFilterFragments above). `sortBy` is matched against a fixed allow-list
+   * rather than interpolated as a column name, so there is no injection surface here even though it
+   * lands directly in ORDER BY text.
+   *
+   * Only three columns are exposed because those are the only three the repository's header offers a
+   * sort control for:
+   *   - "id": external_id is a text column ("PRO-TC-331"), so a plain text sort would put
+   *     "PRO-TC-10" before "PRO-TC-9". Ordering by the numeric suffix instead keeps it a true ID
+   *     sequence, matching compareExternalId() on the frontend.
+   *   - "priority": ranked P0 (Critical) -> P3 (Low) the same way the priority filter dropdown and
+   *     the frontend's comparePriority() already do, not alphabetically (which would put P10-style
+   *     values ahead of P2). A legacy/imported value outside P0-P3 sorts after the canonical set;
+   *     a missing priority sorts last of all regardless of direction.
+   *   - "title": case-insensitive, matching compareTestCaseTitle() on the frontend.
+   * `testcases.id` is always the final tiebreaker so paging (and re-exporting the same data) stays
+   * stable across identical sort keys.
+   *
+   * With no `sortBy` at all, this is also the repository's own default view — `created_at DESC` is
+   * the ID sequence (external_id is assigned sequentially at creation), newest case first. Export
+   * used to hard-code its own, different default (`updated_at DESC` — "most recently updated first"),
+   * so editing an old case moved it to the top of every future export while its position on screen
+   * never changed ("[Test Cases] Exported Test Cases Lose Their Original Sequence"). Export now
+   * shares this same default, so an unsorted export always matches the unsorted repository view.
+   */
+  private buildTestcaseOrderBySql(query: Body): string {
     const sortDir = String(query.sortDir ?? "").toLowerCase() === "desc" ? "DESC" : "ASC";
-    let orderBySql = "testcases.created_at DESC, testcases.id DESC";
     if (query.sortBy === "id") {
-      orderBySql =
+      return (
         `(regexp_match(testcases.external_id, '(\\d+)$'))[1]::bigint ${sortDir} NULLS LAST, ` +
-        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "title") {
-      orderBySql = `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
-    } else if (query.sortBy === "priority") {
-      orderBySql =
+        `testcases.external_id ${sortDir}, testcases.id ${sortDir}`
+      );
+    }
+    if (query.sortBy === "title") {
+      return `lower(testcases.title) ${sortDir}, testcases.id ${sortDir}`;
+    }
+    if (query.sortBy === "priority") {
+      return (
         `(CASE WHEN testcases.priority IS NULL OR testcases.priority = '' THEN 5 ` +
         `WHEN testcases.priority IN ('P0','P1','P2','P3') THEN ` +
         `(CASE testcases.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END) ` +
-        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`;
+        `ELSE 4 END) ${sortDir}, testcases.priority ${sortDir}, testcases.id ${sortDir}`
+      );
     }
+    return "testcases.created_at DESC, testcases.id DESC";
+  }
+
+  private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     values.push(limit, offset);
     // Total comes back as a window function on the same statement rather than a second
     // COUNT(*) query. This endpoint backs the repository table, the suite tree and the run
@@ -3055,10 +3718,17 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
+              testcases.severity, testcases.component, testcases.source_refs,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
                 '{}'::jsonb
               ) AS custom_field_values,
+              COALESCE(
+                (SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY lower(ct.name))
+                 FROM testcase_custom_tags tct JOIN custom_tags ct ON ct.id = tct.tag_id
+                 WHERE tct.testcase_id = testcases.id),
+                '[]'::json
+              ) AS custom_tags,
               COUNT(*) OVER () AS total_count
        FROM testcases ${customFieldJoinSql} WHERE ${where}
        ORDER BY ${orderBySql} LIMIT $${values.length - 1} OFFSET $${values.length}`,
@@ -3069,24 +3739,35 @@ export class LegacyService implements OnModuleInit {
     return { rows: res.rows.map(({ total_count, ...row }) => toCamel(row)), total };
   }
 
-  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = []): Promise<Body[]> {
+  /**
+   * `query` carries the same suite/status/priority/type/automationStatus/jira/linear/search/
+   * customFieldFilters shape as `listTestCasesForUser` — the repository screen's "Export" button
+   * sends whatever suite and filters are currently active on screen, so an export of a selected
+   * suite (or a filtered view) matches what the user was looking at instead of silently returning
+   * the whole project (Basecamp: "Exporting a specific suite exports all test cases"). An empty/
+   * absent query exports the whole project, same as before.
+   */
+  async exportTestCases(projectId: string, customFieldDefinitions: CustomFieldDefinitionDto[] = [], query: Body = {}): Promise<Body[]> {
+    const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
+    const where = filters.join(" AND ");
+    // Same order the repository table is currently showing — its default (created_at DESC, the ID
+    // sequence) with no sortBy, or its ID/title/priority column sort when one is active. See
+    // buildTestcaseOrderBySql for why: export used to hard-code `updated_at DESC` regardless of what
+    // was on screen ("[Test Cases] Exported Test Cases Lose Their Original Sequence").
+    const orderBySql = this.buildTestcaseOrderBySql(query);
     const res = await this.db.query(
-      `SELECT t.id, t.external_id, t.title, COALESCE(t.description, '') AS description,
-              COALESCE(t.preconditions, '') AS preconditions,
-              t.steps, COALESCE(t.test_data, '') AS test_data,
-              COALESCE(t.priority, '') AS priority, COALESCE(t.severity, '') AS severity,
-              COALESCE(t.type, '') AS type, COALESCE(t.status, '') AS status,
-              COALESCE(s.name, '') AS suite, COALESCE(t.component, '') AS component
-       FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
-       -- Export keeps its documented "most recently updated first" contract (pinned by
-       -- api/import-export.spec.ts "orders rows by most recently updated"); only the repository LIST
-       -- moved to ID sequence, which is what card 10212941059 asked for. The id tiebreaker is the part
-       -- that mattered here: a bulk update ties every touched row on one updated_at, and without it the
-       -- export's row order was arbitrary between two exports of the same data.
-       ORDER BY t.updated_at DESC, t.id DESC`,
-      [projectId]
+      `${suiteSubtreeCteSql}SELECT testcases.id, testcases.external_id, testcases.title, COALESCE(testcases.description, '') AS description,
+              COALESCE(testcases.preconditions, '') AS preconditions,
+              testcases.steps, COALESCE(testcases.test_data, '') AS test_data,
+              COALESCE(testcases.priority, '') AS priority, COALESCE(testcases.severity, '') AS severity,
+              COALESCE(testcases.type, '') AS type, COALESCE(testcases.status, '') AS status,
+              COALESCE(s.name, '') AS suite, COALESCE(testcases.component, '') AS component
+       FROM testcases
+       LEFT JOIN suites s ON s.id = testcases.suite_id AND s.deleted_at IS NULL
+       ${customFieldJoinSql}
+       WHERE ${where}
+       ORDER BY ${orderBySql}`,
+      values
     );
 
     const valuesByTestcase = new Map<string, Map<string, unknown>>();
@@ -3105,21 +3786,46 @@ export class LegacyService implements OnModuleInit {
     }
 
     return res.rows.map((row) => {
-      const steps = normalizeJsonArray(row.steps)
-        .map((step) => {
-          if (typeof step === "string") return step;
-          return [step.action || step.step || step.description, step.expectedResult || step.expected]
-            .filter(Boolean)
-            .join(" => ");
-        })
-        .filter(Boolean)
-        .join(" | ");
+      // safeSteps(), not normalizeJsonArray(): `row.steps` can be either a genuine jsonb array or a
+      // JSON-encoded string (the shape the create/edit modal, and now Zyra/MCP, actually persist —
+      // see "[Zyra] Test Steps... Missing After Saving Generated Test Cases"), and
+      // normalizeJsonArray silently emptied the latter instead of parsing it.
+      const parsedSteps = this.safeSteps(row.steps);
+      // Action/Expected Result only take a case with EXACTLY one step, and only when that step has
+      // its own action/expectedResult (not a plain legacy string) — the importer's own Action/
+      // Expected Result columns are single-step-only (ImportTestCasesModal.tsx's handleImport
+      // builds exactly one step from them, with no " | " splitting), so anything joined across
+      // several steps into these columns would come back as one garbled step on re-import instead
+      // of round-tripping. Every other case (0 steps, a plain-string step, or 2+ steps) keeps using
+      // `steps`, in the "action => expected" DSL the importer's Steps column already splits on
+      // both "|" and "=>" correctly regardless of step count.
+      let steps = "";
+      let action = "";
+      let expectedResult = "";
+      if (parsedSteps.length === 1 && parsedSteps[0] && typeof parsedSteps[0] !== "string") {
+        // safeSteps() returns unknown[]; cast like the multi-step branch below (step: any).
+        const step: any = parsedSteps[0];
+        action = step.action || step.step || step.description || "";
+        expectedResult = step.expectedResult || step.expected || "";
+      } else {
+        steps = parsedSteps
+          .map((step: any) => {
+            if (typeof step === "string") return step;
+            return [step.action || step.step || step.description, step.expectedResult || step.expected]
+              .filter(Boolean)
+              .join(" => ");
+          })
+          .filter(Boolean)
+          .join(" | ");
+      }
       const exportRow: Body = {
         externalId: row.external_id || "",
         title: row.title || "",
         description: row.description || "",
         preconditions: row.preconditions || "",
         steps,
+        action,
+        expectedResult,
         testData: row.test_data || "",
         priority: row.priority || "",
         severity: row.severity || "",
@@ -3379,10 +4085,19 @@ export class LegacyService implements OnModuleInit {
         body.postconditions || "",
         JSON.stringify(body.steps || body.stepsJson || []),
         body.testData || "",
-        body.priority || "P2",
+        // `priority`/`type`/`automationStatus` only fall back to their defaults when the caller
+        // never mentioned the field at all (import, Zyra and the MCP tool all either resolve a
+        // real value themselves or omit the key entirely, relying on this default). A caller that
+        // sends the key with an empty/falsy value — the Create Test Case form, whose Suite/Type/
+        // Priority/Automation Type start on an unselected placeholder — means it explicitly, and
+        // that must be honored rather than silently replaced with a value the user never chose.
+        // priority is NOT NULL (V2_test_cases_and_suites.sql), so "explicitly blank" is "" here,
+        // not null; type/automation_status are nullable and use null the same way severity/
+        // component already do below.
+        body.priority !== undefined ? body.priority || "" : "P2",
         body.severity || null,
-        body.type || "Functional",
-        body.automationStatus || "Not Automated",
+        body.type !== undefined ? body.type || null : "Functional",
+        body.automationStatus !== undefined ? body.automationStatus || null : "Not Automated",
         body.automationRepo || null,
         body.automationPath || null,
         body.automationTestName || null,
@@ -3398,7 +4113,7 @@ export class LegacyService implements OnModuleInit {
         body.attachments || null,
         uid,
         this.normalizeEstimatedDuration(body.estimatedDuration),
-        JSON.stringify(body.sourceRefs || [])
+        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs))
       ]
     );
     const row = res.rows[0];
@@ -3410,6 +4125,13 @@ export class LegacyService implements OnModuleInit {
     await this.customFields.setValuesForTestCase(uid, projectId, row.id, body.customFieldValues || {}, client, "skip-if-disabled", {
       testCaseIsNew: true
     });
+    await this.customTags.setTagsForTestCase(projectId, row.id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
+    // NOT enqueued here: this method also runs nested inside zyraSave's shared transaction
+    // (via processZyraSaveEntriesSequential/Batched), where the embedding worker — a separate
+    // connection — could query for this row before that outer transaction commits and find
+    // nothing, mismarking it 'unsupported' (terminal, per rag-embedding.processor.ts's own
+    // comment on that status). Every caller of this method enqueues itself once its own
+    // outermost transaction has actually committed: insertTestCase below, and zyraSave.
     return row;
   }
 
@@ -3418,6 +4140,7 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, "testcase_created", "testcase", created.id, `${created.external_id} - ${created.title}`, { after: toCamel(created) });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
+    this.enqueueTestcaseEmbedding(projectId, created.id, "created");
     return toCamel(created);
   }
 
@@ -3599,7 +4322,7 @@ export class LegacyService implements OnModuleInit {
     if (body?.defaultSuiteId) {
       const candidate = String(body.defaultSuiteId);
       const owned = isUuid(candidate)
-        ? await this.db.query("SELECT 1 FROM suites WHERE id = $1 AND project_id = $2", [candidate, projectId])
+        ? await this.db.query("SELECT 1 FROM suites WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [candidate, projectId])
         : { rows: [] };
       if (!owned.rows[0]) throw new BadRequestException({ error: "defaultSuiteId is not a suite in this project" });
       defaultSuiteId = candidate;
@@ -3617,7 +4340,7 @@ export class LegacyService implements OnModuleInit {
     const titlesInFile = new Set<string>();
 
     const suiteRows = await this.db.query<{ id: string; parent_id: string | null; name: string }>(
-      "SELECT id, parent_id, name FROM suites WHERE project_id = $1",
+      "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND deleted_at IS NULL",
       [projectId]
     );
     const suiteIdByKey = new Map(suiteRows.rows.map((row) => [importSuiteKey(row.name, row.parent_id), row.id]));
@@ -3862,8 +4585,8 @@ export class LegacyService implements OnModuleInit {
     if (missingTop.size) {
       const rescan = await client.query<{ id: string; name: string }>(
         ctx.defaultSuiteId
-          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2"
-          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL",
+          ? "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id = $2 AND deleted_at IS NULL"
+          : "SELECT id, name FROM suites WHERE project_id = $1 AND parent_id IS NULL AND deleted_at IS NULL",
         ctx.defaultSuiteId ? [ctx.projectId, ctx.defaultSuiteId] : [ctx.projectId]
       );
       for (const row of rescan.rows) {
@@ -3897,7 +4620,7 @@ export class LegacyService implements OnModuleInit {
     if (missingChild.size) {
       const parentIds = Array.from(new Set(Array.from(missingChild.values(), (v) => v.parent_id)));
       const rescan = await client.query<{ id: string; parent_id: string; name: string }>(
-        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[])",
+        "SELECT id, parent_id, name FROM suites WHERE project_id = $1 AND parent_id = ANY($2::uuid[]) AND deleted_at IS NULL",
         [ctx.projectId, parentIds]
       );
       for (const row of rescan.rows) {
@@ -4106,6 +4829,19 @@ export class LegacyService implements OnModuleInit {
   // review-batch save run several updates atomically with each other (and with any creates in the
   // same batch) against one shared client, instead of one transaction per row.
   private async updateTestCaseWithClient(client: PoolClient, projectId: string, id: string, uid: string, body: Body) {
+    /*
+     * jiraIssueKey/jiraUrl and linearIssueKey/linearUrl were COALESCE-only, like every other field
+     * here — but unlike the rest, there was genuinely no way to ever clear them: `body.jiraIssueKey
+     * ?? null` collapses "omitted" and "explicitly null" onto the same bound parameter, so an
+     * explicit null was silently indistinguishable from not sending the field at all. No existing
+     * caller (REST PUT, Zyra's write paths, CSV import) ever sends an explicit null for these — they
+     * either send a real string or omit the key — so redefining explicit null/"" to mean "clear"
+     * changes behavior for no caller that exists today. Added for unlink_requirement_from_testcase
+     * (MCP), which needs to actually remove a requirement link, not just leave it alone. Same
+     * explicit-clear convention updateBug already uses for priority/assigneeId.
+     */
+    const clearsJira = body.jiraIssueKey === null || body.jiraIssueKey === "";
+    const clearsLinear = body.linearIssueKey === null || body.linearIssueKey === "";
     const res = await client.query(
       `UPDATE testcases SET
        suite_id=$2, title=COALESCE($3,title), description=COALESCE($4,description),
@@ -4115,8 +4851,11 @@ export class LegacyService implements OnModuleInit {
        automation_repo=COALESCE($13,automation_repo), automation_path=COALESCE($14,automation_path),
        automation_test_name=COALESCE($15,automation_test_name), automation_framework=COALESCE($16,automation_framework),
        automation_tags=COALESCE($17,automation_tags), owner_id=$18, component=COALESCE($19,component),
-       status=COALESCE($20,status), jira_issue_key=COALESCE($21,jira_issue_key), jira_url=COALESCE($22,jira_url),
-       linear_issue_key=COALESCE($23,linear_issue_key), linear_url=COALESCE($24,linear_url),
+       status=COALESCE($20,status),
+       jira_issue_key=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($21,jira_issue_key) END,
+       jira_url=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($22,jira_url) END,
+       linear_issue_key=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($23,linear_issue_key) END,
+       linear_url=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($24,linear_url) END,
        attachments=COALESCE($25,attachments), updated_by=$26,
        estimated_duration=COALESCE($27,estimated_duration),
        source_refs=COALESCE($28::jsonb,source_refs), updated_at=now()
@@ -4152,8 +4891,11 @@ export class LegacyService implements OnModuleInit {
         this.normalizeEstimatedDuration(body.estimatedDuration),
         // Every plain UI/API edit omits this, so COALESCE keeps whatever citations already existed
         // on the row — an update never silently clears them. Only a Zyra save that explicitly
-        // resolved new citations (zyraSaveAttempt) passes a real array here.
-        Array.isArray(body.sourceRefs) ? JSON.stringify(body.sourceRefs) : null
+        // resolved new citations (zyraSaveAttempt) passes a real array here. sanitizeSourceRefsInput
+        // both validates shape and caps length before it overwrites the column.
+        Array.isArray(body.sourceRefs) ? JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)) : null,
+        clearsJira,
+        clearsLinear
       ]
     );
     const row = res.rows[0];
@@ -4161,6 +4903,11 @@ export class LegacyService implements OnModuleInit {
     // enforcement re-checks against currently-active-required fields using existing
     // stored values — correct for "field made required after the fact".
     await this.customFields.setValuesForTestCase(uid, projectId, id, body.customFieldValues || {}, client, "skip-if-disabled");
+    if (body.customTagIds !== undefined) {
+      await this.customTags.setTagsForTestCase(projectId, id, Array.isArray(body.customTagIds) ? body.customTagIds : [], client);
+    }
+    // NOT enqueued here — same reasoning as insertTestCaseWithClient's comment (this method is
+    // also called nested inside zyraSave's shared transaction). Callers enqueue post-commit.
     return row;
   }
 
@@ -4178,6 +4925,10 @@ export class LegacyService implements OnModuleInit {
     });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);
+    // Same "outer transaction has actually committed" reasoning as insertTestCase — see
+    // insertTestCaseWithClient's comment. updateTestCaseWithClient is also called nested inside
+    // zyraSave's shared transaction, which enqueues for its own touched rows separately below.
+    if (after?.id) this.enqueueTestcaseEmbedding(projectId, after.id, "updated");
   }
 
   // No duplicate/clone endpoint existed before this feature. Added so "custom field
@@ -4231,6 +4982,7 @@ export class LegacyService implements OnModuleInit {
       );
       const row = res.rows[0];
       await this.customFields.copyValues(id, row.id, uid, client);
+      await this.customTags.copyTags(id, row.id, client);
       return row;
     });
 
@@ -4376,7 +5128,7 @@ export class LegacyService implements OnModuleInit {
   private async requirePlanAccess(userId: string | null | undefined, planId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(planId)) throw new NotFoundException({ error: "Plan not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM plans WHERE id = $1", [planId]);
+    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM plans WHERE id = $1 AND deleted_at IS NULL", [planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -4392,7 +5144,7 @@ export class LegacyService implements OnModuleInit {
   private async requirePlanItemAccess(userId: string | null | undefined, planId: string, itemId: string) {
     await this.requirePlanAccess(userId, planId);
     if (!isUuid(itemId)) throw new NotFoundException({ error: "Plan item not found" });
-    const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2", [itemId, planId]);
+    const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2 AND deleted_at IS NULL", [itemId, planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan item not found" });
   }
 
@@ -4480,6 +5232,7 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN (
          SELECT plan_id, COUNT(*)::int AS case_count
          FROM plan_items
+         WHERE deleted_at IS NULL
          GROUP BY plan_id
        ) pi ON pi.plan_id = p.id
        LEFT JOIN (
@@ -4491,12 +5244,12 @@ export class LegacyService implements OnModuleInit {
                 COUNT(e.id) FILTER (WHERE e.status = 'Skipped')::int AS skipped,
                 MAX(COALESCE(c.started_at, c.created_at)) AS last_run_at
          FROM cycles c
-         LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+         LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
          LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-         WHERE c.plan_id IS NOT NULL
+         WHERE c.plan_id IS NOT NULL AND c.deleted_at IS NULL
          GROUP BY c.plan_id
        ) runs ON runs.plan_id = p.id
-       WHERE p.project_id = $1
+       WHERE p.project_id = $1 AND p.deleted_at IS NULL
        ORDER BY p.created_at DESC`,
       [projectId]
     );
@@ -4532,8 +5285,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async deletePlan(userId: string | null | undefined, planId: string) {
+    const uid = this.requireUser(userId);
     await this.requirePlanAccess(userId, planId);
-    await this.db.query("DELETE FROM plans WHERE id = $1", [planId]);
+    await this.db.transaction(async (client) => {
+      await client.query("UPDATE plan_items SET deleted_at = now(), deleted_by = $2 WHERE plan_id = $1 AND deleted_at IS NULL", [planId, uid]);
+      await client.query("UPDATE plans SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [planId, uid]);
+    });
   }
 
   async planItems(userId: string | null | undefined, planId: string) {
@@ -4545,7 +5302,14 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT pi.*,
               t.external_id AS tc_external_id, t.title AS tc_title, t.priority AS tc_priority,
-              s.name AS suite_name,
+              -- A plan item's suite_id is a snapshot of what the plan targeted when it was built, not
+              -- a live reference (there is no equivalent of testcases.suite_id here that gets kept in
+              -- sync) — so unlike every live-listing site, this one deliberately does NOT filter out
+              -- a soft-deleted suite. It's the same "history, not current state" category audit_logs
+              -- already is: the name is preserved, with an explicit "(deleted)" marker rather than
+              -- silently going stale or blanking to null (Q10 in the Zyra context integrity progress
+              -- log's Phase 3/4 decisions).
+              (CASE WHEN s.id IS NOT NULL AND s.deleted_at IS NOT NULL THEN s.name || ' (deleted)' ELSE s.name END) AS suite_name,
               lastex.status AS last_status
        FROM plan_items pi
        LEFT JOIN testcases t ON t.id = pi.testcase_id
@@ -4559,7 +5323,7 @@ export class LegacyService implements OnModuleInit {
          ORDER BY e.executed_at DESC NULLS LAST, e.created_at DESC
          LIMIT 1
        ) lastex ON pi.testcase_id IS NOT NULL
-       WHERE pi.plan_id = $1
+       WHERE pi.plan_id = $1 AND pi.deleted_at IS NULL
        ORDER BY pi.position, pi.created_at`,
       [planId]
     );
@@ -4576,8 +5340,9 @@ export class LegacyService implements OnModuleInit {
   }
 
   async deletePlanItem(userId: string | null | undefined, planId: string, itemId: string) {
+    const uid = this.requireUser(userId);
     await this.requirePlanItemAccess(userId, planId, itemId);
-    await this.db.query("DELETE FROM plan_items WHERE id = $1", [itemId]);
+    await this.db.query("UPDATE plan_items SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [itemId, uid]);
   }
 
   async planRuns(userId: string | null | undefined, planId: string) {
@@ -4592,9 +5357,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.*,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.plan_id = $1
+       WHERE c.plan_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at DESC`,
       [planId]
@@ -4622,9 +5387,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT COUNT(DISTINCT c.id)::int AS run_count,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.plan_id = $1`,
+       WHERE c.plan_id = $1 AND c.deleted_at IS NULL`,
       [planId]
     );
     const row = res.rows[0] ?? {
@@ -4672,7 +5437,7 @@ export class LegacyService implements OnModuleInit {
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at DESC`,
       [projectId]
@@ -4731,7 +5496,14 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(cycleId)) throw new NotFoundException({ error: "Cycle not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM cycles WHERE id = $1", [cycleId]);
+    // deleted_at IS NULL: a soft-deleted run must behave like it no longer exists for every caller
+    // that resolves it through here — getCycle, updateCycle, deleteCycle, shareCycle, the
+    // cycle_items routes and executionsForUser all funnel through this one check (hard-delete
+    // remediation Phase 1, see progress log).
+    const res = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -4739,7 +5511,7 @@ export class LegacyService implements OnModuleInit {
 
   async getCycle(cycleId: string, userId?: string | null) {
     await this.requireCycleAccess(userId, cycleId);
-    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1", [cycleId]);
+    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1 AND deleted_at IS NULL", [cycleId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     return toCamel(res.rows[0]);
   }
@@ -4747,11 +5519,14 @@ export class LegacyService implements OnModuleInit {
   async shareCycle(cycleId: string, userId: string | null | undefined, body: Body) {
     await this.requireCycleAccess(userId, cycleId);
     const enabled = body.enabled !== false;
-    const existing = await this.db.query("SELECT id, share_token FROM cycles WHERE id = $1", [cycleId]);
+    const existing = await this.db.query(
+      "SELECT id, share_token FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!existing.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     const shareToken = existing.rows[0].share_token || randomBytes(24).toString("hex");
     const res = await this.db.query(
-      "UPDATE cycles SET share_enabled = $2, share_token = $3, updated_at = now() WHERE id = $1 RETURNING share_enabled, share_token",
+      "UPDATE cycles SET share_enabled = $2, share_token = $3, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING share_enabled, share_token",
       [cycleId, enabled, shareToken]
     );
     return {
@@ -4761,7 +5536,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async publicCycle(token: string) {
-    const res = await this.db.query("SELECT * FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    // deleted_at IS NULL: a soft-deleted run's public share link must go dead, not keep resolving
+    // to a "deleted" run forever (hard-delete remediation Phase 1).
+    const res = await this.db.query(
+      "SELECT * FROM cycles WHERE share_token = $1 AND share_enabled = true AND deleted_at IS NULL",
+      [token]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
     return toCamel(res.rows[0]);
   }
@@ -4779,15 +5559,22 @@ export class LegacyService implements OnModuleInit {
    * needs has to be added here on purpose, which is the point — the previous shape leaked by default.
    */
   async publicCycleExecutions(token: string) {
-    const run = await this.db.query("SELECT id FROM cycles WHERE share_token = $1 AND share_enabled = true", [token]);
+    // deleted_at IS NULL: same as publicCycle above — a soft-deleted run's share link must go dead.
+    const run = await this.db.query(
+      "SELECT id FROM cycles WHERE share_token = $1 AND share_enabled = true AND deleted_at IS NULL",
+      [token]
+    );
     if (!run.rows[0]) throw new NotFoundException({ error: "Shared run not found" });
     const res = await this.db.query(
       `SELECT e.id, e.status,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
-       WHERE ci.cycle_id = $1 AND e.deleted_at IS NULL ORDER BY ci.position, ci.created_at`,
+       WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
+       ORDER BY ci.position, ci.created_at`,
       [run.rows[0].id]
     );
     return res.rows.map(toCamel);
@@ -4839,9 +5626,40 @@ export class LegacyService implements OnModuleInit {
     );
   }
 
+  /**
+   * Soft-deletes the run and every cycle_item/execution in it, in one transaction.
+   *
+   * Used to be `DELETE FROM cycles WHERE id = $1`, which — combined with cycle_items.cycle_id and
+   * executions.cycle_item_id both being ON DELETE CASCADE (V3) — silently hard-deleted every
+   * execution in the run, bypassing executions.deleted_at (V60) entirely. See hard-delete
+   * remediation Phase 1 in the progress log.
+   *
+   * No advisory lock, unlike deleteSuite: there is no recursive-subtree read whose snapshot can go
+   * stale mid-transaction. The three UPDATEs below all filter `deleted_at IS NULL`, so a concurrent
+   * duplicate call (or a caller racing requireCycleAccess's read) just updates zero rows once the
+   * first commits — the same idempotent-no-op shape today's DELETE of zero rows already had.
+   */
   async deleteCycle(cycleId: string, userId?: string | null) {
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
-    await this.db.query("DELETE FROM cycles WHERE id = $1", [cycleId]);
+    await this.db.transaction(async (client) => {
+      const cycleRes = await client.query(
+        "UPDATE cycles SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+        [cycleId, uid]
+      );
+      // Lost a race with a concurrent delete of the same cycle between requireCycleAccess's read
+      // and this transaction's write — nothing left to cascade the soft-delete into.
+      if (!cycleRes.rowCount) return;
+      const itemsRes = await client.query<{ id: string }>(
+        "UPDATE cycle_items SET deleted_at = now(), deleted_by = $2 WHERE cycle_id = $1 AND deleted_at IS NULL RETURNING id",
+        [cycleId, uid]
+      );
+      if (!itemsRes.rows.length) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemsRes.rows.map((row) => row.id), uid]
+      );
+    });
   }
 
   /**
@@ -4885,12 +5703,34 @@ export class LegacyService implements OnModuleInit {
          -- belonging to another workspace and have this run adopt it — copying that tenant's title
          -- into snapshot_title on the way. requireCycleAccess already resolved the run's project, so
          -- scope the join to it and let a foreign id fall out with the unknown ones.
-         INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
-         SELECT $1, t.id, t.title, base.pos + i.ord
+         -- cycle_items_cycle_id_testcase_id_key is now a partial unique index (WHERE deleted_at IS
+         -- NULL, hard-delete remediation Phase 1) — a conflict target against a partial index must
+         -- repeat its predicate, or Postgres can't infer which index this ON CONFLICT means. Only
+         -- an active row can conflict, so re-adding a test case that was previously soft-removed
+         -- from this run inserts a fresh row instead of silently no-op'ing forever.
+         -- The EXISTS guard mirrors attachCases' (automation.service.ts) exactly: requireCycleAccess
+         -- above already refused a soft-deleted run with 404, but that read and this write are two
+         -- separate statements, leaving a window where a concurrent delete could land in between.
+         -- This closes that window at the point of the actual write (hard-delete remediation Phase 2).
+         --
+         -- snapshot_title is joined by every other field the run's execution list, detail panel,
+         -- CSV export and reports display (V119) — captured here at add-time so a run's history
+         -- stops depending on the live testcase row surviving a later soft-delete.
+         INSERT INTO cycle_items (
+           cycle_id, testcase_id, snapshot_title, position,
+           snapshot_external_id, snapshot_priority, snapshot_type, snapshot_suite_id,
+           snapshot_description, snapshot_preconditions, snapshot_postconditions, snapshot_steps,
+           snapshot_test_data, snapshot_automation_status, snapshot_automation_tags
+         )
+         SELECT $1, t.id, t.title, base.pos + i.ord,
+                t.external_id, t.priority, t.type, t.suite_id,
+                t.description, t.preconditions, t.postconditions, t.steps,
+                t.test_data, t.automation_status, t.automation_tags
            FROM input i
            JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = $3
            CROSS JOIN base
-         ON CONFLICT (cycle_id, testcase_id) DO NOTHING
+          WHERE EXISTS (SELECT 1 FROM cycles c WHERE c.id = $1 AND c.deleted_at IS NULL)
+         ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING
          RETURNING id
        )
        INSERT INTO executions (cycle_item_id)
@@ -4903,15 +5743,44 @@ export class LegacyService implements OnModuleInit {
     return { requested, added: res.rows.length, skipped: requested - res.rows.length };
   }
 
+  /**
+   * Soft-deletes a single cycle_item and its execution, in one transaction.
+   *
+   * Used to be `DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = $2`, which cascaded
+   * into a hard `DELETE FROM executions` (V3's ON DELETE CASCADE), bypassing executions.deleted_at
+   * the same way deleteCycle did. See hard-delete remediation Phase 1 in the progress log.
+   */
   async removeCycleTestCase(cycleId: string, userId: string | null | undefined, testcaseId: string) {
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
     if (!isUuid(testcaseId)) throw new NotFoundException({ error: "Test case not found" });
-    await this.db.query("DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = $2", [cycleId, testcaseId]);
+    await this.db.transaction(async (client) => {
+      const itemRes = await client.query<{ id: string }>(
+        `UPDATE cycle_items SET deleted_at = now(), deleted_by = $3
+         WHERE cycle_id = $1 AND testcase_id = $2 AND deleted_at IS NULL
+         RETURNING id`,
+        [cycleId, testcaseId, uid]
+      );
+      // Already removed (or never in the run) — idempotent no-op, same as today's DELETE of 0 rows.
+      if (!itemRes.rows.length) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemRes.rows.map((row) => row.id), uid]
+      );
+    });
   }
 
+  /**
+   * Soft-deletes a bulk selection of cycle_items and their executions, in one transaction.
+   *
+   * Used to be a single `DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = ANY($2)`,
+   * cascading into a hard delete of every execution in the selection. See hard-delete remediation
+   * Phase 1 in the progress log.
+   */
   async removeCycleTestCases(cycleId: string, userId: string | null | undefined, body: Body) {
     // Guarded like every other /api/cycles/* route and like removeCycleTestCase above: without a
     // caller check a cycle id alone was enough to strip cases out of any workspace's run.
+    const uid = this.requireUser(userId);
     await this.requireCycleAccess(userId, cycleId);
     const raw = body.testcaseIds || (body.testcaseId ? [body.testcaseId] : []);
     const requested = normalizeJsonArray(raw).length;
@@ -4919,10 +5788,25 @@ export class LegacyService implements OnModuleInit {
     // request with a driver error, so one bad id in a large selection would 500 the entire remove.
     const ids = [...new Set(normalizeJsonArray(raw).map((id) => String(id)).filter((id) => isUuid(id)))];
     if (!ids.length) return { requested, removed: 0 };
+    let removed = 0;
     // Single statement for the whole selection — the alternative users were left with was one
-    // DELETE per case (or dropping the entire run). executions cascade off cycle_items.
-    const res = await this.db.query("DELETE FROM cycle_items WHERE cycle_id = $1 AND testcase_id = ANY($2::uuid[])", [cycleId, ids]);
-    return { requested, removed: res.rowCount ?? 0 };
+    // UPDATE per case (or dropping the entire run). executions are soft-deleted in a second
+    // statement scoped to exactly the cycle_items this one just touched.
+    await this.db.transaction(async (client) => {
+      const itemsRes = await client.query<{ id: string }>(
+        `UPDATE cycle_items SET deleted_at = now(), deleted_by = $3
+         WHERE cycle_id = $1 AND testcase_id = ANY($2::uuid[]) AND deleted_at IS NULL
+         RETURNING id`,
+        [cycleId, ids, uid]
+      );
+      removed = itemsRes.rows.length;
+      if (!removed) return;
+      await client.query(
+        "UPDATE executions SET deleted_at = now(), deleted_by = $2 WHERE cycle_item_id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [itemsRes.rows.map((row) => row.id), uid]
+      );
+    });
+    return { requested, removed };
   }
 
   /** The guarded entry point for GET /api/cycles/:cycleId/executions. */
@@ -4952,23 +5836,63 @@ export class LegacyService implements OnModuleInit {
      *
      * The CSV export (exportCycleExecutions -> this method) is unaffected: it names its nine
      * headers explicitly rather than iterating the row's keys.
+     *
+     * external_id/priority/type/suite_id/description/preconditions/postconditions/steps/test_data/
+     * automation_status/automation_tags all prefer cycle_items' own snapshot_* column (V119) over
+     * the live testcases join, the same way title already preferred snapshot_title — a run is a
+     * point-in-time record, so its display must not depend on (or drift with) the live test case
+     * surviving or being edited afterwards. `t.*` only still backs the COALESCE for a row that
+     * predates V119's backfill and was never re-saved.
      */
     const res = await this.db.query(
       `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
               e.duration_ms, e.retry_count, e.error_message, e.error_stack, e.reported_by,
               ci.id AS cycle_item_id, ci.testcase_id, ci.snapshot_title,
               COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS title,
-              t.external_id, t.priority, t.type, t.suite_id, t.description, t.preconditions, t.postconditions,
-              t.steps, t.test_data, t.automation_status, t.automation_tags,
+              COALESCE(ci.snapshot_external_id, t.external_id) AS external_id,
+              COALESCE(ci.snapshot_priority, t.priority) AS priority,
+              COALESCE(ci.snapshot_type, t.type) AS type,
+              COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
+              COALESCE(ci.snapshot_description, t.description) AS description,
+              COALESCE(ci.snapshot_preconditions, t.preconditions) AS preconditions,
+              COALESCE(ci.snapshot_postconditions, t.postconditions) AS postconditions,
+              COALESCE(ci.snapshot_steps, t.steps) AS steps,
+              COALESCE(ci.snapshot_test_data, t.test_data) AS test_data,
+              COALESCE(ci.snapshot_automation_status, t.automation_status) AS automation_status,
+              COALESCE(ci.snapshot_automation_tags, t.automation_tags) AS automation_tags,
               COALESCE(ev.count, 0)::int AS evidence_count
        FROM cycle_items ci JOIN executions e ON e.cycle_item_id = ci.id
        LEFT JOIN testcases t ON t.id = ci.testcase_id AND t.deleted_at IS NULL
        LEFT JOIN LATERAL (
          SELECT COUNT(*) AS count FROM attachments a
-          WHERE a.entity_type = 'execution' AND a.entity_id = e.id
+          WHERE a.entity_type = 'execution' AND a.entity_id = e.id AND a.deleted_at IS NULL
        ) ev ON true
-       WHERE ci.cycle_id = $1 AND e.deleted_at IS NULL ORDER BY ci.position, ci.created_at`,
+       WHERE ci.cycle_id = $1 AND ci.deleted_at IS NULL AND e.deleted_at IS NULL
+       ORDER BY ci.position, ci.created_at`,
       [cycleId]
+    );
+    return res.rows.map(toCamel);
+  }
+
+  /**
+   * Every execution of one test case, across every cycle (test run) in the project — the opposite
+   * cut from executions(cycleId) above, which is one cycle's every execution. No REST or frontend
+   * caller needs this yet (the testcase detail route is a redirect stub with no run-history view),
+   * so this exists for the MCP get_testcase_executions tool. Kept project-scoped via a trusted
+   * caller-supplied projectId, same as listBugs/listCycles/createSuite — the MCP tool has already
+   * confirmed the test case belongs to this project before calling in.
+   */
+  async testcaseExecutions(projectId: string, testcaseId: string) {
+    const res = await this.db.query(
+      `SELECT e.id, e.status, e.assignee_id, e.actual_result, e.executed_at, e.defect_key, e.defect_url,
+              e.duration_ms, e.retry_count, e.error_message, e.reported_by,
+              ci.id AS cycle_item_id, ci.testcase_id, c.id AS cycle_id, c.name AS cycle_name, c.status AS cycle_status
+       FROM cycle_items ci
+       JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
+       JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+       WHERE ci.testcase_id = $1 AND ci.deleted_at IS NULL AND c.project_id = $2
+       ORDER BY e.executed_at DESC NULLS LAST, e.id`,
+      [testcaseId, projectId]
     );
     return res.rows.map(toCamel);
   }
@@ -5064,7 +5988,15 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     // Same answer for a malformed id as for one that doesn't exist — see requireProjectAccess.
     if (!isUuid(cycleId)) throw new NotFoundException({ error: "Cycle not found" });
-    const cycle = await this.db.query<{ project_id: string }>("SELECT project_id FROM cycles WHERE id = $1", [cycleId]);
+    // deleted_at IS NULL: this lookup used to be the one place a soft-deleted run's data was still
+    // reachable — requireCycleAccess (used by every other /api/cycles/* route) already refuses a
+    // deleted run with 404, but this export path resolved its own project_id without that filter,
+    // so a still-authorized project member could keep downloading a "deleted" run's CSV forever
+    // (hard-delete remediation Phase 2 — an access-gate bypass, not merely a stale count).
+    const cycle = await this.db.query<{ project_id: string }>(
+      "SELECT project_id FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!cycle.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
     await this.requireProjectAccess(uid, cycle.rows[0].project_id);
     return this.executions(cycleId);
@@ -5165,7 +6097,10 @@ export class LegacyService implements OnModuleInit {
         clearsAssignee
       ]
     );
-    await this.logProjectActivity(
+    // Fire-and-forget: logProjectActivity already swallows its own errors (see its `.catch` below)
+    // and its result is never read, so there is no correctness reason for the status-update response
+    // — which a user is watching live in the execution table's dropdown — to wait on this write.
+    void this.logProjectActivity(
       before.rows[0].project_id,
       uid,
       "execution_updated",
@@ -5191,13 +6126,17 @@ export class LegacyService implements OnModuleInit {
           'testcaseTitle', t.title,
           'testcaseExternalId', t.external_id,
           'cycleId', bl.cycle_id,
-          'cycleName', c.name,
+          -- Historical display, not a live reference: a bug's link record documents which run it
+          -- was found in, and that run can be soft-deleted long after the bug is filed. Marked
+          -- rather than dropped, matching the suites precedent exactly (Q10 in the Zyra context
+          -- integrity progress log's Phase 3/4 decisions; hard-delete remediation Phase 2).
+          'cycleName', (CASE WHEN c.id IS NOT NULL AND c.deleted_at IS NOT NULL THEN c.name || ' (deleted)' ELSE c.name END),
           'executionId', bl.execution_id
         ) ORDER BY bl.created_at) AS items
         FROM bug_links bl
         LEFT JOIN testcases t ON t.id = bl.testcase_id
         LEFT JOIN cycles c ON c.id = bl.cycle_id
-        WHERE bl.bug_id = b.id
+        WHERE bl.bug_id = b.id AND bl.deleted_at IS NULL
       ) links ON true
       LEFT JOIN LATERAL (
         SELECT json_agg(json_build_object(
@@ -5208,9 +6147,9 @@ export class LegacyService implements OnModuleInit {
           'createdAt', a.created_at
         ) ORDER BY a.created_at) AS items
         FROM attachments a
-        WHERE a.entity_type = 'bug' AND a.entity_id = b.id
+        WHERE a.entity_type = 'bug' AND a.entity_id = b.id AND a.deleted_at IS NULL
       ) atts ON true
-      WHERE ${where}`;
+      WHERE b.deleted_at IS NULL AND (${where})`;
   }
 
   /**
@@ -5223,7 +6162,7 @@ export class LegacyService implements OnModuleInit {
   private async requireBugAccess(userId: string | null | undefined, bugId: string): Promise<string> {
     const uid = this.requireUser(userId);
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
+    const res = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1 AND deleted_at IS NULL", [bugId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
     await this.requireProjectAccess(uid, res.rows[0].project_id);
     return res.rows[0].project_id;
@@ -5241,17 +6180,27 @@ export class LegacyService implements OnModuleInit {
       values.push(query.status);
       filters.push(`b.status = $${values.length}`);
     }
-    if (query.cycleId) {
-      values.push(query.cycleId);
-      filters.push(`b.cycle_id = $${values.length}`);
-    }
-    // Sourced from bug_links, not the denormalized b.testcase_id column — updateBug's link edits
-    // only ever touch bug_links (see replaceBugLinks), so b.testcase_id can go stale once a bug's
-    // links are edited after creation. bug_links is what the Bugs page itself already trusts to
-    // show a bug's linked test case(s), so filtering the other direction has to agree with it.
-    if (query.testcaseId) {
+    // cycleId and testcaseId are both sourced from bug_links, not the denormalized b.cycle_id/
+    // b.testcase_id columns — updateBug's and addBugLink's link edits only ever touch bug_links
+    // (see replaceBugLinks), so those columns are just the values from whenever the bug was first
+    // created and go stale the moment a link is added, changed, or the bug is linked to a further
+    // test case in a different run. Concretely: "Link existing bug" onto a test case in a cycle
+    // other than the bug's original one never updates b.cycle_id, so a b.cycle_id = $N filter alone
+    // silently excludes a bug that a real bug_links row says belongs to this cycle — which is what
+    // made a just-linked bug fail to reappear in the Test Case Detail panel. When both are given
+    // they must be satisfied by the SAME link row (this execution's actual bug), not by two
+    // different links on the same bug that happen to each match one side.
+    if (query.testcaseId && query.cycleId) {
+      values.push(query.testcaseId, query.cycleId);
+      filters.push(
+        `EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length - 1} AND bl.cycle_id = $${values.length} AND bl.deleted_at IS NULL)`
+      );
+    } else if (query.testcaseId) {
       values.push(query.testcaseId);
-      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length})`);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.testcase_id = $${values.length} AND bl.deleted_at IS NULL)`);
+    } else if (query.cycleId) {
+      values.push(query.cycleId);
+      filters.push(`EXISTS (SELECT 1 FROM bug_links bl WHERE bl.bug_id = b.id AND bl.cycle_id = $${values.length} AND bl.deleted_at IS NULL)`);
     }
     // "unassigned" is a real, filterable state — not just the absence of a query param — so it gets
     // its own value rather than trying to express IS NULL through an empty/omitted assigneeId.
@@ -5342,7 +6291,7 @@ export class LegacyService implements OnModuleInit {
     };
     const [validTestcases, validCycles, validExecutions] = await Promise.all([
       resolved("SELECT id FROM testcases WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL", testcaseIds),
-      resolved("SELECT id FROM cycles WHERE id = ANY($1::uuid[]) AND project_id = $2", cycleIds),
+      resolved("SELECT id FROM cycles WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL", cycleIds),
       resolved(
         `SELECT e.id FROM executions e
            JOIN cycle_items ci ON ci.id = e.cycle_item_id
@@ -5363,13 +6312,50 @@ export class LegacyService implements OnModuleInit {
       .filter((link) => link.testcaseId || link.cycleId || link.executionId);
   }
 
-  private async replaceBugLinks(client: PoolClient, bugId: string, links: Body[]) {
-    await client.query("DELETE FROM bug_links WHERE bug_id = $1", [bugId]);
+  // A blind delete-all-then-reinsert (the pre-Phase-7 shape) can no longer be a real DELETE, and
+  // doing it as soft-delete-all-then-reinsert-everything would needlessly churn every unchanged
+  // link's id/created_at on every bug edit. Diffs instead: only rows genuinely absent from the new
+  // set are soft-deleted, only genuinely new (testcaseId, cycleId) pairs are inserted, and a pair
+  // that's already live and unchanged is left completely alone.
+  // Diff key/existence checks are done in JS with IS NOT DISTINCT FROM semantics deliberately, not
+  // by trusting ON CONFLICT alone: the partial unique index treats two NULL cycle_id rows as
+  // non-duplicates (ordinary SQL NULL-distinctness), so a bug linked only to a test case (no run)
+  // would otherwise pass every existing-row check as "new," insert a second identical row on this
+  // save, a third on the next, forever. Explicitly checking "does a live row already match this
+  // exact pair" before ever reaching INSERT closes that regardless of nullability, and as a
+  // byproduct also updates a link whose executionId changed in place instead of silently keeping
+  // the stale one (ON CONFLICT DO NOTHING would have swallowed that update for a non-null pair).
+  private async replaceBugLinks(client: PoolClient, bugId: string, uid: string | null, links: Body[]) {
+    const desired = new Map<string, Body>();
     for (const link of links) {
+      desired.set(`${link.testcaseId || ""}|${link.cycleId || ""}`, link);
+    }
+    const existing = await client.query<{ id: string; testcase_id: string | null; cycle_id: string | null; execution_id: string | null }>(
+      "SELECT id, testcase_id, cycle_id, execution_id FROM bug_links WHERE bug_id = $1 AND deleted_at IS NULL",
+      [bugId]
+    );
+    const existingByKey = new Map(existing.rows.map((row) => [`${row.testcase_id || ""}|${row.cycle_id || ""}`, row]));
+
+    const staleIds = existing.rows
+      .filter((row) => !desired.has(`${row.testcase_id || ""}|${row.cycle_id || ""}`))
+      .map((row) => row.id);
+    if (staleIds.length) {
+      await client.query("UPDATE bug_links SET deleted_at = now(), deleted_by = $2 WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL", [staleIds, uid]);
+    }
+
+    for (const [key, link] of desired) {
+      const match = existingByKey.get(key);
+      const executionId = link.executionId || null;
+      if (match) {
+        if (executionId !== match.execution_id) {
+          await client.query("UPDATE bug_links SET execution_id = $2 WHERE id = $1", [match.id, executionId]);
+        }
+        continue;
+      }
       await client.query(
         `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (bug_id, testcase_id, cycle_id) DO NOTHING`,
-        [bugId, link.testcaseId || null, link.cycleId || null, link.executionId || null]
+         ON CONFLICT (bug_id, testcase_id, cycle_id) WHERE deleted_at IS NULL DO NOTHING`,
+        [bugId, link.testcaseId || null, link.cycleId || null, executionId]
       );
     }
   }
@@ -5423,6 +6409,12 @@ export class LegacyService implements OnModuleInit {
   }
 
   async createBug(projectId: string, userId: string | null | undefined, body: Body) {
+    // Deliberately not this.requireUser(userId) — the MCP create_bug tool can call this with a null
+    // userId (an API-token caller with no owning user) and must keep working, same as before this
+    // link-diffing existed. uid is only ever consumed by replaceBugLinks' UPDATE ... deleted_by
+    // branch, which cannot run here (a brand-new bug has no existing links to soft-delete), so
+    // passing null through when there is no authenticated user costs nothing.
+    const uid = userId || null;
     // A link is required whenever the project actually has test cases/runs to link to — enforced
     // client-side (the UI only lets the field be empty when there's nothing to pick). An empty
     // array is accepted here so reporting a bug is never blocked in a project with no test runs yet.
@@ -5469,7 +6461,7 @@ export class LegacyService implements OnModuleInit {
             ]
           );
           const id = res.rows[0].id;
-          await this.replaceBugLinks(client, id, links);
+          await this.replaceBugLinks(client, id, uid, links);
           return id;
         });
         break;
@@ -5506,6 +6498,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   async updateBug(userId: string | null | undefined, bugId: string, body: Body) {
+    const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
     // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
@@ -5550,7 +6543,7 @@ export class LegacyService implements OnModuleInit {
     if (Array.isArray(body.links)) {
       const owner = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
       const sanitized = await this.sanitizeBugLinks(String(owner.rows[0]?.project_id ?? ""), normalizeJsonArray(body.links));
-      await this.db.transaction((client) => this.replaceBugLinks(client, bugId, sanitized));
+      await this.db.transaction((client) => this.replaceBugLinks(client, bugId, uid, sanitized));
     }
     return this.getBug(bugId);
   }
@@ -5558,11 +6551,29 @@ export class LegacyService implements OnModuleInit {
   async addBugLink(userId: string | null | undefined, bugId: string, body: Body) {
     await this.requireBugAccess(userId, bugId);
     if (!body.testcaseId && !body.cycleId) throw new BadRequestException({ error: "testcaseId or cycleId is required." });
-    await this.db.query(
-      `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (bug_id, testcase_id, cycle_id) DO NOTHING`,
-      [bugId, body.testcaseId || null, body.cycleId || null, body.executionId || null]
+    const testcaseId = body.testcaseId || null;
+    const cycleId = body.cycleId || null;
+    const executionId = body.executionId || null;
+    // IS NOT DISTINCT FROM, not ON CONFLICT alone: the partial unique index treats two NULL
+    // cycle_id rows as non-duplicates, so a bug already linked to this test case with no run would
+    // otherwise pass as "new" and insert a second identical row — same root cause as
+    // replaceBugLinks' own comment above.
+    const existing = await this.db.query<{ id: string; execution_id: string | null }>(
+      `SELECT id, execution_id FROM bug_links WHERE bug_id = $1 AND deleted_at IS NULL
+       AND testcase_id IS NOT DISTINCT FROM $2 AND cycle_id IS NOT DISTINCT FROM $3`,
+      [bugId, testcaseId, cycleId]
     );
+    if (existing.rows[0]) {
+      if (executionId !== existing.rows[0].execution_id) {
+        await this.db.query("UPDATE bug_links SET execution_id = $2 WHERE id = $1", [existing.rows[0].id, executionId]);
+      }
+    } else {
+      await this.db.query(
+        `INSERT INTO bug_links (bug_id, testcase_id, cycle_id, execution_id) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (bug_id, testcase_id, cycle_id) WHERE deleted_at IS NULL DO NOTHING`,
+        [bugId, testcaseId, cycleId, executionId]
+      );
+    }
     // requireBugAccess already resolved this bug's project; re-read it rather than trusting the
     // caller's body, which never carries a project id.
     const owner = await this.db.query<{ project_id: string }>("SELECT project_id FROM bugs WHERE id = $1", [bugId]);
@@ -5572,14 +6583,19 @@ export class LegacyService implements OnModuleInit {
   }
 
   async removeBugLink(userId: string | null | undefined, bugId: string, linkId: string) {
+    const uid = this.requireUser(userId);
     await this.requireBugAccess(userId, bugId);
-    await this.db.query("DELETE FROM bug_links WHERE id = $1 AND bug_id = $2", [linkId, bugId]);
+    await this.db.query(
+      "UPDATE bug_links SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND bug_id = $2 AND deleted_at IS NULL",
+      [linkId, bugId, uid]
+    );
     return this.getBug(bugId);
   }
 
   async deleteBug(userId: string | null | undefined, bugId: string) {
+    const uid = this.requireUser(userId);
     await this.requireBugAccess(userId, bugId);
-    await this.db.query("DELETE FROM bugs WHERE id = $1", [bugId]);
+    await this.db.query("UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [bugId, uid]);
   }
 
   // The client controls the uploaded filename completely, and it is only ever a display label —
@@ -5679,7 +6695,7 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     if (!files || files.length === 0) throw new BadRequestException({ error: "No files were uploaded" });
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2", [bugId, projectId]);
+    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
     LegacyService.assertValidEvidenceFiles(files);
     await this.planLimits.assertStorageAvailable(
@@ -5708,7 +6724,7 @@ export class LegacyService implements OnModuleInit {
   private async bugAttachment(attachmentId: string, scopeProjectId?: string): Promise<Body> {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
-      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug'
+      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug' AND deleted_at IS NULL
        AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
       [attachmentId, scopeProjectId ?? null]
     );
@@ -5731,13 +6747,15 @@ export class LegacyService implements OnModuleInit {
 
   async deleteBugAttachment(attachmentId: string, userId?: string | null) {
     // This route carries no project id, so the attachment's own project is what the caller is
-    // authorized against. It destroys the stored object as well as the row — an unauthorized
-    // caller here doesn't just read someone's evidence, they lose it for them.
+    // authorized against. It destroys the stored object — an unauthorized caller here doesn't just
+    // read someone's evidence, they lose it for them. The row itself is soft-deleted, not removed:
+    // metadata-only (who deleted what, when), since the object is already unrecoverable once
+    // storage.delete() below returns — see V115's header comment / Q-AT in the progress log.
     const uid = this.requireUser(userId);
     const file = await this.bugAttachment(attachmentId);
     await this.requireProjectAccess(uid, String(file.project_id));
     await this.storage.delete(file.storage_path);
-    await this.db.query("DELETE FROM attachments WHERE id = $1", [attachmentId]);
+    await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [attachmentId, uid]);
     return { ok: true };
   }
 
@@ -5828,7 +6846,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
       `SELECT * FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
       [attachmentId, executionId, execution.project_id]
     );
     const file = res.rows[0];
@@ -5886,7 +6904,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
       `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
       [attachmentId, executionId, execution.project_id]
     );
     const file = res.rows[0];
@@ -5914,7 +6932,7 @@ export class LegacyService implements OnModuleInit {
     const claims = verifyTraceLink(token);
     const res = await this.db.query(
       `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
-        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2`,
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND deleted_at IS NULL`,
       [claims.attachmentId, claims.executionId]
     );
     const file = res.rows[0];
@@ -5938,7 +6956,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT id, project_id, entity_type, entity_id, file_name, content_type, file_size, uploaded_by,
               evidence_kind, created_at
-       FROM attachments WHERE entity_type = 'execution' AND entity_id = $1 ORDER BY created_at`,
+       FROM attachments WHERE entity_type = 'execution' AND entity_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
       [executionId]
     );
     return { list: res.rows.map(toCamel), total: res.rowCount };
@@ -6002,23 +7020,29 @@ export class LegacyService implements OnModuleInit {
          e.assignee_id,
          ci.testcase_id,
          COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
-         COALESCE(t.priority, 'Unspecified') AS priority,
-         COALESCE(t.automation_tags, '') AS automation_tags,
-         t.suite_id,
+         COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
+         COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
          COALESCE(s.name, 'No Suite') AS suite_name,
          c.id AS run_id,
          COALESCE(c.name, 'Untitled test run') AS run_name,
          c.plan_id,
-         COALESCE(p.name, 'No Plan') AS plan_name,
-         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name
+         COALESCE(CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END, 'No Plan') AS plan_name,
+         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name,
+         COALESCE(tag_agg.tags, '[]'::json) AS custom_tags_json
        FROM cycles c
-       JOIN cycle_items ci ON ci.cycle_id = c.id
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id
+       JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
+       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
        LEFT JOIN plans p ON p.id = c.plan_id
        LEFT JOIN users u ON u.id = e.assignee_id
-       WHERE c.project_id = $1
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY ct.name) AS tags
+         FROM testcase_custom_tags tct
+         JOIN custom_tags ct ON ct.id = tct.tag_id
+         WHERE tct.testcase_id = t.id
+       ) tag_agg ON true
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        ORDER BY c.created_at DESC, ci.position, ci.created_at`,
       [projectId]
     );
@@ -6042,10 +7066,7 @@ export class LegacyService implements OnModuleInit {
       groups.set(groupId, row);
     };
     for (const row of res.rows) {
-      const tags = String(row.automation_tags || "")
-        .split(",")
-        .map((tag) => tag.trim())
-        .filter(Boolean);
+      const tcTags: { id: string; name: string }[] = Array.isArray(row.custom_tags_json) ? row.custom_tags_json : [];
       const matchesFilter = (() => {
         if (!filterValue || filterBy === "overall") return true;
         if (filterBy === "person") return String(row.assignee_id || "unassigned") === filterValue;
@@ -6053,7 +7074,7 @@ export class LegacyService implements OnModuleInit {
         if (filterBy === "run") return String(row.run_id) === filterValue;
         if (filterBy === "suite") return String(row.suite_id || "none") === filterValue;
         if (filterBy === "priority") return String(row.priority || "Unspecified") === filterValue;
-        if (filterBy === "tags") return tags.includes(filterValue);
+        if (filterBy === "tags") return tcTags.some((tag) => tag.id === filterValue);
         return true;
       })();
       if (!matchesFilter) continue;
@@ -6063,8 +7084,8 @@ export class LegacyService implements OnModuleInit {
       else if (filterBy === "suite") add(String(row.suite_id || "none"), String(row.suite_name || "No Suite"), status);
       else if (filterBy === "priority") add(String(row.priority || "Unspecified"), String(row.priority || "Unspecified"), status);
       else if (filterBy === "tags") {
-        const effectiveTags = tags.length ? tags : ["Untagged"];
-        for (const tag of effectiveTags) add(tag, tag, status);
+        const effectiveTags = tcTags.length ? tcTags : [{ id: "untagged", name: "Untagged" }];
+        for (const tag of effectiveTags) add(tag.id, tag.name, status);
       } else {
         add(String(row.run_id), String(row.run_name || "Untitled test run"), status);
       }
@@ -6096,11 +7117,11 @@ export class LegacyService implements OnModuleInit {
          b.status AS bug_status,
          b.external_url AS bug_url
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
-       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
-       LEFT JOIN cycles c ON c.id = ci.cycle_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
+       LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       LEFT JOIN bugs b ON b.execution_id = e.id
+       LEFT JOIN bugs b ON b.execution_id = e.id AND b.deleted_at IS NULL
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
        ORDER BY t.external_id, c.created_at DESC NULLS LAST`,
       [projectId]
@@ -6138,15 +7159,26 @@ export class LegacyService implements OnModuleInit {
       : organizationId
         ? ` WHERE project_id IN (${orgProjectsSubquery})`
         : "";
+    // cycles and plans have no "_active" view the way testcases/suites/executions do, so both
+    // counts need their own deleted_at filter bolted onto childWhere rather than getting one for
+    // free (hard-delete remediation Phases 2 and 4).
+    const cyclesWhere = childWhere ? `${childWhere} AND deleted_at IS NULL` : " WHERE deleted_at IS NULL";
+    const plansWhere = cyclesWhere;
     const values = projectId ? [projectId] : organizationId ? [organizationId, userId] : [];
     const [projects, testcases, suites, plans, cycles, statuses] = await Promise.all([
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM projects${projectsWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM testcases_active${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${childWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${childWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites_active${childWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${plansWhere}`, values),
+      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${cyclesWhere}`, values),
       this.db.query<{ status: string; count: string }>(
-        `SELECT e.status, COUNT(*) AS count FROM executions_active e JOIN cycle_items ci ON ci.id = e.cycle_item_id JOIN cycles c ON c.id = ci.cycle_id${
+        // ci/c both gain deleted_at IS NULL: executions_active already excludes soft-deleted
+        // executions, but a run or a removed cycle_item surviving underneath it (hard-delete
+        // remediation Phase 1/2) must not keep inflating this breakdown just because its execution
+        // row itself is still live.
+        `SELECT e.status, COUNT(*) AS count FROM executions_active e
+           JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+           JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL${
           projectId
             ? " WHERE c.project_id = $1"
             : organizationId
@@ -6181,7 +7213,7 @@ export class LegacyService implements OnModuleInit {
     const bySuiteQuery = () =>
       this.db.query<{ name: string; count: string }>(
         `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
-       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id
+       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        WHERE t.project_id = $1 GROUP BY s.name ORDER BY s.name`,
         [projectId]
       );
@@ -6256,9 +7288,9 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.id, c.name, c.created_at,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.created_at ASC`,
       [projectId]
@@ -6299,7 +7331,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
        LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.project_id = t.project_id
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
@@ -6337,12 +7369,12 @@ export class LegacyService implements OnModuleInit {
               COUNT(DISTINCT t.id)::int AS total_cases,
               COUNT(DISTINCT covered.testcase_id)::int AS covered_cases
        FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id
+       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN LATERAL (
          SELECT ci.testcase_id
          FROM cycle_items ci
-         JOIN executions e ON e.cycle_item_id = ci.id
-         WHERE ci.testcase_id = t.id AND e.status IS NOT NULL AND e.status <> 'Untested'
+         JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+         WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL AND e.status IS NOT NULL AND e.status <> 'Untested'
          LIMIT 1
        ) covered ON true
        WHERE t.project_id = $1 AND t.deleted_at IS NULL
@@ -6363,7 +7395,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT COUNT(*)::int AS count FROM (
          SELECT t.id
          FROM testcases t
-         LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
+         LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
          LEFT JOIN executions e ON e.cycle_item_id = ci.id
          WHERE t.project_id = $1 AND t.deleted_at IS NULL AND t.priority = 'P1'
          GROUP BY t.id
@@ -6384,7 +7416,7 @@ export class LegacyService implements OnModuleInit {
       run_name: string;
       run_created_at: string;
     }>(
-      `SELECT ci.testcase_id, COALESCE(t.external_id, '') AS external_id,
+      `SELECT ci.testcase_id, COALESCE(ci.snapshot_external_id, t.external_id, '') AS external_id,
               COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS title,
               COALESCE(s.name, 'Unassigned') AS suite_name,
               e.status, c.name AS run_name, c.created_at AS run_created_at
@@ -6392,8 +7424,9 @@ export class LegacyService implements OnModuleInit {
        JOIN executions e ON e.cycle_item_id = ci.id
        JOIN cycles c ON c.id = ci.cycle_id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = t.suite_id
-       WHERE c.project_id = $1 AND e.status IS NOT NULL AND e.status <> 'Untested'
+       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
+       WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
+         AND e.status IS NOT NULL AND e.status <> 'Untested'
        ORDER BY ci.testcase_id, c.created_at ASC`,
       [projectId]
     );
@@ -6500,7 +7533,7 @@ export class LegacyService implements OnModuleInit {
          FROM generate_series(date_trunc('week', now() - interval '6 weeks'), date_trunc('week', now()), interval '1 week') AS d
          LEFT JOIN (
            SELECT date_trunc('week', created_at) AS week, COUNT(*) AS cnt
-           FROM bugs WHERE project_id = $1
+           FROM bugs WHERE project_id = $1 AND deleted_at IS NULL
            GROUP BY 1
          ) b ON b.week = d
          ORDER BY d`,
@@ -6523,10 +7556,13 @@ export class LegacyService implements OnModuleInit {
       this.analytics(projectId),
       this.requirementsSummary(projectId, userId),
       this.db.query<{ severity: string; count: string }>(
-        `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND status IN ('Open', 'Reopened') GROUP BY severity`,
+        `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
         [projectId]
       ),
-      this.db.query<{ count: string }>(`SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress'`, [projectId]),
+      this.db.query<{ count: string }>(
+        `SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress' AND deleted_at IS NULL`,
+        [projectId]
+      ),
       this.db.query<{ count: string }>(
         `SELECT COUNT(*)::int AS count FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '7 days'`,
         [projectId]
@@ -6542,8 +7578,8 @@ export class LegacyService implements OnModuleInit {
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS passed_prior,
            COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '14 days' AND e.executed_at < now() - interval '7 days')::int AS settled_prior
          FROM executions e
-         JOIN cycle_items ci ON ci.id = e.cycle_item_id
-         JOIN cycles c ON c.id = ci.cycle_id
+         JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+         JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
          WHERE c.project_id = $1`,
         [projectId]
       )
@@ -6714,7 +7750,12 @@ export class LegacyService implements OnModuleInit {
           'created'::text AS action,
           'suite'::text AS entity_type,
           id::text AS entity_id,
-          name AS entity_name,
+          -- The feed calls itself a full audit log ("who did what and when") — unlike the live
+          -- listing sites, a suite's own history entries must survive it being (soft-)deleted, same
+          -- as any other audited event survives the row it describes. Marked rather than left plain,
+          -- so a reader can tell the suite is gone without the row vanishing outright (Q10 in the
+          -- Zyra context integrity progress log's Phase 3/4 decisions).
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END) AS entity_name,
           NULL::text AS diff,
           created_at
         FROM suites
@@ -6723,7 +7764,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('suite-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'suite'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'suite'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM suites
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6731,7 +7774,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           p.project_id, ('plan-created-' || p.id::text), p.owner_id, u.email, u.name,
           CASE WHEN p.owner_id IS NOT NULL THEN 'user' END,
-          'created'::text, 'plan'::text, p.id::text, p.name, NULL::text, p.created_at
+          'created'::text, 'plan'::text, p.id::text,
+          (CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END),
+          NULL::text, p.created_at
         FROM plans p
         LEFT JOIN users u ON u.id = p.owner_id
         WHERE ${projectScopeSql}
@@ -6739,7 +7784,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('plan-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'plan'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'plan'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM plans
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6747,7 +7794,12 @@ export class LegacyService implements OnModuleInit {
         SELECT
           c.project_id, ('cycle-created-' || c.id::text), c.owner_id, u.email, u.name,
           CASE WHEN c.owner_id IS NOT NULL THEN 'user' END,
-          'created'::text, 'cycle'::text, c.id::text, c.name, NULL::text, c.created_at
+          -- Same "history, not current state" treatment as suites above: a run's creation event must
+          -- survive it being soft-deleted, marked rather than left plain or dropped (hard-delete
+          -- remediation Phase 2).
+          'created'::text, 'cycle'::text, c.id::text,
+          (CASE WHEN c.deleted_at IS NOT NULL THEN c.name || ' (deleted)' ELSE c.name END),
+          NULL::text, c.created_at
         FROM cycles c
         LEFT JOIN users u ON u.id = c.owner_id
         WHERE ${projectScopeSql}
@@ -6755,7 +7807,9 @@ export class LegacyService implements OnModuleInit {
         UNION ALL
         SELECT
           project_id, ('cycle-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
-          'updated'::text, 'cycle'::text, id::text, name, NULL::text, updated_at
+          'updated'::text, 'cycle'::text, id::text,
+          (CASE WHEN deleted_at IS NOT NULL THEN name || ' (deleted)' ELSE name END),
+          NULL::text, updated_at
         FROM cycles
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
 
@@ -6763,7 +7817,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           b.project_id, ('bug-created-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
-          'created'::text, 'bug'::text, b.id::text, b.title, NULL::text, b.created_at
+          'created'::text, 'bug'::text, b.id::text,
+          (CASE WHEN b.deleted_at IS NOT NULL THEN b.title || ' (deleted)' ELSE b.title END),
+          NULL::text, b.created_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql}
@@ -6772,7 +7828,9 @@ export class LegacyService implements OnModuleInit {
         SELECT
           b.project_id, ('bug-updated-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
-          'updated'::text, 'bug'::text, b.id::text, b.title, NULL::text, b.updated_at
+          'updated'::text, 'bug'::text, b.id::text,
+          (CASE WHEN b.deleted_at IS NOT NULL THEN b.title || ' (deleted)' ELSE b.title END),
+          NULL::text, b.updated_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second'
@@ -9029,6 +10087,9 @@ export class LegacyService implements OnModuleInit {
            auth_method = 'oauth',
            personal_token_identifier = NULL,
            disconnected_at = NULL,
+           auth_error = NULL,
+           auth_error_at = NULL,
+           auth_error_refresh_fingerprint = NULL,
            updated_at = now()
          RETURNING id, external_id, site_url`,
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
@@ -9067,6 +10128,9 @@ export class LegacyService implements OnModuleInit {
          auth_method = 'oauth',
          personal_token_identifier = NULL,
          disconnected_at = NULL,
+         auth_error = NULL,
+         auth_error_at = NULL,
+         auth_error_refresh_fingerprint = NULL,
          updated_at = now()
        RETURNING id, site_url`,
       [workspace.id, String(org.id || ""), `https://linear.app/${org.urlKey}`, encryptSecret(accessToken), encryptSecret(String(token.refresh_token || "")), expiresAt, userId || null]
@@ -9086,19 +10150,17 @@ export class LegacyService implements OnModuleInit {
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
     const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
-    const uid = userId || null;
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
     // every ticket ever synced through this connection. Instead: mark it disconnected and clear the
     // live credentials (so it can't be used even if some path forgets to check disconnected_at),
     // and disable every mapping it fed — CASCADE no longer does that for us since nothing is
     // deleted. Every ticket/mapping row stays exactly as it was, current or historical.
-    let filesToPurge: { storage_key: string }[] = [];
-    const affectedFolders = await this.db.transaction(async (client) => {
+    await this.db.transaction(async (client) => {
       // Serializes concurrent disconnect calls for this workspace+provider (a double-click that
       // outraces the frontend's disable-while-pending state, or two tabs/admins). The loser waits
-      // here, then its own SELECT below finds nothing left to clean up and this whole call becomes
-      // a harmless no-op — no special-cased "already disconnected" branch needed.
+      // here, then its own UPDATEs below become a harmless no-op — no special-cased "already
+      // disconnected" branch needed.
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspace.id}:${p}`]);
 
       await client.query(
@@ -9112,52 +10174,14 @@ export class LegacyService implements OnModuleInit {
          )`,
         [workspace.id, p]
       );
-
-      // The Knowledge Base folder ensureProviderFolder created is never touched by the updates
-      // above. Find it in every project under this workspace — not only the currently-mapped one,
-      // since a project's mapping can already be disabled (superseded by a different remote
-      // project/team) while its folder and documents still exist — and soft-delete it the same way
-      // a user deleting it by hand would, tagged so it can never be restored back into view.
-      // idx_knowledge_folders_source_provider (V103) backs this lookup.
-      const folders = await client.query<{ id: string; project_id: string; name: string }>(
-        "SELECT id, project_id, name FROM knowledge_folders WHERE organization_id = $1 AND source_provider = $2 AND is_deleted = false",
-        [workspace.id, p]
-      );
-      if (!folders.rows.length) return [];
-
-      const folderIds = folders.rows.map((f) => f.id);
-      // One set-based pass across every affected folder (however many projects they span) instead
-      // of a round-trip per folder — keeps the advisory lock and the connection/mapping row locks
-      // above held for a bounded, small number of queries regardless of workspace size.
-      const purge = await client.query<{ storage_key: string }>(
-        `${LegacyService.DESCENDANTS_CTE} SELECT storage_key FROM knowledge_files WHERE folder_id IN (SELECT id FROM descendants) AND is_deleted = false`,
-        [folderIds]
-      );
-      filesToPurge = purge.rows;
-      await this.cascadeSoftDeleteFolderTree(client, folderIds, uid, "integration_disconnect");
-
-      return folders.rows;
     });
 
-    // Storage cleanup and activity logging run after the DB commit, same convention as
-    // deleteKnowledgeFolder: the soft-delete is the source of truth, so a transient S3 failure or a
-    // logging hiccup here must never surface as a failed (or half-applied) disconnect.
-    await Promise.all(
-      filesToPurge.map((row) =>
-        this.storage
-          .delete(row.storage_key)
-          .catch((error) => this.logger.warn(`Failed to delete storage object ${row.storage_key}: ${error}`))
-      )
-    );
-    // logProjectActivity swallows its own errors and none of these depend on each other, so they
-    // run concurrently — the KB cleanup above has already committed by this point either way.
-    await Promise.all(
-      affectedFolders.map((folder) =>
-        this.logProjectActivity(folder.project_id, uid, "deleted", "knowledge_folder", folder.id, folder.name, {
-          reason: "integration_disconnected"
-        })
-      )
-    );
+    // The Knowledge Base folder ensureProviderFolder created, and every document mirrored into it,
+    // is deliberately left untouched: disconnecting is a credentials/mapping state flip, not a
+    // delete, so the imported knowledge stays visible in the Knowledge Base whether or not the
+    // integration is currently connected. Reconnecting and re-syncing finds this same folder again
+    // (ensureProviderFolder looks it up by source_provider, not by name) rather than creating a
+    // second one.
 
     return { disconnected: true };
   }
@@ -9180,6 +10204,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, p),
       id: connection.id,
       siteUrl: connection.site_url,
       tokenExpiresAt: connection.token_expires_at,
@@ -9198,6 +10223,11 @@ export class LegacyService implements OnModuleInit {
    * readable, the project-to-remote-project mapping was rewritable, and jiraComment/linearComment
    * posted to the customer's real Jira or Linear using the workspace's stored OAuth token.
    */
+  // Name collision to watch for: this answers "is Jira connected for this project" (connection
+  // status), never "what state is issue X in" (issue status) — for the latter, read `status` off
+  // jiraSnapshot()'s return value instead. The audit that flagged this confusion is
+  // ZYRA_BINDING_REPORT.md §2 ("jiraStatus() is connection status, not issue status — easy to
+  // confuse by name").
   async jiraStatus(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     return this.jiraStatusForProject(projectId);
@@ -9233,6 +10263,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, "jira"),
       id: connection.id,
       cloudId: connection.cloud_id,
       siteUrl: connection.site_url,
@@ -9420,22 +10451,44 @@ export class LegacyService implements OnModuleInit {
     const issueKey = String(body.issueKey || body.jiraIssueKey || "").trim();
     const comment = String(body.comment || body.body || "").trim();
     if (!issueKey || !comment) throw new BadRequestException({ error: "Jira issue key and comment are required." });
+    await this.jiraPostAdfComment(connection, issueKey, {
+      type: "doc",
+      version: 1,
+      content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }]
+    });
+    return { ok: true };
+  }
+
+  // For internal callers that have already authorized (the ticket auto-comment after a Zyra save):
+  // resolves the connection itself, refreshing the token if due. Returns Jira's comment id.
+  //
+  // A 401 on the post itself (a token revoked before its expiry, or replaced by another deployment
+  // sharing the row) gets exactly one forced renewal and one more attempt — never a loop, and never a
+  // second send of the same refused token.
+  private async jiraPostComment(projectId: string, issueKey: string, adf: Body): Promise<string | null> {
+    const connection = await this.getJiraConnection(projectId, true);
+    if (!connection) throw new NotFoundException({ error: "Jira is not connected." });
+    try {
+      return await this.jiraPostAdfComment(connection, issueKey, adf);
+    } catch (err) {
+      if ((err as { providerStatus?: number })?.providerStatus !== 401) throw err;
+      const renewed = await this.getJiraConnection(projectId, true, { rejectedAccessToken: String(connection.access_token) });
+      if (!renewed || String(renewed.access_token) === String(connection.access_token)) throw err;
+      return this.jiraPostAdfComment(renewed, issueKey, adf);
+    }
+  }
+
+  private async jiraPostAdfComment(connection: Body, issueKey: string, adf: Body): Promise<string | null> {
     const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
-    await this.jiraFetch(
+    const created = await this.jiraFetch<Body>(
       `${baseUrl}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
       {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          body: {
-            type: "doc",
-            version: 1,
-            content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }]
-          }
-        })
+        body: JSON.stringify({ body: adf })
       }
     );
-    return { ok: true };
+    return created?.id ? String(created.id) : null;
   }
 
   // Live search against Jira (not the jira_tickets sync cache) — used by the bug-linking picker,
@@ -9476,14 +10529,29 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
-  private async getJiraConnection(projectId: string, refresh: boolean): Promise<Body | null> {
+  private async getJiraConnection(projectId: string, refresh: boolean, options: IntegrationConnectionLoadOptions = {}): Promise<Body | null> {
     const organizationId = await this.projectOrganizationId(projectId);
-    const connection = await this.getIntegrationConnection(organizationId, "jira", refresh);
+    const connection = await this.getIntegrationConnection(organizationId, "jira", refresh, options);
     if (!connection) return null;
     return { ...connection, cloud_id: connection.external_id };
   }
 
-  private async getIntegrationConnection(organizationId: string, provider: IntegrationProvider, refresh: boolean): Promise<Body | null> {
+  // `options.rejectedAccessToken`: the caller just had this access token refused (401) even though
+  // token_expires_at said it was still valid — revoked early, or replaced by another deployment
+  // sharing this row. Renews regardless of the clock, unless the row already holds a different token
+  // by the time the lock is taken (someone else renewed it meanwhile), in which case that one is used.
+  //
+  // Throws a "needs to be reconnected" BadRequestException, WITHOUT contacting the provider, when the
+  // renewal can't possibly succeed: this refresh token was already refused (V125's marker), or — Jira
+  // — the token was issued to a different OAuth app than the one this deployment renews with. A
+  // refusal from the provider itself (401/403 on the token endpoint) is recorded the same way, so the
+  // same dead refresh token is never sent twice.
+  private async getIntegrationConnection(
+    organizationId: string,
+    provider: IntegrationProvider,
+    refresh: boolean,
+    options: IntegrationConnectionLoadOptions = {}
+  ): Promise<Body | null> {
     // disconnected_at IS NULL: a soft-disconnected row (integrationDisconnect) still exists so its
     // historical tickets/mappings stay intact, but must read as "not connected" everywhere.
     const res = await this.db.query(
@@ -9492,9 +10560,13 @@ export class LegacyService implements OnModuleInit {
     );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
+    const forced = Boolean(options.rejectedAccessToken);
     // Fast, lock-free path: this is what the overwhelming majority of calls hit, so it stays exactly
     // as cheap as it always was. Only a token actually due for refresh pays for the transaction below.
-    if (!refresh || this.isIntegrationTokenStillValid(connection) || !connection.refresh_token) return connection;
+    if (!refresh || !connection.refresh_token) return connection;
+    if (!forced && this.isIntegrationTokenStillValid(connection)) return connection;
+    const alreadyRefused = this.refusedRefreshReason(connection);
+    if (alreadyRefused) throw new BadRequestException({ error: alreadyRefused });
 
     // A connection is organization-scoped and can be mapped into several Tesbo projects, so two
     // interactive requests (or an interactive request racing the nightly sync worker's own
@@ -9504,7 +10576,10 @@ export class LegacyService implements OnModuleInit {
     // already-invalidated refresh token. SELECT ... FOR UPDATE serializes them: whichever request
     // gets here first does the one real refresh; the rest block on the row lock, then re-check the
     // now-current row and reuse what the first already wrote.
-    return this.db.transaction(async (client) => {
+    //
+    // A refusal is returned out of the transaction rather than thrown inside it: throwing would roll
+    // back, and the refusal marker has to be written afterwards (recordRefusedRefresh).
+    const outcome = await this.db.transaction(async (client): Promise<{ connection: Body | null } | { refused: string; row: Body }> => {
       const locked = await client.query(
         "SELECT * FROM integration_connections WHERE id = $1 AND disconnected_at IS NULL FOR UPDATE",
         [connection.id]
@@ -9512,52 +10587,158 @@ export class LegacyService implements OnModuleInit {
       const current = locked.rows[0] as Body | undefined;
       // Disconnected by a concurrent integrationDisconnect while this request was queued on the
       // lock — must not resurrect a connection the user just told us to drop.
-      if (!current) return null;
-      if (this.isIntegrationTokenStillValid(current) || !current.refresh_token) return current;
+      if (!current) return { connection: null };
+      const renewedMeanwhile = forced
+        ? String(current.access_token) !== String(options.rejectedAccessToken)
+        : this.isIntegrationTokenStillValid(current);
+      if (renewedMeanwhile || !current.refresh_token) return { connection: current };
+      const refusedNow = this.refusedRefreshReason(current);
+      if (refusedNow) return { refused: refusedNow, row: current };
 
       const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
       const providerLabel: "Jira" | "Linear" = provider === "jira" ? "Jira" : "Linear";
+      if (provider === "jira") {
+        const issuer = this.jiraTokenOAuthClientId(current);
+        if (issuer && issuer !== clientId) {
+          return {
+            refused:
+              "Jira needs to be reconnected from this Tesbo deployment: its authorization was granted to a different Atlassian OAuth app than the one this deployment uses, so this deployment can't renew it. Reconnect Jira in workspace settings (or run this deployment with the same Jira OAuth app as the one that connected it).",
+            row: current
+          };
+        }
+      }
       const refreshToken = decryptSecret(String(current.refresh_token || ""));
-      const token =
-        provider === "jira"
-          ? await this.providerTokenFetch<Body>(
-              "https://auth.atlassian.com/oauth/token",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken })
-              },
-              providerLabel
-            )
-          : await this.providerTokenFetch<Body>(
-              // Linear's OAuth token endpoint accepts grant_type=refresh_token the same way Jira's
-              // does — the same endpoint (and form-urlencoded shape) integrationCallback already
-              // uses for the initial authorization-code exchange. Added because Linear's own OAuth
-              // policy now issues short-lived (~24h) access tokens with a rotating refresh token,
-              // contradicting this method's former assumption that Linear tokens never expire.
-              "https://api.linear.app/oauth/token",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString()
-              },
-              providerLabel
-            );
+      let token: Body;
+      try {
+        token =
+          provider === "jira"
+            ? await this.providerTokenFetch<Body>(
+                "https://auth.atlassian.com/oauth/token",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken })
+                },
+                providerLabel
+              )
+            : await this.providerTokenFetch<Body>(
+                // Linear's OAuth token endpoint accepts grant_type=refresh_token the same way Jira's
+                // does — the same endpoint (and form-urlencoded shape) integrationCallback already
+                // uses for the initial authorization-code exchange. Added because Linear's own OAuth
+                // policy now issues short-lived (~24h) access tokens with a rotating refresh token,
+                // contradicting this method's former assumption that Linear tokens never expire.
+                "https://api.linear.app/oauth/token",
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString()
+                },
+                providerLabel
+              );
+      } catch (err) {
+        // 401/403 from the token endpoint is the provider's final word on this refresh token — record
+        // it. Anything else (network, 5xx) is transient and surfaces as-is, unrecorded.
+        const status = (err as { providerStatus?: number })?.providerStatus;
+        if (status === 401 || status === 403) {
+          return {
+            refused:
+              status === 401
+                ? `${providerLabel} needs to be reconnected: ${providerLabel} rejected this deployment's OAuth app credentials when renewing the connection (401). Reconnect ${providerLabel} in workspace settings.`
+                : `${providerLabel} needs to be reconnected: ${providerLabel} refused to renew the connection (403) — its authorization was revoked or has already been used. Reconnect ${providerLabel} in workspace settings.`,
+            row: current
+          };
+        }
+        throw err;
+      }
       const accessToken = String(token.access_token || "");
       const rotatedRefreshToken = String(token.refresh_token || refreshToken);
       const expiresAt = new Date(Date.now() + Number(token.expires_in || 3600) * 1000).toISOString();
       const encryptedAccessToken = encryptSecret(accessToken);
       const encryptedRefreshToken = encryptSecret(rotatedRefreshToken);
       await client.query(
-        "UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now() WHERE id = $1",
+        `UPDATE integration_connections SET access_token = $2, refresh_token = $3, token_expires_at = $4, updated_at = now(),
+           auth_error = NULL, auth_error_at = NULL, auth_error_refresh_fingerprint = NULL
+         WHERE id = $1`,
         [current.id, encryptedAccessToken, encryptedRefreshToken, expiresAt]
       );
-      return { ...current, access_token: encryptedAccessToken, refresh_token: encryptedRefreshToken, token_expires_at: expiresAt };
+      return {
+        connection: {
+          ...current,
+          access_token: encryptedAccessToken,
+          refresh_token: encryptedRefreshToken,
+          token_expires_at: expiresAt,
+          auth_error: null,
+          auth_error_at: null,
+          auth_error_refresh_fingerprint: null
+        }
+      };
     });
+    if ("refused" in outcome) {
+      await this.recordRefusedRefresh(outcome.row, outcome.refused);
+      throw new BadRequestException({ error: outcome.refused });
+    }
+    return outcome.connection;
   }
 
   private isIntegrationTokenStillValid(connection: Body): boolean {
     return new Date(connection.token_expires_at).getTime() > Date.now() + 60_000;
+  }
+
+  // SHA-256 of the stored (encrypted) refresh_token value — see V125. Never the token itself.
+  private refreshTokenFingerprint(storedRefreshToken: unknown): string {
+    return createHash("sha256").update(String(storedRefreshToken || "")).digest("hex");
+  }
+
+  /** The recorded refusal, if it was for the refresh token this row holds right now (V125). */
+  private refusedRefreshReason(connection: Body): string | null {
+    if (!connection.auth_error || !connection.auth_error_refresh_fingerprint || !connection.refresh_token) return null;
+    return connection.auth_error_refresh_fingerprint === this.refreshTokenFingerprint(connection.refresh_token)
+      ? String(connection.auth_error)
+      : null;
+  }
+
+  // Keyed on the refresh token that was refused: if the row has moved on since (a reconnect, or
+  // another deployment renewed it), the WHERE matches nothing and the fresh token is left alone.
+  private async recordRefusedRefresh(connection: Body, reason: string): Promise<void> {
+    await this.db.query(
+      `UPDATE integration_connections SET auth_error = $2, auth_error_at = now(), auth_error_refresh_fingerprint = $3
+       WHERE id = $1 AND refresh_token = $4`,
+      [connection.id, reason, this.refreshTokenFingerprint(connection.refresh_token), connection.refresh_token]
+    ).catch((err) => this.logger.warn(`Failed to record refused token refresh for connection ${connection.id}: ${err instanceof Error ? err.message : err}`));
+  }
+
+  // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
+  // refresh token only renews through that same app, so a mismatch is knowable without asking
+  // Atlassian. Returns null when the token isn't a readable JWT — then the check is simply skipped.
+  private jiraTokenOAuthClientId(connection: Body): string | null {
+    try {
+      const payload = decryptSecret(String(connection.access_token || "")).split(".")[1];
+      if (!payload) return null;
+      const claims = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Body;
+      const clientId = claims.client_id ?? claims["https://atlassian.com/oauthClientId"];
+      return typeof clientId === "string" && clientId ? clientId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Whether this deployment can keep using the connection, without contacting the provider — what
+  // the status endpoints report alongside `connected`, so a connection that exists but can no longer
+  // be renewed doesn't read as healthy.
+  private integrationConnectionHealth(connection: Body, provider: IntegrationProvider): { needsReconnect: boolean; authError: string | null } {
+    const refused = this.refusedRefreshReason(connection);
+    if (refused) return { needsReconnect: true, authError: refused };
+    if (provider === "jira" && connection.refresh_token) {
+      const issuer = this.jiraTokenOAuthClientId(connection);
+      const ownClientId = this.envIntegrationConfig("jira")?.clientId;
+      if (issuer && ownClientId && issuer !== ownClientId) {
+        return {
+          needsReconnect: true,
+          authError: "This Jira connection was authorized through a different Atlassian OAuth app than the one this Tesbo deployment uses, so this deployment can't renew it once the current access token expires. Reconnect Jira in workspace settings."
+        };
+      }
+    }
+    return { needsReconnect: false, authError: null };
   }
 
   /** Shared fetch+status-check for a provider's OAuth token endpoint — generalizes jiraFetch's
@@ -9590,9 +10771,15 @@ export class LegacyService implements OnModuleInit {
   // Linear error body is not useful to a user and shouldn't be shown to one; every other status is
   // left with its existing (truncated) detail since those are less common and the detail still
   // helps in support/debugging.
+  //
+  // The status also rides along on the exception (non-enumerable, so never serialized into a
+  // response) for callers that need to tell the two apart — see integrationErrorReason, where a 403
+  // on a ticket comment means "no permission", which reconnecting would not fix.
   private cleanAuthErrorOrNull(provider: "Jira" | "Linear", status: number): BadRequestException | null {
     if (status !== 401 && status !== 403) return null;
-    return new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
+    const error = new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
+    Object.defineProperty(error, "providerStatus", { value: status, enumerable: false });
+    return error;
   }
 
   /** True for exactly the error cleanAuthErrorOrNull produces — used to tell "this connection's
@@ -9626,6 +10813,9 @@ export class LegacyService implements OnModuleInit {
   // Linear's API is GraphQL (not REST like Jira's) and its unit of work is a "team" rather than a
   // "project" — kept as separate methods/tables rather than forcing a shared shape onto both APIs.
 
+  // Same name collision as jiraStatus() above: this means "is Linear connected for this
+  // project", never "what state is issue X in" — for issue status, read `status` off
+  // linearSnapshot()'s return value instead.
   async linearStatus(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const organizationId = await this.projectOrganizationId(projectId);
@@ -9650,6 +10840,7 @@ export class LegacyService implements OnModuleInit {
     );
     return {
       connected: true,
+      ...this.integrationConnectionHealth(connection, "linear"),
       id: connection.id,
       siteUrl: connection.site_url,
       tokenExpiresAt: connection.token_expires_at,
@@ -9942,15 +11133,40 @@ export class LegacyService implements OnModuleInit {
     const issueKey = String(body.issueKey || body.linearIssueKey || "").trim();
     const comment = String(body.comment || body.body || "").trim();
     if (!issueKey || !comment) throw new BadRequestException({ error: "Linear issue key and comment are required." });
+    await this.linearCreateComment(connection, issueKey, comment);
+    return { ok: true };
+  }
+
+  // Internal counterpart of linearComment for callers that have already authorized — see
+  // jiraPostComment. `body` is markdown, which Linear renders. Returns Linear's comment id.
+  private async linearPostComment(projectId: string, issueKey: string, body: string): Promise<string | null> {
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "linear", true);
+    if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
+    // Same single forced renewal on a 401 as jiraPostComment.
+    let created: { success: boolean; id: string | null };
+    try {
+      created = await this.linearCreateComment(connection, issueKey, body);
+    } catch (err) {
+      if ((err as { providerStatus?: number })?.providerStatus !== 401) throw err;
+      const renewed = await this.getIntegrationConnection(organizationId, "linear", true, { rejectedAccessToken: String(connection.access_token) });
+      if (!renewed || String(renewed.access_token) === String(connection.access_token)) throw err;
+      created = await this.linearCreateComment(renewed, issueKey, body);
+    }
+    if (!created.success) throw new BadRequestException({ error: "Linear did not accept the comment." });
+    return created.id;
+  }
+
+  private async linearCreateComment(connection: Body, issueKey: string, body: string): Promise<{ success: boolean; id: string | null }> {
     const linearAuthHeader = this.linearAuthHeader(connection);
     const lookup = await this.linearGraphQL<Body>(linearAuthHeader, "query Issue($id: String!) { issue(id: $id) { id } }", { id: issueKey });
     const issueId = lookup?.issue?.id || issueKey;
-    await this.linearGraphQL(
+    const result = await this.linearGraphQL<Body>(
       linearAuthHeader,
-      "mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
-      { issueId, body: comment }
+      "mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+      { issueId, body }
     );
-    return { ok: true };
+    return { success: result?.commentCreate?.success === true, id: result?.commentCreate?.comment?.id ? String(result.commentCreate.comment.id) : null };
   }
 
   // Live search against Linear (not the linear_tickets sync cache) — same rationale as jiraSearchIssues.
@@ -10004,7 +11220,7 @@ export class LegacyService implements OnModuleInit {
    */
   async zyraAgent(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const [project, allocation, usage, tasks, chatActivity] = await Promise.all([
+    const [project, allocation, usage, tasks, chatActivity, approval] = await Promise.all([
       this.getProject(projectId),
       this.zyraAiAllocation(projectId),
       // Reads the zyra_token_usage ledger, not ai_generation_requests.token_total — that column
@@ -10036,9 +11252,32 @@ export class LegacyService implements OnModuleInit {
       this.db.query<{ last_used: string | null }>(
         `SELECT MAX(s.updated_at) AS last_used
            FROM zyra_chat_sessions s
-          WHERE s.project_id = $1
+          WHERE s.project_id = $1 AND s.deleted_at IS NULL
             AND EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id)`,
         [projectId]
+      ),
+      // All-time, unlike `tasks` above which is capped to the 50 most recently updated rows for
+      // display — a project with a long Zyra history must not have its approval rate silently
+      // reset once older runs scroll out of that window. task_status = 'done' (not merely
+      // <> 'failed') is deliberate: a 'in_review' task has drafts generated and saved_count still
+      // 0 simply because the user hasn't finished reviewing it yet, not because they rejected
+      // anything — counting it here would drag the rate down for work that is still pending, not
+      // decided. 'done' is only ever reached via aiSave or zyraCloseTask, an explicit save-or-close
+      // action, which is what "approved and saved" in the ticket actually means. Excludes 'failed'
+      // the same way, since a generation error leaves nothing to approve or reject.
+      //
+      // Deliberately NOT filtered on chat_session_id, unlike `tasks` above: a chat-staged batch is
+      // not display-list material (it has no task-board card to show), but it is saved through the
+      // exact same aiSave route as a task-board batch once approved from the Agent workspace, so it
+      // ends up with the same valid saved_count/generated_count pair at task_status = 'done'.
+      // Scoping this aggregate to task-board rows only left the tile permanently frozen for any
+      // workflow that approves test cases through chat instead — see "[Zyra] Approval Rate does not
+      // update after approving additional test cases".
+      this.db.query<{ saved: string; generated: string }>(
+        `SELECT COALESCE(SUM(saved_count), 0) AS saved, COALESCE(SUM(generated_count), 0) AS generated
+           FROM ai_generation_requests
+          WHERE project_id = $1 AND agent_name = ANY($2::text[]) AND task_status = 'done'`,
+        [projectId, ZYRA_AGENT_NAMES]
       )
     ]);
     const settings = this.parseProjectSettings(project.settings).zyraAgent || {};
@@ -10061,7 +11300,7 @@ export class LegacyService implements OnModuleInit {
       },
       settings: {
         testcaseCount: Number(settings.testcaseCount || 5),
-        testcaseRange: String(settings.testcaseRange || "1-10"),
+        testcaseRange: String(settings.testcaseRange || "30-50"),
         capabilities: this.normalizeZyraCapabilities(settings.capabilities)
       },
       aiKey: key
@@ -10080,7 +11319,11 @@ export class LegacyService implements OnModuleInit {
         total: Number(usage.rows[0]?.total || 0)
       },
       testcasesCreated: await this.zyraCreatedTestcaseCount(projectId),
-      tasks: tasks.rows.map((row) => this.formatAiTask(row))
+      approvalRate: (() => {
+        const generated = Number(approval.rows[0]?.generated || 0);
+        return generated > 0 ? Math.round((Number(approval.rows[0]?.saved || 0) / generated) * 100) : null;
+      })(),
+      tasks: await Promise.all(tasks.rows.map((row) => this.formatAiTask(row)))
     };
   }
 
@@ -10216,7 +11459,7 @@ export class LegacyService implements OnModuleInit {
       [taskId, projectId, ZYRA_AGENT_NAMES]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Zyra task not found" });
-    return this.formatAiTask(res.rows[0]);
+    return await this.formatAiTask(res.rows[0]);
   }
 
   async updateZyraSettings(projectId: string, userId: string | null | undefined, body: Body) {
@@ -10224,10 +11467,10 @@ export class LegacyService implements OnModuleInit {
     const project = await this.getProject(projectId);
     const settings = this.parseProjectSettings(project.settings);
     const current = (settings.zyraAgent || {}) as Body;
-    const validRanges = ["minimum", "1-10", "10-30", "all"];
+    const validRanges = ["1-10", "10-30", "30-50", "all"];
     const testcaseRange = validRanges.includes(String(body.testcaseRange))
       ? String(body.testcaseRange)
-      : String(current.testcaseRange || "1-10");
+      : String(current.testcaseRange || "30-50");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     // Capabilities: merge the incoming partial over current, then normalize to strict booleans.
     const capabilities = this.normalizeZyraCapabilities({
@@ -10254,7 +11497,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT s.id, s.project_id, s.user_id, s.title, s.created_at, s.updated_at, s.active_plan,
               EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id) AS has_messages
        FROM zyra_chat_sessions s
-       WHERE s.project_id = $1
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        ORDER BY s.updated_at DESC
        LIMIT 50`,
       [projectId]
@@ -10266,13 +11509,13 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
     const session = await this.db.query(
-      "SELECT id, project_id, user_id, title, created_at, updated_at, active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      "SELECT id, project_id, user_id, title, created_at, updated_at, active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
       [sessionId, projectId]
     );
     if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const messages = await this.db.query(
       `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
-              status, testcases, activity, created_at, review_request_id
+              status, testcases, activity, created_at, review_request_id, resume_attempt
        FROM zyra_chat_messages
        WHERE session_id = $1 AND project_id = $2
        ORDER BY created_at ASC`,
@@ -10312,7 +11555,7 @@ export class LegacyService implements OnModuleInit {
     if (!title) throw new BadRequestException({ error: "title is required" });
     const res = await this.db.query(
       `UPDATE zyra_chat_sessions SET title = $3, updated_at = now()
-       WHERE id = $1 AND project_id = $2
+       WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
        RETURNING id, project_id, user_id, title, created_at, updated_at`,
       [sessionId, projectId, title]
     );
@@ -10325,16 +11568,17 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     const existing = await this.db.query<{ active_plan: { status?: string } | null }>(
-      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
       [sessionId, projectId]
     );
     if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     if (existing.rows[0].active_plan?.status === "running") {
       throw new ConflictException({ error: "Stop the running generation plan before deleting this conversation." });
     }
-    // Messages (zyra_chat_messages.session_id) and any staged review batches
-    // (ai_generation_requests.chat_session_id) are both ON DELETE CASCADE — nothing else to clean up.
-    await this.db.query("DELETE FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    // Messages and any staged review batch are left physically in place, untouched — the FKs are
+    // ON DELETE RESTRICT now, not CASCADE (V116), and nothing reads them independently of this
+    // session's own now-gated existence, same reasoning as bug_links surviving a soft-deleted bug.
+    await this.db.query("UPDATE zyra_chat_sessions SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId, uid]);
     return { success: true };
   }
 
@@ -10344,7 +11588,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     const message = String(body.message || "").trim();
     if (!message) throw new BadRequestException({ error: "message is required" });
-    const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
 
     // Claim this session for the duration of one turn. Without this, two overlapping requests for
@@ -10428,7 +11672,11 @@ export class LegacyService implements OnModuleInit {
           const hint = pending.kind === "proposal"
             ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
             : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
+          // No onStage here (unlike the first call above): this is a full second pass through
+          // context-gathering/routing/generating on the SAME turnId — re-narrating it would render
+          // as confusing duplicate backlog rows for a rare retry path that already discloses itself
+          // in its own reply wording via the [confirmation-retry:...] marker.
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
           const fired = retried.operations.length > 0;
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
           decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
@@ -10439,7 +11687,7 @@ export class LegacyService implements OnModuleInit {
           if (fired) traceMessageId = `${userMessageId}:confirm-retry`;
         }
       }
-      onStage?.("staging");
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -10453,7 +11701,10 @@ export class LegacyService implements OnModuleInit {
       // `{testcaseIds: [], totalCount: 0}` on every create turn, silently erasing the
       // pendingReviewRequestIds recordZyraPendingReviewRequest had just set moments earlier in the
       // SAME call. See the changelog entry this was fixed alongside.
-      onStage?.("finalizing");
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
       const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId });
       const title = this.compactTitle(message);
       await this.db.query(
@@ -10486,8 +11737,13 @@ export class LegacyService implements OnModuleInit {
     // no live trace (tracing off, or a path that genuinely has none) simply skip recordReconciliation
     // below rather than needing a dummy value.
     traceMessageId?: string;
+    // How many consecutive resume attempts this message's chain has already burned through — 0 for
+    // every ordinary sendZyraChatMessage insert (a fresh turn), or priorAttempts+1/0 from
+    // processZyraChatResume depending on whether this attempt itself timed out again. See
+    // continueZyraChatMessage's ZYRA_RESUME_ATTEMPT_CAP check.
+    resumeAttempt?: number;
   }): Promise<Body> {
-    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId } = params;
+    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId, resumeAttempt } = params;
     const status = decision.timedOut ? "timed_out" : "completed";
     const resumeCheckpoint = decision.timedOut && decision.resumeCheckpoint ? JSON.stringify(decision.resumeCheckpoint) : null;
     const finalReply = this.finalizeZyraChatReply(decision, applied, testcases);
@@ -10518,9 +11774,9 @@ export class LegacyService implements OnModuleInit {
     }
     const assistant = await this.db.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb)
-       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id`,
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint, resume_attempt)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12)
+       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id, resume_attempt`,
       [
         sessionId,
         projectId,
@@ -10532,7 +11788,8 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(testcases),
         JSON.stringify(activity),
         applied.reviewRequestId || null,
-        resumeCheckpoint
+        resumeCheckpoint,
+        resumeAttempt || 0
       ]
     );
     const item = toCamel(assistant.rows[0]);
@@ -10541,10 +11798,21 @@ export class LegacyService implements OnModuleInit {
     return item;
   }
 
+  /** How many consecutive timeouts/failures a single resume chain tolerates before Continue stops
+   *  offering the identical-size retry and requires an explicit narrowed batch instead. */
+  private static readonly ZYRA_RESUME_ATTEMPT_CAP = 2;
+
   /*
    * Picks a timed-out turn back up. Basecamp-reported symptom: the provider stalled, the request
    * held open with no reply and no error, indistinguishable from "Zyra doesn't respond" (see
-   * ZYRA_ROUTER_TIMEOUT_MS/ZYRA_GENERATE_TIMEOUT_MS). This is what the chat's Continue button calls.
+   * ZYRA_ROUTER_TIMEOUT_MS/zyraGenerateTimeoutMs). This is what the chat's Continue button calls.
+   *
+   * Fire-and-forget, NOT synchronous: a resume can legitimately run for minutes (the same budget
+   * the original attempt had), and holding this HTTP request open for that long is exactly what
+   * made the "Resuming…" button look hung with zero feedback (Basecamp: misleading UX, not a
+   * bug in the generation itself). This claims the row, kicks off the real work in the
+   * background via processZyraChatResume, and returns immediately — the frontend polls
+   * getZyraChatSession (and optionally watches the turnId's SSE progress stream) for the result.
    *
    * Race safety: the UPDATE ... WHERE status = 'timed_out' below is the only thing that decides who
    * gets to resume a given checkpoint. It is a single atomic statement, so a double-click or two
@@ -10554,10 +11822,34 @@ export class LegacyService implements OnModuleInit {
    * the user sends a new message, so Continue can never resolve to a turn the conversation has since
    * moved past.
    */
-  async continueZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, messageId: string) {
+  async continueZyraChatMessage(
+    projectId: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void,
+    narrow?: boolean
+  ): Promise<{ session: Body; accepted: boolean }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId) || !isUuid(messageId)) throw new NotFoundException({ error: "Zyra chat message not found" });
+
+    const current = await this.db.query<{ resume_attempt: number }>(
+      "SELECT resume_attempt FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3",
+      [messageId, sessionId, projectId]
+    );
+    if (!current.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
+    const priorAttempts = Number(current.rows[0].resume_attempt) || 0;
+    // Defensive server-side re-check: the frontend hides the plain Continue button once the cap is
+    // hit, but a stale tab or a direct API call must not be able to bypass it — same "never trust
+    // the client alone" stance as the testcaseRange allow-list.
+    if (priorAttempts >= LegacyService.ZYRA_RESUME_ATTEMPT_CAP && !narrow) {
+      throw new BadRequestException({
+        error: "This turn has timed out repeatedly — try a smaller batch instead of the same size again.",
+        code: "zyra_resume_cap_exceeded"
+      });
+    }
 
     const claim = await this.db.query(
       `UPDATE zyra_chat_messages SET status = 'resuming'
@@ -10569,27 +11861,54 @@ export class LegacyService implements OnModuleInit {
       // Not (or no longer) claimable: already resumed by an earlier click, currently being resumed by
       // a concurrent one, expired by a newer message, or never existed. None of these are errors the
       // user caused right now — hand back the current session so the UI just reflects reality.
-      const existing = await this.db.query("SELECT 1 FROM zyra_chat_messages WHERE id = $1 AND session_id = $2 AND project_id = $3", [messageId, sessionId, projectId]);
-      if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat message not found" });
-      return { message: null, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: false };
     }
 
     const checkpoint = (claim.rows[0].resume_checkpoint || {}) as Partial<ZyraResumeCheckpoint>;
     const resumeMessage = String(checkpoint.message || "");
-    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     if (!resumeMessage) {
       // A checkpoint with no message text is unusable — revert rather than strand it in 'resuming'.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
       throw new BadRequestException({ error: "This turn has no context to resume from — send a new message instead." });
     }
+    if (narrow) {
+      checkpoint.routedCount = { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false };
+    }
 
+    void this.processZyraChatResume(projectId, uid, userId, sessionId, messageId, checkpoint, priorAttempts, onStage, onSettled)
+      .catch(() => undefined);
+    return { session: await this.zyraChatSession(projectId, userId, sessionId), accepted: true };
+  }
+
+  /**
+   * The actual resume work, detached from continueZyraChatMessage's HTTP request — see that
+   * method's doc comment for why. Identical logic to what continueZyraChatMessage used to run
+   * inline, plus threading onStage through for SSE narration and tracking resume_attempt so
+   * repeated failures can eventually be capped.
+   */
+  private async processZyraChatResume(
+    projectId: string,
+    uid: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    checkpoint: Partial<ZyraResumeCheckpoint>,
+    priorAttempts: number,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<void> {
+    const resumeMessage = String(checkpoint.message || "");
+    const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
     try {
       const decision = checkpoint.stage === "generate"
         ? await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, {
             routedSuite: checkpoint.routedSuite ?? null,
             routedCount: checkpoint.routedCount ?? {}
-          })
-        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId);
+          }, undefined, onStage)
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, onStage);
+      // Same two stages sendZyraChatMessage narrates, mirrored here so a resumed turn's backlog has
+      // the identical shape as a fresh one — see the "unify both flows" design.
+      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
@@ -10603,18 +11922,33 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
-      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId: checkpointUserMessageId });
+      onStage?.("finalizing", {
+        savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+        proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+      });
+      // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
+      // row; a genuine completion resets it to 0 — see insertZyraAssistantMessage's resumeAttempt
+      // param and the "cap is per-chain" note on continueZyraChatMessage.
+      const nextResumeAttempt = decision.timedOut ? priorAttempts + 1 : 0;
+      const item = await this.insertZyraAssistantMessage({
+        sessionId, projectId, uid, decision, applied, testcases, activity,
+        traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt
+      });
       // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
       // again. A fresh timeout (decision.timedOut again) instead lands on the NEW message's own
       // resume_checkpoint, so Continue keeps working across repeated timeouts.
       await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
+      onSettled?.({ ok: true, payload: { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) } });
     } catch (err) {
       // Anything that throws here (not a timeout — those are caught inside buildZyraChatDecision and
       // returned as another timed-out decision, not thrown) leaves this checkpoint resumable again
-      // rather than stranding it in 'resuming' forever.
-      await this.db.query("UPDATE zyra_chat_messages SET status = 'timed_out' WHERE id = $1 AND status = 'resuming'", [messageId]);
-      throw err;
+      // rather than stranding it in 'resuming' forever. Still counts toward the cap: the user's
+      // experience (clicked Continue, still failed, offered Continue again) is the same either way.
+      await this.db.query(
+        "UPDATE zyra_chat_messages SET status = 'timed_out', resume_attempt = $2 WHERE id = $1 AND status = 'resuming'",
+        [messageId, priorAttempts + 1]
+      );
+      onSettled?.({ ok: false, message: "This turn did not complete." });
     }
   }
 
@@ -10632,7 +11966,7 @@ export class LegacyService implements OnModuleInit {
     // pause, if any, is decided and applied under the row lock in zyraPlanTransition below, the
     // same guard continueZyraChatPlan's own batch commits use, so a Stop click landing the same
     // moment a batch is mid-commit can't race it (see zyraPlanTransition's own comment).
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     if (plan && plan.status !== "paused") {
@@ -10672,7 +12006,7 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     // Fast-path check only, same reasoning as stopZyraChatPlan — the actual reactivation is decided
     // and applied under the row lock below.
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     const remainingScenarios = normalizeJsonArray(plan?.remainingScenarios).map(String);
@@ -10715,6 +12049,44 @@ export class LegacyService implements OnModuleInit {
     return this.zyraChatSession(projectId, userId, sessionId);
   }
 
+  /**
+   * The accuracy-critical branch for the live progress backlog: a capability-gated step (knowledge
+   * base, bugs) must never report `items`/`count` when the capability is OFF, even though the raw
+   * data was already fetched — reporting what was gathered regardless of the gate is exactly the
+   * "claims don't match what was actually used" failure this feature exists to prevent. Pulled out
+   * as its own pure function specifically so this branch has direct unit coverage, independent of
+   * buildZyraChatDecision's much larger surface.
+   */
+  private static zyraGatedBacklogMeta(enabled: boolean, items: Array<Record<string, unknown>>, disabledReason: string): Record<string, unknown> {
+    return enabled ? { items, count: items.length } : { skipped: true, reason: disabledReason };
+  }
+
+  /** Counts by `type` for the live progress backlog's "staging" step — e.g. `{ create: 5 }`. */
+  private static tallyZyraOperationTypes(operations: Array<{ type: string }>): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const op of operations) counts[op.type] = (counts[op.type] || 0) + 1;
+    return counts;
+  }
+
+  /**
+   * The `knowledge` array can carry the same document twice — once from an explicit folder-name
+   * match, once from RAG/recency (`[...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge :
+   * knowledgeFallback)]`, no dedup) — so the live progress backlog's "Knowledge Base" step would
+   * otherwise list one document twice. Keyed on the citation's real source id when present
+   * (title alone is not guaranteed unique — two docs can share a name), falling back to title.
+   */
+  private static dedupeZyraKnowledgeItems<T extends { title: string; citation?: { sourceId?: string } }>(items: T[]): T[] {
+    const seen = new Set<string>();
+    const out: T[] = [];
+    for (const item of items) {
+      const key = item.citation?.sourceId || item.title;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
   // One AI call understands the request, then the system executes it. There is deliberately no
   // keyword router in front of the model: a regex table cannot tell "start generating" from
   // "generate", or know that "save it" means create-these when the cases were never written and
@@ -10744,7 +12116,15 @@ export class LegacyService implements OnModuleInit {
     // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
     onStage?: ZyraOnStage
   ): Promise<ZyraChatDecision> {
-    onStage?.("context");
+    // No onStage call here — the old single "context" announcement fired before any gathering even
+    // started, and provably said nothing about what was actually found. See the granular
+    // context:knowledge/jira/testcases/bugs calls below, once capabilities are known.
+    // Computed here, before context-gathering, purely so the retrieval-time query-embedding call
+    // below can attach to the SAME trace startZyraTurn opens later (once gathered context exists —
+    // see that call's own comment for why the turn itself still opens down there, unchanged). Same
+    // deterministic-seed value either way; only the moment it's computed moved earlier.
+    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    const zyraTurnTraceSeed = confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId;
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
     const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
@@ -10764,7 +12144,7 @@ export class LegacyService implements OnModuleInit {
       // retrieveWithDiagnostics rather than retrieveKnowledgeContext: the plain call returns [] for
       // every failure mode, so "no embeddings key" and "nothing relevant" are indistinguishable —
       // which is how the vector half of this search stayed off in production unnoticed.
-      this.ragRetrieval.retrieveWithDiagnostics(projectId, message),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, message, { traceSeed: zyraTurnTraceSeed }),
       // Direct folder-name lookup — recency/embeddings never match on a folder's name alone
       // (e.g. "knowledge base 'EAD-11215' folder"), only on document content.
       this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys),
@@ -10802,10 +12182,11 @@ export class LegacyService implements OnModuleInit {
     // The trace id is deterministic from messageId (see startZyraTurn), so the confirmation-retry
     // call in sendZyraChatMessage — which re-invokes this method with the SAME userMessageId — needs
     // a distinct suffix here, or its span would collide with the first call's span under the same
-    // fixed spanId rather than landing as its own observation.
-    const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
+    // fixed spanId rather than landing as its own observation. zyraTurnTraceSeed (computed above,
+    // before context-gathering) already carries that same suffix logic — reused here so the
+    // retrieval-time embedding call and this turn land under the identical trace id.
     const trace = await startZyraTurn({
-      messageId: confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId,
+      messageId: zyraTurnTraceSeed,
       sessionId,
       projectId,
       userId,
@@ -10853,11 +12234,28 @@ export class LegacyService implements OnModuleInit {
     const model = normalizeProviderModel(provider, key.default_model);
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
     const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
-    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "1-10");
+    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     const knowledgeForChat = capabilities.knowledgeBase ? knowledge : [];
     // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
     // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
     const bugsForChat = capabilities.knowledgeBase ? bugs : [];
+    // Progress narration for the live chat backlog — deliberately placed HERE, after `capabilities`
+    // is known, not up where gathering started (this used to be a single onStage?.("context") fired
+    // before any of knowledge/jira/testcases/bugs were even fetched). Reporting what was gathered
+    // before knowing whether the knowledge-base capability is even on would show a project with it
+    // OFF a backlog claiming Zyra read documents it never actually showed the model — the exact
+    // trust failure this feature exists to prevent. A capability that's off still gets its own
+    // step, marked `skipped`, rather than silently vanishing — showing Zyra correctly respected the
+    // setting is itself trust-building, not just showing what it read.
+    const knowledgeBacklogItems = LegacyService.dedupeZyraKnowledgeItems(knowledgeForChat);
+    onStage?.("context:knowledge", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, knowledgeBacklogItems.map((k) => ({ title: k.title })), "Knowledge base access is off for this project"
+    ));
+    onStage?.("context:jira", { items: mentionedJira.map((j) => ({ key: j.key, summary: j.summary })), count: mentionedJira.length });
+    onStage?.("context:testcases", { items: existingTestcases.map((tc) => ({ externalId: tc.externalId, title: tc.title })), count: existingTestcases.length });
+    onStage?.("context:bugs", LegacyService.zyraGatedBacklogMeta(
+      capabilities.knowledgeBase, bugsForChat.map((b) => ({ id: b.id, title: b.title })), "Knowledge base access is off for this project"
+    ));
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -10972,7 +12370,9 @@ export class LegacyService implements OnModuleInit {
       });
     }
 
-    onStage?.("routing");
+    onStage?.("routing", {
+      totalContextItems: knowledgeBacklogItems.length + mentionedJira.length + existingTestcases.length + bugsForChat.length
+    });
     try {
       const callRouter = () =>
         providerWire(provider) === "anthropic"
@@ -11150,7 +12550,7 @@ export class LegacyService implements OnModuleInit {
       conversation, routedSuite, routedCount, mentionedJira, capabilities, bugsForChat, onStage, trace,
       knowledgeConfidence
     } = params;
-    onStage?.("generating");
+    onStage?.("generating", { requestedCount: routedCount?.requestedCount ?? null, suiteName: routedSuite?.name ?? null });
     try {
       const decision = await this.generateZyraChatCreateDecision({
         projectId, userId, sessionId, provider, model, key, message,
@@ -11165,8 +12565,14 @@ export class LegacyService implements OnModuleInit {
       return this.applyStorageGateToGenerated(decision, capabilities);
     } catch (err) {
       if (this.isZyraTimeoutError(err)) {
-        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
-        return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount });
+        // Recomputed rather than threaded through the call above — chatTestcasePlan is pure and
+        // this must resolve to exactly the requestedCount generateZyraChatCreateDecision just used,
+        // so the reported budget matches the one the failed call actually ran under.
+        const generateTimeoutMs = LegacyService.zyraGenerateTimeoutMs(
+          this.chatTestcasePlan(message, projectTestcaseRange, routedCount).requestedCount
+        );
+        await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: generateTimeoutMs });
+        return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount }, generateTimeoutMs);
       }
       // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
       // after the router already succeeded.
@@ -11226,11 +12632,12 @@ export class LegacyService implements OnModuleInit {
         };
       } catch (retryErr) {
         if (this.isZyraTimeoutError(retryErr)) {
-          await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: LegacyService.ZYRA_GENERATE_TIMEOUT_MS });
+          const retryTimeoutMs = LegacyService.zyraGenerateTimeoutMs(LegacyService.ZYRA_RETRY_BATCH);
+          await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: retryTimeoutMs });
           return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, {
             routedSuite,
             routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false }
-          });
+          }, retryTimeoutMs);
         }
         const retryDetail = this.extractAiErrorMessage(retryErr);
         const retryFailedUsage = (retryErr as { zyraUsage?: { input?: number; output?: number; total?: number } } | null)?.zyraUsage;
@@ -11278,14 +12685,19 @@ export class LegacyService implements OnModuleInit {
     message: string,
     userMessageId: string | undefined,
     existingCount: number,
-    resumeState?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } }
+    resumeState?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } },
+    // The actual budget that call ran under — the generate stage's is now sized to how many
+    // testcases were requested (see zyraGenerateTimeoutMs), so it's no longer a single constant
+    // this function can look up by stage name alone. Defaults to the router's fixed budget, the
+    // only stage that still has just one.
+    timeoutMs: number = LegacyService.ZYRA_ROUTER_TIMEOUT_MS
   ): ZyraChatDecision {
     return {
       reply: [
         "⏱️ I didn't hear back from the AI provider in time — nothing was created or changed, and nothing was lost.",
         "Click **Continue** below and I'll pick up right where this left off, rather than starting over."
       ].join(" "),
-      reasoningSummary: `Provider call timed out at stage '${stage}' after ${stage === "router" ? LegacyService.ZYRA_ROUTER_TIMEOUT_MS : LegacyService.ZYRA_GENERATE_TIMEOUT_MS}ms. ${this.defaultReasoningSummary(existingCount)}`,
+      reasoningSummary: `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -11356,6 +12768,15 @@ export class LegacyService implements OnModuleInit {
     // counted exactly once — under whichever suite it actually landed in.
     const moveTargetIds = new Set<string>();
     const moveSuites = new Map<string, { suiteName: string; created: boolean }>();
+    // How many EXPLICITLY named move targets (by external id / internal id) across every
+    // move_to_suite op this turn failed to resolve to a real row — see resolveZyraMoveTargets'
+    // requestedCount (null for allExisting/fromLastPlan, which name no fixed count to fall short
+    // of). reconcileZyraReply folds this into its partial-application check: previously, a move
+    // naming 5 ids where only 2 resolved counted as "1 operation, 2 rows applied" — never fewer
+    // rows than operations, so the "N of M applied" warning could never fire for a partially-
+    // resolved move, and the model's (possibly inflated) claim passed through with only the quiet
+    // moveBreakdown footer underneath it to contradict it.
+    let unresolvedMoveTargetCount = 0;
     // A per-turn ceiling still bounds a model that emits junk, but it used to sit at 10 — below
     // what a single legitimate generation batch produces (chatTestcasePlan allows up to 25), so
     // asking for 15 test cases saved 10 of them and said 15. Truncation is now both rarer and
@@ -11370,6 +12791,17 @@ export class LegacyService implements OnModuleInit {
       });
     }
     for (const op of allowed.slice(0, LegacyService.ZYRA_CHAT_MAX_OPERATIONS)) {
+      // F5: this loop is not one transaction — each operation below issues its own independent
+      // DB statement(s) (see moveTargetIds' own comment above for why move counts are read back
+      // after the loop rather than accumulated live). Before this try/catch, an exception partway
+      // through operation N (a dropped connection, a real DB error) propagated out of this whole
+      // method uncaught: whatever operations 1..N-1 already committed stayed committed, but the
+      // turn produced no reply at all — ground truth was partial success, the user saw a hard
+      // failure. Caught per-operation so one bad operation is recorded and skipped, never silently
+      // discards what already succeeded, and the turn still ends with a real, reconciled reply.
+      // Deliberately NOT re-indented below (a ~200-line body) to keep this a minimal, reviewable
+      // diff rather than a whitespace-only rewrite of the whole loop.
+      try {
       if (op.type === "create" && op.draft) {
         // A create op may name a target suite directly (op.suiteId / op.suiteName) so a new
         // testcase can land in the right suite in the same step, mirroring how the Task-based
@@ -11407,7 +12839,13 @@ export class LegacyService implements OnModuleInit {
           jiraIssueKey: op.draft.jiraIssueKey || null,
           // Already resolved+verified by generateZyraChatTestcasesWithAi before this op ever
           // reached the router's operations array — never re-trusted from raw model output here.
-          sourceRefs: Array.isArray(op.draft.sourceRefs) ? op.draft.sourceRefs : []
+          sourceRefs: Array.isArray(op.draft.sourceRefs) ? op.draft.sourceRefs : [],
+          // Same reasoning as sourceRefs above: already validated by normalizeZyraTechniques at
+          // generation time. Without this, a chat-confirmed create silently lost its technique
+          // tags the moment it was staged — chatDraftRow's own allowlist was necessary but not
+          // sufficient, since this object (not the model's original draft) is what actually gets
+          // persisted into generated_payload and re-read later.
+          techniques: Array.isArray(op.draft.techniques) ? op.draft.techniques : []
         };
         // Staged only — no insert, no external-id allocation, nothing to collide on yet. The
         // draft is committed (and a real external id allocated) only by zyraSave, which is also
@@ -11499,7 +12937,25 @@ export class LegacyService implements OnModuleInit {
           }
         }
 
-        const targets = await this.resolveZyraMoveTargets(projectId, sessionId, op, suite.id, createdThisTurn);
+        const moveResolution = await this.resolveZyraMoveTargets(projectId, sessionId, op, suite.id, createdThisTurn);
+        const targets = moveResolution.targets;
+        if (moveResolution.requestedCount !== null && targets.length < moveResolution.requestedCount) {
+          const missing = moveResolution.requestedCount - targets.length;
+          unresolvedMoveTargetCount += missing;
+          // The full-failure case (targets.length === 0) is already covered by the "No testcases
+          // matched" entry below (matchedAnything stays false) — this is specifically the PARTIAL
+          // case, which had no activity entry and no reconcileZyraReply signal at all before this
+          // fix: some of the named ids resolved, so `!matchedAnything` never fires, and nothing
+          // else here ever compared "how many were named" against "how many resolved".
+          if (targets.length > 0) {
+            activity.push({
+              actor: "agent",
+              title: "Some testcases could not be moved",
+              detail: `${missing} of ${moveResolution.requestedCount} requested testcase(s) could not be found in this project and were skipped when moving into "${suite.name}".`,
+              createdAt: new Date().toISOString()
+            });
+          }
+        }
         if (targets.length) {
           matchedAnything = true;
           const movedIds = targets.map((target) => target.id);
@@ -11546,6 +13002,15 @@ export class LegacyService implements OnModuleInit {
           });
         }
       }
+      } catch (err) {
+        this.logger.error(`Zyra chat operation (${op.type}) failed for project ${projectId}: ${err instanceof Error ? err.message : err}`);
+        activity.push({
+          actor: "agent",
+          title: "An operation failed unexpectedly",
+          detail: `This ${op.type.replace(/_/g, " ")} operation hit an unexpected error and was skipped. Anything already applied earlier in this turn was kept.`,
+          createdAt: new Date().toISOString()
+        });
+      }
     }
     let reviewRequestId: string | null = null;
     if (proposals.length) {
@@ -11572,7 +13037,7 @@ export class LegacyService implements OnModuleInit {
       }
     }
     const moveBreakdown = await this.zyraMoveBreakdown(projectId, moveSuites, moveTargetIds);
-    return { testcases, activity, reviewRequestId, moveBreakdown };
+    return { testcases, activity, reviewRequestId, moveBreakdown, unresolvedMoveTargetCount };
   }
 
   // Ground truth for how many testcases actually ended up in each suite a move_to_suite operation
@@ -11606,7 +13071,7 @@ export class LegacyService implements OnModuleInit {
   private async resolveOrCreateSuiteByName(projectId: string, name: string): Promise<{ id: string; name: string; created: boolean }> {
     const trimmed = String(name || "").trim();
     const existing = await this.db.query(
-      "SELECT id, name FROM suites WHERE project_id = $1 AND lower(name) = lower($2) ORDER BY position, created_at LIMIT 1",
+      "SELECT id, name FROM suites WHERE project_id = $1 AND lower(name) = lower($2) AND deleted_at IS NULL ORDER BY position, created_at LIMIT 1",
       [projectId, trimmed]
     ).catch(() => ({ rows: [] as Body[] }));
     if (existing.rows[0]) return { id: String(existing.rows[0].id), name: String(existing.rows[0].name), created: false };
@@ -11616,7 +13081,7 @@ export class LegacyService implements OnModuleInit {
 
   private async getProjectSuite(projectId: string, suiteId: string): Promise<{ id: string; name: string } | null> {
     const res = await this.db.query(
-      "SELECT id, name FROM suites WHERE project_id = $1 AND id = $2::uuid LIMIT 1",
+      "SELECT id, name FROM suites WHERE project_id = $1 AND id = $2::uuid AND deleted_at IS NULL LIMIT 1",
       [projectId, suiteId]
     ).catch(() => ({ rows: [] as Body[] }));
     return res.rows[0] ? { id: String(res.rows[0].id), name: String(res.rows[0].name) } : null;
@@ -11724,34 +13189,42 @@ export class LegacyService implements OnModuleInit {
   // we just generate" is limited to the last 12 chat messages, which a multi-batch plan can
   // easily outgrow; it's a durable, exact record instead of something the model has to
   // re-enumerate from a possibly-truncated history. Never creates testcases.
-  private async resolveZyraMoveTargets(projectId: string, sessionId: string, op: ZyraChatDecision["operations"][number], targetSuiteId: string, createdThisTurn: string[] = []): Promise<Array<{ id: string }>> {
+  // requestedCount is null for allExisting/fromLastPlan — both name "however many currently
+  // qualify" rather than a fixed set of ids, so there is no expected count a resolved count could
+  // fall short of. Only the explicit external-id/internal-id branch names a concrete set, which is
+  // exactly the shape that can partially fail (some ids real, some not) — see F4's fix in
+  // applyZyraChatOperations' move_to_suite branch, which uses requestedCount to detect that.
+  private async resolveZyraMoveTargets(projectId: string, sessionId: string, op: ZyraChatDecision["operations"][number], targetSuiteId: string, createdThisTurn: string[] = []): Promise<{ targets: Array<{ id: string }>; requestedCount: number | null }> {
     if (op.allExisting) {
       const res = await this.db.query(
         "SELECT id FROM testcases WHERE project_id = $1 AND COALESCE(status,'') <> 'Archived' AND suite_id IS DISTINCT FROM $2::uuid AND deleted_at IS NULL",
         [projectId, targetSuiteId]
       ).catch(() => ({ rows: [] as Body[] }));
-      return res.rows.map((row) => ({ id: String(row.id) }));
+      return { targets: res.rows.map((row) => ({ id: String(row.id) })), requestedCount: null };
     }
     if (op.fromLastPlan) {
       const planRes = await this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] }));
       const priorIds = normalizeJsonArray((planRes.rows[0]?.last_completed_plan as Body | undefined)?.testcaseIds).map(String);
       const ids = Array.from(new Set([...createdThisTurn, ...priorIds]));
-      if (!ids.length) return [];
+      if (!ids.length) return { targets: [], requestedCount: null };
       const res = await this.db.query(
         "SELECT id FROM testcases WHERE project_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL",
         [projectId, ids]
       ).catch(() => ({ rows: [] as Body[] }));
-      return res.rows.map((row) => ({ id: String(row.id) }));
+      return { targets: res.rows.map((row) => ({ id: String(row.id) })), requestedCount: null };
     }
     const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const externalIds = [...(op.externalIds || []), ...(op.externalId ? [op.externalId] : [])].map((value) => String(value).trim()).filter(Boolean);
     const internalIds = [...(op.testcaseIds || []), ...(op.testcaseId ? [op.testcaseId] : [])].map((value) => String(value).trim()).filter((value) => uuidPattern.test(value));
-    if (!externalIds.length && !internalIds.length) return [];
+    if (!externalIds.length && !internalIds.length) return { targets: [], requestedCount: null };
+    // Unique named identifiers, not the raw (possibly duplicate-heavy) list — the model repeating
+    // "TC-5" twice in the same operation must not manufacture a false "1 of 2 could not be moved".
+    const requestedCount = new Set([...externalIds, ...internalIds]).size;
     const res = await this.db.query(
       "SELECT id FROM testcases WHERE project_id = $1 AND (external_id = ANY($2::text[]) OR id = ANY($3::uuid[])) AND deleted_at IS NULL",
       [projectId, externalIds, internalIds]
     ).catch(() => ({ rows: [] as Body[] }));
-    return res.rows.map((row) => ({ id: String(row.id) }));
+    return { targets: res.rows.map((row) => ({ id: String(row.id) })), requestedCount };
   }
 
   private async generateZyraChatTestcasesWithAi(params: {
@@ -11794,6 +13267,28 @@ export class LegacyService implements OnModuleInit {
     const matchedSuite = this.resolveRoutedZyraSuite(params.routedSuite, params.suites)
       || this.matchZyraSuiteByName(params.message, params.suites);
     const jiraFromKnowledge = this.countZyraJiraSourcedKnowledge(params.knowledge);
+    const generationInput: ZyraGenerationInput = {
+      story: params.message,
+      context: [
+        "Generated from Zyra chat after reading project knowledge, Jira ticket details, Zyra memory, and existing testcase coverage.",
+        // The generator never sees the chat itself, so a confirmation ("yes, do it", "save
+        // those") would otherwise arrive as a story with no content. The conversation is passed
+        // whole and the model decides whether the request refers back to it.
+        params.conversation
+          ? `Conversation so far. If the user's request is a confirmation of, or a reference to, test cases already described in this conversation, generate exactly those — same titles, same order, same coverage — filling in complete steps and expected results. Otherwise treat this only as background:\n${params.conversation}`
+          : ""
+      ].filter(Boolean).join("\n\n"),
+      acceptanceCriteria: "",
+      feedback: "",
+      knowledge: params.knowledge,
+      jira,
+      linear: [],
+      existingTestcases: params.existingTestcases,
+      bugs,
+      requestedCount: params.requestedCount,
+      testcaseRange: params.testcaseRange,
+      knowledgeConfidence: params.knowledgeConfidence
+    };
     const aiResult = await this.generateZyraWithProvider({
       provider: params.provider,
       model: params.model,
@@ -11802,28 +13297,7 @@ export class LegacyService implements OnModuleInit {
       authHeaderName: params.key.auth_header_name,
       authScheme: params.key.auth_scheme,
       projectId: params.projectId,
-      input: {
-        story: params.message,
-        context: [
-          "Generated from Zyra chat after reading project knowledge, Jira ticket details, Zyra memory, and existing testcase coverage.",
-          // The generator never sees the chat itself, so a confirmation ("yes, do it", "save
-          // those") would otherwise arrive as a story with no content. The conversation is passed
-          // whole and the model decides whether the request refers back to it.
-          params.conversation
-            ? `Conversation so far. If the user's request is a confirmation of, or a reference to, test cases already described in this conversation, generate exactly those — same titles, same order, same coverage — filling in complete steps and expected results. Otherwise treat this only as background:\n${params.conversation}`
-            : ""
-        ].filter(Boolean).join("\n\n"),
-        acceptanceCriteria: "",
-        feedback: "",
-        knowledge: params.knowledge,
-        jira,
-        linear: [],
-        existingTestcases: params.existingTestcases,
-        bugs,
-        requestedCount: params.requestedCount,
-        testcaseRange: params.testcaseRange,
-        knowledgeConfidence: params.knowledgeConfidence
-      }
+      input: generationInput
     });
     // This one function backs every chat-driven "create" call: the first turn, the first batch of
     // an exhaustive plan (startZyraChatPlan), and every subsequent background batch
@@ -11842,11 +13316,93 @@ export class LegacyService implements OnModuleInit {
         usage: aiResult.usage
       });
     }
+    // Semantic-similarity pass (ZYRA_TICKET_WORKFLOW.md §10's Update signal, wired into the create
+    // path only). Two tiers, checked once against each drafted candidate's own content (nothing to
+    // compare before drafting exists):
+    //   - TESTCASE_SIMILARITY_THRESHOLD (advisory): handed to the model as `feedback` on one
+    //     bounded follow-up call (reusing the already-wired ZyraGenerationInput.feedback channel —
+    //     see zyraDynamicTaskPrompt) so the drafting decision itself decides whether to keep,
+    //     revise, or fold each flagged draft. Never a backend reclassification by itself.
+    //   - TESTCASE_UPDATE_THRESHOLD (redirect): a materially higher bar. A draft that clears it
+    //     has its operation redirected from create to update below (see `updateTargetsByIndex`
+    //     used at the operations/testcases return value) — this IS a backend decision, not left to
+    //     the model, because the review panel needs a concrete target id before the user ever sees
+    //     the row. Still fully staged and user-confirmed like any other update — see
+    //     applyZyraChatOperations' "update" branch, untouched by this change.
+    // `matchesByIndex` stays aligned with the ORIGINAL (pre-revision) drafts array — the revision
+    // call below can change a draft's CONTENT but is asked to keep each flagged draft's scenario
+    // recognizable ("revise to differentiate" or "keep if distinct"), so the same positional index
+    // in the (possibly revised) finalResult.drafts below is treated as the same candidate for
+    // update-redirect purposes. Only fires when at least one draft actually matches at the
+    // advisory tier or above; adds zero extra cost/latency otherwise.
+    let finalResult = aiResult;
+    const { feedback: similarityFeedback, matchesByIndex } = await this.zyraSimilarityFeedbackForDrafts(params.projectId, aiResult.drafts, params.trace?.traceId);
+    if (similarityFeedback) {
+      try {
+        const revised = await this.generateZyraWithProvider({
+          provider: params.provider,
+          model: params.model,
+          apiKey: params.key.api_key,
+          baseUrl: params.key.base_url,
+          authHeaderName: params.key.auth_header_name,
+          authScheme: params.key.auth_scheme,
+          projectId: params.projectId,
+          input: { ...generationInput, feedback: similarityFeedback }
+        });
+        // Same "chat_generate" bucket as the first call — zyra_token_usage.source is a DB-level
+        // CHECK constraint (V87) and this revision pass doesn't warrant a schema change just to
+        // sub-categorize it; the Langfuse trace span below ("generate_similarity_revise") already
+        // gives per-call observability for anyone who needs to tell the two apart.
+        await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, revised.usage);
+        if (params.trace) {
+          recordGeneration(params.trace, {
+            name: "generate_similarity_revise",
+            provider: params.provider,
+            model: params.model,
+            input: { feedback: similarityFeedback, draftCount: aiResult.drafts.length },
+            output: { draftCount: revised.drafts.length, drafts: revised.drafts },
+            usage: revised.usage
+          });
+        }
+        finalResult = revised;
+      } catch (err) {
+        // Never blocks the turn — the original, unrevised drafts still ship. Same fail-open
+        // contract as RagRetrievalService itself.
+        this.logger.warn(`Similarity-revision generation call failed for project ${params.projectId}, keeping original drafts: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    // Index -> update target, for drafts whose match cleared the higher redirect bar. Bounds-checked
+    // against finalResult.drafts.length separately at the point of use, in case a revision call
+    // changed the draft count (the model isn't asked for a fixed 1:1 rewrite, just to address the
+    // feedback) — an index with no corresponding final draft simply never gets applied.
+    const updateTargetsByIndex = matchesByIndex.map((match) => (match && match.cosineSimilarity >= TESTCASE_UPDATE_THRESHOLD ? match : null));
+    // Existing severity/component for every redirect target, fetched once here rather than per
+    // draft. Deliberately a separate, additional lookup rather than folded into
+    // zyraSimilarityFeedbackForDrafts — that function's contract (return shape, its own spec) is
+    // unrelated to Zyra-generation's severity/component fix and is left untouched.
+    // Fail-soft and asymmetric on purpose: on any error the map stays empty, and an empty/missing
+    // entry below is treated as "already set" (never overwritten), never as "blank" (would fill
+    // in) — an unverifiable existing value must never be clobbered on a guess.
+    const updateTargetFieldsById = new Map<string, { severity: string | null; component: string | null }>();
+    const updateTargetIds = Array.from(
+      new Set(updateTargetsByIndex.filter((target): target is { testcaseId: string; cosineSimilarity: number } => Boolean(target)).map((target) => target.testcaseId))
+    );
+    if (updateTargetIds.length) {
+      try {
+        const existingRows = await this.db.query<{ id: string; severity: string | null; component: string | null }>(
+          "SELECT id, severity, component FROM testcases WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+          [updateTargetIds]
+        );
+        for (const row of existingRows.rows) updateTargetFieldsById.set(row.id, { severity: row.severity, component: row.component });
+      } catch (err) {
+        this.logger.warn(`Existing severity/component lookup failed for update-redirect targets in project ${params.projectId}, leaving both fields untouched: ${err instanceof Error ? err.message : err}`);
+      }
+    }
     // Resolve each draft's model-reported sourceRefs against the exact labels offered in THIS
     // turn's prompt (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — a label the model invents, or
     // carries over from an earlier turn's transcript, is dropped rather than trusted.
     const sourceRefIndex = this.zyraSourceRefIndex({ knowledge: params.knowledge, jira, existingTestcases: params.existingTestcases, bugs });
-    for (const draft of aiResult.drafts) {
+    for (const draft of finalResult.drafts) {
       draft.sourceRefs = LegacyService.sanitizeZyraSourceRefs(draft.sourceRefs, sourceRefIndex);
     }
     await this.rememberZyraTurn({
@@ -11857,7 +13413,7 @@ export class LegacyService implements OnModuleInit {
       key: params.key,
       userMessage: params.message,
       outcome: [
-        `Generated ${aiResult.drafts.length} testcase draft(s).`,
+        `Generated ${finalResult.drafts.length} testcase draft(s).`,
         params.jiraIssueKeys.length ? `Jira keys: ${params.jiraIssueKeys.join(", ")}` : "",
         `Sources considered: ${params.knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${params.existingTestcases.length} existing testcase(s), ${bugs.length} bug(s).`
       ].filter(Boolean).join(" ")
@@ -11885,7 +13441,7 @@ export class LegacyService implements OnModuleInit {
       && (params.knowledgeConfidence === "weak" || params.knowledgeConfidence === "none");
     const stagedSuiteName = matchedSuite?.name ?? LegacyService.ZYRA_DRAFT_SUITE_NAME;
     const groundedReply = [
-        `I drafted ${aiResult.drafts.length} test case(s) after reading`,
+        `I drafted ${finalResult.drafts.length} test case(s) after reading`,
         [
           `${params.knowledge.length} knowledge-base item(s)${jiraFromKnowledge ? ` (${jiraFromKnowledge} mirrored from Jira)` : ""}`,
           `${jira.length} Jira ticket(s) read directly`,
@@ -11900,26 +13456,160 @@ export class LegacyService implements OnModuleInit {
     ].join(" ").replace(" .", ".") + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`;
     return {
       reply: ungrounded
-        ? [LegacyService.zyraUngroundedNote(aiResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
+        ? [LegacyService.zyraUngroundedNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
         : weaklyGrounded
-          ? [LegacyService.zyraWeakGroundingNote(aiResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
+          ? [LegacyService.zyraWeakGroundingNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
           : groundedReply,
-      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${aiResult.usage.input}, output ${aiResult.usage.output}.`,
+      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
       actionType: "create",
-      operations: aiResult.drafts.map((draft) => ({
-        type: "create",
-        // A suite the router named but that does not exist yet carries only a name — it is created
-        // on demand when the operation is applied (resolveOrCreateSuiteByName).
-        suiteId: matchedSuite?.id,
-        suiteName: matchedSuite?.id ? undefined : matchedSuite?.name,
-        draft: {
-          ...draft,
-          jiraIssueKey: params.jiraIssueKeys[0] || draft.jiraIssueKey || null
-        },
-        reason: "Generated by AI from Zyra chat context."
-      })),
-      testcases: aiResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
+      operations: finalResult.drafts.map((draft, index) => {
+        const updateTarget = updateTargetsByIndex[index];
+        if (updateTarget) {
+          // Redirected: this draft is a near-duplicate of an existing, real test case (see
+          // TESTCASE_UPDATE_THRESHOLD's own comment). Content field names deliberately mirror the
+          // create branch's own draftPayload mapping below (expectedSummary -> description,
+          // stepsJson kept as-is) since sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient
+          // expect the UPDATE field names, not a draft's. `status` is deliberately omitted — unlike
+          // a fresh create (which always defaults to "Draft"), forcing an existing Approved/whatever
+          // case back to "Draft" just because a similar draft arrived would be a real regression;
+          // omitted fields are left untouched by COALESCE (updateTestCaseWithClient) /
+          // "skip if undefined" (patchTestCaseFromZyraWithClient). suiteId/suiteName and
+          // jiraIssueKey are also omitted for the same reason — an update never moves the target or
+          // silently reassigns its Jira link; only its authored content changes.
+          // severity/component follow the same "omitted = untouched" rule, for the same underlying
+          // reason as `status`. existingTarget is undefined when the lookup failed or the row
+          // disappeared between the match and here — treated the SAME as "already has a value"
+          // (both omit), never as "blank" (would fill in): an unverifiable existing value must
+          // never be overwritten on a guess. Only a lookup that positively confirms the field is
+          // currently blank fills it in from the draft.
+          const existingTarget = updateTargetFieldsById.get(updateTarget.testcaseId);
+          const severityAlreadySet = existingTarget === undefined || Boolean(existingTarget.severity);
+          const componentAlreadySet = existingTarget === undefined || Boolean(existingTarget.component);
+          return {
+            type: "update",
+            testcaseId: updateTarget.testcaseId,
+            fields: {
+              title: draft.title,
+              description: draft.description || draft.expectedSummary || "",
+              preconditions: draft.preconditions || "",
+              stepsJson: draft.stepsJson || draft.steps || "[]",
+              testData: draft.testData || "",
+              priority: draft.priority || "P2",
+              severity: severityAlreadySet ? undefined : (draft.severity || null),
+              type: draft.type || "Functional",
+              component: componentAlreadySet ? undefined : (draft.component || null)
+            },
+            reason: `Generated by AI from Zyra chat context; redirected to update — closely matches an existing test case (similarity ${updateTarget.cosineSimilarity.toFixed(2)}).`
+          };
+        }
+        return {
+          type: "create",
+          // A suite the router named but that does not exist yet carries only a name — it is
+          // created on demand when the operation is applied (resolveOrCreateSuiteByName).
+          suiteId: matchedSuite?.id,
+          suiteName: matchedSuite?.id ? undefined : matchedSuite?.name,
+          draft: {
+            ...draft,
+            jiraIssueKey: params.jiraIssueKeys[0] || draft.jiraIssueKey || null
+          },
+          reason: "Generated by AI from Zyra chat context."
+        };
+      }),
+      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
     };
+  }
+
+  // Per-draft semantic similarity check for generateZyraChatTestcasesWithAi's create path only.
+  // Returns two things, aligned 1:1 (by index) with the input `drafts`:
+  //   - `feedback`: text handed back to the SAME drafting call via `feedback` (see
+  //     zyraDynamicTaskPrompt) whenever at least one draft clears TESTCASE_SIMILARITY_THRESHOLD —
+  //     the softer, advisory tier. The model decides what to do with it; this function never
+  //     reclassifies anything itself.
+  //   - `matchesByIndex`: the raw match (if any, regardless of tier) behind each draft, so the
+  //     caller can separately apply TESTCASE_UPDATE_THRESHOLD — the higher, consequential tier —
+  //     to redirect an operation from create to update. Kept out of this function on purpose: the
+  //     caller is the one deciding what to do with a high-confidence match (using either the
+  //     original or the revised draft content, see its own comment), not this one.
+  //
+  // Never throws: mirrors RagRetrievalService's own fail-open contract. A failure here (embedding
+  // call, title lookup) just means this pass is skipped for this turn — never a reason to fail the
+  // whole create request. On any failure or early exit, `matchesByIndex` is all-null (same length
+  // as `drafts`) rather than omitted, so callers can always index it positionally without a
+  // separate null-check on the whole array.
+  private async zyraSimilarityFeedbackForDrafts(
+    projectId: string,
+    drafts: Body[],
+    // The current turn's already-resolved Langfuse trace id, when one exists (undefined for the
+    // background batches that call this with no trace at all — same "trace optional, skip if
+    // absent" convention already used for recordGeneration elsewhere in this file).
+    traceId?: string | null
+  ): Promise<{ feedback: string | null; matchesByIndex: Array<{ testcaseId: string; cosineSimilarity: number } | null> }> {
+    const noMatches = drafts.map(() => null);
+    try {
+      // Cheap early exit: one EXISTS query (project_id is the leading column of idx_tce_unique, so
+      // this is an index probe, not a scan) versus up to ZYRA_PLAN_BATCH_SIZE/ZYRA_CHAT_MAX_OPERATIONS
+      // findSimilarTestcases() calls — each of which is itself 1-2 round trips of its own — for a
+      // project that has never embedded a single test case. That is every project today (see
+      // ZYRA_BINDING_REPORT.md's backfill findings: zero of 1,414 projects with pending embeddings
+      // currently have a capable key), so this is not a cold-path optimization, it is the common
+      // case. No cache used: nothing in this codebase already tracks "does this project have any
+      // testcase_embeddings" for a related purpose, and adding one just for this would be a second
+      // thing to keep correct (invalidate on first successful embed) for a query this cheap.
+      const embeddedRes = await this.db.query<{ exists: boolean }>("SELECT EXISTS(SELECT 1 FROM testcase_embeddings WHERE project_id = $1) AS exists", [
+        projectId
+      ]);
+      if (!embeddedRes.rows[0]?.exists) return { feedback: null, matchesByIndex: noMatches };
+
+      // Same "title + description + steps" shape buildTestcaseEmbeddingText uses for a real,
+      // already-saved test case — built inline here rather than reusing that helper because a
+      // draft's fields (expectedSummary, stepsJson as a JSON *string*) don't match a testcases
+      // row's shape (description, steps as a parsed array).
+      const texts = drafts.map((draft) =>
+        [String(draft.title || ""), String(draft.expectedSummary || draft.description || ""), String(draft.stepsJson || "")]
+          .filter(Boolean)
+          .join("\n")
+          .slice(0, 4000)
+      );
+      const results = await Promise.all(
+        texts.map((text) =>
+          text.trim()
+            ? this.ragRetrieval.findSimilarTestcases(projectId, text, { limit: 1, traceId })
+            : Promise.resolve({ matches: [], semanticSearchRan: false, reason: "Empty draft text." })
+        )
+      );
+      const matchesByIndex = results.map((result) => (result.matches[0] ? { testcaseId: result.matches[0].testcaseId, cosineSimilarity: result.matches[0].cosineSimilarity } : null));
+
+      const hits = matchesByIndex
+        .map((match, index) => (match ? { draft: drafts[index], match } : null))
+        .filter((entry): entry is { draft: Body; match: { testcaseId: string; cosineSimilarity: number } } => Boolean(entry));
+      if (!hits.length) return { feedback: null, matchesByIndex };
+
+      const matchedIds = Array.from(new Set(hits.map((entry) => entry.match.testcaseId)));
+      const rows = await this.db.query<{ id: string; external_id: string; title: string }>(
+        "SELECT id, external_id, title FROM testcases WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+        [matchedIds]
+      );
+      const byId = new Map(rows.rows.map((row) => [row.id, row]));
+
+      const lines = hits
+        .map((entry) => {
+          const existing = byId.get(entry.match.testcaseId);
+          if (!existing) return null;
+          return `An existing test case appears to cover your draft "${entry.draft.title || "Untitled"}": ${existing.external_id} "${existing.title}", similarity ${entry.match.cosineSimilarity.toFixed(2)}.`;
+        })
+        .filter((line): line is string => Boolean(line));
+      const feedback = lines.length
+        ? [
+            "Semantic similarity check found possible overlap with existing test case coverage (a signal, not a rule — decide for each one):",
+            ...lines,
+            "For each flagged draft: keep it unchanged if it's a genuinely distinct scenario, revise it to clearly differentiate from the existing coverage, or fold it in with a note — your judgment. Do not drop a flagged draft silently."
+          ].join("\n")
+        : null;
+      return { feedback, matchesByIndex };
+    } catch (err) {
+      this.logger.warn(`zyraSimilarityFeedbackForDrafts failed for project ${projectId}: ${err instanceof Error ? err.message : err}`);
+      return { feedback: null, matchesByIndex: noMatches };
+    }
   }
 
   // The context Zyra reads before authoring anything: knowledge base by folder name and by semantic
@@ -12416,7 +14106,7 @@ export class LegacyService implements OnModuleInit {
     if (!this.normalizeZyraCapabilities((settings as Body).capabilities).generation) {
       throw new BadRequestException({ error: "Test case generation is disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities.", code: "zyra_capability_disabled" });
     }
-    const testcaseRange = String((settings as Body).testcaseRange || "1-10");
+    const testcaseRange = String((settings as Body).testcaseRange || "30-50");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     const story = String(body.userStory || body.story || "").trim();
     const context = String(body.context || body.prompt || "").trim();
@@ -12431,11 +14121,34 @@ export class LegacyService implements OnModuleInit {
       { actor: "user", stage: "todo", title: "Task created", detail: story, createdAt: now },
       { actor: "agent", stage: "todo", title: "Waiting for Zyra", detail: "Zyra will pick up this task and move it to In Progress.", createdAt: now }
     ];
+    // A Task-board task names its ticket only indirectly, through the Knowledge Base documents the
+    // user picked — a ticket synced into the KB is a mirror document (source_role = 'mirror'). The
+    // Requirements page passes the key explicitly instead, and that always wins. Resolved once, here,
+    // and stored in jira_issue_keys/linear_issue_keys like an explicit key, so everything downstream
+    // (the save's ticket link and tags, regeneration, the ticket auto-comment) reads one source of
+    // truth instead of re-deriving it from a selection that is not itself persisted.
+    const derivedTicket = jiraIssueKeys.length || linearIssueKeys.length
+      ? null
+      : await this.zyraTicketFromKnowledgeSelection(projectId, knowledgeItemIds);
+    if (derivedTicket?.linked) {
+      (derivedTicket.linked.provider === "jira" ? jiraIssueKeys : linearIssueKeys).push(derivedTicket.linked.issueKey);
+    } else if (derivedTicket?.tickets.length) {
+      // More than one ticket behind the selection: the save links every test case to exactly one
+      // ticket, so none of them can be attributed to the right one — link none rather than guess.
+      activityLog.push({
+        actor: "system",
+        stage: "todo",
+        title: "Not linked to a ticket",
+        detail: `The selected Knowledge Base documents belong to ${derivedTicket.tickets.length} tickets (${derivedTicket.tickets.map((t) => t.issueKey).join(", ")}). Test cases from this task won't be linked to a ticket and no ticket comment will be posted. Create one task per ticket to link them.`,
+        createdAt: now
+      });
+    }
+    const derivedKey = derivedTicket?.linked?.issueKey;
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Selected Jira ticket queued for Zyra." })),
-      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Selected Linear ticket queued for Zyra." }))
+      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Jira ticket queued for Zyra." })),
+      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Linear ticket queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
@@ -12465,7 +14178,7 @@ export class LegacyService implements OnModuleInit {
     void this.processZyraTask(projectId, res.rows[0].id, { userId: uid, knowledgeItemIds }).catch(() => undefined);
     return {
       generationRequestId: res.rows[0].id,
-      task: this.formatAiTask(res.rows[0]),
+      task: await this.formatAiTask(res.rows[0]),
       provider,
       drafts: [],
       generatedCount: 0,
@@ -12552,11 +14265,11 @@ export class LegacyService implements OnModuleInit {
       const jiraIssueKeys = normalizeJsonArray(task.jira_issue_keys).map(String);
       const linearIssueKeys = normalizeJsonArray(task.linear_issue_keys).map(String);
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
-      const testcaseRange = String((projectSettings as Body).testcaseRange || "1-10");
+      const testcaseRange = String((projectSettings as Body).testcaseRange || "30-50");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
       provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
       model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
-      const knowledge = await this.knowledgeSnapshot(projectId, options.knowledgeItemIds || []);
+      const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
       const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
@@ -12568,7 +14281,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       const drafts = aiResult.drafts;
       const inputText = [
@@ -12593,7 +14306,7 @@ export class LegacyService implements OnModuleInit {
       ];
       const finishedAt = new Date().toISOString();
       const activity = [
-        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
+        { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel(options.knowledgeItemIds, knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
         { actor: "agent", stage: "in_progress", title: "Generation plan", detail: this.zyraThinking({ story, context, acceptanceCriteria, feedback, knowledgeCount: knowledge.length, jiraCount: jira.length, linearCount: linear.length }), createdAt: finishedAt },
         { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt }
       ];
@@ -12783,7 +14496,7 @@ export class LegacyService implements OnModuleInit {
     // otherwise this falls back to the generic "generate exactly N" phrasing, which reads very
     // differently to the model than "all possible cases".
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
-    const testcaseRange = String(zyraAgentSettings.testcaseRange || "1-10");
+    const testcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
     const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
@@ -12814,7 +14527,7 @@ export class LegacyService implements OnModuleInit {
     }).catch(() => undefined);
     return {
       generationRequestId: taskId,
-      task: this.formatAiTask(claimRes.rows[0]),
+      task: await this.formatAiTask(claimRes.rows[0]),
       provider,
       drafts: [],
       generatedCount: 0,
@@ -12858,8 +14571,15 @@ export class LegacyService implements OnModuleInit {
       // testcases) — gathering them concurrently instead of one after another cuts this stage's
       // wall time down to the slowest of the four instead of their sum, without changing what any
       // of them return.
-      const [knowledge, jira, linear, existingTestcases] = await Promise.all([
-        this.knowledgeSnapshot(projectId),
+      // Feedback ALONE drives the retrieval query — not story/context too. Retrieval falls back
+      // to keyword (full-text) matching whenever no embeddings key is configured (a documented,
+      // common state — see resolveEmbeddingAllocation), and Postgres's plainto_tsquery ANDs every
+      // term together: concatenating the original story's topic with the feedback's would demand
+      // a single document cover both, so a reviewer pivoting to something the initial story never
+      // mentioned (e.g. "also check the session timeout") would match nothing at all. feedback is
+      // guaranteed non-empty here — zyraFeedback (the caller) already rejects an empty one.
+      const [{ knowledge, knowledgeConfidence }, jira, linear, existingTestcases] = await Promise.all([
+        this.zyraTaskKnowledge(projectId, [], [feedback]),
         this.jiraSnapshot(projectId, jiraIssueKeys),
         this.linearSnapshot(projectId, linearIssueKeys),
         this.existingTestcaseSnapshot(projectId, story, context)
@@ -12872,7 +14592,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
@@ -12880,7 +14600,7 @@ export class LegacyService implements OnModuleInit {
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
-        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
+        { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel([], knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
         { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
@@ -13001,7 +14721,7 @@ export class LegacyService implements OnModuleInit {
       );
       return res.rows[0];
     });
-    return this.formatAiTask(result);
+    return await this.formatAiTask(result);
   }
 
   // Inline edit of one pending draft's fields — the review step's "edit" action. Task-board drafts
@@ -13050,7 +14770,7 @@ export class LegacyService implements OnModuleInit {
       );
       return res.rows[0];
     });
-    return this.formatAiTask(result);
+    return await this.formatAiTask(result);
   }
 
   async zyraCloseTask(projectId: string, userId: string | null | undefined, taskId: string) {
@@ -13061,7 +14781,7 @@ export class LegacyService implements OnModuleInit {
     if (existing.rows[0].task_status === "done") {
       // Already closed — a double-click or a second tab landing here after the first request
       // already won should be a harmless no-op, not a duplicate "Closed task" activity entry.
-      return this.formatAiTask(existing.rows[0]);
+      return await this.formatAiTask(existing.rows[0]);
     }
     const now = new Date().toISOString();
     const activity = [{
@@ -13082,9 +14802,9 @@ export class LegacyService implements OnModuleInit {
       // Lost a race to a concurrent close (two tabs, double-click before the button disabled) —
       // return the current state instead of erroring on an action that already succeeded.
       const fresh = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
-      return this.formatAiTask(fresh.rows[0]);
+      return await this.formatAiTask(fresh.rows[0]);
     }
-    return this.formatAiTask(res.rows[0]);
+    return await this.formatAiTask(res.rows[0]);
   }
 
   // The actual save, run inside one transaction so the whole selected batch commits or none of it
@@ -13152,10 +14872,12 @@ export class LegacyService implements OnModuleInit {
       // task per ticket) — this just resolves whichever one applies for the "already linked, update
       // in place" lookup below. Chat-staged rows never set these, so this is always empty for them
       // — every chat create draft goes through the plain "create new testcase" branch.
+      // severity/component now selected alongside id (previously id-only) so the create/update
+      // payload below can decide "only fill if blank" for those two fields — see its own comment.
       const existingLinked = jiraIssueKey
-        ? await client.query("SELECT id FROM testcases WHERE project_id = $1 AND jira_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, jiraIssueKey])
+        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND jira_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, jiraIssueKey])
         : linearIssueKey
-        ? await client.query("SELECT id FROM testcases WHERE project_id = $1 AND linear_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, linearIssueKey])
+        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND linear_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, linearIssueKey])
         : { rows: [] as Body[] };
 
       // Pre-validate every update/archive target still exists before writing anything, so a target
@@ -13175,6 +14897,49 @@ export class LegacyService implements OnModuleInit {
         }
       }
 
+      // Q11 (Zyra context integrity progress log, Phase 3/4): a suite a create-type entry targets —
+      // `batchSuiteId` above, or a chat-staged draft's own `draft.suiteId` (written once, at
+      // resolveOrCreateSuiteByName / patchZyraPendingBatchSuite time, then frozen inside
+      // generated_payload until the user hits Save, potentially hours later) — can have been
+      // soft-deleted out from under it since it was resolved. Before this, that couldn't happen
+      // silently: a suite id that resolved once couldn't stop existing without a hard delete, and a
+      // hard-deleted suite would make the FK insert fail loudly. Now the row still exists (just
+      // filtered out of every list), so the FK is satisfied and the insert would otherwise succeed
+      // with a `suite_id` pointing at a suite that already looks deleted everywhere else — a
+      // create-time version of the same "ghost suite reference" this phase closes off on the read
+      // side. Re-validated live, under this same lock/transaction, rather than trusted from whenever
+      // it was first resolved.
+      // isUuid-filtered defensively so a malformed id here is just "not found" (falls back to
+      // unassigned, below) rather than a raw driver error from the `::uuid[]` cast reaching the
+      // global exception filter as an unhandled 500 — the same failure mode every other uuid-typed
+      // filter in this file already avoids by checking isUuid() first.
+      const createSuiteIdCandidates = new Set<string>();
+      if (batchSuiteId && isUuid(String(batchSuiteId))) createSuiteIdCandidates.add(String(batchSuiteId));
+      for (const entry of selected) {
+        if (entry.opType === "update" || entry.opType === "archive") continue;
+        const draft = entry.draft || entry;
+        if (draft.suiteId && isUuid(String(draft.suiteId))) createSuiteIdCandidates.add(String(draft.suiteId));
+      }
+      let validSuiteIds = new Set<string>();
+      if (createSuiteIdCandidates.size) {
+        // project_id-scoped: without it, a caller supplying another project's (or tenant's) suite
+        // id would pass this check, write testcases into THIS project pointing at that foreign
+        // suite_id, and every suite-joined report/export (repositorySummary, exportTestCases,
+        // executionReport, requirementMatrix, suiteHealth, coverageBySuite, detectFlakyTests — none
+        // of which scope their suites join by project) would then render the other project's suite
+        // name inside this project's data.
+        const foundSuites = await client.query<{ id: string }>(
+          "SELECT id FROM suites WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL",
+          [Array.from(createSuiteIdCandidates), projectId]
+        );
+        validSuiteIds = new Set(foundSuites.rows.map((row) => String(row.id)));
+      }
+      const staleSuiteIds = Array.from(createSuiteIdCandidates).filter((id) => !validSuiteIds.has(id));
+      // A stale batchSuiteId falls back the same way a stale per-draft suiteId does: unassigned,
+      // never a failed batch — see below, entries fall back individually via ctx.validSuiteIds. This
+      // only affects what `events`/the response report as the batch's own suite.
+      if (batchSuiteId && !validSuiteIds.has(String(batchSuiteId))) batchSuiteId = null;
+
       const entryCtx: ZyraSaveEntryContext = {
         projectId,
         uid,
@@ -13185,19 +14950,36 @@ export class LegacyService implements OnModuleInit {
         jiraUrl,
         linearIssueKey,
         linearUrl,
-        existingLinked
+        existingLinked,
+        validSuiteIds
       };
       // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
-      // implementations return the identical { created, touched } shape and must stay behaviorally
-      // interchangeable; the batched one only changes how genuinely-new testcases are written
-      // (one INSERT instead of N), never what gets written or in what order the response reflects it.
-      const { created, touched } = this.config.zyraSetBasedSaveEnabled
+      // implementations return the identical { created, touched, touchedActions } shape and must
+      // stay behaviorally interchangeable; the batched one only changes how genuinely-new
+      // testcases are written (one INSERT instead of N), never what gets written or in what order
+      // the response reflects it.
+      const { created, touched, touchedActions } = this.config.zyraSetBasedSaveEnabled
         ? await this.processZyraSaveEntriesBatched(client, selected, entryCtx)
         : await this.processZyraSaveEntriesSequential(client, selected, entryCtx);
 
       const savedAt = new Date().toISOString();
-      const events = [{ suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
+      // saveEventId names this one save — the ticket auto-comment keys its idempotency claim on it
+      // (see queueZyraTicketComments), so the same save can never be commented on twice.
+      const saveEventId = randomUUID();
+      const events = [{ id: saveEventId, suiteId: batchSuiteId, testcaseIds: touched.map((item) => item.id), savedAt }];
       const saveActivity = [{ actor: "user", stage: "done", title: "Accepted and saved testcases", detail: `Saved ${touched.length} testcase(s).`, createdAt: savedAt }];
+      // Q11: recorded on the batch itself (not just swallowed) when a target suite turned out to be
+      // gone — this is a silent, non-blocking fallback everywhere else in this save, so the only
+      // place it's visible at all is this log entry.
+      if (staleSuiteIds.length) {
+        saveActivity.push({
+          actor: "system",
+          stage: "info",
+          title: "Target suite no longer available",
+          detail: `${staleSuiteIds.length} target suite(s) had been deleted since these drafts were staged. Affected new test case(s) were saved unassigned instead of failing the batch.`,
+          createdAt: savedAt
+        });
+      }
       // Task-board batches always resolve to 'done' on any save, partial selection or not — a single
       // generation request completes as one review, and that is unchanged here. A chat-staged batch
       // is different: a conversation naturally continues across turns, so saving only some of a
@@ -13249,7 +15031,9 @@ export class LegacyService implements OnModuleInit {
           [taskId, projectId, touched.length, JSON.stringify(events), JSON.stringify(saveActivity)]
         );
       }
-      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, remaining: remainingPayload.length };
+      // touchedActions and saveEventId are consumed by zyraSave() (for the post-commit ticket
+      // auto-comment) and deleted from the result there before it reaches the HTTP response.
+      return { savedCount: touched.length, suiteId: batchSuiteId, testcases: touched, touchedActions, saveEventId, remaining: remainingPayload.length };
     });
   }
 
@@ -13263,9 +15047,14 @@ export class LegacyService implements OnModuleInit {
     client: PoolClient,
     selected: Body[],
     ctx: ZyraSaveEntryContext
-  ): Promise<{ created: Body[]; touched: Body[] }> {
+  ): Promise<{ created: Body[]; touched: Body[]; touchedActions: Array<"add" | "update" | "archive"> }> {
     const created: Body[] = [];
     const touched: Body[] = [];
+    // Aligned 1:1 by index with `touched` — the sync-integration wiring in zyraSave needs to know
+    // which action each touched row represents (add/update/archive), which `touched` alone cannot
+    // say: an update and an archive push the exact same row shape (a plain toCamel'd testcases
+    // row), distinguishable only here, at the point `opType` is actually known.
+    const touchedActions: Array<"add" | "update" | "archive"> = [];
     // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
     // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
     // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
@@ -13280,6 +15069,7 @@ export class LegacyService implements OnModuleInit {
         const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
         const row = toCamel(refreshed.rows[0]);
         touched.push(row);
+        touchedActions.push(opType === "archive" ? "archive" : "update");
         await this.logProjectActivity(
           ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
           `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
@@ -13288,23 +15078,43 @@ export class LegacyService implements OnModuleInit {
       }
       const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      // Q11: whichever suite this entry would have targeted, re-validated live (see zyraSaveAttempt)
+      // rather than trusted from whenever it was resolved — a soft-deleted suite falls back to
+      // unassigned instead of failing this entry or the batch.
+      const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const targetSuiteId = rawTargetSuiteId && ctx.validSuiteIds.has(String(rawTargetSuiteId)) ? rawTargetSuiteId : null;
       const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
         ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
         ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
-        ctx.existingLinked.rows[linkedIndex]?.id ? "zyra-regenerated" : "zyra-generated"
+        existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
         suiteId: targetSuiteId,
         title: draft.title,
         description: draft.description || draft.expectedSummary || "",
         preconditions: draft.preconditions || "",
-        stepsJson: this.safeSteps(draft.stepsJson),
+        // Pre-stringified here, once, to match what the create/edit modal already sends
+        // (testcases/page.tsx: `steps: JSON.stringify(steps)`) before this payload reaches
+        // insertTestCaseWithClient/updateTestCaseWithClient or zyraBatchInsertTestCases — all of
+        // which apply exactly one more encode on top of whatever they're given. Handing them a
+        // bare array (the old behavior) got single-encoded into a genuine jsonb array, a shape the
+        // editor's parseSteps() silently discards as one blank step. See
+        // "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+        stepsJson: JSON.stringify(this.safeSteps(draft.stepsJson)),
         testData: draft.testData || "",
         priority: draft.priority || "P2",
+        // Filled from the draft only when there's nothing to protect: a brand-new row (no
+        // existingLinkedRow) always takes the draft's value; regenerating an already-linked row
+        // (existingLinkedRow set) keeps its current severity/component untouched if either is
+        // already non-blank, rather than letting a re-run silently overwrite a human-set value with
+        // a fresh AI guess. Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test
+        // Cases".
+        severity: existingLinkedRow?.severity ? null : (draft.severity || null),
+        component: existingLinkedRow?.component ? null : (draft.component || null),
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
@@ -13314,14 +15124,25 @@ export class LegacyService implements OnModuleInit {
         linearUrl: ctx.linearUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
-        // no sourceRefs ever attached) simply carries none, same as it always has.
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
+        // if blank" protection as severity/component above, but expressed as null-vs-[] rather than
+        // null-vs-value: a brand-new row always takes whatever the draft resolved (even none, i.e.
+        // []); regenerating an already-linked row only overwrites when this run actually resolved
+        // something, otherwise passes null so updateTestCaseWithClient's COALESCE keeps the
+        // citations already on the row instead of silently wiping them on an ungrounded re-run.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
-      if (ctx.existingLinked.rows[linkedIndex]?.id) {
+      if (existingLinkedRow?.id) {
         const linkedId = ctx.existingLinked.rows[linkedIndex].id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
-        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId });
+        // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
+        // sync-integration wiring in zyraSave has something to target — this row IS what was just
+        // written to `payload.jiraIssueKey`/`payload.linearIssueKey` above, not a guess.
+        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey });
+        touchedActions.push("update");
       } else {
         const row = toCamel(await this.insertTestCaseWithClient(client, ctx.projectId, ctx.uid, payload));
         // The same audit action chat mode writes in applyZyraChatOperations. Both modes have to be
@@ -13330,9 +15151,10 @@ export class LegacyService implements OnModuleInit {
         await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entry.reason || null });
         created.push(row);
         touched.push(row);
+        touchedActions.push("add");
       }
     }
-    return { created, touched };
+    return { created, touched, touchedActions };
   }
 
   /**
@@ -13347,13 +15169,16 @@ export class LegacyService implements OnModuleInit {
     client: PoolClient,
     selected: Body[],
     ctx: ZyraSaveEntryContext
-  ): Promise<{ created: Body[]; touched: Body[] }> {
+  ): Promise<{ created: Body[]; touched: Body[]; touchedActions: Array<"add" | "update" | "archive"> }> {
     const created: Body[] = [];
     // Preserves selected's original order: a deferred create's slot is filled in AFTER the batch
     // insert runs, so the final `touched` array (which the response and the save_events/activity_log
     // history both key off) comes out in the same order as the sequential path, not "everything else,
     // then every batch-inserted row appended at the end."
     const touchedSlots: Array<Body | null> = new Array(selected.length).fill(null);
+    // Parallel to touchedSlots, same slot indexing — see processZyraSaveEntriesSequential's
+    // identical field for why this can't be derived from `touched` alone after the fact.
+    const touchedActionSlots: Array<"add" | "update" | "archive" | null> = new Array(selected.length).fill(null);
     const toInsert: Array<{ slot: number; payload: Body; draft: Body; entryReason: unknown }> = [];
     let createPosition = 0;
 
@@ -13365,6 +15190,7 @@ export class LegacyService implements OnModuleInit {
         const refreshed = await client.query("SELECT * FROM testcases WHERE id = $1", [entry.testcaseId]);
         const row = toCamel(refreshed.rows[0]);
         touchedSlots[slot] = row;
+        touchedActionSlots[slot] = opType === "archive" ? "archive" : "update";
         await this.logProjectActivity(
           ctx.projectId, ctx.uid ?? null, opType === "archive" ? "zyra_archived" : "zyra_updated", "testcase", entry.testcaseId,
           `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", fields: entry.fields, reason: entry.reason || null }
@@ -13374,23 +15200,38 @@ export class LegacyService implements OnModuleInit {
 
       const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const targetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      // Q11: same live re-validation as processZyraSaveEntriesSequential — see that function's
+      // identical comment.
+      const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
+      const targetSuiteId = rawTargetSuiteId && ctx.validSuiteIds.has(String(rawTargetSuiteId)) ? rawTargetSuiteId : null;
       const baseTags = Array.isArray(draft.tags) ? draft.tags.map(String) : [];
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
         ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
         ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
-        ctx.existingLinked.rows[linkedIndex]?.id ? "zyra-regenerated" : "zyra-generated"
+        existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
         suiteId: targetSuiteId,
         title: draft.title,
         description: draft.description || draft.expectedSummary || "",
         preconditions: draft.preconditions || "",
-        stepsJson: this.safeSteps(draft.stepsJson),
+        // Pre-stringified here, once, to match what the create/edit modal already sends
+        // (testcases/page.tsx: `steps: JSON.stringify(steps)`) before this payload reaches
+        // insertTestCaseWithClient/updateTestCaseWithClient or zyraBatchInsertTestCases — all of
+        // which apply exactly one more encode on top of whatever they're given. Handing them a
+        // bare array (the old behavior) got single-encoded into a genuine jsonb array, a shape the
+        // editor's parseSteps() silently discards as one blank step. See
+        // "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+        stepsJson: JSON.stringify(this.safeSteps(draft.stepsJson)),
         testData: draft.testData || "",
         priority: draft.priority || "P2",
+        // Same "only fill if blank" rule as processZyraSaveEntriesSequential's identical payload —
+        // see that function's comment.
+        severity: existingLinkedRow?.severity ? null : (draft.severity || null),
+        component: existingLinkedRow?.component ? null : (draft.component || null),
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
@@ -13398,14 +15239,23 @@ export class LegacyService implements OnModuleInit {
         jiraUrl: ctx.jiraUrl,
         linearIssueKey: ctx.linearIssueKey,
         linearUrl: ctx.linearUrl,
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
+        // identical field — see that function's comment for why null (not []) is what protects an
+        // already-linked row's existing citations from being wiped by an ungrounded regeneration.
+        sourceRefs: Array.isArray(draft.sourceRefs) && draft.sourceRefs.length
+          ? draft.sourceRefs
+          : existingLinkedRow?.id ? null : []
       };
       this.assertTestcaseFieldLengths(payload);
 
-      if (ctx.existingLinked.rows[linkedIndex]?.id) {
-        const linkedId = ctx.existingLinked.rows[linkedIndex].id;
+      if (existingLinkedRow?.id) {
+        const linkedId = existingLinkedRow.id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
-        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId };
+        // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
+        // sync-integration wiring in zyraSave has something to target — see the sequential path's
+        // identical comment.
+        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey };
+        touchedActionSlots[slot] = "update";
       } else {
         // Deferred — actually written once, below, as a single batch insert by
         // zyraBatchInsertTestCases. See that method's own comment for the rest of the story
@@ -13434,11 +15284,14 @@ export class LegacyService implements OnModuleInit {
         await this.logProjectActivity(ctx.projectId, ctx.uid ?? null, "zyra_created", "testcase", row.id, `${row.externalId} - ${row.title}`, { source: ctx.chatSessionId ? "zyra_chat" : "zyra_task", taskId: ctx.taskId, reason: draft.reason || entryReason || null });
         created.push(row);
         touchedSlots[slot] = row;
+        touchedActionSlots[slot] = "add";
       }
     }
 
-    const touched = touchedSlots.filter((row): row is Body => row !== null);
-    return { created, touched };
+    const touchedIndexes = touchedSlots.reduce<number[]>((acc, row, index) => (row !== null ? [...acc, index] : acc), []);
+    const touched = touchedIndexes.map((index) => touchedSlots[index] as Body);
+    const touchedActions = touchedIndexes.map((index) => touchedActionSlots[index] as "add" | "update" | "archive");
+    return { created, touched, touchedActions };
   }
 
   /**
@@ -13478,7 +15331,11 @@ export class LegacyService implements OnModuleInit {
       steps: payload.stepsJson || [],
       test_data: payload.testData || "",
       priority: payload.priority || "P2",
-      severity: null,
+      // payload.severity/component (processZyraSaveEntriesBatched) already resolved the "only fill
+      // if blank against an existing linked row" rule before this ever runs — this insert path is
+      // reached only for genuinely-new rows, so there's nothing to protect and the payload value
+      // (or null, same as any other blank field here) is used as-is.
+      severity: payload.severity || null,
       type: payload.type || "Functional",
       automation_status: "Not Automated",
       automation_repo: null,
@@ -13487,7 +15344,7 @@ export class LegacyService implements OnModuleInit {
       automation_framework: null,
       automation_tags: payload.automationTags || null,
       owner_id: null,
-      component: null,
+      component: payload.component || null,
       status: payload.status || "Draft",
       jira_issue_key: payload.jiraIssueKey || null,
       jira_url: payload.jiraUrl || null,
@@ -13495,7 +15352,7 @@ export class LegacyService implements OnModuleInit {
       linear_url: payload.linearUrl || null,
       attachments: null,
       estimated_duration: null,
-      source_refs: Array.isArray(payload.sourceRefs) ? payload.sourceRefs : []
+      source_refs: LegacyService.sanitizeSourceRefsInput(payload.sourceRefs)
     }));
 
     const res = await client.query(
@@ -13553,6 +15410,30 @@ export class LegacyService implements OnModuleInit {
         // triggers a retry below never fires a premature invalidation for the discarded attempt.
         await this.suitesCache.invalidate(projectId);
         await this.testcasesListCache.invalidate(projectId);
+        // Same commit-boundary reasoning: insertTestCaseWithClient/updateTestCaseWithClient/
+        // patchTestCaseFromZyraWithClient run nested inside zyraSaveAttempt's own transaction and
+        // deliberately don't enqueue themselves (see insertTestCaseWithClient's comment), so every
+        // testcase this save touched — create, update, or archive — is enqueued once here, after
+        // the whole batch has actually committed. "created" vs "updated" is cosmetic (the
+        // processor branches on job name, not this reason string) but mirrors the doc/file
+        // enqueueEmbedding call sites' convention of naming what actually happened.
+        const testcases = Array.isArray((result as Body)?.testcases) ? ((result as Body).testcases as Body[]) : [];
+        // touchedActions is aligned 1:1 by index with `testcases` (see
+        // processZyraSaveEntriesSequential/Batched's own comment) — internal-only, never part of
+        // the HTTP response this function returns, so it's read here and stripped below rather
+        // than left on `result`.
+        const touchedActions = Array.isArray((result as Body)?.touchedActions) ? ((result as Body).touchedActions as Array<"add" | "update" | "archive">) : [];
+        testcases.forEach((row) => {
+          if (!row?.id) return;
+          this.enqueueTestcaseEmbedding(projectId, String(row.id), "updated");
+        });
+        // Same commit-boundary discipline: one ticket comment per ticket for this whole save, over
+        // the SAME already-committed rows, however each row's action was decided (an explicit
+        // update/archive, or feature #1's similarity-redirect create->update). Never throws.
+        const saveEventId = (result as Body)?.saveEventId;
+        if (saveEventId) await this.queueZyraTicketComments(projectId, uid, taskId, String(saveEventId), testcases, touchedActions);
+        delete (result as Body).touchedActions;
+        delete (result as Body).saveEventId;
         return result;
       } catch (error) {
         const collided =
@@ -13696,6 +15577,52 @@ export class LegacyService implements OnModuleInit {
     if (inserted.rows[0]?.id) this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", inserted.rows[0].id, "created");
   }
 
+  /**
+   * Knowledge selection for task-board generation (processZyraTask/processZyraFeedback) — the
+   * counterpart to buildZyraChatDecision's own knowledge gathering (~line 11614), which already
+   * fuses ragRetrieval.retrieveWithDiagnostics with a knowledgeSnapshot recency fallback. The
+   * task-board flow used to call knowledgeSnapshot alone, unconditionally: a plain "12
+   * most-recently-updated documents" read with no relation to what the task actually asked for.
+   * On a project with more than 12 knowledge-base items, or one where the relevant document
+   * simply hadn't been touched recently, that document was never shown to the model at all —
+   * "Zyra ignores specific values in Knowledge Base documents" (the embeddings existed; this
+   * function just never queried them).
+   *
+   * An explicit picker selection (`selectedItemIds` — the task-board "attach these documents" UI)
+   * is left exactly as before: a named-document lookup, not a search, per RagRetrievalService's
+   * own header comment ("does NOT replace knowledgeSnapshot() — that stays for the explicit-
+   * picker task-generation flow"). The user already chose these documents; second-guessing that
+   * choice with a relevance query would be a behaviour change nobody asked for.
+   */
+  private async zyraTaskKnowledge(
+    projectId: string,
+    selectedItemIds: string[],
+    queryParts: string[]
+  ): Promise<{ knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>; knowledgeConfidence?: RagRetrievalConfidence }> {
+    if (selectedItemIds.length) {
+      return { knowledge: await this.knowledgeSnapshot(projectId, selectedItemIds) };
+    }
+    const query = queryParts.filter(Boolean).join("\n\n");
+    const [knowledgeFallback, ragDiagnostics] = await Promise.all([
+      this.knowledgeSnapshot(projectId),
+      this.ragRetrieval.retrieveWithDiagnostics(projectId, query)
+    ]);
+    return {
+      knowledge: ragDiagnostics.items.length ? ragDiagnostics.items : knowledgeFallback,
+      knowledgeConfidence: ragDiagnostics.confidence
+    };
+  }
+
+  // For the "Read available sources" / "Re-read sources with feedback" activity-log lines —
+  // reusing the existing per-task activity feed (already rendered in the task's Activity tab)
+  // rather than adding a new tracing surface, so a support report ("Zyra didn't use my document")
+  // has somewhere to look without needing Langfuse access.
+  private zyraKnowledgeSourceLabel(selectedItemIds: string[] | undefined, confidence?: RagRetrievalConfidence): string {
+    if (selectedItemIds && selectedItemIds.length) return "explicitly selected";
+    if (confidence === "strong" || confidence === "weak") return `semantic/keyword match, confidence: ${confidence}`;
+    return "no strong match, showing recent documents";
+  }
+
   private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
     const selected = Array.from(new Set(selectedItemIds.filter(Boolean)));
     const values: any[] = [projectId];
@@ -13785,7 +15712,7 @@ export class LegacyService implements OnModuleInit {
     const folderNames = foldersRes.rows.map((row) => row.name).join(", ");
     const [docsRes, filesRes] = await Promise.all([
       this.db.query(
-        `SELECT id, title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false ORDER BY updated_at DESC LIMIT 12`,
+        `SELECT id, title, content_text FROM knowledge_documents WHERE folder_id = ANY($1::uuid[]) AND is_deleted = false AND (document_type != 'ai_memory' OR status = 'approved') ORDER BY updated_at DESC LIMIT 12`,
         [folderIds]
       ).catch(() => ({ rows: [] as Body[] })),
       this.db.query(
@@ -13814,7 +15741,7 @@ export class LegacyService implements OnModuleInit {
     projectId: string,
     story: string,
     context: string
-  ): Promise<Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string }>> {
+  ): Promise<Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>> {
     const searchText = [story, context].join(" ").toLowerCase();
     const terms = Array.from(new Set(searchText.split(/[^a-z0-9]+/).filter((word) => word.length > 3))).slice(0, 8);
     const values: any[] = [projectId];
@@ -13824,9 +15751,9 @@ export class LegacyService implements OnModuleInit {
       orderBy = `CASE WHEN lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
     }
     const res = await this.db.query(
-      `SELECT external_id, title, description, priority, status, steps
+      `SELECT external_id, title, description, priority, status, steps, component
        FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL
+       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived'
        ORDER BY ${orderBy}
        LIMIT 25`,
       values
@@ -13837,7 +15764,13 @@ export class LegacyService implements OnModuleInit {
       description: String(row.description || "").slice(0, 500),
       priority: String(row.priority || "P2"),
       status: String(row.status || "Draft"),
-      stepsSummary: JSON.stringify(normalizeJsonArray(row.steps)).slice(0, 800)
+      // safeSteps(), not normalizeJsonArray() — same reasoning as exportTestcases: `row.steps` may
+      // be a JSON-encoded string, not a genuine array.
+      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, 800),
+      // Fed back into zyraStaticSourcePrompt so Zyra can reuse an existing component name for a new
+      // draft instead of inventing a similarly-named variant (see zyraSystemPrompt's component
+      // instruction) — an empty string, same as every other blank field here, when unset.
+      component: String(row.component || "").slice(0, 255)
     }));
   }
 
@@ -13885,7 +15818,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       `SELECT id, title, description, status, priority
        FROM bugs
-       WHERE project_id = $1
+       WHERE project_id = $1 AND deleted_at IS NULL
          AND (lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]))
        ORDER BY CASE WHEN lower(title) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC
        LIMIT $3`,
@@ -13947,21 +15880,27 @@ export class LegacyService implements OnModuleInit {
     return knowledge.filter((item) => /^[A-Z][A-Z0-9]+-\d+\s*:/.test(String(item.title || "").trim())).length;
   }
 
-  private async jiraSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string }>> {
+  // Return shape includes `status` — already fetched and persisted to jira_tickets.status on
+  // every upsert below, this just also surfaces it to the caller instead of writing it and never
+  // reading it back (ZYRA_BINDING_REPORT.md §2: "status is captured but not returned"). Additive
+  // only — no new Jira call, no new column, no behavior change for existing callers that only
+  // read key/summary/description.
+  private async jiraSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
     const selectedKeys = Array.from(new Set(keys.map((key) => key.trim()).filter(Boolean)));
     if (!selectedKeys.length) return [];
     const res = await this.db.query(
-      `SELECT jira_issue_key, summary, description FROM jira_tickets
+      `SELECT jira_issue_key, summary, description, status FROM jira_tickets
        WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])`,
       [projectId, selectedKeys]
     ).catch(() => ({ rows: [] as any[] }));
-    const byKey = new Map<string, { key: string; summary: string; description: string }>(
+    const byKey = new Map<string, { key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.jira_issue_key),
         {
           key: String(row.jira_issue_key),
           summary: String(row.summary || ""),
-          description: String(row.description || "")
+          description: String(row.description || ""),
+          status: String(row.status || "")
         }
       ])
     );
@@ -13986,7 +15925,8 @@ export class LegacyService implements OnModuleInit {
           const fields = (issue.fields || {}) as Body;
           const summary = String(fields.summary || "");
           const description = jiraDescriptionToText(fields.description);
-          byKey.set(key, { key, summary, description });
+          const status = String(fields.status?.name || "");
+          byKey.set(key, { key, summary, description, status });
           await this.db.query(
             `INSERT INTO jira_tickets (
                project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, description,
@@ -14015,7 +15955,7 @@ export class LegacyService implements OnModuleInit {
               summary,
               description,
               String(fields.issuetype?.name || ""),
-              String(fields.status?.name || ""),
+              status,
               String(fields.priority?.name || ""),
               String(fields.assignee?.displayName || ""),
               String(fields.reporter?.displayName || ""),
@@ -14034,36 +15974,384 @@ export class LegacyService implements OnModuleInit {
       summary: "Selected Jira ticket",
       description: jiraConnected
         ? "This key was not found in the local Jira cache or via the live Jira API — it may not exist, or may belong to a project this Jira connection cannot access."
-        : "Jira is not connected for this project, so this key could not be looked up. Tell the user Jira isn't connected (Project Settings → Integrations → Jira) rather than implying the ticket itself is missing."
+        : "Jira is not connected for this project, so this key could not be looked up. Tell the user Jira isn't connected (Project Settings → Integrations → Jira) rather than implying the ticket itself is missing.",
+      // Unknown, not "no status" — the key itself couldn't be resolved, so there's nothing to
+      // report a status for. Distinct from a real empty string on a resolved ticket with no
+      // status field set (rare, but not the same case).
+      status: ""
     });
   }
 
   // Only reads the linear_tickets sync cache, unlike jiraSnapshot's live-API fallback for missing
   // keys — the Requirements page only ever selects keys it just listed from that same cache, so a
   // cache miss here would mean the ticket was deleted/unsynced, not "not synced yet".
-  private async linearSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string }>> {
+  //
+  // Return shape includes `status`, same as jiraSnapshot above — already persisted to
+  // linear_tickets.status by the sync pipeline (src/integration-sync/), just not previously read
+  // back here. Additive only, no new Linear call.
+  private async linearSnapshot(projectId: string, keys: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
     const selectedKeys = Array.from(new Set(keys.map((key) => key.trim()).filter(Boolean)));
     if (!selectedKeys.length) return [];
     const res = await this.db.query(
-      `SELECT linear_issue_key, summary, description FROM linear_tickets
+      `SELECT linear_issue_key, summary, description, status FROM linear_tickets
        WHERE project_id = $1 AND linear_issue_key = ANY($2::text[])`,
       [projectId, selectedKeys]
     ).catch(() => ({ rows: [] as any[] }));
-    const byKey = new Map<string, { key: string; summary: string; description: string }>(
+    const byKey = new Map<string, { key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.linear_issue_key),
         {
           key: String(row.linear_issue_key),
           summary: String(row.summary || ""),
-          description: String(row.description || "")
+          description: String(row.description || ""),
+          status: String(row.status || "")
         }
       ])
     );
     return selectedKeys.map((key) => byKey.get(key) || {
       key,
       summary: "Selected Linear ticket",
-      description: "Ticket details were not available from the local cache, but the selected key was included for Zyra context."
+      description: "Ticket details were not available from the local cache, but the selected key was included for Zyra context.",
+      status: ""
     });
+  }
+
+  /**
+   * Archive-sweep sub-task B. Live (never the jira_tickets/linear_tickets nightly-sync cache) lookup
+   * of one linked issue's normalized done/not-done category, for one test case at a time.
+   *
+   * Why live, not the cache: the earlier investigation (ZYRA_IMPLEMENTATION_LOG.md) found the cache
+   * misses 36% of Jira-linked and 99% of Linear-linked test cases today — most linked test cases
+   * live in projects the nightly sync never targets (no mapping, or a disabled one). A sweep built
+   * on the cache would silently skip almost everything it exists to check.
+   *
+   * Why a single-issue shape, not a batch: this sub-task's brief is answering the question for one
+   * test case. It IS batch-friendly where that was free — see the per-provider notes below — but
+   * actually batching (grouping ~320 test cases by project, deciding page sizes, bounding concurrency
+   * across a whole sweep run) is sub-task C's job once it exists to group against; building that
+   * orchestration against no caller yet would be guessing at its shape.
+   *
+   * Jira: `fields=status` on the single-issue GET already returns `status.statusCategory.key`
+   * nested in the same response — Jira Cloud always embeds statusCategory on the status field,
+   * it isn't a separate opt-in param. So this reuses jiraFetch/getJiraConnection/jiraBaseUrlAndAuth
+   * exactly as jiraSnapshot's live-fetch fallback does, just requesting one lighter field list (no
+   * summary/description/etc — this function only ever needs to answer done-or-not).
+   * *For sub-task C*: Jira genuinely supports batching this — `jiraSearchIssues` (line ~9550) already
+   * proves the shape (`POST /rest/api/3/search/jql`, `escapeJql`-escaped `key in (...)` clause, up to
+   * JIRA_PAGE_SIZE keys per call, `fields: ["status"]`). A real sweep should very likely batch Jira
+   * lookups that way instead of calling this function 244 times — flagged, not built, here.
+   *
+   * Linear: no equivalent proven batch-by-key call exists in this codebase. `linear_tickets` is only
+   * ever populated by paging an entire team/project (fetchLinearTickets), never by a key-list query,
+   * and 75 of 76 Linear-linked test cases have no cached row to source an internal id from even if a
+   * batch-by-id call existed. The per-issue `issue(id: $id)` GraphQL query already in production use
+   * (linearComment, legacy.service.ts:~10056) is proven to accept the human-readable key directly
+   * (not just Linear's internal UUID) and to resolve to `data.issue = null` — not a thrown GraphQL
+   * error — when the key doesn't resolve (see linearComment's own `lookup?.issue?.id || issueKey`
+   * fallback, which only makes sense if a miss is a null, not an exception). Reused verbatim here.
+   */
+  async fetchLiveTicketCategory(projectId: string, provider: IntegrationProvider, issueKey: string): Promise<TicketCategoryLookup> {
+    const key = issueKey.trim();
+    if (!key) return NOT_FOUND_RESULT;
+    return provider === "jira" ? this.fetchLiveJiraTicketCategory(projectId, key) : this.fetchLiveLinearTicketCategory(projectId, key);
+  }
+
+  private mapJiraStatusCategory(categoryKey: string): NormalizedTicketDoneness | null {
+    const normalized = categoryKey.toLowerCase();
+    if (normalized === "done") return "done";
+    // Jira's statusCategory enum is exactly these three keys today ("new", "indeterminate", "done") —
+    // https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-status/ documents no
+    // others. Both non-done categories collapse to the same "not_done" verdict for this sweep's
+    // purposes; nothing downstream needs to tell "not started" apart from "in progress".
+    if (normalized === "new" || normalized === "indeterminate") return "not_done";
+    return null;
+  }
+
+  private mapLinearStateType(stateType: string): NormalizedTicketDoneness | null {
+    const normalized = stateType.toLowerCase();
+    // Linear's WorkflowStateType enum is exactly these five values today. "cancelled" counts as
+    // done for archive purposes — an abandoned ticket is exactly as much a reason to archive its
+    // test case as a completed one; the sweep isn't distinguishing "shipped" from "won't do".
+    if (normalized === "completed" || normalized === "cancelled") return "done";
+    if (normalized === "backlog" || normalized === "unstarted" || normalized === "started") return "not_done";
+    return null;
+  }
+
+  private async fetchLiveJiraTicketCategory(projectId: string, key: string): Promise<TicketCategoryLookup> {
+    let connection: Body | null;
+    try {
+      connection = await this.getJiraConnection(projectId, true);
+    } catch {
+      // requireProjectAccess isn't in play here (no userId on this path — this is a system/sweep
+      // caller, not a request handler), but getJiraConnection's own token-refresh call can still
+      // throw (a reconnect-needed BadRequestException, a network failure mid-refresh). Either way,
+      // "can't resolve a usable connection" is the same outcome as "no connection row at all" for
+      // this function's purposes.
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+
+    const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
+    let issue: Body;
+    try {
+      issue = await this.jiraFetch<Body>(`${baseUrl}/rest/api/3/issue/${encodeURIComponent(key)}?fields=status`, { headers });
+    } catch (err) {
+      const status = extractHttpStatus(err);
+      // 404 (unknown key) and 410 (Jira uses this for some deleted-issue cases) both mean "nothing
+      // to judge", the same as a cache miss — not a transient failure worth retrying or alarming on.
+      if (status === 404 || status === 410) return NOT_FOUND_RESULT;
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+
+    const categoryKey = String((issue?.fields as Body)?.status?.statusCategory?.key || "");
+    if (!categoryKey) return { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" };
+    const doneness = this.mapJiraStatusCategory(categoryKey);
+    return { found: true, doneness, rawCategory: categoryKey, reason: doneness ? "ok" : "unmapped_category" };
+  }
+
+  private async fetchLiveLinearTicketCategory(projectId: string, key: string): Promise<TicketCategoryLookup> {
+    let organizationId: string;
+    try {
+      organizationId = await this.projectOrganizationId(projectId);
+    } catch {
+      // Project deleted/inaccessible out from under a sweep mid-run (a real race across a run that
+      // can span many minutes over ~320 test cases) — same "nothing to resolve" outcome as below.
+      return NOT_CONNECTED_RESULT;
+    }
+    let connection: Body | null;
+    try {
+      connection = await this.getIntegrationConnection(organizationId, "linear", true);
+    } catch {
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+
+    const authHeader = this.linearAuthHeader(connection);
+    let data: Body;
+    try {
+      data = await this.linearGraphQL<Body>(
+        authHeader,
+        "query Issue($id: String!) { issue(id: $id) { id identifier state { type } } }",
+        { id: key }
+      );
+    } catch (err) {
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+
+    const issue = data?.issue as Body | undefined;
+    // Proven null-not-throw behavior for an unresolved key — see linearComment's identical
+    // `lookup?.issue?.id || issueKey` fallback, which only makes sense under this same assumption.
+    if (!issue) return NOT_FOUND_RESULT;
+
+    const stateType = String((issue.state as Body)?.type || "");
+    if (!stateType) return { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" };
+    const doneness = this.mapLinearStateType(stateType);
+    return { found: true, doneness, rawCategory: stateType, reason: doneness ? "ok" : "unmapped_category" };
+  }
+
+  /**
+   * Archive-sweep sub-task C's Jira path: one JQL search per up-to-JIRA_PAGE_SIZE keys instead of one
+   * REST call per key — the batch upgrade sub-task B's log flagged and deliberately didn't build.
+   * Reuses jiraSearchIssues' proven shape (POST /rest/api/3/search/jql, escapeJql-escaped `key in
+   * (...)`, `fields: ["status"]`) and mapJiraStatusCategory for the exact same category mapping
+   * fetchLiveTicketCategory's single-issue Jira path uses, so a caller gets identically-shaped
+   * TicketCategoryLookup values regardless of which path answered.
+   *
+   * A key Jira silently omits from the search response (deleted, or the searching connection can no
+   * longer see it) is reported as not_found in the returned map — Jira's `key in (...)` search does
+   * not error on an unresolvable key, it just leaves it out of `issues`, so absence is the signal.
+   */
+  async fetchLiveJiraTicketCategoriesBulk(projectId: string, issueKeys: string[]): Promise<Map<string, TicketCategoryLookup>> {
+    const keys = Array.from(new Set(issueKeys.map((key) => key.trim()).filter(Boolean)));
+    const results = new Map<string, TicketCategoryLookup>();
+    if (!keys.length) return results;
+
+    let connection: Body | null;
+    try {
+      connection = await this.getJiraConnection(projectId, true);
+    } catch {
+      connection = null;
+    }
+    if (!connection) {
+      for (const key of keys) results.set(key, NOT_CONNECTED_RESULT);
+      return results;
+    }
+    const { baseUrl, headers } = this.jiraBaseUrlAndAuth(connection);
+
+    for (let i = 0; i < keys.length; i += JIRA_PAGE_SIZE) {
+      const chunk = keys.slice(i, i + JIRA_PAGE_SIZE);
+      const jql = `key in (${chunk.map((key) => `"${escapeJql(key)}"`).join(", ")})`;
+      let data: Body;
+      try {
+        data = await this.jiraFetch<Body>(`${baseUrl}/rest/api/3/search/jql`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ jql, maxResults: chunk.length, fields: ["status"] })
+        });
+      } catch (err) {
+        // One chunk's search failing (network blip, rate limit) must not blank out every other
+        // chunk's already-resolved results — matches this function's own single-issue sibling's
+        // per-key isolation, just applied per-chunk instead of per-key.
+        const detail = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+        for (const key of chunk) results.set(key, { found: false, doneness: null, rawCategory: null, reason: "error", detail });
+        continue;
+      }
+      const found = new Set<string>();
+      for (const issue of normalizeJsonArray(data.issues)) {
+        const key = String(issue.key || "");
+        if (!key) continue;
+        found.add(key);
+        const categoryKey = String((issue.fields as Body)?.status?.statusCategory?.key || "");
+        if (!categoryKey) {
+          results.set(key, { found: true, doneness: null, rawCategory: null, reason: "unmapped_category" });
+          continue;
+        }
+        const doneness = this.mapJiraStatusCategory(categoryKey);
+        results.set(key, { found: true, doneness, rawCategory: categoryKey, reason: doneness ? "ok" : "unmapped_category" });
+      }
+      for (const key of chunk) {
+        if (!found.has(key)) results.set(key, NOT_FOUND_RESULT);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Archive-sweep sub-task C: stages one archive proposal for one test case, in the exact shape
+   * applyZyraChatOperations' own archive branch already builds (legacy.service.ts:~11593 —
+   * `{ opType: "archive", testcaseId, externalId, fields: { status: "Archived" }, reason }`) so
+   * zyraSave/processZyraSaveEntries* can execute it later with no new shape to support. Unlike a
+   * chat turn, there is no live user/session here — requested_by is NULL (V107), provider is
+   * ZYRA_ARCHIVE_SWEEP_PROVIDER, chat_session_id stays unset (NULL), exactly like a task-board row.
+   *
+   * Race-safe by construction, not by a pre-check: relies entirely on
+   * idx_ai_generation_requests_sweep_archive_dedup (V108) rejecting a second unresolved proposal for
+   * the same testcaseId with a 23505, the same "try the write, recover on conflict" shape
+   * IntegrationSyncService.startRun already uses for its own nightly-cycle dedup index. The caller
+   * (ZyraArchiveSweepService) also pre-filters against already-staged ids before ever reaching here,
+   * purely to avoid spending Jira/Linear API budget on candidates it already knows are covered —
+   * that pre-filter is an optimization with its own race window (TOCTOU against a concurrent sweep),
+   * not this function's safety net; this index is.
+   */
+  async stageArchiveSweepProposal(projectId: string, testcaseId: string, reason: string): Promise<"staged" | "already_staged" | "skipped"> {
+    let row: Body;
+    try {
+      row = await this.getTestCase(testcaseId);
+    } catch {
+      // Deleted/soft-deleted since the candidate query ran, or never belonged to this project —
+      // either way there is nothing left to propose archiving.
+      return "skipped";
+    }
+    if (row.projectId !== projectId) return "skipped";
+    // Re-checked here, not just at candidate-selection time: a run can span real wall-clock time
+    // over ~320 candidates, and this test case may have been archived (by a human, or by an earlier
+    // save of an EARLIER sweep's proposal for it) since the candidate query ran.
+    if (row.status === "Archived") return "skipped";
+
+    const proposal = { opType: "archive", testcaseId: row.id, externalId: row.externalId, fields: { status: "Archived" }, reason };
+    const now = new Date().toISOString();
+    const activityLog = [{ actor: "agent", title: "Archive sweep proposal", detail: reason, createdAt: now }];
+    // A test case can genuinely carry both a Jira and a Linear key at once (no constraint anywhere
+    // rules it out) — populate whichever are actually set, rather than assuming exactly one. Lets
+    // the task-board UI's ticket badge/link (which reads these columns, not the proposal payload)
+    // work for a sweep-staged row the same way it already does for a task-board row that came with
+    // jiraIssueKeys attached at creation.
+    const jiraIssueKeys = row.jiraIssueKey ? [String(row.jiraIssueKey)] : [];
+    const linearIssueKeys = row.linearIssueKey ? [String(row.linearIssueKey)] : [];
+
+    try {
+      await this.db.query(
+        `INSERT INTO ai_generation_requests
+           (project_id, requested_by, provider, model, user_story, requested_count, generated_count,
+            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys)
+         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb)`,
+        [
+          projectId,
+          ZYRA_ARCHIVE_SWEEP_PROVIDER,
+          `Zyra archive sweep: ${row.externalId} — ${String(row.title || "").slice(0, 200)}`,
+          JSON.stringify([proposal]),
+          ZYRA_AGENT_NAME,
+          JSON.stringify(activityLog),
+          row.id,
+          JSON.stringify(jiraIssueKeys),
+          JSON.stringify(linearIssueKeys)
+        ]
+      );
+      return "staged";
+    } catch (err) {
+      const isDedupConflict =
+        (err as { code?: string })?.code === "23505" &&
+        String((err as { constraint?: string })?.constraint || "") === "idx_ai_generation_requests_sweep_archive_dedup";
+      if (isDedupConflict) return "already_staged";
+      throw err;
+    }
+  }
+
+  // ── Notifications ──
+  // Investigated first: `notifications` (V6) has never had a writer anywhere in this codebase, and
+  // GET /api/notifications / POST /api/notifications/:id/read were both hardcoded stubs ("not
+  // implemented yet... a missing feature, recorded in docs/e2e-coverage-waves.md"). The frontend
+  // bell dropdown (TopBar.tsx) already calls the real list endpoint and renders whatever it gets —
+  // it was just never getting anything real. These three methods are the first real read/write path
+  // this table has ever had, built now because the archive sweep needs a real recipient, not a stub.
+
+  /** Everyone who can actually reach this project today (same JOIN requireProjectAccess uses — no
+   *  org-role bypass exists there, so none is added here either) gets one notification row each, in
+   *  a single INSERT..SELECT so "zero members" and "project archived" both fall out naturally as
+   *  zero rows rather than needing separate guards. `dedupeKey`, when given, rides the same
+   *  ON CONFLICT DO NOTHING partial-unique-index technique V90/V108 already established in this
+   *  codebase — a retried or overlapping caller's duplicate attempt is silently absorbed per
+   *  recipient, not per whole call, so "3 of 5 members already notified today" still notifies the
+   *  other 2 rather than skipping the batch entirely. Returns how many rows were actually inserted
+   *  (0 is a normal, valid outcome — no members, or everyone already had today's dedupe key). Never
+   *  throws for "nothing to notify"; only a genuine DB failure propagates, left to the caller to
+   *  decide whether that should block anything (the archive sweep does not — see its own comment).
+   */
+  async notifyProjectMembers(
+    projectId: string,
+    opts: { type: string; title: string; body?: string; linkEntityType?: string; linkEntityId?: string; dedupeKey?: string }
+  ): Promise<number> {
+    const res = await this.db.query(
+      `INSERT INTO notifications (user_id, type, title, body, link_entity_type, link_entity_id, dedupe_key)
+       SELECT pm.user_id, $2, $3, $4, $5, $6, $7
+       FROM project_members pm
+       JOIN projects p ON p.id = pm.project_id
+       WHERE pm.project_id = $1 AND p.archived_at IS NULL
+       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [projectId, opts.type, opts.title, opts.body || null, opts.linkEntityType || null, opts.linkEntityId || null, opts.dedupeKey || null]
+    );
+    return res.rows.length;
+  }
+
+  /** Newest first, capped at 50 — this list has never had real volume to page through, and the
+   *  dropdown it feeds (TopBar.tsx) has no pagination UI to hand a cursor to. Deliberately NOT run
+   *  through toCamel: the frontend's AppNotification type already expects the raw column names
+   *  (link_entity_type/link_entity_id) — it was written against this table's real shape before this
+   *  method existed to serve it, and matching that is what lets the existing UI start working with
+   *  no frontend change. */
+  async notificationsForUser(userId: string | null | undefined): Promise<Body[]> {
+    const uid = this.requireSession(userId);
+    const res = await this.db.query(
+      `SELECT id, type, title, body, link_entity_type, link_entity_id, read_at, created_at
+       FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [uid]
+    );
+    return res.rows;
+  }
+
+  /** Scoped to the caller's own id (user_id = $2) — the gap the removed stub's own comment called
+   *  out ("mark-as-read reported success for any id to anybody"). COALESCE(read_at, now()) makes a
+   *  double-click or a second tab's repeat call a harmless no-op instead of moving the timestamp
+   *  forward on every call, the same idempotency zyraCloseTask already applies to "close". */
+  async markNotificationRead(userId: string | null | undefined, notificationId: string): Promise<void> {
+    const uid = this.requireSession(userId);
+    if (!isUuid(notificationId)) throw new NotFoundException({ error: "Notification not found" });
+    const res = await this.db.query(
+      "UPDATE notifications SET read_at = COALESCE(read_at, now()) WHERE id = $1 AND user_id = $2 RETURNING id",
+      [notificationId, uid]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Notification not found" });
   }
 
   private async generateZyraWithProvider(params: {
@@ -14085,9 +16373,21 @@ export class LegacyService implements OnModuleInit {
     return [
       "You are Zyra the Test Generator, an AI testcase generation agent.",
       "Generate practical, detailed QA testcases from the supplied product story, user context, Jira/Linear tickets, knowledge-base sources, Zyra memory, and existing testcase repository context.",
+      "When a knowledge-base or ticket source states a specific value — a timeout, limit, threshold, format, count, or other concrete number or rule — use that exact value in the relevant testcase's steps, test data, or expected result. Never substitute a generic or invented placeholder value when the sources already gave you the real one.",
       "Review existing testcases before generating. Do not duplicate existing coverage; instead fill gaps, deepen weak coverage, or create clearly distinct edge cases.",
-      "Prioritize edge cases, boundary values, negative paths, permissions, data integrity, state transitions, and traceability.",
-      "Return only valid JSON matching this shape: {\"drafts\":[{\"title\":\"\",\"preconditions\":\"\",\"stepsJson\":\"[]\",\"testData\":\"\",\"expectedSummary\":\"\",\"priority\":\"P1|P2|P3\",\"tags\":[\"\"],\"sourceRefs\":[\"\"]}]}",
+      "Apply these test design techniques wherever they genuinely fit the ticket's actual fields and flows — skip only the ones that truly don't apply, not by default:",
+      "- Equivalence Partitioning: for each meaningful input, split it into valid and invalid classes and draft one representative case per class.",
+      "- Boundary Value Analysis: for each bounded, numeric, or length-limited field, test exactly at and immediately beside each boundary (min-1, min, min+1, max-1, max, max+1).",
+      "- Decision Table Testing: when multiple conditions or business rules interact, enumerate the meaningfully distinct combinations as rows and draft one case per row.",
+      "- State Testing: for any status or lifecycle field, cover every valid transition plus at least one invalid or blocked transition attempt.",
+      "- Use Case Testing: cover the primary end-to-end flow plus at least one alternate or exception flow.",
+      "- Pairwise Testing: when several independent input dimensions exist and full combinatorial coverage is impractical, choose a representative combination set that covers every pair of dimension values at least once.",
+      "- Error Guessing: add cases for likely failure modes a formal technique above wouldn't surface — double-submit, empty/null state, malformed input, a network failure mid-action, concurrent edits.",
+      "- Security Perspective: check auth/authorization boundaries, input sanitization, and data exposure for anything OWASP-relevant the ticket's surface touches.",
+      `Return only valid JSON matching this shape: {"drafts":[{"title":"","preconditions":"","stepsJson":"[]","testData":"","expectedSummary":"","priority":"P1|P2|P3","severity":"Critical|High|Medium|Low","component":"","tags":[""],"sourceRefs":[""],"techniques":[""]}]}`,
+      `For every draft, set techniques to the technique(s) from this exact set that produced it: ${ZYRA_TECHNIQUES.join(", ")}. Use "general" only when a draft genuinely doesn't map to any technique above; list more than one when several genuinely apply.`,
+      `severity is blast radius if this scenario fails in production — Critical/High/Medium/Low — and must be judged independently of priority (priority is scheduling urgency; a P3 case can still be Critical severity, e.g. a rarely-hit but catastrophic data-loss path). Choose exactly one of the four values; never invent a fifth.`,
+      "component is the feature area or module this testcase exercises (e.g. \"Auth\", \"Billing\", \"Checkout\"). Existing testcases below list their own component — reuse one of those exact names whenever this draft genuinely belongs to that same area, instead of inventing a new, similarly-named one. Only introduce a new component name when none of the existing ones actually fit.",
       "Each source below (knowledge base, Jira/Linear tickets, existing testcases, related bugs) is given a label, e.g. 'KB 2', 'HBP-14', 'AIP-TC-73', 'BUG 3'. For every draft, set sourceRefs to the exact labels of the sources that draft actually draws on — copy the label text exactly as given, do not invent or paraphrase one. Leave sourceRefs an empty array when a draft is not grounded in any specific source (general QA practice only).",
       "Do not include markdown fences, explanations, comments, or text before or after the JSON object.",
       "stepsJson must be a JSON string containing an array of step objects with stepNumber, action, and expectedResult fields.",
@@ -14106,7 +16406,7 @@ export class LegacyService implements OnModuleInit {
       ? input.linear.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n")
       : "No Linear tickets were selected.";
     const existingTestcases = input.existingTestcases.length
-      ? input.existingTestcases.map((item) => `${item.externalId}: ${item.title}\nPriority: ${item.priority}; Status: ${item.status}\n${item.description}\nSteps: ${item.stepsSummary}`).join("\n\n")
+      ? input.existingTestcases.map((item) => `${item.externalId}: ${item.title}\nPriority: ${item.priority}; Status: ${item.status}; Component: ${item.component || "unset"}\n${item.description}\nSteps: ${item.stepsSummary}`).join("\n\n")
       : "No existing testcases were available.";
     const bugs = input.bugs?.length
       ? input.bugs.map((item, index) => `BUG ${index + 1}: ${item.title}\nStatus: ${item.status}; Priority: ${item.priority || "unset"}\n${item.description}`).join("\n\n")
@@ -14177,16 +16477,41 @@ export class LegacyService implements OnModuleInit {
     return resolved;
   }
 
+  // Guards the plain create/update endpoints' sourceRefs input the same way sanitizeZyraSourceRefs
+  // guards Zyra's own output. Zyra's citations are already verified against zyraSourceRefIndex before
+  // they ever reach a testcases row, but a raw REST/MCP call has no such check — and this column is
+  // now rendered and clickable in the repository table and detail panel, not just flashed in a
+  // transient review screen, so a malformed or oversized array can no longer be silently trusted.
+  // Same 20-entry cap as sanitizeZyraSourceRefs; entries missing a valid type/id are dropped rather
+  // than rejecting the whole request, matching how every other optional field on this endpoint
+  // already behaves (see insertTestCaseWithClient's own `body.x || y` defaulting).
+  private static sanitizeSourceRefsInput(raw: unknown): ZyraSourceRef[] {
+    const validTypes = new Set(["knowledge_document", "knowledge_file", "jira_ticket", "testcase", "bug"]);
+    if (!Array.isArray(raw)) return [];
+    const resolved: ZyraSourceRef[] = [];
+    for (const entry of raw.slice(0, 20)) {
+      if (!entry || typeof entry !== "object") continue;
+      const type = (entry as Body).type;
+      const id = (entry as Body).id;
+      if (typeof type !== "string" || !validTypes.has(type)) continue;
+      if (typeof id !== "string" || !id.trim()) continue;
+      const title = typeof (entry as Body).title === "string" ? (entry as Body).title.trim() : "";
+      resolved.push({ type: type as ZyraSourceRef["type"], id: id.trim(), title: title || id.trim() });
+    }
+    return resolved;
+  }
+
   private testcaseRangeConfig(range: string): { requestedCount: number; instruction: string } {
     switch (range) {
-      case "minimum":
-        return { requestedCount: 4, instruction: "Generate only the minimum testcases needed — aim for 1 to 3 highly targeted scenarios covering the most critical paths. Never generate more than 5 testcases." };
+      case "1-10":
+        return { requestedCount: 10, instruction: "Generate between 1 and 10 testcases. Prioritise quality and relevance; include edge cases only where genuinely important." };
       case "10-30":
         return { requestedCount: 25, instruction: "Generate between 10 and 25 testcases. Cover the main flows, key edge cases, negative scenarios, and important variations. Aim for at least 10 distinct testcases." };
       case "all":
         return { requestedCount: 50, instruction: "Generate as many testcases as possible — cover every applicable flow, edge case, boundary value, negative path, and variation. Be exhaustive and do not cap yourself." };
-      default: // "1-10"
-        return { requestedCount: 10, instruction: "Generate between 1 and 10 testcases. Prioritise quality and relevance; include edge cases only where genuinely important." };
+      case "30-50":
+      default: // unset or unrecognized values resolve to the product default (30-50)
+        return { requestedCount: 40, instruction: "Generate between 30 and 50 testcases. Cover primary flows, edge cases, negative scenarios, boundary values, and meaningful variations for thorough coverage. Aim for at least 30 distinct testcases and do not exceed 50." };
     }
   }
 
@@ -14216,6 +16541,60 @@ export class LegacyService implements OnModuleInit {
     ].filter(Boolean).join("\n\n");
   }
 
+  /**
+   * Validates a draft's `techniques` against ZYRA_TECHNIQUES rather than trusting the model's
+   * output blindly. Tagging is an enhancement, never a blocking requirement (standing error-
+   * handling bar) — every input shape degrades to `["general"]` instead of throwing: missing
+   * field, non-array, empty array, every entry unrecognized. An unrecognized entry is dropped and
+   * logged (visibility into model drift) rather than surfaced or failing the draft; recognized
+   * entries are deduped but otherwise all kept, since a case can genuinely combine techniques
+   * (e.g. a boundary case for a field only reachable via a specific status transition).
+   */
+  private normalizeZyraTechniques(raw: unknown): ZyraTechnique[] {
+    if (!Array.isArray(raw) || raw.length === 0) return ["general"];
+    const known = new Set<string>(ZYRA_TECHNIQUES);
+    const valid: ZyraTechnique[] = [];
+    const seen = new Set<string>();
+    for (const entry of raw) {
+      const value = String(entry ?? "").trim().toLowerCase();
+      if (!value || seen.has(value)) continue;
+      if (!known.has(value)) {
+        this.logger.warn(`Zyra draft used an unrecognized technique tag "${value.slice(0, 80)}" — dropped, not surfaced`);
+        continue;
+      }
+      seen.add(value);
+      valid.push(value as ZyraTechnique);
+    }
+    return valid.length ? valid : ["general"];
+  }
+
+  /**
+   * Validates a draft's `severity` against the same fixed vocabulary the manual create/edit form
+   * uses (TESTCASE_SEVERITIES in testcases/page.tsx — "Same vocabulary as bugs.severity" per that
+   * file's own comment; BUG_SEVERITIES is reused here rather than duplicated, so the two can never
+   * drift apart). A strict allow-list, not a synonym map: a model returning "Blocker"/"P1"/"Urgent"
+   * is discarded to null rather than guessed at, matching this generation path's standing rule that
+   * an unrecognized field value is dropped, never invented into something plausible-looking.
+   */
+  private normalizeZyraSeverity(raw: unknown): string | null {
+    const value = String(raw ?? "").trim();
+    if (!value) return null;
+    return BUG_SEVERITIES.find((severity) => severity.toLowerCase() === value.toLowerCase()) || null;
+  }
+
+  /**
+   * `component` is free text (testcases.component VARCHAR(255), no CHECK constraint — see
+   * TESTCASE_FIELD_LIMITS), so this only trims and bounds it to the column width rather than
+   * validating against a fixed set. Truncating (not rejecting) an over-long value keeps a single
+   * verbose field from discarding an otherwise-good draft.
+   */
+  private normalizeZyraComponent(raw: unknown): string | null {
+    const value = String(raw ?? "").trim();
+    if (!value) return null;
+    const max = LegacyService.TESTCASE_FIELD_LIMITS.find((limit) => limit.field === "component")?.max ?? 255;
+    return value.slice(0, max);
+  }
+
   private normalizeAiDrafts(raw: unknown, requestedCount: number): Body[] {
     const candidates = this.extractAiDraftCandidates(raw);
     if (!candidates.length) throw new BadRequestException({ error: "AI testcase generation returned no testcase drafts" });
@@ -14229,7 +16608,14 @@ export class LegacyService implements OnModuleInit {
         testData: String(draft.testData || ""),
         expectedSummary: String(draft.expectedSummary || draft.expected || "The workflow behaves as expected."),
         priority: String(draft.priority || (index < 2 ? "P1" : "P2")),
+        // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — the model
+        // is now asked for both (zyraSystemPrompt) and this is where the raw answer is validated
+        // before it ever reaches a payload. Both default to null (same as a blank manual field),
+        // never block the draft.
+        severity: this.normalizeZyraSeverity(draft.severity),
+        component: this.normalizeZyraComponent(draft.component),
         tags,
+        techniques: this.normalizeZyraTechniques(draft.techniques),
         // Raw, unvalidated labels straight from the model — sanitizeZyraSourceRefs (called by
         // whichever generation path has the turn's known-label index in scope) is what turns this
         // into a trustworthy citation list. Never rendered or persisted as-is.
@@ -14566,7 +16952,7 @@ export class LegacyService implements OnModuleInit {
       method: "POST",
       headers,
       body: JSON.stringify(openAiBody),
-      signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
+      signal: LegacyService.zyraProviderSignal(LegacyService.zyraGenerateTimeoutMs(params.input.requestedCount))
     });
     const body = await response.json().catch(() => ({} as Body)) as Body;
     if (!response.ok) {
@@ -14643,7 +17029,7 @@ export class LegacyService implements OnModuleInit {
             }
           ]
         }),
-        signal: LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS)
+        signal: LegacyService.zyraProviderSignal(LegacyService.zyraGenerateTimeoutMs(params.input.requestedCount))
       });
       const body = await response.json().catch(() => ({} as Body)) as Body;
       if (!response.ok) {
@@ -15374,7 +17760,27 @@ export class LegacyService implements OnModuleInit {
    * again.
    */
   private static readonly ZYRA_ROUTER_TIMEOUT_MS = 60_000;
+  // Base budget for a small batch (<=10 testcases — the old, and still smallest, tier). Kept as its
+  // own constant because zyraGenerateTimeoutMs(10) === this is exactly the pre-existing behaviour
+  // for the "1-10" tier and the generation_retry batch, and several call sites still reason about it
+  // by name.
   private static readonly ZYRA_GENERATE_TIMEOUT_MS = 180_000;
+  private static readonly ZYRA_GENERATE_TIMEOUT_MAX_MS = 360_000;
+
+  /*
+   * The generate-stage budget scales with how much was actually asked for. This used to be the flat
+   * ZYRA_GENERATE_TIMEOUT_MS (180s) for every tier, including "all" (up to 50 testcases, the same
+   * max_tokens=16000 ceiling as everything else) — a large batch takes meaningfully longer to
+   * produce because it actually fills that token budget instead of finishing well under it, so the
+   * fixed 180s was already tight for "all" and became the common case once the default range moved
+   * from "1-10" (this function's floor) to "30-50" (Basecamp: 30-50 default generation now times
+   * out at the old 180s ceiling). Linear between the 180s floor at 10 and the 360s ceiling at 50,
+   * i.e. roughly matching max_tokens's own growth over that same range.
+   */
+  private static zyraGenerateTimeoutMs(requestedCount: number): number {
+    const extra = Math.max(0, requestedCount - 10) * 4_500;
+    return Math.min(LegacyService.ZYRA_GENERATE_TIMEOUT_MAX_MS, LegacyService.ZYRA_GENERATE_TIMEOUT_MS + extra);
+  }
 
   /** A fresh per-attempt budget — a model-candidate fallback loop must not have an earlier candidate's stall eat into the next one's time. */
   private static zyraProviderSignal(ms: number): AbortSignal {
@@ -15513,6 +17919,18 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_COMPLETION_CLAIM =
     /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b|\b(test\s?cases?|suite)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|generated|saved|archived|updated|deleted|removed|moved)\b/i;
 
+  // Same pattern as ZYRA_COMPLETION_CLAIM, "suite" removed from every noun alternative — used only
+  // for a turn whose operations are ALL create_suite (reconcileZyraReply's own bypass for that
+  // shape, below). That bypass exists because a genuine "Created the Regression suite" would
+  // otherwise trip ZYRA_COMPLETION_CLAIM itself ("suite" is one of its nouns), so the full check
+  // can't run there — but skipping it entirely left a gap: a reply that ALSO claims an unrelated,
+  // unrequested testcase mutation in the same message (hallucinated content with no corresponding
+  // operation at all) went uncaught, since nothing else in this function inspects that branch's
+  // reply text. This narrower pattern still catches a testcase-specific claim while never matching
+  // on the word "suite" itself, so a true suite-only success keeps passing through untouched.
+  private static readonly ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM =
+    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|repository)\b|\b(test\s?cases?)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b|\b(test\s?cases?)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|generated|saved|archived|updated|deleted|removed|moved)\b/i;
+
   // A reply that already admits nothing happened — "Nothing was saved", "No test cases were
   // created", "could not create/save" — must not be wrapped a second time; the completion-claim
   // guard above exists to add an honest correction, not to stack one on top of an honest refusal.
@@ -15520,8 +17938,26 @@ export class LegacyService implements OnModuleInit {
   // genuinely staged batch ("nothing IS changed…", "…staged for review", "…until you save them") —
   // the past-tense-only "nothing WAS saved" wording used to miss this, so an honest, correctly staged
   // reply got double-wrapped with the same warning it was already giving the user.
+  // "generated"/"changed" added to both verb lists below — zyraDegradedDecision's own hardcoded
+  // note ("no test cases were generated or changed") used exactly this wording, and this regex's
+  // verb lists didn't recognize it as an honest disclosure: ZYRA_COMPLETION_CLAIM's own verb list
+  // DOES include "generated", so every degraded-mode reply (AI provider unreachable, key revoked,
+  // out of credit — any reason string) tripped the false-completion banner and got a second,
+  // contradictory "Sorry! Nothing was saved... Ask me to go ahead" stacked on top of a reply that
+  // had already said precisely that. Safe to widen: both alternatives are anchored on "nothing" /
+  // "no test case(s)" immediately before the verb, so this can only ever recognize a genuine
+  // negation — it cannot swallow a real positive completion claim ("test cases were generated" with
+  // no "no"/"nothing" in front still trips ZYRA_COMPLETION_CLAIM as before).
+  // "i did not save (it|them)" added — applyStorageGateToGenerated forces actionType "answer" on a
+  // real generation reply so it never routes through the save-branch's narrower
+  // zyraPersistedClaimBanner (which correctly allows "drafted"/"staged" wording). That reroutes it
+  // through the wider zyraFalseCompletionBanner/ZYRA_COMPLETION_CLAIM instead — the check meant for
+  // genuine answer turns — and the gate's own prefix wasn't recognized as an honest disclosure, so
+  // every generation reply shown while test case storage is disabled got a false "Sorry! Nothing was
+  // saved... Ask me to go ahead" stacked on top, with a call-to-action that is actively wrong there
+  // (asking Zyra to proceed cannot save anything while the capability itself is off).
   private static readonly ZYRA_ALREADY_DISCLOSED =
-    /\b(nothing (is|was|has\s+been) (saved|changed|created|written)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added)|could\s+not\s+(create|save|generate|archive|update|add)|generation\s+is\s+(turned\s+off|disabled|off)|staged\s+for\s+(your\s+)?review|awaiting\s+(your\s+)?(go[\s-]?ahead|confirmation|approval)|until\s+you\s+save|not\s+(yet\s+)?(saved|written|applied)\s+to\s+the\s+repository)\b/i;
+    /\b(nothing (is|was|has\s+been) (saved|changed|created|written|generated)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added|generated|changed)|could\s+not\s+(create|save|generate|archive|update|add)|i\s+did\s+not\s+save\s+(it|them)|generation\s+is\s+(turned\s+off|disabled|off)|staged\s+for\s+(your\s+)?review|awaiting\s+(your\s+)?(go[\s-]?ahead|confirmation|approval)|until\s+you\s+save|not\s+(yet\s+)?(saved|written|applied)\s+to\s+the\s+repository)\b/i;
 
   // Deterministic per-suite footer built from applied.moveBreakdown (ground truth read back from the
   // database in zyraMoveBreakdown), appended to every reconcileZyraReply return path. The model's own
@@ -15552,8 +17988,12 @@ export class LegacyService implements OnModuleInit {
   // describing a create/update/archive that never actually got structured into real operations — the
   // ALREADY_DISCLOSED bypass below exists to avoid double-warning a genuinely staged batch, and must
   // never apply to a turn that is not one.
-  private zyraFalseCompletionBanner(reply: string, salvaged = false): string {
-    if (!LegacyService.ZYRA_COMPLETION_CLAIM.test(reply)) return "";
+  // claimPattern defaults to the full ZYRA_COMPLETION_CLAIM; the create_suite-only branch of
+  // reconcileZyraReply passes ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM instead, so a genuine suite-only
+  // success ("Created the Regression suite") never trips this on the word "suite" itself, while an
+  // unrelated hallucinated testcase claim in the same reply still does.
+  private zyraFalseCompletionBanner(reply: string, salvaged = false, claimPattern: RegExp = LegacyService.ZYRA_COMPLETION_CLAIM): string {
+    if (!claimPattern.test(reply)) return "";
     if (!salvaged && LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
     return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
   }
@@ -15600,8 +18040,15 @@ export class LegacyService implements OnModuleInit {
       const banner = !applied.testcases.length ? this.zyraFalseCompletionBanner(decision.reply, decision.__salvaged) : "";
       return banner ? [banner, "", decision.reply].join("\n") + moveSuffix : decision.reply + moveSuffix;
     }
-    // Creating an empty suite touches no testcases and is still a complete success.
-    if (decision.operations.length && decision.operations.every((op) => op.type === "create_suite")) return decision.reply + moveSuffix;
+    // Creating an empty suite touches no testcases and is still a complete success — but the reply
+    // can still separately hallucinate an unrelated testcase claim with no corresponding operation
+    // at all, which nothing else in this function would ever see if this branch returned unchecked
+    // (see ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM's own comment for why the full completion-claim
+    // regex can't be used directly here).
+    if (decision.operations.length && decision.operations.every((op) => op.type === "create_suite")) {
+      const banner = this.zyraFalseCompletionBanner(decision.reply, decision.__salvaged, LegacyService.ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM);
+      return (banner ? banner + "\n\n" : "") + decision.reply + moveSuffix;
+    }
 
     // create_suite is the one operation that is not expected to produce a testcase row.
     const requested = decision.operations.filter((op) => op.type !== "create_suite").length;
@@ -15636,16 +18083,27 @@ export class LegacyService implements OnModuleInit {
     const banner = proposedCount > 0 ? this.zyraPersistedClaimBanner(decision.reply) : "";
     const bannerPrefix = banner ? banner + "\n\n" : "";
 
-    if (appliedCount < requested) {
+    // unresolvedMoveTargetCount catches a shortfall appliedCount/requested structurally cannot: one
+    // move_to_suite operation can resolve anywhere from 0 to all of its named ids, so "2 rows moved,
+    // 1 operation requested" always reads as full success by the operation-count comparison alone,
+    // even when 3 of 5 named ids never existed. See applyZyraChatOperations' own comment (F4).
+    const unresolvedMoves = applied.unresolvedMoveTargetCount || 0;
+    if (appliedCount < requested || unresolvedMoves > 0) {
       // The reasons are already in the activity log this turn; naming them here keeps the chat itself
       // truthful instead of making the user open the activity panel to find out.
       const reasons = applied.activity
         .filter((entry) => /could not|skipped/i.test(String(entry.title || "")))
         .map((entry) => String(entry.detail || entry.title))
         .filter(Boolean);
+      // The two shortfalls are independent and can both be true in the same turn (an update that
+      // never resolved to a row, and a move that only partially matched its named ids) — state
+      // whichever applies rather than picking one wording and silently dropping the other.
+      const headline = [
+        appliedCount < requested ? `${appliedCount} of ${requested} test case operation(s) were drafted for review.` : "",
+        unresolvedMoves > 0 ? `${unresolvedMoves} named test case(s) could not be moved.` : ""
+      ].filter(Boolean).join(" ");
       return bannerPrefix + [
-        `⚠️ ${appliedCount} of ${requested} test case operation(s) were drafted for review.` +
-          (reasons.length ? ` ${reasons.join(" ")}` : " The rest were not drafted."),
+        `⚠️ ${headline}` + (reasons.length ? ` ${reasons.join(" ")}` : appliedCount < requested ? " The rest were not drafted." : ""),
         "",
         decision.reply + reviewHint
       ].join("\n") + moveSuffix;
@@ -15754,9 +18212,9 @@ export class LegacyService implements OnModuleInit {
     // reported nothing.
     if (routed?.exhaustive) return { testcaseRange: "all", requestedCount: this.testcaseRangeConfig("all").requestedCount };
     const routedCount = Number(routed?.requestedCount);
-    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(25, Math.floor(routedCount)) };
+    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(50, Math.floor(routedCount)) };
     const explicit = message.match(/\b(\d{1,2})\s+(?:testcases|test cases|tests|cases)\b/i);
-    if (explicit) return { requestedCount: Math.max(1, Math.min(25, Number(explicit[1]))) };
+    if (explicit) return { requestedCount: Math.max(1, Math.min(50, Number(explicit[1]))) };
     const lower = message.toLowerCase();
     const wantsExhaustive = /\ball( the)? possible\b|as many as possible|\bexhaustive\b|every (scenario|edge case|flow|case)|full coverage|\ball types?\b/.test(lower);
     const range = wantsExhaustive ? "all" : projectTestcaseRange;
@@ -15850,8 +18308,8 @@ export class LegacyService implements OnModuleInit {
   private async projectSuiteSummaries(projectId: string): Promise<Array<{ id: string; name: string; testCaseCount: number }>> {
     const suites = await this.db.query(
       `SELECT s.id, s.name, COUNT(t.id)::int AS test_case_count
-       FROM suites s LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
-       WHERE s.project_id = $1
+       FROM suites s LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL AND COALESCE(t.status,'') <> 'Archived'
+       WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id, s.name
        ORDER BY s.position, s.name
        LIMIT 50`,
@@ -15896,7 +18354,7 @@ export class LegacyService implements OnModuleInit {
            COUNT(*)::int AS testcase_count,
            COUNT(*) FILTER (WHERE jira_issue_key IS NOT NULL AND COALESCE(status, '') <> 'Archived')::int AS linked_jira_testcase_count
          FROM testcases
-         WHERE project_id = $1 AND deleted_at IS NULL`,
+         WHERE project_id = $1 AND deleted_at IS NULL AND COALESCE(status,'') <> 'Archived'`,
         [projectId]
       ).catch(() => ({ rows: [{}] as Body[] })),
       this.db.query(
@@ -16091,16 +18549,37 @@ export class LegacyService implements OnModuleInit {
     const values: any[] = [testcaseId];
     for (const [key, column] of LegacyService.ZYRA_PATCH_FIELD_COLUMNS) {
       if (fields[key] === undefined) continue;
-      values.push(column === "steps" ? JSON.stringify(this.safeSteps(fields[key])) : fields[key]);
+      // Double-encoded on purpose, matching insertTestCaseWithClient/updateTestCaseWithClient's own
+      // stepsJson handling: this function doesn't funnel through either of those, so it needs its
+      // own extra JSON.stringify to land in the same jsonb string-scalar shape parseSteps() expects
+      // — see "[Zyra] Test Steps... Missing After Saving Generated Test Cases".
+      values.push(column === "steps" ? JSON.stringify(JSON.stringify(this.safeSteps(fields[key]))) : fields[key]);
       sets.push(`${column} = $${values.length}${column === "steps" ? "::jsonb" : ""}`);
     }
-    if (!sets.length) return;
+    if (!sets.length) return null;
     values.push(actorId);
-    await client.query(`UPDATE testcases SET ${sets.join(", ")}, updated_by = $${values.length}, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, values);
+    // RETURNING project_id only — this method has no projectId parameter of its own (it's called
+    // from inside batch loops that already have one), so this is purely for the standalone
+    // patchTestCaseFromZyra wrapper below to enqueue an embedding refresh once ITS OWN transaction
+    // commits. Not used, and not needed, by the batch-loop callers (see zyraSave's own enqueue
+    // over its returned `testcases`, keyed off the outer transaction's commit instead).
+    const res = await client.query<{ project_id: string }>(
+      `UPDATE testcases SET ${sets.join(", ")}, updated_by = $${values.length}, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING project_id`,
+      values
+    );
+    return res.rows[0]?.project_id ?? null;
   }
 
   private async patchTestCaseFromZyra(testcaseId: string, actorId: string | null, fields: Body) {
-    await this.db.transaction((client) => this.patchTestCaseFromZyraWithClient(client, testcaseId, actorId, fields));
+    // Currently unused in practice — every real Zyra update/archive write goes through
+    // zyraSave -> zyraSaveAttempt -> processZyraSaveEntries[Sequential|Batched], which call
+    // patchTestCaseFromZyraWithClient directly inside their own shared transaction. Kept correct
+    // (rather than deleted) as the one standalone entry point for this operation; if a future
+    // caller uses it directly, it still needs to enqueue post-commit like insertTestCase/
+    // updateTestCase — same nested-transaction race reasoning as insertTestCaseWithClient's
+    // comment explains.
+    const projectId = await this.db.transaction((client) => this.patchTestCaseFromZyraWithClient(client, testcaseId, actorId, fields));
+    if (projectId) this.enqueueTestcaseEmbedding(projectId, testcaseId, "updated");
   }
 
   private chatDraftRow(value: Body, action: string, reason?: string): Body {
@@ -16114,12 +18593,24 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
+      // and save already carry both fields correctly; this row is what the chat/task-board UI
+      // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
+      // so an explicit "" edit (clearing a previously-set value) isn't coerced back to null here —
+      // sanitizeZyraUpdateFields/patchTestCaseFromZyraWithClient decide that, not this formatter.
+      severity: value.severity ?? null,
+      component: value.component ?? null,
       action,
       reason: reason || "",
       // Already-resolved {type,id,title}[] (see zyraSourceRefIndex/sanitizeZyraSourceRefs) — never
       // raw model output. Defaults to [] for every row this function did not build from a draft
       // carrying citations (e.g. a plain move/update row), never undefined.
-      sourceRefs: Array.isArray(value.sourceRefs) ? value.sourceRefs : []
+      sourceRefs: Array.isArray(value.sourceRefs) ? value.sourceRefs : [],
+      // Already validated by normalizeZyraTechniques at generation time (never raw model output
+      // here either) — [] rather than ["general"] when absent, since a genuinely non-generation
+      // row (an update/archive preview, a "no longer exists" stub) never had a technique to begin
+      // with; ["general"] would misleadingly imply one was assigned and just didn't match.
+      techniques: Array.isArray(value.techniques) ? value.techniques : []
     };
   }
 
@@ -16134,13 +18625,32 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      severity: row.severity,
+      component: row.component,
       sourceRefs: row.sourceRefs
     }, action, reason);
   }
 
-  private formatAiTask(row: Body) {
+  /**
+   * generated_payload holds two genuinely different shapes, and always has (see zyraEditDraft's own
+   * `entry.opType || "create"` comment a few hundred lines up): task-board generation writes FLAT
+   * AiGeneratedDraft objects (`{title, priority, stepsJson, tags, ...}`, no `opType` key at all —
+   * task-board has never produced anything but a create); the chat flow (applyZyraChatOperations)
+   * writes WRAPPED `{opType: "create"|"update"|"archive", draft|...}` objects instead. The
+   * `chat_session_id IS NULL` filter every task-listing query uses was, until the archive sweep
+   * existed, an accurate proxy for "this row is flat" — a chat-staged row always carries a session
+   * id. A sweep-staged row (sub-task C) breaks that proxy: no chat session, but a WRAPPED
+   * `{opType: "archive", ...}` payload — exactly the shape this board was never built to render
+   * (see ZYRA_IMPLEMENTATION_LOG.md's investigation entry). This is the fix: detect the shape per
+   * entry and normalize a wrapped one into the same flat, display-ready row shape a create draft
+   * already has, reusing chatDraftRow/chatTestcaseRow (the chat surface's own normalization) rather
+   * than inventing a second version of it. A flat entry (task-board's create, the case every render
+   * site already gets right) is returned completely untouched — no risk of regressing it.
+   */
+  private async formatAiTask(row: Body): Promise<Body> {
     const item = toCamel(row as QueryResultRow);
-    item.drafts = normalizeJsonArray(row.generated_payload);
+    const rawDrafts = normalizeJsonArray(row.generated_payload);
+    item.drafts = await Promise.all(rawDrafts.map((entry: Body) => this.normalizeAiTaskDraftEntry(entry)));
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
     item.sources = normalizeJsonArray(row.source_summary);
@@ -16151,6 +18661,48 @@ export class LegacyService implements OnModuleInit {
       total: Number(row.token_total || 0)
     };
     return item;
+  }
+
+  /**
+   * One generated_payload array element -> one display-ready draft row. See formatAiTask's own
+   * comment for the two shapes this discriminates between.
+   *
+   * update/archive entries only ever carry `{testcaseId, externalId, fields, reason}` — never
+   * display fields (title/priority/...), the same way a live chat turn's staged proposal never
+   * does either (see applyZyraChatOperations' archive branch, legacy.service.ts:~11593). The live
+   * chat flow gets a readable card anyway because it separately snapshots a formatted preview onto
+   * the chat message itself, at staging time — this board has no such snapshot to fall back on, so
+   * it resolves the *current* test case and merges `fields` on top, exactly mirroring
+   * applyZyraChatOperations' own preview construction (`{...row, ...(fields.stepsJson !== undefined
+   * ? {steps: fields.stepsJson} : {}), ...fields}`) rather than a new formula that might drift from
+   * it — deliberately faithful to that existing logic including its one known gap: an archive/update
+   * proposal that doesn't touch stepsJson shows 0 steps in the preview (fields.stepsJson is never
+   * set, so the real test case's own steps are never carried over) exactly like the chat surface
+   * already does today. Not fixed here — reusing the existing formula, not improving on it, is what
+   * was asked.
+   */
+  private async normalizeAiTaskDraftEntry(entry: Body): Promise<Body> {
+    if (!entry || typeof entry !== "object") return entry;
+    const opType = entry.opType as string | undefined;
+    if (!opType) return entry; // task-board's own flat shape — every existing render site already handles this correctly, untouched
+    if (opType === "create") return this.chatDraftRow(entry.draft || {}, "proposed-create", entry.reason);
+    if (opType !== "update" && opType !== "archive") return entry; // an opType this function doesn't recognize — don't guess, pass through as-is
+
+    const action = opType === "archive" ? "proposed-archive" : "proposed-update";
+    let current: Body | null = null;
+    try {
+      current = await this.getTestCase(String(entry.testcaseId || ""));
+    } catch {
+      // Deleted (soft-delete, getTestCase's own filter) or never a real id — either way there is no
+      // current row to preview. Still return an identifiable row rather than a blank one: the
+      // external id and a "no longer exists" title, not a silent drop from the drafts array (which
+      // would also desync draftIndex-addressed actions like discard/edit against this entry).
+      const externalId = String(entry.externalId || "");
+      return this.chatDraftRow({ externalId, title: externalId ? `${externalId} (no longer exists)` : "Test case no longer exists" }, action, entry.reason);
+    }
+    const fields = (entry.fields || {}) as Body;
+    const preview = { ...current, ...(fields.stepsJson !== undefined ? { steps: fields.stepsJson } : {}), ...fields };
+    return this.chatTestcaseRow(preview, action, entry.reason);
   }
 
   // Not private: the MCP create_testcase tool (mcp.tools.ts) normalizes its own input through

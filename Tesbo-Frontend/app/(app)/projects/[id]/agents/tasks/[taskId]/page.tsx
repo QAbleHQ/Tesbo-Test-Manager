@@ -11,22 +11,34 @@ import {
   getZyraTask,
   listJiraTickets,
   listSuites,
+  listZyraTaskTicketComments,
+  retryZyraTicketComment,
   saveZyraTask,
   sendZyraFeedback,
   type JiraTicket,
   type SuiteNode,
   type ZyraTask,
+  type ZyraTicketComment,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
-import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
+import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { ACTION_LABEL, TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
 type SaveMode = "existing" | "new";
 type DetailTab = "testcases" | "feedback" | "activities" | "sources";
+
+const TICKET_COMMENT_STATUS: Record<ZyraTicketComment["status"], { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" }> = {
+  pending: { label: "Posting…", tone: "info" },
+  posted: { label: "Posted", tone: "success" },
+  failed: { label: "Failed", tone: "error" },
+  skipped_disabled: { label: "Not posted — auto-comment off", tone: "neutral" },
+  skipped_not_connected: { label: "Not posted — not connected", tone: "warning" },
+};
 
 function normalizeStatus(status: string): string {
   if (status === "accepted") return "done";
@@ -68,6 +80,13 @@ const TASK_STATUS_LABELS: Record<string, string> = {
 function statusLabel(status: string): string {
   const normalized = normalizeStatus(status);
   return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
+}
+
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// See ZyraChatReviewPanel/TaskQuickViewPanel's identical guard — a draft's severity is only
+// guaranteed to match this set once actually saved (normalizeZyraSeverity).
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
 }
 
 function stepCount(stepsJson: string): number {
@@ -112,6 +131,8 @@ export default function ZyraTaskDetailPage() {
   const [task, setTask] = useState<ZyraTask | null>(null);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
+  const [ticketComments, setTicketComments] = useState<ZyraTicketComment[]>([]);
+  const [retryingCommentId, setRetryingCommentId] = useState<string | null>(null);
   const [selectedDrafts, setSelectedDrafts] = useState<number[]>([]);
   const [feedback, setFeedback] = useState("");
   const [referenceNote, setReferenceNote] = useState("");
@@ -130,13 +151,15 @@ export default function ZyraTaskDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [taskData, suiteList, jiraStatus] = await Promise.all([
+      const [taskData, suiteList, jiraStatus, comments] = await Promise.all([
         getZyraTask(projectId, taskId),
         listSuites(projectId).catch(() => []),
         getJiraStatus(projectId).catch(() => ({ connected: false })),
+        listZyraTaskTicketComments(projectId, taskId).catch(() => [] as ZyraTicketComment[]),
       ]);
       setTask(taskData);
       setSuites(suiteList);
+      setTicketComments(comments);
       setSelectedDrafts((prev) => prev.filter((index) => index < taskData.drafts.length));
       if (jiraStatus.connected) {
         const tickets = await listJiraTickets(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
@@ -183,6 +206,38 @@ export default function ZyraTaskDetailPage() {
     }, 5000);
     return () => clearInterval(timer);
   }, [task, refreshTask]);
+
+  // A ticket comment is posted in the background after a save, so it can still read "Posting…" when
+  // the save returns — re-read until none is pending, then stop.
+  const hasPendingTicketComment = ticketComments.some((comment) => comment.status === "pending");
+  useEffect(() => {
+    if (!hasPendingTicketComment) return;
+    const timer = setInterval(() => {
+      void Promise.all([
+        listZyraTaskTicketComments(projectId, taskId).then(setTicketComments),
+        getZyraTask(projectId, taskId).then(setTask),
+      ]).catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [hasPendingTicketComment, projectId, taskId]);
+
+  async function handleRetryTicketComment(comment: ZyraTicketComment) {
+    setRetryingCommentId(comment.id);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await retryZyraTicketComment(projectId, taskId, comment.id);
+      const label = result.provider === "jira" ? "Jira" : "Linear";
+      if (result.status === "posted") setMessage(`Comment posted on ${label} ${result.issueKey}.`);
+      else setError(`Comment still couldn't be posted on ${label} ${result.issueKey}${result.reason ? `: ${result.reason}` : "."}`);
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to retry the ticket comment.");
+      await loadData();
+    } finally {
+      setRetryingCommentId(null);
+    }
+  }
 
   function toggleDraft(index: number) {
     setSelectedDrafts((prev) => prev.includes(index) ? prev.filter((item) => item !== index) : [...prev, index]);
@@ -342,10 +397,12 @@ export default function ZyraTaskDetailPage() {
   const allDraftsSelected = task.drafts.length > 0 && selectedDrafts.length === task.drafts.length;
   const copyableDrafts = selectedDrafts.length > 0 ? selectedDrafts.map((i) => task.drafts[i]) : task.drafts;
   const draftsTsv = toTsv(
-    ["Title", "Priority", "Preconditions", "Steps", "Expected Result", "Tags"],
+    ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
     copyableDrafts.map((draft) => [
       draft.title,
       draft.priority,
+      draft.severity ?? "",
+      draft.component ?? "",
       draft.preconditions,
       stepsText(draft.stepsJson),
       draft.expectedSummary,
@@ -404,6 +461,41 @@ export default function ZyraTaskDetailPage() {
         </div>
       </Card>
 
+      {ticketComments.length > 0 && (
+        <Card className="p-4">
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">Ticket comments</h3>
+          <p className="mt-1 text-xs text-[var(--muted)]">
+            What was posted to the linked ticket after each save. A failed comment can be sent again once the cause is fixed.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {ticketComments.map((comment) => {
+              const status = TICKET_COMMENT_STATUS[comment.status] ?? { label: comment.status, tone: "neutral" as const };
+              return (
+                <li key={comment.id} className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-[var(--border)] px-3 py-2">
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                      <span className="font-medium text-[var(--foreground)]">{comment.provider === "jira" ? "Jira" : "Linear"} {comment.issueKey}</span>
+                      <StatusChip tone={status.tone}>{status.label}</StatusChip>
+                      <span className="text-xs text-[var(--muted)]">
+                        {comment.testcaseCount} testcase{comment.testcaseCount === 1 ? "" : "s"} · {new Date(comment.postedAt || comment.updatedAt).toLocaleString()}
+                      </span>
+                    </div>
+                    {comment.status === "failed" && comment.reason && (
+                      <p className="text-xs text-[var(--error-foreground)]">{comment.reason}</p>
+                    )}
+                  </div>
+                  {comment.status === "failed" && (
+                    <Button variant="secondary" onClick={() => void handleRetryTicketComment(comment)} disabled={retryingCommentId !== null}>
+                      {retryingCommentId === comment.id ? "Retrying..." : "Retry comment"}
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </Card>
+      )}
+
       <div className="flex flex-wrap gap-2 border-b border-[var(--border)]">
         {tabItems.map((tab) => (
           <button
@@ -445,7 +537,7 @@ export default function ZyraTaskDetailPage() {
               </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[980px] border-collapse text-left text-sm">
+              <table className="w-full min-w-[1180px] border-collapse text-left text-sm">
                 <thead className="bg-[var(--surface-secondary)] text-xs uppercase tracking-[0.08em] text-[var(--muted-soft)]">
                   <tr>
                     <th className="w-10 px-3 py-3">
@@ -459,6 +551,8 @@ export default function ZyraTaskDetailPage() {
                     </th>
                     <th className="px-3 py-3">Testcase</th>
                     <th className="px-3 py-3">Priority</th>
+                    <th className="px-3 py-3">Severity</th>
+                    <th className="px-3 py-3">Component</th>
                     <th className="px-3 py-3">Preconditions</th>
                     <th className="px-3 py-3">Steps</th>
                     <th className="px-3 py-3">Expected Result</th>
@@ -472,12 +566,27 @@ export default function ZyraTaskDetailPage() {
                         <input type="checkbox" checked={selectedDrafts.includes(index)} onChange={() => toggleDraft(index)} disabled={done} aria-label={`Select testcase ${index + 1}`} />
                       </td>
                       <td className="max-w-[260px] px-3 py-3">
+                        {draft.action && (
+                          <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                            <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
+                              {ACTION_LABEL[draft.action] || draft.action}
+                            </StatusChip>
+                            {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
+                          </div>
+                        )}
                         <div className="font-semibold text-[var(--foreground)]">{draft.title}</div>
                         {draft.tags?.length ? <div className="mt-2 text-xs text-[var(--muted-soft)]">{draft.tags.join(", ")}</div> : null}
+                        {draft.techniques?.length ? <div className="mt-2"><TechniqueBadges techniques={draft.techniques} /></div> : null}
+                        {/* Only present on a normalized update/archive draft (formatAiTask) — why
+                            the sweep or the chat turn flagged this, shown right on the card so a
+                            reviewer doesn't have to open the Activities tab to find out. */}
+                        {draft.reason && <div className="mt-1 text-xs italic text-[var(--muted)]">{draft.reason}</div>}
                       </td>
                       <td className="px-3 py-3">
                         <span className="rounded bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">{draft.priority}</span>
                       </td>
+                      <td className="px-3 py-3">{knownSeverity(draft.severity) && <SeverityBadge severity={knownSeverity(draft.severity)!} />}</td>
+                      <td className="px-3 py-3 text-[var(--muted)]">{draft.component || ""}</td>
                       <td className="max-w-[220px] px-3 py-3 text-[var(--muted)]">{draft.preconditions}</td>
                       <td className="px-3 py-3 text-[var(--muted)]">{stepCount(draft.stepsJson)} step{stepCount(draft.stepsJson) === 1 ? "" : "s"}</td>
                       <td className="max-w-[260px] px-3 py-3 text-[var(--muted)]">{draft.expectedSummary}</td>
@@ -491,7 +600,7 @@ export default function ZyraTaskDetailPage() {
                   ))}
                   {task.drafts.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-3 py-10 text-center text-sm text-[var(--muted)]">No generated testcases remain for this task.</td>
+                      <td colSpan={9} className="px-3 py-10 text-center text-sm text-[var(--muted)]">No generated testcases remain for this task.</td>
                     </tr>
                   )}
                 </tbody>

@@ -465,6 +465,12 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   padding: 0;
 }
 
+/* Custom Tags settings page: fill exactly the space under the 3.5rem top bar, so <main> never
+   overflows and its scrollbar stays put — the tag list inside scrolls instead. */
+.tesbo-page:has(> .ct-fixed-page) {
+  height: calc(100vh - 3.5rem);
+}
+
 .tesbo-section {
   margin-bottom: 1.25rem;
 }
@@ -983,6 +989,8 @@ button:disabled,
 .zyra-prose li { margin: 0.15rem 0; }
 .zyra-prose strong { font-weight: 600; color: var(--foreground); }
 .zyra-prose em { font-style: italic; }
+.zyra-prose a { color: var(--accent-light); text-decoration: underline; text-underline-offset: 2px; }
+.zyra-prose a:hover { text-decoration: none; }
 .zyra-prose .inline-code {
   font-family: var(--font-mono);
   font-size: 0.8125em;

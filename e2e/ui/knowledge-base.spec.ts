@@ -37,8 +37,9 @@ import {
  *     portal, with its title as an `h2`. `modal()` below scopes to it by that heading.
  *   - `FieldLabel` is a bare `<label>` with no `htmlFor`, so getByLabel() resolves nothing anywhere
  *     on this screen. Inputs are located by placeholder instead.
- *   - "Knowledge base" is BOTH the page `h1` and the root folder's `h2`, so every heading lookup
- *     here needs an explicit level.
+ *   - The content panel used to render "Knowledge base" a second time as an `h2`, identical to the
+ *     page's own `h1` (see KBU-47) — fixed, but heading lookups here still pass an explicit level
+ *     rather than relying on there being only one match by name.
  */
 
 test.describe("knowledge base (UI)", () => {
@@ -239,10 +240,10 @@ test.describe("knowledge base (UI)", () => {
     );
   }
 
-  /** The row's info-icon trigger (Change history) — every document row has one now, synced or not
+  /** The row's info-icon trigger (Update History) — every document row has one now, synced or not
    *  (see KBU-35); a folder/file row never does. */
   function changeHistoryTrigger(page: Page, name: string): Locator {
-    return row(page, name).getByRole("button", { name: "Change history" });
+    return row(page, name).getByRole("button", { name: "Update History" });
   }
 
   // ─── The primary flow ──────────────────────────────────────────────────────
@@ -262,6 +263,39 @@ test.describe("knowledge base (UI)", () => {
 
     // And the tree in the left sidebar, which is a separate render from the table.
     await expect(page.getByRole("button", { name, exact: true }).first()).toBeVisible();
+  });
+
+  /*
+   * "[Knowledge Base] Remove Duplicate 'Knowledge Base' Label". The content panel repeated the
+   * page's own name a second time right below it: its breadcrumb line rendered kbBreadcrumb's
+   * result verbatim (which always includes the folder itself, so at root that's a single crumb
+   * reading "Knowledge base"), directly above an h2 that — at root — is also forced to read
+   * "Knowledge base" (see setFolderName in page.tsx). Both the one-crumb breadcrumb and the
+   * redundant second heading are now shown only once there's an actual subfolder to name; at root,
+   * the page's own h1 is the only "Knowledge base" text in that area.
+   */
+  test("KBU-47 the root folder's own name is not repeated a second time as a redundant sub-heading", async ({ browser }) => {
+    const page = await openKb(browser);
+
+    // At root: only the page's own h1 says "Knowledge base" — no second, content-panel heading
+    // repeating it, and no one-crumb breadcrumb line where that heading used to sit.
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 2 })).toHaveCount(0);
+
+    // Inside a real subfolder, both ARE useful — the breadcrumb shows the parent chain, and the
+    // heading names the folder actually being viewed, distinct from the page's own h1. This guards
+    // against overcorrecting into hiding them everywhere.
+    const name = stamp("BreadcrumbFolder");
+    await createFolder(page, name);
+    await row(page, name).getByText(name, { exact: true }).click();
+
+    const subfolderHeading = page.getByRole("heading", { name, level: 2 });
+    await expect(subfolderHeading).toBeVisible();
+    const subfolderBlock = subfolderHeading.locator("xpath=..");
+    const breadcrumbLine = subfolderBlock.locator(":scope > div").first();
+    expect(await subfolderBlock.evaluate((el) => el.firstElementChild?.tagName)).toBe("DIV");
+    await expect(breadcrumbLine).toContainText("Knowledge base");
+    await expect(breadcrumbLine).toContainText(name);
   });
 
   test("KBU-02 a document created from a template is stored with the template's body", { tag: '@tesbo.testId("TES-TC-1001")' }, async ({
@@ -1157,8 +1191,8 @@ test.describe("knowledge base (UI)", () => {
     // The icon lives in the Last updated cell, not Type — assert it directly rather than just
     // "somewhere in the row", since that's the exact placement that was reported wrong.
     const lastUpdatedCell = mirrorRow.getByRole("cell").nth(4);
-    await expect(lastUpdatedCell.getByRole("button", { name: "Change history" })).toBeVisible();
-    await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Change history" })).toHaveCount(0);
+    await expect(lastUpdatedCell.getByRole("button", { name: "Update History" })).toBeVisible();
+    await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Update History" })).toHaveCount(0);
 
     // A manually-created, human-authored row gets the very same icon now — its own timeline is
     // synthesized from version snapshots instead of a sync log, but the entry point is identical.
@@ -1166,7 +1200,7 @@ test.describe("knowledge base (UI)", () => {
     await expect(changeHistoryTrigger(page, plainTitle)).toBeVisible();
   });
 
-  test("KBU-35b a Linear-synced row gets the same Change history icon, popover, and provider label as a Jira one", { tag: '@tesbo.testId("TES-TC-2050")' }, async ({ browser }) => {
+  test("KBU-35b a Linear-synced row gets the same Update History icon, popover, and provider label as a Jira one", { tag: '@tesbo.testId("TES-TC-2050")' }, async ({ browser }) => {
     const title = stamp("E2E-80b: Linear ticket");
     const documentId = seedMirrorDocument(title, "kbu-linear-1", 5, 0, "linear");
     seedSyncEvent(documentId, "updated", "Priority updated.", "linear");
@@ -1191,7 +1225,7 @@ test.describe("knowledge base (UI)", () => {
 
     // Hovering, not clicking, must open it — this is the behavior that was reported broken.
     await changeHistoryTrigger(page, title).hover();
-    await expect(panel.getByText("Change history")).toBeVisible();
+    await expect(panel.getByText("Update History")).toBeVisible();
     await expect(panel.getByText("Status: To Do -> In Progress updated.")).toBeVisible();
     await expect(panel.getByText("Added", { exact: false }).first()).toBeVisible();
 
@@ -1205,7 +1239,7 @@ test.describe("knowledge base (UI)", () => {
 
     // Click opens it too, independent of hover (covers touch/keyboard users with no real hover).
     await changeHistoryTrigger(page, title).click();
-    await expect(menuPanel(page).getByText("Change history")).toBeVisible();
+    await expect(menuPanel(page).getByText("Update History")).toBeVisible();
 
     // An outside click closes it — the only way a tap-only device can dismiss it.
     await page.getByRole("heading", { name: "Knowledge base", level: 1 }).click();
@@ -1218,7 +1252,7 @@ test.describe("knowledge base (UI)", () => {
     await page.reload();
     await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
     await changeHistoryTrigger(page, untracked).hover();
-    await expect(menuPanel(page).getByText("No change history recorded yet.")).toBeVisible();
+    await expect(menuPanel(page).getByText("No update history recorded yet.")).toBeVisible();
   });
 
   test("KBU-37 the popover paginates 5 per page with calendar/clock icons in DD/MM/YYYY 12-hour format, and never crops off-screen", { tag: '@tesbo.testId("TES-TC-258")' }, async ({ browser }) => {
@@ -1312,11 +1346,11 @@ test.describe("knowledge base (UI)", () => {
     const page = await openKb(browser);
     await changeHistoryTrigger(page, title).click();
     const panel = menuPanel(page);
-    const diffButton = panel.getByRole("button", { name: "Check Difference" });
+    const diffButton = panel.getByRole("button", { name: "View Details" });
     await expect(diffButton).toBeVisible();
     await diffButton.click();
 
-    const diffModal = modal(page, "Difference");
+    const diffModal = modal(page, "Update History");
     await expect(diffModal).toBeVisible();
     await expect(diffModal.getByText("Highest")).toBeVisible();
 
@@ -1337,6 +1371,48 @@ test.describe("knowledge base (UI)", () => {
     await page.keyboard.press("Escape");
     await expect(diffModal).not.toBeVisible();
     await expect(panel.getByText("Details, Comments updated.")).toBeVisible();
+  });
+
+  /*
+   * Regression: a Zyra AI Memory section is labelled by its own `## <ISO timestamp>` heading
+   * (groupSections, text-diff.util.ts), and that raw label flows straight into the "<label>
+   * updated." summary sentence stored on the event row (changed_summary). ChangeDiffModal already
+   * reformats a raw-ISO *field label* inside the diff modal (see KBU-44), but the popover/modal
+   * list's own summary line rendered that same shape completely unformatted — the "T", milliseconds
+   * and "Z" all visible, unlike every other date in the product. ChangeHistory.tsx now reformats any
+   * ISO-timestamp substring inside changedSummary too, at render time, so this is fixed for rows
+   * that already have the raw string cached in the database as well as new ones.
+   */
+  test("KBU-37d the popover/modal list's own change summary formats a Zyra-memory-style timestamp too, not just the diff modal's field label", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso = "2026-09-18T14:28:46.521Z";
+    const title = stamp("E2E-83d: Raw ISO summary");
+    const documentId = seedMirrorDocument(title, "kbu-popover-iso-summary", 2, 0);
+    // A single-section change: summarizeTextChange's sentence is just "<label> updated.", so a raw
+    // label reaches the row unmodified by anything else in the sentence — the exact shape the
+    // screenshot bug report showed.
+    seedSyncEvent(documentId, "updated", `${iso} updated.`);
+
+    const page = await openKb(browser);
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel.getByText("Update History")).toBeVisible();
+
+    await expect(panel.getByText(`${expectedLabel(iso)} updated.`)).toBeVisible();
+    await expect(panel.getByText(iso, { exact: false })).toHaveCount(0);
   });
 
   test("KBU-37b a failed fetch on page 2+ still leaves Previous clickable — it must not strand the user on the errored page", async ({ browser }) => {
@@ -1393,9 +1469,9 @@ test.describe("knowledge base (UI)", () => {
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
 
-    // The modal is titled "Change history" for a mirror, not "Version history" — same distinction
+    // The modal is titled "Update History" for a mirror, not "Version history" — same distinction
     // as the info-icon popover, since a mirror has no manually saved versions to list.
-    const changeHistoryDialog = modal(page, "Change history");
+    const changeHistoryDialog = modal(page, "Update History");
     await expect(changeHistoryDialog).toBeVisible();
     await expect(changeHistoryDialog.getByText("Description updated.")).toBeVisible();
     // No triggering user was seeded (a nightly-style event) — labelled explicitly, not blank.
@@ -1415,11 +1491,11 @@ test.describe("knowledge base (UI)", () => {
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${untrackedId}`);
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    await expect(modal(page, "Change history").getByText("No change history recorded yet.")).toBeVisible();
+    await expect(modal(page, "Update History").getByText("No update history recorded yet.")).toBeVisible();
     // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
     await page.keyboard.press("Escape");
 
-    // A regular, human-authored document gets the identical "Change history" modal and the same
+    // A regular, human-authored document gets the identical "Update History" modal and the same
     // empty-state copy — it's never had an edit yet either, so there is nothing but "Added".
     const created = await api.post(kbUrl("/documents"), { data: { title: stamp("Plain doc"), folderId: rootFolderId } });
     expect(created.status()).toBe(201);
@@ -1427,7 +1503,7 @@ test.describe("knowledge base (UI)", () => {
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${plainDocumentId}`);
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const plainDialog = modal(page, "Change history");
+    const plainDialog = modal(page, "Update History");
     await expect(plainDialog).toBeVisible();
     await expect(plainDialog.getByText("Added", { exact: false })).toBeVisible();
     // Never had an edit, so there is nothing to restore — no version-diff entry exists yet.
@@ -1469,7 +1545,7 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Change history");
+    const dialog = modal(page, "Update History");
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Restore" }).click();
 
@@ -1502,7 +1578,7 @@ test.describe("knowledge base (UI)", () => {
     // same one — proof the reversibility actually happened, not just that a version count went up.
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const reopened = modal(page, "Change history");
+    const reopened = modal(page, "Update History");
     await expect(reopened.getByRole("button", { name: "Restore" })).toHaveCount(2);
   });
 
@@ -1523,7 +1599,7 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Change history");
+    const dialog = modal(page, "Update History");
     await dialog.getByRole("button", { name: "Restore" }).click();
     const confirmButton = dialog.getByRole("button", { name: "Restore" });
     await expect(confirmButton).toBeVisible();
@@ -1545,7 +1621,7 @@ test.describe("knowledge base (UI)", () => {
     // Not stuck: history opens again with its Restore buttons enabled, not disabled from before.
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const reopened = modal(page, "Change history");
+    const reopened = modal(page, "Update History");
     await expect(reopened.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
   });
 
@@ -1566,7 +1642,7 @@ test.describe("knowledge base (UI)", () => {
 
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Change history");
+    const dialog = modal(page, "Update History");
     await dialog.getByRole("button", { name: "Restore" }).click();
     await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
 
@@ -1587,7 +1663,7 @@ test.describe("knowledge base (UI)", () => {
     await expect(dialog.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
   });
 
-  test("KBU-42 a large content change shows a compact badge with an on-demand 'Check Difference' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
+  test("KBU-42 a large content change shows a compact badge with an on-demand 'View Details' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
     browser,
   }) => {
     const title = stamp("LargeDiff");
@@ -1605,16 +1681,16 @@ test.describe("knowledge base (UI)", () => {
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const dialog = modal(page, "Change history");
+    const dialog = modal(page, "Update History");
     await expect(dialog).toBeVisible();
 
     // The row itself stays a one-line badge — the full old/new text only appears once asked for.
     await expect(dialog.getByText("short old text")).toHaveCount(0);
-    const diffButton = dialog.getByRole("button", { name: "Check Difference" });
+    const diffButton = dialog.getByRole("button", { name: "View Details" });
     await expect(diffButton).toBeVisible();
     await diffButton.click();
 
-    const diffModal = modal(page, "Difference");
+    const diffModal = modal(page, "Update History");
     await expect(diffModal).toBeVisible();
     await expect(diffModal.getByText("short old text", { exact: false })).toBeVisible();
     await expect(diffModal.getByText("New paragraph about the change.", { exact: false }).first()).toBeVisible();
@@ -1630,9 +1706,184 @@ test.describe("knowledge base (UI)", () => {
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${smallDocumentId}`);
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("button", { name: "View history" }).click();
-    const smallDialog = modal(page, "Change history");
+    const smallDialog = modal(page, "Update History");
     await expect(smallDialog.getByText("Details updated.", { exact: false })).toBeVisible();
-    await expect(smallDialog.getByRole("button", { name: "Check Difference" })).toHaveCount(0);
+    await expect(smallDialog.getByRole("button", { name: "View Details" })).toHaveCount(0);
+  });
+
+  /*
+   * Regression: a Zyra AI Memory scratchpad entry is stored as `## <ISO timestamp>\n<note>`
+   * (rememberZyraMemory, legacy.service.ts) — groupSections (text-diff.util.ts) uses that heading
+   * as the changed field's own `label`, so it used to reach this modal as a raw
+   * "2026-09-11T15:31:09.877Z" string: the T, the milliseconds and the Z all still there, unlike
+   * every other date shown anywhere else in the product. ChangeDiffModal now reformats a label in
+   * exactly that shape into the same DD/MM/YYYY, hh:mm:ss AM/PM the Update History list next to it
+   * already uses — computed here the same way the component does (local Date fields), so this
+   * assertion holds regardless of which timezone it runs in.
+   */
+  test("KBU-44 a Zyra-memory-style timestamp heading is formatted as DD/MM/YYYY, hh:mm:ss AM/PM in the Update History modal, not left as a raw ISO string", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso1 = "2026-09-10T11:41:15.253Z";
+    const iso2 = "2026-09-11T15:31:09.877Z";
+    const oldNote1 = "User triggered test case generation for the login page, producing 8 draft test cases.";
+    const newNote1 = `${oldNote1} Edited so this section alone clears the large-change threshold for its own diff button.`;
+    const oldNote2 = "User triggered test case generation targeting coverage gaps, producing 10 draft test cases.";
+    const newNote2 = `${oldNote2} Edited so this section too clears the threshold.`;
+
+    const title = stamp("ZyraMemoryHeading");
+    const created = await api.post(kbUrl("/documents"), {
+      data: {
+        title,
+        folderId: rootFolderId,
+        documentType: "general",
+        contentText: `## ${iso1}\n${newNote1}\n\n## ${iso2}\n${newNote2}`,
+      },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso1}\n${oldNote1}\n\n## ${iso2}\n${oldNote2}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // Both headings are formatted, consistently, and neither raw ISO string leaks through anywhere
+    // in the modal (as a label, or duplicated into the excerpt body underneath it).
+    await expect(diffModal.getByText(expectedLabel(iso1), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(expectedLabel(iso2), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(iso1, { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(iso2, { exact: false })).toHaveCount(0);
+
+    // The diff content itself is untouched by the label formatting. newNoteN extends oldNoteN, so
+    // scope each check to its own colored old/new box (ChangeDiffModal.tsx renders the excerpt as
+    // markdown now, so the "−"/"+" marker is a separate element from the note text rather than one
+    // concatenated string — the class-based scoping below, not a shared text node, is what tells
+    // an old box from a new one).
+    const oldBoxes = diffModal.locator('[class*="error-foreground"]');
+    const newBoxes = diffModal.locator('[class*="success-foreground"]');
+    await expect(oldBoxes.filter({ hasText: oldNote1 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote1 })).toHaveCount(1);
+    await expect(oldBoxes.filter({ hasText: oldNote2 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote2 })).toHaveCount(1);
+
+    // The two sections are visually separated, not run together — a divider between them, distinct
+    // from the space-y-1.5 gap between one section's own old/new boxes.
+    await expect(diffModal.locator(".border-t")).toHaveCount(1);
+  });
+
+  /*
+   * Regression: the Update History modal used to render an excerpt as raw text (ChangeDiffModal.tsx),
+   * so a Zyra AI Memory note's own markdown — the "- " bullets Zyra writes its multi-point notes
+   * with — showed up as literal "- " characters instead of an actual bulleted list. Fixed by
+   * rendering the excerpt through the same renderMarkdown()/zyra-prose pairing
+   * ZyraContextDrawer.tsx already uses for this exact content elsewhere in the product.
+   */
+  test("KBU-45 a note's own markdown (bullets, a heading) renders as real elements in the Update History modal, not literal '- '/'## ' text", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-12T09:46:29.466Z";
+    const oldNote = `## Recap\n- First point about the run.\n- Second point about the run.`;
+    const newNote = `## Recap\n- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.`;
+
+    const title = stamp("ZyraMemoryMarkdown");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // The note's own "## Recap" heading and "- " bullets render as real elements...
+    await expect(diffModal.getByRole("heading", { name: "Recap", level: 2 })).toHaveCount(2); // one per old/new box
+    await expect(diffModal.locator("li", { hasText: "First point about the run." })).toHaveCount(2); // unchanged line, in both boxes
+    await expect(diffModal.locator("li", { hasText: "Third point added to clear the threshold." })).toHaveCount(1);
+
+    // ...so the raw markdown syntax itself is never visible as literal text anywhere in the modal.
+    await expect(diffModal.getByText("## Recap", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(/^- /)).toHaveCount(0);
+  });
+
+  /*
+   * Regression: rendering the excerpt as markdown (KBU-45) fixed the raw "- " text, but the box's
+   * own −/+ old-vs-new marker was still glued directly in front of a bulleted note's first list
+   * item — first inline beside it, then (briefly) as a caption line above it — so a list still
+   * read as "− • User requested…" or "− REMOVED" sitting redundantly next to the colour-coded box
+   * that already says the same thing. Settled on: no marker or caption at all — the box's own
+   * red/green colour is the only old-vs-new signal, so nothing but the bullets themselves shows.
+   */
+  test("KBU-46 a bulleted note renders with no −/+ marker or caption, just its own clean bullets", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-13T08:00:00.000Z";
+    const oldNote = "- First point about the run.\n- Second point about the run.";
+    const newNote = "- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.";
+
+    const title = stamp("ZyraMemoryMarkerSpacing");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // Each bullet's own text is clean — no stray leading "-" or marker character in front of it.
+    const firstPointItem = diffModal.locator("li", { hasText: "First point about the run." }).first();
+    await expect(firstPointItem).toHaveText("First point about the run.");
+    await expect(diffModal.locator("li", { hasText: "−" })).toHaveCount(0);
+
+    // No "− Removed"/"+ Added" caption (or any other marker) sits above the list either — the
+    // colour-coded box alone is the old-vs-new signal now.
+    await expect(diffModal.getByText("Removed", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText("Added", { exact: false })).toHaveCount(0);
+    const oldBox = diffModal.locator('[class*="error-foreground"]').filter({ hasText: "First point about the run." });
+    const newBox = diffModal.locator('[class*="success-foreground"]').filter({ hasText: "Third point added" });
+    await expect(oldBox.locator(":scope > *")).toHaveCount(1); // only the rendered list, nothing else
+    await expect(newBox.locator(":scope > *")).toHaveCount(1);
   });
 
   // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder

@@ -651,6 +651,101 @@ test.describe("custom fields (UI)", () => {
     await expect.poll(() => storedValue(single.id, testcase.id)).toBe(`"${highId}"`);
   });
 
+  /*
+   * Regression test: an unset single_select/boolean custom field used to render its placeholder
+   * <option> with the literal text "—" (CustomFieldValueInput.tsx) — indistinguishable from a
+   * disabled text box, unlike every other field type's real placeholder (Input's `placeholder`
+   * attribute for text fields, the browser's own empty state for date/number). Fixed to read
+   * "Select…", matching the "Select …" placeholder convention already used everywhere else in the
+   * app (e.g. CustomFieldFilterPopover's own "Select an option…").
+   */
+  test("an unset dropdown custom field shows a 'Select…' placeholder, not a bare dash", async ({ browser }) => {
+    await defineField({
+      fieldType: "single_select",
+      config: { options: [{ label: "Chrome" }, { label: "Firefox" }] },
+    });
+    await defineField({ fieldType: "boolean" });
+    // Neither field is given a value — this pins the empty state, not the filled one the test
+    // above already covers.
+    const testcase = await seedTestCase({});
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+
+    const panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    // Told apart from the panel's other dropdowns by an option only each field has (same
+    // convention as the test above).
+    const singleSelect = panel.locator("select").filter({ has: page.locator("option", { hasText: "Chrome" }) });
+    const booleanSelect = panel.locator("select").filter({ has: page.locator("option", { hasText: "Yes" }) });
+
+    for (const select of [singleSelect, booleanSelect]) {
+      await expect(select).toHaveValue("");
+      // The placeholder <option>'s own visible label is what the user actually reads — not just
+      // the <select>'s resolved value, which was already "" before this fix too.
+      const selectedOptionText = await select.evaluate(
+        (el: HTMLSelectElement) => el.options[el.selectedIndex]?.textContent?.trim(),
+      );
+      expect(selectedOptionText).toBe("Select…");
+      await expect(select.locator("option", { hasText: "—" })).toHaveCount(0);
+    }
+  });
+
+  /*
+   * Deactivating or archiving a field used to leave it visible on this tab as a locked, read-only
+   * box (CustomFieldsSection.tsx's non-active branch) — which is what the earlier "Select…, not a
+   * bare dash" fix above was patching the display of. The product decision changed: a non-active
+   * field should not appear on this tab at all, active or not, so the panel always mirrors what
+   * Project Settings currently has switched on. That locked-box rendering path is now unreachable
+   * from here (getValuesForTestCase only returns `status = 'active'` rows) and is exercised, if at
+   * all, only by test data these specs don't construct — nothing here should still assert it shows.
+   */
+  test("a deactivated field disappears from the test case panel, its value survives underneath, and it reappears once reactivated", async ({
+    browser,
+  }) => {
+    const stays = await defineField({ fieldType: "text" });
+    const toggled = await defineField({ fieldType: "text" });
+    const testcase = await seedTestCase({
+      customFieldValues: { [stays.id]: "always shown", [toggled.id]: "still recorded" },
+    });
+    await api.patch(`${definitionsUrl()}/${toggled.id}/status`, { data: { status: "inactive" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+    let panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    await expect(panel.getByText(stays.name)).toBeVisible();
+    await expect(panel.getByText(toggled.name)).toHaveCount(0);
+    // Hidden from the panel, but nothing was deleted underneath.
+    expect(storedValue(toggled.id, testcase.id)).toBe('"still recorded"');
+
+    await api.patch(`${definitionsUrl()}/${toggled.id}/status`, { data: { status: "active" } });
+    await page.reload();
+    await page.getByRole("button", { name: testcase.title }).click();
+    panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+    await expect(panel.getByText(toggled.name)).toBeVisible();
+  });
+
+  test("an archived field also disappears from the test case panel, keeping its recorded value", async ({ browser }) => {
+    const field = await defineField({ fieldType: "text" });
+    const testcase = await seedTestCase({ customFieldValues: { [field.id]: "still there" } });
+    await api.patch(`${definitionsUrl()}/${field.id}/status`, { data: { status: "archived" } });
+
+    const page = await pageAs(browser, "owner");
+    await page.goto(testcasesUrl());
+    await page.getByRole("button", { name: testcase.title }).click();
+    const panel = page.locator("aside");
+    await panel.getByRole("button", { name: /^Custom Fields/ }).click();
+
+    await expect(panel.getByText(field.name)).toHaveCount(0);
+    expect(storedValue(field.id, testcase.id)).toBe('"still there"');
+  });
+
   // ─── Filtering the list ────────────────────────────────────────────────────
 
   test("the custom field filter narrows the test case list", { tag: '@tesbo.testId("TES-TC-666")' }, async ({ browser }) => {

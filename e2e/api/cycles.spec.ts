@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 import { env } from "../utils/env";
+import { column, exec, literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -609,6 +610,377 @@ test.describe("list-cycles bucket counts", () => {
         data: { testcaseIds },
         failOnStatusCode: false,
       });
+    }
+  });
+});
+
+/*
+ * Hard-delete remediation, Phase 1 ("Zyra Workflow Agents/hard-delete-remediation-progress-log.md")
+ * — deleteCycle, removeCycleTestCase and removeCycleTestCases used to issue real
+ * `DELETE FROM cycles ...` / `DELETE FROM cycle_items ...` statements. Combined with
+ * cycle_items.cycle_id and executions.cycle_item_id both being ON DELETE CASCADE
+ * (migrations/V3_plans_cycles_executions.sql), that silently hard-deleted every execution in the
+ * run — bypassing executions.deleted_at (V60), which existed and was simply never reached from
+ * this path.
+ *
+ * migrations/V111_cycles_soft_delete.sql adds cycles.deleted_at/deleted_by and
+ * cycle_items.deleted_at/deleted_by, converts both FKs to RESTRICT, and makes
+ * cycle_items_cycle_id_testcase_id_key a partial unique index (WHERE deleted_at IS NULL). The three
+ * write paths above now only ever issue UPDATEs, inside a transaction that also stamps
+ * executions.deleted_at.
+ *
+ * FAILING-FIRST, STATED RATHER THAN RE-RUN: as with the suites.spec.ts precedent this phase follows
+ * (Zyra context integrity, Phase 3/4), this suite lands in the same change as the fix, so there is
+ * no separate "run it against the old code" step available this session (CLAUDE.local.md also
+ * suspends automatic e2e runs while iterating locally). The failing direction is not hypothetical,
+ * though — it is mechanical: the pre-fix statements this test's assertions would have hit are
+ * `DELETE FROM cycles WHERE id = $1`, `DELETE FROM cycle_items WHERE cycle_id = $1 AND
+ * testcase_id = $2` and the ANY(...) bulk form (all three quoted verbatim in the progress log's
+ * Phase 0 report, and confirmed there as the only call sites for either statement in `src/` before
+ * this change). Postgres's own documented FK CASCADE behavior on cycle_items.cycle_id and
+ * executions.cycle_item_id means every row this test checks for survival is mechanically destroyed
+ * by those statements pre-fix — there is no code path in the old deleteCycle / removeCycleTestCase /
+ * removeCycleTestCases that could have left them in place.
+ */
+test.describe("cycle / cycle_item soft-delete (hard-delete remediation Phase 1)", () => {
+  test("deleting a run soft-deletes it and every cycle_item/execution in it, all surviving in the database", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Soft-Delete Run ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Soft-Delete Run Case ${Date.now()}` } })
+    ).json();
+    await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const cycleItemId = scalar(`SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`);
+    expect(cycleItemId, "the fixture cycle_item must exist before the run is deleted").toBeTruthy();
+    const executionId = scalar(`SELECT id FROM executions WHERE cycle_item_id = ${literal(cycleItemId)};`);
+    expect(executionId, "the fixture execution must exist before the run is deleted").toBeTruthy();
+
+    try {
+      const deleteRes = await request.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      // API-visible: gone from the run's own endpoint and from the list — unchanged observable
+      // behavior, whether the row was hard- or soft-deleted underneath.
+      expect((await request.get(`/api/cycles/${cycle.id}`, { failOnStatusCode: false })).status()).toBe(404);
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/cycles`)).json();
+      expect(list.some((c: { id: string }) => c.id === cycle.id)).toBe(false);
+
+      // Database-visible: the rows genuinely still exist, soft-deleted — this is the actual fix,
+      // not the API surface (which reads the same whether the rows were hard- or soft-deleted).
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycle.id)};`), "the run row itself must still exist, now soft-deleted").toBe("t");
+      expect(scalar(`SELECT deleted_by::text FROM cycles WHERE id = ${literal(cycle.id)};`), "deleted_by must record who deleted it").toBeTruthy();
+      expect(scalar(`SELECT COUNT(*) FROM cycle_items WHERE id = ${literal(cycleItemId)};`), "the cycle_item must survive").toBe("1");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycle_items WHERE id = ${literal(cycleItemId)};`), "the cycle_item must be soft-deleted, not merely orphaned").toBe("t");
+      expect(scalar(`SELECT COUNT(*) FROM executions WHERE id = ${literal(executionId)};`), "the execution must survive").toBe("1");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM executions WHERE id = ${literal(executionId)};`), "the execution must be soft-deleted too — this is the V60 column finally being written").toBe("t");
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("removing a single test case from a run soft-deletes its cycle_item and execution, not merely hiding them", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Soft-Delete Item ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Soft-Delete Item Case ${Date.now()}` } })
+    ).json();
+    await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const cycleItemId = scalar(`SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`);
+    const executionId = scalar(`SELECT id FROM executions WHERE cycle_item_id = ${literal(cycleItemId)};`);
+    expect(cycleItemId && executionId, "the fixture cycle_item/execution must exist before removal").toBeTruthy();
+
+    try {
+      const res = await request.delete(`/api/cycles/${cycle.id}/testcases/${testcase.id}`);
+      expect(res.ok(), `removing the case — ${await res.text()}`).toBeTruthy();
+
+      // API-visible: the run's execution list no longer shows it.
+      expect(await (await request.get(`/api/cycles/${cycle.id}/executions`)).json()).toHaveLength(0);
+
+      // Database-visible: both rows survive, soft-deleted.
+      expect(scalar(`SELECT COUNT(*) FROM cycle_items WHERE id = ${literal(cycleItemId)};`), "the cycle_item must survive").toBe("1");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycle_items WHERE id = ${literal(cycleItemId)};`)).toBe("t");
+      expect(scalar(`SELECT COUNT(*) FROM executions WHERE id = ${literal(executionId)};`), "the execution must survive").toBe("1");
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM executions WHERE id = ${literal(executionId)};`)).toBe("t");
+    } finally {
+      await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("bulk-removing test cases soft-deletes exactly the selected cycle_item/execution pairs, leaving the rest alone", async ({ request }) => {
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Soft-Delete Bulk ${stamp}` } })
+    ).json();
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+        data: { testcases: [0, 1, 2].map((i) => ({ title: `E2E Soft-Delete Bulk Case ${stamp}-${i}` })) },
+      })
+    ).json();
+    const testcaseIds: string[] = created.created.map((c: { id: string }) => c.id);
+
+    try {
+      await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds } });
+      const cycleItemIds = column(
+        `SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} ORDER BY position;`,
+      );
+      expect(cycleItemIds).toHaveLength(3);
+
+      const toRemove = testcaseIds.slice(0, 2);
+      const toKeep = testcaseIds[2];
+      const removeRes = await request.post(`/api/cycles/${cycle.id}/testcases/bulk-delete`, {
+        data: { testcaseIds: toRemove },
+      });
+      expect(await removeRes.json()).toMatchObject({ requested: 2, removed: 2 });
+
+      const remaining = await (await request.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].testcaseId).toBe(toKeep);
+
+      // Database-visible: the two removed pairs are soft-deleted, the one kept is untouched.
+      const deletedCount = scalar(
+        `SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ANY(ARRAY[${toRemove
+          .map((id) => literal(id))
+          .join(",")}]::uuid[]) AND deleted_at IS NOT NULL;`,
+      );
+      expect(deletedCount).toBe("2");
+      const executionsDeletedCount = scalar(
+        `SELECT COUNT(*) FROM executions e JOIN cycle_items ci ON ci.id = e.cycle_item_id
+          WHERE ci.cycle_id = ${literal(cycle.id)} AND ci.testcase_id = ANY(ARRAY[${toRemove
+          .map((id) => literal(id))
+          .join(",")}]::uuid[]) AND e.deleted_at IS NOT NULL;`,
+      );
+      expect(executionsDeletedCount).toBe("2");
+      expect(
+        scalar(`SELECT deleted_at IS NULL FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(toKeep)};`),
+        "the case that was not removed must be untouched",
+      ).toBe("t");
+    } finally {
+      await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+        data: { testcaseIds },
+        failOnStatusCode: false,
+      });
+    }
+  });
+
+  test("re-adding a removed test case creates a fresh cycle_item, leaving the removed one as surviving history", async ({ request }) => {
+    // The DB-level half of "a case removed from a run can be added back" (TES-TC-909 above), which
+    // only checks the API-visible execution count. This is the partial-index decision itself
+    // (progress log, 2026-09-16 14:51 IST: partial index over resurrect-on-conflict) — a removed
+    // case must come back as a NEW row, not a resurrected one, with the old row kept as history.
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Soft-Delete ReAdd ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Soft-Delete ReAdd Case ${Date.now()}` } })
+    ).json();
+
+    try {
+      await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      const firstItemId = scalar(`SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`);
+      expect(firstItemId).toBeTruthy();
+
+      await request.delete(`/api/cycles/${cycle.id}/testcases/${testcase.id}`);
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycle_items WHERE id = ${literal(firstItemId)};`)).toBe("t");
+
+      const readdRes = await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      expect(readdRes.ok(), `re-adding answered ${readdRes.status()}: ${await readdRes.text()}`).toBeTruthy();
+
+      const allItemIds = column(
+        `SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)} ORDER BY created_at;`,
+      );
+      expect(allItemIds, "the old (removed) row and a new one must both exist").toHaveLength(2);
+      expect(allItemIds[0]).toBe(firstItemId);
+      const secondItemId = allItemIds[1];
+      expect(secondItemId).not.toBe(firstItemId);
+
+      // The old row is still soft-deleted history; the new one is active and is what the run shows.
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycle_items WHERE id = ${literal(firstItemId)};`)).toBe("t");
+      expect(scalar(`SELECT deleted_at IS NULL FROM cycle_items WHERE id = ${literal(secondItemId)};`)).toBe("t");
+
+      const executions = await (await request.get(`/api/cycles/${cycle.id}/executions`)).json();
+      expect(executions).toHaveLength(1);
+      expect(executions[0].testcaseId).toBe(testcase.id);
+      expect(
+        scalar(`SELECT COUNT(*) FROM executions WHERE cycle_item_id = ${literal(secondItemId)};`),
+        "the new cycle_item must have gotten its own fresh execution, not reused the old one",
+      ).toBe("1");
+    } finally {
+      await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("requireCycleAccess 404s on an already-soft-deleted run — get, patch, share and re-delete alike", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Already Deleted Run ${Date.now()}` } })
+    ).json();
+
+    const firstDelete = await request.delete(`/api/cycles/${cycle.id}`);
+    expect(firstDelete.ok(), `first delete — ${await firstDelete.text()}`).toBeTruthy();
+
+    // A second delete of the same (now soft-deleted) run must read as "not found" — the same answer
+    // a genuinely nonexistent id gets — not a silent success and not a 500 from acting on a row
+    // requireCycleAccess should already have refused.
+    const secondDelete = await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+    expect(secondDelete.status()).toBe(404);
+
+    const getRes = await request.get(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+    expect(getRes.status()).toBe(404);
+
+    const patchRes = await request.patch(`/api/cycles/${cycle.id}`, {
+      data: { name: "should not apply" },
+      failOnStatusCode: false,
+    });
+    expect(patchRes.status()).toBe(404);
+
+    const shareRes = await request.post(`/api/cycles/${cycle.id}/share`, {
+      data: { enabled: true },
+      failOnStatusCode: false,
+    });
+    expect(shareRes.status()).toBe(404);
+  });
+});
+
+/*
+ * Hard-delete remediation Phase 2 — the read-path gap sweep that follows Phase 1's write-path fix.
+ * V111 made `cycles`/`cycle_items` soft-deletable, but a run of secondary read sites across
+ * legacy.service.ts kept reading them without a `deleted_at IS NULL` filter, so a "deleted" run kept
+ * showing up in exports, dashboards and reports it should no longer be reachable through. This
+ * describe block covers the two cycles.spec.ts-owned sites from that sweep: exportCycleExecutions
+ * (the access-gate bypass — a real security-relevant fix, not merely a stale count) and
+ * addCycleTestCases' new EXISTS guard (parity with attachCases in automation.service.ts).
+ */
+test.describe("cycles read-path gap sweep (hard-delete remediation Phase 2)", () => {
+  test("a soft-deleted run's CSV export now 404s instead of continuing to serve its data", async ({ request }) => {
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Export Gate ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Export Gate Case ${Date.now()}` } })
+    ).json();
+    await request.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+
+    try {
+      // Before the delete: the export works and actually carries the seeded case, so the 404 below
+      // is proven to be the delete's effect, not a route that never worked.
+      const beforeRes = await request.get(`/api/cycles/${cycle.id}/export/csv`);
+      expect(beforeRes.ok(), `export before delete — ${await beforeRes.text()}`).toBeTruthy();
+      const beforeCsv = await beforeRes.text();
+      expect(beforeCsv).toContain(testcase.externalId);
+
+      const deleteRes = await request.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      // This is the access-gate bypass itself: exportCycleExecutions used to resolve its own
+      // project_id with no deleted_at filter at all, so a project member could keep downloading a
+      // "deleted" run's CSV forever even though every other /api/cycles/* route already 404s it
+      // (requireCycleAccess, hard-delete remediation Phase 1). The row is confirmed soft-deleted
+      // (not merely renamed/moved) so a 404 here is unambiguously the new filter, not some other
+      // cause.
+      expect(scalar(`SELECT deleted_at IS NOT NULL FROM cycles WHERE id = ${literal(cycle.id)};`)).toBe("t");
+      const afterRes = await request.get(`/api/cycles/${cycle.id}/export/csv`, { failOnStatusCode: false });
+      expect(afterRes.status(), "the export must 404 once the run is soft-deleted").toBe(404);
+    } finally {
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an anonymous caller and a second tenant are both refused the export, soft-deleted or not", async ({ request }) => {
+    // Companion to the 404 test above: the export's access gate is a caller check first
+    // (requireUser/requireProjectAccess) and a liveness check second. Confirms the delete-driven
+    // 404 above isn't hiding a regression in the ordinary auth gate.
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Export Gate Auth ${Date.now()}` } })
+    ).json();
+    try {
+      const anon = await request.get(`/api/cycles/${cycle.id}/export/csv`, {
+        headers: { Cookie: "" },
+        failOnStatusCode: false,
+      });
+      expect([401, 403]).toContain(anon.status());
+    } finally {
+      await request.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("addCycleTestCases' EXISTS guard refuses to insert a cycle_item once the run is soft-deleted, closing the same race window as attachCases", async ({
+    request,
+  }) => {
+    // requireCycleAccess already 404s a plain POST against an already-soft-deleted run (see the
+    // "requireCycleAccess 404s" test above), so that path never reaches this INSERT at all — the
+    // guard exists purely for the window between requireCycleAccess's read and this statement's
+    // write, which a normal HTTP request cannot pause mid-flight to race deterministically (the same
+    // limitation attachCases' own guard has, noted at its call site in automation.service.ts).
+    //
+    // So this proves the guard the way the automation-side AUT-72 did for attachCases: by re-running
+    // the exact SQL shape directly against a run put into the raced state by hand (soft-deleted
+    // between "resolved as live" and "about to insert"), rather than trusting a JSON response that
+    // the bug could have made lie.
+    const cycle = await (
+      await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E AddCases Guard ${Date.now()}` } })
+    ).json();
+    const testcase = await (
+      await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E AddCases Guard Case ${Date.now()}` } })
+    ).json();
+
+    try {
+      // Simulates a concurrent DELETE landing in the gap between addCycleTestCases' own
+      // requireCycleAccess read and its INSERT — the same race attachCases' comment describes.
+      exec(`UPDATE cycles SET deleted_at = now() WHERE id = ${literal(cycle.id)};`);
+
+      // The guarded statement (mirrors the WITH input/base/ins CTE in
+      // legacy.service.ts's addCycleTestCases exactly): with the EXISTS guard in place, zero rows
+      // insert against the now-soft-deleted run.
+      exec(`
+        WITH input AS (
+          SELECT id, ord FROM unnest(ARRAY[${literal(testcase.id)}]::uuid[]) WITH ORDINALITY AS u(id, ord)
+        ),
+        base AS (
+          SELECT COALESCE(MAX(position), 0) AS pos FROM cycle_items WHERE cycle_id = ${literal(cycle.id)}
+        )
+        INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
+        SELECT ${literal(cycle.id)}, t.id, t.title, base.pos + i.ord
+          FROM input i
+          JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = ${literal(ctx.projectId)}
+          CROSS JOIN base
+         WHERE EXISTS (SELECT 1 FROM cycles c WHERE c.id = ${literal(cycle.id)} AND c.deleted_at IS NULL)
+        ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING;
+      `);
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`),
+        "the EXISTS guard must refuse the insert once the run is soft-deleted",
+      ).toBe("0");
+
+      // Control: the same statement MINUS the EXISTS guard — i.e. addCycleTestCases' shape before
+      // this fix — does insert against the same soft-deleted run, proving the guard clause above is
+      // what's actually doing the work rather than some unrelated constraint.
+      exec(`
+        WITH input AS (
+          SELECT id, ord FROM unnest(ARRAY[${literal(testcase.id)}]::uuid[]) WITH ORDINALITY AS u(id, ord)
+        ),
+        base AS (
+          SELECT COALESCE(MAX(position), 0) AS pos FROM cycle_items WHERE cycle_id = ${literal(cycle.id)}
+        )
+        INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position)
+        SELECT ${literal(cycle.id)}, t.id, t.title, base.pos + i.ord
+          FROM input i
+          JOIN testcases t ON t.id = i.id AND t.deleted_at IS NULL AND t.project_id = ${literal(ctx.projectId)}
+          CROSS JOIN base
+        ON CONFLICT (cycle_id, testcase_id) WHERE deleted_at IS NULL DO NOTHING;
+      `);
+      expect(
+        scalar(`SELECT COUNT(*) FROM cycle_items WHERE cycle_id = ${literal(cycle.id)} AND testcase_id = ${literal(testcase.id)};`),
+        "control: without the guard, the same insert against the same soft-deleted run succeeds — confirming the guard clause is load-bearing",
+      ).toBe("1");
+    } finally {
+      exec(`DELETE FROM executions WHERE cycle_item_id IN (SELECT id FROM cycle_items WHERE cycle_id = ${literal(cycle.id)});`);
+      exec(`DELETE FROM cycle_items WHERE cycle_id = ${literal(cycle.id)};`);
+      exec(`DELETE FROM cycles WHERE id = ${literal(cycle.id)};`);
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
     }
   });
 });
