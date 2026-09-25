@@ -4611,3 +4611,421 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
     expect(status.authError).toMatch(/different Atlassian OAuth app/);
   });
 });
+
+/*
+ * Zyra with "Access to Knowledge Base" OFF, and the chat page's background (non-blocking) send.
+ *
+ * The reported symptom: with KB access disabled, a Zyra prompt ended in "Failed to fetch
+ * (api-app-stage.tesbo.io)". Two separate defects sat under it:
+ *
+ *  1. The toggle only HID knowledge-base results from the prompt — buildZyraChatDecision still ran
+ *     the recency snapshot, the folder match, the semantic search (spending an embeddings call on the
+ *     user's message) and the bug lookup on every turn, and only filtered afterwards. "Disabled" has
+ *     to mean no KB access at all. The fake provider logs /embeddings calls separately, so "was a KB
+ *     search attempted" is observable: only the KB search ever embeds the user's own message.
+ *  2. The request itself: a turn is one POST held open until the reply exists, and generation turns
+ *     run for minutes. Stage sits behind Cloudflare, which drops an origin request at 100 s with a
+ *     CORS-less 524 — the browser reports "Failed to fetch" while the backend goes on to save the
+ *     reply. The failing stage turn was simply a KB-off turn that ran 234 s. The chat page now sends
+ *     `background: true`: the POST returns once the message is recorded, and the page polls for the
+ *     turn, whose user message stays `processing` until the reply row exists. Callers that don't opt
+ *     in (MCP, API tokens) keep the synchronous response — ZYR-A-100/101 drive that form.
+ */
+test.describe("zyra chat — knowledge-base gate and background send (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-kb-gate");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purge();
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+    // One server instance for the whole block — see FakeAiServer.reset().
+    ai?.reset();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT (V116) — before sessions.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    exec(`DELETE FROM bugs WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+    // The capability lives on the project row; dropping the key restores every default (all ON).
+    exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id = ${project};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  // provider "openai", deliberately — unlike the citations block's custom gateway. An
+  // embeddings-capable key is what makes the KB search embed the user's message, which is the
+  // observable these tests assert on. fake-ai-server keeps those calls off the chat reply queue.
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E kb-gate fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function setKnowledgeBaseAccess(enabled: boolean): Promise<void> {
+    const res = await asOwner.patch(url("/settings"), { data: { capabilities: { knowledgeBase: enabled } }, failOnStatusCode: false });
+    expect(res.status(), `saving the KB capability — ${await res.text()}`).toBeLessThan(300);
+    expect((await res.json()).capabilities.knowledgeBase).toBe(enabled);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  /** One KB doc and one bug, each carrying a unique marker word the message below also uses. */
+  async function seedKnowledge(marker: string): Promise<void> {
+    const kbRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title: `${marker} seat policy`, contentText: `${marker}: a booking allows at most 10 seats.` },
+      failOnStatusCode: false,
+    });
+    expect(kbRes.status(), `seeding the KB doc — ${await kbRes.text()}`).toBe(201);
+    const bugRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `${marker} seat picker freezes`, description: `The ${marker} seat picker freezes on the 11th seat.` },
+      failOnStatusCode: false,
+    });
+    expect(bugRes.status(), `seeding the bug — ${await bugRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  async function sessionMessages(sessionId: string): Promise<Array<Record<string, unknown>>> {
+    const res = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    return (await res.json()).messages;
+  }
+
+  /** Polls until the background turn behind `userMessageId` settles, returning the session's messages. */
+  async function waitForTurn(sessionId: string, userMessageId: string): Promise<Array<Record<string, unknown>>> {
+    let messages: Array<Record<string, unknown>> = [];
+    await expect
+      .poll(
+        async () => {
+          messages = await sessionMessages(sessionId);
+          return messages.find((m) => m.id === userMessageId)?.status;
+        },
+        { message: "the background turn never settled its user message", timeout: 60_000, intervals: [500, 1000, 2000] },
+      )
+      .not.toBe("processing");
+    return messages;
+  }
+
+  function queueAnswer(reply: string): void {
+    ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+  }
+
+  function routerPrompt(): string {
+    expect(ai.requests.length, "the router call never reached the provider").toBeGreaterThan(0);
+    return JSON.stringify(ai.requests[0].messages);
+  }
+
+  // Creating a KB document also queues a background embedding job that reaches this server, but it
+  // embeds the document, never the chat message — so filtering on the message isolates the KB search.
+  function kbSearchesFor(message: string): number {
+    return ai.embeddingRequests.filter((r) => r.input.some((text) => text.includes(message))).length;
+  }
+
+  test("ZYR-A-100 KB access OFF: an ordinary question is answered, and no knowledge-base or bug lookup runs", async () => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKnowledge(marker);
+    await setKnowledgeBaseAccess(false);
+    const sessionId = await newSession("E2E kb off answer");
+    const message = `How many seats can a ${marker} booking hold?`;
+    queueAnswer("Knowledge-base access is off in this project, so I cannot confirm the seat limit.");
+
+    // The synchronous form (no background flag) — what MCP and API-token callers use.
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, failOnStatusCode: false });
+    expect(res.status(), `sending the message — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    expect(body.message.role).toBe("assistant");
+    expect(body.message.content).toContain("Knowledge-base access is off");
+
+    const prompt = routerPrompt();
+    expect(prompt).toContain("Knowledge base access is disabled for Zyra in this project");
+    expect(prompt, "the KB document reached the model with KB access OFF").not.toContain(`${marker}: a booking allows`);
+    expect(prompt, "the related bug reached the model with KB access OFF").not.toContain(`${marker} seat picker freezes`);
+    // The regression proper: before the fix the toggle only filtered results, so the semantic search
+    // still embedded the user's message on every KB-off turn.
+    expect(kbSearchesFor(message), "a knowledge-base search ran with KB access OFF").toBe(0);
+
+    const messages = await sessionMessages(sessionId);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(messages[0].status).toBe("sent");
+  });
+
+  test("ZYR-A-101 KB access ON (default): the same question still searches the knowledge base and grounds the answer in it", async () => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKnowledge(marker);
+    const sessionId = await newSession("E2E kb on answer");
+    const message = `How many seats can a ${marker} booking hold?`;
+    queueAnswer("A booking allows at most 10 seats.");
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, failOnStatusCode: false });
+    expect(res.status(), `sending the message — ${await res.text()}`).toBe(201);
+    expect((await res.json()).message.content).toBe("A booking allows at most 10 seats.");
+
+    const prompt = routerPrompt();
+    expect(prompt).not.toContain("Knowledge base access is disabled");
+    expect(prompt, "the KB document must still reach the model with KB access ON").toContain(`${marker}: a booking allows at most 10 seats.`);
+    expect(prompt, "the related bug must still reach the model with KB access ON").toContain(`${marker} seat picker freezes`);
+    expect(kbSearchesFor(message), "the semantic KB search must still run with KB access ON").toBeGreaterThan(0);
+  });
+
+  test("ZYR-A-102 KB access OFF: a generation turn sent in the background still drafts test cases, from no KB context", async () => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKnowledge(marker);
+    await setKnowledgeBaseAccess(false);
+    const sessionId = await newSession("E2E kb off generate");
+    const message = `Generate 1 smoke test case for the ${marker} seat picker.`;
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: `${marker} seat picker opens`,
+        preconditions: "A show with free seats exists.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open the seat picker", expectedResult: "The seat map renders" }]),
+        testData: "",
+        expectedSummary: "The seat map renders.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message, background: true }, failOnStatusCode: false });
+    expect(res.status(), `starting the turn — ${await res.text()}`).toBe(201);
+    const { userMessageId } = await res.json();
+
+    const messages = await waitForTurn(sessionId, userMessageId);
+    expect(messages.find((m) => m.id === userMessageId)?.status).toBe("sent");
+    const reply = messages.find((m) => m.role === "assistant");
+    expect(reply, "no assistant reply was written").toBeTruthy();
+    const testcases = reply!.testcases as Array<Record<string, unknown>>;
+    expect(testcases.map((tc) => tc.title)).toContain(`${marker} seat picker opens`);
+    // The reply says plainly that KB access is off and the cases were written in general — not the
+    // "nothing in your knowledge base, add it and ask again" note, which is wrong when it was never read.
+    const content = String(reply!.content);
+    expect(content).toContain("I don't have access to the Knowledge Base");
+    expect(content).toContain("I've created 1 test case(s) in general");
+    expect(content).not.toContain("I don't have anything about this in the project's knowledge base");
+
+    // Neither the router nor the drafting call was shown the KB doc or the bug.
+    const everyPrompt = JSON.stringify(ai.requests.map((r) => r.messages));
+    expect(everyPrompt).not.toContain(`${marker}: a booking allows`);
+    expect(everyPrompt).not.toContain(`${marker} seat picker freezes`);
+    expect(kbSearchesFor(message), "a knowledge-base search ran with KB access OFF").toBe(0);
+  });
+
+  test("ZYR-A-108 KB access ON: a generation turn does not show the KB-off message and keeps its existing wording", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E kb on generate");
+    // Nothing seeded, so the turn is ungrounded — the case whose note the KB-off message replaces.
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title: "Seat picker opens",
+        preconditions: "A show with free seats exists.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open the seat picker", expectedResult: "The seat map renders" }]),
+        testData: "",
+        expectedSummary: "The seat map renders.",
+        priority: "P1",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Generate 1 smoke test case for the seat picker.", background: true }, failOnStatusCode: false });
+    expect(res.status(), `starting the turn — ${await res.text()}`).toBe(201);
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const content = String(messages.find((m) => m.role === "assistant")?.content);
+    expect(content).not.toContain("I don't have access to the Knowledge Base");
+    expect(content).toContain("I don't have anything about this in the project's knowledge base");
+  });
+
+  test("ZYR-A-103 a background send returns before the turn finishes, and the reply lands once it does", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E background send");
+    // Held longer than the POST is allowed to take: a request that waits for the turn cannot pass.
+    ai.delayNextReplyMs(8_000);
+    queueAnswer("This project currently has 0 test cases.");
+
+    const startedAt = Date.now();
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many test cases exist?", background: true },
+      failOnStatusCode: false,
+    });
+    const elapsedMs = Date.now() - startedAt;
+    expect(res.status(), `starting the turn — ${await res.text()}`).toBe(201);
+    expect(elapsedMs, "the POST waited for the turn instead of returning once the message was recorded").toBeLessThan(5_000);
+
+    const body = await res.json();
+    expect(body.accepted).toBe(true);
+    expect(body.userMessageId).toEqual(expect.any(String));
+    const atStart = body.session.messages as Array<Record<string, unknown>>;
+    expect(atStart.map((m) => [m.role, m.status])).toEqual([["user", "processing"]]);
+
+    const messages = await waitForTurn(sessionId, body.userMessageId);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(messages[0].status).toBe("sent");
+    expect(messages[1].content).toBe("This project currently has 0 test cases.");
+    // The session claim is released once the turn settles — the next message is accepted.
+    queueAnswer("Still 0.");
+    const next = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "And now?", background: true }, failOnStatusCode: false });
+    expect(next.status(), `the follow-up was refused — ${await next.text()}`).toBe(201);
+    await waitForTurn(sessionId, (await next.json()).userMessageId);
+  });
+
+  test("ZYR-A-104 background mode still refuses bad input, a busy session, and other callers synchronously", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E background refusals");
+    const send = (data: Record<string, unknown>, target = sessionId) =>
+      asOwner.post(url(`/chat/sessions/${target}/messages`), { data: { background: true, ...data }, failOnStatusCode: false });
+
+    expect((await send({ message: "   " })).status(), "a whitespace-only message").toBe(400);
+    expect((await send({ message: "hi" }, "00000000-0000-4000-8000-000000000000")).status(), "an unknown session").toBe(404);
+    expect((await send({ message: "hi" }, "not-a-uuid")).status(), "a malformed session id").toBe(404);
+
+    // A second message while the first turn is still running is refused, not queued behind it.
+    ai.delayNextReplyMs(6_000);
+    queueAnswer("First answer.");
+    const first = await send({ message: "First question" });
+    expect(first.status()).toBe(201);
+    const second = await send({ message: "Second question" });
+    expect(second.status(), `a concurrent send was accepted — ${await second.text()}`).toBe(409);
+    await waitForTurn(sessionId, (await first.json()).userMessageId);
+    const contents = (await sessionMessages(sessionId)).filter((m) => m.role === "user").map((m) => m.content);
+    expect(contents, "the refused message must not be persisted").toEqual(["First question"]);
+
+    const anonymous = await anonymousContext();
+    try {
+      const res = await anonymous.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "hi", background: true }, failOnStatusCode: false });
+      // requireUser answers 400 "Authentication required" (not 401) on every legacy route, with or
+      // without `background` — the same refusal ZYR-A-01's expectRefused already accepts.
+      expect(res.status()).toBe(400);
+      expect((await res.json()).error).toBe("Authentication required");
+    } finally {
+      await anonymous.dispose();
+    }
+    const otherTenant = await provisionRbacTenant("zyra-citations");
+    test.skip(otherTenant === null, rbacSuiteSkipReason(otherTenant) ?? "");
+    const asOther = await loginAs(otherTenant!.owner);
+    try {
+      const res = await asOther.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "hi", background: true }, failOnStatusCode: false });
+      expect([403, 404], `another workspace reached this session: ${res.status()}`).toContain(res.status());
+    } finally {
+      await asOther.dispose();
+    }
+    expect((await sessionMessages(sessionId)).filter((m) => m.role === "user")).toHaveLength(1);
+  });
+
+  test("ZYR-A-105 a background turn whose provider call fails still settles, and frees the session", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E background provider failure");
+    ai.failNextWith(500, "provider exploded");
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "How many test cases exist?", background: true }, failOnStatusCode: false });
+    expect(res.status()).toBe(201);
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    // Either the turn produced a reply explaining the failure (`sent` + an assistant row) or it threw
+    // (`failed`) — never stuck in `processing`, which would leave the page waiting forever.
+    const user = messages.find((m) => m.role === "user")!;
+    expect(["sent", "failed"]).toContain(user.status);
+    if (user.status === "sent") expect(messages.some((m) => m.role === "assistant")).toBe(true);
+
+    queueAnswer("Recovered.");
+    const next = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Try again", background: true }, failOnStatusCode: false });
+    expect(next.status(), `the session stayed locked after a failed turn — ${await next.text()}`).toBe(201);
+    const after = await waitForTurn(sessionId, (await next.json()).userMessageId);
+    expect(after[after.length - 1].content).toBe("Recovered.");
+  });
+
+  test("ZYR-A-106 a message left `processing` by a turn whose process died is closed out by the next send", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E orphaned processing");
+    // What a backend restart mid-turn leaves behind: the user row, still processing, and no claim.
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Orphaned question', 'processing');`,
+    );
+    queueAnswer("Fresh answer.");
+
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message: "Fresh question", background: true }, failOnStatusCode: false });
+    expect(res.status()).toBe(201);
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    expect(messages.find((m) => m.content === "Orphaned question")?.status, "the orphan would keep a polling page waiting forever").toBe("failed");
+    expect(messages.find((m) => m.content === "Fresh question")?.status).toBe("sent");
+  });
+
+  test("ZYR-A-107 a background turn's progress stream ends with a complete event carrying the persisted reply", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E background progress");
+    const turnId = `33333333-3333-4333-8333-${String(Date.now()).slice(-12).padStart(12, "0")}`;
+    ai.delayNextReplyMs(1_500);
+    queueAnswer("Streamed answer.");
+
+    // POST first so it registers the turn before the stream attaches — same order as the page.
+    const post = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "How many test cases exist?", background: true, turnId },
+      failOnStatusCode: false,
+    });
+    expect(post.status()).toBe(201);
+    const sse = await asOwner.get(url(`/chat/sessions/${sessionId}/turns/${turnId}/events`), { failOnStatusCode: false });
+    expect(sse.status()).toBe(200);
+    const events = parseSseEvents(await sse.text()) as Array<Record<string, unknown>>;
+    const terminal = events[events.length - 1];
+    expect(terminal?.kind, `stream did not end in a complete event — ${JSON.stringify(events)}`).toBe("complete");
+
+    const messages = await waitForTurn(sessionId, (await post.json()).userMessageId);
+    const persisted = messages.find((m) => m.role === "assistant")!;
+    expect(((terminal.payload as Record<string, unknown>).message as Record<string, unknown>).id).toBe(persisted.id);
+    expect(persisted.content).toBe("Streamed answer.");
+  });
+});

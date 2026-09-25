@@ -44,7 +44,9 @@ function formatApiError(status: number, body: ApiErrorBody): string {
 function isNetworkFetchError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : "Network request failed";
   return (
-    msg === "Failed to fetch" ||
+    // Recent Chrome appends the host — "Failed to fetch (api-app-stage.tesbo.io)" — so an exact
+    // match silently stopped recognising network errors and surfaced the raw TypeError text.
+    msg.startsWith("Failed to fetch") ||
     msg === "Load failed" ||
     msg.includes("NetworkError") ||
     msg.includes("network")
@@ -1179,6 +1181,30 @@ export async function sendZyraChatMessage(
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
     body: { message, turnId: opts.turnId },
+  });
+}
+
+/** User-message status while its background turn (startZyraChatMessage) is still running. */
+export const ZYRA_MESSAGE_PROCESSING = "processing";
+/** User-message status when its background turn failed before posting a reply. */
+export const ZYRA_MESSAGE_FAILED = "failed";
+
+/**
+ * Background form of sendZyraChatMessage — what the chat page uses. Resolves as soon as the server
+ * has recorded the message; the turn itself keeps running server-side. A turn can take minutes, and
+ * a request held open that long is cut off by Cloudflare at 100 s ("Failed to fetch") even though the
+ * backend goes on to save the reply. Watch completion by polling getZyraChatSession until the user
+ * message `userMessageId` leaves ZYRA_MESSAGE_PROCESSING (`opts.turnId`'s SSE stream is a bonus).
+ */
+export async function startZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  message: string,
+  opts: { turnId?: string } = {}
+): Promise<{ accepted: true; userMessageId: string; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: { message, turnId: opts.turnId, background: true },
   });
 }
 

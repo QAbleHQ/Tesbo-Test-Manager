@@ -110,7 +110,14 @@ export type RbacTenantKind =
   // The Jira/Linear ticket auto-comment after a Zyra save. Its own tenant because it toggles the
   // project's auto-comment settings and seeds and disconnects workspace-level integration
   // connections, both of which would change what other integration/Zyra suites see.
-  | "zyra-autocomment";
+  | "zyra-autocomment"
+  // Zyra's knowledge-base capability gate and background (non-blocking) chat sends. Its own tenant
+  // because it switches the project's KB capability off and attaches an embeddings-capable fake key,
+  // either of which would change what every other Zyra suite's turns can see.
+  | "zyra-kb-gate"
+  // The same, driven through the chat page (ui/zyra.spec.ts). Separate from "zyra-kb-gate" because
+  // the API and UI files run concurrently in different workers and each purges its own tenant.
+  | "zyra-ui-chat";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

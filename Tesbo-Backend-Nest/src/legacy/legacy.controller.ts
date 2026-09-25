@@ -1306,6 +1306,24 @@ export class LegacyController {
     const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
       ? rawTurnId
       : undefined;
+    // `background: true` (sent by the Zyra chat page) returns as soon as the user's message is
+    // recorded and runs the turn detached — see LegacyService.startZyraChatMessage for why a request
+    // held open for minutes fails behind Cloudflare. Opt-in, so every other caller is unchanged.
+    // Wired exactly like the continue route below: completion reaches SSE through onSettled.
+    if (body?.background === true) {
+      const onStage = turnId ? this.zyraProgress.stageEmitter(turnId, { projectId, sessionId, userId: req.userId || "" }) : undefined;
+      const onSettled = turnId
+        ? (result: { ok: true; payload: unknown } | { ok: false; message: string }) =>
+            result.ok ? this.zyraProgress.complete(turnId, result.payload) : this.zyraProgress.completeWithError(turnId, result.message)
+        : undefined;
+      try {
+        return await this.legacy.startZyraChatMessage(projectId, req.userId, sessionId, body, onStage, onSettled);
+      } catch (err) {
+        // A synchronous rejection (validation, 409, 404) never reaches onSettled — close the stream here.
+        if (turnId) this.zyraProgress.completeWithError(turnId, "This turn did not complete.");
+        throw err;
+      }
+    }
     if (!turnId) {
       return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
     }

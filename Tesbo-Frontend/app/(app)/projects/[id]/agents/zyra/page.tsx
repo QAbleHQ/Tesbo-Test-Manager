@@ -14,11 +14,13 @@ import {
   listZyraChatSessions,
   openZyraTurnProgress,
   renameZyraChatSession,
-  sendZyraChatMessage,
+  startZyraChatMessage,
   stopZyraChatPlan,
   resumeZyraChatPlan,
   ZYRA_MESSAGE_TIMED_OUT,
   ZYRA_MESSAGE_RESUMING,
+  ZYRA_MESSAGE_PROCESSING,
+  ZYRA_MESSAGE_FAILED,
   ZYRA_RESUME_ATTEMPT_CAP,
   type ZyraAgentState,
   type ZyraChatMessage,
@@ -948,8 +950,12 @@ export default function ZyraChatPage() {
   const loadStartedRef = useRef(false);
   const creatingSessionRef = useRef(false);
   const messages = useMemo(() => activeSession?.messages || [], [activeSession]);
-  // Derived, not stored: reflects only whether the CURRENTLY VIEWED session has a send in flight.
-  const sending = activeSession ? pendingSessionIds.has(activeSession.id) : false;
+  // A user message the server still marks `processing` is a background turn in flight — including
+  // one this tab didn't start (sent before a reload, or from another tab).
+  const hasProcessingMessage = messages.some((m) => m.role === "user" && m.status === ZYRA_MESSAGE_PROCESSING);
+  const sendingLocally = activeSession ? pendingSessionIds.has(activeSession.id) : false;
+  // Derived, not stored: reflects only whether the CURRENTLY VIEWED session has a turn in flight.
+  const sending = sendingLocally || hasProcessingMessage;
   // The sidebar is a history of conversations that actually happened — a session nobody ever sent
   // a message in (including one still being created) has nothing to show and shouldn't clutter or
   // duplicate in the list. `hasMessages` only comes back on list responses (see api.ts), so a
@@ -1113,7 +1119,10 @@ export default function ZyraChatPage() {
   // flag off, a reload lost the turnId, a network blip); this poll is what actually detects
   // completion regardless, the same "watch a detached background job" shape the task-board page
   // uses (5s, paused while the tab is hidden, in-flight-guarded so overlapping ticks never stack).
-  const hasResumingMessage = (activeSession?.messages || []).some((m) => m.status === ZYRA_MESSAGE_RESUMING);
+  // Also covers a background send this tab isn't already watching (submitMessage polls its own turn,
+  // so it's excluded while one is pending here) — e.g. the page was reloaded mid-turn.
+  const hasResumingMessage = (activeSession?.messages || []).some((m) => m.status === ZYRA_MESSAGE_RESUMING)
+    || (hasProcessingMessage && !sendingLocally);
   const resumePollInFlightRef = useRef(false);
   useEffect(() => {
     if (!hasResumingMessage || !activeSessionId) return;
@@ -1138,8 +1147,29 @@ export default function ZyraChatPage() {
     };
   }, [activeSessionId]);
 
+  // Polls a background turn until its user message leaves `processing` — the server flips it only
+  // after the reply row is written, so the returned session already contains the answer. A failed
+  // poll (network blip, deploy) is just skipped; the cap is generous because a turn can legitimately
+  // run several minutes, and past it the reply still lands server-side and shows on the next load.
+  async function waitForZyraTurn(sessionId: string, userMessageId: string): Promise<ZyraChatSession | null> {
+    const deadline = Date.now() + 15 * 60_000;
+    let last: ZyraChatSession | null = null;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      try {
+        last = await getZyraChatSession(projectId, sessionId);
+      } catch {
+        continue;
+      }
+      const userMessage = last.messages?.find((m) => m.id === userMessageId);
+      if (!userMessage || userMessage.status !== ZYRA_MESSAGE_PROCESSING) return last;
+      setActiveSession((prev) => (prev && prev.id === sessionId ? last : prev));
+    }
+    return null;
+  }
+
   async function submitMessage(text: string) {
-    if (!activeSession || !text.trim() || pendingSessionIds.has(activeSession.id)) return;
+    if (!activeSession || !text.trim() || pendingSessionIds.has(activeSession.id) || hasProcessingMessage) return;
     const sessionId = activeSession.id;
     const trimmed = text.trim();
     setInput("");
@@ -1165,25 +1195,51 @@ export default function ZyraChatPage() {
     setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, messages: [...(prev.messages || []), optimistic] } : prev);
     const turnId = crypto.randomUUID();
     setSendingTurnId(turnId);
-    // sendZyraChatMessage below starts its fetch() synchronously (an async function's body runs up
-    // to its first await immediately) — capturing the promise before opening the SSE stream, rather
-    // than awaiting it first, is what fires the POST before the GET without blocking on the whole
-    // turn: opening this stream only after the full reply arrived would mean it could never show
-    // anything live, defeating the point.
-    const sendPromise = sendZyraChatMessage(projectId, sessionId, trimmed, { turnId });
+    // startZyraChatMessage below starts its fetch() synchronously (an async function's body runs up
+    // to its first await immediately) — capturing the promise before opening the SSE stream is what
+    // fires the POST before the GET, so the progress entry exists by the time the stream attaches.
+    //
+    // Background mode: the POST only records the message and returns; the turn runs server-side and
+    // this polls for it. Awaiting the whole turn on one request is what broke behind Cloudflare — a
+    // generation turn runs for minutes, Cloudflare drops the request at 100 s with a CORS-less 524,
+    // and the page showed "Failed to fetch" while the backend went on to save the reply.
+    const startPromise = startZyraChatMessage(projectId, sessionId, trimmed, { turnId });
     watchZyraTurnProgress(sessionId, turnId);
+    let started: Awaited<typeof startPromise>;
     try {
-      const result = await sendPromise;
-      setActiveSession((prev) => prev && prev.id === sessionId ? result.session : prev);
-      void refreshSessions();
-      // Belt and suspenders: the SSE "complete" event already does this (see watchZyraTurnProgress),
-      // but SSE was never meant to be authoritative here (feature flag off, a dropped connection) —
-      // this fires from the awaited response itself, independent of whether that event ever arrived.
-      finishTurn(turnId, result);
+      started = await startPromise;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Zyra could not answer.";
-      setError(msg);
+      // Rejected before the turn began (validation, a turn already running, network) — nothing was
+      // queued server-side, so drop the optimistic bubble and say why.
+      setError(err instanceof Error ? err.message : "Zyra could not answer.");
       setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, messages: (prev.messages || []).filter((m) => m.id !== optimistic.id) } : prev);
+      setPendingSessionIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+      setSendingTurnId(null);
+      return;
+    }
+    try {
+      setActiveSession((prev) => prev && prev.id === sessionId ? started.session : prev);
+      void refreshSessions();
+      const settled = await waitForZyraTurn(sessionId, started.userMessageId);
+      if (settled) setActiveSession((prev) => prev && prev.id === sessionId ? settled : prev);
+      void refreshSessions();
+      const userMessage = settled?.messages?.find((m) => m.id === started.userMessageId);
+      if (!settled || !userMessage) {
+        setError("Zyra is taking longer than expected. The reply will appear here once it's ready — refresh to check.");
+      } else if (userMessage.status === ZYRA_MESSAGE_FAILED) {
+        setError("Zyra couldn't finish answering that message. Please try again.");
+      } else {
+        // Belt and suspenders: the SSE "complete" event already does this (see watchZyraTurnProgress),
+        // but SSE was never meant to be authoritative here (feature flag off, a dropped connection) —
+        // this fires from the polled session itself, independent of whether that event ever arrived.
+        const all = settled.messages || [];
+        const reply = all.slice(all.findIndex((m) => m.id === started.userMessageId) + 1).find((m) => m.role === "assistant");
+        finishTurn(turnId, reply ? { message: reply } : undefined);
+      }
     } finally {
       setPendingSessionIds((prev) => {
         const next = new Set(prev);
