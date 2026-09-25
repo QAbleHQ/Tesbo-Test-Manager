@@ -27,6 +27,7 @@ import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/componen
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { renderMarkdown } from "@/lib/markdown";
 
 const PAGE_SIZE = 25;
 
@@ -1011,9 +1012,23 @@ export default function RequirementsPage() {
                                   <h4 className="text-xs font-semibold text-[var(--muted)] uppercase tracking-wide mb-1">
                                     Description
                                   </h4>
-                                  <p className="text-sm text-[var(--muted)] whitespace-pre-wrap max-h-48 overflow-y-auto">
-                                    {ticket.description}
-                                  </p>
+                                  {/* Linear stores descriptions as Markdown verbatim, so render it. Jira's
+                                      arrive already flattened to plain text (jiraDescriptionToText) —
+                                      running that through renderMarkdown would italicise snake_case. */}
+                                  {ticket.source === "linear" ? (
+                                    <div
+                                      data-testid="ticket-description"
+                                      className="zyra-prose break-words text-sm text-[var(--muted)] max-h-48 overflow-y-auto"
+                                      dangerouslySetInnerHTML={{ __html: renderMarkdown(ticket.description) }}
+                                    />
+                                  ) : (
+                                    <p
+                                      data-testid="ticket-description"
+                                      className="text-sm text-[var(--muted)] whitespace-pre-wrap max-h-48 overflow-y-auto"
+                                    >
+                                      {ticket.description}
+                                    </p>
+                                  )}
                                 </div>
                               )}
                               <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">

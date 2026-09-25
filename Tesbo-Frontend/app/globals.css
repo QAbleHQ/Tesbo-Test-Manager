@@ -465,6 +465,12 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   padding: 0;
 }
 
+/* Custom Tags settings page: fill exactly the space under the 3.5rem top bar, so <main> never
+   overflows and its scrollbar stays put — the tag list inside scrolls instead. */
+.tesbo-page:has(> .ct-fixed-page) {
+  height: calc(100vh - 3.5rem);
+}
+
 .tesbo-section {
   margin-bottom: 1.25rem;
 }

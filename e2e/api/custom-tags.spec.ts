@@ -339,4 +339,165 @@ test.describe("custom tags", () => {
   test("a project with no custom tags reports an empty catalog", async () => {
     expect(await listTags(asOwner, tenant!.secondProjectId)).toEqual([]);
   });
+
+  // ─── Test case list — the repository's Tags filter (customTagIds) ────────────
+
+  async function listCases(params: Record<string, string>, api: APIRequestContext = asOwner): Promise<{ ids: string[]; total: number; rows: any[] }> {
+    const res = await api.get(testcasesUrl(), { params, failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    const rows = await res.json();
+    return { ids: rows.map((r: any) => r.id), total: Number(res.headers()["x-total-count"]), rows };
+  }
+
+  test("filtering by one tag lists only the cases carrying it", async () => {
+    const [smoke, flaky] = await Promise.all([createTag({ name: tagName("smoke") }), createTag({ name: tagName("flaky") })]);
+    const a = await createTestCase({ customTagIds: [smoke.id] });
+    const b = await createTestCase({ customTagIds: [flaky.id] });
+    const none = await createTestCase();
+
+    const { ids, total } = await listCases({ customTagIds: smoke.id });
+    expect(ids).toEqual([a.id]);
+    expect(total).toBe(1);
+    expect(ids).not.toContain(b.id);
+    expect(ids).not.toContain(none.id);
+  });
+
+  test("several tags match any of them, and a case carrying two of them is listed once", async () => {
+    const [smoke, flaky, other] = await Promise.all([
+      createTag({ name: tagName("smoke") }),
+      createTag({ name: tagName("flaky") }),
+      createTag({ name: tagName("other") }),
+    ]);
+    const onlySmoke = await createTestCase({ customTagIds: [smoke.id] });
+    const onlyFlaky = await createTestCase({ customTagIds: [flaky.id] });
+    const both = await createTestCase({ customTagIds: [smoke.id, flaky.id] });
+    const onlyOther = await createTestCase({ customTagIds: [other.id] });
+
+    const { ids, total } = await listCases({ customTagIds: `${smoke.id},${flaky.id}` });
+    expect(new Set(ids)).toEqual(new Set([onlySmoke.id, onlyFlaky.id, both.id]));
+    // No join fan-out: `both` matches twice over but is one row, and the header total agrees.
+    expect(ids.length).toBe(3);
+    expect(total).toBe(3);
+    expect(ids).not.toContain(onlyOther.id);
+
+    // The repeated-param form (?customTagIds=a&customTagIds=b) means the same thing.
+    const repeated = await asOwner.get(`${testcasesUrl()}?customTagIds=${smoke.id}&customTagIds=${flaky.id}`);
+    expect(new Set((await repeated.json()).map((r: any) => r.id))).toEqual(new Set(ids));
+  });
+
+  test("the tag filter combines with the other filters rather than replacing them", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const stamp = `Combo ${Date.now()}`;
+    const draft = await createTestCase({ title: `E2E ${stamp} draft`, status: "Draft", customTagIds: [smoke.id] });
+    const approved = await createTestCase({ title: `E2E ${stamp} approved`, status: "Approved", customTagIds: [smoke.id] });
+    const untaggedDraft = await createTestCase({ title: `E2E ${stamp} untagged`, status: "Draft" });
+
+    expect((await listCases({ customTagIds: smoke.id, status: "Draft" })).ids).toEqual([draft.id]);
+    const searched = await listCases({ customTagIds: smoke.id, search: stamp });
+    expect(new Set(searched.ids)).toEqual(new Set([draft.id, approved.id]));
+    expect(searched.ids).not.toContain(untaggedDraft.id);
+  });
+
+  test("paging through a tag filter keeps the filtered total, not the repository's", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const tagged = await Promise.all([1, 2, 3].map(() => createTestCase({ customTagIds: [smoke.id] })));
+    await createTestCase();
+
+    const first = await listCases({ customTagIds: smoke.id, limit: "2", offset: "0" });
+    const second = await listCases({ customTagIds: smoke.id, limit: "2", offset: "2" });
+    expect(first.total).toBe(3);
+    expect(second.total).toBe(3);
+    expect(first.ids.length).toBe(2);
+    expect(second.ids.length).toBe(1);
+    expect(new Set([...first.ids, ...second.ids])).toEqual(new Set(tagged.map((t) => t.id)));
+  });
+
+  test("a real tag nobody carries yields an empty page, not the whole repository", async () => {
+    const unused = await createTag({ name: tagName("unused") });
+    await createTestCase();
+    const { ids, total } = await listCases({ customTagIds: unused.id });
+    expect(ids).toEqual([]);
+    expect(total).toBe(0);
+  });
+
+  test("an empty or blank customTagIds is no filter at all, and duplicates are harmless", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const tagged = await createTestCase({ customTagIds: [smoke.id] });
+    const untagged = await createTestCase();
+
+    for (const blank of ["", " , ,"]) {
+      const { ids } = await listCases({ customTagIds: blank });
+      expect(ids).toEqual(expect.arrayContaining([tagged.id, untagged.id]));
+    }
+    expect((await listCases({ customTagIds: `${smoke.id},${smoke.id}` })).ids).toEqual([tagged.id]);
+  });
+
+  test("a malformed tag id is a 400, not a 500 and not a silently unfiltered list", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    for (const bad of ["not-a-uuid", `${smoke.id},nope`, "'; DROP TABLE testcases; --"]) {
+      const res = await asOwner.get(testcasesUrl(), { params: { customTagIds: bad }, failOnStatusCode: false });
+      expect(res.status(), `customTagIds=${bad}`).toBe(400);
+    }
+  });
+
+  test("another project's tag id matches nothing here", async () => {
+    const foreign = await createTag({ name: tagName("foreign") }, asOwner, tenant!.secondProjectId);
+    await createTestCase({ customTagIds: [foreign.id] }); // silently dropped: not this project's tag
+    const { ids } = await listCases({ customTagIds: foreign.id });
+    expect(ids).toEqual([]);
+  });
+
+  test("the tag-filtered list refuses a caller with no session or no project access", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const anonRes = await anon.get(testcasesUrl(), { params: { customTagIds: smoke.id }, failOnStatusCode: false });
+    // Same allowance as "every route refuses a caller with no session" above: refused, whatever the code.
+    expect([401, 403]).toContain(anonRes.status());
+    const guestRes = await asGuest.get(testcasesUrl(), { params: { customTagIds: smoke.id }, failOnStatusCode: false });
+    expect(guestRes.status()).toBe(404);
+  });
+
+  test("list rows carry each case's custom tags, sorted by name", async () => {
+    const stamp = `${Date.now()}`;
+    const [zeta, alpha] = await Promise.all([
+      createTag({ name: `E2E zeta ${stamp}` }),
+      createTag({ name: `E2E alpha ${stamp}` }),
+    ]);
+    const tagged = await createTestCase({ customTagIds: [zeta.id, alpha.id] });
+    const untagged = await createTestCase();
+
+    const { rows } = await listCases({});
+    const byId = new Map(rows.map((r: any) => [r.id, r]));
+    expect((byId.get(tagged.id) as any).customTags).toEqual([
+      { id: alpha.id, name: alpha.name },
+      { id: zeta.id, name: zeta.name },
+    ]);
+    expect((byId.get(untagged.id) as any).customTags).toEqual([]);
+  });
+
+  test("deleting a tag drops it from the rows of a previously listed (cached) page", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const tagged = await createTestCase({ customTagIds: [smoke.id] });
+    // The unfiltered first page is the cacheable shape — load it once so it's warm.
+    const before = await listCases({ limit: "100", offset: "0" });
+    expect((before.rows.find((r: any) => r.id === tagged.id) as any).customTags.map((t: any) => t.id)).toEqual([smoke.id]);
+
+    expect((await asOwner.delete(tagUrl(smoke.id), { failOnStatusCode: false })).ok()).toBeTruthy();
+    const after = await listCases({ limit: "100", offset: "0" });
+    expect((after.rows.find((r: any) => r.id === tagged.id) as any).customTags).toEqual([]);
+    // And filtering by the now-deleted id finds nothing rather than erroring.
+    expect((await listCases({ customTagIds: smoke.id })).ids).toEqual([]);
+  });
+
+  test("export honours the tag filter, so the file matches the filtered screen", async () => {
+    const smoke = await createTag({ name: tagName("smoke") });
+    const stamp = `Export ${Date.now()}`;
+    await createTestCase({ title: `E2E ${stamp} tagged`, customTagIds: [smoke.id] });
+    await createTestCase({ title: `E2E ${stamp} untagged` });
+
+    const res = await asOwner.get(`${testcasesUrl()}/export/csv`, { params: { customTagIds: smoke.id }, failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBe(200);
+    const csv = await res.text();
+    expect(csv).toContain(`E2E ${stamp} tagged`);
+    expect(csv).not.toContain(`E2E ${stamp} untagged`);
+  });
 });

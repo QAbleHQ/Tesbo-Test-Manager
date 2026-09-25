@@ -317,3 +317,219 @@ test.describe("requirements page — View in Knowledge base follows the active s
     },
   );
 });
+
+/*
+ * The Linear sync panel's project label. A Linear Project mapping stores its opaque slugId in the
+ * key slot (V95), so the panel used to label a completed sync "4081f3c6e1df" — now it shows the
+ * mapped name (remote_project_name, V126) and keeps the slugId as the hover tooltip, falling back
+ * to the key for runs recorded before the name was stored. The run is seeded directly: a real sync
+ * would call Linear's live API (see api/integrations.spec.ts's file header).
+ */
+test.describe("requirements page — Linear sync panel names the project", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  function seedLinearSyncRun(projectId: string, key: string, name: string | null): void {
+    exec(
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, " +
+        "remote_project_key, remote_project_name, error, started_at, finished_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, 'linear', 'succeeded', 'done', 'manual', ` +
+        `${literal(key)}, ${name === null ? "NULL" : literal(name)}, ` +
+        `${literal(`No changes in ${name ?? key} since the last sync.`)}, now(), now());`,
+    );
+  }
+
+  test("REQ-U-09 a Linear sync shows the project name, with the slugId only as the tooltip", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Linear connection and a sync run");
+    const project = await createProject(api);
+    const slug = `e2e${uniqueSuffix()}`; // shaped like a Linear slugId: opaque, lowercase, no spaces
+    const name = `E2E Orange HRMS ${uniqueSuffix()}`;
+    try {
+      seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedLinearSyncRun(project.id, slug, name);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
+      const chip = panel.getByTestId("sync-run-remote");
+      await expect(chip).toHaveText(name);
+      await expect(chip).toHaveAttribute("title", slug);
+      await expect(panel).toContainText(`No changes in ${name} since the last sync.`);
+      // The reported defect: the opaque slugId was the visible label.
+      await expect(panel.getByText(slug, { exact: true })).toHaveCount(0);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-10 a Linear sync recorded before names were stored falls back to its key", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Linear connection and a sync run");
+    const project = await createProject(api);
+    const slug = `e2e${uniqueSuffix()}`; // shaped like a Linear slugId: opaque, lowercase, no spaces
+    try {
+      seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedLinearSyncRun(project.id, slug, null);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
+      await expect(panel.getByTestId("sync-run-remote")).toHaveText(slug);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+});
+
+/*
+ * The expanded-row Description used to print Linear's Markdown verbatim ("### LIN-05 ...",
+ * "**Module:** Claim"), because Linear stores descriptions as Markdown and the row rendered them
+ * as a plain <p>. Linear descriptions now go through lib/markdown.ts renderMarkdown(); Jira's stay
+ * plain text, since the backend already flattens Jira's ADF to text (jiraDescriptionToText) and
+ * that renderer would turn snake_case into italics.
+ *
+ * The row is expanded by clicking its summary cell — the key cell is a link that stops propagation,
+ * so clicking it opens the provider instead of toggling the detail row.
+ */
+test.describe("requirements page — ticket description rendering", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  async function openDescription(page: import("@playwright/test").Page, projectId: string, key: string) {
+    await page.goto(`/projects/${projectId}/requirements`);
+    await page.getByText(`Requirement ${key}`, { exact: true }).click();
+    return page.getByTestId("ticket-description");
+  }
+
+  test("REQ-U-11 a Linear description renders its Markdown instead of printing it raw", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed linear_tickets directly");
+    const project = await createProject(api);
+    try {
+      const key = `E2ESCR-${uniqueSuffix()}`;
+      // Shaped like the reported ticket (LIN-05), which is exactly what a Linear sync stores.
+      const markdown = [
+        "### LIN-05: Submit an Expense Claim",
+        "",
+        "**Module:** Claim",
+        "**Priority:** Medium",
+        "",
+        "**Acceptance Criteria:**",
+        "- Employee can attach a receipt",
+        "- Claim total is validated",
+        "",
+        "See [the spec](https://example.com/spec).",
+      ].join("\n");
+      seedLinearRequirements(tenant!.organizationId, project.id, [key], { [key]: markdown });
+
+      const desc = await openDescription(page, project.id, key);
+      await expect(desc.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+      await expect(desc.locator("strong", { hasText: "Module:" })).toBeVisible();
+      await expect(desc.locator("strong", { hasText: "Acceptance Criteria:" })).toBeVisible();
+      await expect(desc.locator("li")).toHaveText(["Employee can attach a receipt", "Claim total is validated"]);
+      const link = desc.getByRole("link", { name: "the spec" });
+      await expect(link).toHaveAttribute("href", "https://example.com/spec");
+      await expect(link).toHaveAttribute("target", "_blank");
+      await expect(link).toHaveAttribute("rel", /noopener/);
+      // The reported defect: the raw markers were the visible text.
+      await expect(desc).not.toContainText("###");
+      await expect(desc).not.toContainText("**");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-12 HTML inside a Linear description is shown as text and never executes", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed linear_tickets directly");
+    const project = await createProject(api);
+    try {
+      const key = `E2ESCR-${uniqueSuffix()}`;
+      const payload = [
+        `<img src=x onerror="window.__reqDescXss=1">`,
+        `<script>window.__reqDescXss=1</script>`,
+        `[click me](javascript:window.__reqDescXss=1)`,
+        `[breakout](https://a.test/" onmouseover="window.__reqDescXss=1" x=")`,
+      ].join("\n");
+      seedLinearRequirements(tenant!.organizationId, project.id, [key], { [key]: payload });
+
+      const desc = await openDescription(page, project.id, key);
+      await expect(desc).toContainText(`<img src=x onerror=`);
+      await expect(desc).toContainText(`<script>`);
+      await expect(desc.locator("img, script")).toHaveCount(0);
+      // renderMarkdown only links http(s) URLs, so the javascript: link must stay plain text.
+      await expect(desc.locator('a[href^="javascript:"]')).toHaveCount(0);
+      // The quote-breakout attempt must not have produced a live event-handler attribute.
+      await expect(desc.locator("[onmouseover], [onerror]")).toHaveCount(0);
+      await desc.hover();
+      expect(await page.evaluate(() => (window as unknown as { __reqDescXss?: number }).__reqDescXss)).toBeUndefined();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-13 a Jira description stays literal plain text — snake_case is not italicised", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed jira_tickets directly");
+    const project = await createProject(api);
+    try {
+      const key = `E2ESCR-${uniqueSuffix()}`;
+      const text = "Validate the user_account_id field\n**kept literally**\nline three";
+      seedJiraRequirements(tenant!.organizationId, project.id, [key], { [key]: text });
+
+      const desc = await openDescription(page, project.id, key);
+      await expect(desc).toContainText("user_account_id");
+      await expect(desc).toContainText("**kept literally**");
+      await expect(desc.locator("em, strong, h1, h2, h3, li")).toHaveCount(0);
+      // whitespace-pre-wrap keeps Jira's line breaks, which a plain <p> would otherwise collapse.
+      expect(await desc.innerText()).toContain("field\n**kept literally**\nline three");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-14 a ticket with no description shows no Description block, but the row still expands", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed linear_tickets directly");
+    const project = await createProject(api);
+    try {
+      const key = `E2ESCR-${uniqueSuffix()}`;
+      seedLinearRequirements(tenant!.organizationId, project.id, [key]); // description left NULL
+
+      const desc = await openDescription(page, project.id, key);
+      await expect(page.getByRole("link", { name: "Open in Linear →" })).toBeVisible();
+      await expect(desc).toHaveCount(0);
+      await expect(page.getByRole("heading", { name: "Description", exact: true })).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-15 a long Linear description scrolls inside its capped box instead of stretching the row", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed linear_tickets directly");
+    const project = await createProject(api);
+    try {
+      const key = `E2ESCR-${uniqueSuffix()}`;
+      const long = ["### Long ticket", ...Array.from({ length: 80 }, (_, i) => `- Criterion ${i + 1}`)].join("\n");
+      seedLinearRequirements(tenant!.organizationId, project.id, [key], { [key]: long });
+
+      const desc = await openDescription(page, project.id, key);
+      await expect(desc.locator("li")).toHaveCount(80);
+      // max-h-48 = 12rem = 192px.
+      const box = await desc.evaluate((el) => ({ h: el.clientHeight, sh: el.scrollHeight }));
+      expect(box.h).toBeLessThanOrEqual(192);
+      expect(box.sh).toBeGreaterThan(box.h);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+});

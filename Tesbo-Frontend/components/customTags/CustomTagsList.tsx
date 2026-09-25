@@ -62,8 +62,8 @@ export default function CustomTagsList({
   }
 
   return (
-    <div className="space-y-4">
-      <form onSubmit={handleAdd} className="flex items-start gap-2">
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
+      <form onSubmit={handleAdd} className="flex shrink-0 items-start gap-2">
         <Field className="flex-1">
           <Input
             type="text"
@@ -82,7 +82,7 @@ export default function CustomTagsList({
       {tags.length === 0 ? (
         <p className="text-sm text-[var(--muted)]">No custom tags yet. Add one above to start tagging test cases.</p>
       ) : (
-        <ul className="divide-y divide-[var(--border-subtle)] rounded-lg border border-[var(--border)]">
+        <ul className="min-h-[160px] flex-1 divide-y divide-[var(--border-subtle)] overflow-y-auto rounded-lg border border-[var(--border)]">
           {tags.map((tag) => (
             <li key={tag.id} className="flex items-center justify-between px-4 py-2.5">
               <span className="text-sm font-medium text-[var(--foreground)]">{tag.name}</span>

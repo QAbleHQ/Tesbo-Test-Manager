@@ -1471,6 +1471,8 @@ export interface TestCaseListItem {
    * case when Zyra generated it — see ZyraSourceRef. Empty/absent for every manually-created,
    * imported, or duplicated case, since only Zyra ever populates this. */
   sourceRefs?: ZyraSourceRef[];
+  /** The project custom tags assigned to this case, sorted by name. */
+  customTags?: { id: string; name: string }[];
 }
 
 export async function listTestCases(
@@ -1490,6 +1492,8 @@ export async function listTestCases(
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
+    /** Custom tag ids — a case matches when it carries any one of them. */
+    customTagIds?: string[];
     /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
     sortBy?: "id" | "title" | "priority";
     sortDir?: "asc" | "desc";
@@ -1508,6 +1512,7 @@ export async function listTestCases(
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
+  if (params?.customTagIds?.length) sp.set("customTagIds", params.customTagIds.join(","));
   if (params?.sortBy) sp.set("sortBy", params.sortBy);
   if (params?.sortDir) sp.set("sortDir", params.sortDir);
   const path = `/api/projects/${projectId}/testcases?${sp}`;
@@ -1796,6 +1801,8 @@ export interface TestCaseExportFilters {
   search?: string;
   /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
   customFieldFilters?: string;
+  /** Custom tag ids — a case matches when it carries any one of them. */
+  customTagIds?: string[];
   /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
   sortBy?: "id" | "title" | "priority";
   sortDir?: "asc" | "desc";
@@ -1817,6 +1824,7 @@ export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?
   if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
   if (filters?.search) sp.set("search", filters.search);
   if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+  if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
   if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
   if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
   const qs = sp.toString();
@@ -3174,6 +3182,8 @@ export interface SyncRun {
   status: SyncRunStatus;
   stage: SyncRunStage;
   remoteProjectKey: string | null;
+  /** Linear only — the mapped Team/Project name. Null for Jira and for runs recorded before it existed. */
+  remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;
   failedTickets: number;

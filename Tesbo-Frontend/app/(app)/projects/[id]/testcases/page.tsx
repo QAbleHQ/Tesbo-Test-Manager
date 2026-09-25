@@ -94,6 +94,7 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 const ImportTestCasesModal = dynamic(() => import("@/components/ImportTestCasesModal"), { ssr: false });
 import CustomFieldsSection from "@/components/customFields/CustomFieldsSection";
 import CustomTagsMultiSelect from "@/components/customTags/CustomTagsMultiSelect";
+import CustomTagsFilterPopover from "@/components/customTags/CustomTagsFilterPopover";
 import CustomFieldFilterPopover from "@/components/customFields/CustomFieldFilterPopover";
 import { getConfiguredDefaultValue, validateCustomFieldValues } from "@/components/customFields/customFieldTypes";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
@@ -510,6 +511,14 @@ export default function TestCasesPage() {
   const [suiteTypeFilter, setSuiteTypeFilter] = useState("all");
   const [suiteAutomationFilter, setSuiteAutomationFilter] = useState("all");
   const [customFieldFilters, setCustomFieldFilters] = useState<CustomFieldFilterCondition[]>([]);
+  // Custom tag ids for the toolbar's Tags filter — a case matches when it carries any of them.
+  const [suiteTagFilter, setSuiteTagFilter] = useState<string[]>([]);
+  // A tag deleted from the catalog can't be shown as a chip or unticked any more — drop it from the
+  // filter rather than leave the list narrowed by an id the user can no longer see.
+  useEffect(() => {
+    const known = new Set(customTags.map((t) => t.id));
+    setSuiteTagFilter((prev) => (prev.every((id) => known.has(id)) ? prev : prev.filter((id) => known.has(id))));
+  }, [customTags]);
   const [debouncedSuiteSearch, setDebouncedSuiteSearch] = useState("");
 
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -710,6 +719,7 @@ export default function TestCasesPage() {
     suiteAutomationFilter !== "all",
     activeJiraIssueKey !== "",
     customFieldFilters.length > 0,
+    suiteTagFilter.length > 0,
   ].filter(Boolean).length;
   // Paged against what was actually loaded (suiteCases.length), not the server's raw total — when
   // suiteCasesTruncated is true those differ, and paging against the total would offer pages past
@@ -789,6 +799,7 @@ export default function TestCasesPage() {
     suiteAutomationFilter,
     activeJiraIssueKey,
     customFieldFilters,
+    suiteTagFilter,
     pageSize,
     suiteCasesSort,
   ]);
@@ -826,6 +837,7 @@ export default function TestCasesPage() {
         linearIssueKey: activeLinearIssueKey || undefined,
         search: debouncedSuiteSearch || undefined,
         customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
+        customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
       });
       setSuiteCases(list);
       setSuiteCasesTotal(total);
@@ -849,6 +861,7 @@ export default function TestCasesPage() {
     activeJiraIssueKey,
     activeLinearIssueKey,
     customFieldFilters,
+    suiteTagFilter,
   ]);
 
   // Same suite/status/priority/type/automation/jira/linear/search/custom-field filters AND column
@@ -869,6 +882,7 @@ export default function TestCasesPage() {
       linearIssueKey: activeLinearIssueKey || undefined,
       search: debouncedSuiteSearch || undefined,
       customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
+      customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
       sortBy: suiteCasesSort?.column,
       sortDir: suiteCasesSort?.direction,
     }),
@@ -882,6 +896,7 @@ export default function TestCasesPage() {
       activeLinearIssueKey,
       debouncedSuiteSearch,
       customFieldFilters,
+      suiteTagFilter,
       suiteCasesSort,
     ]
   );
@@ -1040,6 +1055,7 @@ export default function TestCasesPage() {
     setSuiteTypeFilter("all");
     setSuiteAutomationFilter("all");
     setCustomFieldFilters([]);
+    setSuiteTagFilter([]);
     setSuiteCasesPage(1);
     if (activeJiraIssueKey) router.replace(`/projects/${projectId}/testcases`);
   }
@@ -1127,6 +1143,7 @@ export default function TestCasesPage() {
           linearIssueKey: activeLinearIssueKey || undefined,
           search: debouncedSuiteSearch || undefined,
           customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
+          customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
         });
         if (!list.length) break;
         ids.push(...list.map((tc) => tc.id));
@@ -2102,6 +2119,7 @@ export default function TestCasesPage() {
                       conditions={customFieldFilters}
                       onChange={setCustomFieldFilters}
                     />
+                    <CustomTagsFilterPopover tags={customTags} selectedIds={suiteTagFilter} onChange={setSuiteTagFilter} />
                     {/* Columns control renders here (portaled from the table), as the 5th dropdown. */}
                     <div ref={setColumnsSlotEl} className="flex items-center empty:hidden" />
                     {selectedSuiteCases.length > 0 && (

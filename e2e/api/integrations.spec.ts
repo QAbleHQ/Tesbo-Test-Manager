@@ -185,17 +185,25 @@ test.describe("integrations — Jira and Linear", () => {
    */
   function seedSyncRun(
     provider: "jira" | "linear",
-    fields: { status?: string; triggerSource?: "manual" | "nightly"; error?: string | null; remoteProjectKey?: string; projectId?: string } = {},
+    fields: {
+      status?: string;
+      triggerSource?: "manual" | "nightly";
+      error?: string | null;
+      remoteProjectKey?: string;
+      remoteProjectName?: string;
+      projectId?: string;
+    } = {},
   ): string {
     const status = fields.status ?? "failed";
     const projectId = fields.projectId ?? tenant!.mainProjectId;
     const triggerSource = fields.triggerSource ?? "nightly";
     exec(
-      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date, error, remote_project_key, started_at, finished_at) VALUES (" +
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date, error, remote_project_key, remote_project_name, started_at, finished_at) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, ${literal(status)}, ` +
         `${literal(status === "failed" ? "failed" : "done")}, ${literal(triggerSource)}, ` +
         `${triggerSource === "nightly" ? "(now() + interval '5.5 hours')::date" : "NULL"}, ` +
         `${fields.error === undefined ? "NULL" : literal(fields.error)}, ${fields.remoteProjectKey ? literal(fields.remoteProjectKey) : "NULL"}, ` +
+        `${fields.remoteProjectName ? literal(fields.remoteProjectName) : "NULL"}, ` +
         "now(), now());",
     );
     return scalar(
@@ -1139,6 +1147,37 @@ test.describe("integrations — Jira and Linear", () => {
     expect(history.status()).toBe(200);
     const historyBody = await history.json();
     expect(historyBody.runs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ─── Sync run's Linear project name (V126) ────────────────────────────────
+  //
+  // A Linear Project mapping stores its opaque slugId in the key slot (V95), and the Requirements
+  // sync panel showed that ("4081f3c6e1df") instead of the project name. The write side — startRun
+  // and the processor recording the name — needs a live Linear call to reach through HTTP, so it is
+  // pinned in integration-sync.processor.spec.ts; these pin the persisted column's read path.
+
+  test("INT-A-53 a Linear sync run returns its project name alongside the slugId key", async () => {
+    seedSyncRun("linear", { status: "succeeded", error: null, remoteProjectKey: "4081f3c6e1df", remoteProjectName: "E2E Orange HRMS Project" });
+
+    const status = await asOwner.get(url("/integrations/linear/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    const { run } = await status.json();
+    expect(run?.remoteProjectName).toBe("E2E Orange HRMS Project");
+    expect(run?.remoteProjectKey).toBe("4081f3c6e1df");
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status(), await history.text()).toBe(200);
+    expect((await history.json()).runs[0]?.remoteProjectName).toBe("E2E Orange HRMS Project");
+  });
+
+  test("INT-A-54 a Linear run recorded before the name existed still answers, with a null name and its key", async () => {
+    seedSyncRun("linear", { status: "succeeded", error: null, remoteProjectKey: "4081f3c6e1df" });
+
+    const status = await asOwner.get(url("/integrations/linear/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    const { run } = await status.json();
+    expect(run?.remoteProjectName).toBeNull();
+    expect(run?.remoteProjectKey).toBe("4081f3c6e1df");
   });
 
   // ─── Linear Project mapping (V95) ─────────────────────────────────────────
