@@ -2634,6 +2634,132 @@ test.describe("zyra / agents (UI)", () => {
     // Exactly the three attributes renderMarkdown's own link markup sets: href, target, rel.
     expect(attrs.attributeCount).toBe(3);
   });
+
+  // ─── Settings → AI Providers: the "Add workspace AI key" form ──────────────
+  //
+  // "Workspace AI key provider resets to default after deployment": nothing server-side rewrites a
+  // stored provider, but the add form opened pre-set to OpenAI / gpt-4o on every page load. After a
+  // deploy reloads the page, that read as the saved provider having reset — and since the form has
+  // no edit mode, a remove-and-re-add that missed the field really did save openai. These pin that
+  // the form starts unselected and that the saved provider survives a reload untouched.
+
+  async function openAiProviders(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    // The model list is fetched from the provider itself once a key is typed. Answer it locally so
+    // these tests never send a (fake) key to a real provider.
+    await page.route("**/api/workspace/ai-keys/models", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ models: [{ id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6" }], source: "fallback", reason: "" }),
+      }),
+    );
+    await page.goto("/settings?tab=ai");
+    await expect(page.getByRole("heading", { name: "Workspace AI keys" })).toBeVisible();
+    return page;
+  }
+
+  /** The add form. FieldLabel has no htmlFor, so its selects are told apart by an option they own. */
+  function addKeyForm(page: Page) {
+    const form = page.locator("form").filter({ has: page.getByRole("button", { name: /Add workspace AI key|Adding key/ }) });
+    return {
+      form,
+      name: form.getByPlaceholder("Primary OpenAI key"),
+      provider: form.locator("select").filter({ has: page.locator("option", { hasText: "Select a provider" }) }),
+      apiKey: form.locator('input[type="password"]'),
+      model: form.locator("select").filter({ has: page.locator("option", { hasText: "Enter a model name manually..." }) }),
+      submit: form.getByRole("button", { name: /Add workspace AI key|Adding key/ }),
+    };
+  }
+
+  /**
+   * The saved-keys table row for `name`. Matched on an exact Name cell, not row text: the project
+   * allocation table below lists every key as a "<name> (<provider>)" option, so a text filter hits
+   * those rows too.
+   */
+  function keyRow(page: Page, name: string): Locator {
+    return page.getByRole("row").filter({ has: page.getByRole("cell", { name, exact: true }) });
+  }
+
+  function storedProvider(name: string): string {
+    return scalar(
+      `SELECT provider FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name = ${literal(name)};`,
+    );
+  }
+
+  test("ZYU-104 with an Anthropic key saved, the add form opens unselected — not on OpenAI — and cannot submit a default", async ({ browser }) => {
+    const name = stamp("anthropic key");
+    const created = await api.post("/api/workspace/ai-keys", {
+      data: { name, provider: "anthropic", apiKey: "sk-ant-e2e-not-a-real-key", defaultModel: "claude-sonnet-4-6" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `creating the key — ${await created.text()}`).toBe(201);
+
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+
+    // The saved key is shown as saved…
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    // …and the add form does not claim a provider of its own.
+    await expect(f.provider).toHaveValue("");
+    await expect(f.provider.locator("option:checked")).toHaveText("Select a provider");
+
+    // Name and key filled but no provider picked: there is no default left to fall back on.
+    await f.name.fill(stamp("no provider"));
+    await f.apiKey.fill("sk-e2e-not-a-real-key");
+    await expect(f.submit).toBeDisabled();
+
+    expect(storedProvider(name), "opening the page must not change the stored provider").toBe("anthropic");
+  });
+
+  test("ZYU-105 a key added as Anthropic through the form is stored as Anthropic and still shows so after a reload", async ({ browser }) => {
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+    const name = stamp("form key");
+
+    await f.name.fill(name);
+    await f.provider.selectOption("anthropic");
+    await f.apiKey.fill("sk-ant-e2e-not-a-real-key");
+    await f.model.selectOption("claude-sonnet-4-6");
+    await f.submit.click();
+    await expect(page.getByText("Workspace AI key added.")).toBeVisible();
+
+    // Persisted state, via the API the screen itself reads.
+    const list = await api.get("/api/workspace/ai-keys", { failOnStatusCode: false });
+    expect(list.status()).toBe(200);
+    const saved = ((await list.json()).keys as Array<{ name: string; provider: string; defaultModel: string | null }>).find((k) => k.name === name);
+    expect(saved, "the key the form added").toBeTruthy();
+    expect(saved!.provider).toBe("anthropic");
+    expect(saved!.defaultModel).toBe("claude-sonnet-4-6");
+
+    // A reload (what a deploy does to an open tab) shows the saved provider and an unselected form.
+    await page.reload();
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    await expect(addKeyForm(page).provider).toHaveValue("");
+    expect(storedProvider(name)).toBe("anthropic");
+  });
+
+  test("ZYU-106 re-adding a saved key's name through the form is refused and leaves its provider as saved", async ({ browser }) => {
+    const name = stamp("dup key");
+    const created = await api.post("/api/workspace/ai-keys", {
+      data: { name, provider: "anthropic", apiKey: "sk-ant-e2e-original-key", defaultModel: "claude-sonnet-4-6" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `creating the key — ${await created.text()}`).toBe(201);
+
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+    await f.name.fill(name);
+    await f.provider.selectOption("openai");
+    await f.apiKey.fill("sk-e2e-should-not-apply");
+    await f.submit.click();
+
+    await expect(page.getByText(/already exists/)).toBeVisible();
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    expect(storedProvider(name), "the refused re-add must not overwrite the saved provider").toBe("anthropic");
+  });
 });
 
 /*
