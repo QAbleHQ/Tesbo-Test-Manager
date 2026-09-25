@@ -11553,7 +11553,67 @@ export class LegacyService implements OnModuleInit {
     return { success: true };
   }
 
+  /** User-message status while a background turn (startZyraChatMessage) is still running. */
+  private static readonly ZYRA_USER_MESSAGE_PROCESSING = "processing";
+  /** User-message status when a background turn threw before it could post a reply. */
+  private static readonly ZYRA_USER_MESSAGE_FAILED = "failed";
+
+  /**
+   * The synchronous form: holds the HTTP request open for the whole turn and returns the reply.
+   * Kept byte-for-byte for every caller that does not opt into background mode (API tokens, MCP,
+   * scripts). The Zyra chat page uses startZyraChatMessage instead — see that method for why.
+   */
   async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body, onStage?: ZyraOnStage) {
+    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, "sent", onStage);
+    return this.runZyraChatTurn(turn, onStage);
+  }
+
+  /**
+   * Background form of sendZyraChatMessage: validates, claims the session and records the user's
+   * message synchronously (so every 4xx — empty message, unknown session, a turn already running —
+   * still reaches the caller as a real HTTP error), then runs the turn detached and returns at once.
+   *
+   * Why: a turn that generates test cases routinely runs 1–5 minutes (stage, week of 2026-09-24:
+   * 14 of 43 create turns and 2 of 33 answer turns took over 100 s). Stage and production sit behind
+   * Cloudflare, which gives up on an origin after 100 s and answers with its own 524 page — no CORS
+   * headers, so the browser can only report "Failed to fetch" while the backend carries on and saves
+   * a reply nobody is waiting for. Returning immediately means no request lives long enough to hit it.
+   *
+   * Completion is observable without the SSE stream: the user message is stored as `processing` and
+   * flipped to `sent` only after the assistant reply is written (or `failed` if the turn threw), so
+   * polling getZyraChatSession is authoritative. Same shape as continueZyraChatMessage.
+   */
+  async startZyraChatMessage(
+    projectId: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    body: Body,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<{ accepted: true; userMessageId: string; session: Body }> {
+    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, onStage);
+    void this.runZyraChatTurn(turn, onStage).then(
+      (payload) => onSettled?.({ ok: true, payload }),
+      (err) => {
+        this.logger.warn(`Background Zyra turn failed (session ${sessionId}, message ${turn.userMessageId}): ${err instanceof Error ? err.message : String(err)}`);
+        onSettled?.({ ok: false, message: "This turn did not complete." });
+      }
+    );
+    return { accepted: true, userMessageId: turn.userMessageId, session: await this.zyraChatSession(projectId, userId, sessionId) };
+  }
+
+  /**
+   * Everything a turn must settle before any slow work starts: auth, validation, the per-session
+   * claim, and the user message row. Throws the same HTTP errors sendZyraChatMessage always has.
+   */
+  private async beginZyraChatTurn(
+    projectId: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    body: Body,
+    userMessageStatus: string,
+    onStage?: ZyraOnStage
+  ): Promise<{ projectId: string; userId: string | null | undefined; uid: string; sessionId: string; message: string; userMessageId: string; userMessageStatus: string; sessionRow: Body }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
@@ -11571,7 +11631,7 @@ export class LegacyService implements OnModuleInit {
     // rest of this turn makes a live LLM call that can legitimately take up to
     // ZYRA_GENERATE_TIMEOUT_MS, and holding a DB lock or connection across that would serialize every
     // concurrent turn on this LLM call's latency for no benefit. The 5-minute staleness window means
-    // a request that crashed before reaching the `finally` release below self-heals instead of
+    // a request that crashed before reaching runZyraChatTurn's `finally` release self-heals instead of
     // locking the session out permanently — no manual unlock, no deadlock possible.
     const claimRes = await this.db.query(
       `UPDATE zyra_chat_sessions SET processing_since = now()
@@ -11583,6 +11643,13 @@ export class LegacyService implements OnModuleInit {
       throw new ConflictException({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." });
     }
     try {
+      // Winning the claim means no turn is live in this session, so any user message still marked
+      // `processing` belongs to a background turn whose process died (restart, crash) before it could
+      // settle — close it out so a polling client stops waiting on it.
+      await this.db.query(
+        "UPDATE zyra_chat_messages SET status = $2 WHERE session_id = $1 AND role = 'user' AND status = $3",
+        [sessionId, LegacyService.ZYRA_USER_MESSAGE_FAILED, LegacyService.ZYRA_USER_MESSAGE_PROCESSING]
+      );
       onStage?.("received");
       // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
       // only stable identifier for the turn: seeding off the message text instead would give two
@@ -11590,16 +11657,56 @@ export class LegacyService implements OnModuleInit {
       // into one trace.
       const userMessageRes = await this.db.query(
         `INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status)
-         VALUES ($1,$2,$3,'user',$4,'sent')
+         VALUES ($1,$2,$3,'user',$4,$5)
          RETURNING id`,
-        [sessionId, projectId, uid, message]
+        [sessionId, projectId, uid, message, userMessageStatus]
       );
       const userMessageId = String(userMessageRes.rows[0]?.id ?? "");
+      return { projectId, userId, uid, sessionId, message, userMessageId, userMessageStatus, sessionRow: sessionRes.rows[0] };
+    } catch (err) {
+      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [sessionId]).catch(() => {});
+      throw err;
+    }
+  }
 
+  /**
+   * The slow part of a turn — routing, generation, applying operations, writing the reply. Always
+   * releases the session claim, and, for a background turn, settles the user message's status only
+   * AFTER the reply row exists, so a client polling for `sent` never sees it before the answer.
+   */
+  private async runZyraChatTurn(
+    turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
+    onStage?: ZyraOnStage
+  ): Promise<{ message: Body; session: Body }> {
+    const background = turn.userMessageStatus === LegacyService.ZYRA_USER_MESSAGE_PROCESSING;
+    const settleUserMessage = (status: string) =>
+      background
+        ? this.db.query("UPDATE zyra_chat_messages SET status = $2 WHERE id = $1 AND status = $3", [turn.userMessageId, status, LegacyService.ZYRA_USER_MESSAGE_PROCESSING])
+        : Promise.resolve();
+    try {
+      const result = await this.executeZyraChatTurn(turn, onStage);
+      await settleUserMessage("sent");
+      return { message: result.message, session: background ? await this.zyraChatSession(turn.projectId, turn.userId, turn.sessionId) : result.session };
+    } catch (err) {
+      await settleUserMessage(LegacyService.ZYRA_USER_MESSAGE_FAILED).catch(() => undefined);
+      throw err;
+    } finally {
+      // Best-effort: if this fails to run at all (process crash), the 5-minute staleness window
+      // in beginZyraChatTurn is what actually prevents a permanent lockout, not this line.
+      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [turn.sessionId]).catch(() => {});
+    }
+  }
+
+  private async executeZyraChatTurn(
+    turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
+    onStage?: ZyraOnStage
+  ): Promise<{ message: Body; session: Body }> {
+    const { projectId, userId, uid, sessionId, message, userMessageId, sessionRow } = turn;
+    {
       // A paused plan (stopped by the user, or paused after a batch failure) can be picked
       // back up with a plain "continue" — resolved before any other decision-making so it
       // doesn't get treated as a normal analytical question.
-      const existingPlan = sessionRes.rows[0].active_plan as Body | undefined;
+      const existingPlan = sessionRow.active_plan as Body | undefined;
       if (existingPlan?.status === "paused" && this.isZyraResumeIntent(message)) {
         const resumed = await this.resumeZyraChatPlan(projectId, uid, sessionId);
         const lastMessage = resumed.messages[resumed.messages.length - 1];
@@ -11683,10 +11790,6 @@ export class LegacyService implements OnModuleInit {
         [sessionId, projectId, title]
       );
       return { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) };
-    } finally {
-      // Best-effort: if this fails to run at all (process crash), the 5-minute staleness window
-      // above is what actually prevents a permanent lockout, not this line.
-      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [sessionId]).catch(() => {});
     }
   }
 
@@ -12032,6 +12135,15 @@ export class LegacyService implements OnModuleInit {
     return enabled ? { items, count: items.length } : { skipped: true, reason: disabledReason };
   }
 
+  /**
+   * Stands in for RagRetrievalService.retrieveWithDiagnostics when knowledge-base access is OFF, so
+   * the retrieval is never started (no FTS query, no embeddings call on the user's message) while the
+   * trace still records why nothing was retrieved, rather than looking like an empty search.
+   */
+  private static zyraKnowledgeDisabledRetrieval(): Awaited<ReturnType<RagRetrievalService["retrieveWithDiagnostics"]>> {
+    return { items: [], semanticSearchRan: false, reason: "Knowledge base access is disabled for Zyra in this project.", topScore: null, confidence: "none" };
+  }
+
   /** Counts by `type` for the live progress backlog's "staging" step — e.g. `{ create: 5 }`. */
   private static tallyZyraOperationTypes(operations: Array<{ type: string }>): Record<string, number> {
     const counts: Record<string, number> = {};
@@ -12098,6 +12210,13 @@ export class LegacyService implements OnModuleInit {
     const zyraTurnTraceSeed = confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId;
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
     const mentionedJiraKeys = jiraKeyResolution.keys;
+    // Read before gathering, not after: with knowledge-base access OFF, no knowledge-base or bug
+    // lookup may run at all — not the recency snapshot, not the folder match, not the semantic
+    // search (which also spends an embeddings call on the user's message). This used to be read
+    // only after all four had already run, and their results were merely hidden from the prompt.
+    const zyraAgentSettings = await this.zyraAgentSettings(projectId);
+    const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
+    const kbEnabled = capabilities.knowledgeBase;
     const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
       this.db.query(
         `SELECT role, content, reasoning_summary, action_type, testcases
@@ -12107,7 +12226,7 @@ export class LegacyService implements OnModuleInit {
          LIMIT 12`,
         [sessionId, projectId]
       ),
-      this.knowledgeSnapshot(projectId),
+      kbEnabled ? this.knowledgeSnapshot(projectId) : Promise.resolve([]),
       // Semantic (embeddings) retrieval, run in parallel with the always-cheap recency
       // fallback above so a project with nothing embedded yet (or an Anthropic-only key)
       // pays no extra latency — retrieveKnowledgeContext never throws, resolves to [] on
@@ -12115,10 +12234,12 @@ export class LegacyService implements OnModuleInit {
       // retrieveWithDiagnostics rather than retrieveKnowledgeContext: the plain call returns [] for
       // every failure mode, so "no embeddings key" and "nothing relevant" are indistinguishable —
       // which is how the vector half of this search stayed off in production unnoticed.
-      this.ragRetrieval.retrieveWithDiagnostics(projectId, message, { traceSeed: zyraTurnTraceSeed }),
+      kbEnabled
+        ? this.ragRetrieval.retrieveWithDiagnostics(projectId, message, { traceSeed: zyraTurnTraceSeed })
+        : Promise.resolve(LegacyService.zyraKnowledgeDisabledRetrieval()),
       // Direct folder-name lookup — recency/embeddings never match on a folder's name alone
       // (e.g. "knowledge base 'EAD-11215' folder"), only on document content.
-      this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys),
+      kbEnabled ? this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys) : Promise.resolve([]),
       this.existingTestcaseSnapshot(projectId, message, ""),
       this.zyraAiAllocation(projectId),
       this.zyraChatProjectSnapshot(projectId),
@@ -12127,8 +12248,9 @@ export class LegacyService implements OnModuleInit {
       this.relevantJiraSnapshot(projectId, message, mentionedJiraKeys),
       this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] })),
       // Tesbo's own bug tracker (separate from Jira) — relevance-matched, same principle as
-      // relevantJiraSnapshot: an unrelated bug in the citation list is worse than none.
-      this.bugsSnapshot(projectId, message),
+      // relevantJiraSnapshot: an unrelated bug in the citation list is worse than none. Gated by the
+      // same knowledge-base capability — bugs count as "project knowledge", not a separate setting.
+      kbEnabled ? this.bugsSnapshot(projectId, message) : Promise.resolve([]),
       // Still-unsaved create batch(es) from earlier in this session — see zyraPendingCreateBatches.
       // Told to the model alongside lastCompletedPlanCount below so "Most recently generated batch"
       // covers both what was actually saved and what is only staged, instead of only ever the former.
@@ -12203,13 +12325,11 @@ export class LegacyService implements OnModuleInit {
 
     const provider = String(key.provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, key.default_model);
-    const zyraAgentSettings = await this.zyraAgentSettings(projectId);
-    const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
     const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
-    const knowledgeForChat = capabilities.knowledgeBase ? knowledge : [];
-    // Same capability toggle as the knowledge base itself — bugs are treated as part of the same
-    // "project knowledge" Zyra is or isn't allowed to read, not a separate setting.
-    const bugsForChat = capabilities.knowledgeBase ? bugs : [];
+    // Already empty when the capability is OFF (nothing was fetched above); the ternaries stay as a
+    // second line of defence so a future edit to the gathering block can't leak KB content back in.
+    const knowledgeForChat = kbEnabled ? knowledge : [];
+    const bugsForChat = kbEnabled ? bugs : [];
     // Progress narration for the live chat backlog — deliberately placed HERE, after `capabilities`
     // is known, not up where gathering started (this used to be a single onStage?.("context") fired
     // before any of knowledge/jira/testcases/bugs were even fetched). Reporting what was gathered
@@ -13425,8 +13545,13 @@ export class LegacyService implements OnModuleInit {
         ].filter(Boolean).join(", "),
         "."
     ].join(" ").replace(" .", ".") + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`;
+    // With knowledge-base access OFF the KB was never read, so the "nothing in your knowledge base —
+    // add it and ask again" note would be wrong on both counts. Say plainly that access is off.
+    const knowledgeBaseOff = !(await this.zyraProjectCapabilities(params.projectId)).knowledgeBase;
     return {
-      reply: ungrounded
+      reply: knowledgeBaseOff
+        ? [LegacyService.zyraKnowledgeBaseOffNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
+        : ungrounded
         ? [LegacyService.zyraUngroundedNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
         : weaklyGrounded
           ? [LegacyService.zyraWeakGroundingNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
@@ -13601,21 +13726,23 @@ export class LegacyService implements OnModuleInit {
     bugs: ZyraGenerationInput["bugs"];
     knowledgeConfidence: RagRetrievalConfidence;
   }> {
+    // Same rule as buildZyraChatDecision: with knowledge-base access OFF, the lookups never run.
+    const kbEnabled = capabilities.knowledgeBase;
     const [knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, suites, jira, bugs] = await Promise.all([
-      this.knowledgeSnapshot(projectId),
+      kbEnabled ? this.knowledgeSnapshot(projectId) : Promise.resolve([]),
       // retrieveWithDiagnostics, not the plain retrieveKnowledgeContext wrapper — this is a
       // background plan batch (continueZyraChatPlan), which previously carried no confidence signal
       // through at all (see generateZyraChatTestcasesWithAi's own doc comment on `trace` for the
       // same "background batches lag behind the interactive path" pattern this closes for RAG too).
-      this.ragRetrieval.retrieveWithDiagnostics(projectId, message),
-      this.knowledgeFolderSnapshot(projectId, message, jiraIssueKeys),
+      kbEnabled ? this.ragRetrieval.retrieveWithDiagnostics(projectId, message) : Promise.resolve(LegacyService.zyraKnowledgeDisabledRetrieval()),
+      kbEnabled ? this.knowledgeFolderSnapshot(projectId, message, jiraIssueKeys) : Promise.resolve([]),
       this.existingTestcaseSnapshot(projectId, message, ""),
       this.projectSuiteSummaries(projectId),
       // Relevance-matched, not just explicitly-named — see relevantJiraSnapshot.
       this.relevantJiraSnapshot(projectId, message, jiraIssueKeys),
       // Same gate as knowledge below — bugs are treated as part of the same "project knowledge"
       // capability toggle rather than a new one, consistent with how this project already reads.
-      this.bugsSnapshot(projectId, message)
+      kbEnabled ? this.bugsSnapshot(projectId, message) : Promise.resolve([])
     ]);
     const ragKnowledge = ragDiagnostics.items;
     const knowledge = [...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge : knowledgeFallback)];
@@ -17675,6 +17802,16 @@ export class LegacyService implements OnModuleInit {
       `I've still written ${count} test case(s) from general practice for this kind of feature, so you have somewhere to start — treat them as a draft to review rather than as coverage of your actual behaviour.`,
       "",
       "Add the requirement, spec or acceptance criteria to the knowledge base (or link the Jira ticket) and ask me again — I'll regenerate them against how your feature really works, with your own terminology and edge cases."
+    ].join("\n");
+  }
+
+  private static zyraKnowledgeBaseOffNote(count: number): string {
+    return [
+      "ℹ️ I don't have access to the Knowledge Base — Access to Knowledge Base is turned off for Zyra in this project.",
+      "",
+      `I've created ${count} test case(s) in general, from common practice for this kind of feature — treat them as a draft to review rather than as coverage of your actual behaviour.`,
+      "",
+      "To ground them in your own requirements, turn on Access to Knowledge Base in Zyra settings and ask me again."
     ].join("\n");
   }
 

@@ -7,6 +7,7 @@ import {
   writeStorageState,
   type RbacTenant,
 } from "../utils/rbac-tenant";
+import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
 
 /*
  * The Agents screens: the agent picker, Zyra's chat, Zyra's settings, the task board, and the task
@@ -2632,5 +2633,213 @@ test.describe("zyra / agents (UI)", () => {
     expect(attrs.href).toContain('example.com"onmouseover=alert(1');
     // Exactly the three attributes renderMarkdown's own link markup sets: href, target, rel.
     expect(attrs.attributeCount).toBe(3);
+  });
+});
+
+/*
+ * Sending a real chat message through the page, against the fake provider (utils/fake-ai-server.ts).
+ *
+ * Regression coverage for "Failed to fetch (api-app-stage.tesbo.io)" with Knowledge Base access OFF.
+ * The page used to hold one POST open for the whole turn; a generation turn runs for minutes, and
+ * Cloudflare drops an origin request at 100 s with a CORS-less 524, so the browser reported a
+ * network failure while the backend went on to save the reply. The page now starts the turn with
+ * `background: true` (the POST returns as soon as the message is recorded) and polls the session
+ * until its user message leaves `processing`. A 100-second cutoff is not reproducible here, so these
+ * tests pin the property that removes it: the POST returns while the model is still answering.
+ */
+test.describe("zyra / chat send (UI, fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let api: APIRequestContext;
+  let ai: FakeAiServer;
+  let ownerState = "";
+  const contexts: BrowserContext[] = [];
+  const composer = (page: Page) => page.getByPlaceholder("Ask Zyra to generate, update, or review test cases...");
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-ui-chat");
+    if (!tenant) return;
+    api = await loginAs(tenant.owner);
+    ownerState = await writeStorageState(tenant.owner, "zyra-ui-chat-owner");
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purge();
+    await Promise.all(contexts.map((ctx) => ctx.close()));
+    await api?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+    ai?.reset();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)};`);
+    exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id = ${project};`);
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ui chat fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function setKnowledgeBaseAccess(enabled: boolean): Promise<void> {
+    const res = await api.patch(`/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`, {
+      data: { capabilities: { knowledgeBase: enabled } },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving the KB capability — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  async function seedKbDoc(marker: string): Promise<void> {
+    let folderId = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (!folderId) {
+      exec(
+        "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+          `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+      );
+      folderId = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    }
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId, documentType: "general", title: `${marker} seat policy`, contentText: `${marker}: a booking allows at most 10 seats.` },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding the KB doc — ${await res.text()}`).toBe(201);
+  }
+
+  async function openChat(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
+    await expect(composer(page)).toBeEnabled();
+    return page;
+  }
+
+  function isSendRequest(url: string, method: string): boolean {
+    return method === "POST" && /\/agents\/zyra\/chat\/sessions\/[^/]+\/messages$/.test(new URL(url).pathname);
+  }
+
+  function queueAnswer(reply: string): void {
+    ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+  }
+
+  test("ZYU-100 with Knowledge Base access off, a message gets its reply — the send returns while Zyra is still answering", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKbDoc(marker);
+    await setKnowledgeBaseAccess(false);
+    const page = await openChat(browser);
+    const reply = `No knowledge-base access here, so I cannot confirm the ${marker} seat limit.`;
+    // The model answers only after 6 s; the send must not wait for it.
+    ai.delayNextReplyMs(6_000);
+    queueAnswer(reply);
+
+    const sendResponse = page.waitForResponse((res) => isSendRequest(res.url(), res.request().method()));
+    await composer(page).fill(`How many seats can a ${marker} booking hold?`);
+    await composer(page).press("Enter");
+    const response = await sendResponse;
+    expect(response.status()).toBe(201);
+    expect(response.request().postDataJSON()).toMatchObject({ background: true });
+    // The POST came back while the model was still holding its answer — the reply can't be here yet.
+    expect(ai.requests.length, "the router call should still be in flight").toBeLessThanOrEqual(1);
+    await expect(page.getByText(reply)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Thinking..." })).toBeVisible();
+
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("button", { name: "Thinking..." })).toHaveCount(0);
+    await expect(page.getByText(/Failed to fetch|could not reach the API|couldn't finish answering/)).toHaveCount(0);
+    expect(JSON.stringify(ai.requests[0].messages), "the KB document reached the model with access off").not.toContain(`${marker}: a booking allows`);
+
+    // Persisted, not just rendered: the turn is in the session with its user message settled.
+    const sessionId = scalar(`SELECT session_id FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user' LIMIT 1;`);
+    const session = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra/chat/sessions/${sessionId}`)).json();
+    expect(session.messages.map((m: { role: string; status: string }) => [m.role, m.status])).toEqual([["user", "sent"], ["assistant", "completed"]]);
+  });
+
+  test("ZYU-101 with Knowledge Base access on, the reply still arrives and the model is shown the knowledge base", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKbDoc(marker);
+    const page = await openChat(browser);
+    queueAnswer("A booking allows at most 10 seats.");
+
+    await composer(page).fill(`How many seats can a ${marker} booking hold?`);
+    await page.getByRole("button", { name: "Send" }).click();
+
+    await expect(page.getByText("A booking allows at most 10 seats.")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(/Failed to fetch|could not reach the API/)).toHaveCount(0);
+    expect(JSON.stringify(ai.requests[0].messages)).toContain(`${marker}: a booking allows at most 10 seats.`);
+  });
+
+  test("ZYU-102 reloading mid-turn keeps waiting for the same turn and shows its reply, without sending it twice", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    ai.delayNextReplyMs(6_000);
+    queueAnswer("Answer that outlived a reload.");
+
+    const sendResponse = page.waitForResponse((res) => isSendRequest(res.url(), res.request().method()));
+    await composer(page).fill("How many test cases exist?");
+    await composer(page).press("Enter");
+    await sendResponse;
+    await page.reload();
+
+    // After the reload nothing local knows about the turn — only the server's `processing` status.
+    // The message text also names the session (sidebar entry + chat header), so target the bubble.
+    await expect(page.locator("div.whitespace-pre-wrap", { hasText: "How many test cases exist?" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Thinking..." })).toBeVisible();
+    await expect(page.getByText("Answer that outlived a reload.")).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeEnabled();
+    expect(
+      Number(scalar(`SELECT COUNT(*) FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user';`)),
+      "the message was sent again after the reload",
+    ).toBe(1);
+  });
+
+  test("ZYU-103 a send the server refuses shows the server's reason and drops the unsent message", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    // A 409 is what the server answers while another turn in the session is still running.
+    await page.route(
+      (url) => /\/agents\/zyra\/chat\/sessions\/[^/]+\/messages$/.test(url.pathname),
+      async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." }),
+        });
+      },
+    );
+
+    await composer(page).fill("A message that will be refused");
+    await composer(page).press("Enter");
+
+    await expect(page.getByText(/Zyra is still working on your previous message/)).toBeVisible();
+    await expect(page.getByText("A message that will be refused")).toHaveCount(0);
+    await expect(composer(page)).toBeEnabled();
+    expect(ai.requests.length, "a refused send must never reach the model").toBe(0);
   });
 });
