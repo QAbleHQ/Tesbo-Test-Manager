@@ -11299,7 +11299,10 @@ export class LegacyService implements OnModuleInit {
         lastUsedAt
       },
       settings: {
-        testcaseCount: Number(settings.testcaseCount || 5),
+        // Derived from the range rather than read from the stored snapshot, which is written only on
+        // save — a project saved before a tier's count changed (or never saved at all) would report a
+        // count generation no longer uses.
+        testcaseCount: this.testcaseRangeConfig(String(settings.testcaseRange || "30-50")).requestedCount,
         testcaseRange: String(settings.testcaseRange || "30-50"),
         capabilities: this.normalizeZyraCapabilities(settings.capabilities)
       },
@@ -12898,9 +12901,9 @@ export class LegacyService implements OnModuleInit {
     // moveBreakdown footer underneath it to contradict it.
     let unresolvedMoveTargetCount = 0;
     // A per-turn ceiling still bounds a model that emits junk, but it used to sit at 10 — below
-    // what a single legitimate generation batch produces (chatTestcasePlan allows up to 25), so
-    // asking for 15 test cases saved 10 of them and said 15. Truncation is now both rarer and
-    // reported, never silent.
+    // what a single legitimate generation batch produces (chatTestcasePlan allows up to
+    // ZYRA_CHAT_MAX_REQUESTED), so asking for 15 test cases saved 10 of them and said 15.
+    // Truncation is now both rarer and reported, never silent.
     const dropped = allowed.length - Math.min(allowed.length, LegacyService.ZYRA_CHAT_MAX_OPERATIONS);
     if (dropped > 0) {
       activity.push({
@@ -13790,10 +13793,20 @@ export class LegacyService implements OnModuleInit {
   }
 
   private static readonly ZYRA_PLAN_BATCH_SIZE = 5;
-  private static readonly ZYRA_PLAN_MAX_SCENARIOS = 40;
-  // Matches the largest batch chatTestcasePlan will ask for, so a legitimate generation is never
-  // partially applied (see applyZyraChatOperations / normalizeZyraChatDecision).
-  private static readonly ZYRA_CHAT_MAX_OPERATIONS = 25;
+  // The "all" tier's ceiling — one testcase per planned scenario, so up to 100 cases over 20 batches
+  // of ZYRA_PLAN_BATCH_SIZE. It was 40, below the 30-50 tier's own 50, so "all" produced fewer cases
+  // than "extensive". Each batch is its own generation call, so a larger plan only adds batches; it
+  // never enlarges any single call. The planner's output budget in zyraJsonCompletion is sized for it.
+  private static readonly ZYRA_PLAN_MAX_SCENARIOS = 100;
+  // The most testcases one chat generation can ask for: the top of the 30-50 tier, and the clamp
+  // chatTestcasePlan applies to an explicit count.
+  private static readonly ZYRA_CHAT_MAX_REQUESTED = 50;
+  // Tied to ZYRA_CHAT_MAX_REQUESTED, so a legitimate generation is never partially applied (see
+  // applyZyraChatOperations / normalizeZyraChatDecision). It sat at a fixed 25 after the 30-50 tier
+  // (requestedCount 40) and routed counts up to 50 were introduced, so a default-range request
+  // generated 40 drafts and staged only 25 of them. Raising it is cheap: a create op is staged in
+  // memory, never written, until zyraSave commits the batch in one transaction.
+  private static readonly ZYRA_CHAT_MAX_OPERATIONS = LegacyService.ZYRA_CHAT_MAX_REQUESTED;
   /*
    * The knowledge document Zyra keeps its project memory in.
    *
@@ -16628,17 +16641,20 @@ export class LegacyService implements OnModuleInit {
     return resolved;
   }
 
+  // requestedCount is each tier's upper bound, not a midpoint: normalizeAiDrafts keeps at most that
+  // many drafts, so anything lower silently discards cases the instruction told the model it could
+  // write (10-30 used to stop at 25, 30-50 at 40).
   private testcaseRangeConfig(range: string): { requestedCount: number; instruction: string } {
     switch (range) {
       case "1-10":
         return { requestedCount: 10, instruction: "Generate between 1 and 10 testcases. Prioritise quality and relevance; include edge cases only where genuinely important." };
       case "10-30":
-        return { requestedCount: 25, instruction: "Generate between 10 and 25 testcases. Cover the main flows, key edge cases, negative scenarios, and important variations. Aim for at least 10 distinct testcases." };
+        return { requestedCount: 30, instruction: "Generate between 10 and 30 testcases. Cover the main flows, key edge cases, negative scenarios, and important variations. Aim for at least 10 distinct testcases and do not exceed 30." };
       case "all":
         return { requestedCount: 50, instruction: "Generate as many testcases as possible — cover every applicable flow, edge case, boundary value, negative path, and variation. Be exhaustive and do not cap yourself." };
       case "30-50":
       default: // unset or unrecognized values resolve to the product default (30-50)
-        return { requestedCount: 40, instruction: "Generate between 30 and 50 testcases. Cover primary flows, edge cases, negative scenarios, boundary values, and meaningful variations for thorough coverage. Aim for at least 30 distinct testcases and do not exceed 50." };
+        return { requestedCount: 50, instruction: "Generate between 30 and 50 testcases. Cover primary flows, edge cases, negative scenarios, boundary values, and meaningful variations for thorough coverage. Aim for at least 30 distinct testcases and do not exceed 50." };
     }
   }
 
@@ -16967,7 +16983,9 @@ export class LegacyService implements OnModuleInit {
         headers: this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme),
         body: JSON.stringify({
           model: providerModelCandidates(provider, model)[0],
-          max_tokens: 2000,
+          // Sized for ZYRA_PLAN_MAX_SCENARIOS (100) short labels. At 2000, a full 100-label plan could
+          // truncate mid-array, fail to parse, and silently fall back to a single batch of 10.
+          max_tokens: 4000,
           system: [{ type: "text", text: systemPrompt }],
           messages: [{ role: "user", content: userPrompt }]
         }),
@@ -18349,9 +18367,9 @@ export class LegacyService implements OnModuleInit {
     // reported nothing.
     if (routed?.exhaustive) return { testcaseRange: "all", requestedCount: this.testcaseRangeConfig("all").requestedCount };
     const routedCount = Number(routed?.requestedCount);
-    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(50, Math.floor(routedCount)) };
+    if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(LegacyService.ZYRA_CHAT_MAX_REQUESTED, Math.floor(routedCount)) };
     const explicit = message.match(/\b(\d{1,2})\s+(?:testcases|test cases|tests|cases)\b/i);
-    if (explicit) return { requestedCount: Math.max(1, Math.min(50, Number(explicit[1]))) };
+    if (explicit) return { requestedCount: Math.max(1, Math.min(LegacyService.ZYRA_CHAT_MAX_REQUESTED, Number(explicit[1]))) };
     const lower = message.toLowerCase();
     const wantsExhaustive = /\ball( the)? possible\b|as many as possible|\bexhaustive\b|every (scenario|edge case|flow|case)|full coverage|\ball types?\b/.test(lower);
     const range = wantsExhaustive ? "all" : projectTestcaseRange;

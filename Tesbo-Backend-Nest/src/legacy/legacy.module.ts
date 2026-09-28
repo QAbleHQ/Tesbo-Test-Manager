@@ -6,6 +6,7 @@ import { IntegrationSyncModule } from "../integration-sync/integration-sync.modu
 import { PlanLimitsModule } from "../plan-limits/plan-limits.module";
 import { CustomFieldsModule } from "../custom-fields/custom-fields.module";
 import { CustomTagsModule } from "../custom-tags/custom-tags.module";
+import { WelcomeEmailModule } from "../welcome-email/welcome-email.module";
 import { LegacyController } from "./legacy.controller";
 import { LegacyService } from "./legacy.service";
 import { SignupController } from "./signup.controller";
@@ -20,6 +21,7 @@ import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
     RagModule,
     IntegrationSyncModule,
     PlanLimitsModule,
+    WelcomeEmailModule,
     forwardRef(() => CustomFieldsModule),
     forwardRef(() => CustomTagsModule)
   ],

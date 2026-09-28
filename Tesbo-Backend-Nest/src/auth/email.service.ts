@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import { escapeHtml } from "../common/integration-text.util";
 import { AppConfigService } from "../config/app-config.service";
 import { EmailDeliveryPolicy, EmailKind } from "../config/email-delivery.policy";
 
@@ -23,7 +24,8 @@ export class EmailService {
     textBody: string,
     htmlBody: string | undefined,
     logLabel: string,
-    kind: EmailKind = "communication"
+    kind: EmailKind = "communication",
+    cc?: string
   ): Promise<void> {
     const decision = await this.delivery.decide(kind);
     if (!decision.post || this.delivery.logsEveryEmail) {
@@ -40,6 +42,7 @@ export class EmailService {
       body: JSON.stringify({
         From: this.config.postmarkFromEmail,
         To: to,
+        ...(cc && { Cc: cc }),
         Subject: subject,
         TextBody: textBody,
         ...(htmlBody && { HtmlBody: htmlBody })
@@ -213,6 +216,43 @@ ${this.button(resetUrl, "Reset password")}
     await this.sendBestEffort("password-changed", () =>
       this.send(to, subject, textBody, htmlBody, `[PASSWORD CHANGED] ${to}`)
     );
+  }
+
+  /**
+   * The welcome email, sent a few hours after registration by welcome-email/. Recipient (the new
+   * user) and CC (WELCOME_EMAIL_CC) are chosen by the caller, never derived here.
+   *
+   * Not best-effort: this runs inside a BullMQ job, so a Postmark failure has to throw for the job's
+   * retries to kick in, rather than being swallowed the way the request-path emails above are.
+   */
+  async sendWelcome(to: string, cc: string | undefined, firstName: string): Promise<void> {
+    const loginUrl = `${this.config.frontendUrl}/login`;
+    const name = escapeHtml(firstName);
+    const brand = "<strong>Tesbo Test Manager</strong>";
+    const p = 'style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#1F2937"';
+    const subject = "Welcome to Tesbo Test Manager";
+    const textBody = `Hi ${firstName},\n\nThank you for Choosing Tesbo Test Manager!\n\nWe noticed that you recently created your account, and we wanted to make sure you have everything you need to get started.\n\nYou can now log in to your account and explore Tesbo Test Manager. If you have any questions or need assistance, our team is happy to help.\n\nGet started: ${loginUrl}\n\nWe look forward to having you with us!\n\nBest regards,\nTesbo Test Manager`;
+    // Table layout with inline styles only: that is what Gmail/Outlook actually render. The button is
+    // a styled <a> inside its own cell so it stays a real, clickable button in clients that ignore
+    // padding on inline elements.
+    const htmlBody = `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F3F4F6;font-family:Arial,Helvetica,sans-serif">
+<tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#FFFFFF">
+<tr><td style="background:#1F2937;padding:28px 32px;font-size:26px;color:#FFFFFF">${brand}</td></tr>
+<tr><td style="padding:32px">
+<p ${p}>Hi <strong>${name}</strong>,</p>
+<p ${p}>Thank you for Choosing ${brand}!</p>
+<p ${p}>We noticed that you recently created your account, and we wanted to make sure you have everything you need to get started.</p>
+<p ${p}>You can now log in to your account and explore ${brand}. If you have any questions or need assistance, our team is happy to help.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 28px"><tr><td style="background:#16A34A;border-radius:6px"><a href="${loginUrl}" style="display:inline-block;padding:14px 36px;font-size:16px;font-weight:bold;color:#FFFFFF;text-decoration:none;border-radius:6px">Get started</a></td></tr></table>
+<p ${p}>We look forward to having you with us!</p>
+<p style="margin:0;font-size:16px;line-height:1.6;color:#1F2937">Best regards,<br>${brand}</p>
+</td></tr>
+<tr><td style="padding:0 32px 28px"><div style="border-top:1px solid #E5E7EB;padding-top:16px;font-size:13px;color:#6B7280">${brand}</div></td></tr>
+</table>
+</td></tr>
+</table>`;
+    await this.send(to, subject, textBody, htmlBody, `[WELCOME] ${to}${cc ? ` cc ${cc}` : ""} → ${loginUrl}`, "communication", cc);
   }
 
   async sendOtp(to: string, code: string): Promise<void> {

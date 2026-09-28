@@ -1,12 +1,14 @@
 "use client";
 
-import { useEditor, EditorContent, type JSONContent } from "@tiptap/react";
+import { useEditor, EditorContent, type Editor, type JSONContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import ImageExtension from "@tiptap/extension-image";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
+import { Markdown } from "@tiptap/markdown";
 import { useEffect, useRef } from "react";
+import { isMarkdownPaste } from "./markdownPaste";
 import {
   IconBold,
   IconItalic,
@@ -88,6 +90,8 @@ export default function RichTextEditor({
   // this to force the mounted editor to actually replace its document with the new content.
   resetKey?: string | number;
 }) {
+  // ProseMirror's handlePaste is handed the view, not the TipTap editor that owns the Markdown parser.
+  const editorRef = useRef<Editor | null>(null);
   const editor = useEditor({
     immediatelyRender: false,
     editable,
@@ -100,6 +104,9 @@ export default function RichTextEditor({
       TableRow,
       TableHeader,
       TableCell,
+      // Only consulted when a caller passes `contentType: "markdown"` (the paste handler below) —
+      // loading, saving and restoring documents still go through JSON/HTML exactly as before.
+      Markdown,
     ],
     content: contentJson || contentHtml || "<p></p>",
     onUpdate: ({ editor: instance }) => {
@@ -109,8 +116,19 @@ export default function RichTextEditor({
       attributes: {
         class: "tiptap-editor focus:outline-none min-h-[300px] text-[14px] leading-6 text-[var(--foreground)]",
       },
+      handlePaste: (view, event) => {
+        const instance = editorRef.current;
+        const text = event.clipboardData?.getData("text/plain") ?? "";
+        const html = event.clipboardData?.getData("text/html") ?? "";
+        if (!instance || !isMarkdownPaste(text, html)) return false;
+        // Inside a code block or inline code, Markdown is content, not formatting: leave it to the
+        // default paste, which inserts it literally.
+        if (view.state.selection.$from.parent.type.spec.code || instance.isActive("code")) return false;
+        return instance.commands.insertContent(text, { contentType: "markdown" });
+      },
     },
   });
+  editorRef.current = editor;
 
   useEffect(() => {
     editor?.setEditable(editable);

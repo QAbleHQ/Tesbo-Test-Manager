@@ -1923,4 +1923,190 @@ test.describe("knowledge base (UI)", () => {
       exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
     }
   });
+
+  // ─── Regression: Markdown pasted into a document was stored as raw text ("# Title", "* item",
+  //     "**bold**" all literal, one paragraph per line) because the editor only ever parsed a
+  //     clipboard's HTML. Markdown is now parsed on paste — but only when there is no rich HTML to
+  //     prefer, and never inside code, where the characters are the content. ───
+
+  /** Creates an empty document and opens it in the editor, caret in the (empty) body. */
+  async function openEmptyDocument(browser: Browser, label: string): Promise<{ page: Page; editor: Locator; documentId: string }> {
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: stamp(label), folderId: rootFolderId, documentType: "general" },
+    });
+    expect(created.status(), `creating the document — ${await created.text()}`).toBe(201);
+    const documentId = (await created.json()).id;
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor).toBeVisible();
+    await editor.click();
+    return { page, editor, documentId };
+  }
+
+  /**
+   * A synthetic paste carrying exactly the given clipboard flavours. The real OS clipboard is not
+   * used on purpose: it is one machine-wide buffer shared by every parallel worker, and it can't
+   * express "text/plain only" vs "text/plain + text/html" — the distinction this feature turns on.
+   * ProseMirror reads `event.clipboardData`, which a constructed ClipboardEvent supplies in Chromium.
+   */
+  async function paste(editor: Locator, data: { text: string; html?: string }) {
+    await editor.evaluate((el, { text, html }) => {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", text);
+      if (html) dt.setData("text/html", html);
+      el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    }, data);
+  }
+
+  /** Saves, then waits until the stored HTML shows `marker` — the save is only real once it's persisted. */
+  async function saveAndReadStored(page: Page, documentId: string, marker: string): Promise<{ html: string; text: string }> {
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`), {
+        message: "the pasted content reaches the stored document",
+      })
+      .toContain(marker);
+    return {
+      html: scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      text: scalar(`SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+    };
+  }
+
+  test("KBU-48 pasted Markdown becomes headings, bold and a bullet list — stored without the # / ** / * syntax, and survives a reload", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Markdown paste");
+    // The body from the bug report, as copied out of a plain-text source (no text/html flavour).
+    await paste(editor, {
+      text: [
+        "# Payment & Booking Confirmation Module – Scope Document",
+        "## Module Overview",
+        "This module handles payment processing and confirms a booking after **successful payment**.",
+        "## In Scope",
+        "### Booking Summary",
+        "Before payment, the system displays:",
+        "* Movie name",
+        "* Cinema",
+        "* Convenience fee",
+      ].join("\n"),
+    });
+
+    await expect(editor.locator("h1")).toHaveText("Payment & Booking Confirmation Module – Scope Document");
+    await expect(editor.locator("h2")).toHaveText(["Module Overview", "In Scope"]);
+    await expect(editor.locator("h3")).toHaveText("Booking Summary");
+    await expect(editor.locator("strong")).toHaveText("successful payment");
+    await expect(editor.locator("ul > li")).toHaveText(["Movie name", "Cinema", "Convenience fee"]);
+
+    const stored = await saveAndReadStored(page, documentId, "<h3>Booking Summary</h3>");
+    expect(stored.html).toContain("<h2>Module Overview</h2>");
+    expect(stored.html).toContain("<strong>successful payment</strong>");
+    expect(stored.html).toMatch(/<ul>\s*<li>\s*<p>Movie name<\/p>\s*<\/li>/);
+    // The bug itself: none of the Markdown syntax is left behind as text.
+    expect(stored.text).not.toContain("#");
+    expect(stored.text).not.toContain("**");
+    expect(stored.text).not.toMatch(/^\* /m);
+
+    await page.reload();
+    await expect(page.locator(".ProseMirror").first().locator("h2").first()).toHaveText("Module Overview");
+    await expect(page.locator(".ProseMirror").first().locator("ul > li")).toHaveCount(3);
+  });
+
+  test("KBU-49 Markdown copied from a code editor — whose clipboard HTML is only styled spans around the raw text — is converted too", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Editor Markdown paste");
+    // The shape VS Code puts on the clipboard: presentational <div>/<span> wrappers, no structure.
+    await paste(editor, {
+      text: "## Copied from an editor\n* first point",
+      html: '<div style="color: #d4d4d4;"><div><span style="color: #569cd6;">## Copied from an editor</span></div><div><span>* first point</span></div></div>',
+    });
+
+    await expect(editor.locator("h2")).toHaveText("Copied from an editor");
+    await expect(editor.locator("ul > li")).toHaveText("first point");
+    const stored = await saveAndReadStored(page, documentId, "<h2>Copied from an editor</h2>");
+    expect(stored.text).not.toContain("##");
+  });
+
+  test("KBU-50 a rich HTML paste keeps its HTML structure — the Markdown-looking plain-text twin on the clipboard is ignored", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Rich paste");
+    // A browser/Docs copy carries both flavours. The <em> exists only in the HTML, so seeing it is
+    // proof the HTML was used rather than the text/plain Markdown.
+    await paste(editor, {
+      text: "## Rich heading\n\n**Bold** and italic\n\n* item one",
+      html: "<h2>Rich heading</h2><p><strong>Bold</strong> and <em>italic</em></p><ul><li><p>item one</p></li></ul>",
+    });
+
+    await expect(editor.locator("h2")).toHaveText("Rich heading");
+    await expect(editor.locator("em")).toHaveText("italic");
+    const stored = await saveAndReadStored(page, documentId, "<em>italic</em>");
+    expect(stored.html).toContain("<h2>Rich heading</h2>");
+    expect(stored.html).toContain("<strong>Bold</strong>");
+    expect(stored.html).toMatch(/<li>\s*<p>item one<\/p>\s*<\/li>/);
+    expect(stored.text).not.toContain("##");
+  });
+
+  test("KBU-51 Markdown inside pasted code spans and fenced blocks stays literal", async ({ browser }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Markdown code paste");
+    await paste(editor, { text: "Use `**not bold**` here\n\n```\n# not a heading\n* not a list\n```" });
+
+    await expect(editor.locator("p code")).toHaveText("**not bold**");
+    await expect(editor.locator("pre")).toContainText("# not a heading");
+    await expect(editor.locator("h1")).toHaveCount(0);
+    await expect(editor.locator("strong")).toHaveCount(0);
+    await expect(editor.locator("ul")).toHaveCount(0);
+
+    const stored = await saveAndReadStored(page, documentId, "<code>**not bold**</code>");
+    expect(stored.html).toMatch(/<pre><code>[^<]*# not a heading\n\* not a list[^<]*<\/code><\/pre>/);
+  });
+
+  test("KBU-52 Markdown pasted into a code block or with the caret in inline code is inserted literally", async ({ browser }) => {
+    // Two separate documents, so no caret movement is ever needed *after* a paste: pressing End with
+    // the caret inside an inline <code> run did not reliably reach the end of the line in Chromium,
+    // and the following Enter then split the paragraph mid-word.
+
+    // 1. A code block in an empty document.
+    const block = await openEmptyDocument(browser, "Paste into code block");
+    await block.page.getByRole("button", { name: "Code block" }).click();
+    await paste(block.editor, { text: "## block literal\n* still text" });
+    await expect(block.editor.locator("pre")).toContainText("## block literal");
+    await expect(block.editor.locator("h2")).toHaveCount(0);
+    await expect(block.editor.locator("ul")).toHaveCount(0);
+    const storedBlock = await saveAndReadStored(block.page, block.documentId, "## block literal");
+    expect(storedBlock.html).toMatch(/<pre><code>## block literal\n\* still text<\/code><\/pre>/);
+
+    // 2. The caret inside an inline-code run: turn inline code on, type a word, step back into it.
+    //    No selection is ever made: the toolbar re-focuses the editor asynchronously, and a key
+    //    pressed before focus returned was lost — with a word selected, the next ArrowLeft then
+    //    collapsed to its *start* and the paste landed outside the intended spot.
+    const inline = await openEmptyDocument(browser, "Paste into inline code");
+    await inline.page.getByRole("button", { name: "Inline code" }).click();
+    await expect(inline.editor).toBeFocused();
+    await inline.page.keyboard.type("codeword");
+    await expect(inline.editor.locator("code")).toHaveText("codeword");
+    await inline.page.keyboard.press("ArrowLeft");
+    await inline.page.keyboard.press("ArrowLeft");
+    await paste(inline.editor, { text: "**inline literal**" });
+    await expect(inline.editor.locator("strong")).toHaveCount(0);
+    await expect(inline.editor.locator("code")).toHaveText("codewo**inline literal**rd");
+    const storedInline = await saveAndReadStored(inline.page, inline.documentId, "**inline literal**");
+    expect(storedInline.html).toContain("<code>codewo**inline literal**rd</code>");
+    expect(storedInline.html).not.toContain("<strong>");
+  });
+
+  test("KBU-53 plain text with no Markdown in it pastes exactly as before — one paragraph per line, nothing reformatted", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Plain paste");
+    await paste(editor, { text: "First plain line\nSecond line: 2 * 3 = 6" });
+
+    await expect(editor.locator("p")).toHaveText(["First plain line", "Second line: 2 * 3 = 6"]);
+    const stored = await saveAndReadStored(page, documentId, "Second line: 2 * 3 = 6");
+    expect(stored.html).toContain("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
+  });
 });

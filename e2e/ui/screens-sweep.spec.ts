@@ -322,6 +322,21 @@ test.describe("screens sweep — the pages no other spec opens", () => {
     expect(body).not.toMatch(/tsb_[A-Za-z0-9]{16,}/);
   });
 
+  test("SWP-11b the Claude Code MCP command registers at user scope so IDE extensions see it", async ({ page }) => {
+    await renderCheck(page, `/projects/${projectId()}/settings/api-tokens`);
+    // "Claude Code" is the default tab, so the command renders without a click. Read the <pre>
+    // itself rather than the body: the .mcp.json snippet below it also names the MCP URL.
+    const command = page.locator("pre", { hasText: "claude mcp add" });
+    await expect(command).toHaveCount(1);
+    const text = await command.innerText();
+    // Without --scope user the CLI defaults to local scope, which ~/.claude.json keys by the
+    // case-sensitive folder path. On Windows a terminal writes `D:/repo` and VS Code reads `d:/repo`,
+    // so the server shows Connected in `claude mcp list` and never appears in the extension.
+    expect(text).toContain("--scope user");
+    expect(text).toContain(`/api/projects/${projectId()}/mcp`);
+    expect(text).toContain("<YOUR_API_TOKEN>");
+  });
+
   test("SWP-12 the workspace integration screens open with nothing connected", { tag: '@tesbo.testId("TES-TC-818")' }, async ({ page }) => {
     for (const provider of ["jira", "linear"]) {
       const result = await renderCheck(page, `/settings/integrations/${provider}`);
