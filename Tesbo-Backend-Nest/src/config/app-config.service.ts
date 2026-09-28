@@ -103,6 +103,9 @@ export class AppConfigService {
   readonly planGraceDays = this.integer("PLAN_GRACE_DAYS", 30);
   // Where "need more storage?" and other billing dead-ends point people.
   readonly supportContactEmail = this.string("SUPPORT_CONTACT_EMAIL", "support@tryqable.com");
+  // Optional CC on the welcome email (welcome-email/), which is sent to the registering user. No
+  // default: unset means no CC.
+  readonly welcomeEmailCc = this.optionalString("WELCOME_EMAIL_CC");
   // Kill switch for RequestCacheService's per-request memoization (see request-cache/). Off falls
   // straight through to an uncached lookup at every call site — never staleness, just no dedup.
   readonly enableRequestScopedCache = this.string("ENABLE_REQUEST_SCOPED_CACHE", "true").trim().toLowerCase() !== "false";

@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
-import { testAddress } from "../utils/env";
+import { env, testAddress } from "../utils/env";
+import { expectWelcomeJobScheduled, readWelcomeJob, removeWelcomeJob } from "../utils/welcome-email-queue";
 import { clearOtpIpRateLimit, clearOtpRateLimit, seedOtpCode } from "../utils/otp";
 import {
   anonymousContext,
@@ -81,6 +82,18 @@ test.describe("invitations", () => {
 
   function uniqueEmail(label: string): string {
     return testAddress(`invite-${label}`);
+  }
+
+  /**
+   * Every registration path schedules the welcome email. Only the local stack has a Redis container
+   * to inspect, so elsewhere the check is recorded as not run rather than silently passed.
+   */
+  function expectWelcomeScheduled(userId: string) {
+    if (!env.targetIsLocal) {
+      test.info().annotations.push({ type: "not-checked", description: "welcome-email job: no local Redis to inspect" });
+      return null;
+    }
+    return expectWelcomeJobScheduled(userId);
   }
 
   // ─── Sending ───────────────────────────────────────────────────────────────
@@ -499,7 +512,18 @@ test.describe("invitations", () => {
         failOnStatusCode: false,
       });
       expect(login.ok(), "the newly registered user should be able to sign in").toBeTruthy();
+
+      // This older single-shot route is still live (the frontend's lib/api.ts calls it), so it
+      // schedules the welcome email too — and a re-submit of the same invite must not add a second.
+      const welcomeJob = expectWelcomeScheduled(body.userId);
+      const again = await anon.post(`/api/invitations/${token}/register`, {
+        data: { name: "EndToEnd Registered Invitee", password },
+        failOnStatusCode: false,
+      });
+      expect(again.ok(), "an accepted invite was registered against twice").toBeFalsy();
+      if (welcomeJob) expect(readWelcomeJob(body.userId)?.timestamp).toBe(welcomeJob.timestamp);
     } finally {
+      removeWelcomeJob(body.userId);
       detachUserByEmail(email);
     }
   });
@@ -550,6 +574,7 @@ test.describe("invitations", () => {
       const { id, token } = await invite(email, { role: "manager", projectIds: [tenant!.mainProjectId] });
       const password = "E2E-Otp-Reg-1!";
       const ctx = await anonymousContext();
+      let userId: string | undefined;
       try {
         const start = await ctx.post(`/api/invitations/${token}/register/start`, {
           data: { firstName: "EndToEnd", lastName: "OTP Invitee", mobileNumber: "+14155550100", password },
@@ -566,6 +591,8 @@ test.describe("invitations", () => {
         const body = await verify.json();
         expect(body.ok).toBe(true);
         expect(body.organizationId).toBe(tenant!.organizationId);
+        userId = body.userId;
+        expectWelcomeScheduled(body.userId);
 
         expect(storedOrgRole(tenant!, body.userId)).toBe("manager");
         expect(storedProjectRole(tenant!.mainProjectId, body.userId)).toBe("manager");
@@ -592,6 +619,7 @@ test.describe("invitations", () => {
         });
         expect(login.ok(), "the chosen password should work on the login screen").toBeTruthy();
       } finally {
+        removeWelcomeJob(userId);
         await ctx.dispose();
         clearOtpRateLimit(email);
         detachUserByEmail(email);
@@ -602,6 +630,7 @@ test.describe("invitations", () => {
       const email = uniqueEmail("otp-only");
       const { token } = await invite(email);
       const ctx = await anonymousContext();
+      let userId: string | undefined;
       try {
         const start = await ctx.post(`/api/invitations/${token}/register/otp/start`, {
           data: { firstName: "EndToEnd", lastName: "Passwordless Invitee" },
@@ -616,7 +645,9 @@ test.describe("invitations", () => {
         });
         expect(verify.ok(), `verify failed: ${verify.status()} ${await verify.text()}`).toBeTruthy();
         const body = await verify.json();
+        userId = body.userId;
         expect(storedOrgRole(tenant!, body.userId)).toBe("qa_engineer");
+        expectWelcomeScheduled(body.userId);
 
         // No password was ever set, so password login must not be a way in — an account created
         // passwordless that accepts an empty or default password would be worse than no account.
@@ -628,6 +659,7 @@ test.describe("invitations", () => {
           expect(login.ok(), `password "${password}" must not sign in a passwordless account`).toBeFalsy();
         }
       } finally {
+        removeWelcomeJob(userId);
         await ctx.dispose();
         clearOtpRateLimit(email);
         detachUserByEmail(email);
@@ -798,7 +830,7 @@ test.describe("invitations", () => {
 
   test("registering against an address that already has an account is refused", { tag: '@tesbo.testId("TES-TC-272")' }, async () => {
     const email = uniqueEmail("taken");
-    seedFixtureUser(email, "E2E Existing Account");
+    const existing = seedFixtureUser(email, "E2E Existing Account");
     const { token } = await invite(email);
 
     try {
@@ -808,6 +840,8 @@ test.describe("invitations", () => {
       });
       expect(res.status()).toBe(400);
       expect((await res.json()).error).toContain("already exists");
+      // A refused registration creates no account, so it must not welcome the one that already existed.
+      if (env.targetIsLocal) expect(readWelcomeJob(existing.userId), "a refused registration scheduled a welcome email").toBeNull();
     } finally {
       detachUserByEmail(email);
     }
