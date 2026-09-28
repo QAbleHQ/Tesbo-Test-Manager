@@ -499,6 +499,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     // tenant's org, and so a stale key never gets picked over the one the next test allocates.
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+    // The ZCC-B-11.. range tests PATCH testcaseRange; dropping the key restores the 30-50 default
+    // so a range set by one test never decides another test's generation size.
+    exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id = ${project};`);
   }
 
   function url(suffix: string): string {
@@ -1142,5 +1145,178 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
     const messages = (await session.json()).messages as Array<Record<string, unknown>>;
     expect(messages.some((m) => String(m.content || "").includes("Stopped at your request")), "no-op means no new message either").toBe(false);
+  });
+
+  /*
+   * The configured test-case range must survive all the way to the review batch.
+   *
+   * Reported with 30-50 (the default) selected: "25 of 40 test case operation(s) were drafted for
+   * review. 15 operation(s) beyond the 25-per-message limit were not applied." The generation itself
+   * succeeded — ZYRA_CHAT_MAX_OPERATIONS, a fixed 25, discarded the rest in applyZyraChatOperations.
+   * Separately, each tier's requestedCount (the cap normalizeAiDrafts keeps) sat below the tier's own
+   * upper bound: 10-30 stopped at 25, 30-50 at 40.
+   *
+   * Each test routes an ordinary "create" with no count (so the project range decides), has the fake
+   * model return MORE drafts than the tier allows, and asserts on the staged review batch — the
+   * persisted state the Review panel and Save both read — not on the reply's wording.
+   */
+  async function setRange(range: string): Promise<void> {
+    const res = await asOwner.patch(url("/settings"), { data: { testcaseRange: range }, failOnStatusCode: false });
+    expect(res.status(), `saving testcaseRange ${range} — ${await res.text()}`).toBe(200);
+    expect((await res.json()).testcaseRange).toBe(range);
+  }
+
+  /** Router routes to create with no count, then the generation call returns `drafts` drafts. */
+  async function generateWithRange(sessionId: string, drafts: number, routerExtra: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false, ...routerExtra });
+    ai.queueReply({ drafts: Array.from({ length: drafts }, (_, i) => scenarioDraft(`E2E range case ${i + 1} ${Date.now()}`)) });
+    const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    return [...messages].reverse().find((m) => m.role === "assistant")!;
+  }
+
+  /** The generation call is the router's successor — the second request this test's turn made. */
+  function generationPrompt(): string {
+    expect(ai.requests.length, "the generation call never reached the provider").toBeGreaterThanOrEqual(2);
+    return JSON.stringify(ai.requests[1].messages);
+  }
+
+  function expectNothingDropped(assistant: Record<string, unknown>): void {
+    const activity = (assistant.activity as Array<{ title?: string; detail?: string }>) ?? [];
+    expect(activity.filter((a) => /skipped some operations/i.test(String(a.title || ""))), "no operation may be dropped for a per-message limit").toEqual([]);
+    expect(String(assistant.content || "")).not.toContain("per-message limit");
+  }
+
+  test("ZCC-B-11 the default 30-50 range stages all 40 generated cases, and Save lands all 40", async () => {
+    // 40 inserts through zyraSave's one transaction, each a round trip to the hosted database.
+    test.setTimeout(240_000);
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC range 30-50 default");
+    const before = liveCaseCount();
+
+    // No setRange: purge() leaves the project on the product default, which is 30-50.
+    const assistant = await generateWithRange(sessionId, 40);
+    expect(generationPrompt(), "the configured tier's instruction must reach the generation call").toContain("between 30 and 50");
+
+    const review = reviewRequestFor(sessionId);
+    expect(review, "the generation should stage a review batch").toBeTruthy();
+    expect(review!.payloadLength, "all 40 drafts must be staged — the reported bug staged 25").toBe(40);
+    expect(review!.generatedCount).toBe(40);
+    expect(assistant.testcases as unknown[], "the review panel must list every staged draft").toHaveLength(40);
+    expectNothingDropped(assistant);
+    expect(liveCaseCount(), "staging must not write testcases").toBe(before);
+
+    const reviewRow = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    const saveRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/ai/generation-history/${reviewRow}/save`, {
+      data: { selectedDraftIndexes: Array.from({ length: 40 }, (_, i) => i) },
+      failOnStatusCode: false,
+      timeout: 180_000,
+    });
+    expect(saveRes.status(), `saving all 40 — ${await saveRes.text()}`).toBeLessThan(300);
+    expect((await saveRes.json()).savedCount).toBe(40);
+    expect(liveCaseCount(), "every saved draft must be a real test case").toBe(before + 40);
+  });
+
+  test("ZCC-B-12 30-50 keeps up to 50 and never more", async () => {
+    await allocateFakeAiKey();
+    await setRange("30-50");
+    const sessionId = await newSession("E2E ZCC range 30-50 ceiling");
+
+    const assistant = await generateWithRange(sessionId, 55);
+    const review = reviewRequestFor(sessionId);
+    expect(review!.payloadLength, "30-50 must allow the tier's upper bound, 50 — it stopped at 40, then 25").toBe(50);
+    expect(assistant.testcases as unknown[]).toHaveLength(50);
+    expectNothingDropped(assistant);
+  });
+
+  test("ZCC-B-13 10-30 allows up to 30, not 25", async () => {
+    await allocateFakeAiKey();
+    await setRange("10-30");
+    const sessionId = await newSession("E2E ZCC range 10-30");
+
+    const assistant = await generateWithRange(sessionId, 35);
+    expect(generationPrompt()).toContain("between 10 and 30");
+    const review = reviewRequestFor(sessionId);
+    expect(review!.payloadLength, "10-30 must keep 30 — its requestedCount was 25").toBe(30);
+    expect(assistant.testcases as unknown[]).toHaveLength(30);
+    expectNothingDropped(assistant);
+  });
+
+  test("ZCC-B-14 1-10 still stops at 10", async () => {
+    await allocateFakeAiKey();
+    await setRange("1-10");
+    const sessionId = await newSession("E2E ZCC range 1-10");
+
+    const assistant = await generateWithRange(sessionId, 15);
+    expect(generationPrompt()).toContain("between 1 and 10");
+    expect(reviewRequestFor(sessionId)!.payloadLength, "a model that overshoots 1-10 is trimmed to the tier's maximum").toBe(10);
+    expect(assistant.testcases as unknown[]).toHaveLength(10);
+  });
+
+  test("ZCC-B-15 a count the user names overrides the range, in both directions, and is clamped at 50", async () => {
+    await allocateFakeAiKey();
+
+    // Fewer than the range: 30-50 project, "give me 5" — must not pad or keep the model's extra 7.
+    await setRange("30-50");
+    const small = await newSession("E2E ZCC explicit 5");
+    await generateWithRange(small, 12, { requestedCount: 5 });
+    expect(reviewRequestFor(small)!.payloadLength, "an explicit 5 must stage exactly 5").toBe(5);
+
+    // More than the range: 1-10 project, "45 test cases" — the old 25 ceiling cut this too.
+    ai.reset();
+    await setRange("1-10");
+    const large = await newSession("E2E ZCC explicit 45");
+    const largeTurn = await generateWithRange(large, 45, { requestedCount: 45 });
+    expect(reviewRequestFor(large)!.payloadLength).toBe(45);
+    expectNothingDropped(largeTurn);
+
+    // Beyond the ceiling: an asked-for 100 is clamped to 50, not truncated at 25. 100 is the "all"
+    // tier's plan ceiling (ZCC-B-16) — naming that number must not borrow it: no scenario plan runs,
+    // and the turn stays one single-shot generation.
+    ai.reset();
+    const huge = await newSession("E2E ZCC explicit 100");
+    const hugeTurn = await generateWithRange(huge, 100, { requestedCount: 100 });
+    expect(reviewRequestFor(huge)!.payloadLength, "a count above the ceiling is clamped to 50").toBe(50);
+    expectNothingDropped(hugeTurn);
+    expect(ai.requests.some((r) => JSON.stringify(r.messages).includes("List up to")), "a named count must never run the 'all' scenario planner").toBe(false);
+    expect(scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(huge)};`), "a named count must not start a batch plan").toBeNull();
+  });
+
+  test("ZCC-B-16 the 'all' range plans up to 100 scenarios — and only 'all' does", async () => {
+    await allocateFakeAiKey();
+    await setRange("all");
+    const sessionId = await newSession("E2E ZCC range all 100");
+
+    // Router: create, no count — the project's "all" range routes it to the scenario planner. The
+    // planner overshoots with 120; the first batch of 5 comes back inline.
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
+    ai.queueReply({ scenarios: Array.from({ length: 120 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    // rememberZyraTurn after the first batch — see ZCC-B-08.
+    ai.queueReply("Noted.");
+    // Nothing is queued for the background batches: this test is about the plan's size, not its
+    // execution (ZCC-B-08/09 cover that). The first background call gets the fake server's no-drafts
+    // default, which pauses the plan instead of running 19 more batches against the hosted database.
+    const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+    expect(JSON.stringify(ai.requests[1].messages), "the planner must be told the 'all' ceiling").toContain("List up to 100 scenarios");
+    const messages = (await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json()).messages as Array<Record<string, unknown>>;
+    const first = messages.find((m) => m.role === "assistant")!;
+    expect(String(first.content || ""), "a 120-scenario plan is trimmed to 100 — it used to stop at 40").toContain("I identified 100 distinct scenarios");
+    expect(String(first.content || "")).toContain("(95 more)");
+    expect(reviewRequestFor(sessionId)!.payloadLength, "the inline first batch is still ZYRA_PLAN_BATCH_SIZE").toBe(5);
+
+    // Let the background loop settle (paused on the unscripted batch, or stopped here) before purge()
+    // deletes the session out from under it.
+    await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(active_plan->>'status', 'none') FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must stop running before cleanup",
+        timeout: 30_000,
+      })
+      .not.toBe("running");
   });
 });
