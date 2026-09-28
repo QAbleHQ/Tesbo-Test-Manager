@@ -243,7 +243,14 @@ export default function ApiTokensPage() {
   const mcpUrl = getMcpUrl(projectId);
   const tokenForSnippets = revealedToken?.token ?? "<YOUR_API_TOKEN>";
 
-  const claudeCodeCli = `claude mcp add --transport http tesbo ${mcpUrl} --header "Authorization: Bearer ${tokenForSnippets}"`;
+  /*
+   * `--scope user`, not the CLI's default `local` scope. A local-scope server is stored in
+   * ~/.claude.json keyed by the exact folder path the terminal was in, and on Windows that key is
+   * case-sensitive: a terminal registers under `D:/repo` while VS Code opens the same folder as
+   * `d:/repo`, so the server shows "Connected" in `claude mcp list` yet never appears in the IDE
+   * extension. User scope isn't keyed by path, so every surface on the machine sees it.
+   */
+  const claudeCodeCli = `claude mcp add --transport http --scope user tesbo ${mcpUrl} --header "Authorization: Bearer ${tokenForSnippets}"`;
   const mcpJsonSnippet = `{
   "mcpServers": {
     "tesbo": {
