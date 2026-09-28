@@ -1149,7 +1149,7 @@ test.describe("integrations — Jira and Linear", () => {
     expect(historyBody.runs.length).toBeGreaterThanOrEqual(2);
   });
 
-  // ─── Sync run's Linear project name (V126) ────────────────────────────────
+  // ─── Sync run's Jira/Linear project name (V126) ──────────────────────────
   //
   // A Linear Project mapping stores its opaque slugId in the key slot (V95), and the Requirements
   // sync panel showed that ("4081f3c6e1df") instead of the project name. The write side — startRun
@@ -1178,6 +1178,31 @@ test.describe("integrations — Jira and Linear", () => {
     const { run } = await status.json();
     expect(run?.remoteProjectName).toBeNull();
     expect(run?.remoteProjectKey).toBe("4081f3c6e1df");
+  });
+
+  // Same defect on Jira: the panel showed "KAN" rather than the mapped project's name.
+  test("INT-A-55 a Jira sync run returns its project name alongside the key", async () => {
+    seedSyncRun("jira", { status: "succeeded", error: null, remoteProjectKey: "KAN", remoteProjectName: "E2E QA Demo" });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    const { run } = await status.json();
+    expect(run?.remoteProjectName).toBe("E2E QA Demo");
+    expect(run?.remoteProjectKey).toBe("KAN");
+
+    const history = await asOwner.get(url("/integrations/sync-history"), { failOnStatusCode: false });
+    expect(history.status(), await history.text()).toBe(200);
+    expect((await history.json()).runs[0]?.remoteProjectName).toBe("E2E QA Demo");
+  });
+
+  test("INT-A-56 a Jira run recorded before the name existed still answers, with a null name and its key", async () => {
+    seedSyncRun("jira", { status: "succeeded", error: null, remoteProjectKey: "KAN" });
+
+    const status = await asOwner.get(url("/integrations/jira/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    const { run } = await status.json();
+    expect(run?.remoteProjectName).toBeNull();
+    expect(run?.remoteProjectKey).toBe("KAN");
   });
 
   // ─── Linear Project mapping (V95) ─────────────────────────────────────────
