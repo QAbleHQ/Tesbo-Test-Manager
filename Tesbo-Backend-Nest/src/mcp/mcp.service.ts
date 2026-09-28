@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
@@ -9,6 +10,7 @@ import {
   MCP_SERVER_INSTRUCTIONS,
   MCP_SERVER_NAME,
   MCP_SERVER_VERSION,
+  MCP_SUPPORTED_PROTOCOL_VERSIONS,
   McpError,
   RpcCode,
   type JsonRpcId,
@@ -36,6 +38,23 @@ export class McpService {
   private readonly logger = new Logger(McpService.name);
   private readonly tools: McpTool[] = buildMcpTools();
   private readonly toolsByName = new Map(this.tools.map((t) => [t.name, t]));
+  /*
+   * A fingerprint of everything a client caches from this server: the tools/list payload and the
+   * session instructions. MCP clients fetch tools/list once per session and keep it, and a
+   * blue/green deploy swaps the process behind the same URL without breaking anything, so a client
+   * connected before a deploy kept calling with the old schemas indefinitely (the "severity still
+   * free text on stage" report). Session ids embed this value — see isCurrentSession.
+   *
+   * A content hash rather than GIT_SHA: it changes exactly when the schemas do (a deploy that
+   * leaves MCP untouched does not force every client to reconnect), and it works where GIT_SHA is
+   * "local" — local dev, e2e, and prod, whose deploy does not pass GIT_SHA through today.
+   */
+  private readonly toolsFingerprint = createHash("sha256")
+    .update(JSON.stringify({ tools: this.listToolsPayload(), instructions: MCP_SERVER_INSTRUCTIONS }))
+    .digest("hex")
+    .slice(0, 16);
+  /** SemVer build metadata: which deploy (GIT_SHA) and which tool set (fingerprint) this is. */
+  readonly serverVersion = `${MCP_SERVER_VERSION}+${process.env.GIT_SHA || "local"}.${this.toolsFingerprint}`;
 
   // Resolved once and reused — the MCP agent's actor id never changes at runtime.
   private mcpActorIdPromise: Promise<string | null> | null = null;
@@ -63,6 +82,30 @@ export class McpService {
 
   listTools(): McpTool[] {
     return this.tools;
+  }
+
+  /** A fresh session id bound to the current tool set. */
+  newSessionId(): string {
+    return `${this.toolsFingerprint}.${randomUUID()}`;
+  }
+
+  /** False for an id issued against a different tool set (or not issued by this server at all). */
+  isCurrentSession(sessionId: string): boolean {
+    return sessionId.startsWith(`${this.toolsFingerprint}.`);
+  }
+
+  /** A JSON-RPC notification: no id, so no response is expected (Streamable HTTP answers 202). */
+  static isNotification(body: unknown): boolean {
+    const req = body as Partial<JsonRpcRequest> | null;
+    return !!req && typeof req === "object" && req.jsonrpc === "2.0" && typeof req.method === "string" && req.method.startsWith("notifications/") && req.id === undefined;
+  }
+
+  private listToolsPayload() {
+    return this.tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema
+    }));
   }
 
   /**
@@ -105,25 +148,27 @@ export class McpService {
     principal: ApiTokenContext
   ): Promise<unknown> {
     switch (method) {
-      case "initialize":
+      case "initialize": {
+        // Echo the client's version when supported; otherwise answer with the long-standing default
+        // (the spec lets the client decide whether it can proceed with that).
+        const requested = typeof params.protocolVersion === "string" ? params.protocolVersion : "";
+        const protocolVersion = (MCP_SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested) ? requested : MCP_PROTOCOL_VERSION;
         return {
-          protocolVersion: MCP_PROTOCOL_VERSION,
+          protocolVersion,
+          // Still false: this transport has no server-to-client stream to send
+          // notifications/tools/list_changed on. Tool-set changes reach clients through session
+          // expiry instead (see isCurrentSession / McpController).
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+          serverInfo: { name: MCP_SERVER_NAME, version: this.serverVersion },
           instructions: MCP_SERVER_INSTRUCTIONS
         };
+      }
 
       case "ping":
         return {};
 
       case "tools/list":
-        return {
-          tools: this.tools.map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema
-          }))
-        };
+        return { tools: this.listToolsPayload() };
 
       case "tools/call":
         return this.callTool(params, principal);

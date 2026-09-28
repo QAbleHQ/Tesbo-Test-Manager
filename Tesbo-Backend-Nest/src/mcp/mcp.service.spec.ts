@@ -149,6 +149,51 @@ describe("McpService", () => {
       expect(res.id).toBe(1);
     });
 
+    it("initialize echoes a supported client protocol version and falls back to the default otherwise", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const version = async (protocolVersion?: string) =>
+        ((await svc.handleRequest(rpc("initialize", protocolVersion ? { protocolVersion } : {}), principal(), "proj-1")) as any).result.protocolVersion;
+      expect(await version("2025-06-18")).toBe("2025-06-18");
+      expect(await version("2024-11-05")).toBe("2024-11-05");
+      // Requires JSON-RPC batch support, which this server does not have — answered as before.
+      expect(await version("2025-03-26")).toBe(MCP_PROTOCOL_VERSION);
+      expect(await version("1999-01-01")).toBe(MCP_PROTOCOL_VERSION);
+      expect(await version()).toBe(MCP_PROTOCOL_VERSION);
+    });
+
+    it("serverInfo.version carries the deploy and a fingerprint of the tool set", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(rpc("initialize"), principal(), "proj-1");
+      expect(res.result.serverInfo.version).toBe(svc.serverVersion);
+      expect(svc.serverVersion).toMatch(/^0\.1\.0\+[^.]+\.[0-9a-f]{16}$/);
+    });
+
+    it("a session id is current only for the tool set it was issued against", () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const id = svc.newSessionId();
+      expect(svc.isCurrentSession(id)).toBe(true);
+      // Each initialize gets its own id.
+      expect(svc.newSessionId()).not.toBe(id);
+      // Another process built from the same code (the other blue/green color, a replica) must
+      // accept it — the fingerprint is derived from the tools, not from the process.
+      expect(new McpService(makeLegacy(), db).isCurrentSession(id)).toBe(true);
+      // Issued by a build whose tools differed: stale, so the client is told to re-initialize.
+      expect(svc.isCurrentSession(`0000000000000000.${id.split(".")[1]}`)).toBe(false);
+      expect(svc.isCurrentSession("not-a-tesbo-session")).toBe(false);
+      expect(svc.isCurrentSession("")).toBe(false);
+    });
+
+    it("recognises JSON-RPC notifications, which get no response", () => {
+      expect(McpService.isNotification({ jsonrpc: "2.0", method: "notifications/initialized" })).toBe(true);
+      expect(McpService.isNotification({ jsonrpc: "2.0", id: 1, method: "notifications/initialized" })).toBe(false);
+      expect(McpService.isNotification({ jsonrpc: "2.0", method: "tools/list" })).toBe(false);
+      expect(McpService.isNotification(null)).toBe(false);
+      expect(McpService.isNotification("notifications/initialized")).toBe(false);
+    });
+
     it("ping returns an empty result", async () => {
       const { db } = makeDb();
       const svc = new McpService(makeLegacy(), db);
