@@ -329,8 +329,12 @@ describe("Zyra chat AI routing", () => {
       expect(internals(svc).chatTestcasePlan("generate cases", "1-10", { requestedCount: 0 }).testcaseRange).toBe("1-10");
     });
 
-    it("resolves the project's 30-50 range to a requestedCount of 40 when nothing else is specified", () => {
-      expect(internals(svc).chatTestcasePlan("generate cases", "30-50")).toEqual({ testcaseRange: "30-50", requestedCount: 40 });
+    it("resolves each project range to its upper bound when nothing else is specified", () => {
+      // The upper bound, because requestedCount is also the cap normalizeAiDrafts keeps — 30-50 at
+      // 40 and 10-30 at 25 discarded drafts the tier's own instruction allowed.
+      expect(internals(svc).chatTestcasePlan("generate cases", "1-10")).toEqual({ testcaseRange: "1-10", requestedCount: 10 });
+      expect(internals(svc).chatTestcasePlan("generate cases", "10-30")).toEqual({ testcaseRange: "10-30", requestedCount: 30 });
+      expect(internals(svc).chatTestcasePlan("generate cases", "30-50")).toEqual({ testcaseRange: "30-50", requestedCount: 50 });
     });
 
     it("no longer truncates an explicit 30-50 chat request down to the old 25 ceiling", () => {

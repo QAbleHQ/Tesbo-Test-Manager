@@ -457,8 +457,17 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     });
     expect(res.status(), `updating settings — ${await res.text()}`).toBe(200);
 
+    // Each tier reports its upper bound — the count generation actually keeps. 10-30 used to report
+    // (and cap at) 25.
+    expect((await res.json()).testcaseCount).toBe(30);
+
     const agent = await (await asOwner.get(url("/agents/zyra"))).json();
     expect(JSON.stringify(agent)).toContain("10-30");
+    expect(agent.settings.testcaseCount).toBe(30);
+
+    const small = await asOwner.patch(url("/agents/zyra/settings"), { data: { testcaseRange: "1-10" }, failOnStatusCode: false });
+    expect(small.status()).toBe(200);
+    expect((await small.json()).testcaseCount).toBe(10);
   });
 
   test("ZYR-A-09b the 30-50 tier round-trips the same way as every other range", { tag: '@tesbo.testId("TES-TC-603")' }, async () => {
@@ -469,11 +478,12 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(res.status(), `updating settings — ${await res.text()}`).toBe(200);
     const body = await res.json();
     expect(body.testcaseRange).toBe("30-50");
-    expect(body.testcaseCount).toBe(40);
+    // 50, the tier's upper bound: at 40, normalizeAiDrafts discarded every draft past the 40th.
+    expect(body.testcaseCount).toBe(50);
 
     const agent = await (await asOwner.get(url("/agents/zyra"))).json();
     expect(agent.settings.testcaseRange).toBe("30-50");
-    expect(agent.settings.testcaseCount).toBe(40);
+    expect(agent.settings.testcaseCount).toBe(50);
   });
 
   test("ZYR-A-10 an unknown testcaseRange falls back instead of being stored", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
@@ -521,7 +531,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     try {
       const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
       expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
-      expect(agent.settings.testcaseCount).toBe(40);
+      expect(agent.settings.testcaseCount).toBe(50);
     } finally {
       purgeProject(project.id);
     }
