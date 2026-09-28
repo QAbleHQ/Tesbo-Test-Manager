@@ -106,6 +106,10 @@ test.describe("zyra / agents (UI)", () => {
     );
   }
 
+  function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
   function stamp(label: string): string {
     return `E2E ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
   }
@@ -1019,10 +1023,167 @@ test.describe("zyra / agents (UI)", () => {
     await page.getByRole("tab", { name: "Kanban board" }).click();
     await page.locator("button", { has: page.getByText(userStory) }).click();
 
+    // The description is rendered as Markdown now (ZYU-107), so blank-line-separated sections come
+    // out as separate paragraphs rather than one pre-wrap <p> holding the raw string — the
+    // behaviour this test protects (sections are not run together) is unchanged.
     const panel = page.locator(".slide-in-right");
-    const contextParagraph = panel.locator("div.no-scrollbar p").last();
-    await expect(contextParagraph).toHaveCSS("white-space", "pre-wrap");
-    expect(await contextParagraph.textContent()).toBe(context);
+    const paragraphs = panel.locator("div.no-scrollbar .zyra-prose p");
+    await expect(paragraphs).toHaveText(["Section one detail.", "Section two detail.", "Section three detail."]);
+  });
+
+  // ─── Markdown in the description (fix for "Zyra task displays Markdown formatting in ticket
+  // descriptions") ────────────────────────────────────────────────────────────
+  //
+  // Jira/Linear tickets arrive through the Knowledge Base as flattened Markdown (see
+  // IntegrationSyncDocumentBuilder), and that text becomes task.context. Before the fix all three
+  // surfaces printed it verbatim, so "### LIN-05 …" and "**Module:** Claim" showed their syntax.
+  // The quick-view panel now renders it with lib/markdown.ts; the list row and Kanban card, being
+  // two-line clamped previews where headings and lists cannot lay out, show it as plain text.
+
+  /** The shape of the Linear ticket in the bug report's screenshot. */
+  const TICKET_MARKDOWN = [
+    "### LIN-05: Submit an Expense Claim",
+    "",
+    "**Module:** Claim",
+    "**Priority:** Medium",
+    "",
+    "**User Story:**",
+    "As an employee, I want to submit an expense claim with supporting documents so that I can request reimbursement.",
+    "",
+    "- Receipt is mandatory",
+    "- Amount must be _positive_",
+    "",
+    "See [the claim policy](https://example.com/claims) for limits.",
+  ].join("\n");
+
+  /** Markdown syntax that must never survive into a rendered or preview surface. */
+  const MARKDOWN_SYNTAX = /###|\*\*|\]\(|(^|\s)- /;
+
+  test("ZYU-107 the quick-view panel renders a ticket's Markdown description instead of showing its syntax", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Markdown panel story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const description = panel.locator("div.no-scrollbar .zyra-prose");
+    await expect(description.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+    await expect(description.locator("strong")).toHaveText(["Module:", "Priority:", "User Story:"]);
+    await expect(description.locator("li")).toHaveText(["Receipt is mandatory", "Amount must be positive"]);
+    await expect(description.locator("em")).toHaveText("positive");
+    const link = description.getByRole("link", { name: "the claim policy" });
+    await expect(link).toHaveAttribute("href", "https://example.com/claims");
+    // Opens outside the app, and without handing the target a window.opener back into it.
+    await expect(link).toHaveAttribute("target", "_blank");
+    await expect(link).toHaveAttribute("rel", /noopener/);
+
+    const text = (await description.innerText()) ?? "";
+    expect(text, "no Markdown syntax is left visible in the rendered description").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("As an employee, I want to submit an expense claim");
+  });
+
+  test("ZYU-108 the task window row previews a Markdown description as plain text", async ({ browser }) => {
+    const userStory = stamp("Markdown row story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    // Wait for the row itself first: the list can still be on its loading skeleton when the page
+    // opens, and a count of the row's <p> would otherwise spend its whole timeout on that skeleton.
+    await expect(row).toBeVisible();
+    const preview = row.locator("p");
+    await expect(preview).toHaveCount(1);
+    const text = (await preview.textContent()) ?? "";
+    expect(text, "the row preview carries no Markdown syntax").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("LIN-05: Submit an Expense Claim Module: Claim Priority: Medium");
+    // A link keeps its visible text and drops the URL syntax.
+    expect(text).toContain("See the claim policy for limits.");
+    expect(text).not.toContain("https://example.com/claims");
+  });
+
+  test("ZYU-109 the kanban card previews a Markdown description as plain text", async ({ browser }) => {
+    const userStory = stamp("Markdown card story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    const card = page.locator("button", { has: page.getByText(userStory) });
+    // The card's second <p> is its "N testcases generated" summary line; the description is first.
+    await expect(card.locator("p")).toHaveCount(2);
+    const text = (await card.locator("p").first().textContent()) ?? "";
+    expect(text, "the card preview carries no Markdown syntax").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("LIN-05: Submit an Expense Claim Module: Claim");
+  });
+
+  test("ZYU-110 raw HTML in a description is shown as text, never rendered as markup", async ({ browser }) => {
+    const userStory = stamp("HTML in context story");
+    // Ticket bodies are third-party content. The quote-breaking link is the payload lib/markdown.ts's
+    // own comment calls out; the javascript: link must stay inert text since only http(s) is linked.
+    const context = [
+      `<img src=x onerror="window.__zyraMdXss=1"> <b>not bold</b>`,
+      `[x](https://a" onmouseover="window.__zyraMdXss=2" x=")`,
+      `[click](javascript:window.__zyraMdXss=3)`,
+    ].join("\n");
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    await expect(row.locator("img, b")).toHaveCount(0);
+    await row.click();
+
+    const description = page.locator(".slide-in-right div.no-scrollbar .zyra-prose");
+    await expect(description).toContainText("<b>not bold</b>");
+    await expect(description.locator("img, b")).toHaveCount(0);
+    await expect(description.locator('a[href^="javascript"], [onmouseover], [onerror]')).toHaveCount(0);
+    await description.hover();
+    expect(await page.evaluate(() => (window as unknown as { __zyraMdXss?: number }).__zyraMdXss)).toBeUndefined();
+  });
+
+  test("ZYU-111 a plain description with snake_case identifiers and no Markdown is shown unchanged", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Plain context story");
+    // Intraword underscores are not emphasis (CommonMark agrees) — without that rule, turning on
+    // Markdown rendering would mangle every plain description that names a field.
+    const context = "Validate user_id and order_id before saving the claim_total.";
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    // See ZYU-108: wait out the list's loading skeleton before asserting on the row's contents.
+    await expect(row).toBeVisible();
+    await expect(row.locator("p")).toHaveText(context);
+    await row.click();
+
+    const description = page.locator(".slide-in-right div.no-scrollbar .zyra-prose");
+    await expect(description).toHaveText(context);
+    await expect(description.locator("em, strong")).toHaveCount(0);
+  });
+
+  test("ZYU-112 a whitespace-only description renders no description line on the row, card or panel", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Whitespace context story");
+    seedTask({ userStory, context: "   \n\n   " });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    await expect(row).toBeVisible();
+    await expect(row.locator("p")).toHaveCount(0);
+
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    const card = page.locator("button", { has: page.getByText(userStory) });
+    // Only the card's own summary line, as in ZYU-25 — no blank description paragraph.
+    await expect(card.locator("p")).toHaveCount(1);
+
+    await card.click();
+    const panel = page.locator(".slide-in-right");
+    await expect(panel.getByText(userStory)).toBeVisible();
+    await expect(panel.locator("div.no-scrollbar .zyra-prose")).toHaveCount(0);
+    await expect(panel.locator("h2 + p")).toHaveCount(0);
   });
 
   test("ZYU-63 a failed task with a long failure detail still keeps 'Close task' reachable in the footer", async ({

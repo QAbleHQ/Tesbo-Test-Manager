@@ -206,7 +206,13 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
           {failureDetail && (
             <p className="mt-1.5 break-words text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
           )}
-          {task.context && <p className="mt-1.5 break-words whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--muted)]">{task.context}</p>}
+          {/* Ticket descriptions synced from Jira/Linear are Markdown; render it rather than showing its syntax. */}
+          {task.context?.trim() && (
+            <div
+              className="zyra-prose mt-1.5 break-words text-[13px] text-[var(--muted)]"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(task.context) }}
+            />
+          )}
         </div>
 
         {/* Stats row */}
