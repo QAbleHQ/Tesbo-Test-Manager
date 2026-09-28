@@ -123,6 +123,9 @@ git fetch origin main
 git checkout -f main
 git reset --hard origin/main
 git log -1 --oneline
+# docker-compose.yml threads GIT_SHA into the backend (/health, MCP serverInfo.version). Stage gets
+# it from Jenkins' own env; this remote shell never did, so prod always reported "local".
+export GIT_SHA="$(git rev-parse --short HEAD)"
 
 if [ -f "$ACTIVE_COLOR_FILE" ]; then
   ACTIVE="$(tr -d '[:space:]' < "$ACTIVE_COLOR_FILE" | tr '[:upper:]' '[:lower:]')"

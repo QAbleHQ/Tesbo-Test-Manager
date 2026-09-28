@@ -187,6 +187,194 @@ test.describe("MCP initialize", () => {
   });
 });
 
+/*
+ * "[MCP] Ensure MCP changes are automatically picked up by Dev/Stage clients".
+ *
+ * Stage was already running the severity fix (its /health gitSha matched origin/dev). What went
+ * stale was the client: MCP clients fetch tools/list once per session and keep it, the server told
+ * them the list never changes (listChanged: false), it reported the same serverInfo.version on
+ * every build, and a blue/green deploy swaps the process behind the same URL without breaking a
+ * single request — so a client connected before the deploy kept the old free-text `severity` schema
+ * until someone restarted it.
+ *
+ * The fix is Streamable HTTP's own session mechanism: initialize issues an Mcp-Session-Id bound to
+ * a fingerprint of the tool set, and a request carrying an id from a different fingerprint gets 404,
+ * which the spec requires a client to answer by re-initializing. A different build is simulated
+ * here by a session id with another fingerprint prefix — exactly what a pre-deploy client holds.
+ */
+test.describe("MCP sessions keep a client's tool list current across deploys", () => {
+  const STALE_SESSION = "0000000000000000.11111111-2222-4333-8444-555555555555";
+
+  type Rpc = { status: number; headers: Record<string, string>; body: any };
+
+  async function withToken(
+    request: APIRequestContext,
+    scopes: string[],
+    fn: (mcpApi: APIRequestContext, token: string, createdIds: string[]) => Promise<void>,
+  ) {
+    // Cookie-free for the same reason as callMcpTool: a real MCP client never sends a browser session.
+    const mcpApi = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    const createdIds: string[] = [];
+    let tokenId: string | undefined;
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP session token ${Date.now()}`, scopes },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      await fn(mcpApi, tokenBody.token as string, createdIds);
+    } finally {
+      for (const id of createdIds) await deleteCase(request, id);
+      if (tokenId) await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      await mcpApi.dispose();
+    }
+  }
+
+  /** One raw JSON-RPC POST to the dynamic endpoint, with an optional session id. */
+  async function rpc(api: APIRequestContext, token: string, body: Record<string, unknown>, session?: string): Promise<Rpc> {
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json, text/event-stream" };
+    if (session) headers["Mcp-Session-Id"] = session;
+    const res = await api.post("/api/mcp", { headers, data: { jsonrpc: "2.0", ...body }, failOnStatusCode: false });
+    const text = await res.text();
+    return { status: res.status(), headers: res.headers(), body: text ? JSON.parse(text) : null };
+  }
+
+  async function initialize(api: APIRequestContext, token: string, session?: string): Promise<Rpc> {
+    return rpc(api, token, { id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "e2e", version: "1" } } }, session);
+  }
+
+  test("initialize issues a session id and reports the build it is connected to", async ({ request }) => {
+    await withToken(request, ["read"], async (api, token) => {
+      const init = await initialize(api, token);
+      expect(init.status).toBeLessThan(300);
+      expect(init.body.error).toBeUndefined();
+      expect(init.body.result.protocolVersion, "a supported client version is echoed back").toBe("2025-06-18");
+      const session = init.headers["mcp-session-id"];
+      expect(session, "initialize must hand the client a session id").toMatch(/^[0-9a-f]{16}\.[0-9a-f-]{36}$/);
+
+      // serverInfo.version names the same deploy /health does — the check a person runs to see
+      // which build their client is actually talking to.
+      const health = await (await api.get("/health")).json();
+      expect(init.body.result.serverInfo.version).toBe(`0.1.0+${health.gitSha}.${session.split(".")[0]}`);
+
+      const second = await initialize(api, token);
+      expect(second.headers["mcp-session-id"], "every initialize gets its own id").not.toBe(session);
+    });
+  });
+
+  test("a current session is served, and tools/list exposes the deployed create_testcase schema", async ({ request }) => {
+    await withToken(request, ["read"], async (api, token) => {
+      const session = (await initialize(api, token)).headers["mcp-session-id"];
+      const list = await rpc(api, token, { id: 2, method: "tools/list" }, session);
+      expect(list.status).toBeLessThan(300);
+      const create = (list.body.result.tools as Array<{ name: string; inputSchema: any }>).find((t) => t.name === "create_testcase");
+      expect(create?.inputSchema.properties.severity.enum, "the severity fix's enum is what a fresh session sees").toEqual(["Critical", "High", "Medium", "Low"]);
+    });
+  });
+
+  test("a session from a different tool set gets 404, runs nothing, and re-initializing recovers", async ({ request }) => {
+    await withToken(request, ["read", "write"], async (api, token, createdIds) => {
+      const listed = await rpc(api, token, { id: 2, method: "tools/list" }, STALE_SESSION);
+      expect(listed.status, "the spec's signal to re-initialize").toBe(404);
+      expect(listed.body.error.code).toBe(-32004);
+      expect(listed.body.id).toBe(2);
+
+      // A stale client's tools/call must not run against the new code with the old schema's
+      // arguments — that is the path that produced "severity not saved".
+      const title = `E2E MCP stale session ${Date.now()}`;
+      const called = await rpc(api, token, { id: 3, method: "tools/call", params: { name: "create_testcase", arguments: { title, severity: "Major" } } }, STALE_SESSION);
+      expect(called.status).toBe(404);
+      const found = await request.get(`/api/projects/${ctx.projectId}/testcases?search=${encodeURIComponent(title)}`);
+      expect(JSON.stringify(await found.json()), "a rejected stale call must create nothing").not.toContain(title);
+
+      // Recovery exactly as a client does it: initialize (it may still send the stale header),
+      // then carry on with the new id.
+      const init = await initialize(api, token, STALE_SESSION);
+      expect(init.status).toBeLessThan(300);
+      const fresh = init.headers["mcp-session-id"];
+      expect(fresh).toBeTruthy();
+      expect(fresh).not.toBe(STALE_SESSION);
+
+      // The Severity fix through the recovered session: the canonical value is persisted.
+      const created = await rpc(api, token, { id: 4, method: "tools/call", params: { name: "create_testcase", arguments: { title, severity: "high" } } }, fresh);
+      expect(created.status).toBeLessThan(300);
+      expect(created.body.error).toBeUndefined();
+      const testcase = JSON.parse(created.body.result.content[0].text);
+      createdIds.push(testcase.id);
+      const stored = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`)).json();
+      expect(stored.severity, "severity is canonicalized and persisted").toBe("High");
+    });
+  });
+
+  test("a client that never sends a session id is served exactly as before", async ({ request }) => {
+    await withToken(request, ["read"], async (api, token) => {
+      const list = await rpc(api, token, { id: 1, method: "tools/list" });
+      expect(list.status).toBe(201);
+      expect(list.body.result.tools.length).toBeGreaterThan(10);
+      // A client that names no protocol version keeps getting the long-standing default.
+      const init = await rpc(api, token, { id: 2, method: "initialize" });
+      expect(init.body.result.protocolVersion).toBe("2024-11-05");
+    });
+  });
+
+  test("notifications get 202 with no body; GET and DELETE get 405", async ({ request }) => {
+    await withToken(request, ["read"], async (api, token) => {
+      const session = (await initialize(api, token)).headers["mcp-session-id"];
+      const note = await rpc(api, token, { method: "notifications/initialized" }, session);
+      expect(note.status).toBe(202);
+      expect(note.body).toBeNull();
+
+      for (const path of ["/api/mcp", `/api/projects/${ctx.projectId}/mcp`]) {
+        const get = await api.get(path, { headers: { Authorization: `Bearer ${token}` }, failOnStatusCode: false });
+        expect(get.status(), `GET ${path}`).toBe(405);
+        expect(get.headers()["allow"]).toBe("POST");
+        const del = await api.delete(path, { headers: { Authorization: `Bearer ${token}`, "Mcp-Session-Id": session }, failOnStatusCode: false });
+        expect(del.status(), `DELETE ${path}`).toBe(405);
+      }
+    });
+  });
+
+  test("a session id is not a credential: unauthenticated calls are refused, and it never crosses projects", async ({ request }) => {
+    await withToken(request, ["read"], async (api, token) => {
+      const session = (await initialize(api, token)).headers["mcp-session-id"];
+
+      const anon = await api.post("/api/mcp", { headers: { "Mcp-Session-Id": session }, data: { jsonrpc: "2.0", id: 1, method: "tools/list" }, failOnStatusCode: false });
+      expect(anon.status(), "a session id without a token").toBe(401);
+      const anonGet = await api.get("/api/mcp", { failOnStatusCode: false });
+      expect(anonGet.status(), "GET without a token is refused before the 405").toBe(401);
+
+      // Account B's token presenting account A's session id acts in B's project only — the token
+      // alone decides the project.
+      const asB = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state-b.json") });
+      let bTokenId: string | undefined;
+      let aCaseId: string | undefined;
+      try {
+        const aCase = await createCase(request, { title: `E2E MCP session A-only ${Date.now()}` });
+        aCaseId = aCase.id;
+        const bTokenRes = await asB.post(`/api/projects/${ctxB.projectId}/apikeys`, { data: { name: `E2E MCP session B ${Date.now()}`, scopes: ["read"] } });
+        expect(bTokenRes.ok()).toBeTruthy();
+        const bToken = await bTokenRes.json();
+        bTokenId = bToken.id;
+
+        const got = await rpc(api, bToken.token, { id: 1, method: "tools/call", params: { name: "get_testcase", arguments: { testcaseId: aCaseId } } }, session);
+        expect(got.body.error, "B must not read A's test case through A's session").toBeDefined();
+
+        const aScoped = await api.post(`/api/projects/${ctx.projectId}/mcp`, {
+          headers: { Authorization: `Bearer ${bToken.token}`, "Mcp-Session-Id": session },
+          data: { jsonrpc: "2.0", id: 2, method: "tools/list" },
+          failOnStatusCode: false,
+        });
+        expect((await aScoped.json()).error?.code, "B's token on A's project URL stays denied").toBe(-32001);
+      } finally {
+        if (aCaseId) await deleteCase(request, aCaseId);
+        if (bTokenId) await asB.delete(`/api/projects/${ctxB.projectId}/apikeys/${bTokenId}`, { failOnStatusCode: false });
+        await asB.dispose();
+      }
+    });
+  });
+});
+
 test.describe("MCP list_testcases and the repository total agree on Archived cases", () => {
   test("includeArchived lets an MCP caller reach the same total the repository summary counts", async ({
     request,

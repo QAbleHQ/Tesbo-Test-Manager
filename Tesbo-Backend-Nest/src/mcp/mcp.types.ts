@@ -15,9 +15,25 @@ import type { LegacyService } from "../legacy/legacy.service";
  * because the Playwright e2e suite cannot boot in the build sandbox.
  */
 
+/** Answered to a client that names no protocol version, or one this server does not support. */
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
+/**
+ * Every version `initialize` will echo back when a client asks for it. 2025-03-26 is left out
+ * deliberately: it requires servers to accept JSON-RPC batches, which this server does not — a
+ * client asking for it is answered with MCP_PROTOCOL_VERSION, exactly as before.
+ */
+export const MCP_SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", MCP_PROTOCOL_VERSION] as const;
 export const MCP_SERVER_NAME = "tesbo-mcp";
 export const MCP_SERVER_VERSION = "0.1.0";
+
+/**
+ * Streamable HTTP's session header. Tesbo uses it for one thing: telling a client its cached tool
+ * list is out of date. The id embeds a fingerprint of the tool definitions (see McpService), and a
+ * request carrying an id from a different fingerprint gets HTTP 404 — which the MCP spec requires a
+ * client to answer by re-initializing, i.e. re-fetching tools/list. A session grants nothing: every
+ * request is still authorized by its bearer token alone.
+ */
+export const MCP_SESSION_HEADER = "mcp-session-id";
 
 /**
  * Returned in `initialize`'s result as the MCP spec's optional top-level `instructions` field —
@@ -87,7 +103,9 @@ export const RpcCode = {
   /** Authenticated token lacks the scope (read/write) a tool requires. */
   ScopeDenied: -32002,
   /** Tool executed but the underlying operation failed (bad args, not found, etc.). */
-  ToolExecutionError: -32003
+  ToolExecutionError: -32003,
+  /** The request's Mcp-Session-Id was issued for a different tool set; re-initialize. */
+  SessionExpired: -32004
 } as const;
 
 /** A protocol-aware error the engine maps straight onto a JSON-RPC error response. */
