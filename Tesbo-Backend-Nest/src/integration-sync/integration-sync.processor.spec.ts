@@ -339,7 +339,7 @@ describe.each<SyncProvider>(["jira", "linear"])(
   }
 );
 
-describe("IntegrationSyncProcessor#process — the run records a readable Linear name, Jira keeps its key", () => {
+describe("IntegrationSyncProcessor#process — the run records the mapped project name, not just its key", () => {
   // A Linear Project mapping stores its opaque slugId in the key slot (V95); the Requirements sync
   // panel displayed that ("4081f3c6e1df") instead of the project's name.
   function emptyRun(provider: SyncProvider, mapping: { remote_key: string; remote_name: string }) {
@@ -372,13 +372,32 @@ describe("IntegrationSyncProcessor#process — the run records a readable Linear
     expect(runs.finishRun).toHaveBeenCalledWith("run-1", "No changes in Namm Orange HRMS Project since the last sync.");
   });
 
-  it("leaves a Jira run's name unset and keeps the project key in its note", async () => {
+  it("stores the Jira project name beside its key and names it in the 'no changes' note", async () => {
     const { processor, runs, db } = emptyRun("jira", { remote_key: "KAN", remote_name: "Kanban Board" });
     const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider: "jira", triggeredBy: null, since: "2026-09-01T00:00:00.000Z" };
 
     await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
 
-    expect(keyUpdateParams(db)).toEqual(["run-1", "KAN", null]);
-    expect(runs.finishRun).toHaveBeenCalledWith("run-1", "No changes in KAN since the last sync.");
+    expect(keyUpdateParams(db)).toEqual(["run-1", "KAN", "Kanban Board"]);
+    expect(runs.finishRun).toHaveBeenCalledWith("run-1", "No changes in Kanban Board since the last sync.");
+  });
+});
+
+describe("IntegrationSyncProcessor#process — a mapping with no name falls back to its key", () => {
+  it("records a null name and keeps the key in the note", async () => {
+    const dbQuery = jest.fn((sql: string) =>
+      Promise.resolve(sql.includes("FROM jira_project_mappings") ? { rows: [{ remote_id: "remote-1", remote_key: "KAN", remote_name: "" }] } : { rows: [] })
+    );
+    const { processor, runs, db } = makeProcessor({
+      db: { query: dbQuery },
+      client: { loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }), fetchJiraTickets: jest.fn().mockResolvedValue({ total: 0, truncated: false }) }
+    });
+    const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider: "jira", triggeredBy: null };
+
+    await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+
+    const update = (db.query as unknown as jest.Mock).mock.calls.find(([sql]) => String(sql).includes("SET remote_project_key"));
+    expect(update?.[1]).toEqual(["run-1", "KAN", null]);
+    expect(runs.finishRun).toHaveBeenCalledWith("run-1", "No tickets found in KAN.");
   });
 });

@@ -12,7 +12,8 @@ function mdInline(s: string): string {
     .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/_(.+?)_/g, "<em>$1</em>")
+    // Intraword underscores are not emphasis (as in CommonMark): user_id and order_id stay as written.
+    .replace(/(^|[^A-Za-z0-9_])_([^_]+?)_(?![A-Za-z0-9_])/g, "$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
 
@@ -25,6 +26,28 @@ function mdTable(lines: string[]): string {
   const thead = `<thead><tr>${cells(hdr).map(h => `<th>${mdInline(h)}</th>`).join("")}</tr></thead>`;
   const tbody = `<tbody>${rows.map(r => `<tr>${cells(r).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`).join("")}</tbody>`;
   return `<div class="zyra-md-table-wrap"><table class="zyra-md-table">${thead}${tbody}</table></div>`;
+}
+
+// The same Markdown flattened to one line of plain text, for clamped previews (task rows, Kanban
+// cards) where headings and lists can't lay out: syntax is dropped, link text is kept, lines join.
+// Returns text, not HTML — render it as a React text child, never via dangerouslySetInnerHTML.
+export function markdownToPlainText(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !/^---+$/.test(line) && !/^\|[\s\-:|]+\|$/.test(line))
+    .map((line) =>
+      line
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^[-*]\s+/, "")
+        .replace(/^\|(.*)\|$/, (_, cells: string) => cells.split("|").map((c) => c.trim()).join(" · "))
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
+        .replace(/`([^`]+)`/g, "$1")
+        .replace(/\*\*(.+?)\*\*/g, "$1")
+        .replace(/\*(.+?)\*/g, "$1")
+        .replace(/(^|[^A-Za-z0-9_])_([^_]+?)_(?![A-Za-z0-9_])/g, "$1$2"),
+    )
+    .join(" ");
 }
 
 export function renderMarkdown(text: string): string {

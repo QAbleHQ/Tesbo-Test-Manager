@@ -3746,6 +3746,106 @@ test.describe("zyra task-board generation — knowledge relevance (fake provider
       "regeneration after feedback must also retrieve a KB doc outside the 12-most-recent window, not just the initial generation",
     ).toContain("20 minutes of inactivity");
   });
+
+  test("ZYR-A-93 feedback's linearIssueKeys reach the regeneration prompt and are merged, de-duplicated, onto the task", async () => {
+    // Backs the task-detail Feedback form's "Attach Linear tickets" picker (ZYU-113..116): the page
+    // sends the picked keys as linearIssueKeys, and this is what the server must do with them.
+    await allocateFakeAiKey();
+    const org = literal(tenant!.organizationId);
+    const project = literal(tenant!.mainProjectId);
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const oldKey = `LFA-${suffix}-1`;
+    const newKey = `LFA-${suffix}-2`;
+    const newSummary = `Linear feedback ticket ${suffix} covers the refund window`;
+    try {
+      // linearSnapshot reads linear_tickets by key alone (no mapping filter), so the connection and
+      // ticket rows are all a sync would have needed to leave behind for the summary to be found.
+      exec(
+        `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+          `VALUES (${org}, 'linear', 'e2e-zyra-feedback', 'https://e2e-zyra-feedback.invalid', 'e2e', '', now() + interval '365 days') ` +
+          `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+      );
+      const connectionId = scalar(`SELECT id FROM integration_connections WHERE organization_id = ${org} AND provider = 'linear';`);
+      exec(
+        `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status) ` +
+          `VALUES (${project}, ${literal(connectionId)}, ${literal(newKey)}, ${literal(newKey)}, ${literal(newSummary)}, 'Story', 'Todo');`,
+      );
+      const userStory = `E2E linear feedback story ${suffix}`;
+      exec(
+        `INSERT INTO ai_generation_requests
+          (project_id, requested_by, provider, model, user_story, requested_count, generated_count, generated_payload,
+           agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys, activity_log)
+         VALUES (${project}, ${literal(tenant!.owner.userId)}, 'e2e-fake-gateway', 'gpt-4o-mini', ${literal(userStory)}, 1, 1,
+           ${literal(JSON.stringify([{ title: "Seeded draft", priority: "P2", preconditions: "", steps: [] }]))}::jsonb,
+           'Zyra the Test Generator', 'in_review', '', '', '[]'::jsonb, ${literal(JSON.stringify([oldKey]))}::jsonb, '[]'::jsonb);`,
+      );
+      const taskId = scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${project} AND user_story = ${literal(userStory)};`);
+
+      ai.queueReply({
+        drafts: [{
+          title: "Refund is refused after the refund window closes",
+          preconditions: "",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Request a refund after the window", expectedResult: "The refund is refused" }]),
+          testData: "",
+          expectedSummary: "The refund is refused.",
+          priority: "P1",
+          tags: ["zyra"],
+          sourceRefs: [],
+        }],
+      });
+
+      const res = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+        // A repeat of the new key and of the key the task already carries, plus an empty entry —
+        // the picker itself prevents repeats, but the server must not trust that.
+        data: { feedback: "Cover the refund window from the Linear ticket.", linearIssueKeys: [newKey, newKey, oldKey, ""] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `submitting feedback — ${await res.text()}`).toBe(201);
+      expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+
+      const storedKeys = JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(storedKeys, "existing key kept, new key appended once, empty entry dropped").toEqual([oldKey, newKey]);
+      const storedJira = JSON.parse(scalar(`SELECT jira_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(storedJira, "Linear keys must not leak into the Jira list").toEqual([]);
+
+      const task = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+      expect(task.linearIssueKeys).toEqual([oldKey, newKey]);
+      expect(
+        task.activities.some((a: { kind?: string; detail?: string }) => a.kind === "feedback" && String(a.detail).includes(`Linear tickets: ${newKey}`)),
+        "the feedback entry names the attached Linear ticket",
+      ).toBe(true);
+
+      const prompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+      expect(prompt, "the attached Linear ticket's summary must be in the regeneration prompt").toContain(newSummary);
+    } finally {
+      exec(`DELETE FROM linear_tickets WHERE project_id = ${project};`);
+      exec(`DELETE FROM integration_connections WHERE organization_id = ${org} AND provider = 'linear';`);
+    }
+  });
+
+  test("ZYR-A-94 feedback with a non-array linearIssueKeys is accepted and attaches nothing, rather than failing", async () => {
+    // Wrong-type payload: normalizeJsonArray treats anything but an array as empty. Checked with no
+    // AI key allocated so it stops at the allocation check — the point is it is a clean 4xx/2xx
+    // decision, never a 500 from calling .map on a string.
+    const project = literal(tenant!.mainProjectId);
+    const userStory = `E2E linear wrong-type story ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    exec(
+      `INSERT INTO ai_generation_requests
+        (project_id, requested_by, provider, model, user_story, requested_count, generated_count, generated_payload,
+         agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys, activity_log)
+       VALUES (${project}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ${literal(userStory)}, 0, 0, '[]'::jsonb,
+         'Zyra the Test Generator', 'in_review', '', '', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb);`,
+    );
+    const taskId = scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${project} AND user_story = ${literal(userStory)};`);
+    const res = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "x", linearIssueKeys: "LIN-1" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), await res.text()).toBe(400);
+    expect(await res.text()).toContain("Zyra is inactive");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    expect(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("[]");
+  });
 });
 
 /*
@@ -5037,5 +5137,326 @@ test.describe("zyra chat — knowledge-base gate and background send (fake provi
     const persisted = messages.find((m) => m.role === "assistant")!;
     expect(((terminal.payload as Record<string, unknown>).message as Record<string, unknown>).id).toBe(persisted.id);
     expect(persisted.content).toBe("Streamed answer.");
+  });
+});
+
+/*
+ * [Zyra] Knowledge Base exact-value/requirement grounding.
+ *
+ * The defect: the KB stated a concrete requirement ("sessions expire after 20 minutes of
+ * inactivity") and Zyra still wrote "verify the session times out". Three causes stacked, all in
+ * the keyword-search path that every workspace runs today (no workspace has an embeddings key, so
+ * semantic search never runs):
+ *   1. plainto_tsquery ANDed every word of the request — "Generate test cases for session timeout"
+ *      required a document to contain "generate", "test" and "cases" too, so it matched nothing;
+ *   2. a matched (or explicitly chosen) document contributed only its first 1500 characters, so a
+ *      requirement stated further down never reached the model;
+ *   3. a keyword-only match was graded confidence "none", and the drafting prompt's last line then
+ *      told the model to write "from general practice", overriding the exact-value rule.
+ *
+ * Every document below states its requirement PAST character 1500 (asserted), and every request is
+ * phrased the way a user types it, not built from the document's own words. Each test fails on the
+ * pre-fix code for cause 1 or 2 and asserts the cause-3 note is gone.
+ *
+ * What these can and cannot prove: the provider is fake (utils/fake-ai-server.ts), so they prove the
+ * exact value reaches the model, labelled and citable, with an instruction to use it verbatim — not
+ * that a real model then writes it. The drafts it returns are canned.
+ *
+ * The provider is a custom gateway — not embeddings-capable (see the relevance block's
+ * allocateFakeAiKey) — so only keyword retrieval runs: the production state this bug lives in.
+ */
+test.describe("zyra — exact KB requirement grounding (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-exact-values");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purge();
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+    ai?.reset();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT (V116) — before sessions.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_folders WHERE project_id = ${project} AND is_root = false;`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E exact-values fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  // Deliberately free of every term the requests below use, so no filler passage can outrank the
+  // requirement's own — and long enough that the requirement starts past character 1500.
+  const FILLER = "This handbook part collects team conventions and general onboarding context for new joiners. ".repeat(9);
+
+  /** A document whose one concrete requirement sits under its own heading, after ~1700 chars of filler. */
+  function longDoc(heading: string, requirement: string): string {
+    const text = ["# Overview", FILLER, "# Background", FILLER, `# ${heading}`, requirement, "# Change log", FILLER.slice(0, 300)].join("\n\n");
+    expect(text.indexOf(requirement), "the requirement must start past the old 1500-character cut").toBeGreaterThan(1500);
+    return text;
+  }
+
+  async function createDoc(title: string, contentText: string, folderId = rootFolderId()): Promise<string> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId, documentType: "general", title, contentText },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    return (await res.json()).id;
+  }
+
+  function draftReply(title: string): Record<string, unknown> {
+    return {
+      drafts: [{
+        title,
+        preconditions: "The feature is available.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Exercise the rule", expectedResult: "The rule holds" }]),
+        testData: "",
+        expectedSummary: "The rule holds.",
+        priority: "P1",
+        tags: ["zyra"],
+        // "KB 1" is the only KB label in these prompts; the backend resolves it against the sources it
+        // actually showed, so it round-trips to the seeded document's id only if that doc was KB 1.
+        sourceRefs: ["KB 1"],
+      }],
+    };
+  }
+
+  /** The drafting call — the one carrying zyraStaticSourcePrompt — as opposed to the router or memory calls. */
+  function draftingPrompt(): string {
+    const call = ai.requests.find((r) => JSON.stringify(r.messages).includes("Static project sources for prompt caching"));
+    expect(call, "the drafting call never reached the provider").toBeTruthy();
+    return JSON.stringify(call!.messages);
+  }
+
+  // JSON.stringify escapes quotes and newlines, so compare against the same encoding.
+  const encoded = (text: string) => JSON.stringify(text).slice(1, -1);
+
+  function expectGroundedOn(prompt: string, requirement: string): void {
+    expect(prompt, "the exact requirement must reach the drafting model").toContain(encoded(requirement));
+    // Cause 3: a keyword match is a real (loose) match, never "nothing found — write from general practice".
+    expect(prompt).not.toContain("were not matched to this request by search");
+    expect(prompt).not.toContain("did not clear the relevance bar");
+    expect(prompt, "the model must be told to use a stated value verbatim").toContain("use it exactly as stated");
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  /** Sends a generation turn in the background and waits for it, returning the assistant's reply row. */
+  async function generateInChat(message: string, draftTitle: string): Promise<Record<string, unknown>> {
+    const sessionId = await newSession(`E2E exact values ${Date.now()}`);
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply(draftReply(draftTitle));
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message, background: true }, failOnStatusCode: false });
+    expect(res.status(), `starting the turn — ${await res.text()}`).toBe(201);
+    const { userMessageId } = await res.json();
+    let messages: Array<Record<string, unknown>> = [];
+    await expect
+      .poll(
+        async () => {
+          const got = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+          messages = (await got.json()).messages;
+          return messages.find((m) => m.id === userMessageId)?.status;
+        },
+        { message: "the background turn never settled its user message", timeout: 60_000, intervals: [500, 1000, 2000] },
+      )
+      .not.toBe("processing");
+    const reply = messages.find((m) => m.role === "assistant");
+    expect(reply, "no assistant reply was written").toBeTruthy();
+    return reply!;
+  }
+
+  function citedIds(reply: Record<string, unknown>): string[] {
+    const rows = (reply.testcases as Array<Record<string, unknown>>) || [];
+    return rows.flatMap((row) => ((row.sourceRefs as Array<Record<string, unknown>>) || []).map((ref) => String(ref.id)));
+  }
+
+  /*
+   * One requirement type per row. Each request is phrased the way a user asks for it — with the
+   * request words ("generate", "test cases") that sank the old AND query — and none of them contains
+   * the value being checked, so the value can only have come from the knowledge base.
+   */
+  const REQUIREMENTS = [
+    { id: "ZYR-A-109", kind: "a duration", title: "Portal session policy", heading: "Session policy",
+      requirement: "An authenticated session expires after 20 minutes of inactivity and the user is returned to the sign-in page.",
+      request: "Generate test cases for session timeout" },
+    { id: "ZYR-A-110", kind: "a min/max character limit", title: "Profile field rules", heading: "Display name",
+      requirement: "Display names must be between 3 and 30 characters long; leading and trailing spaces are trimmed first.",
+      request: "Write test cases for display name validation" },
+    { id: "ZYR-A-111", kind: "a numeric range", title: "Order quantity limits", heading: "Quantity per order",
+      requirement: "A single order may contain between 1 and 99 units of any one product.",
+      request: "Create tests for order quantity limits" },
+    { id: "ZYR-A-112", kind: "a date constraint", title: "Delivery scheduling", heading: "Allowed delivery window",
+      requirement: "Delivery dates can be scheduled no earlier than 2 business days and no later than 60 days after the order date.",
+      request: "Generate test cases for delivery date scheduling" },
+    { id: "ZYR-A-113", kind: "allowed and disallowed values", title: "Avatar uploads", heading: "Accepted formats",
+      requirement: "Accepted avatar formats are PNG, JPEG and WebP; GIF and SVG uploads are rejected.",
+      request: "Write test cases for avatar upload formats" },
+    { id: "ZYR-A-114", kind: "an error code and message", title: "Coupon redemption", heading: "Expired coupons",
+      requirement: "When a coupon has expired the API responds 410 with error code CPN-EXPIRED and the message 'This coupon is no longer valid.'",
+      request: "Generate tests for expired coupon handling" },
+    { id: "ZYR-A-115", kind: "a lockout threshold", title: "Login lockout", heading: "Lockout rule",
+      requirement: "After 5 consecutive failed login attempts the account is locked for 15 minutes.",
+      request: "Write test cases for the failed login lockout" },
+  ];
+
+  for (const row of REQUIREMENTS) {
+    test(`${row.id} chat generation grounds on ${row.kind} stated deep in a KB document, from a naturally phrased request`, async () => {
+      await allocateFakeAiKey();
+      const docId = await createDoc(row.title, longDoc(row.heading, row.requirement));
+
+      const reply = await generateInChat(row.request, `${row.title} rule holds`);
+
+      expectGroundedOn(draftingPrompt(), row.requirement);
+      // The heading travels with the passage — it's what tells the model what a bare value is about.
+      expect(draftingPrompt()).toContain(encoded(`${row.heading}\n${row.requirement}`));
+      // Persisted state: the draft's "KB 1" citation resolved to this very document.
+      expect(citedIds(reply)).toContain(docId);
+    });
+  }
+
+  test("ZYR-A-116 only the relevant passage is sent: the document's unrelated opening is not, and the passage stays bounded", async () => {
+    await allocateFakeAiKey();
+    const requirement = REQUIREMENTS[0].requirement;
+    await createDoc("Portal session policy", longDoc("Session policy", requirement));
+
+    await generateInChat("Generate test cases for session timeout", "Session expires after inactivity");
+
+    const prompt = draftingPrompt();
+    expectGroundedOn(prompt, requirement);
+    // The opening that used to be all the model saw is gone — the budget went to the requirement.
+    expect(prompt).not.toContain("# Overview");
+    expect(prompt.split("This handbook part collects").length - 1, "filler passages crowded out the requirement").toBeLessThanOrEqual(1);
+  });
+
+  test("ZYR-A-117 an unrelated request does not pull in a document that only shares a common word", async () => {
+    await allocateFakeAiKey();
+    const requirement = REQUIREMENTS[0].requirement;
+    // Shares "page" with the request below ("…returned to the sign-in page") — one of three content
+    // terms, under the coverage floor. Matching on it would ground a checkout test in session policy.
+    await createDoc("Portal session policy", longDoc("Session policy", requirement));
+
+    await generateInChat("Generate test cases for the checkout page layout", "Checkout layout renders");
+
+    const prompt = draftingPrompt();
+    expect(prompt, "a one-shared-word document was treated as relevant").not.toContain(encoded(requirement));
+    // Nothing matched, so the recency fallback is shown — and honestly labelled as not matched.
+    expect(prompt).toContain("were not matched to this request by search");
+  });
+
+  /** Waits for a task-board generation to leave todo/in_progress. */
+  async function waitForTaskSettled(taskId: string): Promise<string> {
+    for (let i = 0; i < 80; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status ?? "";
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`) ?? "";
+  }
+
+  async function generateOnTaskBoard(data: Record<string, unknown>): Promise<void> {
+    ai.queueReply(draftReply("Session expires after inactivity"));
+    // rememberZyraTurn's summarization call, made after every successful generation.
+    ai.queueReply("- Generated a session-timeout test case.");
+    const res = await asOwner.post(url("/tasks"), { data, failOnStatusCode: false });
+    expect(res.status(), `creating the task — ${await res.text()}`).toBe(201);
+    expect(await waitForTaskSettled((await res.json()).generationRequestId), "generation must complete, not fail").toBe("in_review");
+  }
+
+  test("ZYR-A-118 task-board generation grounds on the requirement from a naturally phrased story (not one built from the doc's words)", async () => {
+    await allocateFakeAiKey();
+    const requirement = REQUIREMENTS[0].requirement;
+    await createDoc("Portal session policy", longDoc("Session policy", requirement));
+
+    // ZYR-A-91 had to hand-craft its story from only the words its document contained, because the
+    // old AND query dropped the document otherwise. This is the story a user actually writes.
+    await generateOnTaskBoard({ userStory: "Write test cases for session timeout" });
+
+    expectGroundedOn(draftingPrompt(), requirement);
+  });
+
+  test("ZYR-A-119 an explicitly selected KB document shows the passage the story is about, not just its opening", async () => {
+    await allocateFakeAiKey();
+    const requirement = REQUIREMENTS[0].requirement;
+    const docId = await createDoc("Portal session policy", longDoc("Session policy", requirement));
+
+    await generateOnTaskBoard({ userStory: "Write test cases for session timeout", knowledgeItemIds: [docId] });
+
+    const prompt = draftingPrompt();
+    expect(prompt, "the picked document's requirement must reach the model").toContain(encoded(requirement));
+    expect(prompt).toContain("Portal session policy");
+  });
+
+  test("ZYR-A-120 a document in a folder the message names shows its relevant passage, not just its opening", async () => {
+    await allocateFakeAiKey();
+    const requirement = REQUIREMENTS[0].requirement;
+    const folderName = `Aurora Policies ${Date.now() % 100000}`;
+    const folderRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/folders`, { data: { name: folderName }, failOnStatusCode: false });
+    expect(folderRes.status(), `creating the folder — ${await folderRes.text()}`).toBe(201);
+    await createDoc("Portal session policy", longDoc("Session policy", requirement), (await folderRes.json()).id);
+
+    await generateInChat(`Generate test cases for session timeout from the '${folderName}' folder`, "Session expires after inactivity");
+
+    // Folder items are listed first: KB 1 is the folder banner, KB 2 the folder's document. Checking
+    // KB 2 specifically isolates the folder path from keyword search, which would find the doc too.
+    const prompt = draftingPrompt();
+    expect(prompt).toContain(encoded(`KB 1: Knowledge base folder: ${folderName}`));
+    const kb2 = prompt.split("KB 2: ")[1]?.split("KB 3: ")[0] ?? "";
+    expect(kb2, "the folder's own copy of the document must carry the requirement").toContain(encoded(requirement));
   });
 });

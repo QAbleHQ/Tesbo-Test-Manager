@@ -15,7 +15,7 @@ import {
 import { Button, Field, FieldLabel, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import TaskQuickViewPanel, { JIRA_BADGE_CLASS, latestFailureDetail, normalizeTaskStatus as normalizeStatus, taskStatusLabel, taskStatusTone as tone } from "@/components/agents/TaskQuickViewPanel";
-import { renderMarkdown } from "@/lib/markdown";
+import { markdownToPlainText, renderMarkdown } from "@/lib/markdown";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
@@ -369,7 +369,7 @@ export default function ZyraTasksPage() {
                   {normalizeStatus(task.taskStatus) === "failed" ? (
                     <p className="mt-1 line-clamp-2 text-xs text-[var(--error-foreground)]">{latestFailureDetail(task.activities)}</p>
                   ) : (
-                    task.context && <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{task.context}</p>
+                    task.context?.trim() && <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{markdownToPlainText(task.context)}</p>
                   )}
                 </div>
                 <div><StatusChip tone={tone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip></div>
@@ -414,7 +414,7 @@ export default function ZyraTasksPage() {
                       {normalizeStatus(task.taskStatus) === "failed" && (
                         <p className="mt-1 line-clamp-2 text-xs text-[var(--error-foreground)]">{latestFailureDetail(task.activities)}</p>
                       )}
-                      {task.context && <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{task.context}</p>}
+                      {task.context?.trim() && <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{markdownToPlainText(task.context)}</p>}
                       {task.jiraIssueKeys.length > 0 && (
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {task.jiraIssueKeys.slice(0, 3).map((key) => (

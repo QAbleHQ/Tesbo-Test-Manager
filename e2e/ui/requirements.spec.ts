@@ -319,13 +319,13 @@ test.describe("requirements page — View in Knowledge base follows the active s
 });
 
 /*
- * The Linear sync panel's project label. A Linear Project mapping stores its opaque slugId in the
- * key slot (V95), so the panel used to label a completed sync "4081f3c6e1df" — now it shows the
- * mapped name (remote_project_name, V126) and keeps the slugId as the hover tooltip, falling back
- * to the key for runs recorded before the name was stored. The run is seeded directly: a real sync
- * would call Linear's live API (see api/integrations.spec.ts's file header).
+ * The sync panel's project label. It used to show the mapping's key — a Linear Project's opaque
+ * slugId ("4081f3c6e1df", V95) or a Jira key ("KAN") — and now shows the mapped name
+ * (remote_project_name, V126) with the key as the hover tooltip, falling back to the key for runs
+ * recorded before the name was stored. The run is seeded directly: a real sync would call the
+ * provider's live API (see api/integrations.spec.ts's file header).
  */
-test.describe("requirements page — Linear sync panel names the project", () => {
+test.describe("requirements page — sync panel names the project", () => {
   test.skip(!!skipReason, skipReason ?? "");
 
   let api: APIRequestContext;
@@ -336,11 +336,11 @@ test.describe("requirements page — Linear sync panel names the project", () =>
     await api?.dispose();
   });
 
-  function seedLinearSyncRun(projectId: string, key: string, name: string | null): void {
+  function seedSyncRun(provider: "jira" | "linear", projectId: string, key: string, name: string | null): void {
     exec(
       "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, " +
         "remote_project_key, remote_project_name, error, started_at, finished_at) VALUES (" +
-        `${literal(tenant!.organizationId)}, ${literal(projectId)}, 'linear', 'succeeded', 'done', 'manual', ` +
+        `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, 'succeeded', 'done', 'manual', ` +
         `${literal(key)}, ${name === null ? "NULL" : literal(name)}, ` +
         `${literal(`No changes in ${name ?? key} since the last sync.`)}, now(), now());`,
     );
@@ -353,7 +353,7 @@ test.describe("requirements page — Linear sync panel names the project", () =>
     const name = `E2E Orange HRMS ${uniqueSuffix()}`;
     try {
       seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
-      seedLinearSyncRun(project.id, slug, name);
+      seedSyncRun("linear", project.id, slug, name);
 
       await page.goto(`/projects/${project.id}/requirements`);
       const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
@@ -375,11 +375,51 @@ test.describe("requirements page — Linear sync panel names the project", () =>
     const slug = `e2e${uniqueSuffix()}`; // shaped like a Linear slugId: opaque, lowercase, no spaces
     try {
       seedLinearRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
-      seedLinearSyncRun(project.id, slug, null);
+      seedSyncRun("linear", project.id, slug, null);
 
       await page.goto(`/projects/${project.id}/requirements`);
       const panel = page.getByRole("status").filter({ hasText: "Linear sync complete" });
       await expect(panel.getByTestId("sync-run-remote")).toHaveText(slug);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  // The same defect on Jira: the panel labelled a sync "KAN" rather than the project's name.
+  test("REQ-U-16 a Jira sync shows the project name, with the key only as the tooltip", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Jira connection and a sync run");
+    const project = await createProject(api);
+    const key = `E2EK${uniqueSuffix()}`;
+    const name = `E2E QA Demo ${uniqueSuffix()}`;
+    try {
+      seedJiraRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedSyncRun("jira", project.id, key, name);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Jira sync complete" });
+      const chip = panel.getByTestId("sync-run-remote");
+      await expect(chip).toHaveText(name);
+      await expect(chip).toHaveAttribute("title", key);
+      await expect(panel).toContainText(`No changes in ${name} since the last sync.`);
+      await expect(panel.getByText(key, { exact: true })).toHaveCount(0);
+    } finally {
+      exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("REQ-U-17 a Jira sync recorded before names were stored falls back to its key", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a Jira connection and a sync run");
+    const project = await createProject(api);
+    const key = `E2EK${uniqueSuffix()}`;
+    try {
+      seedJiraRequirements(tenant!.organizationId, project.id, [`E2ESCR-${uniqueSuffix()}`]);
+      seedSyncRun("jira", project.id, key, null);
+
+      await page.goto(`/projects/${project.id}/requirements`);
+      const panel = page.getByRole("status").filter({ hasText: "Jira sync complete" });
+      await expect(panel.getByTestId("sync-run-remote")).toHaveText(key);
     } finally {
       exec(`DELETE FROM integration_sync_runs WHERE project_id = ${literal(project.id)};`);
       await deleteProjects(api, [project.id]);

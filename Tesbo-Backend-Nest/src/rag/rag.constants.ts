@@ -31,6 +31,29 @@ export const RAG_RRF_K = 60;
 export const RAG_MAX_SOURCES = 8;
 export const RAG_CONTEXT_CHAR_BUDGET = 6000;
 
+// How much of one whole document a keyword match (or an explicitly chosen document) contributes.
+// Same size the old `content.slice(0, 1500)` used — what changed is WHICH 1600 characters: the
+// passages that match the request (see RagRetrievalService.focusOnQuery), not the document's
+// opening. A requirement stated past the opening used to never reach the model at all.
+export const RAG_PASSAGE_CHARS = 1600;
+
+// Words that describe the REQUEST rather than the product ("generate test cases for session
+// timeout"). Keyword search matches on content terms, and these appear in almost no requirements
+// document — left in, they either sink an AND query or, in an OR query, match any doc that happens
+// to say "test". Stemmed through the same 'english' config as the query, so plurals/tenses go too.
+export const RAG_QUERY_BOILERPLATE = [
+  "generate", "write", "create", "draft", "produce", "suggest", "add", "make", "give", "prepare",
+  "please", "need", "want", "zyra", "test", "tests", "testcase", "testcases", "case", "cases",
+  "scenario", "scenarios", "knowledge", "base", "kb", "based", "using", "cover", "coverage"
+];
+
+// A keyword match must hit at least this share of the request's content terms (capped below), so
+// an OR query ranks related documents instead of admitting every doc that shares one common word.
+export const RAG_FTS_MIN_TERM_COVERAGE = 0.5;
+// ...but never more than this many terms: a pasted user story yields dozens of terms, and demanding
+// half of them from one document would reproduce the old all-terms AND query's empty result.
+export const RAG_FTS_MAX_REQUIRED_TERMS = 3;
+
 // Minimum cosine similarity (the raw ANN score, before RRF fusion) for a semantic match to count as
 // relevant at all, rather than merely the least-bad candidate in an otherwise weak pool. RRF's own
 // score (1/(k+rank+1)) is a rank position, not a relevance magnitude — without this floor, the 8th

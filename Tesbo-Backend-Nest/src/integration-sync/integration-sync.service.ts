@@ -37,7 +37,7 @@ export interface SyncRunView {
   status: string;
   stage: string;
   remoteProjectKey: string | null;
-  /** Linear only (V126) — the mapped Team/Project name; null for Jira and for pre-V126 runs. */
+  /** The mapped Jira project / Linear Team or Project name (V126); null for runs recorded before it was stored. */
   remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;
@@ -101,16 +101,16 @@ export class IntegrationSyncService {
     const cycleDate = triggerSource === "nightly" ? nightlyCycleDate() : null;
 
     try {
-      // $9 is the project id for Linear and NULL for Jira, so the name subquery only ever resolves
-      // for Linear — recorded here, not just by the processor, so a still-queued run already shows
-      // the name rather than a Linear Project's opaque slugId.
+      // The mapped project's name, recorded here, not just by the processor, so a still-queued run
+      // already shows "QA DEMO" rather than a Jira key or a Linear Project's opaque slugId.
+      const remoteNameSql = provider === "jira"
+        ? "SELECT jira_project_name FROM jira_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1"
+        : "SELECT linear_team_name FROM linear_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1";
       const inserted = await this.db.query<{ id: string }>(
         `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, remote_project_name, triggered_by, trigger_source, nightly_cycle_date, status, stage)
-         VALUES ($1, $2, $3, $4, $5,
-                 (SELECT linear_team_name FROM linear_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1),
-                 $6, $7, $8, 'queued', 'queued')
+         VALUES ($1, $2, $3, $4, $5, (${remoteNameSql}), $6, $7, $8, 'queued', 'queued')
          RETURNING id`,
-        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate, provider === "linear" ? projectId : null]
+        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate, projectId]
       );
       const runId = inserted.rows[0].id;
 
