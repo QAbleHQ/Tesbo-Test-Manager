@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
-import { emailDomain } from "../utils/env";
+import { emailDomain, env } from "../utils/env";
+import { expectWelcomeJobScheduled, readWelcomeJob, removeWelcomeJob } from "../utils/welcome-email-queue";
 import { clearOtpIpRateLimit, seedOtpCode } from "../utils/otp";
 import {
   dbControlAvailable,
@@ -41,6 +42,8 @@ test.describe("self-serve signup", () => {
   let anon: APIRequestContext;
   /** Emails this file created, cleaned up in afterAll whatever happened. */
   const created: string[] = [];
+  /** Users whose welcome-email job must be removed, so a run doesn't send mail three hours later. */
+  const welcomed: string[] = [];
 
   const skipReason = dbControlAvailable()
     ? null
@@ -52,6 +55,7 @@ test.describe("self-serve signup", () => {
   });
 
   test.afterAll(async () => {
+    for (const userId of welcomed) removeWelcomeJob(userId);
     if (!skipReason) {
       for (const email of created) purgeAccount(email);
       // Hand the allowance back: another spec file's rate-limit test should not fail because this one
@@ -292,6 +296,16 @@ test.describe("self-serve signup", () => {
     const body = await verified.json();
     expect(body.ok).toBe(true);
     expect(body.userId).toBeTruthy();
+    welcomed.push(body.userId);
+
+    // Completing signup schedules the welcome email: one delayed BullMQ job, due 3 hours after the
+    // account's created_at. Asserted here rather than in a test of its own because a separate test
+    // would spend another rate-limited signup/start (see BUDGET above). Only the local stack has a
+    // Redis container to read; against a deployed target the check is recorded as not run.
+    const welcomeJob = env.targetIsLocal ? expectWelcomeJobScheduled(body.userId) : null;
+    if (!welcomeJob) {
+      test.info().annotations.push({ type: "not-checked", description: "welcome-email job: no local Redis to inspect" });
+    }
 
     // The account exists, the pending row is consumed, and the response set a session cookie so the
     // user lands signed in rather than at a login form.
@@ -324,6 +338,12 @@ test.describe("self-serve signup", () => {
     const replay = await verify({ email, code: "444444" });
     expect(replay.status(), "the OTP code was accepted twice").toBeGreaterThanOrEqual(400);
     expect(userCount(email)).toBe(1);
+    // ...nor a second welcome email: the one job is untouched, not re-added with a fresh timestamp.
+    if (welcomeJob) {
+      const after = readWelcomeJob(body.userId);
+      expect(after?.timestamp, "the replayed verify re-scheduled the welcome email").toBe(welcomeJob.timestamp);
+      expect(after?.firesAt).toBe(welcomeJob.firesAt);
+    }
 
     // And the password that was set actually works, which is the only proof it survived the pending
     // row intact.

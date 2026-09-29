@@ -26,6 +26,7 @@ import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
 import { ZyraProgressService } from "./zyra-progress.service";
+import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
 
 const TESTCASE_EXPORT_BASE_HEADERS = [
   "externalId",
@@ -106,7 +107,8 @@ export class LegacyController {
   constructor(
     private readonly legacy: LegacyService,
     private readonly customFields: CustomFieldsService,
-    private readonly zyraProgress: ZyraProgressService
+    private readonly zyraProgress: ZyraProgressService,
+    private readonly welcomeEmail: WelcomeEmailService
   ) {}
 
   // Kill switch for the whole SSE progress-narration side-channel (see zyra-progress.service.ts's
@@ -368,8 +370,11 @@ export class LegacyController {
   }
 
   @Post("/api/invitations/:token/register")
-  registerFromInvitation(@Param("token") token: string, @Body() body: Record<string, any>) {
-    return this.legacy.registerFromInvitation(token, body);
+  async registerFromInvitation(@Param("token") token: string, @Body() body: Record<string, any>) {
+    const result = await this.legacy.registerFromInvitation(token, body);
+    // Scheduled here rather than inside LegacyService, whose ~25 unit specs construct it positionally.
+    await this.welcomeEmail.schedule(result.userId);
+    return result;
   }
 
   @Get("/api/projects")

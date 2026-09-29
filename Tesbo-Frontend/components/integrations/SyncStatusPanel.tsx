@@ -143,9 +143,9 @@ export function SyncStatusPanel({ run, label, className = "" }: { run: SyncRun |
           <span className="text-sm font-semibold" style={{ color: tone.text }}>
             {headline}
           </span>
-          {/* A Linear Project's key is an opaque slugId, so Linear shows the mapped name and keeps the
-              key as the tooltip. Runs recorded before the name was stored fall back to the key. */}
-          {run.provider === "linear" && run.remoteProjectName ? (
+          {/* Shows the mapped project name and keeps the key (a Jira key, or a Linear Project's opaque
+              slugId) as the tooltip. Runs recorded before the name was stored fall back to the key. */}
+          {run.remoteProjectName ? (
             <span
               data-testid="sync-run-remote"
               title={run.remoteProjectKey || undefined}

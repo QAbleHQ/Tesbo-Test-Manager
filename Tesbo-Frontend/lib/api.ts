@@ -3182,7 +3182,7 @@ export interface SyncRun {
   status: SyncRunStatus;
   stage: SyncRunStage;
   remoteProjectKey: string | null;
-  /** Linear only — the mapped Team/Project name. Null for Jira and for runs recorded before it existed. */
+  /** The mapped Jira project / Linear Team or Project name. Null for runs recorded before it was stored. */
   remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;

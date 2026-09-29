@@ -154,9 +154,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
         await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} project is mapped to this project yet.`);
         return;
       }
-      // A Linear Project's remote_key is its opaque slugId (V95), so Linear runs record and show the
-      // mapped name (V126). Jira keeps its human-readable key and records no name.
-      const remoteName = provider === "linear" && remote.remote_name ? remote.remote_name : null;
+      // Runs record and show the mapped project name (V126), not the key — a Jira key ("KAN") is
+      // terse and a Linear Project's is an opaque slugId (V95). The key stays as the fallback.
+      const remoteName = remote.remote_name || null;
       const remoteLabel = remoteName || remote.remote_key;
       await this.db.query(
         "UPDATE integration_sync_runs SET remote_project_key = $2, remote_project_name = $3, updated_at = now() WHERE id = $1",

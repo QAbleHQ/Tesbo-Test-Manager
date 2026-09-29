@@ -70,6 +70,8 @@ services:
       # emails an OTP and only replays other emails through a Postmark SANDBOX server (verified with
       # Postmark, not assumed), so a local or CI stack cannot bounce mail off invented addresses.
       EMAIL_DELIVERY_MODE: ${EMAIL_DELIVERY_MODE:-log}
+      # Optional CC on the welcome email (see Tesbo-Backend-Nest/.env.example). No default on purpose.
+      WELCOME_EMAIL_CC: ${WELCOME_EMAIL_CC:-}
       # Platform OAuth apps. Set these and workspace owners connect with one click — no
       # per-workspace client id/secret entry.
       JIRA_CLIENT_ID: ${JIRA_CLIENT_ID:-}
