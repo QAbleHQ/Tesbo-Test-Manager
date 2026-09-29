@@ -1861,6 +1861,11 @@ export class LegacyController {
     return this.legacy.jiraTickets(projectId, req.userId, query);
   }
 
+  @Get("/api/projects/:projectId/jira/tickets/:issueKey")
+  jiraTicketByKey(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("issueKey") issueKey: string) {
+    return this.legacy.jiraTicketByKey(projectId, req.userId, issueKey);
+  }
+
   @Post("/api/projects/:projectId/jira/comment")
   jiraComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
     return this.legacy.jiraComment(projectId, req.userId, body);

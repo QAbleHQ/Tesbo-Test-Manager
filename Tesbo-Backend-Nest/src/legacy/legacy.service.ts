@@ -10475,6 +10475,30 @@ export class LegacyService implements OnModuleInit {
     return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
   }
 
+  // One synced ticket by its exact key — what a Zyra "jira_ticket" citation opens. Deliberately NOT
+  // scoped to the currently enabled mapping the way jiraTickets (the Requirements list) is: Zyra
+  // reads jira_tickets by project_id alone (relevantJiraSnapshot/jiraSnapshot), and a disconnect or
+  // re-map keeps the old mapping's rows, so a ticket Zyra read and cited can belong to a mapping that
+  // has since been switched off. Resolving the citation through the list endpoint therefore reported
+  // a ticket Zyra had just read as "could not be found". Same scope as the reader, so anything Zyra
+  // could cite, this can open. Two rows can share a key only across two Jira connections in one
+  // project; the currently mapped one wins, then the most recently synced.
+  async jiraTicketByKey(projectId: string, userId: string | null | undefined, issueKey: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const key = String(issueKey || "").trim();
+    if (!key) throw new BadRequestException({ error: "Jira issue key is required." });
+    const res = await this.db.query(
+      `SELECT * FROM jira_tickets
+       WHERE project_id = $1 AND jira_issue_key = $2
+       ORDER BY CASE WHEN mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1) THEN 0 ELSE 1 END,
+                synced_at DESC NULLS LAST
+       LIMIT 1`,
+      [projectId, key]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Jira ticket not found" });
+    return toCamel(res.rows[0]);
+  }
+
   async jiraComment(projectId: string, userId: string | null | undefined, body: Body) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const connection = await this.getJiraConnection(projectId, true);

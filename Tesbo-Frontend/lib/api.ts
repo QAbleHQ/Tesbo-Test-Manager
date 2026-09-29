@@ -3298,6 +3298,12 @@ export async function listJiraTickets(
   );
 }
 
+// One synced ticket by exact key, scoped to the project rather than to its currently enabled Jira
+// mapping (unlike listJiraTickets) — the scope Zyra reads tickets in, so a cited ticket always opens.
+export async function getJiraTicket(projectId: string, issueKey: string): Promise<JiraTicket> {
+  return api<JiraTicket>(`/api/projects/${projectId}/jira/tickets/${encodeURIComponent(issueKey)}`);
+}
+
 export interface IssueSearchResult {
   provider: "JIRA" | "LINEAR";
   key: string;
