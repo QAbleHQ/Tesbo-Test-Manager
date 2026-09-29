@@ -943,6 +943,66 @@ describe("LegacyService#linearTeams — merged Team + Project picker", () => {
   });
 });
 
+/*
+ * linearSearchIssues backs the "Select Linear ticket" picker. A mapping can hold a Linear Project
+ * id (entity_type = 'project'), and passing that id to `team(id:)` is what Linear answers with
+ * "Entity not found: Team" — the picker then showed that raw GraphQL error and no issues. The
+ * search has to pick the root field per mapping, as the sync client already does.
+ */
+function searchRoutes(mappings: Array<{ linear_team_id: string; entity_type?: string | null }>): Route[] {
+  return withProjectAccess([
+    { match: "FROM projects WHERE id", rows: [{ organization_id: "org-1" }] },
+    { match: "FROM integration_connections WHERE organization_id", rows: [{ id: "conn-1", access_token: encryptSecret("at"), auth_method: "oauth" }] },
+    { match: "FROM linear_project_mappings WHERE project_id", rows: mappings }
+  ]);
+}
+
+/** Answers like Linear does: an id only resolves under the root field of the kind it really is. */
+function mockLinearEntities(kinds: Record<string, "team" | "project">) {
+  return jest.spyOn(global, "fetch").mockImplementation(async (_url, init) => {
+    const { query, variables } = JSON.parse(String((init as RequestInit)?.body ?? "{}"));
+    const id = String(variables?.id ?? variables?.teamId ?? "");
+    const asked = /\bproject\(id:/.test(String(query)) ? "project" : "team";
+    if (kinds[id] !== asked) {
+      const label = asked === "project" ? "Project" : "Team";
+      return { ok: true, json: async () => ({ errors: [{ message: `Entity not found: ${label}`, path: [asked] }] }) } as unknown as Response;
+    }
+    const nodes = [{ id: `${id}-issue`, identifier: `${id.toUpperCase()}-1`, title: `Issue in ${id}`, url: `https://linear.app/x/${id}`, state: { name: "Todo" } }];
+    return { ok: true, json: async () => ({ data: { entity: { issues: { nodes } } } }) } as unknown as Response;
+  });
+}
+
+describe("LegacyService#linearSearchIssues — team vs project mappings", () => {
+  it("searches a Project mapping through project(id:), not team(id:)", async () => {
+    mockLinearEntities({ "proj-1": "project" });
+    const svc = makeLegacy(makeDb(searchRoutes([{ linear_team_id: "proj-1", entity_type: "project" }])).db);
+    const result = await svc.linearSearchIssues(PROJECT_ID, CALLER_ID, { search: "" });
+    expect(result.list).toEqual([{ provider: "LINEAR", key: "PROJ-1-1", summary: "Issue in proj-1", status: "Todo", url: "https://linear.app/x/proj-1" }]);
+  });
+
+  it("still searches a Team mapping through team(id:)", async () => {
+    mockLinearEntities({ "team-1": "team" });
+    const svc = makeLegacy(makeDb(searchRoutes([{ linear_team_id: "team-1", entity_type: "team" }])).db);
+    const result = await svc.linearSearchIssues(PROJECT_ID, CALLER_ID, { search: "x" });
+    expect(result.list.map((issue) => issue.key)).toEqual(["TEAM-1-1"]);
+  });
+
+  it("treats a mapping with no entity_type (pre-V95 row) as a Team", async () => {
+    mockLinearEntities({ "team-1": "team" });
+    const svc = makeLegacy(makeDb(searchRoutes([{ linear_team_id: "team-1", entity_type: null }])).db);
+    const result = await svc.linearSearchIssues(PROJECT_ID, CALLER_ID, {});
+    expect(result.list.map((issue) => issue.key)).toEqual(["TEAM-1-1"]);
+  });
+
+  it("forwards the search text as a title filter", async () => {
+    const fetchSpy = mockLinearEntities({ "proj-1": "project" });
+    const svc = makeLegacy(makeDb(searchRoutes([{ linear_team_id: "proj-1", entity_type: "project" }])).db);
+    await svc.linearSearchIssues(PROJECT_ID, CALLER_ID, { search: "  login  " });
+    const sent = JSON.parse(String((fetchSpy.mock.calls[0][1] as RequestInit).body));
+    expect(sent.variables.filter).toEqual({ title: { containsIgnoreCase: "login" } });
+  });
+});
+
 describe("LegacyService#connectLinearTeams — entityType (team vs project)", () => {
   it("accepts entityType 'project' and writes it", async () => {
     const { db, calls } = makeDb(withProjectAccess([

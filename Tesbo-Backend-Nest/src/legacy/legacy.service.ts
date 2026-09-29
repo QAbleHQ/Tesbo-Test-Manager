@@ -11207,28 +11207,33 @@ export class LegacyService implements OnModuleInit {
     const connection = await this.getIntegrationConnection(organizationId, "linear", true);
     if (!connection) throw new NotFoundException({ error: "Linear is not connected." });
     const mappings = await this.db.query(
-      "SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND integration_connection_id = $2 AND enabled = true",
+      "SELECT linear_team_id, entity_type FROM linear_project_mappings WHERE project_id = $1 AND integration_connection_id = $2 AND enabled = true",
       [projectId, connection.id]
     );
-    const teamIds = mappings.rows.map((row) => String(row.linear_team_id)).filter(Boolean);
-    if (!teamIds.length) return { list: [] };
+    // linear_team_id holds a Project id when entity_type = 'project' (V95), and Linear only resolves
+    // an id under the root field of its own kind — a Project id sent to team(id:) is "Entity not
+    // found: Team". Same per-mapping choice as IntegrationSyncClient.fetchLinearTickets.
+    const entities = mappings.rows
+      .map((row) => ({ id: String(row.linear_team_id || ""), rootField: row.entity_type === "project" ? "project" : "team" }))
+      .filter((entity) => entity.id);
+    if (!entities.length) return { list: [] };
 
     const search = String(query.search || query.q || "").trim();
     const linearAuthHeader = this.linearAuthHeader(connection);
     const results: Body[] = [];
-    for (const teamId of teamIds) {
+    for (const entity of entities) {
       const data = await this.linearGraphQL<Body>(
         linearAuthHeader,
-        `query TeamIssues($teamId: String!, $filter: IssueFilter) {
-           team(id: $teamId) {
+        `query EntityIssues($id: String!, $filter: IssueFilter) {
+           entity: ${entity.rootField}(id: $id) {
              issues(first: 20, orderBy: updatedAt, filter: $filter) {
                nodes { id identifier title url state { name } }
              }
            }
          }`,
-        { teamId, filter: search ? { title: { containsIgnoreCase: search } } : null }
+        { id: entity.id, filter: search ? { title: { containsIgnoreCase: search } } : null }
       );
-      for (const issue of normalizeJsonArray(data?.team?.issues?.nodes)) {
+      for (const issue of normalizeJsonArray(data?.entity?.issues?.nodes)) {
         results.push({
           provider: "LINEAR",
           key: String(issue.identifier || ""),
