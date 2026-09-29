@@ -8,14 +8,17 @@ import {
   createSuite,
   deleteZyraTaskDraft,
   getJiraStatus,
+  getLinearStatus,
   getZyraTask,
   listJiraTickets,
+  listLinearTickets,
   listSuites,
   listZyraTaskTicketComments,
   retryZyraTicketComment,
   saveZyraTask,
   sendZyraFeedback,
   type JiraTicket,
+  type LinearTicket,
   type SuiteNode,
   type ZyraTask,
   type ZyraTicketComment,
@@ -131,12 +134,14 @@ export default function ZyraTaskDetailPage() {
   const [task, setTask] = useState<ZyraTask | null>(null);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
+  const [linearTickets, setLinearTickets] = useState<LinearTicket[]>([]);
   const [ticketComments, setTicketComments] = useState<ZyraTicketComment[]>([]);
   const [retryingCommentId, setRetryingCommentId] = useState<string | null>(null);
   const [selectedDrafts, setSelectedDrafts] = useState<number[]>([]);
   const [feedback, setFeedback] = useState("");
   const [referenceNote, setReferenceNote] = useState("");
   const [selectedJiraKeys, setSelectedJiraKeys] = useState<string[]>([]);
+  const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
   const [saveMode, setSaveMode] = useState<SaveMode>("existing");
@@ -151,10 +156,11 @@ export default function ZyraTaskDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [taskData, suiteList, jiraStatus, comments] = await Promise.all([
+      const [taskData, suiteList, jiraStatus, linearStatus, comments] = await Promise.all([
         getZyraTask(projectId, taskId),
         listSuites(projectId).catch(() => []),
         getJiraStatus(projectId).catch(() => ({ connected: false })),
+        getLinearStatus(projectId).catch(() => ({ connected: false })),
         listZyraTaskTicketComments(projectId, taskId).catch(() => [] as ZyraTicketComment[]),
       ]);
       setTask(taskData);
@@ -166,6 +172,12 @@ export default function ZyraTaskDetailPage() {
         setJiraTickets(tickets.list || []);
       } else {
         setJiraTickets([]);
+      }
+      if (linearStatus.connected) {
+        const tickets = await listLinearTickets(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
+        setLinearTickets(tickets.list || []);
+      } else {
+        setLinearTickets([]);
       }
       setError(null);
     } catch (err) {
@@ -268,11 +280,13 @@ export default function ZyraTaskDetailPage() {
         feedback: feedback.trim(),
         referenceNote: referenceNote.trim() || undefined,
         jiraIssueKeys: selectedJiraKeys,
+        linearIssueKeys: selectedLinearKeys,
       });
       setTask(result.task);
       setFeedback("");
       setReferenceNote("");
       setSelectedJiraKeys([]);
+      setSelectedLinearKeys([]);
       setMessage("Feedback sent. Zyra moved the task to Todo and is regenerating the testcase drafts now — this can take a minute.");
       await loadData();
     } catch (err) {
@@ -443,9 +457,9 @@ export default function ZyraTaskDetailPage() {
             <p className="mt-2 text-sm text-[var(--muted)]">
               {task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"} generated, {task.savedCount} saved, {task.tokenUsage.total} tokens, updated {new Date(task.updatedAt).toLocaleString()}
             </p>
-            {task.jiraIssueKeys.length > 0 && (
+            {(task.jiraIssueKeys.length > 0 || (task.linearIssueKeys ?? []).length > 0) && (
               <div className="mt-3 flex flex-wrap gap-2">
-                {task.jiraIssueKeys.map((key) => (
+                {[...task.jiraIssueKeys, ...(task.linearIssueKeys ?? [])].map((key) => (
                   <span key={key} className="rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent-light)]">
                     {key}
                   </span>
@@ -647,7 +661,7 @@ export default function ZyraTaskDetailPage() {
             </Field>
             <Field>
               <FieldLabel>Docs or ticket references for knowledge base</FieldLabel>
-              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder="Mention docs, Jira tickets, release notes, or policy links Zyra should consider." />
+              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder="Mention docs, Jira or Linear tickets, release notes, or policy links Zyra should consider." />
             </Field>
             {jiraTickets.length > 0 && (
               <Field>
@@ -671,6 +685,37 @@ export default function ZyraTaskDetailPage() {
                         type="button"
                         key={key}
                         onClick={() => setSelectedJiraKeys((prev) => prev.filter((item) => item !== key))}
+                        className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
+                      >
+                        {key} x
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </Field>
+            )}
+            {linearTickets.length > 0 && (
+              <Field>
+                <FieldLabel>Attach Linear tickets</FieldLabel>
+                <Select
+                  value=""
+                  onChange={(event) => {
+                    const key = event.target.value;
+                    if (key && !selectedLinearKeys.includes(key)) setSelectedLinearKeys((prev) => [...prev, key]);
+                  }}
+                >
+                  <option value="">Select ticket...</option>
+                  {linearTickets.map((ticket) => (
+                    <option key={ticket.id} value={ticket.linearIssueKey}>{ticket.linearIssueKey} - {ticket.summary}</option>
+                  ))}
+                </Select>
+                {selectedLinearKeys.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {selectedLinearKeys.map((key) => (
+                      <button
+                        type="button"
+                        key={key}
+                        onClick={() => setSelectedLinearKeys((prev) => prev.filter((item) => item !== key))}
                         className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
                       >
                         {key} x

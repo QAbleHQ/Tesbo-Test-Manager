@@ -101,8 +101,12 @@ test.describe("zyra / agents (UI)", () => {
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
     exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM jira_project_mappings WHERE project_id IN (${projects});`);
+    // The task-detail Feedback pickers (ZYU-113..116) seed a Linear connection, mapping and tickets too.
+    exec(`DELETE FROM linear_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM linear_project_mappings WHERE project_id IN (${projects});`);
     exec(
-      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider IN ('jira', 'linear');`,
     );
   }
 
@@ -1822,6 +1826,246 @@ test.describe("zyra / agents (UI)", () => {
     await donePage.getByRole("button", { name: "Feedback (0)" }).click();
     await expect(donePage.getByText("Feedback isn't available once a task is closed.")).toBeVisible();
     await expect(donePage.getByRole("button", { name: "Send feedback" })).toBeDisabled();
+  });
+
+  // ─── Feedback tab: attaching Jira and Linear tickets (fix for "Feedback form does not show a
+  // Linear ticket dropdown") ──────────────────────────────────────────────────────────────────
+
+  /*
+   * The form used to load and offer Jira tickets only; Linear tickets could not be attached at all,
+   * though POST .../feedback has always accepted linearIssueKeys (api/zyra.spec.ts ZYR-A-93).
+   *
+   * Both ticket lists are scoped to the project's currently ENABLED mapping (mapped_remote_id —
+   * see api/integrations.spec.ts currentOrAutoLinearMapping), so a ticket row alone never reaches
+   * the picker: each seed below writes connection + enabled mapping + tickets carrying its id.
+   */
+  function seedFeedbackTickets(provider: "jira" | "linear", tickets: Array<{ key: string; summary: string }>): void {
+    const t = tenant!;
+    const org = literal(t.organizationId);
+    const project = literal(t.mainProjectId);
+    exec(
+      `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+        `VALUES (${org}, ${literal(provider)}, 'e2e-zyra-ui-feedback', 'https://e2e-zyra-ui-feedback.invalid', 'e2e', '', now() + interval '365 days') ` +
+        `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+    );
+    const connectionId = literal(
+      scalar(`SELECT id FROM integration_connections WHERE organization_id = ${org} AND provider = ${literal(provider)};`),
+    );
+    const remoteId = literal(`${provider}-feedback-${t.mainProjectId}`);
+    if (provider === "jira") {
+      exec(
+        "INSERT INTO jira_project_mappings (project_id, jira_connection_id, jira_project_id, jira_project_key, jira_project_name, enabled) " +
+          `VALUES (${project}, ${connectionId}, ${remoteId}, 'ZFB', 'E2E feedback mapping', true) ON CONFLICT DO NOTHING;`,
+      );
+    } else {
+      exec(
+        "INSERT INTO linear_project_mappings (project_id, integration_connection_id, linear_team_id, linear_team_key, linear_team_name, entity_type, enabled) " +
+          `VALUES (${project}, ${connectionId}, ${remoteId}, 'ZFB', 'E2E feedback mapping', 'team', true) ON CONFLICT DO NOTHING;`,
+      );
+    }
+    for (const ticket of tickets) {
+      exec(
+        provider === "jira"
+          ? "INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status, mapped_remote_id) " +
+              `VALUES (${project}, ${connectionId}, ${literal(ticket.key)}, ${literal(ticket.key)}, ${literal(ticket.summary)}, 'Story', 'Open', ${remoteId});`
+          : "INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status, mapped_remote_id) " +
+              `VALUES (${project}, ${connectionId}, ${literal(ticket.key)}, ${literal(ticket.key)}, ${literal(ticket.summary)}, 'Story', 'Todo', ${remoteId});`,
+      );
+    }
+  }
+
+  /** The picker's native <select>. FieldLabel has no htmlFor, so it is reached through its Field
+   *  (div.space-y-2); `.last()` is the innermost such div, as outer containers also match. */
+  function ticketPicker(page: Page, label: "Attach Jira tickets" | "Attach Linear tickets"): Locator {
+    return page
+      .locator("div.space-y-2")
+      .filter({ has: page.locator("label", { hasText: new RegExp(`^${label}$`) }) })
+      .last()
+      .locator("select");
+  }
+
+  async function openFeedbackTab(browser: Browser, taskId: string): Promise<Page> {
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: /^Feedback \(/ }).click();
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();
+    return page;
+  }
+
+  /** A fake-provider key (utils/fake-ai-server.ts), so the regeneration Send feedback kicks off
+   *  completes for real. A custom gateway provider name keeps embeddings off (see api/zyra.spec.ts
+   *  ZYR-A-91's allocateFakeAiKey comment). */
+  async function allocateFakeProviderKey(ai: FakeAiServer): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ui feedback fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function waitForTaskSettled(taskId: string): Promise<string> {
+    for (let i = 0; i < 80; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+  }
+
+  function isFeedbackRequest(url: string, method: string): boolean {
+    return method === "POST" && /\/agents\/zyra\/tasks\/[^/]+\/feedback$/.test(new URL(url).pathname);
+  }
+
+  test("ZYU-113 with Linear connected, the Feedback tab offers a Linear ticket picker, and the picked ticket reaches Zyra and the task", async ({
+    browser,
+  }) => {
+    // The regression test for the report: before the fix there is no "Attach Linear tickets" field
+    // at all, so this fails at the first picker assertion.
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const linearKey = `ZLN-${suffix}`;
+    const linearSummary = `Linear refund window rule ${suffix}`;
+    seedFeedbackTickets("linear", [{ key: linearKey, summary: linearSummary }, { key: `ZLN-${suffix}-B`, summary: "Another Linear ticket" }]);
+    const ai = await startFakeAiServer();
+    try {
+      await allocateFakeProviderKey(ai);
+      const taskId = seedTask();
+      const page = await openFeedbackTab(browser, taskId);
+
+      const picker = ticketPicker(page, "Attach Linear tickets");
+      await expect(picker).toBeVisible();
+      await expect(picker.locator("option", { hasText: `${linearKey} - ${linearSummary}` })).toHaveCount(1);
+      // Linear is the only provider connected — no empty Jira field alongside it.
+      await expect(page.getByText("Attach Jira tickets", { exact: true })).toHaveCount(0);
+
+      await picker.selectOption(linearKey);
+      const chip = page.getByRole("button", { name: `${linearKey} x` });
+      await expect(chip).toBeVisible();
+      // The select resets to its placeholder after each pick; picking the same key again must not add a second chip.
+      await expect(picker).toHaveValue("");
+      await picker.selectOption(linearKey);
+      await expect(chip).toHaveCount(1);
+
+      ai.queueReply({
+        drafts: [{
+          title: "Refund refused after the refund window",
+          preconditions: "",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Request a late refund", expectedResult: "It is refused" }]),
+          testData: "",
+          expectedSummary: "It is refused.",
+          priority: "P1",
+          tags: ["zyra"],
+          sourceRefs: [],
+        }],
+      });
+      await page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.").fill("Cover the Linear refund rule");
+      const sent = page.waitForRequest((req) => isFeedbackRequest(req.url(), req.method()));
+      await page.getByRole("button", { name: "Send feedback" }).click();
+      expect((await sent).postDataJSON()).toMatchObject({ linearIssueKeys: [linearKey], jiraIssueKeys: [] });
+      await expect(page.getByText(/Feedback sent\./)).toBeVisible();
+      // Sending clears the selection.
+      await expect(page.getByRole("button", { name: `${linearKey} x` })).toHaveCount(0);
+
+      expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+      expect(JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([linearKey]);
+      expect(JSON.stringify(ai.requests[0]?.messages ?? []), "the Linear ticket's summary must reach the model").toContain(linearSummary);
+
+      // The task header now shows the attached Linear key, as it always did for Jira keys.
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "Zyra task", level: 1 })).toBeVisible();
+      await expect(page.locator("span", { hasText: new RegExp(`^${linearKey}$`) })).toBeVisible();
+    } finally {
+      await ai.close();
+    }
+  });
+
+  test("ZYU-114 with Jira and Linear both connected, each picker lists only its own tickets and sends them in its own list", async ({ browser }) => {
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const jiraKey = `ZJI-${suffix}`;
+    const linearKey = `ZLN-${suffix}`;
+    const linearKey2 = `ZLN-${suffix}-B`;
+    seedFeedbackTickets("jira", [{ key: jiraKey, summary: "Seeded Jira feedback ticket" }]);
+    seedFeedbackTickets("linear", [{ key: linearKey, summary: "Seeded Linear feedback ticket" }, { key: linearKey2, summary: "Second Linear ticket" }]);
+    const ai = await startFakeAiServer();
+    try {
+      await allocateFakeProviderKey(ai);
+      const taskId = seedTask();
+      const page = await openFeedbackTab(browser, taskId);
+
+      const jiraPicker = ticketPicker(page, "Attach Jira tickets");
+      const linearPicker = ticketPicker(page, "Attach Linear tickets");
+      await expect(jiraPicker).toBeVisible();
+      await expect(linearPicker).toBeVisible();
+      await expect(jiraPicker.locator("option", { hasText: linearKey })).toHaveCount(0);
+      await expect(linearPicker.locator("option", { hasText: jiraKey })).toHaveCount(0);
+
+      await jiraPicker.selectOption(jiraKey);
+      await linearPicker.selectOption(linearKey);
+      await linearPicker.selectOption(linearKey2);
+      // Clicking a chip removes just that key.
+      await page.getByRole("button", { name: `${linearKey2} x` }).click();
+      await expect(page.getByRole("button", { name: `${linearKey2} x` })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: `${linearKey} x` })).toBeVisible();
+      await expect(page.getByRole("button", { name: `${jiraKey} x` })).toBeVisible();
+
+      await page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.").fill("Use both tickets");
+      const sent = page.waitForRequest((req) => isFeedbackRequest(req.url(), req.method()));
+      await page.getByRole("button", { name: "Send feedback" }).click();
+      expect((await sent).postDataJSON()).toMatchObject({ jiraIssueKeys: [jiraKey], linearIssueKeys: [linearKey] });
+      await expect(page.getByText(/Feedback sent\./)).toBeVisible();
+
+      expect(await waitForTaskSettled(taskId)).toBe("in_review");
+      expect(JSON.parse(scalar(`SELECT jira_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([jiraKey]);
+      expect(JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([linearKey]);
+    } finally {
+      await ai.close();
+    }
+  });
+
+  test("ZYU-115 no ticket picker is shown for a provider that is not connected or has no tickets in the mapped scope", async ({ browser }) => {
+    const taskId = seedTask();
+
+    // Nothing connected: neither picker, and the rest of the form still works.
+    let page = await openFeedbackTab(browser, taskId);
+    await expect(page.getByRole("button", { name: "Send feedback" })).toBeVisible();
+    await expect(page.getByText("Attach Jira tickets", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+
+    // Linear connected and mapped, but with no tickets synced: still no empty picker.
+    seedFeedbackTickets("linear", []);
+    page = await openFeedbackTab(browser, taskId);
+    await expect(page.getByRole("button", { name: "Send feedback" })).toBeVisible();
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+
+    // Jira only: the Jira picker is unaffected by the Linear addition.
+    seedFeedbackTickets("jira", [{ key: `ZJI-${Date.now()}`, summary: "Jira only" }]);
+    page = await openFeedbackTab(browser, taskId);
+    await expect(ticketPicker(page, "Attach Jira tickets")).toBeVisible();
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-116 a failing Linear status call hides only the Linear picker; the task and the Jira picker still load", async ({ browser }) => {
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const jiraKey = `ZJI-${suffix}`;
+    seedFeedbackTickets("jira", [{ key: jiraKey, summary: "Jira survives" }]);
+    seedFeedbackTickets("linear", [{ key: `ZLN-${suffix}`, summary: "Hidden by the failure" }]);
+    const taskId = seedTask();
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    // The API is cross-origin from the page, so match on path rather than a full URL.
+    await page.route(/\/linear\/status(\?|$)/, (route) => route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' }));
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: /^Feedback \(/ }).click();
+
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();
+    await expect(ticketPicker(page, "Attach Jira tickets").locator("option", { hasText: jiraKey })).toHaveCount(1);
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Failed to load task.")).toHaveCount(0);
   });
 
   // ─── Sources tab: label and formatting ─────────────────────────────────────

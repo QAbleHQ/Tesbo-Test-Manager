@@ -3746,6 +3746,106 @@ test.describe("zyra task-board generation — knowledge relevance (fake provider
       "regeneration after feedback must also retrieve a KB doc outside the 12-most-recent window, not just the initial generation",
     ).toContain("20 minutes of inactivity");
   });
+
+  test("ZYR-A-93 feedback's linearIssueKeys reach the regeneration prompt and are merged, de-duplicated, onto the task", async () => {
+    // Backs the task-detail Feedback form's "Attach Linear tickets" picker (ZYU-113..116): the page
+    // sends the picked keys as linearIssueKeys, and this is what the server must do with them.
+    await allocateFakeAiKey();
+    const org = literal(tenant!.organizationId);
+    const project = literal(tenant!.mainProjectId);
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const oldKey = `LFA-${suffix}-1`;
+    const newKey = `LFA-${suffix}-2`;
+    const newSummary = `Linear feedback ticket ${suffix} covers the refund window`;
+    try {
+      // linearSnapshot reads linear_tickets by key alone (no mapping filter), so the connection and
+      // ticket rows are all a sync would have needed to leave behind for the summary to be found.
+      exec(
+        `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+          `VALUES (${org}, 'linear', 'e2e-zyra-feedback', 'https://e2e-zyra-feedback.invalid', 'e2e', '', now() + interval '365 days') ` +
+          `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+      );
+      const connectionId = scalar(`SELECT id FROM integration_connections WHERE organization_id = ${org} AND provider = 'linear';`);
+      exec(
+        `INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status) ` +
+          `VALUES (${project}, ${literal(connectionId)}, ${literal(newKey)}, ${literal(newKey)}, ${literal(newSummary)}, 'Story', 'Todo');`,
+      );
+      const userStory = `E2E linear feedback story ${suffix}`;
+      exec(
+        `INSERT INTO ai_generation_requests
+          (project_id, requested_by, provider, model, user_story, requested_count, generated_count, generated_payload,
+           agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys, activity_log)
+         VALUES (${project}, ${literal(tenant!.owner.userId)}, 'e2e-fake-gateway', 'gpt-4o-mini', ${literal(userStory)}, 1, 1,
+           ${literal(JSON.stringify([{ title: "Seeded draft", priority: "P2", preconditions: "", steps: [] }]))}::jsonb,
+           'Zyra the Test Generator', 'in_review', '', '', '[]'::jsonb, ${literal(JSON.stringify([oldKey]))}::jsonb, '[]'::jsonb);`,
+      );
+      const taskId = scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${project} AND user_story = ${literal(userStory)};`);
+
+      ai.queueReply({
+        drafts: [{
+          title: "Refund is refused after the refund window closes",
+          preconditions: "",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Request a refund after the window", expectedResult: "The refund is refused" }]),
+          testData: "",
+          expectedSummary: "The refund is refused.",
+          priority: "P1",
+          tags: ["zyra"],
+          sourceRefs: [],
+        }],
+      });
+
+      const res = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+        // A repeat of the new key and of the key the task already carries, plus an empty entry —
+        // the picker itself prevents repeats, but the server must not trust that.
+        data: { feedback: "Cover the refund window from the Linear ticket.", linearIssueKeys: [newKey, newKey, oldKey, ""] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `submitting feedback — ${await res.text()}`).toBe(201);
+      expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+
+      const storedKeys = JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(storedKeys, "existing key kept, new key appended once, empty entry dropped").toEqual([oldKey, newKey]);
+      const storedJira = JSON.parse(scalar(`SELECT jira_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+      expect(storedJira, "Linear keys must not leak into the Jira list").toEqual([]);
+
+      const task = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+      expect(task.linearIssueKeys).toEqual([oldKey, newKey]);
+      expect(
+        task.activities.some((a: { kind?: string; detail?: string }) => a.kind === "feedback" && String(a.detail).includes(`Linear tickets: ${newKey}`)),
+        "the feedback entry names the attached Linear ticket",
+      ).toBe(true);
+
+      const prompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+      expect(prompt, "the attached Linear ticket's summary must be in the regeneration prompt").toContain(newSummary);
+    } finally {
+      exec(`DELETE FROM linear_tickets WHERE project_id = ${project};`);
+      exec(`DELETE FROM integration_connections WHERE organization_id = ${org} AND provider = 'linear';`);
+    }
+  });
+
+  test("ZYR-A-94 feedback with a non-array linearIssueKeys is accepted and attaches nothing, rather than failing", async () => {
+    // Wrong-type payload: normalizeJsonArray treats anything but an array as empty. Checked with no
+    // AI key allocated so it stops at the allocation check — the point is it is a clean 4xx/2xx
+    // decision, never a 500 from calling .map on a string.
+    const project = literal(tenant!.mainProjectId);
+    const userStory = `E2E linear wrong-type story ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    exec(
+      `INSERT INTO ai_generation_requests
+        (project_id, requested_by, provider, model, user_story, requested_count, generated_count, generated_payload,
+         agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys, activity_log)
+       VALUES (${project}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', ${literal(userStory)}, 0, 0, '[]'::jsonb,
+         'Zyra the Test Generator', 'in_review', '', '', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb);`,
+    );
+    const taskId = scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${project} AND user_story = ${literal(userStory)};`);
+    const res = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "x", linearIssueKeys: "LIN-1" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), await res.text()).toBe(400);
+    expect(await res.text()).toContain("Zyra is inactive");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("in_review");
+    expect(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("[]");
+  });
 });
 
 /*
