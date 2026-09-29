@@ -5460,3 +5460,600 @@ test.describe("zyra — exact KB requirement grounding (fake provider)", () => {
     expect(kb2, "the folder's own copy of the document must carry the requirement").toContain(encoded(requirement));
   });
 });
+
+/*
+ * [Zyra] The per-request trace, and the session-claim / resume lifecycle it rides on.
+ *
+ * The trace (src/legacy/zyra-turn-trace.ts) is opened step by step at the real branch points of a
+ * turn and persisted on the user message that asked for it (or on an assistant message that answers
+ * no user message of its own — a plan batch, a resumed turn, a Stop/Resume). These tests assert on
+ * that persisted trace through the ordinary session read, for each shape of request: a step appears
+ * only when its work ran, carries what that work found, and records how it ended.
+ *
+ * The lifecycle half pins the stuck-session fixes that shipped alongside it: a live turn keeps its
+ * claim past the old 5-minute window (heartbeat), a turn whose claim was taken over cannot release
+ * the newer turn's claim (owner token), and work whose process died reads as failed/timed out
+ * instead of leaving the page waiting forever. Stale state is arranged through Postgres — the same
+ * "arrange through the database" rule the resume tests above use, since killing the backend
+ * mid-turn is not something this suite does.
+ */
+test.describe("zyra chat — request trace and turn lifecycle (fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-trace");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purge();
+    await asOwner?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+    // One server instance for the whole block — see FakeAiServer.reset().
+    ai?.reset();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  type TraceStep = { stage: string; attempt: number; status: string; meta?: Record<string, unknown>; startedAt: string; endedAt: string | null };
+  type Trace = { version: number; outcome: string; startedAt: string; endedAt: string | null; steps: TraceStep[] };
+  type Message = Record<string, unknown> & { id: string; role: string; status: string; content: string; trace?: Trace | null };
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    exec(`DELETE FROM bugs WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+    exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id = ${project};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E trace fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function setCapabilities(capabilities: Record<string, boolean>): Promise<void> {
+    const res = await asOwner.patch(url("/settings"), { data: { capabilities }, failOnStatusCode: false });
+    expect(res.status(), `saving capabilities — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  function rootFolderId(): string {
+    const existing = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (existing) return existing;
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+    );
+    return scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+  }
+
+  /** One KB doc and one bug, each carrying a unique marker word the message also uses. */
+  async function seedKnowledge(marker: string): Promise<void> {
+    const kbRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId: rootFolderId(), documentType: "general", title: `${marker} seat policy`, contentText: `${marker}: a booking allows at most 10 seats.` },
+      failOnStatusCode: false,
+    });
+    expect(kbRes.status(), `seeding the KB doc — ${await kbRes.text()}`).toBe(201);
+    const bugRes = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `${marker} seat picker freezes`, description: `The ${marker} seat picker freezes on the 11th seat.` },
+      failOnStatusCode: false,
+    });
+    expect(bugRes.status(), `seeding the bug — ${await bugRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  async function sessionMessages(sessionId: string, as: APIRequestContext = asOwner): Promise<Message[]> {
+    const res = await as.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    return (await res.json()).messages;
+  }
+
+  function send(sessionId: string, message: string, extra: Record<string, unknown> = { background: true }): Promise<APIResponse> {
+    return asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message, ...extra }, failOnStatusCode: false });
+  }
+
+  /** Polls until the background turn behind `userMessageId` settles, returning the session's messages. */
+  async function waitForTurn(sessionId: string, userMessageId: string, timeout = 60_000): Promise<Message[]> {
+    let messages: Message[] = [];
+    await expect
+      .poll(
+        async () => {
+          messages = await sessionMessages(sessionId);
+          return messages.find((m) => m.id === userMessageId)?.status;
+        },
+        { message: "the background turn never settled its user message", timeout, intervals: [500, 1000, 2000] },
+      )
+      .not.toBe("processing");
+    return messages;
+  }
+
+  function queueAnswer(reply: string): void {
+    ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+  }
+
+  function queueCreateTurn(title: string): void {
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({ drafts: [draft(title)] });
+  }
+
+  function draft(title: string): Record<string, unknown> {
+    return {
+      title,
+      preconditions: "A show with free seats exists.",
+      stepsJson: JSON.stringify([{ stepNumber: 1, action: "Open the seat picker", expectedResult: "The seat map renders" }]),
+      testData: "",
+      expectedSummary: "The seat map renders.",
+      priority: "P1",
+      tags: ["zyra"],
+      sourceRefs: [],
+    };
+  }
+
+  function stages(trace: Trace | null | undefined): string[] {
+    return (trace?.steps || []).map((s) => (s.attempt > 1 ? `${s.stage}#${s.attempt}` : s.stage));
+  }
+
+  function step(trace: Trace | null | undefined, stage: string, attempt = 1): TraceStep {
+    const found = trace?.steps.find((s) => s.stage === stage && s.attempt === attempt);
+    expect(found, `no '${stage}' (attempt ${attempt}) step in ${JSON.stringify(stages(trace))}`).toBeTruthy();
+    return found!;
+  }
+
+  function seedRunningPlan(sessionId: string, status: "running" | "paused" = "running"): void {
+    const plan = JSON.stringify({ planId: `e2e-plan-${Date.now()}`, status, remainingScenarios: ["Seat limit", "Seat release"], batchSize: 5, doneCount: 3, totalCount: 5, originalMessage: "Generate all possible cases" });
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(plan)}::jsonb WHERE id = ${literal(sessionId)};`);
+  }
+
+  test("ZYR-A-121 an answer turn's trace lists exactly what it read and decided — no generation or staging step it never ran", async () => {
+    await allocateFakeAiKey();
+    const marker = `Quillon${Date.now() % 100000}`;
+    await seedKnowledge(marker);
+    const sessionId = await newSession("E2E trace answer");
+    queueAnswer("A booking allows at most 10 seats.");
+
+    // The synchronous form — an API/MCP caller with no turnId still gets a persisted trace.
+    const res = await send(sessionId, `How many seats can a ${marker} booking hold?`, {});
+    expect(res.status(), `sending the message — ${await res.text()}`).toBe(201);
+
+    const [user, reply] = await sessionMessages(sessionId);
+    expect(reply.role).toBe("assistant");
+    expect(reply.trace ?? null, "an ordinary reply carries no trace of its own — the request's is on the user message").toBeNull();
+    const trace = user.trace!;
+    expect(trace.version).toBe(1);
+    expect(trace.outcome).toBe("completed");
+    expect(trace.endedAt).toEqual(expect.any(String));
+    expect(stages(trace)).toEqual(["received", "context:knowledge", "context:jira", "context:testcases", "context:bugs", "routing", "finalizing"]);
+    expect(trace.steps.every((s) => s.status !== "active" && s.endedAt), "every step of a finished request is closed").toBe(true);
+
+    const knowledge = step(trace, "context:knowledge");
+    expect(knowledge.status).toBe("ok");
+    expect((knowledge.meta!.items as Array<{ title: string }>).map((i) => i.title)).toContain(`${marker} seat policy`);
+    const bugs = step(trace, "context:bugs");
+    expect((bugs.meta!.items as Array<{ title: string }>).map((i) => i.title)).toContain(`${marker} seat picker freezes`);
+    expect(step(trace, "context:jira").status, "no Jira is synced for this tenant, and the trace says so").toBe("empty");
+    expect(step(trace, "routing").meta).toMatchObject({ action: "answer", operationCount: 0 });
+    expect(step(trace, "finalizing").meta).toMatchObject({ savedCount: 0, proposedCount: 0 });
+  });
+
+  test("ZYR-A-122 a generation turn's trace records the routed action, the drafts produced, what was staged, and what was proposed", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace create");
+    queueCreateTurn("Seat picker opens");
+
+    const res = await send(sessionId, "Generate 1 smoke test case for the seat picker.");
+    expect(res.status()).toBe(201);
+    const { userMessageId } = await res.json();
+    const messages = await waitForTurn(sessionId, userMessageId);
+    const trace = messages.find((m) => m.id === userMessageId)!.trace!;
+
+    expect(trace.outcome).toBe("completed");
+    expect(stages(trace)).toEqual(["received", "context:knowledge", "context:jira", "context:testcases", "context:bugs", "routing", "generating", "staging", "finalizing"]);
+    expect(step(trace, "routing").meta).toMatchObject({ action: "create" });
+    expect(step(trace, "generating").meta).toMatchObject({ requestedCount: 1, draftedCount: 1 });
+    expect(step(trace, "staging").meta).toMatchObject({ operationCounts: { create: 1 } });
+    expect(step(trace, "finalizing").meta).toMatchObject({ savedCount: 0, proposedCount: 1 });
+  });
+
+  test("ZYR-A-123 with KB access off, the knowledge and bug steps are recorded as skipped with the reason — never as found", async () => {
+    await allocateFakeAiKey();
+    const marker = `Quillon${Date.now() % 100000}`;
+    await seedKnowledge(marker);
+    await setCapabilities({ knowledgeBase: false });
+    const sessionId = await newSession("E2E trace kb off");
+    queueAnswer("Knowledge-base access is off.");
+
+    const res = await send(sessionId, `How many seats can a ${marker} booking hold?`);
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    for (const stage of ["context:knowledge", "context:bugs"]) {
+      const s = step(trace, stage);
+      expect(s.status, stage).toBe("skipped");
+      expect(s.meta).toMatchObject({ skipped: true, reason: "Knowledge base access is off for this project" });
+      expect(s.meta!.items, `${stage} must not list what it was never allowed to read`).toBeUndefined();
+    }
+  });
+
+  test("ZYR-A-124 a request refused by a capability gate is recorded as blocked on the routing step, with no generation step", async () => {
+    await allocateFakeAiKey();
+    await setCapabilities({ generation: false });
+    const sessionId = await newSession("E2E trace blocked");
+    ai.queueReply({ reply: "", reasoningSummary: "Creating.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+
+    const res = await send(sessionId, "Generate 1 test case for the seat picker.");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    expect(stages(trace)).not.toContain("generating");
+    expect(step(trace, "routing")).toMatchObject({ status: "blocked", meta: { action: "create", reason: "Test case generation is off for this project" } });
+    expect(trace.outcome, "a gate doing its job is not an error").toBe("completed");
+    expect(messages[1].content).toContain("disabled");
+  });
+
+  test("ZYR-A-125 with no AI key, the context that was gathered is still shown and the decision step says why it was blocked", async () => {
+    const sessionId = await newSession("E2E trace no key");
+    const res = await send(sessionId, "How many test cases exist?");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    expect(stages(trace)).toEqual(["received", "context:knowledge", "context:jira", "context:testcases", "context:bugs", "routing", "finalizing"]);
+    const routing = step(trace, "routing");
+    expect(routing.status).toBe("blocked");
+    expect(String(routing.meta!.reason)).not.toBe("");
+    expect(ai.requests.length, "nothing reached a provider").toBe(0);
+  });
+
+  test("ZYR-A-126 a provider error on the decision call is recorded as a failed step, and the turn as completed with errors", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace provider error");
+    ai.failNextWith(500, "provider exploded");
+
+    const res = await send(sessionId, "How many test cases exist?");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    expect(step(trace, "routing").status).toBe("failed");
+    expect(String(step(trace, "routing").meta!.reason)).not.toBe("");
+    expect(trace.outcome).toBe("completed_with_errors");
+    expect(messages[0].status, "the degraded reply was still written").toBe("sent");
+  });
+
+  test("ZYR-A-127 a generation that fails and is retried at a smaller batch shows both attempts — the failed one and the one that produced the drafts", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace generation retry");
+    ai.queueReply({ reply: "", reasoningSummary: "Creating.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    // Unparseable drafting output — the failure the narrowed retry exists for.
+    ai.queueReply("this is not json at all");
+    ai.queueReply({ drafts: [draft("Seat picker opens (retry)")] });
+
+    const res = await send(sessionId, "Generate 1 test case for the seat picker.");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    expect(stages(trace)).toEqual(expect.arrayContaining(["generating", "generating#2"]));
+    expect(step(trace, "generating", 1)).toMatchObject({ status: "failed" });
+    expect(step(trace, "generating", 2)).toMatchObject({ status: "ok", meta: { retry: true, draftedCount: 1 } });
+    expect(trace.outcome).toBe("completed_with_errors");
+  });
+
+  test("ZYR-A-128 a Jira coverage question records the tool run and its summarizing call as their own steps", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace jira tool");
+    ai.queueReply({ reply: "", reasoningSummary: "Counting coverage.", action: "jira_pending_testcases", actionType: "answer", operations: [], testcases: [] });
+    ai.queueReply({ reply: "No Jira tickets are synced yet.", reasoningSummary: "From the tool result.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+
+    const res = await send(sessionId, "How many Jira tickets still need test cases?");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    const trace = messages[0].trace!;
+    expect(stages(trace)).toEqual(["received", "context:knowledge", "context:jira", "context:testcases", "context:bugs", "routing", "tool:jira_coverage", "summarizing", "finalizing"]);
+    expect(step(trace, "routing").meta).toMatchObject({ action: "jira_pending_testcases" });
+  });
+
+  test("ZYR-A-129 a confirmation the first pass ignored is retried under its own step, and the retry's own context and decision are recorded as attempt 2", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace confirmation retry");
+    // The previous turn: a create PROPOSAL that staged nothing — what a bare "yes" confirms.
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, action_type, status) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', 'I can draft a seat picker test case. Shall I?', 'create', 'completed');`,
+    );
+    queueAnswer("Sure, I could do that.");
+    queueCreateTurn("Seat picker opens (confirmed)");
+
+    const res = await send(sessionId, "yes");
+    const { userMessageId } = await res.json();
+    const messages = await waitForTurn(sessionId, userMessageId);
+    const trace = messages.find((m) => m.id === userMessageId)!.trace!;
+    expect(stages(trace)).toEqual(expect.arrayContaining(["routing", "retrying", "context:knowledge#2", "routing#2", "generating"]));
+    expect(step(trace, "routing", 1).meta).toMatchObject({ action: "answer" });
+    expect(step(trace, "retrying").meta).toMatchObject({ reason: "confirmation", fired: true });
+    expect(step(trace, "routing", 2).meta).toMatchObject({ action: "create" });
+  });
+
+  test("ZYR-A-130 the live progress stream narrates the same steps the persisted trace records, including the outcome updates", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace stream parity");
+    const turnId = `44444444-4444-4444-8444-${String(Date.now()).slice(-12).padStart(12, "0")}`;
+    ai.delayNextReplyMs(1_500);
+    queueAnswer("Streamed answer.");
+
+    const post = await send(sessionId, "How many test cases exist?", { background: true, turnId });
+    expect(post.status()).toBe(201);
+    const sse = await asOwner.get(url(`/chat/sessions/${sessionId}/turns/${turnId}/events`), { failOnStatusCode: false });
+    const events = parseSseEvents(await sse.text()) as Array<Record<string, unknown>>;
+    const messages = await waitForTurn(sessionId, (await post.json()).userMessageId);
+
+    const streamed = events.filter((e) => e.kind === "stage").map((e) => e.stage);
+    expect(streamed).toEqual(stages(messages[0].trace));
+    const routingUpdate = events.find((e) => e.kind === "update" && e.stage === "routing");
+    expect(routingUpdate?.meta, "the routing decision reaches the live stream as an update").toMatchObject({ action: "answer" });
+  });
+
+  test("ZYR-A-131 a turn still running shows its trace so far on the session read — a reload mid-turn is not a blank", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace mid-turn");
+    ai.delayNextReplyMs(6_000);
+    queueAnswer("Eventually.");
+
+    const res = await send(sessionId, "How many test cases exist?");
+    const { userMessageId } = await res.json();
+    await expect.poll(() => ai.requests.length, { message: "the decision call never reached the provider", timeout: 30_000 }).toBeGreaterThan(0);
+    await expect
+      .poll(async () => {
+        const user = (await sessionMessages(sessionId)).find((m) => m.id === userMessageId)!;
+        const last = user.trace?.steps[user.trace.steps.length - 1];
+        return [user.status, user.trace?.outcome, last?.stage, last?.status].join("|");
+      }, { message: "the in-flight trace never showed the routing step running", timeout: 10_000 })
+      .toBe("processing|running|routing|active");
+    await waitForTurn(sessionId, userMessageId);
+  });
+
+  test("ZYR-A-132 a message left processing by a dead turn reads as failed on the next session read — without waiting for another send", async () => {
+    const sessionId = await newSession("E2E trace orphan read");
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'user', 'Orphaned question', 'processing');`,
+    );
+    // No claim on the session: nothing is running. The page disables its composer while any message
+    // is processing, so a row nobody will ever settle used to lock the conversation for good.
+    expect((await sessionMessages(sessionId))[0].status).toBe("failed");
+
+    // A live claim means a turn really is running — then it must still read as processing.
+    exec(`UPDATE zyra_chat_sessions SET processing_since = now() WHERE id = ${literal(sessionId)};`);
+    expect((await sessionMessages(sessionId))[0].status).toBe("processing");
+    // A claim past the staleness window is a dead one again.
+    exec(`UPDATE zyra_chat_sessions SET processing_since = now() - interval '10 minutes' WHERE id = ${literal(sessionId)};`);
+    expect((await sessionMessages(sessionId))[0].status).toBe("failed");
+    // The read never wrote anything — the row itself is only rewritten by the next claim.
+    expect(scalar(`SELECT status FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)};`)).toBe("processing");
+  });
+
+  test("ZYR-A-133 a live turn keeps its session claim past the staleness window, so a second message is still refused", async () => {
+    test.setTimeout(180_000);
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace heartbeat");
+    ai.queueReply({ reply: "", reasoningSummary: "Creating.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({ drafts: [draft("Seat picker opens (slow)")] });
+
+    const res = await send(sessionId, "Generate 1 test case for the seat picker.");
+    const { userMessageId } = await res.json();
+    await expect.poll(() => ai.requests.length, { timeout: 30_000 }).toBe(1);
+    // Hold the drafting call well past one heartbeat interval (60s), inside the generate timeout.
+    ai.delayNextReplyMs(80_000);
+    // Make the claim look as old as a turn that started before the 5-minute window — what every
+    // generation longer than that looked like before the heartbeat.
+    exec(`UPDATE zyra_chat_sessions SET processing_since = now() - interval '10 minutes' WHERE id = ${literal(sessionId)};`);
+
+    await expect
+      .poll(() => scalar(`SELECT (processing_since > now() - interval '2 minutes')::text FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the running turn never refreshed its claim",
+        timeout: 75_000,
+        intervals: [2_000],
+      })
+      .toBe("true");
+    const second = await send(sessionId, "A second question");
+    expect(second.status(), `a second turn took over a live turn's session — ${await second.text()}`).toBe(409);
+    await waitForTurn(sessionId, userMessageId, 120_000);
+  });
+
+  test("ZYR-A-134 a turn whose claim was taken over cannot release the claim of the turn that took it", async () => {
+    test.setTimeout(120_000);
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace owner release");
+    ai.delayNextReplyMs(4_000);
+    queueAnswer("First.");
+    const first = await send(sessionId, "First question");
+    expect(first.status()).toBe(201);
+    await expect.poll(() => ai.requests.length, { timeout: 30_000 }).toBe(1);
+    // The first turn now looks dead (its claim is past the window), so a second may take the session.
+    exec(`UPDATE zyra_chat_sessions SET processing_since = now() - interval '10 minutes' WHERE id = ${literal(sessionId)};`);
+    ai.delayNextReplyMs(15_000);
+    queueAnswer("Second.");
+    const second = await send(sessionId, "Second question");
+    expect(second.status(), `taking over a stale claim — ${await second.text()}`).toBe(201);
+
+    // The first turn finishes while the second is still held at the provider.
+    await expect
+      .poll(async () => (await sessionMessages(sessionId)).some((m) => m.role === "assistant" && m.content === "First."), { timeout: 30_000 })
+      .toBe(true);
+    // Its release runs right after its reply is written; give it that moment.
+    await new Promise((r) => setTimeout(r, 1_500));
+    const third = await send(sessionId, "Third question");
+    expect(third.status(), `the first turn's exit released the second turn's claim — ${await third.text()}`).toBe(409);
+    await waitForTurn(sessionId, (await second.json()).userMessageId);
+  });
+
+  test("ZYR-A-135 two sessions run their turns independently — a slow turn in one never blocks or leaks into the other", async () => {
+    await allocateFakeAiKey();
+    const slowSession = await newSession("E2E trace isolation slow");
+    const fastSession = await newSession("E2E trace isolation fast");
+    ai.delayNextReplyMs(10_000);
+    queueAnswer("Slow answer.");
+    queueAnswer("Fast answer.");
+
+    const slow = await send(slowSession, "Slow question");
+    await expect.poll(() => ai.requests.length, { timeout: 30_000 }).toBe(1);
+    const fast = await send(fastSession, "Fast question");
+    expect(fast.status(), "a turn in another session was refused").toBe(201);
+    const fastMessages = await waitForTurn(fastSession, (await fast.json()).userMessageId);
+    expect(fastMessages[1].content).toBe("Fast answer.");
+    const slowNow = (await sessionMessages(slowSession))[0];
+    expect(slowNow.status, "the fast session finished while the slow one was still running").toBe("processing");
+    expect(slowNow.trace?.outcome).toBe("running");
+    expect(fastMessages[0].trace?.outcome).toBe("completed");
+    await waitForTurn(slowSession, (await slow.json()).userMessageId);
+  });
+
+  test("ZYR-A-136 a resumed turn carries its own trace, starting with the resume, and the resumed message falls back to its first attempt", async () => {
+    // No AI key: the resume resolves quickly through the degraded path (same as ZYR-A-86).
+    const sessionId = await newSession("E2E trace resume");
+    const checkpoint = JSON.stringify({ stage: "generate", userMessageId: "", message: "Write me some test cases", routedSuite: null, routedCount: { requestedCount: 10, exhaustive: false } });
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, resume_checkpoint) VALUES " +
+        `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', 'Timed out.', 'timed_out', ${literal(checkpoint)}::jsonb);`,
+    );
+    const messageId = scalar(`SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)};`);
+    const res = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${messageId}/continue`), { failOnStatusCode: false });
+    expect((await res.json()).accepted).toBe(true);
+
+    let messages: Message[] = [];
+    await expect.poll(async () => { messages = await sessionMessages(sessionId); return messages.find((m) => m.id === messageId)?.status; }, { timeout: 30_000 }).toBe("resumed");
+    const original = messages.find((m) => m.id === messageId)!;
+    const resumed = messages.find((m) => m.id !== messageId)!;
+    expect(original.trace ?? null, "the live resume trace is moved off the original once the new reply carries it").toBeNull();
+    expect(stages(resumed.trace)[0]).toBe("resuming");
+    expect(step(resumed.trace, "resuming").meta).toMatchObject({ attempt: 1, fromStage: "generate", requestedCount: 10 });
+    expect(stages(resumed.trace)).toEqual(expect.arrayContaining(["context:testcases", "routing", "finalizing"]));
+    expect(resumed.trace!.outcome).toBe("completed");
+  });
+
+  test("ZYR-A-137 a resume whose heartbeat lapsed reads as timed out and can be continued again; a live one cannot", async () => {
+    const sessionId = await newSession("E2E trace stale resume");
+    const checkpoint = JSON.stringify({ stage: "generate", userMessageId: "", message: "Write me some test cases", routedSuite: null, routedCount: { requestedCount: 10, exhaustive: false } });
+    const seed = (since: string) => {
+      exec(
+        "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, resume_checkpoint, resuming_since) VALUES " +
+          `(${literal(sessionId)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'assistant', 'Timed out.', 'resuming', ${literal(checkpoint)}::jsonb, ${since});`,
+      );
+      return scalar(`SELECT id FROM zyra_chat_messages WHERE session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    };
+    const live = seed("now()");
+    const dead = seed("now() - interval '10 minutes'");
+
+    const read = await sessionMessages(sessionId);
+    expect(read.find((m) => m.id === live)?.status).toBe("resuming");
+    expect(read.find((m) => m.id === dead)?.status, "a resume nobody is running must offer Continue again").toBe("timed_out");
+
+    const liveContinue = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${live}/continue`), { failOnStatusCode: false });
+    expect((await liveContinue.json()).accepted, "a live resume must not be claimed twice").toBe(false);
+    const deadContinue = await asOwner.post(url(`/chat/sessions/${sessionId}/messages/${dead}/continue`), { failOnStatusCode: false });
+    expect((await deadContinue.json()).accepted, "a dead resume must be claimable again").toBe(true);
+    await expect.poll(() => scalar(`SELECT status FROM zyra_chat_messages WHERE id = ${literal(dead)};`), { timeout: 30_000 }).toBe("resumed");
+  });
+
+  test("ZYR-A-138 a new message that cancels a running plan records that in its trace", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace supersede");
+    seedRunningPlan(sessionId);
+    queueAnswer("Moving on.");
+
+    const res = await send(sessionId, "What does the seat picker do?");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId);
+    expect(step(messages[0].trace, "plan:superseded").meta).toMatchObject({ planStatus: "running", doneCount: 3, totalCount: 5 });
+    expect(scalar(`SELECT active_plan::text FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`) || null).toBeNull();
+  });
+
+  test("ZYR-A-139 Stop and Resume on a plan each post a message with its own trace, and a batch refused for want of a key records why", async () => {
+    // No AI key: Resume launches the batch loop, whose first batch is refused and says so.
+    const sessionId = await newSession("E2E trace plan stop resume");
+    seedRunningPlan(sessionId);
+
+    const stop = await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
+    expect(stop.status()).toBeLessThan(300);
+    const stopped = (await sessionMessages(sessionId)).filter((m) => m.role === "assistant");
+    expect(stopped).toHaveLength(1);
+    expect(stages(stopped[0].trace)).toEqual(["plan:stop"]);
+    expect(step(stopped[0].trace, "plan:stop").meta).toMatchObject({ doneCount: 3, totalCount: 5, remainingCount: 2 });
+
+    const resume = await asOwner.post(url(`/chat/sessions/${sessionId}/resume-plan`), { failOnStatusCode: false });
+    expect(resume.status()).toBeLessThan(300);
+    let assistants: Message[] = [];
+    await expect
+      .poll(async () => { assistants = (await sessionMessages(sessionId)).filter((m) => m.role === "assistant"); return assistants.length; }, { timeout: 30_000 })
+      .toBe(3);
+    expect(stages(assistants[1].trace)).toEqual(["plan:resume"]);
+    expect(step(assistants[1].trace, "plan:resume").meta).toMatchObject({ doneCount: 3, totalCount: 5, remainingCount: 2 });
+    const batch = assistants[2].trace!;
+    expect(stages(batch)).toEqual(["plan:batch"]);
+    expect(step(batch, "plan:batch")).toMatchObject({ status: "blocked", meta: { fromScenario: 4, toScenario: 5, totalCount: 5 } });
+  });
+
+  test("ZYR-A-140 a request's trace is only readable by those who can read its session", async () => {
+    const sessionId = await newSession("E2E trace access");
+    const res = await send(sessionId, "How many test cases exist?");
+    await waitForTurn(sessionId, (await res.json()).userMessageId);
+
+    const otherTenant = await provisionRbacTenant("zyra-citations");
+    test.skip(otherTenant === null, rbacSuiteSkipReason(otherTenant) ?? "");
+    const asOther = await loginAs(otherTenant!.owner);
+    const anonymous = await anonymousContext();
+    try {
+      const foreign = await asOther.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+      expect([403, 404], `another workspace read this session's trace: ${foreign.status()}`).toContain(foreign.status());
+      expect(await foreign.text()).not.toContain("context:testcases");
+      const anon = await anonymous.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+      expect(anon.status()).toBeGreaterThanOrEqual(400);
+      expect(await anon.text()).not.toContain("context:testcases");
+    } finally {
+      await asOther.dispose();
+      await anonymous.dispose();
+    }
+  });
+
+  test("ZYR-A-141 a decision call that never answers is recorded as timed out on its step, and the turn as timed out", async () => {
+    test.setTimeout(150_000);
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E trace router timeout");
+    // Past ZYRA_ROUTER_TIMEOUT_MS (60s): the backend aborts the call, the fake server never answers in time.
+    ai.delayNextReplyMs(70_000);
+    queueAnswer("Too late.");
+
+    const res = await send(sessionId, "How many test cases exist?");
+    const messages = await waitForTurn(sessionId, (await res.json()).userMessageId, 120_000);
+    const trace = messages[0].trace!;
+    expect(step(trace, "routing")).toMatchObject({ status: "timed_out", meta: { timeoutMs: 60_000 } });
+    expect(trace.outcome).toBe("timed_out");
+    expect(messages.find((m) => m.role === "assistant")?.status).toBe("timed_out");
+  });
+});

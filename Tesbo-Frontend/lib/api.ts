@@ -1098,6 +1098,32 @@ export interface ZyraChatMessage {
   reviewRequestId?: string | null;
   /** How many consecutive resume attempts this message's chain has already burned through. */
   resumeAttempt: number;
+  /**
+   * What Zyra actually did for this request — see zyra-turn-trace.ts on the backend. On a user
+   * message it is that request's trace (written step by step while it runs); on an assistant
+   * message only when the reply answers no user message of its own (a plan batch, a resumed turn).
+   */
+  trace?: ZyraTurnTrace | null;
+}
+
+export type ZyraTraceStepStatus = "active" | "ok" | "empty" | "skipped" | "blocked" | "failed" | "timed_out";
+export type ZyraTraceOutcome = "running" | "completed" | "completed_with_errors" | "timed_out" | "failed";
+
+export interface ZyraTraceStep {
+  stage: string;
+  attempt: number;
+  status: ZyraTraceStepStatus;
+  meta?: Record<string, unknown>;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface ZyraTurnTrace {
+  version: 1;
+  outcome: ZyraTraceOutcome;
+  startedAt: string;
+  endedAt: string | null;
+  steps: ZyraTraceStep[];
 }
 
 export interface ZyraChatActivePlan {
@@ -1239,6 +1265,8 @@ export async function continueZyraChatMessage(
 
 export type ZyraTurnProgressEvent =
   | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  /** Merges `meta` into the latest step named `stage` ("*" = the open one). */
+  | { kind: "update"; stage: string; meta?: Record<string, unknown> }
   | { kind: "complete"; payload: unknown }
   | { kind: "error"; message: string }
   | { kind: "unknown" };

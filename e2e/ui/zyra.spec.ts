@@ -3433,4 +3433,111 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     await expect(composer(page)).toBeEnabled();
     expect(ai.requests.length, "a refused send must never reach the model").toBe(0);
   });
+
+  // ─── Request trace ────────────────────────────────────────────────────────
+  // The trace is persisted on the request's own message (see zyra-turn-trace.ts), so the states a
+  // live send can't reach on demand — a failed request, one whose process died, one running in
+  // another tab — are arranged by writing that trace directly, in the exact shape the backend writes.
+
+  function traceJson(outcome: string, steps: Array<{ stage: string; status: string; meta?: Record<string, unknown> }>): string {
+    const at = new Date(Date.now() - 30_000).toISOString();
+    return JSON.stringify({
+      version: 1,
+      outcome,
+      startedAt: at,
+      endedAt: outcome === "running" ? null : new Date().toISOString(),
+      steps: steps.map((s) => ({ ...s, attempt: 1, startedAt: at, endedAt: s.status === "active" ? null : new Date().toISOString() })),
+    });
+  }
+
+  function seedRequest(status: string, trace: string, opts: { claimed?: boolean } = {}): string {
+    const t = tenant!;
+    exec(`INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES (${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E trace session');`);
+    const sessionId = scalar(`SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, trace) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'user', 'Seeded question', ${literal(status)}, ${literal(trace)}::jsonb);`,
+    );
+    if (opts.claimed) exec(`UPDATE zyra_chat_sessions SET processing_since = now() WHERE id = ${literal(sessionId)};`);
+    return sessionId;
+  }
+
+  async function gotoChat(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
+    return page;
+  }
+
+  test("ZYU-118 a send shows its live trace while it runs, then the finished trace under the reply — still there after a reload", async ({ browser }) => {
+    await allocateFakeAiKey();
+    // Held long enough to observe the decision step while it is running.
+    ai.delayNextReplyMs(4_000);
+    queueAnswer("There are no test cases yet.");
+    const page = await openChat(browser);
+    await composer(page).fill("How many test cases exist?");
+    await composer(page).press("Enter");
+
+    const running = page.locator('[data-zyra-trace="running"]');
+    await expect(running.locator('[data-zyra-step="routing"][data-zyra-step-status="active"]')).toBeVisible({ timeout: 20_000 });
+    await expect(running.getByText(/zyra · step \d+ · /)).toBeVisible();
+    // No invented total: the old header claimed "turn 7/8" before knowing what the turn would need.
+    await expect(running.getByText(/turn \d+\/\d+/)).toHaveCount(0);
+
+    await expect(page.getByText("There are no test cases yet.")).toBeVisible({ timeout: 30_000 });
+    const finished = page.locator('[data-zyra-trace="completed"]');
+    await expect(finished).toBeVisible();
+    await expect(finished.locator("summary")).toContainText("[DONE]");
+    await finished.locator("summary").click();
+    await expect(finished.locator('[data-zyra-step="context:knowledge"]')).toBeVisible();
+    await expect(finished.locator('[data-zyra-step="routing"]')).toContainText("answer");
+    // An answer never generates, so the trace must not claim it did.
+    await expect(finished.locator('[data-zyra-step="generating"]')).toHaveCount(0);
+
+    await page.reload();
+    await expect(page.locator('[data-zyra-trace="completed"]')).toBeVisible();
+  });
+
+  test("ZYU-119 a request that failed before any reply shows its trace under the request, with the step that failed", async ({ browser }) => {
+    seedRequest("failed", traceJson("failed", [
+      { stage: "received", status: "ok" },
+      { stage: "routing", status: "failed", meta: { status: "failed", reason: "This turn did not complete." } },
+    ]));
+    const page = await gotoChat(browser);
+    const failed = page.locator('[data-zyra-trace="failed"]');
+    await expect(failed.locator("summary")).toContainText("[FAILED]");
+    await failed.locator("summary").click();
+    const routing = failed.locator('[data-zyra-step="routing"]');
+    await expect(routing).toContainText("[FAIL]");
+    await expect(routing).toContainText("This turn did not complete.");
+    await expect(composer(page)).toBeEnabled();
+  });
+
+  test("ZYU-120 a request left processing by a turn that died reads as interrupted, and the conversation is not locked", async ({ browser }) => {
+    seedRequest("processing", traceJson("running", [
+      { stage: "received", status: "ok" },
+      { stage: "routing", status: "active", meta: { totalContextItems: 2 } },
+    ]));
+    const page = await gotoChat(browser);
+    // Before the fix this row kept the composer disabled and the page polling, forever.
+    await expect(composer(page)).toBeEnabled();
+    const failed = page.locator('[data-zyra-trace="failed"]');
+    await failed.locator("summary").click();
+    await expect(failed.locator('[data-zyra-step="routing"]')).toContainText("interrupted");
+  });
+
+  test("ZYU-121 a request still running elsewhere (another tab, or before a reload) shows its steps so far from the persisted trace", async ({ browser }) => {
+    seedRequest("processing", traceJson("running", [
+      { stage: "received", status: "ok" },
+      { stage: "context:jira", status: "empty", meta: { items: [], count: 0 } },
+      { stage: "routing", status: "active", meta: { totalContextItems: 0 } },
+    ]), { claimed: true });
+    const page = await gotoChat(browser);
+    const running = page.locator('[data-zyra-trace="running"]');
+    await expect(running.getByText(/zyra · step 3 · /)).toBeVisible();
+    await expect(running.locator('[data-zyra-step="routing"]')).toContainText("[RUN]");
+    await expect(running.locator('[data-zyra-step="context:jira"]')).toContainText("none found");
+    await expect(composer(page)).toBeDisabled();
+  });
 });

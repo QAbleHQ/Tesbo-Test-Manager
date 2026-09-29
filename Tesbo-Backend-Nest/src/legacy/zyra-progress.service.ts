@@ -19,6 +19,9 @@ import { ReplaySubject } from "rxjs";
 
 export type ZyraProgressEvent =
   | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  // Merges `meta` into the latest step named `stage` ("*" = the currently open one) — an outcome
+  // only known after the step started (a routing decision, a timeout, a capability block).
+  | { kind: "update"; stage: string; meta?: Record<string, unknown> }
   | { kind: "complete"; payload: unknown }
   | { kind: "error"; message: string }
   | { kind: "unknown" };
@@ -77,11 +80,10 @@ export class ZyraProgressService implements OnModuleDestroy {
       if (!sameOwner(existing.owner, owner)) return { status: "foreign" };
       return { status: "ok", subject: existing.subject };
     }
-    // Bounded replay buffer: generous enough for every stage this turn will ever emit (single
-    // digits — up to ~9 named stages per chat turn as of the progress-backlog work, plus one
-    // terminal complete/error), small enough that a turn nobody ever reads back costs nothing
-    // meaningful.
-    const subject = new ReplaySubject<ZyraProgressEvent>(50);
+    // Bounded replay buffer: generous enough for every event this turn will ever emit (roughly a
+    // dozen stages plus their update events, twice over on a confirmation retry, plus one terminal
+    // complete/error), small enough that a turn nobody ever reads back costs nothing meaningful.
+    const subject = new ReplaySubject<ZyraProgressEvent>(100);
     this.turns.set(turnId, { subject, owner, createdAt: Date.now() });
     return { status: "ok", subject };
   }
@@ -92,13 +94,13 @@ export class ZyraProgressService implements OnModuleDestroy {
    * what goes wrong here. Returns a plain no-op when the turn is unknown/foreign, so the pipeline
    * that invokes it never needs to branch on whether streaming is actually active.
    */
-  stageEmitter(turnId: string, owner: ZyraProgressOwner): (stage: string, meta?: Record<string, unknown>) => void {
+  stageEmitter(turnId: string, owner: ZyraProgressOwner): (stage: string, meta?: Record<string, unknown>, mode?: "update") => void {
     const attached = this.registerOrAttach(turnId, owner);
     if (attached.status !== "ok") return () => {};
     const subject = attached.subject;
-    return (stage, meta) => {
+    return (stage, meta, mode) => {
       try {
-        subject.next({ kind: "stage", stage, meta });
+        subject.next(mode === "update" ? { kind: "update", stage, meta } : { kind: "stage", stage, meta });
       } catch (err) {
         // Must never propagate into the generation pipeline — a broken progress feature can only
         // ever cost the user the progress narration, never the generation itself.
