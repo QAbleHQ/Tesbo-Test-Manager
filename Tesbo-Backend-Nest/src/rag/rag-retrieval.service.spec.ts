@@ -39,13 +39,30 @@ jest.mock("../observability/embedding-trace", () => ({
 
 import { RagRetrievalService } from "./rag-retrieval.service";
 import type { DatabaseService } from "../database/database.service";
-import { RAG_CONFIDENT_SIMILARITY, RAG_MIN_SIMILARITY, TESTCASE_SIMILARITY_THRESHOLD } from "./rag.constants";
+import { RAG_CONFIDENT_SIMILARITY, RAG_MIN_SIMILARITY, RAG_PASSAGE_CHARS, TESTCASE_SIMILARITY_THRESHOLD } from "./rag.constants";
 
 type AnnRow = { source_type: string; source_id: string; heading_path: string | null; content: string; title: string; cosine_similarity: number };
 type FtsRow = { id: string; title: string; content: string; rank: number };
 
+// Stand-in for Postgres's 'english' lexing (keywordQuery's tsvector_to_array call): lowercased words,
+// no stemming. Good enough for these specs, which exercise the service's own logic rather than
+// Postgres's stemmer — the e2e suite runs the real one.
+const STOPWORDS = new Set(["for", "the", "a", "an", "of", "to", "and", "is", "are", "with", "after", "on", "in", "from"]);
+function lexemes(text: string): string[] {
+  return Array.from(new Set(String(text).toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 1 && !STOPWORDS.has(word))));
+}
+
+// Passage ranking stand-in: a chunk's rank is how many of the query's lexemes it contains.
+function rankRows(params: unknown[]): Array<{ s: number; c: number; rank: number }> {
+  const [sourceIdx, chunkIdx, bodies, tsquery] = params as [number[], number[], string[], string];
+  const terms = String(tsquery).split("|").map((part) => part.trim().replace(/^'|'$/g, ""));
+  return bodies.map((body, i) => ({ s: sourceIdx[i], c: chunkIdx[i], rank: terms.filter((term) => lexemes(body).includes(term)).length }));
+}
+
 function makeDb(annRows: AnnRow[], ftsDocRows: FtsRow[] = [], ftsFileRows: FtsRow[] = []): DatabaseService {
-  const query = jest.fn((sql: string) => {
+  const query = jest.fn((sql: string, params: unknown[] = []) => {
+    if (sql.includes("tsvector_to_array")) return Promise.resolve({ rows: [{ terms: lexemes(String(params[0])), boilerplate: lexemes(String(params[1])) }] });
+    if (sql.includes("AS x(s, c, body)")) return Promise.resolve({ rows: rankRows(params) });
     if (sql.includes("knowledge_document_chunks")) return Promise.resolve({ rows: annRows });
     if (sql.includes("FROM knowledge_documents")) return Promise.resolve({ rows: ftsDocRows });
     if (sql.includes("FROM knowledge_files")) return Promise.resolve({ rows: ftsFileRows });
@@ -119,14 +136,19 @@ describe("RagRetrievalService.retrieveWithDiagnostics", () => {
     expect(result.topScore).toBeNull();
   });
 
-  it("reports confidence 'none' (not a crash, not a false 'weak') when there is no embeddings key at all — FTS-only degradation", async () => {
+  // Previously asserted "none" here. Changed deliberately with the exact-value grounding fix: a
+  // keyword hit must now cover a real share of the request's content terms (ftsSearch), so it IS a
+  // loose match — and "none" made the drafting prompt write from general practice even when the
+  // matched document stated the requirement outright. No embeddings key is every workspace today,
+  // so this was the common path, not an edge case.
+  it("reports confidence 'weak' (a keyword match, not 'nothing found') when there is no embeddings key at all — FTS-only degradation", async () => {
     resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: null, reason: "No embeddings-capable key." });
     const db = makeDb([], [{ id: "kw-doc", title: "Keyword match", content: "matched by text", rank: 0.5 }]);
     const svc = new RagRetrievalService(db);
     const result = await svc.retrieveWithDiagnostics("project-1", "some query");
     expect(result.items.map((item) => item.citation.sourceId)).toContain("kw-doc");
     expect(result.semanticSearchRan).toBe(false);
-    expect(result.confidence).toBe("none");
+    expect(result.confidence).toBe("weak");
     expect(result.topScore).toBeNull();
     expect(embedTextsMock).not.toHaveBeenCalled();
   });
@@ -152,6 +174,102 @@ describe("RagRetrievalService.retrieveWithDiagnostics", () => {
     const svcWithTrace = new RagRetrievalService(makeDb([annRow("a", 0.9)]));
     const withTrace = await svcWithTrace.retrieveWithDiagnostics("project-1", "query", { traceId: "turn-trace-1" });
     expect(withTrace).toEqual(withoutTrace);
+  });
+});
+
+/*
+ * Keyword retrieval and passage selection — the half that runs in every workspace without an
+ * embeddings key (which, at the time of writing, is every workspace). Two defects lived here, both
+ * behind "[Zyra] Knowledge Base exact-value/requirement grounding": plainto_tsquery ANDed every word
+ * of the request ("generate", "test", "cases" …) so realistic requests matched nothing, and a
+ * matched document contributed only its first 1500 characters, so a requirement stated later
+ * never reached the model.
+ */
+describe("RagRetrievalService keyword retrieval and passage selection", () => {
+  beforeEach(() => {
+    resolveEmbeddingAllocationMock.mockReset();
+    embedTextsMock.mockReset();
+    resolveEmbeddingAllocationMock.mockResolvedValue({ allocation: null, reason: "No embeddings-capable key." });
+  });
+
+  // Several distinct sections so the chunker splits it; the requirement sits well past char 1500.
+  const filler = (label: string) => `${label} ${"general onboarding narrative with nothing specific in it ".repeat(30)}`;
+  const LONG_DOC = [
+    "# Overview",
+    filler("Introduction."),
+    "# Billing",
+    filler("Invoices."),
+    "# Session policy",
+    "An authenticated session expires after 20 minutes of inactivity and the user is returned to the sign-in page.",
+    "# Appendix",
+    filler("History.")
+  ].join("\n\n");
+
+  function ftsSqlCalls(db: DatabaseService) {
+    return (db.query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes("FROM knowledge_documents"));
+  }
+
+  it("searches on the request's content terms with OR semantics, dropping request boilerplate", async () => {
+    const db = makeDb([], []);
+    await new RagRetrievalService(db).retrieveWithDiagnostics("project-1", "Generate test cases for session timeout");
+    const [[sql, params]] = ftsSqlCalls(db);
+    expect(sql).not.toContain("plainto_tsquery");
+    // "generate", "test", "cases" describe the request, not the product — they must not be required
+    // (AND) nor match on their own (OR).
+    expect(params[1]).toBe("'session' | 'timeout'");
+    expect(params[2]).toEqual(["'session'", "'timeout'"]);
+  });
+
+  it("requires half the content terms to match, capped so a long pasted story can still match", async () => {
+    const db = makeDb([], []);
+    const svc = new RagRetrievalService(db);
+    await svc.retrieveWithDiagnostics("project-1", "session timeout");
+    await svc.retrieveWithDiagnostics("project-1", "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima");
+    const [[, twoTerms], [, manyTerms]] = ftsSqlCalls(db);
+    expect(twoTerms[3]).toBe(1);
+    expect(manyTerms[3]).toBe(3);
+  });
+
+  it("skips keyword search entirely when the request is nothing but boilerplate", async () => {
+    const db = makeDb([], [{ id: "kw-doc", title: "Anything", content: "anything", rank: 0.5 }]);
+    const result = await new RagRetrievalService(db).retrieveWithDiagnostics("project-1", "generate test cases");
+    expect(ftsSqlCalls(db)).toHaveLength(0);
+    expect(result.items).toEqual([]);
+    expect(result.confidence).toBe("none");
+  });
+
+  it("sends the passage that states the requirement, not the document's opening, for a long keyword-matched document", async () => {
+    expect(LONG_DOC.indexOf("20 minutes")).toBeGreaterThan(1500);
+    const db = makeDb([], [{ id: "policy", title: "Portal handbook", content: LONG_DOC, rank: 0.4 }]);
+    const result = await new RagRetrievalService(db).retrieveWithDiagnostics("project-1", "write test cases for session expiry after inactivity");
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].content).toContain("expires after 20 minutes of inactivity");
+    expect(result.items[0].content).not.toContain("Introduction.");
+    expect(result.items[0].citation.headingPath).toBe("Session policy");
+    expect(result.items[0].content.length).toBeLessThanOrEqual(RAG_PASSAGE_CHARS);
+  });
+
+  it("passes a short keyword-matched document through whole", async () => {
+    const content = "Passwords must be 8 to 64 characters and may not reuse the last 5 passwords.";
+    const db = makeDb([], [{ id: "pw", title: "Password rules", content, rank: 0.4 }]);
+    const result = await new RagRetrievalService(db).retrieveWithDiagnostics("project-1", "password validation");
+    expect(result.items[0].content).toBe(content);
+  });
+
+  it("falls back to the opening when no passage matches (e.g. the hit was on the title only)", async () => {
+    const db = makeDb([], [{ id: "policy", title: "Session policy", content: LONG_DOC, rank: 0.4 }]);
+    const result = await new RagRetrievalService(db).retrieveWithDiagnostics("project-1", "zzqx");
+    expect(result.items[0].content).toBe(LONG_DOC.slice(0, RAG_PASSAGE_CHARS));
+  });
+
+  it("focusOnQuery narrows explicitly chosen documents to the relevant passage, and keeps the opening with no query", async () => {
+    const svc = new RagRetrievalService(makeDb([]));
+    const [focused] = await svc.focusOnQuery([LONG_DOC], "session inactivity");
+    expect(focused).toContain("20 minutes of inactivity");
+    const [unfocused] = await svc.focusOnQuery([LONG_DOC], "");
+    expect(unfocused).toBe(LONG_DOC.slice(0, RAG_PASSAGE_CHARS));
+    const [short] = await svc.focusOnQuery(["Uploads over 5 MB are rejected with UPL-413."], "upload");
+    expect(short).toBe("Uploads over 5 MB are rejected with UPL-413.");
   });
 });
 
