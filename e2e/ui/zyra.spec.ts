@@ -1477,6 +1477,66 @@ test.describe("zyra / agents (UI)", () => {
     expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`)).toBe("Auth");
   });
 
+  /*
+   * "[Zyra] Save Test Cases error message is hidden behind the modal" — a failed save used to write
+   * to the page-level error banner, which sits under the modal's portaled backdrop. The text was in
+   * the DOM, so a page-wide toBeVisible() would have passed; the assertion is therefore scoped to
+   * the dialog, and a trial click proves nothing is layered over it.
+   */
+  test("ZYU-117 a failed save shows its error inside the open Save modal, and a retry still saves", async ({ browser }) => {
+    const title = stamp("Save failure draft");
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const failure = "Suite is locked for this plan — upgrade to save more testcases.";
+
+    // First attempt is held until released, then refused; later attempts reach the real API.
+    // Pathname predicate rather than a glob: the API is on a different origin from the page.
+    let attempts = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route(
+      (url) => url.pathname === `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${taskId}/save`,
+      async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        attempts++;
+        if (attempts > 1) return route.continue();
+        await held;
+        await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ error: failure }) });
+      },
+    );
+
+    await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
+    const dialog = modal(page, "Save generated testcases");
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    // In flight: the button reports it, and Escape can't dismiss the modal out from under the result.
+    await expect(dialog.getByRole("button", { name: "Saving..." })).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeVisible();
+    release();
+
+    const alert = dialog.getByRole("alert");
+    await expect(alert).toHaveText(failure);
+    // Actionability includes "receives pointer events" — this fails if the backdrop covers the text.
+    await alert.click({ trial: true });
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
+
+    // Closing and reopening starts clean rather than replaying the stale failure.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+
+    // Retry goes through the unchanged success path: modal closes, page confirms, the row exists.
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("1 testcase saved.")).toBeVisible();
+    await expect
+      .poll(() => Number(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`)))
+      .toBe(1);
+    expect(attempts).toBe(2);
+  });
+
   test("ZYU-15 deleting a draft removes it from the task and leaves the rest", { tag: '@tesbo.testId("TES-TC-1100")' }, async ({ browser }) => {
     const taskId = seedTask();
     const page = await open(browser, `/agents/tasks/${taskId}`);

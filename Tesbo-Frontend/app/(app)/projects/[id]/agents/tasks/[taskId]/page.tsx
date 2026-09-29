@@ -152,6 +152,9 @@ export default function ZyraTaskDetailPage() {
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A save failure renders inside the Save modal: the page-level `error` banner sits under the
+  // modal's backdrop, so a failed save looked like the button had done nothing.
+  const [saveError, setSaveError] = useState<string | null>(null);
   const pollInFlightRef = useRef(false);
 
   const loadData = useCallback(async () => {
@@ -267,7 +270,15 @@ export default function ZyraTaskDetailPage() {
 
   function openSaveModal(indexes?: number[]) {
     setSavingDraftIndexes(indexes || selectedDrafts);
+    setSaveError(null);
     setSavingOpen(true);
+  }
+
+  function closeSaveModal() {
+    // Held open while a save is in flight, as Cancel already is, so its outcome can't land unseen.
+    if (working) return;
+    setSavingOpen(false);
+    setSaveError(null);
   }
 
   async function handleFeedback() {
@@ -340,6 +351,7 @@ export default function ZyraTaskDetailPage() {
     setWorking(true);
     setMessage(null);
     setError(null);
+    setSaveError(null);
     try {
       let suiteId = saveMode === "existing" ? targetSuiteId : "";
       if (saveMode === "new" && newSuiteName.trim()) {
@@ -355,7 +367,7 @@ export default function ZyraTaskDetailPage() {
       setSavingDraftIndexes(null);
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save testcases.");
+      setSaveError(err instanceof Error ? err.message : "Failed to save testcases.");
     } finally {
       setWorking(false);
     }
@@ -776,9 +788,10 @@ export default function ZyraTaskDetailPage() {
         </Card>
       )}
 
-      <Modal open={savingOpen} onClose={() => setSavingOpen(false)} title="Save generated testcases">
+      <Modal open={savingOpen} onClose={closeSaveModal} title="Save generated testcases">
         <div className="space-y-4">
           <p className="text-sm text-[var(--muted)]">Save {(savingDraftIndexes || selectedDrafts).length} selected testcase draft(s) into a suite.</p>
+          {saveError && <p role="alert" className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">{saveError}</p>}
           <Field>
             <FieldLabel>Suite target</FieldLabel>
             <Select value={saveMode} onChange={(event) => setSaveMode(event.target.value as SaveMode)}>
@@ -801,7 +814,7 @@ export default function ZyraTaskDetailPage() {
             </Field>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setSavingOpen(false)} disabled={working}>Cancel</Button>
+            <Button variant="secondary" onClick={closeSaveModal} disabled={working}>Cancel</Button>
             <Button onClick={handleSave} disabled={working || (savingDraftIndexes || selectedDrafts).length === 0 || (saveMode === "new" && !newSuiteName.trim())}>{working ? "Saving..." : "Save"}</Button>
           </div>
         </div>
