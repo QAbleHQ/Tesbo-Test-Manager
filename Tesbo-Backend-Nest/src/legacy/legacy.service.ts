@@ -15739,10 +15739,12 @@ export class LegacyService implements OnModuleInit {
     selectedItemIds: string[],
     queryParts: string[]
   ): Promise<{ knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>; knowledgeConfidence?: RagRetrievalConfidence }> {
-    if (selectedItemIds.length) {
-      return { knowledge: await this.knowledgeSnapshot(projectId, selectedItemIds) };
-    }
     const query = queryParts.filter(Boolean).join("\n\n");
+    if (selectedItemIds.length) {
+      // Still exactly the documents the user picked — `query` only chooses which passages of each
+      // one reach the model, instead of every document's first 1500 characters.
+      return { knowledge: await this.knowledgeSnapshot(projectId, selectedItemIds, query) };
+    }
     const [knowledgeFallback, ragDiagnostics] = await Promise.all([
       this.knowledgeSnapshot(projectId),
       this.ragRetrieval.retrieveWithDiagnostics(projectId, query)
@@ -15763,7 +15765,11 @@ export class LegacyService implements OnModuleInit {
     return "no strong match, showing recent documents";
   }
 
-  private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = []): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
+  // `query` applies to an explicit selection only: those documents were chosen by the user, not
+  // matched, so the request decides which of their passages to show (RagRetrievalService.
+  // focusOnQuery). The recency listing (no selection) is unrelated to the request by definition and
+  // keeps showing each document's opening.
+  private async knowledgeSnapshot(projectId: string, selectedItemIds: string[] = [], query = ""): Promise<Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>> {
     const selected = Array.from(new Set(selectedItemIds.filter(Boolean)));
     const values: any[] = [projectId];
     // Only approved AI-memory documents are trusted context; every other document type
@@ -15794,12 +15800,19 @@ export class LegacyService implements OnModuleInit {
             [projectId]
           )
     ]);
+    if (selected.length) {
+      const focused = await this.ragRetrieval.focusOnQuery(res.rows.map((row) => String(row.content_text || "")), query);
+      return res.rows.map((row, i) => ({
+        title: row.title || "Knowledge base item",
+        content: focused[i],
+        citation: { sourceType: "document" as const, sourceId: String(row.id) }
+      }));
+    }
     const documents = res.rows.map((row) => ({
       title: row.title || "Knowledge base item",
       content: String(row.content_text || "").slice(0, 1500),
       citation: { sourceType: "document" as const, sourceId: String(row.id) }
     }));
-    if (selected.length) return documents;
 
     const files = filesRes.rows.map((row) => ({
       title: row.original_file_name || "Uploaded file",
@@ -15860,14 +15873,23 @@ export class LegacyService implements OnModuleInit {
         [folderIds]
       ).catch(() => ({ rows: [] as Body[] }))
     ]);
-    const documents = docsRes.rows.map((row) => ({
+    // A folder named in the message is an explicit choice, not a search hit — so the message picks
+    // which passages of each item reach the model, rather than each item's first 1500 characters.
+    // One focusOnQuery call for documents and files together (a single passage-ranking round trip).
+    const extractedFiles = filesRes.rows.filter((row) => row.extracted_text);
+    const focused = await this.ragRetrieval.focusOnQuery(
+      [...docsRes.rows.map((row) => String(row.content_text || "")), ...extractedFiles.map((row) => String(row.extracted_text))],
+      message
+    );
+    const focusedFileText = new Map(extractedFiles.map((row, i) => [row.id, focused[docsRes.rows.length + i]]));
+    const documents = docsRes.rows.map((row, i) => ({
       title: row.title || "Knowledge base item",
-      content: String(row.content_text || "").slice(0, 1500),
+      content: focused[i],
       citation: { sourceType: "document" as const, sourceId: String(row.id) }
     }));
     const files = filesRes.rows.map((row) => ({
       title: row.original_file_name || "Uploaded file",
-      content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status),
+      content: row.extracted_text ? String(focusedFileText.get(row.id) ?? "") : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status),
       citation: { sourceType: "file" as const, sourceId: String(row.id) }
     }));
     if (!documents.length && !files.length) {
@@ -16667,10 +16689,17 @@ export class LegacyService implements OnModuleInit {
     // barely-related one. Only fires when knowledge is the ONLY grounding (no Jira/bug already
     // backing this — see the identical condition in generateZyraChatTestcasesWithAi's own
     // weaklyGrounded, which shapes the reply the user sees; this shapes what the model itself does).
+    //
+    // Both notes hedge only what the sources DON'T state. They used to hedge everything ("prefer
+    // generic-but-correct steps", "treat this as general practice"), and being the last instruction
+    // in the prompt they overrode the system prompt's use-the-exact-value rule — so a keyword-matched
+    // document stating "sessions expire after 20 minutes" still produced "verify the session times
+    // out". A value a source actually states is not invented detail, however the source was found.
+    const statedValuesRule = "Where one of these sources does apply and states an exact value or rule — a number, limit, duration, range, format, date, allowed or disallowed value, error message or code — use it exactly as stated in the relevant steps, test data and expected results.";
     const groundingNote = input.knowledgeConfidence === "weak"
-      ? "The knowledge base sources above are only a loose match for this request, not a confident one. Write drafts that make their assumptions explicit rather than stating specifics as settled fact, and prefer generic-but-correct steps over invented detail that isn't actually supported by what was retrieved."
+      ? `The knowledge base sources above are only a loose match for this request, not a confident one — check that each one really applies before relying on it. ${statedValuesRule} For anything no source states, make the assumption explicit rather than inventing specifics.`
       : input.knowledgeConfidence === "none" && input.knowledge.length > 0
-        ? "The knowledge base sources above did not clear the relevance bar for this request (they're shown anyway in case they're still useful) — treat this generation as closer to general practice than to grounded coverage, the same as if nothing had been found."
+        ? `The knowledge base sources above were not matched to this request by search — they're shown in case one still applies. ${statedValuesRule} Otherwise write from general practice, and never present an invented specific as this team's requirement.`
         : "";
     return [
       instruction,

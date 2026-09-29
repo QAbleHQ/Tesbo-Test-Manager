@@ -117,7 +117,10 @@ export type RbacTenantKind =
   | "zyra-kb-gate"
   // The same, driven through the chat page (ui/zyra.spec.ts). Separate from "zyra-kb-gate" because
   // the API and UI files run concurrently in different workers and each purges its own tenant.
-  | "zyra-ui-chat";
+  | "zyra-ui-chat"
+  // Zyra's exact-value KB grounding (api/zyra.spec.ts). Its own, genuinely-empty tenant: each test
+  // asserts which document is "KB 1", which any other suite's leftover docs would change.
+  | "zyra-exact-values";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";
