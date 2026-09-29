@@ -1331,6 +1331,41 @@ test.describe("assigning a test execution", () => {
       await cleanUp(cycle.id, testcase.id);
     }
   });
+
+  test("the full-page execute view uses the page width, with no empty gutters either side", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Execute Width ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+
+      // Wide enough that a centred narrow column leaves obvious blank space on both sides — the
+      // reported layout was a 672px (max-w-2xl) column centred in a ~1500px content area.
+      await page.setViewportSize({ width: 1600, height: 900 });
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`);
+
+      // Geometry rather than a class name: the breadcrumb header spans the full content region, so
+      // the details card should span it too, minus only the main's own horizontal padding.
+      const header = page.locator("header").filter({ has: page.getByRole("link", { name: "Run Detail" }) });
+      const details = page.locator("section").filter({ has: page.getByRole("heading", { name: "Test case details" }) });
+      await expect(details).toBeVisible();
+      const headerBox = await header.boundingBox();
+      const detailsBox = await details.boundingBox();
+      expect(headerBox, "the breadcrumb header did not render").not.toBeNull();
+      expect(detailsBox, "the test case details card did not render").not.toBeNull();
+
+      expect(
+        detailsBox!.x - headerBox!.x,
+        "the details card starts well right of the header — there is an empty left gutter",
+      ).toBeLessThan(60);
+      expect(
+        headerBox!.x + headerBox!.width - (detailsBox!.x + detailsBox!.width),
+        "the details card ends well left of the header — there is an empty right gutter",
+      ).toBeLessThan(60);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
 });
 
 test.describe("bulk assignment (run detail)", () => {

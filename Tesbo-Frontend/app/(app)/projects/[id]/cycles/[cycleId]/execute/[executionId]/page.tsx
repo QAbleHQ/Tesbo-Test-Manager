@@ -192,7 +192,7 @@ export default function ExecutionDetailPage() {
         />
       </header>
 
-      <main className="max-w-2xl mx-auto px-6 py-8">
+      <main className="w-full px-6 py-8">
         <div className="flex items-center gap-3 mb-6">
           <h1 className="text-xl font-bold text-[var(--foreground)]">
             {executionTitle(execution)}
