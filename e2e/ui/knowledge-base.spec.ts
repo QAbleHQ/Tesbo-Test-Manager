@@ -2109,4 +2109,94 @@ test.describe("knowledge base (UI)", () => {
     const stored = await saveAndReadStored(page, documentId, "Second line: 2 * 3 = 6");
     expect(stored.html).toContain("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
   });
+
+  // ─── Regression: the Create document dialog's Content box (Blank document template) stored every
+  //     line verbatim as its own paragraph, so Markdown typed or pasted there — "# Title",
+  //     "* item", "**bold**", "---" — was saved as literal text. This path never touches the
+  //     editor's paste handler (KBU-48..53); the text is converted when the document is created. ───
+
+  /** Creates a Blank document through the dialog with `content` in its Content box; returns its id. */
+  async function createBlankDocument(page: Page, title: string, content: string): Promise<string> {
+    await newMenu(page, "Create document");
+    const dialog = modal(page, "Create document");
+    await dialog.getByPlaceholder("e.g. Login Requirements").fill(title);
+    // "Blank document" is the default template, and the only one that shows the Content box.
+    await dialog.getByPlaceholder(/Write something before creating/).fill(content);
+    await dialog.getByRole("button", { name: "Create document" }).click();
+    await expect(page).toHaveURL(/\/knowledge-base\/documents\/[0-9a-f-]{36}$/);
+    return page.url().split("/").pop()!;
+  }
+
+  function storedDocument(documentId: string): { html: string; text: string } {
+    return {
+      html: scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      text: scalar(`SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+    };
+  }
+
+  test("KBU-54 Markdown in the Create document Content box is stored as headings, lists, bold and a divider — not raw syntax", async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    // The body from the bug report.
+    const documentId = await createBlankDocument(
+      page,
+      stamp("Create Markdown"),
+      [
+        "# SmartCart Test Document",
+        "",
+        "## 1. Feature Overview",
+        "",
+        "SmartCart is an online shopping application.",
+        "",
+        "### 1.1 Main Features",
+        "",
+        "* User Registration",
+        "* Product Search",
+        "",
+        "### 1.2 Important Rules",
+        "",
+        "**User must be logged in before placing an order.**",
+        "",
+        "---",
+        "",
+        "```",
+        "# not a heading",
+        "```",
+      ].join("\n"),
+    );
+
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor.locator("h1")).toHaveText("SmartCart Test Document");
+    await expect(editor.locator("h2")).toHaveText("1. Feature Overview");
+    await expect(editor.locator("h3")).toHaveText(["1.1 Main Features", "1.2 Important Rules"]);
+    await expect(editor.locator("ul > li")).toHaveText(["User Registration", "Product Search"]);
+    await expect(editor.locator("strong")).toHaveText("User must be logged in before placing an order.");
+    await expect(editor.locator("hr")).toHaveCount(1);
+    // Markdown inside a fenced block stays literal.
+    await expect(editor.locator("pre")).toContainText("# not a heading");
+
+    // Persisted at create time — not dependent on the editor's autosave.
+    const stored = storedDocument(documentId);
+    expect(stored.html).toContain("<h1>SmartCart Test Document</h1>");
+    expect(stored.html).toContain("<h3>1.1 Main Features</h3>");
+    expect(stored.html).toContain("<strong>User must be logged in before placing an order.</strong>");
+    expect(stored.html).toContain("<hr>");
+    expect(stored.text).not.toMatch(/^#{1,3} /m);
+    expect(stored.text).not.toMatch(/^\* /m);
+    expect(stored.text).not.toContain("**");
+
+    await page.reload();
+    await expect(page.locator(".ProseMirror").first().locator("h1")).toHaveText("SmartCart Test Document");
+  });
+
+  test("KBU-55 plain text with no Markdown in the Create document Content box is stored as before — one paragraph per line", async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const documentId = await createBlankDocument(page, stamp("Create plain"), "First plain line\nSecond line: 2 * 3 = 6");
+
+    await expect(page.locator(".ProseMirror").first().locator("p")).toHaveText(["First plain line", "Second line: 2 * 3 = 6"]);
+    expect(storedDocument(documentId).html).toBe("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
+  });
 });

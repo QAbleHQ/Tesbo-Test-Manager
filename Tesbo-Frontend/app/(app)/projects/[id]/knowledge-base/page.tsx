@@ -51,6 +51,8 @@ import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
+import { markdownToDocument } from "@/components/knowledge-base/editorExtensions";
+import { looksLikeMarkdown } from "@/components/knowledge-base/markdownPaste";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -1230,17 +1232,28 @@ function KnowledgeBasePageInner() {
     setSaving(true);
     setError(null);
     try {
-      const content =
-        template.key === "blank" && blankContent
-          ? doc(...blankContent.split(/\n+/).map((line) => paragraph(line)).filter((p) => p.content))
-          : template.content;
+      let body: { contentJson?: unknown; contentHtml?: string; contentText?: string };
+      if (template.key === "blank" && blankContent && looksLikeMarkdown(blankContent)) {
+        // The Content box is plain text, so Markdown typed or pasted into it (# headings, * lists,
+        // **bold**) is parsed into real formatting here — otherwise it was stored verbatim.
+        const parsed = markdownToDocument(blankContent);
+        body = { contentJson: parsed.json, contentHtml: parsed.html, contentText: parsed.text };
+      } else {
+        const content =
+          template.key === "blank" && blankContent
+            ? doc(...blankContent.split(/\n+/).map((line) => paragraph(line)).filter((p) => p.content))
+            : template.content;
+        body = {
+          contentJson: content || undefined,
+          contentHtml: content ? docNodeToHtml(content) : undefined,
+          contentText: content ? docNodeToText(content) : undefined,
+        };
+      }
       const created = await createKnowledgeDocument(projectId, {
         folderId: selectedFolderId,
         title,
         documentType: template.documentType,
-        contentJson: content || undefined,
-        contentHtml: content ? docNodeToHtml(content) : undefined,
-        contentText: content ? docNodeToText(content) : undefined,
+        ...body,
       });
       if (template.key === "blank") {
         try {
