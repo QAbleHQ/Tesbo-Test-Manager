@@ -33,6 +33,7 @@ import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 import { SuitesCacheService } from "../cache/suites-cache.service";
 import { TestcasesListCacheService } from "../cache/testcases-list-cache.service";
 import { ProjectOverviewCacheService } from "../cache/project-overview-cache.service";
+import { ZYRA_TRACE_CURRENT_STEP, ZyraTurnTraceRecorder, type ZyraOnStage, type ZyraTurnTrace } from "./zyra-turn-trace";
 
 type Body = Record<string, any>;
 
@@ -222,11 +223,10 @@ type ZyraTechnique = typeof ZYRA_TECHNIQUES[number];
 /** Frontend treats this path as "no custom logo" and renders the theme-aware lockup. */
 const DEFAULT_BRAND_LOGO_URL = "/brand/tesbo-logo-horizontal.svg";
 
-// Optional, best-effort progress narration for one chat turn (see zyra-progress.service.ts). Every
-// function below that accepts one defaults it to undefined and calls it with `?.()` — a caller that
-// never passes one gets behavior byte-for-byte identical to before this existed. Never awaited,
-// never allowed to change control flow: it only ever describes what the turn is already doing.
-type ZyraOnStage = (stage: string, meta?: Record<string, unknown>) => void;
+// Optional, best-effort narration for one chat turn — the ZyraOnStage type and the recorder that
+// turns these calls into the persisted trace live in zyra-turn-trace.ts. Every function below that
+// accepts one defaults it to undefined and calls it with `?.()`. Never awaited, never allowed to
+// change control flow: it only ever describes what the turn is already doing.
 
 // A resolved citation attached to a generated test case — which knowledge-base doc/file, Jira
 // ticket, existing test case, or bug actually informed it. Resolved once from the exact in-memory
@@ -317,6 +317,37 @@ type ZyraChatDecision = {
   // zyraFalseCompletionBanner's ALREADY_DISCLOSED bypass: a salvaged reply's own honest-sounding
   // "staged for review" phrasing must never excuse a turn that produced zero real operations.
   __salvaged?: boolean;
+  // The sources this turn resolved (its own message's, plus what it carried from the turn before —
+  // see ZyraTurnContextRefs). Set by buildZyraChatDecision on every decision it returns, persisted to
+  // zyra_chat_messages.context_refs by insertZyraAssistantMessage.
+  contextRefs?: ZyraTurnContextRefs;
+};
+
+// Which sources a chat turn resolved, by reference only — re-fetched (project-scoped) by the next
+// turn rather than trusted as stored content. Every lookup a turn makes is keyed on its own message
+// text, so a follow-up that names nothing ("yes", "generate them", "add negative cases too") would
+// otherwise resolve no ticket at all, and every draft citing the ticket the previous turn identified
+// was dropped by sanitizeZyraSourceRefs as a label this turn was never shown.
+type ZyraTurnContextRefs = {
+  // Explicitly referenced Jira keys (typed into a message, or carried from one that was) — these,
+  // unlike relevance matches, also link the drafted testcase (jiraIssueKey) and seed folder lookups.
+  jiraIssueKeys: string[];
+  // Every Jira ticket the turn read, explicit and relevance-matched.
+  jiraKeys: string[];
+  // Relevance-matched knowledge (folder + RAG) only — never the recency fallback, which is not a
+  // match for anything and would otherwise be carried forward as if it were.
+  knowledge: ZyraKnowledgeCitation[];
+  knowledgeConfidence: RagRetrievalConfidence;
+  bugIds: string[];
+};
+
+// The resolved content behind ZyraTurnContextRefs, in the shape the gathering step already uses.
+type ZyraTurnSources = {
+  jiraIssueKeys: string[];
+  jira: Array<{ key: string; summary: string; description: string }>;
+  knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
+  knowledgeConfidence: RagRetrievalConfidence;
+  bugs: NonNullable<ZyraGenerationInput["bugs"]>;
 };
 
 // What continueZyraChatMessage needs to pick a timed-out turn back up without repeating the work
@@ -10444,6 +10475,30 @@ export class LegacyService implements OnModuleInit {
     return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
   }
 
+  // One synced ticket by its exact key — what a Zyra "jira_ticket" citation opens. Deliberately NOT
+  // scoped to the currently enabled mapping the way jiraTickets (the Requirements list) is: Zyra
+  // reads jira_tickets by project_id alone (relevantJiraSnapshot/jiraSnapshot), and a disconnect or
+  // re-map keeps the old mapping's rows, so a ticket Zyra read and cited can belong to a mapping that
+  // has since been switched off. Resolving the citation through the list endpoint therefore reported
+  // a ticket Zyra had just read as "could not be found". Same scope as the reader, so anything Zyra
+  // could cite, this can open. Two rows can share a key only across two Jira connections in one
+  // project; the currently mapped one wins, then the most recently synced.
+  async jiraTicketByKey(projectId: string, userId: string | null | undefined, issueKey: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const key = String(issueKey || "").trim();
+    if (!key) throw new BadRequestException({ error: "Jira issue key is required." });
+    const res = await this.db.query(
+      `SELECT * FROM jira_tickets
+       WHERE project_id = $1 AND jira_issue_key = $2
+       ORDER BY CASE WHEN mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1) THEN 0 ELSE 1 END,
+                synced_at DESC NULLS LAST
+       LIMIT 1`,
+      [projectId, key]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Jira ticket not found" });
+    return toCamel(res.rows[0]);
+  }
+
   async jiraComment(projectId: string, userId: string | null | undefined, body: Body) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const connection = await this.getJiraConnection(projectId, true);
@@ -11517,20 +11572,35 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
     const session = await this.db.query(
-      "SELECT id, project_id, user_id, title, created_at, updated_at, active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan,
+              (processing_since IS NOT NULL AND processing_since >= now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes') AS turn_alive
+       FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
       [sessionId, projectId]
     );
     if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    const { turn_alive: turnAlive, ...sessionRow } = session.rows[0];
+    // Read-time view of work whose owner is gone, never a write from a GET. A user message still
+    // `processing` with no live claim in its session, or a resume whose heartbeat has lapsed, was
+    // left behind by a process that died mid-turn: nothing will ever settle it, and shown as-is it
+    // disables the composer (and keeps the page polling) forever. The next send's claim, or a
+    // Continue on the resume, is what actually rewrites these rows.
+    // A 'resuming' row with no resuming_since predates the heartbeat; it is left as-is rather than
+    // guessed dead.
     const messages = await this.db.query(
       `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
-              status, testcases, activity, created_at, review_request_id, resume_attempt
+              CASE
+                WHEN role = 'user' AND status = $3 AND NOT $4::boolean THEN $5
+                WHEN status = 'resuming' AND resuming_since < now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes' THEN 'timed_out'
+                ELSE status
+              END AS status,
+              testcases, activity, created_at, review_request_id, resume_attempt, trace
        FROM zyra_chat_messages
        WHERE session_id = $1 AND project_id = $2
        ORDER BY created_at ASC`,
-      [sessionId, projectId]
+      [sessionId, projectId, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, Boolean(turnAlive), LegacyService.ZYRA_USER_MESSAGE_FAILED]
     );
     return {
-      ...toCamel(session.rows[0]),
+      ...toCamel(sessionRow),
       messages: messages.rows.map((row) => {
         const item = toCamel(row);
         item.testcases = normalizeJsonArray(row.testcases);
@@ -11601,8 +11671,9 @@ export class LegacyService implements OnModuleInit {
    * scripts). The Zyra chat page uses startZyraChatMessage instead — see that method for why.
    */
   async sendZyraChatMessage(projectId: string, userId: string | null | undefined, sessionId: string, body: Body, onStage?: ZyraOnStage) {
-    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, "sent", onStage);
-    return this.runZyraChatTurn(turn, onStage);
+    const recorder = new ZyraTurnTraceRecorder(onStage);
+    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, "sent", recorder);
+    return this.runZyraChatTurn(turn, recorder);
   }
 
   /**
@@ -11628,8 +11699,9 @@ export class LegacyService implements OnModuleInit {
     onStage?: ZyraOnStage,
     onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
   ): Promise<{ accepted: true; userMessageId: string; session: Body }> {
-    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, onStage);
-    void this.runZyraChatTurn(turn, onStage).then(
+    const recorder = new ZyraTurnTraceRecorder(onStage);
+    const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, recorder);
+    void this.runZyraChatTurn(turn, recorder).then(
       (payload) => onSettled?.({ ok: true, payload }),
       (err) => {
         this.logger.warn(`Background Zyra turn failed (session ${sessionId}, message ${turn.userMessageId}): ${err instanceof Error ? err.message : String(err)}`);
@@ -11649,8 +11721,8 @@ export class LegacyService implements OnModuleInit {
     sessionId: string,
     body: Body,
     userMessageStatus: string,
-    onStage?: ZyraOnStage
-  ): Promise<{ projectId: string; userId: string | null | undefined; uid: string; sessionId: string; message: string; userMessageId: string; userMessageStatus: string; sessionRow: Body }> {
+    recorder: ZyraTurnTraceRecorder
+  ): Promise<{ projectId: string; userId: string | null | undefined; uid: string; sessionId: string; message: string; userMessageId: string; userMessageStatus: string; sessionRow: Body; claimToken: string }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
@@ -11670,11 +11742,18 @@ export class LegacyService implements OnModuleInit {
     // concurrent turn on this LLM call's latency for no benefit. The 5-minute staleness window means
     // a request that crashed before reaching runZyraChatTurn's `finally` release self-heals instead of
     // locking the session out permanently — no manual unlock, no deadlock possible.
+    //
+    // A live turn can outlast that window (router 60s + a salvage retry, then generation up to
+    // ZYRA_GENERATE_TIMEOUT_MAX_MS and a narrowed retry), so runZyraChatTurn heartbeats
+    // processing_since while it runs — the window now measures "time since the owning process was
+    // last alive", not "time since the turn started". claimToken makes the release owner-only: a turn
+    // whose claim was ever taken over can no longer clear the newer turn's claim on its way out.
+    const claimToken = randomUUID();
     const claimRes = await this.db.query(
-      `UPDATE zyra_chat_sessions SET processing_since = now()
-       WHERE id = $1 AND (processing_since IS NULL OR processing_since < now() - interval '5 minutes')
+      `UPDATE zyra_chat_sessions SET processing_since = now(), processing_token = $2
+       WHERE id = $1 AND (processing_since IS NULL OR processing_since < now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes')
        RETURNING id`,
-      [sessionId]
+      [sessionId, claimToken]
     );
     if (!claimRes.rows[0]) {
       throw new ConflictException({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." });
@@ -11687,7 +11766,7 @@ export class LegacyService implements OnModuleInit {
         "UPDATE zyra_chat_messages SET status = $2 WHERE session_id = $1 AND role = 'user' AND status = $3",
         [sessionId, LegacyService.ZYRA_USER_MESSAGE_FAILED, LegacyService.ZYRA_USER_MESSAGE_PROCESSING]
       );
-      onStage?.("received");
+      recorder.onStage("received");
       // id is returned because it seeds this turn's Langfuse trace id (see startZyraTurn). It is the
       // only stable identifier for the turn: seeding off the message text instead would give two
       // identical messages in one session the same deterministic trace id, collapsing both turns
@@ -11699,11 +11778,49 @@ export class LegacyService implements OnModuleInit {
         [sessionId, projectId, uid, message, userMessageStatus]
       );
       const userMessageId = String(userMessageRes.rows[0]?.id ?? "");
-      return { projectId, userId, uid, sessionId, message, userMessageId, userMessageStatus, sessionRow: sessionRes.rows[0] };
+      // The request's trace lives on the user message that asked for it — the one row that exists
+      // for the whole turn, success or failure — and is written as each step happens, so a reload
+      // mid-turn (or a progress stream that never attached) still reads where the turn has got to.
+      recorder.attach((trace) =>
+        this.db.query("UPDATE zyra_chat_messages SET trace = $2::jsonb WHERE id = $1", [userMessageId, JSON.stringify(trace)])
+      );
+      return { projectId, userId, uid, sessionId, message, userMessageId, userMessageStatus, sessionRow: sessionRes.rows[0], claimToken };
     } catch (err) {
-      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [sessionId]).catch(() => {});
+      await this.releaseZyraSessionClaim(sessionId, claimToken);
       throw err;
     }
+  }
+
+  /** How long a session claim / resume claim survives without a heartbeat before it counts as dead. */
+  private static readonly ZYRA_CLAIM_STALE_MINUTES = 5;
+  private static readonly ZYRA_HEARTBEAT_MS = 60_000;
+  // Longer than any turn can legitimately run (and than the page's own 15-minute wait), so a turn
+  // stuck on an await that never settles stops heartbeating and its claim goes stale on its own,
+  // rather than holding the session forever.
+  private static readonly ZYRA_HEARTBEAT_MAX_MS = 15 * 60_000;
+
+  /**
+   * Keeps a claim's timestamp fresh while its owner is alive. Best-effort: a missed beat costs at
+   * most one interval of the staleness window. Returns the stop function; always call it in `finally`.
+   */
+  private startZyraHeartbeat(sql: string, params: unknown[]): () => void {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (Date.now() - startedAt > LegacyService.ZYRA_HEARTBEAT_MAX_MS) {
+        clearInterval(timer);
+        return;
+      }
+      this.db.query(sql, params).catch(() => undefined);
+    }, LegacyService.ZYRA_HEARTBEAT_MS);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  /** Owner-only release — a no-op when this turn's claim was already superseded. */
+  private releaseZyraSessionClaim(sessionId: string, claimToken: string): Promise<unknown> {
+    return this.db
+      .query("UPDATE zyra_chat_sessions SET processing_since = NULL, processing_token = NULL WHERE id = $1 AND processing_token = $2", [sessionId, claimToken])
+      .catch(() => undefined);
   }
 
   /**
@@ -11713,24 +11830,40 @@ export class LegacyService implements OnModuleInit {
    */
   private async runZyraChatTurn(
     turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
-    onStage?: ZyraOnStage
+    recorder: ZyraTurnTraceRecorder
   ): Promise<{ message: Body; session: Body }> {
     const background = turn.userMessageStatus === LegacyService.ZYRA_USER_MESSAGE_PROCESSING;
-    const settleUserMessage = (status: string) =>
-      background
-        ? this.db.query("UPDATE zyra_chat_messages SET status = $2 WHERE id = $1 AND status = $3", [turn.userMessageId, status, LegacyService.ZYRA_USER_MESSAGE_PROCESSING])
-        : Promise.resolve();
+    // One statement for both, so a polling client can never see the settled status without the
+    // final trace. The trace is written whatever the status; the status only moves off
+    // `processing` (a sync turn's user row was never `processing` to begin with).
+    const settleUserMessage = async (status: string, trace: ZyraTurnTrace) => {
+      await recorder.drain();
+      await this.db.query(
+        `UPDATE zyra_chat_messages
+         SET trace = $4::jsonb, status = CASE WHEN $5::boolean AND status = $3 THEN $2 ELSE status END
+         WHERE id = $1`,
+        [turn.userMessageId, status, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, JSON.stringify(trace), background]
+      );
+    };
+    const stopHeartbeat = this.startZyraHeartbeat(
+      "UPDATE zyra_chat_sessions SET processing_since = now() WHERE id = $1 AND processing_token = $2",
+      [turn.sessionId, turn.claimToken]
+    );
     try {
-      const result = await this.executeZyraChatTurn(turn, onStage);
-      await settleUserMessage("sent");
+      const result = await this.executeZyraChatTurn(turn, recorder.onStage);
+      await settleUserMessage("sent", recorder.finish(result.message?.status === "timed_out" ? "timed_out" : undefined));
       return { message: result.message, session: background ? await this.zyraChatSession(turn.projectId, turn.userId, turn.sessionId) : result.session };
     } catch (err) {
-      await settleUserMessage(LegacyService.ZYRA_USER_MESSAGE_FAILED).catch(() => undefined);
+      // The reason is deliberately generic: `err` can be anything (a SQL error included), and the
+      // trace is shown to the user. The detail still reaches the logs and, for a sync turn, the
+      // caller's own HTTP error response.
+      await settleUserMessage(LegacyService.ZYRA_USER_MESSAGE_FAILED, recorder.fail("This turn did not complete.")).catch(() => undefined);
       throw err;
     } finally {
-      // Best-effort: if this fails to run at all (process crash), the 5-minute staleness window
-      // in beginZyraChatTurn is what actually prevents a permanent lockout, not this line.
-      await this.db.query("UPDATE zyra_chat_sessions SET processing_since = NULL WHERE id = $1", [turn.sessionId]).catch(() => {});
+      stopHeartbeat();
+      // Best-effort: if this fails to run at all (process crash), the heartbeat stops with the
+      // process and the staleness window in beginZyraChatTurn is what prevents a permanent lockout.
+      await this.releaseZyraSessionClaim(turn.sessionId, turn.claimToken);
     }
   }
 
@@ -11755,13 +11888,27 @@ export class LegacyService implements OnModuleInit {
       // mid-commit can't race this message and resurrect a plan the user just walked away from.
       if (existingPlan) {
         await this.zyraSupersedePlan(sessionId);
+        // The one way a running plan is cancelled besides Stop — recorded so the trace says this
+        // message is what ended it, rather than the plan's batches just silently stopping.
+        onStage?.("plan:superseded", {
+          planStatus: String(existingPlan.status || ""),
+          doneCount: Number(existingPlan.doneCount || 0),
+          totalCount: Number(existingPlan.totalCount || 0)
+        });
       }
       // A genuinely new message means the user has moved on from whatever turn timed out earlier in
       // this session — expire any dangling checkpoint so Continue can no longer resolve to context this
       // message has superseded. Deliberately scoped to 'timed_out' only: a checkpoint a concurrent
       // continueZyraChatMessage call has already claimed (status 'resuming') is left alone so that
       // in-flight resume can still finish and post its own message — see continueZyraChatMessage.
-      await this.db.query("UPDATE zyra_chat_messages SET status = 'expired' WHERE session_id = $1 AND status = 'timed_out'", [sessionId]);
+      // A 'resuming' claim whose heartbeat has lapsed has no live resume behind it any more (its
+      // process died) — it reads as timed_out (zyraChatSession), so it expires like one.
+      await this.db.query(
+        `UPDATE zyra_chat_messages SET status = 'expired'
+         WHERE session_id = $1
+           AND (status = 'timed_out' OR (status = 'resuming' AND resuming_since < now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes'))`,
+        [sessionId]
+      );
 
       let decision = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, undefined, onStage);
       // Which trace the FINAL decision actually came from — see the reassignment below.
@@ -11787,12 +11934,14 @@ export class LegacyService implements OnModuleInit {
           const hint = pending.kind === "proposal"
             ? `the previous turn was routed as '${pending.actionType}' but staged/wrote nothing — it was a PROPOSAL. The user's message you are answering now ("${message.slice(0, 120)}") is the confirmation for it. Emit the '${pending.actionType}' operation(s) for exactly what was proposed.`
             : `the previous turn ended with an offer to act ("${pending.content.slice(0, 300)}"). The user's message you are answering now ("${message.slice(0, 120)}") confirms that offer. Work out exactly what was offered and emit the corresponding operation(s) (create/update/archive/move_to_suite as appropriate).`;
-          // No onStage here (unlike the first call above): this is a full second pass through
-          // context-gathering/routing/generating on the SAME turnId — re-narrating it would render
-          // as confusing duplicate backlog rows for a rare retry path that already discloses itself
-          // in its own reply wording via the [confirmation-retry:...] marker.
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint);
+          // A full second pass through context-gathering/routing/generating. Narrated behind its own
+          // `retrying` step, so its steps read as attempt 2 of each rather than as unexplained
+          // duplicates — and so the trace shows the context the persisted decision actually used,
+          // not only the discarded first attempt's.
+          onStage?.("retrying", { reason: "confirmation", previousAction: pending.actionType || null });
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
           const fired = retried.operations.length > 0;
+          onStage?.("retrying", { fired }, "update");
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
           decision = { ...(fired ? retried : decision), reasoningSummary: `[${marker}] ${(fired ? retried : decision).reasoningSummary || ""}`.trim() };
           // Found by review: recordReconciliation used to always point at the FIRST attempt's trace
@@ -11802,7 +11951,9 @@ export class LegacyService implements OnModuleInit {
           if (fired) traceMessageId = `${userMessageId}:confirm-retry`;
         }
       }
-      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
+      // Only a turn that has operations to apply stages anything — an answer turn never reaches
+      // this step, so its trace doesn't claim a staging pass that did nothing.
+      if (decision.operations.length) onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
@@ -11853,8 +12004,11 @@ export class LegacyService implements OnModuleInit {
     // processZyraChatResume depending on whether this attempt itself timed out again. See
     // continueZyraChatMessage's ZYRA_RESUME_ATTEMPT_CAP check.
     resumeAttempt?: number;
+    // Only for a reply that is NOT the direct answer to a user message in this session (a resumed
+    // turn) — an ordinary turn's trace lives on the user message that asked for it.
+    trace?: ZyraTurnTrace | null;
   }): Promise<Body> {
-    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId, resumeAttempt } = params;
+    const { sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId, resumeAttempt, trace } = params;
     const status = decision.timedOut ? "timed_out" : "completed";
     const resumeCheckpoint = decision.timedOut && decision.resumeCheckpoint ? JSON.stringify(decision.resumeCheckpoint) : null;
     const finalReply = this.finalizeZyraChatReply(decision, applied, testcases);
@@ -11885,9 +12039,9 @@ export class LegacyService implements OnModuleInit {
     }
     const assistant = await this.db.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint, resume_attempt)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12)
-       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id, resume_attempt`,
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, review_request_id, resume_checkpoint, resume_attempt, context_refs, trace)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11::jsonb,$12,$13::jsonb,$14::jsonb)
+       RETURNING id, session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, created_at, review_request_id, resume_attempt, trace`,
       [
         sessionId,
         projectId,
@@ -11900,7 +12054,11 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(activity),
         applied.reviewRequestId || null,
         resumeCheckpoint,
-        resumeAttempt || 0
+        resumeAttempt || 0,
+        // Read back by the next turn in this session (zyraPriorTurnContextRefs) — never returned to
+        // the frontend, same as resume_checkpoint.
+        decision.contextRefs ? JSON.stringify(decision.contextRefs) : null,
+        trace ? JSON.stringify(trace) : null
       ]
     );
     const item = toCamel(assistant.rows[0]);
@@ -11963,8 +12121,11 @@ export class LegacyService implements OnModuleInit {
     }
 
     const claim = await this.db.query(
-      `UPDATE zyra_chat_messages SET status = 'resuming'
-       WHERE id = $1 AND session_id = $2 AND project_id = $3 AND status = 'timed_out'
+      // Also reclaims a 'resuming' row whose heartbeat has lapsed: its resume died with its process
+      // (zyraChatSession already shows it as timed_out, with Continue), so nothing live owns it.
+      `UPDATE zyra_chat_messages SET status = 'resuming', resuming_since = now()
+       WHERE id = $1 AND session_id = $2 AND project_id = $3
+         AND (status = 'timed_out' OR (status = 'resuming' AND resuming_since < now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes'))
        RETURNING resume_checkpoint`,
       [messageId, sessionId, projectId]
     );
@@ -12010,16 +12171,33 @@ export class LegacyService implements OnModuleInit {
   ): Promise<void> {
     const resumeMessage = String(checkpoint.message || "");
     const checkpointUserMessageId = String(checkpoint.userMessageId || "") || undefined;
+    // This attempt's trace is written live onto the message being resumed (the one row that exists
+    // throughout, and the one a reload mid-resume renders), then moved onto the new reply on success.
+    // Guarded on 'resuming' so a write can never land after this attempt has already settled.
+    const recorder = new ZyraTurnTraceRecorder(onStage);
+    recorder.attach((trace) =>
+      this.db.query("UPDATE zyra_chat_messages SET trace = $2::jsonb WHERE id = $1 AND status = 'resuming'", [messageId, JSON.stringify(trace)])
+    );
+    const stage = recorder.onStage;
+    stage("resuming", {
+      attempt: priorAttempts + 1,
+      fromStage: checkpoint.stage || null,
+      requestedCount: typeof checkpoint.routedCount?.requestedCount === "number" ? checkpoint.routedCount.requestedCount : null
+    });
+    const stopHeartbeat = this.startZyraHeartbeat(
+      "UPDATE zyra_chat_messages SET resuming_since = now() WHERE id = $1 AND status = 'resuming'",
+      [messageId]
+    );
     try {
       const decision = checkpoint.stage === "generate"
         ? await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, {
             routedSuite: checkpoint.routedSuite ?? null,
             routedCount: checkpoint.routedCount ?? {}
-          }, undefined, onStage)
-        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, onStage);
+          }, undefined, stage)
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, resumeMessage, checkpointUserMessageId, undefined, undefined, stage);
       // Same two stages sendZyraChatMessage narrates, mirrored here so a resumed turn's backlog has
       // the identical shape as a fresh one — see the "unify both flows" design.
-      onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
+      if (decision.operations.length) stage("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
       const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
       const activity = [
         { actor: "user", title: "Continued after timeout", detail: resumeMessage.slice(0, 320), createdAt: new Date().toISOString() },
@@ -12033,33 +12211,41 @@ export class LegacyService implements OnModuleInit {
           [sessionId, JSON.stringify({ testcaseIds: ids, totalCount: ids.length })]
         );
       }
-      onStage?.("finalizing", {
+      stage("finalizing", {
         savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
         proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
       });
+      const trace = recorder.finish(decision.timedOut ? "timed_out" : undefined);
+      await recorder.drain();
       // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
       // row; a genuine completion resets it to 0 — see insertZyraAssistantMessage's resumeAttempt
       // param and the "cap is per-chain" note on continueZyraChatMessage.
       const nextResumeAttempt = decision.timedOut ? priorAttempts + 1 : 0;
       const item = await this.insertZyraAssistantMessage({
         sessionId, projectId, uid, decision, applied, testcases, activity,
-        traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt
+        traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt, trace
       });
       // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
       // again. A fresh timeout (decision.timedOut again) instead lands on the NEW message's own
-      // resume_checkpoint, so Continue keeps working across repeated timeouts.
-      await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed' WHERE id = $1 AND status = 'resuming'", [messageId]);
+      // resume_checkpoint, so Continue keeps working across repeated timeouts. Its live trace is
+      // cleared now the new reply carries it, so the original message reads as its first attempt again.
+      await this.db.query("UPDATE zyra_chat_messages SET status = 'resumed', trace = NULL WHERE id = $1 AND status = 'resuming'", [messageId]);
       onSettled?.({ ok: true, payload: { message: item, session: await this.zyraChatSession(projectId, userId, sessionId) } });
     } catch (err) {
       // Anything that throws here (not a timeout — those are caught inside buildZyraChatDecision and
       // returned as another timed-out decision, not thrown) leaves this checkpoint resumable again
       // rather than stranding it in 'resuming' forever. Still counts toward the cap: the user's
       // experience (clicked Continue, still failed, offered Continue again) is the same either way.
+      // The failed attempt's trace stays on the message, next to the Continue it offers again.
+      const trace = recorder.fail("This resume did not complete.");
+      await recorder.drain();
       await this.db.query(
-        "UPDATE zyra_chat_messages SET status = 'timed_out', resume_attempt = $2 WHERE id = $1 AND status = 'resuming'",
-        [messageId, priorAttempts + 1]
-      );
+        "UPDATE zyra_chat_messages SET status = 'timed_out', resume_attempt = $2, trace = $3::jsonb WHERE id = $1 AND status = 'resuming'",
+        [messageId, priorAttempts + 1, JSON.stringify(trace)]
+      ).catch(() => undefined);
       onSettled?.({ ok: false, message: "This turn did not complete." });
+    } finally {
+      stopHeartbeat();
     }
   }
 
@@ -12097,7 +12283,9 @@ export class LegacyService implements OnModuleInit {
           uid,
           `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${totalCount - doneCount}.`,
           [],
-          []
+          [],
+          "answer",
+          LegacyService.zyraSingleStepTrace("plan:stop", { doneCount, totalCount, remainingCount: totalCount - doneCount })
         );
       });
     }
@@ -12147,7 +12335,9 @@ export class LegacyService implements OnModuleInit {
         uid,
         `Resuming — ${doneCount}/${totalCount} scenarios covered so far, continuing with the remaining ${scenariosRemaining}.`,
         [],
-        []
+        [],
+        "answer",
+        LegacyService.zyraSingleStepTrace("plan:resume", { doneCount, totalCount, remainingCount: scenariosRemaining })
       );
     }).catch((err) => {
       // Thrown deliberately above when the LOCKED read shows the plan is no longer resumable
@@ -12179,6 +12369,40 @@ export class LegacyService implements OnModuleInit {
    */
   private static zyraKnowledgeDisabledRetrieval(): Awaited<ReturnType<RagRetrievalService["retrieveWithDiagnostics"]>> {
     return { items: [], semanticSearchRan: false, reason: "Knowledge base access is disabled for Zyra in this project.", topScore: null, confidence: "none" };
+  }
+
+  /**
+   * The four context steps, from exactly what was gathered and handed on — shared by a chat turn
+   * and a background plan batch so the two can't drift in what they claim was read.
+   */
+  private static emitZyraContextSteps(
+    onStage: ZyraOnStage | undefined,
+    capabilities: ZyraCapabilities,
+    gathered: {
+      knowledge: Array<{ title: string }>;
+      jira: Array<{ key: string; summary: string }>;
+      existingTestcases: Array<{ externalId?: unknown; title?: unknown }>;
+      bugs: Array<{ id?: unknown; title?: unknown }>;
+    }
+  ): void {
+    if (!onStage) return;
+    const kbOff = "Knowledge base access is off for this project";
+    onStage("context:knowledge", LegacyService.zyraGatedBacklogMeta(capabilities.knowledgeBase, gathered.knowledge.map((k) => ({ title: k.title })), kbOff));
+    onStage("context:jira", { items: gathered.jira.map((j) => ({ key: j.key, summary: j.summary })), count: gathered.jira.length });
+    onStage("context:testcases", { items: gathered.existingTestcases.map((tc) => ({ externalId: tc.externalId, title: tc.title })), count: gathered.existingTestcases.length });
+    onStage("context:bugs", LegacyService.zyraGatedBacklogMeta(capabilities.knowledgeBase, gathered.bugs.map((b) => ({ id: b.id, title: b.title })), kbOff));
+  }
+
+  /** How many drafts a generation call actually returned — read off its create operations. */
+  private static zyraDraftedCount(decision: ZyraChatDecision): number {
+    return decision.operations.filter((op) => op.type === "create").length;
+  }
+
+  /** The whole trace of a request that is one step (Stop / Resume on a plan) — still recorded, not invented. */
+  private static zyraSingleStepTrace(stage: string, meta: Record<string, unknown>): ZyraTurnTrace {
+    const recorder = new ZyraTurnTraceRecorder();
+    recorder.onStage(stage, meta);
+    return recorder.finish();
   }
 
   /** Counts by `type` for the live progress backlog's "staging" step — e.g. `{ create: 5 }`. */
@@ -12214,7 +12438,25 @@ export class LegacyService implements OnModuleInit {
   // of its own previous turns actually persisted testcases (see zyraTranscript) — and what the
   // system does with the answer is validated, capability-gated, and reconciled against reality
   // (applyZyraChatOperations, reconcileZyraReply). The model decides; it never writes.
+  //
+  // A thin wrapper so the sources the turn resolved ride out on EVERY decision it returns — answer,
+  // create, degraded, timed out — without touching each of decideZyraChatTurn's many return sites.
   private async buildZyraChatDecision(
+    projectId: string,
+    userId: string,
+    sessionId: string,
+    message: string,
+    userMessageId?: string,
+    resume?: { routedSuite: { id?: string; name?: string } | null; routedCount: { requestedCount?: unknown; exhaustive?: boolean } },
+    confirmationHint?: string,
+    onStage?: ZyraOnStage
+  ): Promise<ZyraChatDecision> {
+    const turn: { contextRefs?: ZyraTurnContextRefs } = {};
+    const decision = await this.decideZyraChatTurn(projectId, userId, sessionId, message, userMessageId, resume, confirmationHint, onStage, turn);
+    return turn.contextRefs ? { ...decision, contextRefs: turn.contextRefs } : decision;
+  }
+
+  private async decideZyraChatTurn(
     projectId: string,
     userId: string,
     sessionId: string,
@@ -12234,7 +12476,9 @@ export class LegacyService implements OnModuleInit {
     confirmationHint?: string,
     // Optional progress narration (see ZyraOnStage) — undefined for every caller that doesn't pass
     // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
-    onStage?: ZyraOnStage
+    onStage?: ZyraOnStage,
+    // Filled in once this turn's sources are resolved — see buildZyraChatDecision.
+    turn: { contextRefs?: ZyraTurnContextRefs } = {}
   ): Promise<ZyraChatDecision> {
     // No onStage call here — the old single "context" announcement fired before any gathering even
     // started, and provably said nothing about what was actually found. See the granular
@@ -12246,7 +12490,8 @@ export class LegacyService implements OnModuleInit {
     const traceMessageId = userMessageId || `${sessionId}:${Date.now()}`;
     const zyraTurnTraceSeed = confirmationHint ? `${traceMessageId}:confirm-retry` : traceMessageId;
     const jiraKeyResolution = await this.resolveJiraIssueKeysDetailed(projectId, message);
-    const mentionedJiraKeys = jiraKeyResolution.keys;
+    // Only the keys THIS message names; merged with the previous turn's below (see turnSources).
+    const ownJiraKeys = jiraKeyResolution.keys;
     // Read before gathering, not after: with knowledge-base access OFF, no knowledge-base or bug
     // lookup may run at all — not the recency snapshot, not the folder match, not the semantic
     // search (which also spends an embeddings call on the user's message). This used to be read
@@ -12254,7 +12499,7 @@ export class LegacyService implements OnModuleInit {
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
     const capabilities = this.normalizeZyraCapabilities(zyraAgentSettings.capabilities);
     const kbEnabled = capabilities.knowledgeBase;
-    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, mentionedJira, lastCompletedPlanRes, bugs, pendingCreateBatches] = await Promise.all([
+    const [history, knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, allocation, projectSnapshot, ownJira, lastCompletedPlanRes, ownBugs, pendingCreateBatches, carriedSources] = await Promise.all([
       this.db.query(
         `SELECT role, content, reasoning_summary, action_type, testcases
          FROM zyra_chat_messages
@@ -12276,13 +12521,13 @@ export class LegacyService implements OnModuleInit {
         : Promise.resolve(LegacyService.zyraKnowledgeDisabledRetrieval()),
       // Direct folder-name lookup — recency/embeddings never match on a folder's name alone
       // (e.g. "knowledge base 'EAD-11215' folder"), only on document content.
-      kbEnabled ? this.knowledgeFolderSnapshot(projectId, message, mentionedJiraKeys) : Promise.resolve([]),
+      kbEnabled ? this.knowledgeFolderSnapshot(projectId, message, ownJiraKeys) : Promise.resolve([]),
       this.existingTestcaseSnapshot(projectId, message, ""),
       this.zyraAiAllocation(projectId),
       this.zyraChatProjectSnapshot(projectId),
       // Relevance-matched, not just explicitly-named: a request that never types an issue key still
       // needs the tickets it is about (see relevantJiraSnapshot).
-      this.relevantJiraSnapshot(projectId, message, mentionedJiraKeys),
+      this.relevantJiraSnapshot(projectId, message, ownJiraKeys),
       this.db.query("SELECT last_completed_plan FROM zyra_chat_sessions WHERE id = $1", [sessionId]).catch(() => ({ rows: [] as Body[] })),
       // Tesbo's own bug tracker (separate from Jira) — relevance-matched, same principle as
       // relevantJiraSnapshot: an unrelated bug in the citation list is worse than none. Gated by the
@@ -12291,17 +12536,38 @@ export class LegacyService implements OnModuleInit {
       // Still-unsaved create batch(es) from earlier in this session — see zyraPendingCreateBatches.
       // Told to the model alongside lastCompletedPlanCount below so "Most recently generated batch"
       // covers both what was actually saved and what is only staged, instead of only ever the former.
-      this.zyraPendingCreateBatches(projectId, sessionId)
+      this.zyraPendingCreateBatches(projectId, sessionId),
+      // What the previous turn resolved, re-fetched by reference — see ZyraTurnContextRefs.
+      this.zyraPriorTurnContextRefs(projectId, sessionId).then((refs) => this.zyraResolveContextRefs(projectId, refs, kbEnabled))
     ]);
     const ragKnowledge = ragDiagnostics.items;
-    const usedRecencyFallback = !ragKnowledge.length;
-    const knowledge = [...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge : knowledgeFallback)];
+    // Every lookup above is keyed on this message alone, so a follow-up that names nothing ("yes",
+    // "generate them") resolves nothing — and the ticket the previous turn identified is then absent
+    // from the generation prompt, and every draft citing it loses that citation in
+    // sanitizeZyraSourceRefs. Merging the previous turn's sources carries the subject forward; with
+    // nothing carried, turnSources is exactly this message's own.
     // A folder-name match is explicit and deliberate ("the EAD-11215 folder") — never scored by
     // similarity, so it counts as strong grounding on its own regardless of what RAG found. A
-    // recency-fallback document (used only when RAG found nothing) is not a relevance match at all,
-    // and correctly inherits "none"/"weak" from ragDiagnostics.confidence rather than being treated
-    // as if it were.
-    const knowledgeConfidence: RagRetrievalConfidence = folderKnowledge.length > 0 ? "strong" : ragDiagnostics.confidence;
+    // recency-fallback document (used only when nothing relevant was found) is not a relevance match
+    // at all, so it is neither part of turnSources nor carried to the next turn, and correctly
+    // inherits "none"/"weak" from ragDiagnostics.confidence rather than being treated as if it were.
+    const turnSources = LegacyService.mergeZyraTurnSources(
+      {
+        jiraIssueKeys: ownJiraKeys,
+        jira: ownJira,
+        knowledge: [...folderKnowledge, ...ragKnowledge],
+        knowledgeConfidence: folderKnowledge.length > 0 ? "strong" : ragDiagnostics.confidence,
+        bugs: ownBugs
+      },
+      carriedSources
+    );
+    turn.contextRefs = LegacyService.zyraContextRefsFor(turnSources);
+    const mentionedJiraKeys = turnSources.jiraIssueKeys;
+    const mentionedJira = turnSources.jira;
+    const bugs = turnSources.bugs;
+    const knowledgeConfidence: RagRetrievalConfidence = turnSources.knowledgeConfidence;
+    const usedRecencyFallback = !ragKnowledge.length && turnSources.knowledge.length === folderKnowledge.length;
+    const knowledge = [...turnSources.knowledge, ...(usedRecencyFallback ? knowledgeFallback : [])];
 
     // Opened once the gathered context exists, so the trace carries what Zyra actually read rather
     // than only what it later claims to have read.
@@ -12355,14 +12621,6 @@ export class LegacyService implements OnModuleInit {
     );
     // Oldest-first: the transcript handed to the model must read in conversation order.
     const chronologicalHistory = [...history.rows].reverse();
-    const key = allocation.key;
-    if (!key) {
-      return this.zyraDegradedDecision(message, existingTestcases, allocation.reason);
-    }
-
-    const provider = String(key.provider || "openai").toLowerCase();
-    const model = normalizeProviderModel(provider, key.default_model);
-    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     // Already empty when the capability is OFF (nothing was fetched above); the ternaries stay as a
     // second line of defence so a future edit to the gathering block can't leak KB content back in.
     const knowledgeForChat = kbEnabled ? knowledge : [];
@@ -12375,15 +12633,25 @@ export class LegacyService implements OnModuleInit {
     // trust failure this feature exists to prevent. A capability that's off still gets its own
     // step, marked `skipped`, rather than silently vanishing — showing Zyra correctly respected the
     // setting is itself trust-building, not just showing what it read.
+    //
+    // Emitted before the AI-key check below, not after: the gathering above has already run either
+    // way, and the degraded reply still answers from exactly this context.
     const knowledgeBacklogItems = LegacyService.dedupeZyraKnowledgeItems(knowledgeForChat);
-    onStage?.("context:knowledge", LegacyService.zyraGatedBacklogMeta(
-      capabilities.knowledgeBase, knowledgeBacklogItems.map((k) => ({ title: k.title })), "Knowledge base access is off for this project"
-    ));
-    onStage?.("context:jira", { items: mentionedJira.map((j) => ({ key: j.key, summary: j.summary })), count: mentionedJira.length });
-    onStage?.("context:testcases", { items: existingTestcases.map((tc) => ({ externalId: tc.externalId, title: tc.title })), count: existingTestcases.length });
-    onStage?.("context:bugs", LegacyService.zyraGatedBacklogMeta(
-      capabilities.knowledgeBase, bugsForChat.map((b) => ({ id: b.id, title: b.title })), "Knowledge base access is off for this project"
-    ));
+    LegacyService.emitZyraContextSteps(onStage, capabilities, {
+      knowledge: knowledgeBacklogItems,
+      jira: mentionedJira,
+      existingTestcases,
+      bugs: bugsForChat
+    });
+    const key = allocation.key;
+    if (!key) {
+      onStage?.("routing", { status: "blocked", reason: allocation.reason });
+      return this.zyraDegradedDecision(message, existingTestcases, allocation.reason);
+    }
+
+    const provider = String(key.provider || "openai").toLowerCase();
+    const model = normalizeProviderModel(provider, key.default_model);
+    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -12470,8 +12738,17 @@ export class LegacyService implements OnModuleInit {
     // suite/count it already decided. `context` above still gets built even though it goes unused
     // here; keeping this branch a plain early-return, rather than restructuring the whole function
     // around it, is what keeps the diff against the non-resume path small enough to trust.
+    // Records that the decision was refused by a capability gate, so the trace shows why nothing
+    // happened rather than an ordinary "answer": on the routing step that chose the action, or — a
+    // resume, which skips routing — as the generation step that was refused.
+    const blockedBy = (capability: keyof ZyraCapabilities, action: string | null) => {
+      const blocked = { status: "blocked", reason: LegacyService.ZYRA_CAPABILITY_OFF_REASON[capability] };
+      if (resume) onStage?.("generating", blocked);
+      else onStage?.("routing", { ...(action ? { action } : {}), ...blocked }, "update");
+      return this.zyraCapabilityDisabled(capability, existingTestcases.length);
+    };
     if (resume) {
-      if (!capabilities.generation) return this.zyraCapabilityDisabled("generation", existingTestcases.length);
+      if (!capabilities.generation) return blockedBy("generation", null);
       return this.zyraHandleChatCreate({
         projectId,
         userId,
@@ -12494,7 +12771,8 @@ export class LegacyService implements OnModuleInit {
         bugsForChat,
         onStage,
         trace,
-        knowledgeConfidence
+        knowledgeConfidence,
+        contextRefs: turn.contextRefs
       });
     }
 
@@ -12530,6 +12808,7 @@ export class LegacyService implements OnModuleInit {
           salvaged: true,
           errorMessage: "Router JSON unparseable; only reply/reasoningSummary salvaged. Retrying once."
         });
+        onStage?.("routing", { attempts: 2 }, "update");
         const retried = await callRouter();
         await this.recordZyraTokenUsage(projectId, "chat_router", provider, model, retried.__zyraUsage || {});
         raw = retried;
@@ -12546,6 +12825,7 @@ export class LegacyService implements OnModuleInit {
           errorMessage: "Router JSON unparseable on retry too; returning an honest failure instead of the salvaged narrative."
         });
         await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { stage: "routing_salvaged" });
+        onStage?.("routing", { status: "failed", reason: "The AI response could not be read, twice" }, "update");
         const decision = this.zyraSalvagedRouterDecision(existingTestcases.length);
         endZyraTurn(trace, { reply: decision.reply, actionType: decision.actionType, operationsRequested: 0 });
         return decision;
@@ -12569,8 +12849,12 @@ export class LegacyService implements OnModuleInit {
         actionType: modelIntent,
         operationsRequested: normalizeJsonArray(raw.operations).length
       });
+      // What the router decided — the one fact that explains every step after this one.
+      onStage?.("routing", { action: modelIntent, operationCount: normalizeJsonArray(raw.operations).length }, "update");
       if (modelIntent === "jira_pending_testcases") {
+        onStage?.("tool:jira_coverage");
         const toolDecision = await this.analyzeZyraJiraTestcaseCoverage(projectId);
+        onStage?.("summarizing");
         return this.finalizeZyraToolDecisionWithAi({
           projectId,
           key,
@@ -12583,13 +12867,13 @@ export class LegacyService implements OnModuleInit {
         });
       }
       if (modelIntent === "suite" && !capabilities.suiteOperations) {
-        return this.zyraCapabilityDisabled("suiteOperations", existingTestcases.length);
+        return blockedBy("suiteOperations", modelIntent);
       }
       if ((modelIntent === "update" || modelIntent === "archive") && !capabilities.testcaseStorage) {
-        return this.zyraCapabilityDisabled("testcaseStorage", existingTestcases.length);
+        return blockedBy("testcaseStorage", modelIntent);
       }
       if (modelIntent === "create") {
-        if (!capabilities.generation) return this.zyraCapabilityDisabled("generation", existingTestcases.length);
+        if (!capabilities.generation) return blockedBy("generation", modelIntent);
         // The router picked create but does not author the drafts — generation is its own call,
         // handed off to zyraHandleChatCreate (shared with continueZyraChatMessage's resume-from-
         // generate path, so a timeout here and a timeout on resume are handled identically).
@@ -12615,7 +12899,8 @@ export class LegacyService implements OnModuleInit {
           bugsForChat,
           onStage,
           trace,
-          knowledgeConfidence
+          knowledgeConfidence,
+          contextRefs: turn.contextRefs
         });
       }
       return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
@@ -12624,11 +12909,15 @@ export class LegacyService implements OnModuleInit {
       if (this.isZyraTimeoutError(err)) {
         // Nothing was resolved yet — routing itself never answered — so there is nothing to skip on
         // resume; continueZyraChatMessage just retries buildZyraChatDecision from this same message.
+        onStage?.(ZYRA_TRACE_CURRENT_STEP, { status: "timed_out", timeoutMs: LegacyService.ZYRA_ROUTER_TIMEOUT_MS }, "update");
         recordGeneration(trace, { name: "router", provider, model, input: { message }, errorMessage: "timeout" });
         endZyraTurn(trace, { reply: "timeout", actionType: "timeout" });
         await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "routing", timeoutMs: LegacyService.ZYRA_ROUTER_TIMEOUT_MS });
         return this.zyraTimedOutDecision("router", message, userMessageId, existingTestcases.length);
       }
+      // The open step, not "routing" by name: the jira tool's own summarizing call fails here too.
+      // errorDetail is what the degraded reply already tells the user.
+      onStage?.(ZYRA_TRACE_CURRENT_STEP, { status: "failed", reason: errorDetail }, "update");
       recordGeneration(trace, { name: "router", provider, model, input: { message }, errorMessage: errorDetail });
       endZyraTurn(trace, { reply: errorDetail, actionType: "error" });
       await this.logProjectActivity(projectId, userId, "zyra_chat_ai_failed", "zyra_chat", sessionId, "Zyra chat", { message: errorDetail, stage: "routing" });
@@ -12671,12 +12960,14 @@ export class LegacyService implements OnModuleInit {
     onStage?: ZyraOnStage;
     trace?: TurnHandle;
     knowledgeConfidence?: RagRetrievalConfidence;
+    // Handed to an exhaustive plan so its background batches keep this turn's sources.
+    contextRefs?: ZyraTurnContextRefs;
   }): Promise<ZyraChatDecision> {
     const {
       projectId, userId, sessionId, provider, model, key, message, userMessageId,
       knowledgeForChat, existingTestcases, mentionedJiraKeys, projectTestcaseRange, suites,
       conversation, routedSuite, routedCount, mentionedJira, capabilities, bugsForChat, onStage, trace,
-      knowledgeConfidence
+      knowledgeConfidence, contextRefs
     } = params;
     onStage?.("generating", { requestedCount: routedCount?.requestedCount ?? null, suiteName: routedSuite?.name ?? null });
     try {
@@ -12688,8 +12979,10 @@ export class LegacyService implements OnModuleInit {
         jira: mentionedJira,
         bugs: bugsForChat,
         trace,
-        knowledgeConfidence
+        knowledgeConfidence,
+        contextRefs
       });
+      onStage?.("generating", { draftedCount: LegacyService.zyraDraftedCount(decision) }, "update");
       return this.applyStorageGateToGenerated(decision, capabilities);
     } catch (err) {
       if (this.isZyraTimeoutError(err)) {
@@ -12700,6 +12993,7 @@ export class LegacyService implements OnModuleInit {
           this.chatTestcasePlan(message, projectTestcaseRange, routedCount).requestedCount
         );
         await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation", timeoutMs: generateTimeoutMs });
+        onStage?.("generating", { status: "timed_out", timeoutMs: generateTimeoutMs }, "update");
         return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, { routedSuite, routedCount }, generateTimeoutMs);
       }
       // Generation is a second call and can fail on its own (truncated JSON, no usable drafts)
@@ -12727,6 +13021,9 @@ export class LegacyService implements OnModuleInit {
        * first attempt failed and that this is a narrowed second attempt: a user who asked for 20
        * and receives 5 is owed the reason, and finding out from the count alone is not that.
        */
+      // The user-facing cause, not the raw `detail` (parser wording) — see zyraFailureReply below.
+      onStage?.("generating", { status: "failed", reason: LegacyService.zyraFailureCause(detail).cause }, "update");
+      onStage?.("generating", { requestedCount: LegacyService.ZYRA_RETRY_BATCH, suiteName: routedSuite?.name ?? null, retry: true });
       try {
         const retried = await this.generateZyraChatCreateDecision({
           projectId, userId, sessionId, provider, model, key, message,
@@ -12737,8 +13034,10 @@ export class LegacyService implements OnModuleInit {
           jira: mentionedJira,
           bugs: bugsForChat,
           trace,
-          knowledgeConfidence
+          knowledgeConfidence,
+          contextRefs
         });
+        onStage?.("generating", { draftedCount: LegacyService.zyraDraftedCount(retried) }, "update");
         const gated = this.applyStorageGateToGenerated(retried, capabilities);
         const { cause } = LegacyService.zyraFailureCause(detail);
         await this.logProjectActivity(projectId, userId, "zyra_chat_ai_retried", "zyra_chat", sessionId, "Zyra chat", {
@@ -12762,6 +13061,7 @@ export class LegacyService implements OnModuleInit {
         if (this.isZyraTimeoutError(retryErr)) {
           const retryTimeoutMs = LegacyService.zyraGenerateTimeoutMs(LegacyService.ZYRA_RETRY_BATCH);
           await this.logProjectActivity(projectId, userId, "zyra_chat_timeout", "zyra_chat", sessionId, "Zyra chat", { stage: "generation_retry", timeoutMs: retryTimeoutMs });
+          onStage?.("generating", { status: "timed_out", timeoutMs: retryTimeoutMs }, "update");
           return this.zyraTimedOutDecision("generate", message, userMessageId, existingTestcases.length, {
             routedSuite,
             routedCount: { requestedCount: LegacyService.ZYRA_RETRY_BATCH, exhaustive: false }
@@ -12774,6 +13074,7 @@ export class LegacyService implements OnModuleInit {
           message: retryDetail,
           stage: "generation_retry"
         });
+        onStage?.("generating", { status: "failed", reason: LegacyService.zyraFailureCause(retryDetail || detail).cause }, "update");
         /*
          * The router's own reply is NOT reused here any more.
          *
@@ -13754,7 +14055,9 @@ export class LegacyService implements OnModuleInit {
     projectId: string,
     message: string,
     jiraIssueKeys: string[],
-    capabilities: ZyraCapabilities
+    capabilities: ZyraCapabilities,
+    // Sources carried from the chat turn that started the plan — see startZyraChatPlan.
+    carriedRefs: ZyraTurnContextRefs | null = null
   ): Promise<{
     knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
     existingTestcases: ZyraGenerationInput["existingTestcases"];
@@ -13765,7 +14068,7 @@ export class LegacyService implements OnModuleInit {
   }> {
     // Same rule as buildZyraChatDecision: with knowledge-base access OFF, the lookups never run.
     const kbEnabled = capabilities.knowledgeBase;
-    const [knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, suites, jira, bugs] = await Promise.all([
+    const [knowledgeFallback, ragDiagnostics, folderKnowledge, existingTestcases, suites, ownJira, ownBugs, carriedSources] = await Promise.all([
       kbEnabled ? this.knowledgeSnapshot(projectId) : Promise.resolve([]),
       // retrieveWithDiagnostics, not the plain retrieveKnowledgeContext wrapper — this is a
       // background plan batch (continueZyraChatPlan), which previously carried no confidence signal
@@ -13779,14 +14082,29 @@ export class LegacyService implements OnModuleInit {
       this.relevantJiraSnapshot(projectId, message, jiraIssueKeys),
       // Same gate as knowledge below — bugs are treated as part of the same "project knowledge"
       // capability toggle rather than a new one, consistent with how this project already reads.
-      kbEnabled ? this.bugsSnapshot(projectId, message) : Promise.resolve([])
+      kbEnabled ? this.bugsSnapshot(projectId, message) : Promise.resolve([]),
+      this.zyraResolveContextRefs(projectId, carriedRefs, kbEnabled)
     ]);
     const ragKnowledge = ragDiagnostics.items;
-    const knowledge = [...folderKnowledge, ...(ragKnowledge.length ? ragKnowledge : knowledgeFallback)];
-    // Same folder-match-overrides-confidence rule as buildZyraChatDecision's own computation — kept
-    // in sync there rather than factored out, since the two call sites gather from different
-    // Promise.all shapes and a shared helper would need to take both apart again anyway.
-    const knowledgeConfidence: RagRetrievalConfidence = folderKnowledge.length > 0 ? "strong" : ragDiagnostics.confidence;
+    // Same folder-match-overrides-confidence rule and same carried-source merge as
+    // decideZyraChatTurn's own computation — kept in sync there rather than factored out, since the
+    // two call sites gather from different Promise.all shapes and a shared helper would need to take
+    // both apart again anyway.
+    const turnSources = LegacyService.mergeZyraTurnSources(
+      {
+        jiraIssueKeys,
+        jira: ownJira,
+        knowledge: [...folderKnowledge, ...ragKnowledge],
+        knowledgeConfidence: folderKnowledge.length > 0 ? "strong" : ragDiagnostics.confidence,
+        bugs: ownBugs
+      },
+      carriedSources
+    );
+    const jira = turnSources.jira;
+    const bugs = turnSources.bugs;
+    const knowledgeConfidence: RagRetrievalConfidence = turnSources.knowledgeConfidence;
+    const usedRecencyFallback = !ragKnowledge.length && turnSources.knowledge.length === folderKnowledge.length;
+    const knowledge = [...turnSources.knowledge, ...(usedRecencyFallback ? knowledgeFallback : [])];
     return {
       knowledge: capabilities.knowledgeBase ? knowledge : [],
       existingTestcases,
@@ -13857,6 +14175,7 @@ export class LegacyService implements OnModuleInit {
     // own doc comment for why the background continuation loop stays untraced.
     trace?: TurnHandle;
     knowledgeConfidence?: RagRetrievalConfidence;
+    contextRefs?: ZyraTurnContextRefs;
   }): Promise<ZyraChatDecision> {
     let scenarios: string[] = [];
     try {
@@ -13930,6 +14249,9 @@ export class LegacyService implements OnModuleInit {
         status: "running",
         originalMessage: params.message,
         jiraIssueKeys: params.jiraIssueKeys,
+        // The starting turn's sources: originalMessage is often the follow-up that confirmed the plan
+        // ("yes"), which names none of them, so re-gathering on it alone would lose them by batch 2.
+        contextRefs: params.contextRefs || null,
         routedSuite: params.routedSuite || null,
         remainingScenarios: remaining,
         batchSize: LegacyService.ZYRA_PLAN_BATCH_SIZE,
@@ -13958,12 +14280,14 @@ export class LegacyService implements OnModuleInit {
    * `testcases.length > 0` is genuinely possible (the batch-drafts success path), 'answer' for every
    * pure status message, matching how normalizeZyraChatDecision already routes a zero-mutation reply.
    */
-  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer"): Promise<void> {
+  // `trace`: a plan message answers no user message of its own, so it carries its own trace — what
+  // this batch (or this stop/resume) actually did.
+  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer", trace: ZyraTurnTrace | null = null): Promise<void> {
     await client.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb)`,
-      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity)]
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb)`,
+      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null]
     );
     await client.query("UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = $1", [sessionId]);
   }
@@ -14072,6 +14396,13 @@ export class LegacyService implements OnModuleInit {
         return;
       }
 
+      // Each batch message carries its own trace: this loop answers no user message, so there is no
+      // other row the steps could live on. Built in memory and written with the message itself — a
+      // batch whose commit is discarded (superseded, stale) posts nothing, trace included.
+      const recorder = new ZyraTurnTraceRecorder();
+      const stage = recorder.onStage;
+      stage("plan:batch", { fromScenario: doneCount + 1, toScenario: doneCount + batch.length, totalCount });
+
       // Hoisted so the catch block below can still record tokens from a billed-but-unparsed
       // response even though provider/model are only known once the allocation resolves.
       let provider = "unknown";
@@ -14079,16 +14410,18 @@ export class LegacyService implements OnModuleInit {
       try {
         const allocation = await this.zyraAiAllocation(projectId);
         if (!allocation.key) {
+          stage("plan:batch", { status: "blocked", reason: allocation.reason }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I couldn't continue generating more test cases — ${allocation.reason}`, [], []);
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I couldn't continue generating more test cases — ${allocation.reason}`, [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
         }
         const capabilities = await this.zyraProjectCapabilities(projectId);
         if (!capabilities.generation) {
+          stage("plan:batch", { status: "blocked", reason: "Test case generation is off for this project" }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], []);
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
@@ -14103,8 +14436,17 @@ export class LegacyService implements OnModuleInit {
           projectId,
           `${originalMessage}\n${batch.join("\n")}`,
           jiraIssueKeys,
-          capabilities
+          capabilities,
+          LegacyService.normalizeZyraContextRefs(plan.contextRefs)
         );
+        LegacyService.emitZyraContextSteps(stage, capabilities, {
+          knowledge: LegacyService.dedupeZyraKnowledgeItems(knowledge),
+          jira,
+          existingTestcases,
+          bugs: bugs || []
+        });
+        const batchSuite = (plan.routedSuite as { id?: string; name?: string } | null) || null;
+        stage("generating", { requestedCount: batch.length, suiteName: batchSuite?.name ?? null });
         const decision = await this.generateZyraChatTestcasesWithAi({
           projectId,
           userId,
@@ -14124,7 +14466,9 @@ export class LegacyService implements OnModuleInit {
           // the first — a routed suite id is not recoverable from the original message text.
           routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null
         });
+        stage("generating", { draftedCount: LegacyService.zyraDraftedCount(decision) }, "update");
         const gated = this.applyStorageGateToGenerated(decision, capabilities);
+        if (gated.operations.length) stage("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(gated.operations) });
         // applyZyraChatOperations itself records this batch's ai_generation_requests row as pending
         // (recordZyraPendingReviewRequest) so a later "save them to <suite>" can find it — a batch
         // here is staged exactly like a single chat turn's create, so there is no separate id-based
@@ -14135,6 +14479,11 @@ export class LegacyService implements OnModuleInit {
         // decides not to post about it in the (now-superseded) chat session.
         const applied = await this.applyZyraChatOperations(projectId, userId, sessionId, gated.operations);
         const testcases = applied.testcases.length ? applied.testcases : gated.testcases;
+        stage("finalizing", {
+          savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
+          proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
+        });
+        const batchTrace = recorder.finish();
 
         const newDoneCount = doneCount + batch.length;
         const remaining = remainingScenarios.slice(batch.length);
@@ -14157,7 +14506,7 @@ export class LegacyService implements OnModuleInit {
           // 'create' only when this batch genuinely produced staged rows — a "saved nothing" batch
           // (testcases.length === 0) gets 'answer' via the default, matching how a zero-mutation
           // reply is classified everywhere else in this file.
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer");
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer", batchTrace);
           if (!remaining.length) {
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           } else {
@@ -14181,8 +14530,10 @@ export class LegacyService implements OnModuleInit {
         if (batchUsage) await this.recordZyraTokenUsage(projectId, "chat_generate", provider, model, batchUsage);
         // Pause rather than discard: remainingScenarios/doneCount are unchanged (this batch
         // never succeeded), so "continue" — or resumeZyraChatPlan — can retry from here later.
+        // `detail` is already what the pause message itself tells the user.
+        const failedTrace = recorder.fail(detail || "This batch did not complete.");
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client, current) => {
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], []);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
           // Spread the locked read, not the outer closure's `plan` — same reasoning as the
           // success-path commit above.
           await client.query(
@@ -16043,6 +16394,180 @@ export class LegacyService implements OnModuleInit {
   // (see IntegrationSyncDocumentBuilder). Counting them makes the "sources read" line in a reply
   // honest: reporting "0 Jira ticket(s)" while a dozen retrieved knowledge items were Jira tickets
   // reads as "Jira is not connected", which is the wrong conclusion.
+  // Per-source ceiling for carried context — the same 8 relevantJiraSnapshot/bugsSnapshot already
+  // cap a single turn at, so carrying never makes a prompt larger than one turn's own lookup could.
+  private static readonly ZYRA_TURN_SOURCE_LIMIT = 8;
+  private static readonly ZYRA_CONFIDENCE_RANK: Record<RagRetrievalConfidence, number> = { none: 0, weak: 1, strong: 2 };
+
+  // The context the most recent assistant turn in this session resolved (see ZyraTurnContextRefs).
+  // Plan progress messages and rows written before V127 carry none and are skipped, so a follow-up
+  // sent while a plan is posting batches still continues the turn that started the plan. Fail-open:
+  // an unreadable row means "nothing to carry", never a failed turn.
+  private async zyraPriorTurnContextRefs(projectId: string, sessionId: string): Promise<ZyraTurnContextRefs | null> {
+    const res = await this.db.query(
+      `SELECT context_refs FROM zyra_chat_messages
+       WHERE session_id = $1 AND project_id = $2 AND role = 'assistant' AND context_refs IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [sessionId, projectId]
+    ).catch(() => ({ rows: [] as Body[] }));
+    return LegacyService.normalizeZyraContextRefs(res.rows[0]?.context_refs);
+  }
+
+  // Stored refs are re-validated on the way back in rather than trusted: JSONB written by an older
+  // build, or a plan's active_plan copy, may be partial.
+  private static normalizeZyraContextRefs(raw: unknown): ZyraTurnContextRefs | null {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const value = raw as Body;
+    const limit = LegacyService.ZYRA_TURN_SOURCE_LIMIT;
+    const ids = (list: unknown) => Array.from(new Set(normalizeJsonArray(list).map((item) => String(item ?? "").trim()).filter(Boolean))).slice(0, limit);
+    const knowledge = normalizeJsonArray(value.knowledge)
+      .map((item) => ({ sourceType: (item as Body)?.sourceType, sourceId: String((item as Body)?.sourceId ?? "").trim() }))
+      .filter((item): item is ZyraKnowledgeCitation => (item.sourceType === "document" || item.sourceType === "file") && Boolean(item.sourceId))
+      .slice(0, limit);
+    const confidence = String(value.knowledgeConfidence || "");
+    return {
+      jiraIssueKeys: ids(value.jiraIssueKeys),
+      jiraKeys: ids(value.jiraKeys),
+      knowledge,
+      knowledgeConfidence: confidence === "strong" || confidence === "weak" ? confidence : "none",
+      bugIds: ids(value.bugIds)
+    };
+  }
+
+  // `sources.knowledge` must already exclude the recency fallback — see ZyraTurnContextRefs.knowledge.
+  private static zyraContextRefsFor(sources: ZyraTurnSources): ZyraTurnContextRefs {
+    return {
+      jiraIssueKeys: sources.jiraIssueKeys,
+      jiraKeys: sources.jira.map((ticket) => ticket.key).filter(Boolean),
+      knowledge: sources.knowledge.map((item) => item.citation).filter((citation): citation is ZyraKnowledgeCitation => Boolean(citation?.sourceId)),
+      knowledgeConfidence: sources.knowledgeConfidence,
+      bugIds: sources.bugs.map((bug) => bug.id).filter(Boolean)
+    };
+  }
+
+  // Re-fetches carried refs by id, scoped to this project — a ref that no longer resolves (deleted
+  // document, archived bug, ticket gone from the sync cache) simply drops out. Knowledge and bugs
+  // honour the same knowledge-base capability gate as the turn's own lookups.
+  private async zyraResolveContextRefs(projectId: string, refs: ZyraTurnContextRefs | null, kbEnabled: boolean): Promise<ZyraTurnSources> {
+    if (!refs) return { jiraIssueKeys: [], jira: [], knowledge: [], knowledgeConfidence: "none", bugs: [] };
+    const [jira, knowledge, bugs] = await Promise.all([
+      this.jiraSnapshot(projectId, refs.jiraKeys),
+      kbEnabled ? this.zyraKnowledgeByCitations(projectId, refs.knowledge) : Promise.resolve([]),
+      kbEnabled ? this.zyraBugsByIds(projectId, refs.bugIds) : Promise.resolve([])
+    ]);
+    return {
+      jiraIssueKeys: refs.jiraIssueKeys,
+      jira: jira.map((ticket) => ({ key: ticket.key, summary: ticket.summary, description: ticket.description })),
+      knowledge,
+      knowledgeConfidence: knowledge.length ? refs.knowledgeConfidence : "none",
+      bugs
+    };
+  }
+
+  // Same row filter and content shape as knowledgeSnapshot, addressed by id and returned in the
+  // order the citations were stored.
+  private async zyraKnowledgeByCitations(projectId: string, citations: ZyraKnowledgeCitation[]): Promise<Array<{ title: string; content: string; citation: ZyraKnowledgeCitation }>> {
+    const docIds = citations.filter((c) => c.sourceType === "document").map((c) => c.sourceId);
+    const fileIds = citations.filter((c) => c.sourceType === "file").map((c) => c.sourceId);
+    if (!docIds.length && !fileIds.length) return [];
+    const empty = { rows: [] as Body[] };
+    const [docs, files] = await Promise.all([
+      docIds.length
+        ? this.db.query(
+            `SELECT id, title, content_text FROM knowledge_documents
+             WHERE project_id = $1 AND id::text = ANY($2::text[]) AND is_deleted = false
+               AND (document_type != 'ai_memory' OR status = 'approved')`,
+            [projectId, docIds]
+          ).catch(() => empty)
+        : empty,
+      fileIds.length
+        ? this.db.query(
+            `SELECT id, original_file_name, file_extension, extracted_text, extraction_status FROM knowledge_files
+             WHERE project_id = $1 AND id::text = ANY($2::text[]) AND is_deleted = false`,
+            [projectId, fileIds]
+          ).catch(() => empty)
+        : empty
+    ]);
+    const byRef = new Map<string, { title: string; content: string; citation: ZyraKnowledgeCitation }>();
+    for (const row of docs.rows) {
+      byRef.set(`document:${row.id}`, {
+        title: row.title || "Knowledge base item",
+        content: String(row.content_text || "").slice(0, 1500),
+        citation: { sourceType: "document", sourceId: String(row.id) }
+      });
+    }
+    for (const row of files.rows) {
+      byRef.set(`file:${row.id}`, {
+        title: row.original_file_name || "Uploaded file",
+        content: row.extracted_text ? String(row.extracted_text).slice(0, 1500) : this.knowledgeFileFallbackContent(row.file_extension, row.extraction_status),
+        citation: { sourceType: "file", sourceId: String(row.id) }
+      });
+    }
+    return citations.map((c) => byRef.get(`${c.sourceType}:${c.sourceId}`)).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  }
+
+  // Same columns and shape as bugsSnapshot, addressed by id.
+  private async zyraBugsByIds(projectId: string, ids: string[]): Promise<NonNullable<ZyraGenerationInput["bugs"]>> {
+    if (!ids.length) return [];
+    const res = await this.db.query(
+      `SELECT id, title, description, status, priority
+       FROM bugs
+       WHERE project_id = $1 AND deleted_at IS NULL AND id::text = ANY($2::text[])`,
+      [projectId, ids]
+    ).catch(() => ({ rows: [] as Body[] }));
+    const byId = new Map(res.rows.map((row) => [String(row.id), {
+      id: String(row.id || ""),
+      title: String(row.title || "Untitled bug").slice(0, 512),
+      description: String(row.description || "").slice(0, 2000),
+      status: String(row.status || "Open"),
+      priority: String(row.priority || "")
+    }]));
+    return ids.map((id) => byId.get(id)).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  }
+
+  /**
+   * Combines what this turn's own message resolved with what the previous turn resolved, so a
+   * follow-up keeps the subject it is following up on. Pure — unit-tested directly.
+   *
+   * Own sources always come first and are never displaced: carried context only fills remaining room
+   * up to the per-source limit, so a message that names a new subject leads with that subject and
+   * earlier ones age out as new turns fill the cap. The one exception is knowledge, where order is by
+   * confidence — a follow-up's own RAG hits are typically weak noise ("yes" matches nothing), and
+   * must not outrank the documents the conversation was actually about. With nothing carried, the
+   * result is exactly `own`.
+   */
+  private static mergeZyraTurnSources(own: ZyraTurnSources, carried: ZyraTurnSources): ZyraTurnSources {
+    const limit = LegacyService.ZYRA_TURN_SOURCE_LIMIT;
+    const appendNew = <T>(first: T[], second: T[], keyOf: (item: T) => string, cap: number): T[] => {
+      const seen = new Set(first.map(keyOf));
+      const extra: T[] = [];
+      for (const item of second) {
+        const key = keyOf(item);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        extra.push(item);
+      }
+      return [...first, ...extra].slice(0, Math.max(first.length, cap));
+    };
+    const knowledgeKey = (item: { title: string; citation?: ZyraKnowledgeCitation }) =>
+      item.citation?.sourceId ? `${item.citation.sourceType}:${item.citation.sourceId}` : item.title;
+    const ownKnowledgeKeys = new Set(own.knowledge.map(knowledgeKey));
+    const carriedKnowledge = carried.knowledge.filter((item) => !ownKnowledgeKeys.has(knowledgeKey(item)));
+    const rank = LegacyService.ZYRA_CONFIDENCE_RANK;
+    const carriedOutranks = rank[carried.knowledgeConfidence] > rank[own.knowledgeConfidence];
+    const knowledge = carriedKnowledge.length
+      ? (carriedOutranks ? [...carriedKnowledge, ...own.knowledge] : [...own.knowledge, ...carriedKnowledge])
+      : own.knowledge;
+    return {
+      jiraIssueKeys: appendNew(own.jiraIssueKeys, carried.jiraIssueKeys, (key) => key, limit),
+      jira: appendNew(own.jira, carried.jira, (ticket) => ticket.key, limit),
+      knowledge,
+      knowledgeConfidence: carriedKnowledge.length && carriedOutranks ? carried.knowledgeConfidence : own.knowledgeConfidence,
+      bugs: appendNew(own.bugs, carried.bugs, (bug) => bug.id, limit)
+    };
+  }
+
   private countZyraJiraSourcedKnowledge(knowledge: Array<{ title: string }>): number {
     return knowledge.filter((item) => /^[A-Z][A-Z0-9]+-\d+\s*:/.test(String(item.title || "").trim())).length;
   }
@@ -17731,6 +18256,13 @@ export class LegacyService implements OnModuleInit {
     return this.normalizeZyraCapabilities(zyraAgent.capabilities);
   }
 
+  private static readonly ZYRA_CAPABILITY_OFF_REASON: Record<keyof ZyraCapabilities, string> = {
+    generation: "Test case generation is off for this project",
+    knowledgeBase: "Knowledge base access is off for this project",
+    testcaseStorage: "Test case storage is off for this project",
+    suiteOperations: "Suite operations are off for this project"
+  };
+
   private zyraCapabilityDisabled(capability: keyof ZyraCapabilities, existingCount: number): ZyraChatDecision {
     const label: Record<keyof ZyraCapabilities, string> = {
       generation: "Test case generation",
@@ -18433,6 +18965,7 @@ export class LegacyService implements OnModuleInit {
     bugs?: ZyraGenerationInput["bugs"];
     trace?: TurnHandle;
     knowledgeConfidence?: RagRetrievalConfidence;
+    contextRefs?: ZyraTurnContextRefs;
   }): Promise<ZyraChatDecision> {
     const plan = this.chatTestcasePlan(params.message, params.projectTestcaseRange, params.routedCount);
     if (plan.testcaseRange === "all") {
@@ -18453,7 +18986,8 @@ export class LegacyService implements OnModuleInit {
         jira: params.jira,
         bugs: params.bugs,
         trace: params.trace,
-        knowledgeConfidence: params.knowledgeConfidence
+        knowledgeConfidence: params.knowledgeConfidence,
+        contextRefs: params.contextRefs
       });
     }
     return this.generateZyraChatTestcasesWithAi({

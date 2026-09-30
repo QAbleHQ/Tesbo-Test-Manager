@@ -173,4 +173,49 @@ describe("Zyra citation guards", () => {
       expect(out).toEqual([{ type: "knowledge_document", id: "doc-1", title: "Refund policy v4" }]);
     });
   });
+
+  /*
+   * What a "jira_ticket" citation opens (ZyraContextDrawer -> GET .../jira/tickets/:issueKey). Zyra
+   * reads jira_tickets by project_id alone, so the lookup must use the same scope — resolving it
+   * through the Requirements list endpoint (currently-enabled mapping only) reported a ticket Zyra
+   * had just read, from a since-re-mapped Jira project, as "could not be found".
+   */
+  describe("jiraTicketByKey", () => {
+    function withDb(rows: Array<Record<string, unknown>>) {
+      const query = jest.fn(() => Promise.resolve({ rows }));
+      (svc as unknown as { db: { query: jest.Mock } }).db.query = query;
+      jest.spyOn(svc as unknown as { requireProjectAccess: () => Promise<void> }, "requireProjectAccess").mockResolvedValue(undefined);
+      return query;
+    }
+
+    it("looks the ticket up by exact key within the project, without restricting it to the enabled mapping", async () => {
+      const query = withDb([{ jira_issue_key: "HBP-4", summary: "Hotel Details & Room Selection", mapped_remote_id: "10033" }]);
+      const ticket = await svc.jiraTicketByKey("project-A", "user-1", " HBP-4 ");
+      expect(ticket).toMatchObject({ jiraIssueKey: "HBP-4", summary: "Hotel Details & Room Selection", mappedRemoteId: "10033" });
+      const [sql, params] = (query.mock.calls as unknown as Array<[string, unknown[]]>)[0];
+      expect(params).toEqual(["project-A", "HBP-4"]);
+      expect(sql).toMatch(/WHERE project_id = \$1 AND jira_issue_key = \$2/);
+      // The enabled mapping only ORDERS rows (preferring the current one) — it must never filter.
+      expect(sql).not.toMatch(/AND mapped_remote_id =/);
+      expect(sql).toMatch(/ORDER BY CASE WHEN mapped_remote_id =/);
+    });
+
+    it("checks project access before reading anything", async () => {
+      const query = withDb([]);
+      (svc as unknown as { requireProjectAccess: jest.Mock }).requireProjectAccess.mockRejectedValueOnce(new Error("Forbidden"));
+      await expect(svc.jiraTicketByKey("project-B", "user-1", "HBP-4")).rejects.toThrow("Forbidden");
+      expect(query).not.toHaveBeenCalled();
+    });
+
+    it("returns the exact not-found body the drawer maps to its 'no longer available' message", async () => {
+      withDb([]);
+      await expect(svc.jiraTicketByKey("project-A", "user-1", "HBP-4")).rejects.toMatchObject({ response: { error: "Jira ticket not found" } });
+    });
+
+    it("rejects an empty key instead of querying", async () => {
+      const query = withDb([]);
+      await expect(svc.jiraTicketByKey("project-A", "user-1", "  ")).rejects.toMatchObject({ response: { error: "Jira issue key is required." } });
+      expect(query).not.toHaveBeenCalled();
+    });
+  });
 });

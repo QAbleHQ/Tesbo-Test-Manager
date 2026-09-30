@@ -10,7 +10,7 @@ import {
   getKnowledgeFile,
   getKnowledgeFileDownloadUrl,
   getCustomFieldValues,
-  listJiraTickets,
+  getJiraTicket,
   type ZyraSourceRef,
   type BugItem,
   type KnowledgeDocument,
@@ -259,7 +259,7 @@ function JiraTicketDetail({ data }: { data: JiraTicket }) {
 }
 
 // The exact NotFoundException body each single-item GET throws (legacy.service.ts: kbDocument,
-// kbFile, getTestCaseForUser, getBugForUser) when the row is gone or soft-deleted. A citation is a
+// kbFile, getTestCaseForUser, getBugForUser, jiraTicketByKey) when the row is gone or soft-deleted. A citation is a
 // historical record of what informed a past reply, kept even after its source is later edited or
 // deleted (see zyraSourceRefIndex's own comment) — so this is an expected, not-broken outcome, and
 // deserves a plain explanation instead of the bare backend string surfacing as if something failed.
@@ -268,6 +268,7 @@ const NOT_FOUND_MESSAGE: Partial<Record<ZyraSourceRef["type"], string>> = {
   bug: "Bug not found",
   knowledge_document: "Document not found",
   knowledge_file: "File not found",
+  jira_ticket: "Jira ticket not found",
 };
 
 const STALE_SOURCE_MESSAGE: Record<ZyraSourceRef["type"], string> = {
@@ -325,13 +326,12 @@ export function ZyraContextDrawer({
           const data = await getKnowledgeFile(projectId, reference.id);
           if (!cancelled) setState({ kind: "knowledge_file", data });
         } else {
-          // No single-ticket-by-id route exists; the list endpoint's `search` is a substring
-          // ILIKE, so "PRO-1" would also match "PRO-10" — exact-match the real key client-side
-          // rather than trust the first/only row a substring search happens to return.
-          const { list } = await listJiraTickets(projectId, { search: reference.id, limit: 10 });
-          const match = list.find((t) => t.jiraIssueKey === reference.id);
-          if (!match) throw new Error(STALE_SOURCE_MESSAGE.jira_ticket);
-          if (!cancelled) setState({ kind: "jira_ticket", data: match });
+          // Exact-key lookup, not the Requirements list endpoint: that one only lists the currently
+          // enabled mapping's tickets (and pages a substring search), so a ticket Zyra read from a
+          // since-re-mapped Jira project — or one past the first page of "PRO-1…" matches — reported
+          // as not found. See jiraTicketByKey in legacy.service.ts.
+          const data = await getJiraTicket(projectId, reference.id);
+          if (!cancelled) setState({ kind: "jira_ticket", data });
         }
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : "Failed to load this item.";
