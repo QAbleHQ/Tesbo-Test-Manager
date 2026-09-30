@@ -16,6 +16,7 @@ import { Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { BugStatusBadge } from "@/components/bugs/BugBadges";
+import BugActivity from "@/components/bugs/BugActivity";
 import BugComments from "@/components/bugs/BugComments";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import EditBugModal from "@/components/bugs/EditBugModal";
@@ -42,6 +43,8 @@ export default function BugDetailPage() {
   const [editing, setEditing] = useState(searchParams.get("edit") === "1");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Bumped when a comment is posted, so the Activity section re-reads its entries.
+  const [commentTick, setCommentTick] = useState(0);
 
   /* Same gates the bugs list passes to Edit Bug. */
   const [jiraConnected, setJiraConnected] = useState(false);
@@ -172,7 +175,16 @@ export default function BugDetailPage() {
             className="space-y-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
           >
             <BugDetailsBody bug={bug} projectId={projectId} onAttachmentDeleted={load} />
-            <BugComments key={bug.id} projectId={projectId} bugId={bug.id} />
+            {/* Comments and Activity side by side on wide screens, stacked below lg. */}
+            <div className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
+              <BugComments key={bug.id} projectId={projectId} bugId={bug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
+              <BugActivity
+                key={`activity-${bug.id}`}
+                projectId={projectId}
+                bugId={bug.id}
+                refreshKey={`${bug.updatedAt}|${bug.attachments.length}|${commentTick}`}
+              />
+            </div>
           </section>
         )}
       </main>

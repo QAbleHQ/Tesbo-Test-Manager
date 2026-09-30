@@ -11,7 +11,16 @@ import { MemberAvatar } from "@/components/bugs/BugBadges";
  * Knowledge Base's DocumentComments, but flat: no replies, anchors or resolve — a bug's status
  * already says whether it is resolved. Render with `key={bugId}` so switching bugs starts clean.
  */
-export default function BugComments({ projectId, bugId }: { projectId: string; bugId: string }) {
+export default function BugComments({
+  projectId,
+  bugId,
+  onCommentAdded,
+}: {
+  projectId: string;
+  bugId: string;
+  /** Lets the Activity section beside this one pick up the new "added a comment" entry. */
+  onCommentAdded?: () => void;
+}) {
   const [comments, setComments] = useState<BugComment[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -46,6 +55,7 @@ export default function BugComments({ projectId, bugId }: { projectId: string; b
       // Appended from the POST response rather than refetched, so it shows the moment it is saved.
       setComments((prev) => [...prev, created]);
       setDraft("");
+      onCommentAdded?.();
     } catch (err) {
       // The draft is kept, so a failed post can be retried without retyping it.
       setSubmitError(err instanceof Error ? err.message : "Failed to add comment.");

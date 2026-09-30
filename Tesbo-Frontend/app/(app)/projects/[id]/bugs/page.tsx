@@ -47,6 +47,7 @@ import {
   BugStatusBadge,
   MemberAvatar,
 } from "@/components/bugs/BugBadges";
+import BugActivity from "@/components/bugs/BugActivity";
 import BugComments from "@/components/bugs/BugComments";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import EditBugModal from "@/components/bugs/EditBugModal";
@@ -447,6 +448,8 @@ export default function BugsPage() {
 
   /* detail view modal */
   const [viewBug, setViewBug] = useState<BugItem | null>(null);
+  // Bumped when a comment is posted in the panel, so its Activity section re-reads its entries.
+  const [commentTick, setCommentTick] = useState(0);
 
   /* delete confirm */
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -1028,7 +1031,14 @@ export default function BugsPage() {
                   load();
                 }}
               />
-              <BugComments key={viewBug.id} projectId={projectId} bugId={viewBug.id} />
+              <BugComments key={viewBug.id} projectId={projectId} bugId={viewBug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
+              {/* The panel is too narrow for side by side, so Activity stacks under Comments here. */}
+              <BugActivity
+                key={`activity-${viewBug.id}`}
+                projectId={projectId}
+                bugId={viewBug.id}
+                refreshKey={`${viewBug.updatedAt}|${viewBug.attachments.length}|${commentTick}`}
+              />
             </div>
 
             {/* Footer actions — primary on the left, destructive on the right, as in the Test Case
