@@ -1,6 +1,7 @@
 "use client";
 
-import { getBugAttachmentDownloadUrl, type BugItem } from "@/lib/api";
+import type { BugItem } from "@/lib/api";
+import BugAttachments from "@/components/bugs/BugAttachments";
 import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from "@/components/bugs/BugBadges";
 
 /*
@@ -8,7 +9,16 @@ import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from 
  * both the Bug Details side panel and the full-page bug view, so the two cannot drift apart.
  * Layout (padding, scrolling, header, actions) belongs to the caller.
  */
-export default function BugDetailsBody({ bug, projectId }: { bug: BugItem; projectId: string }) {
+export default function BugDetailsBody({
+  bug,
+  projectId,
+  onAttachmentDeleted,
+}: {
+  bug: BugItem;
+  projectId: string;
+  /** Called after an attachment is deleted from the Attachments section, to refresh the bug. */
+  onAttachmentDeleted: (attachmentId: string) => void;
+}) {
   return (
     <>
       {/* Description */}
@@ -69,23 +79,7 @@ export default function BugDetailsBody({ bug, projectId }: { bug: BugItem; proje
           </a>
         </div>
       ) : bug.attachments.length > 0 ? (
-        <div>
-          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">Attachments</p>
-          <ul className="space-y-1">
-            {bug.attachments.map((att) => (
-              <li key={att.id}>
-                <a
-                  href={getBugAttachmentDownloadUrl(projectId, att.id)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-sm text-[var(--accent-light)] hover:underline break-all"
-                >
-                  {att.fileName}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <BugAttachments projectId={projectId} attachments={bug.attachments} onDeleted={onAttachmentDeleted} />
       ) : null}
 
       {/* Severity / Priority / Status — read-only here; Edit Bug is where they change. These

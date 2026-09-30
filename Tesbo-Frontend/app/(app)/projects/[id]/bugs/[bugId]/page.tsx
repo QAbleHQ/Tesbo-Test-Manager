@@ -171,7 +171,7 @@ export default function BugDetailPage() {
             aria-label="Bug details"
             className="space-y-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
           >
-            <BugDetailsBody bug={bug} projectId={projectId} />
+            <BugDetailsBody bug={bug} projectId={projectId} onAttachmentDeleted={load} />
             <BugComments key={bug.id} projectId={projectId} bugId={bug.id} />
           </section>
         )}

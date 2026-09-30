@@ -1018,7 +1018,16 @@ export default function BugsPage() {
         {viewBug && (
           <section aria-label="Bug details" className="flex h-full flex-col">
             <div className="flex-1 space-y-5 overflow-y-auto p-5">
-              <BugDetailsBody bug={viewBug} projectId={projectId} />
+              <BugDetailsBody
+                bug={viewBug}
+                projectId={projectId}
+                onAttachmentDeleted={(attachmentId) => {
+                  // The panel renders its own copy of the bug, so drop the file there at once, then
+                  // reload the list so its rows and the next open are current too.
+                  setViewBug((prev) => (prev ? { ...prev, attachments: prev.attachments.filter((a) => a.id !== attachmentId) } : prev));
+                  load();
+                }}
+              />
               <BugComments key={viewBug.id} projectId={projectId} bugId={viewBug.id} />
             </div>
 

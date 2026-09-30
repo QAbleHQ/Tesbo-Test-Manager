@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 import {
   createBug,
   createProject,
@@ -2344,6 +2345,285 @@ test.describe("bug comments", () => {
 
       const persisted = await (await api.get(commentsUrl(bug.id))).json();
       expect(persisted.list.map((c: { body: string }) => c.body)).toEqual(["Seeded before opening", body]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The Attachments section of Bug Details (components/bugs/BugAttachments.tsx): image thumbnails
+ * with an in-app preview, filename links for everything else, and Open/View + Delete on every file.
+ * Upload, storage and the delete endpoint itself are covered in api/attachments.spec.ts.
+ */
+test.describe("bug attachments in Bug Details", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  type Attachment = { id: string; fileName: string };
+
+  /** A bug with these files attached, through the same upload route the Report Bug form uses. */
+  async function bugWith(label: string, files: UploadFile[]): Promise<{ id: string; title: string; attachments: Attachment[] }> {
+    const bug = await createBug(api, projectId, { title: `E2E Attachments ${label} ${uniqueSuffix()}` });
+    // The route takes at most 10 files per request (FilesInterceptor's cap), as the UI batches too.
+    for (let i = 0; i < files.length; i += 10) {
+      const res = await api.post(`/api/projects/${projectId}/bugs/${bug.id}/attachments`, {
+        multipart: filesForm(files.slice(i, i + 10)),
+      });
+      expect(res.ok(), await res.text()).toBeTruthy();
+    }
+    const full = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    return { ...bug, attachments: full.attachments };
+  }
+
+  function downloadUrl(attachmentId: string) {
+    return `/api/projects/${projectId}/bugs/attachments/${attachmentId}/download`;
+  }
+
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  async function openPanel(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  /** True once the browser actually decoded the image — a broken or unauthorised src stays 0×0. */
+  async function expectDecoded(img: Locator): Promise<void> {
+    await expect
+      .poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth > 0))
+      .toBe(true);
+  }
+
+  test("BUG-U-71 images show as thumbnails and other files as filename links, each with Open/View and Delete", async ({ page }) => {
+    const bug = await bugWith("Mixed", [
+      pngFile("shot-one.png"),
+      pngFile("shot-two.png"),
+      sizedFile("report.pdf", 2048, "application/pdf"),
+      textFile("console.txt"),
+    ]);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByText("Attachments (4)")).toBeVisible();
+
+      const thumbs = body.getByTestId("bug-attachment-image");
+      await expect(thumbs).toHaveCount(2);
+      for (const name of ["shot-one.png", "shot-two.png"]) {
+        const thumb = thumbs.filter({ hasText: name });
+        await expectDecoded(thumb.getByRole("img", { name }));
+        await expect(thumb.getByRole("button", { name: `View ${name}` }).first()).toBeVisible();
+        await expect(thumb.getByRole("button", { name: `Delete ${name}` })).toBeVisible();
+      }
+
+      const rows = body.getByTestId("bug-attachment-file");
+      await expect(rows).toHaveCount(2);
+      for (const name of ["report.pdf", "console.txt"]) {
+        const att = bug.attachments.find((a) => a.fileName === name)!;
+        const row = rows.filter({ hasText: name });
+        await expect(row.getByRole("img")).toHaveCount(0);
+        // Open keeps the existing behaviour for non-images: the file's download route, in a new tab.
+        const open = row.getByRole("link", { name: `Open ${name}` });
+        await expect(open).toHaveAttribute("href", new RegExp(`${downloadUrl(att.id)}$`));
+        await expect(open).toHaveAttribute("target", "_blank");
+        await expect(row.getByRole("link", { name, exact: true })).toHaveAttribute("href", new RegExp(`${downloadUrl(att.id)}$`));
+        await expect(row.getByRole("button", { name: `Delete ${name}` })).toBeVisible();
+      }
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-72 View opens the full image in a preview, and closing it keeps Bug Details open", async ({ page }) => {
+    const bug = await bugWith("Preview", [pngFile("preview-me.png")]);
+    try {
+      await openPanel(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "View preview-me.png" }).first().click();
+
+      const preview = page.getByRole("region", { name: "Attachment preview" });
+      await expect(preview).toBeVisible();
+      await expect(preview.getByRole("heading", { name: "preview-me.png" })).toBeVisible();
+      await expectDecoded(preview.getByRole("img", { name: "preview-me.png" }));
+      await expect(preview.getByRole("link", { name: "Download" })).toHaveAttribute(
+        "href",
+        new RegExp(`${downloadUrl(bug.attachments[0].id)}$`),
+      );
+
+      await preview.getByRole("button", { name: "Close preview" }).click();
+      await expect(preview).toHaveCount(0);
+      await expect(panelBody(page)).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-73 deleting an image asks first; Cancel keeps it, confirming removes it from the panel and the server", async ({ page }) => {
+    const bug = await bugWith("Delete Image", [pngFile("keep.png"), pngFile("remove.png")]);
+    const removed = bug.attachments.find((a) => a.fileName === "remove.png")!;
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+
+      await body.getByRole("button", { name: "Delete remove.png" }).click();
+      await expect(page.getByText("Delete attachment", { exact: true })).toBeVisible();
+      await expect(page.getByText(`Delete "remove.png" from this bug?`, { exact: false })).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(2);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toHaveLength(2);
+
+      await body.getByRole("button", { name: "Delete remove.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(1);
+      await expect(body.getByTestId("bug-attachment-image").filter({ hasText: "keep.png" })).toBeVisible();
+      await expect(body.getByText("Attachments (1)")).toBeVisible();
+      // The panel is still the same bug — deleting a file is not deleting the bug.
+      await expect(body).toBeVisible();
+
+      const after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(after.attachments.map((a: Attachment) => a.fileName)).toEqual(["keep.png"]);
+      expect((await api.get(downloadUrl(removed.id), { failOnStatusCode: false })).ok()).toBe(false);
+
+      // And the list was refreshed: reopening shows one file, not a stale two.
+      await page.reload();
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page).getByTestId("bug-attachment-image")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-74 a non-image file can be deleted from the full bug page, and the last one removes the section", async ({ page }) => {
+    const bug = await bugWith("Delete File", [sizedFile("spec.pdf", 1024, "application/pdf")]);
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const card = page.getByRole("region", { name: "Bug details" });
+      await expect(card.getByTestId("bug-attachment-file")).toHaveCount(1);
+      await card.getByRole("button", { name: "Delete spec.pdf" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(card.getByTestId("bug-attachment-file")).toHaveCount(0);
+      await expect(card.getByText(/^Attachments/)).toHaveCount(0);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-75 a failed delete says so and leaves the attachment in place", async ({ page }) => {
+    const bug = await bugWith("Delete Error", [pngFile("stuck.png")]);
+    try {
+      await openPanel(page, bug.title);
+      await page.route("**/api/bugs/attachments/*", (route) =>
+        route.request().method() === "DELETE"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Storage is unavailable." }) })
+          : route.continue(),
+      );
+      await panelBody(page).getByRole("button", { name: "Delete stuck.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(panelBody(page).getByTestId("bug-attachment-error")).toContainText("Storage is unavailable.");
+      await expect(panelBody(page).getByTestId("bug-attachment-image")).toHaveCount(1);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toHaveLength(1);
+    } finally {
+      await page.unroute("**/api/bugs/attachments/*");
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-77 the Edit Bug form shows thumbnails for existing image attachments, and none for other files", async ({ page }) => {
+    const bug = await bugWith("Edit Thumbs", [pngFile("edit-shot.png"), sizedFile("edit-notes.pdf", 1024, "application/pdf")]);
+    try {
+      // Both ways into Edit Bug render the same field: the full-page form and the list's dialog.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(1);
+      await expectDecoded(form.getByRole("img", { name: "edit-shot.png" }));
+      await expect(form.getByRole("img", { name: "edit-notes.pdf" })).toHaveCount(0);
+      await expect(form.getByRole("link", { name: "edit-notes.pdf" })).toBeVisible();
+
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).getByRole("button", { name: "Edit bug" }).click();
+      await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+      await expectDecoded(page.getByRole("img", { name: "edit-shot.png" }));
+      await expect(page.getByTestId("evidence-thumbnail")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-78 a newly picked image is previewed before saving, and removing it removes the preview", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Attachments Staged ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      const png = pngFile("picked.png");
+      const txt = textFile("picked.txt");
+      await form.locator('input[type="file"]').setInputFiles([
+        { name: png.name, mimeType: png.mimeType, buffer: png.body },
+        { name: txt.name, mimeType: txt.mimeType, buffer: txt.body },
+      ]);
+
+      await expect(form.getByText("picked.txt")).toBeVisible();
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(1);
+      await expectDecoded(form.getByRole("img", { name: "picked.png" }));
+      // Nothing is uploaded until Save.
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+
+      await form.locator("li", { hasText: "picked.png" }).getByRole("button").click();
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(0);
+      await expect(form.getByText("picked.txt")).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-76 many attachments wrap inside the panel without widening it", async ({ page }) => {
+    const files = [
+      ...Array.from({ length: 10 }, (_, i) => pngFile(`Screenshot 2026-09-11 1${String(i).padStart(5, "0")} with a long name.png`)),
+      sizedFile("Tesbo_RAG_Testing_Report_with_a_very_long_file_name_indeed.docx", 1024, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ];
+    const bug = await bugWith("Many", files);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(10);
+      await expect(body.getByTestId("bug-attachment-file")).toHaveCount(1);
+
+      // No horizontal overflow: the scroll area is no wider than the panel it sits in.
+      const scroller = body.locator(":scope > div").first();
+      const overflow = await scroller.evaluate((el) => el.scrollWidth - el.clientWidth);
+      expect(overflow).toBeLessThanOrEqual(1);
+      const panelBox = (await body.boundingBox())!;
+      for (const box of await body.getByTestId("bug-attachment-image").evaluateAll((els) =>
+        els.map((el) => el.getBoundingClientRect().right),
+      )) {
+        expect(box).toBeLessThanOrEqual(panelBox.x + panelBox.width + 1);
+      }
+      // The footer actions are still where they were.
+      await expect(body.getByRole("button", { name: "Delete Bug", exact: true })).toBeInViewport({ ratio: 1 });
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
