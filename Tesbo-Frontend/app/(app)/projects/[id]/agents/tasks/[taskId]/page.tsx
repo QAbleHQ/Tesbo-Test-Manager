@@ -478,6 +478,22 @@ export default function ZyraTaskDetailPage() {
                 ))}
               </div>
             )}
+            {/* The task's description — for a Jira/Linear task, the ticket description captured into
+                `context` when the task was created from Requirements. The quick-view popup always
+                rendered it; this page never did, so "View full task" dropped it and only a
+                320-character excerpt survived, as a Sources entry. Same field and same Markdown
+                renderer as the popup (escaped, http(s)-only links), so the two can't disagree. */}
+            <div data-testid="task-description" className="mt-4 border-t border-[var(--border-subtle)] pt-3">
+              <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted)]">Description</p>
+              {task.context?.trim() ? (
+                <div
+                  className="zyra-prose mt-1.5 break-words text-sm text-[var(--muted)]"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(task.context) }}
+                />
+              ) : (
+                <p className="mt-1.5 text-sm text-[var(--muted-soft)]">No description available</p>
+              )}
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {!done && (
