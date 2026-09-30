@@ -2,9 +2,26 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { authMe, createWorkspace, createWorkspaceInvitation, getWorkspace } from "@/lib/api";
+import { authMe, createWorkspace, createWorkspaceInvitation, getWorkspace, type WorkspaceRole } from "@/lib/api";
 import { countryOptions } from "@/lib/countries";
+import { DEFAULT_INVITE_ROLE, inviteRoleDescription, invitableRoleOptions } from "@/lib/workspaceRoles";
 import { Button, Field, FieldError, FieldHint, FieldLabel, Input, Select, Textarea } from "@/components/ui";
+
+// Whoever reaches the team step just created this workspace in step 1, so they are its owner (step 1
+// says as much). The server still enforces what an owner may invite — see createInvitation.
+const ONBOARDING_INVITER_ROLE: WorkspaceRole = "owner";
+
+/** One address per line, comma or semicolon — lower-cased and de-duplicated, in the order typed. */
+function parseTeamEmails(raw: string): string[] {
+  return Array.from(
+    new Set(
+      raw
+        .split(/[\n,;]+/)
+        .map((v) => v.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+}
 
 /** Best-effort default from the browser locale (e.g. "en-IN" → "IN"); empty when it has no region. */
 function guessCountryFromLocale(): string {
@@ -25,6 +42,12 @@ export default function OnboardingPage() {
   // and pre-selecting the likely answer beats making everyone scroll a 240-entry list.
   const [country, setCountry] = useState(() => guessCountryFromLocale());
   const [teamEmails, setTeamEmails] = useState("");
+  // Role chosen per invited address. An address with no entry uses DEFAULT_INVITE_ROLE, so a newly
+  // typed email starts on the same default Settings › Members does — visible and changeable, where
+  // this step used to invite everyone as a QA Engineer with no way to say otherwise.
+  const [roleByEmail, setRoleByEmail] = useState<Record<string, WorkspaceRole>>({});
+  const parsedTeamEmails = useMemo(() => parseTeamEmails(teamEmails), [teamEmails]);
+  const inviteRoleOptions = useMemo(() => invitableRoleOptions(ONBOARDING_INVITER_ROLE), []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [orgNameError, setOrgNameError] = useState("");
@@ -81,17 +104,8 @@ export default function OnboardingPage() {
     setError("");
     setLoading(true);
     try {
-      const emails = Array.from(
-        new Set(
-          teamEmails
-            .split(/[\n,;]+/)
-            .map((v) => v.trim().toLowerCase())
-            .filter(Boolean)
-        )
-      );
-
-      for (const email of emails) {
-        await createWorkspaceInvitation({ email, role: "qa_engineer" });
+      for (const email of parsedTeamEmails) {
+        await createWorkspaceInvitation({ email, role: roleByEmail[email] ?? DEFAULT_INVITE_ROLE });
       }
 
       router.push("/projects?create=1&fromOnboarding=1");
@@ -179,6 +193,42 @@ export default function OnboardingPage() {
               />
               <FieldHint>One email per line (or comma separated).</FieldHint>
             </Field>
+            {parsedTeamEmails.length > 0 && (
+              <Field>
+                <FieldLabel>Roles</FieldLabel>
+                <ul className="space-y-2">
+                  {parsedTeamEmails.map((email) => {
+                    const role = roleByEmail[email] ?? DEFAULT_INVITE_ROLE;
+                    return (
+                      <li key={email} className="flex items-center gap-3">
+                        <span className="min-w-0 flex-1 truncate text-sm text-[var(--foreground)]" title={email}>
+                          {email}
+                        </span>
+                        <Select
+                          aria-label={`Role for ${email}`}
+                          value={role}
+                          onChange={(e) => {
+                            const next = e.target.value as WorkspaceRole;
+                            setRoleByEmail((prev) => ({ ...prev, [email]: next }));
+                          }}
+                          disabled={loading}
+                          className="w-40 shrink-0"
+                        >
+                          {inviteRoleOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </Select>
+                      </li>
+                    );
+                  })}
+                </ul>
+                <FieldHint>
+                  {inviteRoleOptions.map((opt) => `${opt.label}: ${inviteRoleDescription(opt.value)}`).join(" ")}
+                </FieldHint>
+              </Field>
+            )}
             {error && <FieldError>{error}</FieldError>}
             <div className="flex gap-2">
               <Button
