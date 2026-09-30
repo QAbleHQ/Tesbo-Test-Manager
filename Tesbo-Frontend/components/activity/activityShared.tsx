@@ -92,6 +92,17 @@ const ACTION_META: Record<string, [string, StatusChipProps["tone"]]> = {
   custom_field_archived: ["Archived", "error"],
   custom_field_deleted: ["Deleted", "error"],
   testcase_custom_field_updated: ["Custom field updated", "info"],
+  commented: ["Commented", "neutral"],
+  bug_created: ["Created", "success"],
+  bug_updated: ["Updated", "info"],
+  bug_status_changed: ["Status changed", "info"],
+  bug_severity_changed: ["Severity changed", "info"],
+  bug_priority_changed: ["Priority changed", "info"],
+  bug_assignee_changed: ["Assigned", "info"],
+  bug_attachment_added: ["Attachment added", "info"],
+  bug_attachment_deleted: ["Attachment deleted", "error"],
+  bug_mentioned: ["Mentioned", "neutral"],
+  bug_deleted: ["Deleted", "error"],
 };
 
 export function actionMeta(action: string): [string, StatusChipProps["tone"]] {
@@ -191,6 +202,19 @@ export function describeActivity(item: ActivityLogItem): string | null {
   }
   if (item.action === "invitation_accepted" && typeof diff?.role === "string") {
     return `Joined as ${diff.role}.`;
+  }
+  if ((item.action === "bug_status_changed" || item.action === "bug_severity_changed" || item.action === "bug_priority_changed") && diff) {
+    const field = item.action.replace(/^bug_|_changed$/g, "");
+    return `${field.charAt(0).toUpperCase()}${field.slice(1)} changed from ${diff.from || "None"} to ${diff.to || "None"}.`;
+  }
+  if (item.action === "bug_assignee_changed" && diff) {
+    return diff.toName ? `Assigned to ${diff.toName}.` : "Unassigned.";
+  }
+  if ((item.action === "bug_attachment_added" || item.action === "bug_attachment_deleted") && typeof diff?.fileName === "string") {
+    return diff.fileName;
+  }
+  if (item.action === "bug_mentioned" && typeof diff?.mentionedName === "string") {
+    return `Mentioned ${diff.mentionedName} in a comment.`;
   }
   if (item.action === "project_created") return "Project created.";
   if (item.action === "project_deleted") return "Project deleted.";

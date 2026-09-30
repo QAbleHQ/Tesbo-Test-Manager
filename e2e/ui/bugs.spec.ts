@@ -2629,3 +2629,151 @@ test.describe("bug attachments in Bug Details", () => {
     }
   });
 });
+
+/*
+ * Bug Details' Activity section: the bug's own history (from the project activity feed, filtered
+ * to this bug) beside Comments on the full page, stacked under it in the narrow side panel. The
+ * logging itself — which actions, which actor — is specified in api/bugs.spec.ts "bug activity";
+ * these tests are about what the screen shows.
+ */
+test.describe("bug activity", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  let actorName: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** A fresh bug, plus the name the feed attributes its creation to (the screens user). */
+  async function seedBug(label: string) {
+    const bug = await createBug(api, projectId, { title: `E2E Activity ${label} ${uniqueSuffix()}` });
+    const feed = await (
+      await api.get(`/api/projects/${projectId}/activity`, { params: { entityType: "bug", entityId: bug.id } })
+    ).json();
+    actorName = feed.list.find((i: { action: string }) => i.action === "bug_created")?.actorName;
+    expect(actorName, "the bug_created row names who filed the bug").toBeTruthy();
+    return bug;
+  }
+
+  function detailsRegion(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  test("BUG-U-79 the full page shows Activity beside Comments, oldest first, naming the actor of each entry", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Page");
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress", priority: "P1" } });
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      const entries = activity.getByTestId("bug-activity");
+      await expect(entries).toHaveCount(3);
+      await expect(entries.nth(0)).toContainText(`${actorName} created the bug`);
+      await expect(entries.nth(1)).toContainText(`${actorName} changed status from Open to In Progress`);
+      await expect(entries.nth(2)).toContainText(`${actorName} changed priority from None to P1`);
+      await expect(entries.nth(0).locator("time")).toHaveAttribute("datetime", /\d{4}-\d{2}-\d{2}T/);
+
+      // Side by side: same row, Activity to the right of Comments.
+      const c = (await comments.boundingBox())!;
+      const a = (await activity.boundingBox())!;
+      expect(Math.abs(a.y - c.y)).toBeLessThan(4);
+      expect(a.x).toBeGreaterThan(c.x + c.width - 4);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-80 posting a comment adds its entry to Activity without a reload, and Comments still works as before", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Comment");
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+
+      await comments.getByLabel("Add a comment").fill("Seen again on build 12");
+      await comments.getByRole("button", { name: "Add Comment" }).click();
+      await expect(comments.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} added a comment`);
+
+      const persisted = await (await api.get(`/api/projects/${projectId}/bugs/${bug.id}/comments`)).json();
+      expect(persisted.list.map((x: { body: string }) => x.body)).toEqual(["Seen again on build 12"]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-81 on a narrow screen Activity stacks below Comments", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    const bug = await seedBug("Narrow");
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+      const c = (await comments.boundingBox())!;
+      const a = (await activity.boundingBox())!;
+      expect(a.y).toBeGreaterThanOrEqual(c.y + c.height - 1);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), "no horizontal scroll").toBe(true);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-82 the side panel shows the bug's Activity under its Comments", async ({ page }) => {
+    const bug = await seedBug("Panel");
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } });
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(2);
+      await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} closed the bug (was Open)`);
+      const c = (await detailsRegion(page).getByRole("region", { name: "Comments" }).boundingBox())!;
+      expect((await activity.boundingBox())!.y).toBeGreaterThan(c.y);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-83 when the activity request fails the section says so and offers Retry, and Comments is unaffected", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Failure");
+    try {
+      let fail = true;
+      await page.route(`**/api/projects/${projectId}/activity?**`, (route) =>
+        fail ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Boom" }) }) : route.continue(),
+      );
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      await expect(activity.getByRole("alert")).toContainText("Couldn't load activity");
+      await expect(detailsRegion(page).getByRole("region", { name: "Comments" }).getByText("No comments yet.")).toBeVisible();
+
+      fail = false;
+      await activity.getByRole("button", { name: "Retry" }).click();
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
