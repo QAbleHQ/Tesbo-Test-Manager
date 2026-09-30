@@ -1602,3 +1602,445 @@ test.describe("bug — field order matches between Report a Bug and Edit Bug", (
     expect(statusIdx).toBeLessThan(severityIdx);
   });
 });
+
+/*
+ * Bug Details as a right-side detail panel. It used to be a small centred modal; it now uses the
+ * shared Drawer the Test Run detail panel uses (components/ui/Drawer.tsx), with the same content
+ * and the same Edit / Delete / Close actions. These pin the placement, that nothing was dropped in
+ * the move, and that every action and dismissal still does what it did in the modal.
+ */
+test.describe("bug details panel", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The panel body. Drawer renders without role="dialog", so the page labels its own section. */
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  /**
+   * The whole drawer surface (header + body). The section sits in Drawer's scroll wrapper, whose
+   * parent is the panel itself, two levels up. Drawer is shared and its close button has no
+   * aria-label, so this is also how that header control is reached: it is the panel's first button.
+   */
+  function panel(page: Page): Locator {
+    return panelBody(page).locator("xpath=../..");
+  }
+
+  async function openFromList(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  test("BUG-U-48 opening a bug shows a full-height panel docked to the right, with every detail and action", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const cycle = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Panel Run ${suffix}` } })).json();
+    const testcase = await (
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title: `E2E Panel Case ${suffix}` } })
+    ).json();
+    await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const me = await (await api.get("/api/auth/me")).json();
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: {
+          title: `E2E Panel Bug ${suffix}`,
+          description: `Panel description ${suffix}`,
+          severity: "High",
+          priority: "P1",
+          assigneeId: me.userId,
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id }],
+        },
+      })
+    ).json();
+    try {
+      await openFromList(page, bug.title);
+
+      // Placement: right edge of the viewport, full height, the Drawer's 480px width.
+      const viewport = page.viewportSize()!;
+      const box = (await panel(page).boundingBox())!;
+      expect(box.x + box.width).toBeGreaterThanOrEqual(viewport.width - 1);
+      expect(box.y).toBeLessThanOrEqual(1);
+      expect(box.height).toBeGreaterThanOrEqual(viewport.height - 1);
+      expect(box.width).toBeLessThanOrEqual(481);
+      expect(box.x, "a centred modal would leave room on the right").toBeGreaterThan(viewport.width / 2);
+
+      // Header: eyebrow, key and title.
+      const surface = panel(page);
+      await expect(surface.getByText("Bug Details", { exact: true })).toBeVisible();
+      await expect(surface.getByText(bug.externalId, { exact: true })).toBeVisible();
+      await expect(surface.getByRole("heading", { name: bug.title })).toBeVisible();
+
+      // Body: every field the modal had.
+      const body = panelBody(page);
+      for (const label of ["Description", "Severity", "Priority", "Status", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        await expect(body.getByText(label, { exact: true }), label).toBeVisible();
+      }
+      await expect(body.getByText(`Panel description ${suffix}`)).toBeVisible();
+      await expect(body.getByText("High", { exact: true })).toBeVisible();
+      await expect(body.getByText("P1", { exact: true })).toBeVisible();
+      await expect(body.getByText("Open", { exact: true })).toBeVisible();
+      await expect(body.getByText(testcase.title)).toBeVisible();
+      await expect(body.getByText(`— ${cycle.name}`)).toBeVisible();
+
+      // Footer actions.
+      for (const name of ["Edit", "Close", "Delete Bug"]) {
+        await expect(body.getByRole("button", { name, exact: true })).toBeVisible();
+      }
+      await expect(body.getByRole("link", { name: "Open full page" })).toHaveAttribute(
+        "href",
+        `/projects/${projectId}/bugs/${bug.id}`,
+      );
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-49 a board card opens the same panel", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Board ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "Board", exact: true }).click();
+      await page.locator('[role="button"]').filter({ hasText: bug.title }).first().click();
+      await expect(panelBody(page)).toBeVisible();
+      await expect(panel(page).getByRole("heading", { name: bug.title })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-50 Close, the header close button, Escape and a backdrop click each dismiss the panel", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Dismiss ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Close", exact: true }).click();
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await panel(page).locator("button").first().click();
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page)).toBeVisible();
+      // The backdrop fills the viewport behind the right-docked panel; its far left is backdrop.
+      await page.mouse.click(10, page.viewportSize()!.height / 2);
+      await expect(panelBody(page)).toBeHidden();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-51 Edit hands off to the Edit Bug modal for the same bug and closes the panel", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Edit ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(panelBody(page)).toBeHidden();
+      await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+      const values = await page.locator("input").evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value));
+      expect(values).toContain(bug.title);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-52 Delete Bug asks for confirmation, and confirming removes the bug", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Delete ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await expect(panelBody(page)).toBeHidden();
+      // The confirm modal's title is the only "Delete Bug" text left once the panel is gone.
+      await expect(page.getByText("Delete Bug", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(page.locator("tbody tr").filter({ hasText: bug.title })).toHaveCount(0);
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(404);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-53 an untriaged, unassigned, unlinked bug shows its empty states, and no Last updated", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Empty ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByText("Not set", { exact: true })).toBeVisible();
+      await expect(body.getByText("Unassigned", { exact: true })).toBeVisible();
+      await expect(body.getByText("Not linked", { exact: true })).toBeVisible();
+      // No description was given, so the section is omitted rather than rendered empty.
+      await expect(body.getByText("Description", { exact: true })).toHaveCount(0);
+      await expect(body.getByText(/^Last updated:/)).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-54 Last updated appears once the bug has been edited", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Updated ${uniqueSuffix()}` });
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress" } });
+      await openFromList(page, bug.title);
+      await expect(panelBody(page).getByText(/^Last updated:/)).toBeVisible();
+      await expect(panelBody(page).getByText("In Progress", { exact: true })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-55 a long description scrolls inside the panel while the footer actions stay on screen", async ({ page }) => {
+    const description = Array.from({ length: 150 }, (_, i) => `Line ${i + 1} of a long reproduction`).join("\n");
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Panel Long ${uniqueSuffix()}`, description } })
+    ).json();
+    try {
+      await openFromList(page, bug.title);
+      const body = panelBody(page);
+      const viewportHeight = page.viewportSize()!.height;
+
+      // The footer is pinned: fully inside the viewport without any scrolling.
+      const edit = body.getByRole("button", { name: "Edit", exact: true });
+      await expect(edit).toBeInViewport({ ratio: 1 });
+      const editBox = (await edit.boundingBox())!;
+      expect(editBox.y + editBox.height).toBeLessThanOrEqual(viewportHeight);
+
+      // The body is what scrolls, and scrolling it reaches the last line.
+      const scroller = body.locator(":scope > div").first();
+      const overflows = await scroller.evaluate((el) => el.scrollHeight > el.clientHeight);
+      expect(overflows, "a 150-line description must overflow the panel body").toBe(true);
+      await body.getByText("Line 150 of a long reproduction").scrollIntoViewIfNeeded();
+      await expect(body.getByText("Line 150 of a long reproduction")).toBeInViewport();
+      await expect(edit).toBeInViewport({ ratio: 1 });
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The full-page bug view at /projects/:id/bugs/:bugId — the panel's "Open full page" target, the
+ * way the execute page is for the Test Run panel. It renders the same BugDetailsBody as the panel
+ * and the same EditBugModal as the list, so these cover the route, the navigation in and out of
+ * it, and its own Edit / Delete wiring; the modal's form behaviour is covered by the Edit Bug
+ * specs above.
+ */
+test.describe("bug full page", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The page's details card. Labelled by the page itself; nothing here has role="dialog". */
+  function details(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  test("BUG-U-56 Open full page goes from the panel to the bug's own page, with every detail and a way back", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title: `E2E Full Page ${suffix}`, description: `Full page description ${suffix}`, severity: "Critical", priority: "P0" },
+      })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await page.getByRole("link", { name: "Open full page" }).click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      await expect(page.getByText(bug.externalId, { exact: true }).first()).toBeVisible();
+      // The side panel is not what is showing: the list page and its drawer are gone.
+      await expect(page.locator("tbody tr")).toHaveCount(0);
+
+      const card = details(page);
+      for (const label of ["Description", "Severity", "Priority", "Status", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        await expect(card.getByText(label, { exact: true }), label).toBeVisible();
+      }
+      await expect(card.getByText(`Full page description ${suffix}`)).toBeVisible();
+      await expect(card.getByText("Critical", { exact: true })).toBeVisible();
+      await expect(card.getByText("P0", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toBeVisible();
+
+      // Breadcrumb back to the list. Scoped to the page header: the app sidebar has its own
+      // "Bugs" link.
+      await page.locator("header").getByRole("link", { name: "Bugs", exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /** The in-page Edit Bug card (the list uses a dialog; this page edits in place). */
+  function editForm(page: Page): Locator {
+    return page.getByRole("region", { name: "Edit bug" });
+  }
+
+  /** FieldLabel is not tied to its input (no htmlFor), so getByLabel cannot reach the title; it
+   *  is the first input after the "Bug Title" label. */
+  function titleInput(page: Page): Locator {
+    return editForm(page).locator("xpath=.//label[contains(., 'Bug Title')]/following::input[1]");
+  }
+
+  test("BUG-U-57 Edit on the full page edits in place, saves, and the page shows the new values", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Edit ${uniqueSuffix()}` });
+    const renamed = `${bug.title} renamed`;
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+      // In place, like the Test Run execute page: the form card replaces the details card, the
+      // header's Edit/Delete give way to the form's own actions, and no dialog opens over it.
+      await expect(editForm(page)).toBeVisible();
+      await expect(details(page)).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 2, name: "Edit Bug" })).toBeVisible();
+      const formBox = (await editForm(page).boundingBox())!;
+      const mainBox = (await editForm(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      expect(formBox.width, "the form spans the page, it is not a centred dialog").toBeGreaterThan(mainBox.width - 60);
+
+      await expect(titleInput(page)).toHaveValue(bug.title);
+      await titleInput(page).fill(renamed);
+      await editForm(page).getByLabel("Bug priority").selectOption("P2");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+
+      await expect(editForm(page)).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 1, name: renamed })).toBeVisible();
+      await expect(details(page).getByText("P2", { exact: true })).toBeVisible();
+
+      const persisted = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(persisted.title).toBe(renamed);
+      expect(persisted.priority).toBe("P2");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-61 Cancel on the in-place edit discards the change and restores the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Cancel ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await titleInput(page).fill(`${bug.title} discarded`);
+      await editForm(page).getByRole("button", { name: "Cancel", exact: true }).click();
+
+      await expect(editForm(page)).toHaveCount(0);
+      await expect(details(page)).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: bug.title, exact: true })).toBeVisible();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).title).toBe(bug.title);
+
+      // Reopening starts from the stored bug, not the discarded draft.
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(titleInput(page)).toHaveValue(bug.title);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-62 the full page uses the page width, with no extra side gutters around the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Width ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const card = (await details(page).boundingBox())!;
+      const main = (await details(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      // Only main's own px-6 (24px a side) separates the card from the page edges — the same
+      // gutter the execute page has, not a centred max-width column.
+      expect(card.x - main.x).toBeLessThanOrEqual(25);
+      expect(main.x + main.width - (card.x + card.width)).toBeLessThanOrEqual(25);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-58 Delete on the full page can be cancelled, and confirming it deletes and returns to the list", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Delete ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+
+      await page.getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(200);
+
+      await page.getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(404);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-59 an unknown or deleted bug id says so and links back to the list", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Gone ${uniqueSuffix()}` });
+    await api.delete(`/api/bugs/${bug.id}`);
+
+    for (const id of [bug.id, "00000000-0000-0000-0000-000000000000"]) {
+      await page.goto(`/projects/${projectId}/bugs/${id}`);
+      await expect(page.getByText("This bug could not be found. It may have been deleted.")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toHaveCount(0);
+    }
+    await page.getByRole("link", { name: "Back to Bugs" }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+  });
+
+  test("BUG-U-60 a signed-out visitor is sent to log in and never sees the bug", async ({ browser }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Anon ${uniqueSuffix()}` });
+    const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    try {
+      const anon = await ctx.newPage();
+      await anon.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await expect(anon).toHaveURL(/\/login/);
+      await expect(anon.getByText(bug.title)).toHaveCount(0);
+    } finally {
+      await ctx.close();
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
