@@ -6,8 +6,8 @@ import { literal, scalar } from "./psql";
 /*
  * Reading the backend's welcome-email BullMQ queue straight out of Redis.
  *
- * Registration schedules a job delayed until 3 hours after users.created_at. Nothing in the API
- * exposes that job, and no test can wait 3 hours for the email, so these helpers inspect the job
+ * Registration schedules a job delayed until 120 seconds after users.created_at. Nothing in the API
+ * exposes that job, and the email itself isn't something a test can read back, so these helpers inspect the job
  * where BullMQ keeps it — the `bull:welcome-email:<jobId>` hash and the queue's `delayed` sorted
  * set — via `docker compose exec redis redis-cli`, the same transport utils/backend-logs.ts uses.
  * No bullmq dependency is added to the suite for this; the key layout is BullMQ's default prefix
@@ -82,14 +82,15 @@ export function userCreatedAtMs(userId: string): number {
   return Number(scalar(`SELECT floor(extract(epoch FROM created_at) * 1000)::bigint FROM users WHERE id = ${literal(userId)};`));
 }
 
-const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+const WELCOME_DELAY_MS = 120 * 1000;
 // Room for clock skew between the hosted database (which stamps created_at) and the backend
 // container (which stamps the job), not for any slack in the product's own arithmetic.
 const CLOCK_SKEW_MS = 60_000;
 
 /**
  * Asserts the user has exactly the welcome job the ticket calls for: waiting in the delayed set,
- * carrying only the user id (no recipient address in Redis), due 3 hours after users.created_at.
+ * carrying only the user id (no recipient address in Redis), due 120 seconds after users.created_at.
+ * Call it right after registering: after 120s the job has run and left the delayed set.
  */
 export function expectWelcomeJobScheduled(userId: string): WelcomeJob {
   const job = readWelcomeJob(userId);
@@ -98,18 +99,18 @@ export function expectWelcomeJobScheduled(userId: string): WelcomeJob {
   expect(job!.data).toEqual({ userId });
   expect(job!.rawData, "the job must not carry an email address").not.toContain("@");
   expect(job!.isDelayed, "the welcome job is not waiting in the delayed set").toBe(true);
-  // Enqueued within moments of registering, so the delay itself is (just under) 3 hours...
-  expect(job!.delay).toBeGreaterThan(THREE_HOURS_MS - 5 * 60_000);
-  expect(job!.delay).toBeLessThanOrEqual(THREE_HOURS_MS);
-  // ...and, the actual requirement, it fires 3 hours after the registration time.
-  const expected = userCreatedAtMs(userId) + THREE_HOURS_MS;
-  expect(Math.abs(job!.firesAt - expected), "the welcome job is not due 3h after users.created_at").toBeLessThan(CLOCK_SKEW_MS);
+  // Enqueued within moments of registering, so the delay itself is (just under) 120 seconds...
+  expect(job!.delay).toBeGreaterThan(WELCOME_DELAY_MS - 30_000);
+  expect(job!.delay).toBeLessThanOrEqual(WELCOME_DELAY_MS);
+  // ...and, the actual requirement, it fires 120 seconds after the registration time.
+  const expected = userCreatedAtMs(userId) + WELCOME_DELAY_MS;
+  expect(Math.abs(job!.firesAt - expected), "the welcome job is not due 120s after users.created_at").toBeLessThan(CLOCK_SKEW_MS);
   return job!;
 }
 
 /**
  * Teardown: removes this user's pending welcome job, so a test account doesn't get a welcome email
- * sent three hours after the run. (The job would skip a deleted user anyway; many fixtures are
+ * sent two minutes later, if the test finishes first. (The job would skip a deleted user anyway; many fixtures are
  * detached rather than deleted, so this is what actually keeps the inbox quiet.)
  */
 export function removeWelcomeJob(userId: string | null | undefined): void {

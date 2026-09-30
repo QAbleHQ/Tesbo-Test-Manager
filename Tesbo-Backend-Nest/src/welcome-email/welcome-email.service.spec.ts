@@ -7,7 +7,7 @@ import { DatabaseService } from "../database/database.service";
 import { WELCOME_EMAIL_DELAY_MS, WELCOME_EMAIL_JOB, welcomeEmailDelayMs, welcomeEmailJobId } from "./welcome-email.constants";
 import { WelcomeEmailService } from "./welcome-email.service";
 
-const HOUR = 60 * 60 * 1000;
+const SECOND = 1000;
 
 function makeService(opts: { rows?: unknown[]; config?: Partial<AppConfigService>; queueAdd?: jest.Mock } = {}) {
   const query = jest.fn().mockResolvedValue({ rows: opts.rows ?? [] });
@@ -24,28 +24,28 @@ function makeService(opts: { rows?: unknown[]; config?: Partial<AppConfigService
 }
 
 describe("welcomeEmailDelayMs", () => {
-  it("is exactly 3 hours when scheduled at the moment of registration", () => {
-    expect(WELCOME_EMAIL_DELAY_MS).toBe(3 * HOUR);
+  it("is exactly 120 seconds when scheduled at the moment of registration", () => {
+    expect(WELCOME_EMAIL_DELAY_MS).toBe(120 * SECOND);
     const now = Date.parse("2026-09-28T10:00:00Z");
-    expect(welcomeEmailDelayMs(new Date(now), now)).toBe(3 * HOUR);
+    expect(welcomeEmailDelayMs(new Date(now), now)).toBe(120 * SECOND);
   });
 
   it("is measured from the registration time, not from when it is scheduled", () => {
     const createdAt = new Date("2026-09-28T10:00:00Z");
-    const fortyMinutesLater = createdAt.getTime() + 40 * 60 * 1000;
-    // Fires at 13:00 whatever time the enqueue happened.
-    expect(fortyMinutesLater + welcomeEmailDelayMs(createdAt, fortyMinutesLater)).toBe(createdAt.getTime() + 3 * HOUR);
+    const fortySecondsLater = createdAt.getTime() + 40 * SECOND;
+    // Fires at 10:02:00 whatever time the enqueue happened.
+    expect(fortySecondsLater + welcomeEmailDelayMs(createdAt, fortySecondsLater)).toBe(createdAt.getTime() + 120 * SECOND);
   });
 
-  it("never goes negative for a registration already more than 3 hours old", () => {
+  it("never goes negative for a registration already more than 120 seconds old", () => {
     const createdAt = new Date("2026-09-28T10:00:00Z");
-    expect(welcomeEmailDelayMs(createdAt, createdAt.getTime() + 5 * HOUR)).toBe(0);
+    expect(welcomeEmailDelayMs(createdAt, createdAt.getTime() + 300 * SECOND)).toBe(0);
   });
 });
 
 describe("WelcomeEmailService.schedule", () => {
-  it("enqueues one delayed job keyed to the user, due 3 hours after users.created_at", async () => {
-    const createdAt = new Date(Date.now() - 10 * 60 * 1000); // registered 10 minutes ago
+  it("enqueues one delayed job keyed to the user, due 120 seconds after users.created_at", async () => {
+    const createdAt = new Date(Date.now() - 30 * SECOND); // registered 30 seconds ago
     const { svc, add, query } = makeService({ rows: [{ created_at: createdAt }] });
 
     await svc.schedule("user-1");
@@ -58,7 +58,8 @@ describe("WelcomeEmailService.schedule", () => {
     expect(data).toEqual({ userId: "user-1" });
     expect(opts.jobId).toBe("welcome-user-1");
     const firesAt = Date.now() + opts.delay;
-    expect(Math.abs(firesAt - (createdAt.getTime() + 3 * HOUR))).toBeLessThan(1000);
+    expect(opts.delay).toBeGreaterThan(0);
+    expect(Math.abs(firesAt - (createdAt.getTime() + 120 * SECOND))).toBeLessThan(1000);
   });
 
   it("uses the same jobId every time for a user, which is what stops BullMQ from queueing a duplicate", async () => {

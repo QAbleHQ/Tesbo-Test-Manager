@@ -42,7 +42,7 @@ test.describe("self-serve signup", () => {
   let anon: APIRequestContext;
   /** Emails this file created, cleaned up in afterAll whatever happened. */
   const created: string[] = [];
-  /** Users whose welcome-email job must be removed, so a run doesn't send mail three hours later. */
+  /** Users whose welcome-email job must be removed, so a run doesn't send mail two minutes later. */
   const welcomed: string[] = [];
 
   const skipReason = dbControlAvailable()
@@ -298,7 +298,7 @@ test.describe("self-serve signup", () => {
     expect(body.userId).toBeTruthy();
     welcomed.push(body.userId);
 
-    // Completing signup schedules the welcome email: one delayed BullMQ job, due 3 hours after the
+    // Completing signup schedules the welcome email: one delayed BullMQ job, due 120 seconds after the
     // account's created_at. Asserted here rather than in a test of its own because a separate test
     // would spend another rate-limited signup/start (see BUDGET above). Only the local stack has a
     // Redis container to read; against a deployed target the check is recorded as not run.
