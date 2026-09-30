@@ -980,12 +980,41 @@ button:disabled,
 .zyra-prose h1 { font-size: 1.0625rem; font-weight: 700; margin: 1rem 0 0.4rem; color: var(--foreground); }
 .zyra-prose h2 { font-size: 1rem; font-weight: 700; margin: 0.9rem 0 0.35rem; color: var(--foreground); }
 .zyra-prose h3 { font-size: 0.9375rem; font-weight: 600; margin: 0.75rem 0 0.3rem; color: var(--foreground); }
+.zyra-prose h4 { font-size: 0.875rem; font-weight: 600; margin: 0.7rem 0 0.25rem; color: var(--foreground); }
+.zyra-prose h5,
+.zyra-prose h6 { font-size: 0.8125rem; font-weight: 600; margin: 0.6rem 0 0.2rem; color: var(--foreground); }
 .zyra-prose h1:first-child,
 .zyra-prose h2:first-child,
-.zyra-prose h3:first-child { margin-top: 0; }
+.zyra-prose h3:first-child,
+.zyra-prose h4:first-child,
+.zyra-prose h5:first-child,
+.zyra-prose h6:first-child { margin-top: 0; }
 .zyra-prose hr { border: none; border-top: 1px solid var(--border); margin: 0.6rem 0; }
 .zyra-prose p { margin: 0.25rem 0; }
 .zyra-prose ul { margin: 0.3rem 0; padding-left: 1.25rem; list-style: disc; }
+.zyra-prose ol { margin: 0.3rem 0; padding-left: 1.5rem; list-style: decimal; }
+.zyra-prose blockquote {
+  margin: 0.4rem 0;
+  padding: 0.15rem 0 0.15rem 0.75rem;
+  border-left: 3px solid var(--border-strong);
+  color: var(--muted);
+}
+.zyra-prose pre.code-block {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  background: var(--surface-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.8125em;
+  line-height: 1.55;
+  color: var(--foreground);
+  /* Code keeps its own line structure — the container's overflow-wrap:anywhere would otherwise
+     break it mid-token; long lines scroll horizontally instead. */
+  white-space: pre;
+  overflow-wrap: normal;
+}
 .zyra-prose li { margin: 0.15rem 0; }
 .zyra-prose strong { font-weight: 600; color: var(--foreground); }
 .zyra-prose em { font-style: italic; }
@@ -1006,6 +1035,9 @@ button:disabled,
 .zyra-prose-compact h1 { font-size: 0.875rem; margin: 0.5rem 0 0.25rem; }
 .zyra-prose-compact h2 { font-size: 0.8125rem; margin: 0.45rem 0 0.2rem; }
 .zyra-prose-compact h3 { font-size: 0.75rem; margin: 0.4rem 0 0.2rem; }
+.zyra-prose-compact h4,
+.zyra-prose-compact h5,
+.zyra-prose-compact h6 { font-size: 0.75rem; margin: 0.35rem 0 0.15rem; }
 
 .zyra-md-table-wrap { overflow-x: auto; margin: 0.6rem 0; border-radius: 8px; border: 1px solid var(--border-strong); }
 .zyra-md-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
